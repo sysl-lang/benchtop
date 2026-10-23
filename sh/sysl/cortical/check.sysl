@@ -1,0 +1,569 @@
+module sh.sysl.cortical
+
+import sh.sysl.parsing.{Report, Source, Span, error, nearest_name}
+import sysl.buf.{Buf, buf}
+
+// A board held to the library: every part is one the registry has, every wire goes to something its
+// port can take, no pin is wired twice, every element is on the panel, every key drives a control.
+//
+// **Every check runs, whatever failed before it.** An unknown part still has its neighbours' wiring
+// checked, and an unknown chip still has its elements placed, so a person editing a file sees each
+// of its mistakes once and at its own line.
+
+/** Check a built board against a registry, adding every mistake to `r`. An element whose size is the
+ * part's own (a screen's glass) has it filled in here.
+ */
+check(b: *Board, reg: Registry, src: Source, r: *Report)
+    val chip = reg.chip(b.chip)
+
+    if chip.is_none() && !b.chip.is_empty() then
+        r.add(guessed(error(b.chip_span, s"unknown chip `${b.chip}`"), b.chip, reg.chip_names())
+            .with_note(s"the chips cortical knows are ${listing(reg.chip_names())}"))
+
+    var pins = PinUses(buf(), buf())
+
+    check_buses(b, chip, src, r, &pins)
+    check_parts(b, chip, reg, src, r, &pins)
+    check_panel(b, reg, r)
+    check_input(b, reg, r)
+end check
+
+// Who holds each pin, by number: the index of its owner's name and place, or -1.
+private struct PinUses
+    owner: Buf[(string, Span)]
+    taken: Buf[int]
+end PinUses
+
+// A pin wired to `who`, unless something has it already.
+private claim(uses: *PinUses, src: Source, r: *Report, n: int, who: string, span: Span)
+    while uses.taken.len() <= usize(n)
+        uses.taken.push(-1)
+
+    val held = uses.taken.at(usize(n))
+
+    if held >= 0 then
+        val (first, at) = uses.owner.at(usize(held))
+
+        r.add(error(span, s"${pin_name(n)} is wired twice")
+            .with_note(s"it is already `$first`'s, at ${src.locate(at.start)}"))
+        return
+    end if
+
+    uses.taken.set(usize(n), int(uses.owner.len()))
+    uses.owner.push((who, span))
+end claim
+
+// Whether a pin exists on the chip, saying so where it does not.
+private real_pin(chip: Option[ChipSpec], r: *Report, n: int, span: Span) -> bool
+    chip match
+        None -> true
+        Some(c) ->
+            if n >= 0 && n < c.pins then return true
+
+            r.add(error(span, s"${pin_name(n)} is not a pin of the ${c.name}")
+                .with_note(s"its pins are GP0 to GP${c.pins - 1}"))
+            false
+end real_pin
+
+// -- buses -----------------------------------------------------------------------------------------
+
+private check_buses(b: *Board, chip: Option[ChipSpec], src: Source, r: *Report, pins: *PinUses)
+    val c = chip match
+        Some(c) -> c
+        None -> return
+
+    for bus in b.buses
+        val ctl = c.controller(bus.name) match
+            Some(x) -> x
+            None ->
+                r.add(guessed(error(bus.name_span, s"the ${c.name} has no bus `${bus.name}`"), bus.name, bus_names(c))
+                    .with_note(s"its buses are ${listing(bus_names(c))}"))
+                continue
+
+        for s in bus.signals
+            val spec = ctl.signal(s.name) match
+                Some(x) -> x
+                None ->
+                    r.add(guessed(error(s.name_span, s"`${bus.name}` has no signal `${s.name}`"), s.name, signal_names(ctl))
+                        .with_note(s"its signals are ${listing(signal_names(ctl))}"))
+                    continue
+
+            if !real_pin(chip, r, s.pin, s.span) then continue
+
+            if !contains(spec.pins, s.pin) then
+                r.add(error(s.span, s"${pin_name(s.pin)} cannot carry `${bus.name}.${s.name}`")
+                    .with_note(s"it can be on ${pin_list(spec.pins)}"))
+                continue
+            end if
+
+            claim(pins, src, r, s.pin, s"${bus.name}.${s.name}", s.span)
+        end for
+    end for
+end check_buses
+
+// -- parts -----------------------------------------------------------------------------------------
+
+private check_parts(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Source, r: *Report, pins: *PinUses)
+    // The offered pins taken so far, as `part.port`, with who took them.
+    var offered: Buf[(string, string, Span)] = buf()
+
+    for p in b.parts
+        for bus in b.buses
+            if bus.name == p.name then
+                r.add(error(p.name_span, s"duplicate name `${p.name}`")
+                    .with_note(s"`${p.name}` is also a bus, written at ${src.locate(bus.name_span.start)}"))
+
+        if p.kind.is_empty() then continue
+
+        val spec = reg.part(p.kind) match
+            Some(s) -> s
+            None ->
+                r.add(guessed(error(p.kind_span, s"unknown part `${p.kind}`"), p.kind, reg.part_names())
+                    .with_note(s"the parts cortical knows are ${listing(reg.part_names())}"))
+                continue
+
+        check_params(p, spec, r)
+
+        for w in p.wires
+            val port = spec.port(w.port) match
+                Some(x) -> x
+                None ->
+                    r.add(guessed(error(w.port_span, s"`${p.name}` (${spec.name}) has no port `${w.port}`"), w.port, port_names(spec))
+                        .with_note(s"its ports are ${listing(port_names(spec))}"))
+                    continue
+
+            val who = s"${p.name}.${w.port}"
+
+            port.kind match
+                PinPort(need) ->
+                    w.to match
+                        Pin(n) ->
+                            if real_pin(chip, r, n, w.span) then
+                                if need == AdcPin && !adc_pin(chip, n) then
+                                    r.add(error(w.span, s"`$who` takes an ADC pin, and ${pin_name(n)} has no ADC channel")
+                                        .with_note(s"the ${b.chip}'s ADC pins are ${pin_list(adc_pins(chip))}"))
+                                else
+                                    claim(pins, src, r, n, who, w.span)
+                        Bus(name) ->
+                            r.add(error(w.span, s"`$who` takes a pin, and `$name` is a bus")
+                                .with_note("a pin is written `GP16`, or another part's port as `wifi.gpio0`"))
+                        Port(other, its) ->
+                            if need == AdcPin then
+                                r.add(error(w.span, s"`$who` takes an ADC pin, and `$other.$its` is a part's port"))
+                            elif offered_port(b, reg, r, other, its, w.span) then
+                                var again = false
+
+                                for o in offered
+                                    if !again && o.0 == s"$other.$its" then
+                                        r.add(error(w.span, s"`$other.$its` is wired twice")
+                                            .with_note(s"it is already `${o.1}`'s, at ${src.locate(o.2.start)}"))
+                                        again = true
+
+                                if !again then offered.push((s"$other.$its", who, w.span))
+                BusPort(kind) ->
+                    w.to match
+                        Bus(name) -> check_bus_wire(b, chip, r, who, kind, name, w.span)
+                        _ ->
+                            r.add(error(w.span, s"`$who` takes ${bus_kind(kind)} bus, and `${target_text(w.to)}` is not one")
+                                .with_note(s"wire the bus's signals to pins under `buses`, and the port to the bus by name"))
+                Offer ->
+                    r.add(error(w.port_span, s"`$who` is a pin `${p.name}` offers to other parts")
+                        .with_note(s"wire the other part to it instead, as `wire { anode = $who }`"))
+        end for
+
+        for port in spec.ports
+            if port.required && !wired(p, port.name) then
+                r.add(error(p.name_span, s"`${p.name}.${port.name}` is not wired")
+                    .with_note(s"${article_of(spec.name)} ${spec.name} needs its `${port.name}` port wired"))
+    end for
+end check_parts
+
+private check_bus_wire(b: *Board, chip: Option[ChipSpec], r: *Report, who: string, kind: string, name: string, span: Span)
+    val c = chip match
+        Some(c) -> c
+        None -> return
+
+    val ctl = c.controller(name) match
+        Some(x) -> x
+        None ->
+            r.add(guessed(error(span, s"the ${c.name} has no bus `$name`"), name, bus_names(c))
+                .with_note(s"its buses are ${listing(bus_names(c))}"))
+            return
+
+    if ctl.kind != kind then
+        r.add(error(span, s"`$who` takes ${bus_kind(kind)} bus, and `$name` is ${bus_kind(ctl.kind)} bus"))
+        return
+    end if
+
+    for bus in b.buses
+        if bus.name == name then return
+
+    r.add(error(span, s"`$who` uses `$name`, which `buses` does not wire")
+        .with_note(s"say which pins it is on, as `buses { $name { ${signal_names(ctl).at(0)} = GP... } }`"))
+end check_bus_wire
+
+// Whether `other.its` is a port another part offers, saying why where it is not.
+private offered_port(b: *Board, reg: Registry, r: *Report, other: string, its: string, span: Span) -> bool
+    val p = part_named(*b, other) match
+        Some(x) -> x
+        None ->
+            r.add(error(span, s"`$other` is not a part"))
+            return false
+
+    val spec = reg.part(p.kind) match
+        Some(s) -> s
+        None -> return false
+
+    spec.port(its) match
+        None ->
+            r.add(error(span, s"`$other` (${spec.name}) has no port `$its`")
+                .with_note(s"its ports are ${listing(port_names(spec))}"))
+            false
+        Some(port) ->
+            port.kind match
+                Offer -> true
+                _ ->
+                    r.add(error(span, s"`$other.$its` is not a pin another part can be wired to"))
+                    false
+end offered_port
+
+private check_params(p: Part, spec: PartSpec, r: *Report)
+    for prm in p.params
+        val ps = spec.param(prm.name) match
+            Some(x) -> x
+            None ->
+                val known = param_names(spec)
+                val also = if known.is_empty() then "it has no parameters" else s"its parameters are ${listing(known)}"
+
+                r.add(guessed(error(prm.name_span, s"`${p.name}` (${spec.name}) has no parameter `${prm.name}`"), prm.name, known)
+                    .with_note(also))
+                continue
+
+        val what = s"`${p.name}.${prm.name}`"
+
+        ps.kind match
+            PWhole(lo, hi) ->
+                prm.value match
+                    Whole(n) ->
+                        if n < lo || n > hi then r.add(error(prm.span, s"$what must be from $lo to $hi, not $n"))
+                    _ -> r.add(error(prm.span, s"$what must be a whole number, not `${setting_text(prm.value)}`"))
+            PNumber ->
+                prm.value match
+                    Whole(_) -> ()
+                    Number(_) -> ()
+                    _ -> r.add(error(prm.span, s"$what must be a number, not `${setting_text(prm.value)}`"))
+            PText ->
+                prm.value match
+                    Text(_) -> ()
+                    _ -> r.add(error(prm.span, s"$what must be text, not `${setting_text(prm.value)}`"))
+            PFlag ->
+                prm.value match
+                    Flag(_) -> ()
+                    _ -> r.add(error(prm.span, s"$what must be `true` or `false`, not `${setting_text(prm.value)}`"))
+            PChoice(options) ->
+                val ok = prm.value match
+                    Text(t) -> contains_name(options, t)
+                    _ -> false
+
+                if !ok then
+                    r.add(guessed(error(prm.span, s"$what must be one of ${listing(options)}, not `${setting_text(prm.value)}`"),
+                        setting_text(prm.value), options))
+    end for
+
+    for ps in spec.params
+        if ps.required && param_named(p.params, ps.name).is_none() then
+            r.add(error(p.name_span, s"`${p.name}` (${spec.name}) needs `${ps.name}`")
+                .with_note(s"add it, as `${ps.name} = ${example(ps.kind)}`"))
+end check_params
+
+// -- the panel -------------------------------------------------------------------------------------
+
+private check_panel(b: *Board, reg: Registry, r: *Report)
+    val panel = b.panel
+
+    if panel.width <= 0 || panel.height <= 0 then
+        if panel.width != 0 || panel.height != 0 then
+            r.add(error(panel.span, s"the panel's size must be positive, not ${panel.width} × ${panel.height}"))
+
+    for i in 0..<panel.elements.len()
+        var e = panel.elements.at(i)
+
+        check_look(e, r)
+
+        e.shows match
+            ShowPart(name) ->
+                part_named(*b, name) match
+                    None ->
+                        r.add(guessed(error(e.shows_span, s"the element `${e.name}` shows `$name`, which is not a part"), name, part_list(b))
+                            .with_note(s"`show` names a part from `parts`"))
+                    Some(p) ->
+                        if !e.has_size then
+                            reg.part(p.kind) match
+                                Some(spec) ->
+                                    if spec.display then
+                                        val w = whole_param(p, "width")
+                                        val h = whole_param(p, "height")
+                                        val turned = rotation(e) == 90 || rotation(e) == 270
+
+                                        e.w = if turned then h else w
+                                        e.h = if turned then w else h
+                                        e.has_size = w > 0 && h > 0
+                                        e.natural = e.has_size
+                                None -> e.has_size = true
+            _ -> ()
+
+        if !e.has_size then
+            r.add(error(e.name_span, s"the element `${e.name}` has no size")
+                .with_note("give it one, as `size = [40, 40]`; only a screen takes its size from its part"))
+        elif e.w <= 0 || e.h <= 0 then
+            r.add(error(e.name_span, s"the element `${e.name}` must have a positive size, not ${e.w} × ${e.h}"))
+        elif panel.width > 0 && panel.height > 0 &&
+             (e.x < 0 || e.y < 0 || e.x + e.w > panel.width || e.y + e.h > panel.height) then
+            r.add(error(e.name_span, s"the element `${e.name}` lies outside the panel")
+                .with_note(s"it covers x ${e.x} to ${e.x + e.w} and y ${e.y} to ${e.y + e.h}, and the panel is ${panel.width} × ${panel.height}"))
+
+        b.panel.elements.set(i, e)
+    end for
+end check_panel
+
+private check_look(e: Element, r: *Report)
+    for l in e.look
+        val what = s"`${e.name}.look.${l.name}`"
+
+        if l.name == "color" || l.name == "border" then
+            l.value match
+                Text(_) -> ()
+                _ -> r.add(error(l.span, s"$what must be a colour, as \"#20c040\" or `green`"))
+        elif l.name == "shape" then
+            val ok = l.value match
+                Text(t) -> t == "round" || t == "square"
+                _ -> false
+
+            if !ok then r.add(error(l.span, s"$what must be `round` or `square`, not `${setting_text(l.value)}`"))
+        elif l.name == "rotate" then
+            val ok = l.value match
+                Whole(n) -> n == 0 || n == 90 || n == 180 || n == 270
+                _ -> false
+
+            if !ok then r.add(error(l.span, s"$what must be 0, 90, 180 or 270, not `${setting_text(l.value)}`"))
+        else
+            var known: Buf[string] = buf()
+
+            known.extend(["color", "border", "shape", "rotate"])
+            r.add(guessed(error(l.name_span, s"unknown look `${l.name}` in the element `${e.name}`"), l.name, known)
+                .with_note(s"the looks are ${listing(known)}"))
+    end for
+end check_look
+
+/** An element's rotation in degrees, from its look; 0 where it gives none. */
+rotation(e: Element) -> int
+    param_named(e.look, "rotate") match
+        Some(p) -> p.value match
+            Whole(n) -> int(n)
+            _ -> 0
+        None -> 0
+end rotation
+
+// -- input -----------------------------------------------------------------------------------------
+
+private check_input(b: *Board, reg: Registry, r: *Report)
+    for i in 0..<b.keys.len()
+        var k = b.keys.at(i)
+
+        if !contains_name(key_names(), k.key) then
+            r.add(guessed(error(k.key_span, s"unknown key `${k.key}`"), k.key, key_names())
+                .with_note("a key is a letter, a digit, `up`, `down`, `left`, `right`, `space`, `return`, `escape`, `tab`, `backspace` or `f1` to `f12`"))
+
+        val spec = part_spec(b, reg, k.part) match
+            Some(s) -> s
+            None ->
+                r.add(error(k.span, s"`${k.part}` is not a part"))
+                continue
+
+        if k.control.is_empty() then
+            if spec.controls.len() == 1 then
+                k.control = spec.controls.at(0)
+            elif spec.controls.is_empty() then
+                r.add(error(k.span, s"`${k.part}` (${spec.name}) has no control a key can drive"))
+            else
+                r.add(error(k.span, s"`${k.part}` has several controls: name one, as `${k.part}.${spec.controls.at(0)}`")
+                    .with_note(s"its controls are ${listing(spec.controls)}"))
+        elif !contains_name(spec.controls, k.control) then
+            val its = if spec.controls.is_empty() then "it has none" else s"its controls are ${listing(spec.controls)}"
+
+            r.add(guessed(error(k.span, s"`${k.part}` (${spec.name}) has no control `${k.control}`"), k.control, spec.controls)
+                .with_note(its))
+        end if
+
+        b.keys.set(i, k)
+    end for
+
+    for pb in b.pointers
+        var found = false
+
+        for e in b.panel.elements
+            if e.name == pb.element then found = true
+
+        if !found then
+            r.add(error(pb.element_span, s"`${pb.element}` is not an element of the panel"))
+
+        part_spec(b, reg, pb.part) match
+            None -> r.add(error(pb.span, s"`${pb.part}` is not a part"))
+            Some(spec) ->
+                if !contains_name(spec.controls, "point") then
+                    r.add(error(pb.span, s"`${pb.part}` (${spec.name}) cannot be driven by the pointer: it takes no `point`"))
+    end for
+end check_input
+
+/** The names a key binding may use. */
+key_names() -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for c in u8('a')..u8('z')
+        out.push(s"${char(c)}")
+
+    for c in u8('0')..u8('9')
+        out.push(s"${char(c)}")
+
+    out.extend(["up", "down", "left", "right", "space", "return", "escape", "tab", "backspace"])
+
+    for i in 1..12
+        out.push(s"f$i")
+
+    out
+end key_names
+
+// -- small things ----------------------------------------------------------------------------------
+
+private part_spec(b: *Board, reg: Registry, name: string) -> Option[PartSpec]
+    part_named(*b, name) match
+        Some(p) -> reg.part(p.kind)
+        None -> None
+
+private guessed(d: sh.sysl.parsing.Diagnostic, name: string, among: Buf[string]) -> sh.sysl.parsing.Diagnostic
+    nearest_name(name, among) match
+        Some(n) -> d.with_label(s"did you mean `$n`?")
+        None -> d
+
+private wired(p: Part, port: string) -> bool
+    for w in p.wires
+        if w.port == port then return true
+
+    false
+end wired
+
+private whole_param(p: Part, name: string) -> int
+    param_named(p.params, name) match
+        Some(x) -> x.value match
+            Whole(n) -> int(n)
+            _ -> 0
+        None -> 0
+end whole_param
+
+private adc_pin(chip: Option[ChipSpec], n: int) -> bool
+    chip match
+        Some(c) -> contains(c.adc_pins, n)
+        None -> true
+
+private adc_pins(chip: Option[ChipSpec]) -> Buf[int]
+    chip match
+        Some(c) -> c.adc_pins
+        None -> buf()
+
+private contains(xs: Buf[int], n: int) -> bool
+    for x in xs
+        if x == n then return true
+
+    false
+end contains
+
+private contains_name(xs: Buf[string], n: string) -> bool
+    for x in xs
+        if x == n then return true
+
+    false
+end contains_name
+
+private pin_list(xs: Buf[int]) -> string
+    var names: Buf[string] = buf()
+
+    for x in xs
+        names.push(pin_name(x))
+
+    plain_listing(names, "or")
+end pin_list
+
+// Names joined with commas and a last word, without backticks: `GP2, GP6, GP18 or GP22`.
+private plain_listing(names: Buf[string], last: string) -> string
+    var out = ""
+
+    for i in 0..<names.len()
+        if i > 0 then out = out + (if i + 1 == names.len() then s" $last " else ", ")
+
+        out = out + names.at(i)
+
+    out
+end plain_listing
+
+private bus_names(c: ChipSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in c.controllers
+        out.push(x.name)
+
+    out
+end bus_names
+
+private signal_names(c: ControllerSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in c.signals
+        out.push(x.name)
+
+    out
+end signal_names
+
+private port_names(s: PartSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in s.ports
+        out.push(x.name)
+
+    out
+end port_names
+
+private param_names(s: PartSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for x in s.params
+        out.push(x.name)
+
+    out
+end param_names
+
+private part_list(b: *Board) -> Buf[string]
+    var out: Buf[string] = buf()
+
+    for p in b.parts
+        out.push(p.name)
+
+    out
+end part_list
+
+// A bus kind with its article, as a message says it: `an SPI`, `an I2C`, `a UART`.
+private bus_kind(kind: string) -> string =
+    if kind == "spi" then "an SPI" elif kind == "i2c" then "an I2C" elif kind == "uart" then "a UART" else s"a $kind"
+
+private article_of(word: string) -> string =
+    if !word.is_empty() && (word.bytes[0] == u8('a') || word.bytes[0] == u8('e') || word.bytes[0] == u8('i') ||
+                            word.bytes[0] == u8('o') || word.bytes[0] == u8('u')) then "an" else "a"
+
+// A value a parameter of a kind could take, for a note saying how to add one.
+private example(k: ParamKind) -> string
+    k match
+        PWhole(lo, _) -> str(lo)
+        PNumber -> "1.0"
+        PText -> "\"...\""
+        PFlag -> "true"
+        PChoice(options) -> options.at(0)
+end example

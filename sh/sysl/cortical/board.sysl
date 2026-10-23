@@ -1,0 +1,439 @@
+module sh.sysl.cortical
+
+import sh.sysl.hocon.*
+import sh.sysl.parsing.{Diagnostic, Report, Source, Span, error, full_report, nearest_name}
+import sysl.buf.{Buf, buf}
+import sysl.text.{parse_long_base, str_builder}
+
+// A board file read into the model: the HOCON tree, held to the board format's shape.
+//
+// **This half knows the format and nothing about the library.** It says a section is unknown, a size
+// is not two numbers, an element says both what part it shows and what text it is; whether `st7796`
+// is a part, or GP30 a pin, is `check.sysl`'s question, asked of the registry. Every mistake is
+// recorded and reading goes on, so a person editing a file sees all of its mistakes at once rather
+// than one per save.
+
+/** A board file read: the model as far as it could be built, and everything wrong with it. */
+struct Loaded
+    board: Board
+    report: Report
+
+/** Read, build and check a board description. */
+load(src: Source, reg: Registry) -> Loaded
+    var r = full_report()
+
+    val doc = parse(src) match
+        Ok(d) -> d
+        Err(d) ->
+            r.add(d)
+            return Loaded(empty_board(), r)
+
+    var b = build(src, doc, &r)
+
+    check(&b, reg, src, &r)
+    Loaded(b, r)
+end load
+
+/** The model a document describes, with every shape mistake added to `r`. */
+build(src: Source, doc: Document, r: *Report) -> Board
+    var b = empty_board()
+    val root = doc.root
+
+    if !root.is_obj() then
+        r.add(error(root.span, s"a board description is a block of sections, not ${root.kind_name()}"))
+        return b
+
+    for f in root.fields()
+        if f.key == "board" then
+            read_board_block(&b, f, r)
+        elif f.key == "parts" then
+            read_parts(&b, f, r)
+        elif f.key == "buses" then
+            read_buses(&b, f, r)
+        elif f.key == "panel" then
+            read_panel(&b, f, r)
+        elif f.key == "input" then
+            read_input(&b, f, r)
+        else
+            unknown(r, f, "section", "", ["board", "parts", "buses", "panel", "input"])
+    end for
+
+    if b.chip.is_empty() then
+        val at = root.field("board") match
+            Some(f) -> f.key_span
+            None -> Span(0, 0)
+
+        r.add(error(at, "the board names no chip")
+            .with_note("say which chip the parts are wired to, as `board { chip = rp2040 }`"))
+    end if
+
+    repeats(src, doc, r)
+    b
+end build
+
+// -- board -----------------------------------------------------------------------------------------
+
+private read_board_block(b: *Board, f: Field, r: *Report)
+    if !is_block(f, "the `board` section", r) then return
+
+    for g in f.value.fields()
+        if g.key == "name" then
+            b.name = text(g, "`board.name`", r)
+        elif g.key == "chip" then
+            b.chip = text(g, "`board.chip`", r)
+            b.chip_span = g.value.span
+        else
+            unknown(r, g, "setting", " in `board`", ["name", "chip"])
+end read_board_block
+
+// -- parts -----------------------------------------------------------------------------------------
+
+private read_parts(b: *Board, f: Field, r: *Report)
+    if !is_block(f, "`parts`", r) then return
+
+    for g in f.value.fields()
+        if !is_block(g, s"the part `${g.key}`", r) then continue
+
+        var p = Part(g.key, g.key_span, "", g.key_span, buf(), buf())
+
+        for h in g.value.fields()
+            if h.key == "part" then
+                p.kind = text(h, s"`${g.key}.part`", r)
+                p.kind_span = h.value.span
+            elif h.key == "wire" then
+                read_wires(&p, h, r)
+            else
+                setting(h, s"`${g.key}.${h.key}`", r) match
+                    Some(s) -> p.params.push(Param(h.key, h.key_span, s, h.value.span))
+                    None -> ()
+        end for
+
+        if p.kind.is_empty() && !has_field(g.value, "part") then
+            r.add(error(g.key_span, s"`${g.key}` names no part")
+                .with_note("every part says which library part it is, as `part = led`"))
+
+        b.parts.push(p)
+    end for
+end read_parts
+
+private read_wires(p: *Part, f: Field, r: *Report)
+    if !is_block(f, s"`${p.name}.wire`", r) then return
+
+    for g in f.value.fields()
+        val what = s"`${p.name}.wire.${g.key}`"
+
+        g.value.as_text() match
+            Some(t) -> p.wires.push(Wire(g.key, g.key_span, target_of(t), g.value.span))
+            None -> r.add(error(g.value.span, s"$what must be a pin, a bus or a part's port, not ${g.value.kind_name()}")
+                .with_note("a wire names a pin as `GP16`, a bus as `spi0`, or another part's port as `wifi.gpio0`"))
+end read_wires
+
+/** What a wire's text names. `GP` and digits is a pin; a dotted name is a part's port; anything else
+ * is a bus, which the checker looks for among the chip's.
+ */
+target_of(t: string) -> Target
+    pin_number(t) match
+        Some(n) -> return Pin(n)
+        None -> ()
+
+    t.index_of(".") match
+        Some(dot) -> Port(t[0..<dot], t[(dot + 1)..])
+        None -> Bus(t)
+end target_of
+
+/** The number in `GP16`, or `None` for text that is not a pin's name. */
+pin_number(t: string) -> Option[int]
+    if t.bytes.len < 3 || !t.starts_with("GP") then return None
+
+    var n = 0
+
+    for i in 2..<t.bytes.len
+        val c = t.bytes[i]
+
+        if !c.is_digit() || n > 100000 then return None
+
+        n = n * 10 + int(c - u8('0'))
+    end for
+
+    Some(n)
+end pin_number
+
+// -- buses -----------------------------------------------------------------------------------------
+
+private read_buses(b: *Board, f: Field, r: *Report)
+    if !is_block(f, "`buses`", r) then return
+
+    for g in f.value.fields()
+        if !is_block(g, s"the bus `${g.key}`", r) then continue
+
+        var bus = Bus(g.key, g.key_span, buf())
+
+        for h in g.value.fields()
+            val pin = h.value.as_text() match
+                Some(t) -> pin_number(t)
+                None -> None
+
+            pin match
+                Some(n) -> bus.signals.push(Signal(h.key, h.key_span, n, h.value.span))
+                None -> r.add(error(h.value.span, s"`${g.key}.${h.key}` must be a pin such as `GP2`"))
+        end for
+
+        b.buses.push(bus)
+    end for
+end read_buses
+
+// -- the panel -------------------------------------------------------------------------------------
+
+private read_panel(b: *Board, f: Field, r: *Report)
+    if !is_block(f, "`panel`", r) then return
+
+    b.panel.span = f.key_span
+
+    var sized = false
+
+    for g in f.value.fields()
+        if g.key == "size" then
+            pair(g.value, "`panel.size`", "[width, height]", r) match
+                Some((w, h)) ->
+                    b.panel.width = w
+                    b.panel.height = h
+                    sized = true
+                None -> ()
+        elif g.key == "background" then
+            b.panel.background = text(g, "`panel.background`", r)
+        elif g.key == "elements" then
+            read_elements(b, g, r)
+        else
+            unknown(r, g, "setting", " in `panel`", ["size", "background", "elements"])
+    end for
+
+    if !sized && !has_field(f.value, "size") then
+        r.add(error(f.key_span, "the panel has no size").with_note("give it one, as `size = [922, 499]`"))
+end read_panel
+
+private read_elements(b: *Board, f: Field, r: *Report)
+    if !is_block(f, "`panel.elements`", r) then return
+
+    for g in f.value.fields()
+        if !is_block(g, s"the element `${g.key}`", r) then continue
+
+        var e = Element(g.key, g.key_span, Caption(""), g.key_span, 0, 0, 0, 0, false, false, "", buf(), g.key_span)
+        var says: Buf[string] = buf()
+        var placed = false
+
+        for h in g.value.fields()
+            val what = s"`${g.key}.${h.key}`"
+
+            if h.key == "show" || h.key == "text" || h.key == "box" then
+                val t = text(h, what, r)
+
+                says.push(h.key)
+                e.shows_span = h.key_span
+                e.shows = if h.key == "show" then ShowPart(t) elif h.key == "text" then Caption(t) else Fill(t)
+            elif h.key == "at" then
+                pair(h.value, what, "[x, y]", r) match
+                    Some((x, y)) ->
+                        e.x = x
+                        e.y = y
+                        placed = true
+                    None -> placed = true
+            elif h.key == "size" then
+                pair(h.value, what, "[width, height]", r) match
+                    Some((w, hh)) ->
+                        e.w = w
+                        e.h = hh
+                        e.has_size = true
+                    None -> ()
+            elif h.key == "label" then
+                e.label = text(h, what, r)
+            elif h.key == "look" then
+                if is_block(h, what, r) then
+                    for k in h.value.fields()
+                        setting(k, s"`${g.key}.look.${k.key}`", r) match
+                            Some(s) -> e.look.push(Param(k.key, k.key_span, s, k.value.span))
+                            None -> ()
+            else
+                unknown(r, h, "setting", s" in the element `${g.key}`", ["show", "text", "box", "at", "size", "label", "look"])
+        end for
+
+        if says.is_empty() then
+            r.add(error(g.key_span, s"the element `${g.key}` does not say what it draws")
+                .with_note("an element is a part (`show = d1`), a caption (`text = \"BTN1\"`) or a filled box (`box = \"#202020\"`)"))
+        elif says.len() > 1 then
+            r.add(error(g.key_span, s"the element `${g.key}` says both `${says.at(0)}` and `${says.at(1)}`")
+                .with_note("an element draws one thing: a part, a caption or a box"))
+
+        if !placed then
+            r.add(error(g.key_span, s"the element `${g.key}` has no place on the panel")
+                .with_note("give it one, as `at = [20, 40]`: its top-left corner, in pixels"))
+
+        b.panel.elements.push(e)
+    end for
+end read_elements
+
+// -- input -----------------------------------------------------------------------------------------
+
+private read_input(b: *Board, f: Field, r: *Report)
+    if !is_block(f, "`input`", r) then return
+
+    for g in f.value.fields()
+        if g.key == "keys" then
+            if !is_block(g, "`input.keys`", r) then continue
+
+            for h in g.value.fields()
+                val t = text(h, s"`input.keys.${h.key}`", r)
+                val (part, control) = t.index_of(".") match
+                    Some(dot) -> (t[0..<dot], t[(dot + 1)..])
+                    None -> (t, "")
+
+                b.keys.push(KeyBinding(h.key, h.key_span, part, control, h.value.span))
+            end for
+        elif g.key == "pointer" then
+            if !is_block(g, "`input.pointer`", r) then continue
+
+            for h in g.value.fields()
+                b.pointers.push(PointerBinding(h.key, h.key_span, text(h, s"`input.pointer.${h.key}`", r), h.value.span))
+        else
+            unknown(r, g, "setting", " in `input`", ["keys", "pointer"])
+    end for
+end read_input
+
+// -- names written twice ---------------------------------------------------------------------------
+
+// HOCON merges a name written twice; on a board it is a mistake, so every repeat the reader recorded
+// at a place where names are identities is reported, pointing at the second and naming the first.
+private repeats(src: Source, doc: Document, r: *Report)
+    for rep in doc.repeats
+        val segs = split_path(rep.path)
+        val first = s"${src.locate(rep.first.start)}"
+        val n = segs.len()
+        val last = segs.at(n - 1)
+
+        val message =
+            if n == 2 && (segs.at(0) == "parts" || segs.at(0) == "buses") then
+                s"duplicate name `$last`"
+            elif n == 3 && segs.at(0) == "panel" && segs.at(1) == "elements" then
+                s"duplicate name `$last`"
+            elif n == 3 && segs.at(0) == "input" && segs.at(1) == "keys" then
+                s"the key `$last` is bound twice"
+            elif n == 3 && segs.at(0) == "input" && segs.at(1) == "pointer" then
+                s"the element `$last` is bound twice"
+            elif n == 3 && segs.at(0) == "parts" then
+                s"`${segs.at(1)}.$last` is set twice"
+            elif n == 4 && segs.at(0) == "parts" && segs.at(2) == "wire" then
+                s"`${segs.at(1)}.$last` is wired twice"
+            elif n == 2 && segs.at(0) == "board" then
+                s"`board.$last` is set twice"
+            else
+                ""
+
+        if !message.is_empty() then
+            r.add(error(rep.again, message).with_note(s"it was first written at $first"))
+    end for
+end repeats
+
+// A repeat's path, `parts.d1` or `parts."a.b"`, split into its names.
+private split_path(p: string) -> Buf[string]
+    var out: Buf[string] = buf()
+    var from: usize = 0
+    var quoted = false
+
+    for i in 0..(p.bytes.len)
+        if i < p.bytes.len && p.bytes[i] == u8('"') then
+            quoted = !quoted
+        elif i == p.bytes.len || (p.bytes[i] == u8('.') && !quoted) then
+            var seg = p[from..<i]
+
+            if seg.bytes.len >= 2 && seg.starts_with("\"") then seg = seg[1..<(seg.bytes.len - 1)]
+
+            out.push(seg)
+            from = i + 1
+        end if
+    end for
+
+    out
+end split_path
+
+// -- the shapes every section shares ---------------------------------------------------------------
+
+private is_block(f: Field, what: string, r: *Report) -> bool
+    if f.value.is_obj() then return true
+
+    r.add(error(f.value.span, s"$what must be a block, not ${f.value.kind_name()}")
+        .with_note(s"write it as `${f.key} { ... }`"))
+    false
+end is_block
+
+private has_field(v: Value, key: string) -> bool = v.field(key).is_some()
+
+// A setting whose value must be text: a word or a quoted string. Anything else is reported and read
+// as empty.
+private text(f: Field, what: string, r: *Report) -> string
+    f.value.as_text() match
+        Some(t) -> t
+        None ->
+            r.add(error(f.value.span, s"$what must be a word or a quoted string, not ${f.value.kind_name()}"))
+            ""
+end text
+
+// A pair of whole numbers, `[x, y]`.
+private pair(v: Value, what: string, shape: string, r: *Report) -> Option[(int, int)]
+    val items = v.items()
+
+    if v.is_arr() && items.len() == 2 then
+        val a = items.at(0).as_long()
+        val b = items.at(1).as_long()
+
+        if a.is_some() && b.is_some() then return Some((int(a.unwrap()), int(b.unwrap())))
+    end if
+
+    r.add(error(v.span, s"$what must be $shape, two whole numbers"))
+    None
+end pair
+
+// A parameter's value as it was written. A word that is a hexadecimal number, `0x5d`, is a whole
+// number, which is how an address is written on a datasheet.
+private setting(f: Field, what: string, r: *Report) -> Option[Setting]
+    f.value.kind match
+        Int(n) -> Some(Whole(n))
+        Real(x) -> Some(Number(x))
+        Bool(on) -> Some(Flag(on))
+        Str(s) -> Some(Text(s))
+        Word(w) ->
+            if w.starts_with("0x") && w.bytes.len > 2 then
+                parse_long_base(w[2..], 16) match
+                    Ok(n) -> return Some(Whole(n))
+                    Err(_) -> ()
+
+            Some(Text(w))
+        _ ->
+            r.add(error(f.value.span, s"$what must be a single value, not ${f.value.kind_name()}"))
+            None
+end setting
+
+// A name that is not one the format knows, with a guess at the one that was meant.
+private unknown(r: *Report, f: Field, what: string, where: string, known: []const string)
+    var names: Buf[string] = buf()
+
+    names.extend(known)
+
+    var d = error(f.key_span, s"unknown $what `${f.key}`$where")
+
+    nearest_name(f.key, names) match
+        Some(n) -> d = d.with_label(s"did you mean `$n`?")
+        None -> ()
+
+    r.add(d.with_note(s"the ${what}s here are ${listing(names)}"))
+end unknown
+
+/** Names as a message lists them: `a`, `b` and `c`. */
+listing(names: Buf[string]) -> string
+    var b = str_builder()
+
+    for i in 0..<names.len()
+        if i > 0 then b.push(if i + 1 == names.len() then " and " else ", ")
+
+        b.push(s"`${names.at(i)}`")
+
+    b.finish()
+end listing
