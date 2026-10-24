@@ -852,6 +852,40 @@ handler per shift kind, and the writeback loads and stores one per transfer.
 
 ---
 
+### 2.10 Cortex-M4: sharing the integer implementation
+
+`Kind.V7em` selects the Cortex-M4 integer subset, on the bundled `virt4` board. It reuses the
+Thumb-2 decoder, cached records, both executors, instruction semantics and exception machinery.
+The M0+ decoder and its executor specialization stay separate. The decoder rejects ARMv8-M
+acquire/release instructions and MSPLIM/PSPLIM accesses for M4; stack limits never apply to it.
+M4 reports CPUID 0x410FC241 (r0p1), resets CCR to 0x200 and permits STKALIGN to be cleared.
+The virtual implementation exposes 32 IRQs and four priority bits. Configurable faults stop
+execution, as on M33. DSP, FP, MPU and bit-band aliases are not implemented. Guests compiled
+for Cortex-M3 with soft float stay in the shared ARMv7-M subset; the example build emits
+`*-m4.elf` using these flags. This does not yet implement a real M4 chip or the full ARMv7E-M ISA.
+
+### 2.11 Cortex-M7: another model of the shared ARMv7-M core
+
+`Kind.V7emM7` selects the M7 integer subset on `virt7`, reusing the M4's decoder gates,
+instruction handlers, both executors and exception machinery. No new instruction semantics are
+introduced. It reports CPUID 0x410FC270 (r0p0). M7's CCR.BP and STKALIGN always read one;
+exception frames are always eight-byte aligned, with xPSR recording a padding word only where
+needed. NONBASETHRDENA is writable, unlike the M33's fixed bit 0. The model has no optional
+caches and CCR.IC/DC read zero. Cache identification/maintenance and TCM control registers,
+DSP, FP and MPU are not implemented. The intended H7's cache and TCM model in §2.1 remains
+future work; this virtual M7 has the same 32 implemented IRQs and four priority bits as M4.
+
+Tests cover every width of ARMv8-M-only ordered access, MSPLIM/PSPLIM, CCR fixed/writable/reserved
+bits, divide boundaries and traps, exception alignment/return, interrupt masks, exclusive-monitor
+clearing, and guests under both scheduling modes. `isa-m7.elf` hashes the same 96 shared integer
+instructions over edge operands and initial flag states as the existing QEMU reference. Its build
+uses the ARMv7-M ISA with M7 tuning, avoiding unimplemented DSP instructions.
+
+Sources: Arm Cortex-M7 Devices Generic User Guide, DUI0646C, CCR and exception entry/return;
+[ST PM0253](https://www.st.com/resource/en/programming_manual/pm0253-stm32f7-series-and-stm32h7-series-cortexm7-processor-programming-manual-stmicroelectronics.pdf),
+CPUID and CCR bit assignments. The fixed BP bit is included in the value the emulator reads even
+though the register-summary table lists CCR's reset value as 0x200.
+
 ## 3. Peripherals: the STM32H747I-DISCO
 
 §3.0 and §3.2 hold for every board. §3.1 is the H7's device list; the Pico 2's is §9 and the

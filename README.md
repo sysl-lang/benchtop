@@ -21,14 +21,14 @@ devices, how fidelity is tested against real boards, and the milestones with the
 sysl build . -o cortical
 ./cortical run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>
 ./cortical check <name | file.hocon>
-./cortical bench [--core <cortex-m0plus | cortex-m33>] <image.bin> [expected r0] [match | threaded]
+./cortical bench [--core <cortex-m0plus | cortex-m4 | cortex-m7 | cortex-m33>] <image.bin> [expected r0] [match | threaded]
 ./cortical bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
 ```
 
 **`run`** boots an image on the board `--board` names — the virtual board, `virt`, where none is
-named — its console on this terminal a keystroke at a time. It runs a board of two Cortex-M0+ cores
-or two Cortex-M33s and the parts cortical emulates on their bus, and refuses any other board with
-the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
+named — its console on this terminal a keystroke at a time. It runs a board of two Cortex-M0+ cores,
+two Cortex-M4s, two Cortex-M7s or two Cortex-M33s and the parts cortical emulates on their bus, and refuses any
+other board with the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
 as raw bytes from address 0. **Ctrl-]** ends cortical whatever the guest is doing, with exit status
 130. Otherwise the exit status is the one the guest wrote to the console's EXIT register; a guest
 that stops on a breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can
@@ -58,7 +58,7 @@ A description is a HOCON file, and the shortest names a board built into cortica
 board = pico2w
 ```
 
-`virt`, `virt33`, `pico`, `pico2w` and `pico-breadboard-kit` are built in ([boards](boards) has their
+`virt`, `virt4`, `virt7`, `virt33`, `pico`, `pico2w` and `pico-breadboard-kit` are built in ([boards](boards) has their
 sources). **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**,
 on the command line and in a file alike, so `--board virt` is the virtual board and `--board
 ./virt` a file. A path in a file is read from that file's directory.
@@ -112,14 +112,47 @@ mistake `check` reports.
 | kind | core | what it runs |
 |---|---|---|
 | ARMv6-M | `cortex-m0plus` | the whole ARMv6-M instruction set, its exceptions, SysTick, the NVIC and SCB |
+| ARMv7E-M (integer subset) | `cortex-m4` | shared ARMv7-M integer Thumb-2, IT blocks, exclusives, divide, BASEPRI, FAULTMASK and PRIGROUP; no DSP, FP or MPU |
+| ARMv7E-M (integer subset) | `cortex-m7` | the same shared integer ISA as M4; M7 CPUID and fixed exception-stack alignment; no DSP, FP, MPU or optional caches |
 | ARMv8-M Mainline | `cortex-m33` | the integer Thumb-2 instruction set: every 16- and 32-bit integer encoding, IT blocks, the exclusives, `LDA`/`STL`, hardware divide; BASEPRI, FAULTMASK, PRIGROUP, the stack limits (MSPLIM, PSPLIM) |
 
-One interpreter serves both, configured by the core's kind when it decodes; the M0+ runs no slower
+One interpreter serves all four, configured by the core's kind when it decodes; the M0+ runs no slower
 for the M33 being there. The M33 has no FP, DSP, Security or MPU extension — their encodings are
 undefined, so a program for it is built `-mcpu=cortex-m33+nodsp -mfloat-abi=soft` — and takes no
 configurable fault: where a UsageFault, BusFault or MemManage would be taken, the core stops and
 cortical says why. Each is checked against the ARMv8-M or ARMv6-M ARM instruction by instruction, and
 the M33 against QEMU's too ([DESIGN.md](DESIGN.md) §2.8–§2.9).
+
+`virt4` runs two Cortex-M4 cores using the same decoder, instruction handlers and exception
+machinery as the M33. ARMv8-M-only acquire/release encodings and stack-limit registers are
+undefined on the M4. Its CPUID and CCR behavior are selected separately. This is an integer
+subset of the M4: DSP, floating point and MPU support are not implemented, and configurable faults
+stop execution as on the M33. The virtual boards currently implement 32 external interrupts,
+with four priority bits on M4 and M33.
+
+Build guests for this subset with `-mcpu=cortex-m3 -mthumb -mfloat-abi=soft` to keep the compiler
+within the shared ARMv7-M instruction set. `examples/virt/build.sh` produces `*-m4.elf` guests:
+
+```
+./cortical run --board virt4 examples/virt/crunch-m4.elf
+./cortical run --board virt4 --threads examples/virt/exclusive-m4.elf
+```
+
+`virt7` runs two Cortex-M7s using that same ARMv7-M instruction implementation, with CPUID
+0x410FC270 (r0p0). Unlike M4, M7 always aligns exception frames to eight bytes: CCR.STKALIGN
+and CCR.BP read as one. The virtual M7 has no optional caches; CCR.IC/DC read as zero. Cache
+identification, cache maintenance and TCM control registers are not implemented. This is the same
+integer subset as M4, with no DSP, FP or MPU, and the same 32 implemented interrupts and four
+priority bits. It is not yet the STM32H7 board model or a cycle-accurate model of the M7 pipeline.
+
+The example build also emits `*-m7.elf`, using `-mcpu=cortex-m3 -mtune=cortex-m7 -mthumb
+-mfloat-abi=soft`: the shared ISA, with M7 instruction scheduling. The M7 instruction-hash guest
+checks 96 instructions over edge operands and flag states against the existing QEMU reference.
+
+```
+./cortical run --board virt7 examples/virt/crunch-m7.elf
+./cortical run --board virt7 --threads examples/virt/exclusive-m7.elf
+```
 
 The bench kernel (`bench/guest/kernel.c`) built for each, on an M5 Pro:
 
@@ -134,8 +167,8 @@ fewer, in half the time ([bench/README.md](bench/README.md)).
 ## The virtual boards
 
 Machines that exist only in cortical, for running a program and talking to it with nothing but the
-core — deliberately not a real chip. `virt` has two Cortex-M0+ cores and `virt33` two Cortex-M33s,
-with the same devices:
+core — deliberately not a real chip. `virt` has two Cortex-M0+ cores, `virt4` two Cortex-M4s,
+`virt7` two Cortex-M7s and `virt33` two Cortex-M33s, with the same devices:
 
 | address | what |
 |---|---|
