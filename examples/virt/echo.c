@@ -2,10 +2,17 @@
 
 #include "virt.h"
 
+// The core it was built for.
+#ifdef __ARM_ARCH_8M_MAIN__
+#define CORE "an M33"
+#else
+#define CORE "an M0+"
+#endif
+
 int main(void) {
     unsigned lines = 0;
 
-    put_string("hello from an M0+ on cortical's virtual board\n");
+    put_string("hello from " CORE " on cortical's virtual board\n");
     put_string("type a line; Ctrl-D ends\n> ");
 
     for (;;) {
