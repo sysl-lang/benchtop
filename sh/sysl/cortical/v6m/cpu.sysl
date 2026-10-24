@@ -1,12 +1,16 @@
-module sh.sysl.dispatch
+module sh.sysl.cortical.v6m
 
-// The machine both executors share: the registers, the flags, guest memory behind a page table, and
-// the decoded-instruction array.
+// The ARMv6-M core (the Cortex-M0 and M0+): the registers, the flags, guest memory behind a page
+// table, and the decoded-instruction array, which every core of a machine shares.
 //
 // **Decoding is one record per halfword of guest address.** The instruction at guest address `a` is
 // decoded into `dec[a >> 1]`, so the next instruction is the next record (or the one after, for a
 // 32-bit encoding) and a branch target is an index, not a lookup. A record starts as "not decoded"
-// and is decoded the first time control reaches it.
+// and is decoded the first time control reaches it. Code runs from RAM, which starts at address 0;
+// one more record past its end stands for everywhere else, and stops the core that reaches it.
+//
+// **An access with no page is the board's.** Devices live at addresses the page table leaves empty,
+// and the core hands such an access to the board through `io_read` and `io_write`.
 //
 // **The flags are kept lazily.** N and Z are both read from `nz`, the last flag-setting result: N is
 // its top bit and Z is whether it is zero. C is 0 or 1. V is kept as the last addition that set it —
@@ -15,7 +19,7 @@ module sh.sysl.dispatch
 // computing bits.
 
 // The guest's RAM, from address 0. Code and data share it, as they do on an M0+ running from SRAM.
-const RAM_BYTES: u32 = 256 * 1024
+const RAM_BYTES: u32 = 1024 * 1024
 
 // One page-table entry per 4 KB page of the 4 GB address space. An entry is the host address of the
 // page's first byte, or 0 for a page with no fast path.
@@ -26,12 +30,20 @@ const PAGES = 1 << 20
 // instructions retired so far, and replaces its own frame with the next handler's.
 type Handler = *extern(*Cpu, *Insn, u64) -> unit
 
+// The board's half of an access with no page: a read answers the value, `width` bytes (1, 2 or 4)
+// zero-extended; a write takes it. Either may stop the core with `halt`.
+type IoRead = *extern(*Cpu, u32, u32) -> u32
+type IoWrite = *extern(*Cpu, u32, u32, u32) -> unit
+
 // Why `run` came back.
 enum Stop
     Budget = 0
     Breakpoint
     Undefined
+    // An access, or a jump, to an address nothing answers; `stop_at` is the address.
     Unmapped
+    // The guest asked to end, with `exit_code`.
+    Exit
 
 // A decoded instruction. `h` is its handler for the threaded executor and `op` its case for the
 // `match` executor; the rest are its operands, extracted once. A register number is a `u4`, so
@@ -59,14 +71,18 @@ struct Cpu
     retired: u64
     stop: Stop
     stop_at: u32
+    exit_code: u32
     pages: *usize
     dec: *Insn
+    io_read: IoRead
+    io_write: IoWrite
 
-var ram: [262144]u8
+var ram: [1048576]u8
 var page_table: [1048576]usize
-var decoded: [131072]Insn
+// One record per halfword of RAM, and the record for everywhere else.
+var decoded: [524289]Insn
 
-// A machine with `image` at address 0, ready to start at `entry`.
+// A machine with `image` at address 0, ready to start at `entry`, and no devices.
 reset(cpu: *Cpu, image: []const u8, entry: u32)
     for i in 0..<ram.len do ram[i] = 0
     for i in 0..<image.len do ram[i] = image[i]
@@ -77,6 +93,12 @@ reset(cpu: *Cpu, image: []const u8, entry: u32)
 
     for i in 0..<decoded.len do decoded[i] = blank
 
+    clear(cpu, entry)
+    cpu.io_read = &no_device_read
+    cpu.io_write = &no_device_write
+
+// The core's own state as a reset leaves it, to start at `entry`. Memory is the machine's, untouched.
+clear(cpu: *Cpu, entry: u32)
     for i in 0..<16 do cpu.r[i] = 0
     cpu.nz = 1
     cpu.c = 0
@@ -88,12 +110,29 @@ reset(cpu: *Cpu, image: []const u8, entry: u32)
     cpu.retired = 0
     cpu.stop = Stop.Budget
     cpu.stop_at = 0
+    cpu.exit_code = 0
     cpu.pages = &page_table[0]
     cpu.dec = &decoded[0]
 
-// The record for guest address `a`.
+// The record for guest address `a`: past the end of RAM, the one record that stands for everywhere
+// else.
 @inline
-insn_at(cpu: *Cpu, a: u32) -> *Insn = &cpu.dec[a >> 1]
+insn_at(cpu: *Cpu, a: u32) -> *Insn = &cpu.dec[(if a < RAM_BYTES then a else RAM_BYTES) >> 1]
+
+// Stop the core for `why` at `at`: it comes back at its next taken branch, since its budget is gone.
+halt(cpu: *Cpu, why: Stop, at: u32)
+    if cpu.stop != Stop.Budget then return
+
+    cpu.stop = why
+    cpu.stop_at = at
+    cpu.limit = 0
+
+// A machine with no devices: every access off the page table stops the core.
+no_device_read(cpu: *Cpu, a: u32, width: u32) -> u32
+    halt(cpu, Stop.Unmapped, a)
+    0
+
+no_device_write(cpu: *Cpu, a: u32, width: u32, x: u32) = halt(cpu, Stop.Unmapped, a)
 
 // The record a direct branch goes to: its `imm` is a signed count of records from its own.
 @inline
@@ -105,7 +144,7 @@ addr_of(cpu: *Cpu, ip: *Insn) -> u32 = u32(ip - cpu.dec) << 1
 
 // ---------------------------------------------------------------------------------------------------
 // Memory. The fast path is one table load, one test and one host access; everything else (a page
-// with no entry: MMIO, unmapped) is the slow path, which this machine answers by stopping.
+// with no entry: a device, or nothing) is the slow path, the board's `io_read` and `io_write`.
 
 // The host address of the first byte of the page holding `a`, or 0 for a page with no fast path. The
 // test is made on this, not on the byte's own address, which nothing stops from being 0.
@@ -116,7 +155,7 @@ page_of(cpu: *Cpu, a: u32) -> usize = cpu.pages[a >> PAGE_SHIFT]
 load32(cpu: *Cpu, a: u32) -> u32
     val page = page_of(cpu, a)
 
-    if page == 0 then return unmapped(cpu, a)
+    if page == 0 then return cpu.io_read(cpu, a, 4)
 
     val p: *u32 = ptr_cast(page + (a & 0xFFF))
 
@@ -126,7 +165,7 @@ load32(cpu: *Cpu, a: u32) -> u32
 load16(cpu: *Cpu, a: u32) -> u32
     val page = page_of(cpu, a)
 
-    if page == 0 then return unmapped(cpu, a)
+    if page == 0 then return cpu.io_read(cpu, a, 2)
 
     val p: *u16 = ptr_cast(page + (a & 0xFFF))
 
@@ -136,7 +175,7 @@ load16(cpu: *Cpu, a: u32) -> u32
 load8(cpu: *Cpu, a: u32) -> u32
     val page = page_of(cpu, a)
 
-    if page == 0 then return unmapped(cpu, a)
+    if page == 0 then return cpu.io_read(cpu, a, 1)
 
     val p: *u8 = ptr_cast(page + (a & 0xFFF))
 
@@ -147,7 +186,7 @@ store32(cpu: *Cpu, a: u32, x: u32)
     val page = page_of(cpu, a)
 
     if page == 0
-        unmapped(cpu, a)
+        cpu.io_write(cpu, a, 4, x)
         return
 
     val p: *u32 = ptr_cast(page + (a & 0xFFF))
@@ -159,7 +198,7 @@ store16(cpu: *Cpu, a: u32, x: u32)
     val page = page_of(cpu, a)
 
     if page == 0
-        unmapped(cpu, a)
+        cpu.io_write(cpu, a, 2, x & 0xFFFF)
         return
 
     val p: *u16 = ptr_cast(page + (a & 0xFFF))
@@ -171,22 +210,12 @@ store8(cpu: *Cpu, a: u32, x: u32)
     val page = page_of(cpu, a)
 
     if page == 0
-        unmapped(cpu, a)
+        cpu.io_write(cpu, a, 1, x & 0xFF)
         return
 
     val p: *u8 = ptr_cast(page + (a & 0xFFF))
 
     p[0] = u8(x)
-
-// An access with no fast path. The benchmark's guest makes none, so this records the first and
-// answers 0; the executors notice `stop` at the next branch.
-unmapped(cpu: *Cpu, a: u32) -> u32
-    if cpu.stop != Stop.Unmapped
-        cpu.stop = Stop.Unmapped
-        cpu.stop_at = a
-        cpu.limit = 0
-
-    0
 
 // ---------------------------------------------------------------------------------------------------
 // Flags.

@@ -1,0 +1,170 @@
+module sh.sysl.cortical.virt
+
+// The virtual board: a machine that exists only in cortical, for running a program and talking to it
+// with nothing between them but the core. Its RAM is the core's, 1 MB from address 0, holding the
+// vector table, the code, the data and the stack. Its one device is the debug console:
+//
+//     0x4000_0000  DATA    write: the low byte goes to the host's standard output.
+//                          read: the next byte typed, or 0xFFFF_FFFF when none is waiting.
+//     0x4000_0004  STATUS  bit 0: a byte is waiting. bit 1: input has ended and nothing is waiting.
+//     0x4000_0008  EXIT    write: cortical ends, with the value as its exit status.
+//
+// Every other address off the RAM stops the core with `Stop.Unmapped`.
+//
+// **The console's input is a channel**, so where it comes from is the caller's: `listen` starts a
+// thread that copies the host's standard input into it a byte at a time, and a test sends its bytes
+// in itself. **Its output is collected**, and goes to the host when a line ends, when the guest looks
+// for input (so a prompt shows before the guest waits), when it exits, and at `flush_console` —
+// unless `capture` asked to keep it, which is what a test reads.
+
+import sh.sysl.cortical.v6m.{Cpu, Stop, RAM_BYTES, halt, load32, reset, run_threaded}
+import sh.sysl.elf as elf
+import sysl.buf.{Buf, buf}
+import sysl.threads.{Channel, channel, spawn}
+import sysl.io.stdin
+
+const CONSOLE: u32 = 0x40000000
+const DATA: u32 = 0x40000000
+const STATUS: u32 = 0x40000004
+const EXIT: u32 = 0x40000008
+
+// STATUS bits.
+const WAITING: u32 = 1
+const ENDED: u32 = 2
+
+var typed_slots: [4096]u8
+var typed = channel(typed_slots[..])
+// A byte taken from the channel to answer STATUS, and not yet read through DATA; -1 for none.
+var held: int = -1
+var out: Buf[u8] = buf()
+var capturing = false
+
+// Ready the console with an empty input, its output going to the host.
+open_console()
+    typed = channel(typed_slots[..])
+    held = -1
+    out = buf()
+    capturing = false
+
+// Keep the guest's output for `output` rather than writing it to the host.
+capture()
+    capturing = true
+
+// Everything the guest has written since `capture`.
+output() -> []const u8 = out.view()
+
+// Give the guest `bytes` to read, and then the end of its input.
+type_in(bytes: []const u8)
+    for b in bytes do typed.send(b)
+    typed.close()
+
+// The byte that ends cortical from the keyboard, whatever the guest is doing: Ctrl-], as telnet's.
+const QUIT: u8 = 0x1D
+
+// Copy the host's standard input to the guest, from a thread of its own, until it ends. Ctrl-] is not
+// passed on: it ends cortical with status 130, as an interrupt would, the terminal put back by the
+// exit hook `sysl.tty.raw` registered.
+listen() -> bool = spawn(&pump, &typed).is_some()
+
+private pump(ch: *Channel[u8])
+    var r = stdin()
+    var one: [1]u8 = [0]
+
+    loop
+        val got = r.read(one[..])
+
+        if got.len == 0 then break
+        if got[0] == QUIT then exit(130)
+        if !ch.send(got[0]) then break
+
+    ch.close()
+
+// Write out what the guest has written, unless it is being captured.
+flush_console()
+    if capturing || out.len() == 0 then return
+
+    putbytes(out.view())
+    flush()
+    out.clear()
+
+// The next byte of input if one is waiting, without taking it.
+private peek() -> int
+    if held < 0
+        typed.try_receive() match
+            Some(b) -> held = int(b)
+            None -> ()
+
+    held
+
+private status() -> u32
+    if peek() >= 0 then return WAITING
+    if typed.is_closed() then return ENDED
+
+    0
+
+// The board's half of an access off the RAM.
+console_read(cpu: *Cpu, a: u32, width: u32) -> u32
+    a match
+        DATA ->
+            flush_console()
+
+            val b = peek()
+
+            held = -1
+            if b < 0 then 0xFFFFFFFF else u32(b)
+        STATUS ->
+            flush_console()
+            status()
+        _ ->
+            halt(cpu, Stop.Unmapped, a)
+            0
+
+console_write(cpu: *Cpu, a: u32, width: u32, x: u32)
+    a match
+        DATA ->
+            out.push(u8(x & 0xFF))
+            if x & 0xFF == 10 || out.len() >= 4096 then flush_console()
+        EXIT ->
+            cpu.exit_code = x
+            halt(cpu, Stop.Exit, a)
+        _ -> halt(cpu, Stop.Unmapped, a)
+
+// The board's RAM as `file` fills it: an ELF file's segments at their load addresses, or, for a file
+// that is not ELF, its bytes from address 0.
+image_of(file: []const u8) -> Result[Buf[u8], string]
+    var image: Buf[u8] = buf()
+
+    for i in 0..<RAM_BYTES do image.push(0)
+
+    elf.read(file) match
+        Ok(e) ->
+            val regions: []elf.Region = [elf.Region(0, image.view())]
+
+            elf.load(e, regions) match
+                Ok(_) -> ()
+                Err(why) -> return Err(s"$why")
+        Err(elf.ElfError.NotElf) ->
+            if file.len > image.len() then return Err("larger than the board's 1 MB of RAM")
+            for i in 0..<file.len do image.set(i, file[i])
+        Err(why) -> return Err(s"$why")
+
+    Ok(image)
+
+// A virtual board with `image` loaded at 0 and its one core reset as an M0+ resets: SP from the
+// vector table's first word, PC from its second.
+boot(cpu: *Cpu, image: []const u8)
+    reset(cpu, image, 0)
+    cpu.io_read = &console_read
+    cpu.io_write = &console_write
+    cpu.r[13] = load32(cpu, 0)
+    cpu.pc = load32(cpu, 4) & ~1
+
+// Run the board until its core stops, a million instructions at a time, writing out the console's
+// output between them.
+run_board(cpu: *Cpu)
+    while cpu.stop == Stop.Budget
+        cpu.limit = cpu.retired + 1000000
+        run_threaded(cpu)
+        flush_console()
+
+    flush_console()
