@@ -15,6 +15,9 @@ for program in echo irq dual count pingpong order crunch; do
     arm-none-eabi-gcc $m33 $flags start.c $program.c -lgcc -o $program-m33.elf
 done
 
+# isa.c is for the M33 alone; examples/qemu/build.sh runs it on QEMU for isa.qemu.
+arm-none-eabi-gcc $m33 $flags start.c isa.c -lgcc -o isa-m33.elf
+
 # exclusive.c is for the M33 alone: an M0+ has no exclusives.
 arm-none-eabi-gcc $m33 $flags start.c exclusive.c -lgcc -o exclusive-m33.elf
 
