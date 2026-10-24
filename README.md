@@ -2,8 +2,8 @@
 
 A Cortex-M board emulator written in sysl. It runs the firmware a developer would flash onto a board,
 unmodified: each core on its own host thread, the board's display and controls in a Mac window, its
-UART on a terminal. A board is a description (cores, memory, devices, wiring, panel), not a new
-emulator, and the cores are one interpreter configured per architecture (ARMv6-M, ARMv7E-M,
+UART on a terminal. A board is a description (its chip, parts, wiring, what it exposes and its view),
+not a new emulator, and the cores are one interpreter configured per architecture (ARMv6-M, ARMv7E-M,
 ARMv8-M Mainline). It is an interpreter; a JIT is not planned.
 
 *An independent sysl project. It is not affiliated with or endorsed by Arm, Raspberry Pi or STMicroelectronics, or their trademark holders; Cortex is a trademark of Arm Limited.*
@@ -18,11 +18,14 @@ devices, how fidelity is tested against real boards, and the milestones with the
 
 ```
 sysl build . -o cortical
-./cortical run <image.elf | image.bin>
+./cortical run [--board <name | file.hocon>] <image.elf | image.bin>
+./cortical check <name | file.hocon>
 ./cortical bench <image.bin> [expected r0] [match | threaded]
 ```
 
-**`run`** boots an image on the virtual board, its console on this terminal a keystroke at a time.
+**`run`** boots an image on the board `--board` names — the virtual board, `virt`, where none is
+named — its console on this terminal a keystroke at a time. It runs a board of two Cortex-M0+ cores
+and the parts cortical emulates on their bus, and refuses any other board with the reason.
 An ELF file's segments are placed at their physical addresses; any other file is loaded as raw bytes
 from address 0. **Ctrl-]** ends cortical whatever the guest is doing, with exit status 130. Otherwise
 the exit status is the one the guest wrote to the console's EXIT register; a guest that stops on a
@@ -30,10 +33,70 @@ breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothin
 fault the core cannot take gets a message saying where, and status 3 for all but the breakpoint. A
 system reset request (AIRCR) ends it with status 0.
 
+**`check`** reads a board or product description and holds it to cortical's part library: it
+prints every mistake with its line and column and exits 1, or prints what the description is.
+
 **`bench`** runs a raw image from address 0 to its breakpoint under both executors, three rounds
 each, and reports each one's speed; [bench/README.md](bench/README.md) has the numbers.
 
 `sysl test .` runs every test.
+
+## Describing a board
+
+A description is a HOCON file, and the shortest names a board built into cortical:
+
+```hocon
+board = pico2w
+```
+
+`virt`, `pico`, `pico2w` and `pico-breadboard-kit` are built in ([boards](boards) has their
+sources). **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**,
+on the command line and in a file alike, so `--board virt` is the virtual board and `--board
+./virt` a file. A path in a file is read from that file's directory.
+
+There are three levels. A **chip** (`rp2040`, `rp2350`) is built into cortical. A **board** names
+a chip, or for a board with no real chip its `cores`, and holds its parts, the pins and buses it
+exposes, and its view:
+
+```hocon
+board {
+  name = "Raspberry Pi Pico"
+  chip = rp2040
+  parts {
+    led { part = led, color = green, wire { anode = GP25 } }
+  }
+  exposes {
+    pins  = [GP0, GP1, GP2, GP3, GP4, GP5, GP6, GP7, GP8, GP9, GP10, GP11, GP12, GP13, GP14, GP15,
+             GP16, GP17, GP18, GP19, GP20, GP21, GP22, GP26, GP27, GP28]
+    buses = [spi0, spi1, i2c0, i2c1, uart0, uart1]
+  }
+  view {
+    size = [168, 408]
+    elements { led { show = led, at = [28, 16], size = [16, 10] } }
+  }
+}
+```
+
+A **product** is one or more boards, each under a name of its own, and the parts outside them, wired
+only to pins and buses the boards expose, by qualified name. The breadboard kit is a product around a
+`pico`:
+
+```hocon
+product {
+  name = "Pico Breadboard Kit"
+  boards { pico { board = pico } }
+  parts {
+    d1      { part = led, color = red, wire { anode = pico.GP16 } }
+    console { part = terminal, wire { uart = pico.uart0 } }
+  }
+  buses { pico.uart0 { tx = GP0, rx = GP1 } }
+}
+```
+
+A product tweaks a board by its parts' parameters (`boards { pico { board = pico, parts.led.color =
+red } }`) and never otherwise. Each exposed pin is wired once across the product; a part on the
+cores' bus has `at`, `size` and `irq`. [DESIGN.md](DESIGN.md) §12 has the whole format and every
+mistake `check` reports.
 
 ## The virtual board
 
@@ -82,7 +145,11 @@ zsh examples/virt/build.sh
 ./cortical run examples/virt/echo.elf
 ./cortical run examples/virt/irq.elf
 ./cortical run examples/virt/dual.elf
+./cortical run --board examples/virt/moved.hocon examples/virt/irq-moved.elf
 ```
+
+The last runs `irq.c` built for a console at `0x5000_0000` on IRQ 7, on a description of the board
+that puts it there: the devices are wherever the description says.
 
 ## Boards, in order
 

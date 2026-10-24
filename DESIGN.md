@@ -6,8 +6,9 @@ board is emulated yet. The rest is design.** The repo is `sysl-lang/cortical`.
 cortical emulates Cortex-M boards well enough to run, unmodified, the firmware a developer would
 flash onto them: each core on a host thread, a board's display in a Mac window, its UART on a
 terminal, and skiff on every core. It is an interpreter. **JIT: not planned.** It is written in sysl, and part of its job is to stress the language. A gap
-found while writing it is reported, not worked around (Rule 9). A board is a **description**: a sysl
-package that names its cores, memory, devices, wiring and panel. Another board is another
+found while writing it is reported, not worked around (Rule 9). A board is a **description**: a HOCON
+file that names its chip or cores, its parts and their wiring, what it exposes, and its view; a
+product is one or more boards and the parts around them (§12). Another board is another
 description, not another emulator.
 
 **The boards, in order** (decided 2026-10-23):
@@ -681,10 +682,12 @@ breadboard kit's §10.
   and keeps its register block as the generated struct. Behaviour is written against named fields:
   `if cr1.ue && cr1.te`. The offset-to-field dispatch is a `match` the generator also writes, unless the
   reflection probe in §8 shows `T::Fields` can derive it.
-- **A board description** is a sysl module that builds a constant `Board`: cores, regions, device
-  instances with base addresses and IRQ numbers per core, wires (a GPIO pin to an LED, a joystick key
-  to a pin, an I2C bus to a chip, the DSI link to a panel), clocks (HSE 25 MHz, LSE 32.768 kHz), option
-  bytes, supply wiring, and the panel layout for the window. A new board is a new module.
+- **A board is a description** in the format of §12: a chip from cortical's registry (or, for a board
+  with no real chip, its cores), its parts with their places on the bus, parameters and wires, the
+  pins and buses it exposes, and its view. A chip's own memory and devices are the registry's, so a
+  board names the chip rather than listing them. What the H7 adds beyond the format as it stands —
+  clocks (HSE 25 MHz, LSE 32.768 kHz), option bytes, supply wiring, the DSI link to a panel — are
+  parameters of its chip and board in this design.
 
 ### 3.1 The devices
 
@@ -733,10 +736,10 @@ in order and 1 otherwise, as skiff's `boot-test.sh` reads QEMU's output today.
 
 ## 4. How it appears on screen
 
-### 4.1 The panel description
+### 4.1 The view
 
-The window is a drawing of the board, generated from the description's layout rather than taken from
-a photograph:
+The window is a drawing of the board, generated from the description's `view` (§12.7) rather than
+taken from a photograph:
 
 - **The display area** shows exactly 800×480 guest pixels (`LCD_DEFAULT_WIDTH/HEIGHT`, landscape), at
   1×, 2× (Retina) or a fitted scale. When the panel is off, in reset, or the backlight pin is low, the
@@ -1204,8 +1207,10 @@ own USB port carries USB stdio, which cortical does not model until the USB item
 
 The user's board is GeeekPi's "Expansion Module 3.5inch" for the Raspberry Pi Pico (Amazon
 B0C98G37PW), the GeeekPi edition of 52Pi's EP-0172, with an original Pico (RP2040, two M0+s) plugged
-in. `sysl-lang/picokit` is the org's program for it. The pin map is from `picokit/README.md:31–37`,
-which agrees with the 52Pi wiki:
+in. `sysl-lang/picokit` is the org's program for it. **The kit is a product around a `pico` board**
+(`boards/pico-breadboard-kit.hocon`, §12.3): the Pico is a board of its own, the kit's parts are
+wired to the header pins it exposes (`pico.GP15`), and the kit's view replaces the Pico's. The pin
+map is from `picokit/README.md:31–37`, which agrees with the 52Pi wiki:
 
 | part | wiring |
 |---|---|
@@ -1362,6 +1367,12 @@ exist, and the smallest machine a test can boot.
   unit because a C program's data follows its code: on the benchmark, whose hot data shares a page
   with its code, the check costs about 3% more host instructions and no measurable cycles, where a
   page-granular one would send every one of those stores down the slow path.
+- **The board is described by `boards/virt.hocon`**, built into cortical as `virt` (§12.5), and
+  `sh.sysl.cortical.virt` builds the machine from it: each device answers at the `at` and raises the
+  `irq` its part gives, so a description that moves the console (`examples/virt/moved.hocon`) moves
+  it for the guest. `cortical run` runs a description of two `cortex-m0plus` cores, a 1 MB `ram` at 0
+  and at most one `debug-console` and one `virt-sio`, or a product of one such board and nothing
+  outside it; anything else is refused with the reason.
 - **The board** is `sh.sysl.cortical.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
   (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
   the input has ended), EXIT (end with this status) and CTRL (bit 0 enables the console's interrupt).
@@ -1422,3 +1433,272 @@ exist, and the smallest machine a test can boot.
   that it has finished through the FIFO before core 0 exits. The board's tests boot the committed
   `echo.elf`, `irq.elf` and `dual.elf` and check each whole conversation byte for byte, and
   `dual.elf` twice for the same counts and `pc` on both cores.
+
+---
+
+## 12. Board description format
+
+A description is a HOCON file, read by `sh.sysl.cortical` (`board.sysl` reads the shape,
+`shelf.sysl` finds the boards it names, `check.sysl` holds it to the registry). Every mistake is
+reported with its line and column, all of them at once, and checking goes on past each one.
+
+### 12.1 Three levels
+
+- **A chip** is built into cortical's registry (`registry.sysl`): `rp2040`, `rp2350`. It holds its
+  cores, its pins `GP0` up to the last, its ADC pins, and its bus controllers with the pins each
+  signal can be routed to. A description names a chip; it never describes one.
+- **A board** is a chip — or, for a board with no real chip, `cores = [...]` — with the parts
+  soldered to it, the pins and buses it **exposes** to whatever it is plugged into, and its `view`.
+- **A product** is one or more boards, each an instance with a name of its own, the parts outside
+  them wired to what they expose, and a `view` of the whole, which replaces the boards' views.
+
+A file's top level is exactly one of `board { ... }`, `board = <name or path>`, or `product { ... }`.
+
+### 12.2 A board
+
+The one-liner names a board built into cortical, and is that board:
+
+```hocon
+board = pico2w
+```
+
+A board written out (`boards/pico.hocon`):
+
+```hocon
+board {
+  name = "Raspberry Pi Pico"
+  chip = rp2040
+
+  parts {
+    led { part = led, color = green, wire { anode = GP25 } }
+  }
+
+  exposes {
+    pins = [GP0, GP1, GP2, GP3, GP4, GP5, GP6, GP7, GP8, GP9, GP10, GP11, GP12, GP13, GP14, GP15,
+            GP16, GP17, GP18, GP19, GP20, GP21, GP22, GP26, GP27, GP28]
+    buses = [spi0, spi1, i2c0, i2c1, uart0, uart1]
+  }
+
+  view {
+    size = [168, 408]
+    background = "#1b5e20"
+
+    elements {
+      usb     { box = "#c0c0c0", at = [52, 0], size = [64, 40] }
+      led     { show = led, at = [28, 16], size = [16, 10] }
+      bootsel { box = "#f0f0f0", at = [32, 88], size = [24, 24], label = "BOOTSEL" }
+      chip    { box = "#202020", at = [56, 168], size = [56, 56], label = "RP2040" }
+    }
+  }
+}
+```
+
+Its settings are `name` (required), exactly one of `chip` and `cores`, and `parts`, `buses`,
+`exposes`, `view` and `input`, each optional. A part is `<name> { part = <library part>, <parameter>
+= <value>, ..., wire { <port> = <target> } }`. A wire's target is a pin of the chip (`GP16`), one of
+its buses (`spi0`), whose signals `buses { spi0 { sck = GP2, tx = GP3 } }` routes to pins, or a pin
+another part offers (`wifi.gpio0`, the CYW43439's GPIO driving the Pico 2 W's LED). A parameter is
+held to its part's type: a whole number in a range, a number, text, `true`/`false`, or one of a list;
+`0x5d` is the whole number 93, as an address is written on a datasheet.
+
+### 12.3 A product
+
+`boards/pico-breadboard-kit.hocon`, the kit of §10:
+
+```hocon
+product {
+  name = "Pico Breadboard Kit"
+
+  boards {
+    pico { board = pico }
+  }
+
+  parts {
+    lcd {
+      part = st7796, width = 320, height = 480, invert = true
+      wire { spi = pico.spi0, cs = pico.GP5, dc = pico.GP6, reset = pico.GP7 }
+    }
+    touch    { part = gt911, address = 0x5d, wire { i2c = pico.i2c0 } }
+    joystick { part = joystick, wire { x = pico.GP26, y = pico.GP27 } }
+    btn1     { part = button, active = low, wire { pin = pico.GP15 } }
+    btn2     { part = button, active = low, wire { pin = pico.GP14 } }
+    d1       { part = led, color = red, wire { anode = pico.GP16 } }
+    d2       { part = led, color = red, wire { anode = pico.GP17 } }
+    rgb      { part = ws2812, wire { din = pico.GP12 } }
+    buzzer   { part = buzzer, kind = active, wire { pin = pico.GP13 } }
+    console  { part = terminal, wire { uart = pico.uart0 } }
+  }
+
+  buses {
+    pico.spi0  { sck = GP2, tx = GP3 }
+    pico.i2c0  { sda = GP8, scl = GP9 }
+    pico.uart0 { tx = GP0, rx = GP1 }
+  }
+
+  view {
+    size = [922, 499]
+    background = black
+
+    elements {
+      title  { text = "Pico Breadboard Kit", at = [58, 6], size = [262, 23] }
+      socket { box = "#1b5e20", at = [124, 54], size = [134, 326], label = "Pico" }
+      led    { show = pico.led, at = [140, 64], size = [16, 10] }
+      bezel  { box = "#202020", at = [364, 44], size = [540, 351] }
+      // The glass is mounted landscape; its size is the part's own.
+      screen { show = lcd, at = [379, 58], look { rotate = 90 } }
+      buzzer { show = buzzer, at = [28, 407], size = [77, 77], label = "Beeper", look { shape = round } }
+      d1     { show = d1, at = [175, 425], size = [16, 10], label = "D1" }
+      d2     { show = d2, at = [175, 445], size = [16, 10], label = "D2" }
+      stick  { show = joystick, at = [259, 387], size = [102, 102] }
+      rgb    { show = rgb, at = [431, 405], size = [32, 32], label = "RGB Led" }
+      btn1   { show = btn1, at = [516, 416], size = [38, 38], label = "BTN1" }
+      btn2   { show = btn2, at = [604, 416], size = [38, 38], label = "BTN2" }
+    }
+  }
+
+  input {
+    keys {
+      up = joystick.up, down = joystick.down, left = joystick.left, right = joystick.right
+      "1" = btn1, "2" = btn2
+    }
+    pointer { screen = touch }
+  }
+}
+```
+
+Its settings are `name` (required), `boards` (required, with at least one), and `parts`, `buses`,
+`view` and `input`. Each board instance is `<instance> { board = <name or path>, parts { ... } }`; the
+instance's name is how the product's wires and view reach the board, and is often the board's own.
+A product may hold two boards of one kind under two names, each wired on its own.
+
+### 12.4 Exposure and qualified wiring
+
+A board says what its header carries: `exposes { pins = [...], buses = [...] }`, by their names on
+the chip. A board with no chip exposes nothing. A product's part reaches a board only through a
+qualified name, `<instance>.<pin or bus>`: `pico.GP15`, `pico.spi0`. A product's `buses` routes an
+exposed bus's signals to exposed pins of the same board (`pico.spi0 { sck = GP2 }`), and a part's bus
+port uses an exposed bus only once `buses` routes it. Each board's pins are its own: `left.GP15`
+and `right.GP15` are two pins. Within one board, a pin is wired once across the whole product — by
+a product's part, by a product's bus, or by the board itself (a pin the board's own parts or buses
+use may still be exposed, as an Arduino's D13 is its LED's, but the product cannot wire it again). A
+dotted name whose first half is one of the product's parts is a pin that part offers, as on a board.
+A product's view shows its own parts by name and a board's as `<instance>.<part>` (`pico.led`).
+
+### 12.5 Bundled boards, and naming one
+
+`virt`, `pico`, `pico2w` and `pico-breadboard-kit` (a product) are embedded in the `cortical`
+binary. **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in.**
+The rule is the same for `board = <name>` at the top of a file, a product's `board = <name>`, and the
+command line, so `--board virt` is always the built-in board even with a file called `virt` in the
+current directory, which is `./virt`. A path is read relative to the directory of the file that
+names it (absolute paths as they stand). A board named this way is read and checked on its own; its
+mistakes are reported as one, at the name, with its own report as the note. A one-liner is written
+back as its name.
+
+### 12.6 Overrides
+
+A product tweaks one of its boards by setting its parts' parameters, never by copying the board:
+
+```hocon
+boards {
+  pico { board = pico, parts.led.color = red }
+}
+```
+
+**Overrides change parameters only.** They cannot add or remove a part, rewire one, or move it on
+the bus: `part`, `wire`, `at`, `size` and `irq` are refused. The part must be one the board has, and
+the parameter one its library part declares (whether or not the board set it); the value is held to
+the parameter's type as on a board. A built-in board is untouched: each instance reads its own copy.
+
+### 12.7 The view and input
+
+`view { size = [w, h], background = <colour>, elements { ... } }`, in host pixels at 1×. An element
+draws one thing — a part (`show = d1`), a caption (`text = "BTN1"`) or a box (`box = "#202020"`) — at
+`at = [x, y]`, with `size = [w, h]`, an optional `label`, and `look { color, border, shape = round |
+square, rotate = 0 | 90 | 180 | 270 }`. A display part's element may leave out its size, which is
+its glass, turned with `rotate`. `input { keys { <key> = <part>[.<control>] }, pointer { <element> =
+<part> } }` binds host keys to a part's controls (a part with one control needs no `.control`) and
+the mouse over an element to a part that takes a point.
+
+### 12.8 Memory-mapped parts
+
+A part the cores reach by address — `ram`, `debug-console`, `virt-sio` — has `at` (decimal or
+`0x…`), `size` (decimal, `0x…`, or `64K`/`1M`; fixed for a part whose window is fixed), and, for a
+part that raises one, `irq`. Its address is aligned as the part needs, its window lies in the 32-bit
+space, meets no other part's and stays off the cores' private peripheral bus (`0xE000_0000` to
+`0xE00F_FFFF`), and no two parts share an IRQ, which is below the core's count (32 for an M0+, 480
+for an M33). A part off the bus has none of the three, and neither has a product's own part.
+
+### 12.9 The diagnostics
+
+Each points at the name or value it is about; `<x>` is the name in the file.
+
+- **The top level.** `the description is neither a board nor a product`; `the description is both
+  a board and a product`; `` `parts` belongs inside `board { ... }` or `product { ... }` `` (for
+  every board or product setting written at the top); `` unknown section `x` ``; `` `board` must be
+  a block, or the name of a board, not a number ``; `` a description is `board { ... }` or `product
+  { ... }`, not an array ``.
+- **Naming a board.** `` unknown board `pico3` `` (with the nearest name); `` cannot read
+  `x.hocon`: <why> ``; `` the board `x` has mistakes ``; `` `pico-breadboard-kit` is a product, and
+  only a board is named here ``; `` `x` is not a board: the boards name each other in a circle ``.
+- **A board.** `the board has no name`; `the board names neither a chip nor its cores`; `the board
+  names both a chip and cores`; `` unknown chip `x` ``; `` unknown core `x` ``; `` `board.cores` must
+  be a list of cores ``, `` names no core ``; `a core is named by a word`.
+- **Exposure.** `GP30 is not a pin of the rp2040`; `GP0 is exposed twice`; `` `spi0` is exposed
+  twice ``; `` the rp2040 has no bus `spi9` ``; `` `exposes.pins` lists pins such as `GP15`, and `X1`
+  is not one ``; `` `exposes.buses` lists buses such as `spi0` ``; `` `exposes.pins` must be a list
+  ``; `a board with no chip has no pins or buses to expose`.
+- **A product.** `the product has no name`; `the product has no boards` (none written, or an empty
+  block); `` `p` names no board ``; `` `pico` does not expose GP25 `` (and `` `spi9` ``); ``
+  `pico.GP15` is wired twice ``; `` `pcio` is neither a board nor a part of the product ``; ``
+  `d1.anode` names `GP15` without its board ``; `` `d1.anode` takes a pin, and `pico.spi0` is not
+  one ``; `` `c.uart` takes a UART bus, and `pico.GP0` is not one ``; `` `c.uart` uses `pico.uart0`,
+  which `buses` does not wire ``; `` `c` is outside the product's boards, so `c.at` means nothing
+  ``; `` duplicate name `pico` `` (a part named as a board).
+- **Overrides.** `` `pico` (pico) has no part `ledd` ``; `` `pico.parts.led` (led) has no parameter
+  `colour` ``; `` `pico.parts.led.color` must be one of ... ``; `` `pico.parts.led.wire` cannot be
+  overridden `` (and `part`, `at`, `size`, `irq`).
+- **Parts and wires.** `` unknown part `lde` ``; `` `d1` names no part ``; `` `d1` (led) has no
+  port `cathode` ``; `` `d1.anode` is not wired ``; `GP16 is wired twice`; `` `d1.anode` takes a pin,
+  and `spi0` is a bus ``; `` `j.x` takes an ADC pin, and GP2 has no ADC channel `` (or `` `w.gpio0`
+  is a part's port ``); `` `w.gpio0` is wired twice ``; `` `x` is not a part ``; `` `w.cs` is not a
+  pin another part can be wired to ``; `` `w.gpio0` is a pin `w` offers to other parts ``; ``
+  `c.uart` takes a UART bus, and `spi0` is an SPI bus `` (or `` `GP0` is not one ``); `` `c.uart`
+  uses `uart0`, which `buses` does not wire ``; `` `d1.wire.anode` must be a pin, a bus or a part's
+  port ``.
+- **Buses.** `` the rp2040 has no bus `spi9` ``; `` `spi0` has no signal `clk` ``; `` GP3 cannot
+  carry `spi0.sck` ``; `` `spi0.sck` must be a pin such as `GP2` ``.
+- **Parameters.** `` `d1` (led) has no parameter `colour` ``; `` `b.tone` must be from 20 to 20000,
+  not 5 ``; `` must be a whole number ``, `` a number ``, `` text ``, `` `true` or `false` ``, `` one
+  of `red`, ... ``; `` `b` (buzzer) needs `kind` ``.
+- **The bus.** `` `c` has no address ``; `` `ram` has no size ``; `` `c.at` is not aligned: a
+  debug-console's base is a multiple of 0x10 ``; `` `c.at` must be a whole number such as `7` or
+  `0x40000000` ``; `` the size of a debug-console is fixed, at 16 bytes (0x10) ``; `` `ram.size`
+  must be more than 0 ``; `` a ram raises no interrupt, so `ram.irq` means nothing ``; `IRQ 32 is
+  beyond the cortex-m0plus's 32 interrupts`; `IRQ 5 is used twice`; `` `c` (...) overlaps `ram`
+  (...) ``; `` overlaps the cores' own private peripheral bus ``; `` `ram` runs past the end of the
+  address space ``; `` a led is not on the cores' bus, so `d1.at` means nothing ``.
+- **The view and input.** `the view has no size`; `the view's size must be positive`; `` `view.size`
+  must be [width, height], two whole numbers ``; `` the element `e` does not say what it draws ``,
+  `` says both `show` and `text` ``, `` has no place in the view ``, `` shows `nope`, which is not a
+  part ``, `` has no size ``, `` must have a positive size ``, `` lies outside the view ``; `` unknown
+  look `colr` ``, and each look's value; `` unknown key `upp` ``; `` `j` has several controls: name
+  one ``; `` `j` (joystick) has no control `upp` ``; `` `d1` (led) has no control a key can drive
+  ``; `` `nope` is not an element of the view ``; `` cannot be driven by the pointer ``.
+- **Names written twice.** `` duplicate name `d1` `` (a part, a bus, an element, a board instance,
+  a product's `pico.uart0`), `` `d1.color` is set twice ``, `` `d1.anode` is wired twice ``, ``
+  `board.name` is set twice ``, `` the key `up` is bound twice ``, `` `p.board` is set twice ``. A
+  whole block written twice is one mistake, however much its two copies hold.
+- **Shapes.** `` <x> must be a block ``, `` must be a word or a quoted string ``, `` must be a
+  single value ``; `` unknown setting `x` in <where> `` (with the nearest name).
+
+### 12.10 The command line
+
+- `cortical check <name | file.hocon>` reads a board or a product, prints every mistake and exits 1,
+  or prints what it is: the board's chip or cores, each part with its place, wires and parameters,
+  what it exposes, and its view; for a product, each board instance and then the same.
+- `cortical run [--board <name | file.hocon>] <image>` runs on `virt` where no board is named. It runs
+  a board of two M0+ cores and the parts cortical emulates on their bus, or a product of one such
+  board and nothing outside it, and refuses anything else with the reason (`cortical does not emulate
+  the rp2040`, `cortical runs one board, and this product has 2`).
+- `cortical render` — drawing a description's view to an image — comes with the window (§4).
