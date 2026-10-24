@@ -2,18 +2,6 @@
 
 #include "virt.h"
 
-static void put_number(unsigned n) {
-    char digits[10];
-    int k = 0;
-
-    do {
-        digits[k++] = (char)('0' + n % 10);
-        n /= 10;
-    } while (n);
-
-    while (k) put_char(digits[--k]);
-}
-
 int main(void) {
     unsigned lines = 0;
 

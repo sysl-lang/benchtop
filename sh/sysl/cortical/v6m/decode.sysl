@@ -1,12 +1,11 @@
 module sh.sysl.cortical.v6m
 
-// The ARMv6-M decoder: every 16-bit encoding, and the 32-bit `BL` and barriers. It reads the
-// halfwords at a guest address and fills a record; every operand extraction, every immediate scaling
-// and every PC-relative address is done here, once, so an executor only reads fields.
+// The ARMv6-M decoder: every 16-bit encoding, and the 32-bit `BL`, `MRS`, `MSR` and barriers. It
+// reads the halfwords at a guest address and fills a record; every operand extraction, every
+// immediate scaling and every PC-relative address is done here, once, so an executor only reads
+// fields.
 //
-// An encoding that writes the PC through a general data-processing form, and the system forms the
-// benchmark has no use for (`MSR`, `MRS`, `SVC`, `CPS`), decode as `Undefined` or `Nop`; the full
-// core models them.
+// An encoding that writes the PC through a general data-processing form decodes as `Undefined`.
 
 enum Op: u8
     Undecoded = 0
@@ -14,8 +13,19 @@ enum Op: u8
     // The record past the end of RAM: control has left it.
     Outside
     Bkpt
+    // `NOP`, `YIELD`, `WFE` and `SEV`: the event register is not modelled, so a `WFE` never waits.
     Nop
-    Nop32
+    // `DSB`, `DMB` and `ISB`: nothing to order on one core, but each is a point where the budget is
+    // checked, so a change to the exception state made just before one is acted on there.
+    Barrier
+    // The system instructions, each also a point where the budget is checked. `SVC`: imm = its
+    // number. `CPS`: imm = 1 for `CPSID i`, 0 for `CPSIE i`. `MRS`: a = rd, imm = SYSm. `MSR`:
+    // b = rn, imm = SYSm.
+    Svc
+    Cps
+    Mrs
+    Msr
+    Wfi
     // Shifts by an immediate: a = rd, b = rm, imm = amount (1..32).
     LslImm
     LsrImm
@@ -335,7 +345,11 @@ private decode16(cpu: *Cpu, pc: u32, hw: u32, into: *Insn) -> Op
     if hw >> 12 == 0b1101
         val cond = bits(hw, 8, 4)
 
-        if cond >= 14 then return Op.Undefined
+        if cond == 15
+            set(into, 0, 0, 0, hw & 0xFF)
+            return Op.Svc
+
+        if cond == 14 then return Op.Undefined
 
         set(into, 0, 0, 0, records_to(pc, pc + 4 + sext((hw & 0xFF) << 1, 9)))
 
@@ -404,8 +418,13 @@ private decode_misc(hw: u32, into: *Insn) -> Op
         set(into, 0, 0, 0, hw & 0xFF)
         return Op.Bkpt
 
-    // Hints, and CPS, which this machine has no interrupts to mask for.
-    if hw >> 8 == 0b10111111 || hw >> 5 == 0b10110110011 then return Op.Nop
+    if hw == 0xBF30 then return Op.Wfi
+
+    if hw >> 8 == 0b10111111 then return Op.Nop
+
+    if hw >> 5 == 0b10110110011
+        set(into, 0, 0, 0, bits(hw, 4, 1))
+        return Op.Cps
 
     Op.Undefined
 
@@ -420,7 +439,29 @@ private decode32(cpu: *Cpu, pc: u32, hw1: u32, hw2: u32, into: *Insn) -> Op
         set(into, 0, 0, 0, records_to(pc, pc + 4 + sext(off, 25)))
         return Op.Bl
 
-    // DSB, DMB, ISB: nothing to order on one core.
-    if hw1 == 0xF3BF && hw2 >> 8 == 0x8F then return Op.Nop32
+    if hw1 == 0xF3BF && hw2 >> 8 == 0x8F then return Op.Barrier
+
+    // MRS and MSR name a special register by SYSm; one this core lacks, or SP or PC as the general
+    // register, is UNPREDICTABLE, and refused.
+    val sysm = hw2 & 0xFF
+
+    if hw1 == 0xF3EF && hw2 >> 12 == 0b1000 && special(sysm)
+        val rd = bits(hw2, 8, 4)
+
+        if rd >= 13 then return Op.Undefined
+
+        set(into, rd, 0, 0, sysm)
+        return Op.Mrs
+
+    if hw1 >> 4 == 0xF38 && hw2 >> 8 == 0x88 && special(sysm)
+        val rn = hw1 & 0xF
+
+        if rn >= 13 then return Op.Undefined
+
+        set(into, 0, rn, 0, sysm)
+        return Op.Msr
 
     Op.Undefined
+
+// The special registers ARMv6-M has: the PSR views (0–3, 5–7), MSP, PSP, PRIMASK and CONTROL.
+private special(sysm: u32) -> bool = sysm <= 3 || (sysm >= 5 && sysm <= 9) || sysm == 16 || sysm == 20

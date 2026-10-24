@@ -8,8 +8,16 @@ module sh.sysl.cortical.virt
 //                          read: the next byte typed, or 0xFFFF_FFFF when none is waiting.
 //     0x4000_0004  STATUS  bit 0: a byte is waiting. bit 1: input has ended and nothing is waiting.
 //     0x4000_0008  EXIT    write: cortical ends, with the value as its exit status.
+//     0x4000_000C  CTRL    bit 0: the console's interrupt, IRQ 0, is enabled. Reads back.
 //
-// Every other address off the RAM stops the core with `Stop.Unmapped`.
+// The console raises IRQ 0 while its interrupt is enabled and STATUS is not 0 — a byte is waiting, or
+// the input has ended — so a handler that reads until STATUS is 0, or turns CTRL off, ends it. The
+// core's own system control space (SysTick, the NVIC, the SCB) is at 0xE000_E000. Every other
+// address off the RAM stops the core with `Stop.Unmapped`.
+//
+// **The interrupt is raised between runs**, which a million instructions apart is often enough for
+// typing; and when the core sleeps in `WFI` with nothing in it to wake it, the board waits for the
+// console, if its interrupt would.
 //
 // **The console's input is a channel**, so where it comes from is the caller's: `listen` starts a
 // thread that copies the host's standard input into it a byte at a time, and a test sends its bytes
@@ -17,7 +25,7 @@ module sh.sysl.cortical.virt
 // for input (so a prompt shows before the guest waits), when it exits, and at `flush_console` —
 // unless `capture` asked to keep it, which is what a test reads.
 
-import sh.sysl.cortical.v6m.{Cpu, Stop, RAM_BYTES, halt, load32, reset, run_threaded}
+import sh.sysl.cortical.v6m.{Cpu, Stop, IRQ0, RAM_BYTES, could_wake, halt, load32, raise, reset, run_threaded, wake}
 import sh.sysl.elf as elf
 import sysl.buf.{Buf, buf}
 import sysl.threads.{Channel, channel, spawn}
@@ -27,10 +35,15 @@ const CONSOLE: u32 = 0x40000000
 const DATA: u32 = 0x40000000
 const STATUS: u32 = 0x40000004
 const EXIT: u32 = 0x40000008
+const CTRL: u32 = 0x4000000C
 
 // STATUS bits.
 const WAITING: u32 = 1
 const ENDED: u32 = 2
+
+// CTRL's bit, and the IRQ it enables.
+const RX_INTERRUPT: u32 = 1
+const CONSOLE_IRQ: u32 = 0
 
 var typed_slots: [4096]u8
 var typed = channel(typed_slots[..])
@@ -38,13 +51,15 @@ var typed = channel(typed_slots[..])
 var held: int = -1
 var out: Buf[u8] = buf()
 var capturing = false
+var ctrl: u32 = 0
 
-// Ready the console with an empty input, its output going to the host.
+// Ready the console with an empty input, its output going to the host, and its interrupt off.
 open_console()
     typed = channel(typed_slots[..])
     held = -1
     out = buf()
     capturing = false
+    ctrl = 0
 
 // Keep the guest's output for `output` rather than writing it to the host.
 capture()
@@ -115,6 +130,7 @@ console_read(cpu: *Cpu, a: u32, width: u32) -> u32
         STATUS ->
             flush_console()
             status()
+        CTRL -> ctrl
         _ ->
             halt(cpu, Stop.Unmapped, a)
             0
@@ -127,6 +143,7 @@ console_write(cpu: *Cpu, a: u32, width: u32, x: u32)
         EXIT ->
             cpu.exit_code = x
             halt(cpu, Stop.Exit, a)
+        CTRL -> ctrl = x & RX_INTERRUPT
         _ -> halt(cpu, Stop.Unmapped, a)
 
 // The board's RAM as `file` fills it: an ELF file's segments at their load addresses, or, for a file
@@ -160,11 +177,31 @@ boot(cpu: *Cpu, image: []const u8)
     cpu.pc = load32(cpu, 4) & ~1
 
 // Run the board until its core stops, a million instructions at a time, writing out the console's
-// output between them.
+// output and raising its interrupt between them.
 run_board(cpu: *Cpu)
     while cpu.stop == Stop.Budget
+        interrupt(cpu)
+        if cpu.sleeping then doze(cpu)
         cpu.limit = cpu.retired + 1000000
         run_threaded(cpu)
         flush_console()
 
     flush_console()
+
+// Raise the console's IRQ while it is enabled and STATUS is not 0.
+private interrupt(cpu: *Cpu)
+    if ctrl & RX_INTERRUPT != 0 && status() != 0 then raise(cpu, CONSOLE_IRQ)
+
+// A core asleep with nothing in it to wake it waits for the console's input — a byte, or its end —
+// where the interrupt that raises would wake it. Otherwise the run that follows stops it at `Asleep`.
+private doze(cpu: *Cpu)
+    if wake(cpu) then return
+    if ctrl & RX_INTERRUPT == 0 || status() != 0 || !could_wake(cpu, IRQ0 + CONSOLE_IRQ) then return
+
+    flush_console()
+
+    typed.receive() match
+        Some(b) -> held = int(b)
+        None -> ()
+
+    interrupt(cpu)

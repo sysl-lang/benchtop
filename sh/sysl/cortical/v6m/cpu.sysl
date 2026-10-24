@@ -9,8 +9,9 @@ module sh.sysl.cortical.v6m
 // and is decoded the first time control reaches it. Code runs from RAM, which starts at address 0;
 // one more record past its end stands for everywhere else, and stops the core that reaches it.
 //
-// **An access with no page is the board's.** Devices live at addresses the page table leaves empty,
-// and the core hands such an access to the board through `io_read` and `io_write`.
+// **An access with no page is the board's**, unless it is to the system control space, which is the
+// core's own (except.sysl). Devices live at addresses the page table leaves empty, and the core hands
+// such an access to the board through `io_read` and `io_write`.
 //
 // **The flags are kept lazily.** N and Z are both read from `nz`, the last flag-setting result: N is
 // its top bit and Z is whether it is zero. C is 0 or 1. V is kept as the last addition that set it —
@@ -44,6 +45,16 @@ enum Stop
     Unmapped
     // The guest asked to end, with `exit_code`.
     Exit
+    // A `WFI` that nothing can ever wake: no exception is pending that could run, the system timer
+    // will not raise one, and the board has nothing that will. `stop_at` is the instruction after it.
+    Asleep
+    // Where an M0+ would take a HardFault it cannot (and lock up), or where cortical does not model
+    // the fault: an exception whose vector lacks its Thumb bit (an unset one is 0), `stop_at` the
+    // vector's address; an `SVC` or a return that cannot be taken, or an EXC_RETURN that names no
+    // return, `stop_at` the instruction.
+    Fault
+    // The guest asked for a system reset (AIRCR.SYSRESETREQ); what that does is the board's.
+    Reset
 
 // A decoded instruction. `h` is its handler for the threaded executor and `op` its case for the
 // `match` executor; the rest are its operands, extracted once. A register number is a `u4`, so
@@ -76,6 +87,37 @@ struct Cpu
     dec: *Insn
     io_read: IoRead
     io_write: IoWrite
+    // The exception model (except.sysl). `r[13]` is the stack pointer in use; `sp_other` is the
+    // other one: the main stack's while thread mode runs on the process stack, the process stack's
+    // otherwise.
+    sp_other: u32
+    // CONTROL's two bits: nPRIV (kept, and restricting nothing) and SPSEL.
+    control: u32
+    // The exception number running, 0 in thread mode, which is exactly when IPSR is 0.
+    ipsr: u32
+    primask: u32
+    // The vector table's address, VTOR.
+    vtor: u32
+    // One bit per exception number.
+    pending: u64
+    active: u64
+    // Bit k: IRQ k is enabled.
+    enabled: u32
+    // The priority byte of each exception number that has one to set; only its top two bits are kept.
+    prio: [48]u8
+    // Set by `WFI`: the core runs nothing until something wakes it.
+    sleeping: bool
+    // The clock is the count of instructions retired plus `slept`, the time skipped while asleep.
+    slept: u64
+    // SysTick: CSR's ENABLE and TICKINT bits, COUNTFLAG, the reload value, and the current value
+    // while it is stopped. While it runs, the current value is worked out from `tick_zero`, the clock
+    // at which it next counts down to 0, and `tick_last`, the clock at which it was last 0.
+    tick_ctrl: u32
+    tick_flag: bool
+    tick_reload: u32
+    tick_value: u32
+    tick_zero: u64
+    tick_last: u64
 
 var ram: [1048576]u8
 var page_table: [1048576]usize
@@ -113,6 +155,7 @@ clear(cpu: *Cpu, entry: u32)
     cpu.exit_code = 0
     cpu.pages = &page_table[0]
     cpu.dec = &decoded[0]
+    clear_exceptions(cpu)
 
 // The record for guest address `a`: past the end of RAM, the one record that stands for everywhere
 // else, which stops the core there, the address it was asked for kept as `stop_at`.
@@ -148,49 +191,68 @@ addr_of(cpu: *Cpu, ip: *Insn) -> u32 = u32(ip - cpu.dec) << 1
 
 // ---------------------------------------------------------------------------------------------------
 // Memory. The fast path is one table load, one test and one host access; everything else (a page
-// with no entry: a device, or nothing) is the slow path, the board's `io_read` and `io_write`.
+// with no entry) is the slow path: the system control space (except.sysl), or else the board's
+// `io_read` and `io_write`.
+//
+// A guest access is made at `n`, the count of instructions retired before the one making it, since
+// the system timer's registers answer by the time. `load32` and the rest are the same accesses made
+// at the time the core last stopped, for the host's own use and for the core's work between
+// instructions.
 
 // The host address of the first byte of the page holding `a`, or 0 for a page with no fast path. The
 // test is made on this, not on the byte's own address, which nothing stops from being 0.
 @inline
 page_of(cpu: *Cpu, a: u32) -> usize = cpu.pages[a >> PAGE_SHIFT]
 
+// The slow path of a read, `width` bytes at `a`.
+slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if a >= SCS && a < SCS_END then return scs_read(cpu, a, width, n)
+
+    cpu.io_read(cpu, a, width)
+
+slow_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if a >= SCS && a < SCS_END
+        scs_write(cpu, a, width, x, n)
+        return
+
+    cpu.io_write(cpu, a, width, x)
+
 @inline
-load32(cpu: *Cpu, a: u32) -> u32
+read32(cpu: *Cpu, a: u32, n: u64) -> u32
     val page = page_of(cpu, a)
 
-    if page == 0 then return cpu.io_read(cpu, a, 4)
+    if page == 0 then return slow_read(cpu, a, 4, n)
 
     val p: *u32 = ptr_cast(page + (a & 0xFFF))
 
     p[0]
 
 @inline
-load16(cpu: *Cpu, a: u32) -> u32
+read16(cpu: *Cpu, a: u32, n: u64) -> u32
     val page = page_of(cpu, a)
 
-    if page == 0 then return cpu.io_read(cpu, a, 2)
+    if page == 0 then return slow_read(cpu, a, 2, n)
 
     val p: *u16 = ptr_cast(page + (a & 0xFFF))
 
     p[0]
 
 @inline
-load8(cpu: *Cpu, a: u32) -> u32
+read8(cpu: *Cpu, a: u32, n: u64) -> u32
     val page = page_of(cpu, a)
 
-    if page == 0 then return cpu.io_read(cpu, a, 1)
+    if page == 0 then return slow_read(cpu, a, 1, n)
 
     val p: *u8 = ptr_cast(page + (a & 0xFFF))
 
     p[0]
 
 @inline
-store32(cpu: *Cpu, a: u32, x: u32)
+write32(cpu: *Cpu, a: u32, x: u32, n: u64)
     val page = page_of(cpu, a)
 
     if page == 0
-        cpu.io_write(cpu, a, 4, x)
+        slow_write(cpu, a, 4, x, n)
         return
 
     val p: *u32 = ptr_cast(page + (a & 0xFFF))
@@ -198,11 +260,11 @@ store32(cpu: *Cpu, a: u32, x: u32)
     p[0] = x
 
 @inline
-store16(cpu: *Cpu, a: u32, x: u32)
+write16(cpu: *Cpu, a: u32, x: u32, n: u64)
     val page = page_of(cpu, a)
 
     if page == 0
-        cpu.io_write(cpu, a, 2, x & 0xFFFF)
+        slow_write(cpu, a, 2, x & 0xFFFF, n)
         return
 
     val p: *u16 = ptr_cast(page + (a & 0xFFF))
@@ -210,16 +272,28 @@ store16(cpu: *Cpu, a: u32, x: u32)
     p[0] = u16(x)
 
 @inline
-store8(cpu: *Cpu, a: u32, x: u32)
+write8(cpu: *Cpu, a: u32, x: u32, n: u64)
     val page = page_of(cpu, a)
 
     if page == 0
-        cpu.io_write(cpu, a, 1, x & 0xFF)
+        slow_write(cpu, a, 1, x & 0xFF, n)
         return
 
     val p: *u8 = ptr_cast(page + (a & 0xFFF))
 
     p[0] = u8(x)
+
+load32(cpu: *Cpu, a: u32) -> u32 = read32(cpu, a, cpu.retired)
+
+load16(cpu: *Cpu, a: u32) -> u32 = read16(cpu, a, cpu.retired)
+
+load8(cpu: *Cpu, a: u32) -> u32 = read8(cpu, a, cpu.retired)
+
+store32(cpu: *Cpu, a: u32, x: u32) = write32(cpu, a, x, cpu.retired)
+
+store16(cpu: *Cpu, a: u32, x: u32) = write16(cpu, a, x, cpu.retired)
+
+store8(cpu: *Cpu, a: u32, x: u32) = write8(cpu, a, x, cpu.retired)
 
 // ---------------------------------------------------------------------------------------------------
 // Flags.

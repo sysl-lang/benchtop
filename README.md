@@ -26,8 +26,9 @@ sysl build . -o cortical
 An ELF file's segments are placed at their physical addresses; any other file is loaded as raw bytes
 from address 0. **Ctrl-]** ends cortical whatever the guest is doing, with exit status 130. Otherwise
 the exit status is the one the guest wrote to the console's EXIT register; a guest that stops on a
-breakpoint, an undefined instruction or an access where nothing is gets a message saying where, and
-status 3 for the last two.
+breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can wake, or a
+fault the core cannot take gets a message saying where, and status 3 for all but the breakpoint. A
+system reset request (AIRCR) ends it with status 0.
 
 **`bench`** runs a raw image from address 0 to its breakpoint under both executors, three rounds
 each, and reports each one's speed; [bench/README.md](bench/README.md) has the numbers.
@@ -45,17 +46,25 @@ core — deliberately not a real chip. One Cortex-M0+ core:
 | `0x4000_0000` DATA | write: the low byte goes to standard output. read: the next byte typed, or `0xFFFF_FFFF` when none is waiting |
 | `0x4000_0004` STATUS | bit 0: a byte is waiting. bit 1: the input has ended and nothing is waiting |
 | `0x4000_0008` EXIT | write: cortical ends, with the value as its exit status |
+| `0x4000_000C` CTRL | bit 0: the console's interrupt, IRQ 0, is enabled; reads back |
+| `0xE000_E000`– | the M0+'s own SysTick, NVIC and SCB |
 
-Any other address stops the core, and cortical reports it. The core resets as an M0+ does: SP from
-the vector table's first word, PC from its second.
+The console raises IRQ 0 while CTRL bit 0 is set and STATUS is not 0 (a byte is waiting, or the input
+has ended). Any other address stops the core, and cortical reports it. The core resets as an M0+
+does: SP from the vector table's first word, PC from its second. It takes exceptions as an M0+ does —
+SVC, PendSV, SysTick, IRQs, with priorities, PRIMASK and both stacks; SysTick counts one per
+instruction. [DESIGN.md](DESIGN.md) §2.2 says what is modelled and what is not.
 
-[examples/virt](examples/virt) is a C runtime for it (`virt.h`, `start.c`, `virt.ld`) and `echo.c`,
-which echoes each line typed until the input ends or Ctrl-D. Build it with `arm-none-eabi-gcc` on the
-PATH:
+[examples/virt](examples/virt) is a C runtime for it (`virt.h`, `start.c`, `virt.ld`), `echo.c`,
+which echoes each line typed until the input ends or Ctrl-D, and `irq.c`, which echoes from the
+console's interrupt handler while `main` sleeps in `WFI`. A program handles an exception by defining
+the function `start.c`'s vector table names (`console_handler`, `systick_handler`, `svc_handler`, …).
+Build them with `arm-none-eabi-gcc` on the PATH:
 
 ```
 zsh examples/virt/build.sh
 ./cortical run examples/virt/echo.elf
+./cortical run examples/virt/irq.elf
 ```
 
 ## Boards, in order

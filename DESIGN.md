@@ -307,6 +307,63 @@ checked against the SVD):
 - **Semihosting** (`BKPT 0xAB`, SYS_WRITE0/WRITEC/WRITE/EXIT_EXTENDED) is on by an option. It is how
   skiff's boot tests halt, so the same scripts can drive cortical and QEMU.
 
+**What the ARMv6-M core models** (`sh.sysl.cortical.v6m`, `except.sysl`; ARMv6-M ARM B1, the M0+
+subset of the above):
+
+- **State**: MSP and PSP with CONTROL.SPSEL (`r13` is the one in use, the other kept beside it),
+  handler and thread mode (handler mode is exactly IPSR ≠ 0), PRIMASK, CONTROL.nPRIV (kept, and
+  restricting nothing), and xPSR as stacked: APSR's flags, the T bit and IPSR. VTOR is a register,
+  reset to 0.
+- **Instructions**: `MRS`/`MSR` of APSR, IAPSR, EAPSR, xPSR, IPSR, EPSR, IEPSR, MSP, PSP, PRIMASK
+  and CONTROL (any other SYSm, or SP or PC as the general register, is undefined; EPSR reads as 0;
+  IPSR and EPSR ignore writes, and so does SPSEL in handler mode), `CPSIE i`/`CPSID i`, `SVC`, `WFI`.
+  `WFE`, `SEV` and `YIELD` are `NOP`s: the event register is not modelled, which the architecture
+  permits. `DSB`, `DMB` and `ISB` order nothing on one core.
+- **Entry and return**: eight words on the stack in use, aligned to 8 with xPSR bit 9 recording the
+  skipped word; the vector from VTOR; LR = `0xFFFFFFF1`, `F9` or `FD`; return when `BX` or `POP {pc}`
+  in handler mode puts `0xFFFFFFFx` in PC. That check is free on the hot path: a value off the RAM
+  already takes `branch_to`'s slow path. A tail-chain is a return followed by an entry, which stacks
+  the same frame.
+- **Priorities**: the 2-bit priorities of SVCall, PendSV, SysTick (SHPR2/SHPR3) and 32 IRQs (IPR);
+  NMI and HardFault fixed above them. A pending, enabled exception is taken when its priority is
+  higher than the execution priority — the highest active one's, or 0 under PRIMASK — the lowest
+  exception number winning a tie. `SVC` where SVCall cannot preempt escalates to HardFault.
+- **Registers**: NVIC ISER/ICER/ISPR/ICPR/IPR; SCB CPUID, ICSR (NMIPENDSET, PENDSV and PENDST set and
+  clear, ISRPENDING, VECTPENDING, VECTACTIVE), VTOR, AIRCR (SYSRESETREQ under the key stops the core
+  at `Reset`; what a reset means is the board's), SHPR2, SHPR3; SysTick CSR/RVR/CVR/CALIB. Each is a
+  word; any other width, or any other address in the system control space, stops at `Unmapped`.
+- **Not modelled**: lockup, the MPU, and HardFault for an undefined instruction or a bad access,
+  which stop the core at `Undefined` or `Unmapped` as they always have. An exception that cannot be
+  taken — `SVC` inside HardFault, an EXC_RETURN naming no return, a return whose stacked IPSR
+  disagrees with the mode it names, a vector without its Thumb bit (an unset one is 0) — stops at
+  `Fault`. An access off the RAM while stacking or unstacking stops at `Unmapped` like any other.
+
+**The clock is the instruction count.** SysTick counts down once per instruction retired, plus the
+time a `WFI` skips; it is worked out from the clock when a register is read, not decremented. A guest
+access happens at the count of instructions retired before it, which every load and store carries
+into the slow path at no cost to the fast one. Started at clock *t* from 0, SysTick next reaches 0
+at *t* + RELOAD + 1 and every RELOAD + 1 after.
+
+**Where pending exceptions are checked: between runs, never per instruction.** A run comes back at
+its first taken branch past its budget, and every run begins by bringing SysTick up to the clock,
+taking the exception that should run, and cutting the budget at SysTick's next expiry. So whatever
+can make an exception ready cuts the budget to 0: any write to the system control space, `CPSIE`,
+`MSR`, an exception return with another one still pending. `DSB`, `DMB`, `ISB`, `CPS`, `MSR` and
+`WFI` check the budget as a taken branch does, so such a change is acted on at the next taken branch
+or barrier — where the architecture asks software to put a barrier anyway. A SysTick exception is
+taken at the first taken branch at or after its expiry: in a loop of branches, at the expiry exactly.
+`SVC` takes its exception at once. **The cost** of all of it on the benchmark (`bench/`, the `become`
+chain, `/usr/bin/time -l`, a loaded machine, three runs each way): 3.25–3.27 cycles and 14.58 host
+instructions per guest instruction before, 3.26–3.29 and 14.65 after — about half a percent.
+
+**`WFI`** sleeps; the next run wakes it when an exception is pending that would preempt with PRIMASK
+clear (taking it only if PRIMASK is clear). When nothing pending would, but SysTick's expiry will,
+the clock skips to the expiry. When nothing in the core can wake it the board may (§11), and if it
+cannot either the core stops at `Asleep`, its PC after the `WFI`.
+
+**N and Z both set**, which `MSR APSR` or a crafted frame can write and no instruction can produce, is
+kept as Z alone: the lazy flags (§2.3) hold N and Z as one word, whose sign is N and whose zeroness Z.
+
 ### 2.3 The dispatch loop
 
 ```
@@ -1216,12 +1273,20 @@ exist, and the smallest machine a test can boot.
 - **The core** is `sh.sysl.cortical.v6m`: the ARMv6-M interpreter (§2.8) with its two executors,
   the `become` chain and the `match` loop (§2.3), 1 MB of RAM from address 0 behind a page table, a
   guard record past the end of RAM, and an `io_read`/`io_write` pair the board fills for every
-  address with no page. A stop names its kind and its address (`stop_at`): a breakpoint, an undefined
-  instruction, an access or a jump where nothing is, or the guest asking to exit.
+  address with no page, outside the system control space at `0xE000_E000` that the core answers
+  itself (§2.2's ARMv6-M paragraph: SysTick, the NVIC, the SCB). A stop names its kind and its
+  address (`stop_at`): a breakpoint, an undefined instruction, an access or a jump where nothing is,
+  the guest asking to exit, a `WFI` nothing can wake, a fault it cannot take, or a reset request.
 - **The board** is `sh.sysl.cortical.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
   (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
-  the input has ended) and EXIT (end with this status). Every other address stops the core with
-  `Unmapped`. The core resets as an M0+ does, SP and PC from the vector table at 0.
+  the input has ended), EXIT (end with this status) and CTRL (bit 0 enables the console's interrupt).
+  Every other address stops the core with `Unmapped`. The core resets as an M0+ does, SP and PC from
+  the vector table at 0, and an AIRCR reset request ends the board.
+- **The console's interrupt is IRQ 0**, raised while CTRL bit 0 is set and STATUS is not 0 — a byte
+  waiting, or the input ended — so a handler reads until STATUS is 0, or turns CTRL off once the input
+  has ended. The board raises it between runs, a million instructions apart at most. When the core
+  sleeps in `WFI` with nothing in it to wake it, the board blocks on the console's input if the
+  interrupt that input raises would wake the core, and otherwise lets the core stop at `Asleep`.
 - **The console's input is a channel.** `cortical run` fills it from a thread reading the terminal in
   raw mode a byte at a time; a test fills it itself and closes it, which the guest sees as STATUS's
   ENDED. Output is buffered and written at a line's end, when the guest reads STATUS or DATA (so a
@@ -1231,5 +1296,7 @@ exist, and the smallest machine a test can boot.
   addresses (the package is built with `elf64` and `big_endian` off, so it refuses the others as
   unsupported), or raw bytes from address 0, up to the RAM's 1 MB.
 - **`examples/virt`** is the C runtime for it (`virt.h`'s register macros, `start.c`'s vector table
-  and reset, `virt.ld`) and `echo.c`, built with `arm-none-eabi-gcc`. The board's tests boot the
-  committed `echo.elf` and check its whole conversation byte for byte.
+  of weak handlers and reset, `virt.ld`), `echo.c`, which polls the console, and `irq.c`, which echoes
+  from the console's interrupt handler while `main` sleeps in `WFI`, built with `arm-none-eabi-gcc`.
+  The board's tests boot the committed `echo.elf` and `irq.elf` and check each whole conversation byte
+  for byte.
