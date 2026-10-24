@@ -113,7 +113,7 @@ Sources, and how far each was checked:
   skiff's AN521 boots flaky (skiff `CLAUDE.md`, milestone 2: a tick delivered up to 5 ticks late), and
   cortical should not repeat that. `--seed n` jitters the quanta, which explores interleavings
   reproducibly: a skiff race found at seed 1234 recurs at seed 1234.
-- **The virtual board (§11) runs its two M0+ cores this way, and only this way.** A round gives core
+- **The virtual board (§11) runs its two M0+ cores this way by default.** A round gives core
   0 a turn and then core 1, each running until its clock (instructions retired plus the time skipped
   asleep) reaches the round's end, `quantum` past the last one's: 1000 instructions by default, a
   board parameter. A turn ends at the core's first taken branch at or past that time, as every run
@@ -126,7 +126,20 @@ Sources, and how far each was checked:
   latency. Tests set a quantum of a dozen instructions to pin an exact
   interleaving. There is no `--seed` yet; the quantum is the one input to the interleaving, and the
   same image, input and quantum give the same run, counts and all. This single-threaded run is the
-  oracle the threaded mode will be checked against.
+  oracle the threaded mode is checked against.
+- **`cortical run --threads` gives each of the virtual board's cores a host thread of its own**
+  (`virt/parallel.sysl`). Core 0 runs alone, exactly as above, until it launches core 1; then core 1
+  gets a thread and the two run at once, each a quantum at a time, with the lag bound of §1.3 between
+  them. Between its runs a core does what a turn's start does on one thread — takes in what the other
+  core raised in it, raises the board's interrupts, wakes or sleeps — and publishes its clock. A core
+  asleep in `WFI` blocks its thread on a condition variable (§1.3), so an idle core costs no host core.
+  The board ends when either core stops: its thread cuts the other's run short (§1.4) and both
+  threads leave, and `run_board` answers the core that stopped. **Turns stay the default**, because
+  what cortical is for is a run that can be repeated and compared: a failure found on one thread
+  recurs, counts and all, and the threaded mode is not reproducible by nature. `--threads` is the
+  speed for a guest that keeps both cores busy — about 1.8 times the turns' aggregate on the
+  two-core bench (`bench/README.md`) — and is checked against the turns on every outcome that does
+  not depend on the interleaving (`virt/parallel_tests.sysl`).
 
 ### 1.2 The bus and memory map
 
@@ -200,6 +213,24 @@ checked against the SVD):
 - **WFI/WFE/Stop**: a sleeping core jumps its time forward to its next wake (its SysTick, a due event
   routed to it, the other core's SEV), bounded by `t_other + W`, so an idle M4 costs nothing. When
   both sleep, the machine jumps to the next event.
+- **On the virtual board with `--threads` (§1.1), the clock is the instruction count and `W` is 4
+  quanta: 4000 clocks by default, 32 µs at the RP2040's 125 MHz.** Each core counts its own clock and
+  publishes it after every run; a core whose clock has reached the other's plus the bound spins
+  briefly and then blocks until the other's run brings it within reach (a yield would not do: macOS
+  parks a thread that yields for a whole scheduling quantum). The bound is what a word or an
+  interrupt between the cores can be off by, in virtual time: a word pushed at clock `t` is seen by
+  the other core somewhere within `t ± W`, where on one thread it is seen within a quantum. **SysTick
+  is unaffected**, since each core's counts that core's own clock, so a tick period is exact to its
+  core whatever the other does; only when the handler runs relative to the other core's code moves,
+  by up to `W`. A core asleep in `WFI` blocks its thread; its clock follows the other's, and it does
+  not hold the other back except at its own SysTick's expiry, which the other's run wakes it at. It
+  wakes on an interrupt the other core raises in it, at the other's last published clock. When both
+  sleep, the last to fall asleep decides under the board's lock, with the other's thread blocked and
+  its state still: the first SysTick expiry wakes its core, the clock skipping there; failing that the
+  board waits for the console where its interrupt would wake a core; failing that both stop at
+  `Asleep`. Every change to whether a core sleeps, and every look at both, is made under that lock,
+  and each core raises before it looks at the other's flag and sets its own flag before it looks at
+  what was raised, so the board never stops while an interrupt is on its way.
 - **Pacing against the wall clock**: `--realtime` (the default with a window) sleeps when virtual time
   runs ahead of the wall, so a 2-second LED blink takes 2 seconds and the display runs at its virtual
   60 Hz. When the emulator is slower than real time, virtual time just runs slow. Nothing drops,
@@ -214,6 +245,39 @@ checked against the SVD):
   VTOR — and its exception state, which is its NVIC's pending, active and enable bits and its
   priorities, and its SysTick. A device's interrupt is raised in each NVIC separately (the console's
   in both, the FIFO's in the reading core's alone), and each core enables its own.
+- **With a thread per core (`--threads`), each piece of shared state is safe by construction:**
+  - **The decoded records become each core's own.** At the launch core 1 gets a fresh array of its
+    own (`pair`), and nothing writes a record but its core's thread. The line map stays shared: a
+    decode marks its lines, with relaxed atomic stores, before it reads the bytes. A store to a
+    marked line forgets the writer's own records at once and posts the line to the other core: a bit
+    in a 256-word map, set with an atomic OR, then a flag set with release. The other core forgets its
+    records on every posted line at its next `DMB`, `DSB` or `ISB`, and between runs, so a quantum
+    at most. **The guarantee is the architecture's: code one core writes is run by the other after
+    the writer's `DSB` and the runner's `ISB`** — the pair ARMv6-M asks of a program that modifies
+    instructions, so that the new ones are fetched. The writer's `DSB` is a full fence
+    after the post, and the reader's `ISB` takes in every line posted before it, so a program that
+    synchronises as the architecture asks never runs a stale record; one that does not may run the
+    old code for up to a quantum, which the architecture permits. The one window left is a store
+    that reads the line map before the other core's mark of that same line reaches it — the other
+    core decoding, for the first time, the very bytes being written, which is concurrent modification
+    and execution and UNPREDICTABLE in the architecture.
+  - **The FIFOs are single-producer single-consumer rings without a lock.** Core `1 - k` alone pushes
+    to core k's RX FIFO and core k alone pops it; each side counts the words it has moved, writes
+    its own count with release after the slot, and reads the other's with acquire. VLD and RDY are
+    the two counts' difference; WOF and ROE are set and cleared only by their own core's accesses.
+  - **A spinlock claim is one atomic test-and-set** (an OR with acquire, after a plain look that
+    keeps a claimed lock's word quiet while it is spun on), and a release an AND with release, so a
+    lock's holder publishes its writes to the next claimer as the RP2040's SDK expects.
+  - **An interrupt one core raises in the other is a `poke`**: an atomic OR into the target's
+    `incoming` word and a store of 0 to its `limit`. The target's run comes back at its next taken
+    branch, the same check point that notices a pending exception on one thread (§2.2), and its
+    thread moves `incoming` into `pending` before the next run; a sleeping target's thread is also
+    signalled. Nothing is added per instruction. A poke that lands just as the target's own thread
+    sets a new limit is overwritten by it, and is then taken at the end of that run, a quantum at most.
+  - **The console is under a lock**, taken by both threads for its registers and by a core looking
+    at its interrupt; its output is collected and written a line at a time as on one thread.
+  - **The devices are a plain array**, which both threads read and neither writes while the board
+    runs. A `Buf` would not do: reading one copies a counted reference, a write to its count.
 - **HSEM** (32 semaphores, RM0399 "Hardware semaphore"): each `R[n]` is a host `Atomic[u32]` holding
   `LOCK | COREID<<8 | PROCID`. A 2-step write-lock or a 1-step read-lock (`RLR[n]`) is a
   compare-and-swap against the unlocked value. Unlock requires a matching COREID/PROCID. The core IDs
@@ -240,7 +304,7 @@ checked against the SVD):
 - **In parallel mode the host is Apple silicon (AArch64, weakly ordered).** Guest RAM accesses compile
   to host loads and stores of the same width, and aligned accesses up to 32 bits are single-copy
   atomic on both sides. Guest `DMB`/`DSB` are host `dmb ish`; `ISB` drains the decode-cache check
-  (§2.4).
+  (§2.4). The virtual board's threaded mode is built this way; the argument is in the `--threads` bullet below.
 - **The M7 really is weakly ordered for Normal memory**, so plain host accesses are a fair model. The
   M4 in practice performs its memory accesses in order, so firmware that "works on the M4" may rely
   on it. M4 stores are therefore emitted as store-release and M4 loads as load-acquire (`stlr`/`ldar`,
@@ -259,16 +323,39 @@ checked against the SVD):
   global`, a monitor shared by both cores over SRAM. The RP2040's M0+s have no exclusives at all.
 - **Device (MMIO) accesses are strongly ordered and serialised** by the device lock.
 - **On one host thread (the virtual board, §11) memory is sequentially consistent by construction**:
-  only one core runs at a time, so every access is in one global order and `DMB`/`DSB`/`ISB` need do
-  nothing beyond being a point where the budget is checked. Giving each core its own thread will need:
-  guest RAM accesses that stay single-copy atomic up to a word (they are host accesses of the same
-  width, so this holds on AArch64), `DMB`/`DSB` as `dmb ish`; the SIO's FIFOs and spinlocks under its
-  lock, a spinlock claim a compare-and-swap; an interrupt raised by one core's thread in the other's
-  NVIC as an atomic pending bit plus a poke of that core's `limit`; and the decoded records made safe
-  to forget while the other thread runs them — today a store puts a 16-byte record back to "not
-  decoded" with a plain write, which a racing reader could see torn, so the threaded stage swaps the
-  handler word alone (atomically, to the decoder) or moves to the generation check of §2.4, and marks
-  the code-line map with atomic stores.
+  only one core runs at a time, so every access is in one global order, and `DMB`/`DSB`/`ISB` order
+  nothing that was not already in order.
+- **With a thread per core (`--threads`) the guest's RAM accesses are the host's relaxed atomic
+  accesses, and `DMB`, `DSB` and `ISB` are a sequentially consistent host fence** (`atomic_fence
+  (SeqCst)`, `dmb ish` on AArch64). Why that is sound:
+  - **The guest's model is weaker than or equal to what the host gives it.** ARMv6-M Normal memory is
+    weakly ordered: without a barrier, a core's accesses to different locations may be seen by the
+    other core in any order, and the architecture promises only single-copy atomicity of aligned
+    accesses up to a word and coherence (one order of writes per location). A relaxed host access of
+    the same width gives exactly those two on AArch64 — aligned loads and stores up to 64 bits are
+    single-copy atomic, and every location is coherent — so a plain guest access needs no more.
+  - **Ordering comes from the barriers, and a barrier is at least as strong on the host.** A guest
+    `DMB` orders every access before it against every access after it, for every observer; a host
+    `SeqCst` fence between relaxed atomics does that and more (C11's fence rules: a release half
+    publishes everything before, an acquire half sees everything published, and all such fences are in
+    one total order). `DSB` adds completion, which a fence is too, and `ISB` adds the instruction-side
+    effects of §1.4. A message passed through RAM with a `DMB` on each side is never seen out of order:
+    `examples/virt/order.c` checks it, two hundred thousand messages a run, and without the host fence
+    it sees thousands of stale ones every run.
+  - **The SIO's own accesses order themselves.** A spinlock claim is an acquire, a release a release,
+    and the FIFO's counts are release and acquire, so firmware that synchronises through the SIO alone,
+    as `virt.h`'s spin locks do with no barrier, still sees what the other core wrote first.
+  - **Relaxed, not plain, because a race is undefined behaviour in sysl.** Two host threads making
+    plain accesses to the same RAM, one of them a store, is a data race, which the language leaves
+    undefined; with relaxed atomics the same race is defined and does what the guest's architecture
+    says. On AArch64 a relaxed load or store is the plain `ldr`/`str`, so the one-thread machine pays
+    nothing for it (the single-core bench is unchanged).
+  - **What the host does not reproduce** is the M0+'s own strength: the core performs its accesses in
+    order, so firmware that omits a barrier works on silicon and may not here. That makes cortical
+    stricter than the part, which is the side to err on.
+  - Every other shared word — `limit`, `incoming`, the posted lines, the published clocks, the sleep
+    flags, the FIFO counts — is an atomic with the ordering its pairing needs, and ThreadSanitizer finds
+    no race in the suite (`SYSL_EXTRA_CFLAGS="-fsanitize=thread -g" sysl test .`).
 - **Caches are no-ops (the brief).** That makes cortical *more* coherent than silicon: a missing clean
   or invalidate works in cortical and fails on the board. Since skiff's milestone 9 is exactly "shared
   state uncached on the M7, then the cache trait", a **later** option, `--dcache-model`, keeps a
@@ -1401,7 +1488,9 @@ exist, and the smallest machine a test can boot.
   starts it again; VTOR, SP and ENTRY may be any word, so a vector table at 0 launches. An ENTRY
   without its Thumb bit stops core 1 at `Fault` there, which ends the board. Once core 1 runs the
   same words are only data in its FIFO: there is no second launch.
-- **The cores take turns on one host thread** (§1.1): `quantum` instructions each, 1000 by default.
+- **The cores take turns on one host thread** (§1.1): `quantum` instructions each, 1000 by default;
+  with `--threads` each has a thread of its own once core 1 is launched, within the lag bound of
+  §1.3, and the rest of this paragraph holds of it except where §1.3 and §1.4 say otherwise.
   Before core 1 is launched core 0 runs alone a million instructions at a time, exactly as a
   single-core board, so `cortical run` on a one-core program and `cortical bench` are unchanged. A
   core asleep in `WFI` skips to the end of the round, or wakes within it on its own SysTick or on an

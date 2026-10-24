@@ -18,9 +18,10 @@ devices, how fidelity is tested against real boards, and the milestones with the
 
 ```
 sysl build . -o cortical
-./cortical run [--board <name | file.hocon>] <image.elf | image.bin>
+./cortical run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>
 ./cortical check <name | file.hocon>
 ./cortical bench <image.bin> [expected r0] [match | threaded]
+./cortical bench-board <image.elf> [turns | threads]
 ```
 
 **`run`** boots an image on the board `--board` names — the virtual board, `virt`, where none is
@@ -33,11 +34,17 @@ breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothin
 fault the core cannot take gets a message saying where, and status 3 for all but the breakpoint. A
 system reset request (AIRCR) ends it with status 0.
 
+The two cores take turns on one host thread, so a run is the same every time. **`--threads`** gives
+each core a host thread of its own once core 1 is launched: faster where both cores are busy, and
+not reproducible, as two real cores are not.
+
 **`check`** reads a board or product description and holds it to cortical's part library: it
 prints every mistake with its line and column and exits 1, or prints what the description is.
 
 **`bench`** runs a raw image from address 0 to its breakpoint under both executors, three rounds
-each, and reports each one's speed; [bench/README.md](bench/README.md) has the numbers.
+each, and reports each one's speed; **`bench-board`** runs an image on the virtual board to its exit,
+three rounds with the cores taking turns and three with a thread each, and reports both cores'
+speed together. [bench/README.md](bench/README.md) has the numbers.
 
 `sysl test .` runs every test.
 
@@ -132,11 +139,21 @@ every time, to the instruction. A core asleep in `WFI` costs nothing while the o
 board stops at `Asleep` only when both sleep with nothing that can wake them. A program that never
 launches core 1 runs exactly as on a single core. [DESIGN.md](DESIGN.md) §1.1 and §11 have the rest.
 
+**With `--threads` each core runs on a host thread of its own**, and neither gets more than 4000
+instructions ahead of the other; a core asleep in `WFI` blocks its thread until the other core or its
+own SysTick wakes it. On the two-core bench that is about 1.8 times the speed of taking turns
+([bench/README.md](bench/README.md)). Guest RAM accesses are the host's relaxed atomic accesses and
+`DMB`/`DSB`/`ISB` a host fence, so a program that orders its accesses with barriers, or through the
+SIO's spinlocks and FIFOs, sees them in order; code one core writes is run by the other after the
+writer's `DSB` and the runner's `ISB`. [DESIGN.md](DESIGN.md) §1.3–§1.5 give the argument.
+
 [examples/virt](examples/virt) is a C runtime for it (`virt.h`, `start.c`, `virt.ld`), `echo.c`,
 which echoes each line typed until the input ends or Ctrl-D, `irq.c`, which echoes from the
 console's interrupt handler while `main` sleeps in `WFI`, and `dual.c`, in which core 0 launches core
 1, sends it numbers through the FIFO to be squared in core 1's FIFO interrupt, and both cores print
-under a spinlock. A program handles an exception by defining the function `start.c`'s vector table
+under a spinlock. `count.c`, `pingpong.c` and `order.c` are what the tests run on two threads: both
+cores counting under one spinlock, the FIFO run full both ways, and messages passed through RAM with
+`DMB`s. A program handles an exception by defining the function `start.c`'s vector table
 names (`console_handler`, `sio_handler`, `systick_handler`, `svc_handler`, …). Build them with
 `arm-none-eabi-gcc` on the PATH:
 
@@ -145,6 +162,7 @@ zsh examples/virt/build.sh
 ./cortical run examples/virt/echo.elf
 ./cortical run examples/virt/irq.elf
 ./cortical run examples/virt/dual.elf
+./cortical run --threads examples/virt/dual.elf
 ./cortical run --board examples/virt/moved.hocon examples/virt/irq-moved.elf
 ```
 
