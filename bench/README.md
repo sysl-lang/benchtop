@@ -45,6 +45,27 @@ and `br x3`. Guest RAM accesses are relaxed atomics, so that two host threads ma
 (DESIGN.md §1.5); on AArch64 a relaxed load or store is the plain `ldr` or `str`, and the counters
 did not move when they became so (30.18 G host instructions for three rounds before and after).
 
+## The M33
+
+`kernel33.bin` is the same `kernel.c` built for the Cortex-M33 without its DSP extension, and
+`cortical bench --core cortex-m33` runs it on the ARMv8-M Mainline core:
+
+```
+/usr/bin/time -l ./cortical bench bench/guest/kernel.bin 1380735027 threaded
+/usr/bin/time -l ./cortical bench --core cortex-m33 bench/guest/kernel33.bin 1380735027 threaded
+```
+
+On the M5 Pro, sysl 0.5.7, five runs each, interleaved, on a machine shared with other work (so the
+cycles are a range and the host instructions are not):
+
+| core | guest instructions, three rounds | host instructions | per guest instruction | cycles per guest instruction |
+|---|---|---|---|---|
+| M0+ | 2002.6 M | 30.18 G | 15.1 | 3.3–3.5 |
+| M33 | 1762.5 M | 27.04 G | 15.3 | 3.6–3.8 |
+
+Thumb-2 says the same in 12% fewer instructions, and each costs about what an M0+ instruction does,
+so a round takes about as long on either. The M0+'s count is the same as before the M33 existed.
+
 ## Two cores
 
 `guest/dual.c` runs on the virtual board: each core folds the CRC over a 4 KB buffer of its own a
@@ -69,3 +90,8 @@ more cycles altogether: each core's run ends every quantum to publish its clock 
 other's, and the two cores' threads share a cache line or two of the board's state. On a loaded
 machine the threaded mode gives back much of its gain — a core that gets 4000 instructions ahead of
 one the host has descheduled blocks until it runs again.
+
+`dual33.elf` is `dual.c` built for the M33, which `bench-board --board virt33` runs on two M33s:
+368.7 M guest instructions a round against the M0+ build's 573.5 M, in about 0.20 s taking turns
+and 0.12 s on a thread each (single runs, the same loaded machine), against the M0+'s 0.42 s and
+0.24 s.

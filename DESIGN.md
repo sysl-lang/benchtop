@@ -113,7 +113,7 @@ Sources, and how far each was checked:
   skiff's AN521 boots flaky (skiff `CLAUDE.md`, milestone 2: a tick delivered up to 5 ticks late), and
   cortical should not repeat that. `--seed n` jitters the quanta, which explores interleavings
   reproducibly: a skiff race found at seed 1234 recurs at seed 1234.
-- **The virtual board (§11) runs its two M0+ cores this way by default.** A round gives core
+- **The virtual boards (§11) run their two cores this way by default.** A round gives core
   0 a turn and then core 1, each running until its clock (instructions retired plus the time skipped
   asleep) reaches the round's end, `quantum` past the last one's: 1000 instructions by default, a
   board parameter. A turn ends at the core's first taken branch at or past that time, as every run
@@ -575,8 +575,9 @@ loop
   because an interrupt's arrival time is not architecturally fixed. A masked-to-unmasked transition
   ends the block, so a pending interrupt is taken on the next instruction, as the architecture
   requires.
-- **IT blocks** are decoded together. Each of up to four instructions carries its condition, and the
-  ITSTATE is materialised only if an exception lands inside the block.
+- **IT blocks** are decoded together. Each of up to four instructions carries its condition in its
+  handler, and only the instructions of a block keep ITSTATE, for an exception that lands inside one
+  (§2.9).
 
 ### 2.4 Decode caching and the memory fast path
 
@@ -740,6 +741,113 @@ means a HardFault (ARMv6-M ARM, DDI0419, "The ARMv6-M instruction set"):
 **Cost: 1.5–2 agent-days**, most of it the fault model and the tests: which v7-M encodings fault, and
 how. QEMU's `microbit` machine (nRF51, M0) is the differential oracle for v6-M, as §5.1's QEMU harness
 is for v7E-M and v8-M.
+
+### 2.9 The ARMv8-M Mainline core as built
+
+The first item of milestone 1: the integer Thumb-2 instruction set and IT blocks, what a Cortex-M33
+executes without the FP, DSP, Security and MPU extensions. It runs on the `virt33` board (§11).
+
+- **One core with a kind, in the one module.** `Cpu.kind` is `V6m` (the zero value, so every core
+  nobody gave a kind is an M0+) or `V8mMain`; the board sets it from the description's `cores`. The
+  M33 is in `sh.sysl.cortical.v6m`, the module named for its first kind, beside the M0+: `thumb2.sysl`
+  decodes, `t2sem.sysl` is the semantics, `t2threaded.sysl` the handlers, `t2system.sysl` the system
+  registers and instructions, and switch.sysl's `match` loop has the cases. A separate module was the
+  alternative, and it would have needed a second `Cpu`: the record's `op`, the decode arrays, the
+  store-invalidation path, the exception engine and the whole board (`virt.sysl`, `parallel.sysl`) are
+  typed on the one `Cpu` and `Insn`, so the board would have been duplicated for a type. **The ARMv6-M
+  handlers are unchanged code**: `decode` consults the kind once per instruction decoded, never per
+  instruction run, and the new state is at the end of `Cpu`, so the M0+'s speed is unchanged (the
+  same 30.18 G host instructions for the bench's three rounds before and after, the cycles within the
+  machine's noise). The `match` loop is made once per kind (`run_match_of[const V8]`), so its one
+  ARMv8-M test, of ITSTATE, folds away on ARMv6-M.
+- **The record stays 16 bytes, and everything is pre-expanded at decode.** Every operand set fits the
+  three register fields and the word: a modified immediate is expanded, and its carry-out — bit 31 of
+  the value where it was rotated, C itself where not — chooses between two cases (`LogicImm`,
+  `LogicImmC`, the carry in a field); a shift's kind and amount, an addressing mode, a bitfield's
+  position, a fourth register (`MLA`'s Ra, a long multiply's RdHi) and `LDRD`'s offset are packed
+  into the word. So no instruction needs a second record or a table beside the records. A **family**
+  of operations — data processing with a shifted register, with an immediate, the loads and stores of
+  one register, the conditional branches — is one `Op` with the operation in a field, which keeps
+  `Op` a byte; the decoder gives each record the handler instantiated for its operation (and for a
+  shifted register, its shift's kind), so the threaded handler holds that one operation's code and
+  tests nothing. `handler_of` answers the family's generic handler, which reads the field, and the
+  `match` loop switches on the field. A 32-bit instruction's second halfword record is left alone: a
+  branch to it decodes the halfword there as an instruction, as the core would run it.
+- **IT blocks are decoded with their IT, and the fast path never looks at ITSTATE.** Decoding an `IT`
+  decodes the up to four instructions it governs at once, each into its own record with the handler
+  `h_pred[K, L]`, its condition K and its length L in records compiled in; that handler runs the
+  record's own handler (looked up from its `op`) or skips it. A 16-bit data-processing instruction,
+  which sets no flags inside a block, is decoded as the form that does not (`ItAlu`, or the plain
+  `AddImm`, `LoadConst`, `MovHi`). ITSTATE is `cpu.it`, set by `IT` and advanced by `h_pred` alone, so
+  it is right wherever the core can stop or take an exception and costs nothing outside a block. The
+  `match` loop does not read the baked condition: it keeps ITSTATE as the architecture does and tests
+  each instruction against it, so it checks the baking.
+  - **A branch into the middle of a block** is UNPREDICTABLE. ITSTATE is 0 there, and both executors
+    run the instructions left in the block unconditionally, as the block decoded them.
+  - **An exception taken inside a block** (an `SVC` in it, or an interrupt an `MSR` or barrier in it
+    lets in) stacks ITSTATE in the frame's EPSR and clears it; the return restores it and decodes what
+    is left of the block under the restored state, so a handler that rewrites the stacked ITSTATE is
+    obeyed.
+  - **The decode cache keys a record by address alone**, so a halfword reached both inside and
+    outside a block must not keep the wrong decode. The only legal way to do that is to rewrite the
+    code (and `ISB`), and on ARMv8-M a store forgets the records from 16 bytes before it to 18 after
+    (cpu.sysl's `reach_back`, `last_reached`): a store into a block forgets its IT, a store over an IT
+    forgets its block, and the two are decoded again together the next time the IT runs.
+- **The flags stay lazy** (§2.3), and every 32-bit form has its own S and non-S case. Q is a word of
+  its own, set by `SSAT`/`USAT` and read and written through APSR. N and Z both set is held as Z
+  alone, as on ARMv6-M, and `MSR APSR_nzcvq` meets the same limit: writing both reads back Z.
+- **Compare and branch.** As on ARMv6-M a 16-bit `CMP` and the `B<cond>` after it run as one handler,
+  and so does a 32-bit `CMP` with an immediate and a 16-bit `B<cond>` (`fuse_wide`).
+- **The exclusive monitor**, per core, holds the address, size and value of the last load-exclusive.
+  A store-exclusive succeeds where the monitor is set for the same address and size and the memory
+  still holds that value, checked and replaced in one host compare-and-swap; either way the monitor
+  is then clear, as `CLREX`, exception entry and exception return leave it. That rule is the global
+  monitor too, on one thread or two: any store by the other core (or this one, or a device) that
+  changed the value between makes the store-exclusive fail, atomically against the other core's
+  thread. A store of the very value that was there (A, then B, then A) does not, where silicon would;
+  no lock or counter built on the exclusives can tell. An exclusive to a device is an ordinary access.
+  `LDA`/`STL` and `LDAEX`/`STLEX` are the plain and exclusive forms with a host fence on the acquire
+  or release side.
+- **The exception model is §2.2's with the ARMv8-M registers**: BASEPRI and BASEPRI_MAX, FAULTMASK
+  (cleared by every return but NMI's), AIRCR.PRIGROUP (the group priority decides preemption), four
+  priority bits as the RP2350's M33 has them, byte and halfword access to the priority registers,
+  SHPR1, STIR, CCR, and SHCSR's enables stored. CPUID is `0x411FD210`. Thirty-two IRQs. EXC_RETURN
+  has its ARMv7-M values, which ARMv8-M keeps without the Security Extension.
+- **The stack limits.** MSPLIM and PSPLIM are checked on every way an instruction moves SP down — a
+  16- or 32-bit push, `SUB`/`ADD`/`MOV` into SP, a pre- or post-indexed store or load, `STRD`, an
+  `STMDB`/`LDM` with writeback — and on exception entry. A violation is the UsageFault STKOF, which
+  cortical does not take: **the core stops at `Stop.StackLimit`** on the instruction (or, on entry, the
+  address the exception would have returned to), with nothing stored. `MSR` to MSP or PSP is not
+  checked.
+- **Faults are stops**, as on ARMv6-M: an undefined instruction stops at `Undefined`, an access where
+  nothing is at `Unmapped`, a division by zero with CCR.DIV_0_TRP at `Fault` (without it the quotient
+  is 0); MemManage, BusFault and UsageFault are never taken, and CFSR, HFSR, MMFAR and BFAR read 0.
+  An unaligned `LDRD`, `LDM` or exclusive, which faults on silicon, is made as an unaligned access.
+  These, with the escalation to HardFault and its registers, are a later item.
+- **Undefined in this kind**: the floating-point and coprocessor space, the DSP extension (`QADD`,
+  `SADD16`, `SSAT16`, `SMLABB`, the extend-and-adds `SXTAB` and its kin), the Security Extension's
+  `TT`, `SG`, `BXNS` and `BLXNS`, `UDF`, the MPU's registers, and the encodings ARMv8-M calls
+  UNPREDICTABLE that a compiler does not emit (SP or the PC where an encoding may not name them, a
+  load writing back to a register it loads, and the like). A program for this core is built
+  `-mcpu=cortex-m33+nodsp -mfloat-abi=soft`, since GCC's `cortex-m33` has the DSP extension.
+
+**The oracles.** Per-instruction tests against the ARMv8-M ARM's pseudocode run under both executors
+(t2_insns, t2_mem, t2_it, t2_except): the edges of every operand, every shift amount that matters,
+the modified immediate's carry, every condition under every IT mask of one to four instructions on
+every flag state, ITSTATE across exceptions, the limits, the masks. Two oracles nobody here wrote
+check them: **QEMU's Cortex-M33** (`mps2-an505`) runs `examples/virt/isa.c` — 96 instructions, each on
+every pair of 16 edge values from 12 flag states, hashed with their APSR — and `virt33` must print
+the same hashes (`examples/qemu/build.sh` makes them); and **the host** builds `crunch.c` (64-bit
+arithmetic, division, bitfields, switch tables, saturation, IT blocks, an atomic counter), whose
+output both cores must print. The bench kernel built for the M33 gives the host's answer.
+
+**Measured** (`cortical bench --core cortex-m33`, M5 Pro, sysl 0.5.7, `time -l` over three rounds,
+on a machine shared with other work): the bench kernel built for the M33 is 587.5 M guest
+instructions a round against the M0+ build's 667.5 M, 12% fewer. The M33 costs 15.3 host instructions
+and 3.6–3.8 cycles per guest instruction, against the M0+'s 15.1 and 3.3–3.5, so a round takes about
+as long; the two-core bench (`bench-board`, `dual.c`) is 36% fewer instructions on the M33 and half
+the time. No handler on the bench's path switches on a field: the shifted-register forms have a
+handler per shift kind, and the writeback loads and stores one per transfer.
 
 ---
 
@@ -1433,12 +1541,14 @@ succeed. Which Pico is under the kit decides it, and that is the user's to say.
 **What it is for: running a program and talking to it with nothing but the core.** It is
 deliberately not a real chip, so there is no datasheet to follow and no oracle board; a program built
 for it exercises the instruction set, the memory path and a console, and nothing else stands between
-the core and the terminal. It is how the ARMv6-M core runs real C before any real board's devices
-exist, and the smallest machine a test can boot.
+the core and the terminal. It is how the ARMv6-M and ARMv8-M cores run real C before any real
+board's devices exist, and the smallest machine a test can boot. `virt` has two M0+ cores and
+`virt33` two M33s (§2.9), with the same devices at the same addresses.
 
-- **The core** is `sh.sysl.cortical.v6m`: the ARMv6-M interpreter (§2.8) with its two executors,
-  the `become` chain and the `match` loop (§2.3), 1 MB of RAM from address 0 behind a page table, a
-  guard record past the end of RAM, and an `io_read`/`io_write` pair the board fills for every
+- **The core** is `sh.sysl.cortical.v6m`: the ARMv6-M interpreter (§2.8), and the ARMv8-M Mainline
+  one beside it (§2.9), with their two executors, the `become` chain and the `match` loop (§2.3), 1
+  MB of RAM from address 0 behind a page table, a guard record past the end of RAM, and an
+  `io_read`/`io_write` pair the board fills for every
   address with no page, outside the system control space at `0xE000_E000` that the core answers
   itself (§2.2's ARMv6-M paragraph: SysTick, the NVIC, the SCB). A stop names its kind and its
   address (`stop_at`): a breakpoint, an undefined instruction, an access or a jump where nothing is,
@@ -1449,22 +1559,24 @@ exist, and the smallest machine a test can boot.
   record has been decoded from it (or from the 3 bytes after it); every store on the fast path tests
   its line, one load and a branch, and a store to a code line puts back to "not decoded" the records
   of the halfwords written and the one before them, which may be a 32-bit instruction or a compare
-  fused with the branch after it (§2.4). The records and the map are the machine's, so code one core
-  writes is decoded afresh wherever either core next runs it. The line, not the 4 KB page, is the
+  fused with the branch after it (§2.4) — on an M33, from 16 bytes before to 18 after, for the IT
+  blocks (§2.9). The records and the map are the machine's, so code one core writes is decoded
+  afresh wherever either core next runs it. The line, not the 4 KB page, is the
   unit because a C program's data follows its code: on the benchmark, whose hot data shares a page
   with its code, the check costs about 3% more host instructions and no measurable cycles, where a
   page-granular one would send every one of those stores down the slow path.
-- **The board is described by `boards/virt.hocon`**, built into cortical as `virt` (§12.5), and
-  `sh.sysl.cortical.virt` builds the machine from it: each device answers at the `at` and raises the
-  `irq` its part gives, so a description that moves the console (`examples/virt/moved.hocon`) moves
-  it for the guest. `cortical run` runs a description of two `cortex-m0plus` cores, a 1 MB `ram` at 0
-  and at most one `debug-console` and one `virt-sio`, or a product of one such board and nothing
-  outside it; anything else is refused with the reason.
+- **The board is described by `boards/virt.hocon`** (and `boards/virt33.hocon`), built into cortical
+  as `virt` and `virt33` (§12.5), and `sh.sysl.cortical.virt` builds the machine from it: each
+  device answers at the `at` and raises the `irq` its part gives, so a description that moves the
+  console (`examples/virt/moved.hocon`) moves it for the guest. `cortical run` runs a description of
+  two `cortex-m0plus` or two `cortex-m33` cores, a 1 MB `ram` at 0 and at most one `debug-console`
+  and one `virt-sio`, or a product of one such board and nothing outside it; anything else is
+  refused with the reason.
 - **The board** is `sh.sysl.cortical.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
   (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
   the input has ended), EXIT (end with this status) and CTRL (bit 0 enables the console's interrupt).
-  Every other address stops the core with `Unmapped`. Core 0 resets as an M0+ does, SP and PC from
-  the vector table at 0, and an AIRCR reset request ends the board.
+  Every other address stops the core with `Unmapped`. Core 0 resets as every M-profile core does, SP
+  and PC from the vector table at 0, and an AIRCR reset request ends the board.
 - **Two cores, and an SIO after the RP2040's** at `0xD000_0000`, which answers each core by which one
   made the access (the board compares the `Cpu` it is handed):
 
@@ -1675,10 +1787,10 @@ A product's view shows its own parts by name and a board's as `<instance>.<part>
 
 ### 12.5 Bundled boards, and naming one
 
-`virt`, `pico`, `pico2w` and `pico-breadboard-kit` (a product) are embedded in the `cortical`
-binary. **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in.**
-The rule is the same for `board = <name>` at the top of a file, a product's `board = <name>`, and the
-command line, so `--board virt` is always the built-in board even with a file called `virt` in the
+`virt`, `virt33`, `pico`, `pico2w` and `pico-breadboard-kit` (a product) are embedded in the
+`cortical` binary. **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is
+built in.** The rule is the same for `board = <name>` at the top of a file, a product's `board =
+<name>`, and the command line, so `--board virt` is always the built-in board even with a file called `virt` in the
 current directory, which is `./virt`. A path is read relative to the directory of the file that
 names it (absolute paths as they stand). A board named this way is read and checked on its own; its
 mistakes are reported as one, at the name, with its own report as the note. A one-liner is written
@@ -1787,7 +1899,7 @@ Each points at the name or value it is about; `<x>` is the name in the file.
   or prints what it is: the board's chip or cores, each part with its place, wires and parameters,
   what it exposes, and its view; for a product, each board instance and then the same.
 - `cortical run [--board <name | file.hocon>] <image>` runs on `virt` where no board is named. It runs
-  a board of two M0+ cores and the parts cortical emulates on their bus, or a product of one such
-  board and nothing outside it, and refuses anything else with the reason (`cortical does not emulate
+  a board of two M0+ cores or two M33s and the parts cortical emulates on their bus, or a product of
+  one such board and nothing outside it, and refuses anything else with the reason (`cortical does not emulate
   the rp2040`, `cortical runs one board, and this product has 2`).
 - `cortical render` — drawing a description's view to an image — comes with the window (§4).

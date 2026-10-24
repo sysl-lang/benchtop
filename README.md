@@ -10,7 +10,8 @@ ARMv8-M Mainline). It is an interpreter; a JIT is not planned.
 
 ## Status
 
-**The ARMv6-M (Cortex-M0+) core runs, on a virtual board.** No real board is emulated yet.
+**The ARMv6-M (Cortex-M0+) and ARMv8-M Mainline (Cortex-M33, its integer instruction set) cores
+run, on the virtual boards.** No real board is emulated yet.
 [DESIGN.md](DESIGN.md) is the design note: the architecture, the CPU interpreter, each board's
 devices, how fidelity is tested against real boards, and the milestones with their estimates.
 
@@ -20,19 +21,19 @@ devices, how fidelity is tested against real boards, and the milestones with the
 sysl build . -o cortical
 ./cortical run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>
 ./cortical check <name | file.hocon>
-./cortical bench <image.bin> [expected r0] [match | threaded]
-./cortical bench-board <image.elf> [turns | threads]
+./cortical bench [--core <cortex-m0plus | cortex-m33>] <image.bin> [expected r0] [match | threaded]
+./cortical bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
 ```
 
 **`run`** boots an image on the board `--board` names — the virtual board, `virt`, where none is
 named — its console on this terminal a keystroke at a time. It runs a board of two Cortex-M0+ cores
-and the parts cortical emulates on their bus, and refuses any other board with the reason.
-An ELF file's segments are placed at their physical addresses; any other file is loaded as raw bytes
-from address 0. **Ctrl-]** ends cortical whatever the guest is doing, with exit status 130. Otherwise
-the exit status is the one the guest wrote to the console's EXIT register; a guest that stops on a
-breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can wake, or a
-fault the core cannot take gets a message saying where, and status 3 for all but the breakpoint. A
-system reset request (AIRCR) ends it with status 0.
+or two Cortex-M33s and the parts cortical emulates on their bus, and refuses any other board with
+the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
+as raw bytes from address 0. **Ctrl-]** ends cortical whatever the guest is doing, with exit status
+130. Otherwise the exit status is the one the guest wrote to the console's EXIT register; a guest
+that stops on a breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can
+wake, a fault the core cannot take, or (on an M33) a stack-limit violation gets a message saying
+where, and status 3 for all but the breakpoint. A system reset request (AIRCR) ends it with status 0.
 
 The two cores take turns on one host thread, so a run is the same every time. **`--threads`** gives
 each core a host thread of its own once core 1 is launched: faster where both cores are busy, and
@@ -41,8 +42,9 @@ not reproducible, as two real cores are not.
 **`check`** reads a board or product description and holds it to cortical's part library: it
 prints every mistake with its line and column and exits 1, or prints what the description is.
 
-**`bench`** runs a raw image from address 0 to its breakpoint under both executors, three rounds
-each, and reports each one's speed; **`bench-board`** runs an image on the virtual board to its exit,
+**`bench`** runs a raw image from address 0 to its breakpoint on one core (an M0+, or the core
+`--core` names) under both executors, three rounds each, and reports each one's speed;
+**`bench-board`** runs an image on a virtual board (`virt`, or the one `--board` names) to its exit,
 three rounds with the cores taking turns and three with a thread each, and reports both cores'
 speed together. [bench/README.md](bench/README.md) has the numbers.
 
@@ -56,7 +58,7 @@ A description is a HOCON file, and the shortest names a board built into cortica
 board = pico2w
 ```
 
-`virt`, `pico`, `pico2w` and `pico-breadboard-kit` are built in ([boards](boards) has their
+`virt`, `virt33`, `pico`, `pico2w` and `pico-breadboard-kit` are built in ([boards](boards) has their
 sources). **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**,
 on the command line and in a file alike, so `--board virt` is the virtual board and `--board
 ./virt` a file. A path in a file is read from that file's directory.
@@ -105,10 +107,35 @@ red } }`) and never otherwise. Each exposed pin is wired once across the product
 cores' bus has `at`, `size` and `irq`. [DESIGN.md](DESIGN.md) §12 has the whole format and every
 mistake `check` reports.
 
-## The virtual board
+## The cores
 
-A machine that exists only in cortical, for running a program and talking to it with nothing but the
-core — deliberately not a real chip. Two Cortex-M0+ cores:
+| kind | core | what it runs |
+|---|---|---|
+| ARMv6-M | `cortex-m0plus` | the whole ARMv6-M instruction set, its exceptions, SysTick, the NVIC and SCB |
+| ARMv8-M Mainline | `cortex-m33` | the integer Thumb-2 instruction set: every 16- and 32-bit integer encoding, IT blocks, the exclusives, `LDA`/`STL`, hardware divide; BASEPRI, FAULTMASK, PRIGROUP, the stack limits (MSPLIM, PSPLIM) |
+
+One interpreter serves both, configured by the core's kind when it decodes; the M0+ runs no slower
+for the M33 being there. The M33 has no FP, DSP, Security or MPU extension — their encodings are
+undefined, so a program for it is built `-mcpu=cortex-m33+nodsp -mfloat-abi=soft` — and takes no
+configurable fault: where a UsageFault, BusFault or MemManage would be taken, the core stops and
+cortical says why. Each is checked against the ARMv8-M or ARMv6-M ARM instruction by instruction, and
+the M33 against QEMU's too ([DESIGN.md](DESIGN.md) §2.8–§2.9).
+
+The bench kernel (`bench/guest/kernel.c`) built for each, on an M5 Pro:
+
+| core | guest instructions a round | host instructions per guest instruction | cycles per guest instruction |
+|---|---|---|---|
+| M0+ | 667.5 M | 15.1 | 3.3–3.5 |
+| M33 | 587.5 M | 15.3 | 3.6–3.8 |
+
+The M33 build runs 12% fewer instructions in about the same time; on the two-core bench it runs 36%
+fewer, in half the time ([bench/README.md](bench/README.md)).
+
+## The virtual boards
+
+Machines that exist only in cortical, for running a program and talking to it with nothing but the
+core — deliberately not a real chip. `virt` has two Cortex-M0+ cores and `virt33` two Cortex-M33s,
+with the same devices:
 
 | address | what |
 |---|---|
@@ -127,12 +154,13 @@ core — deliberately not a real chip. Two Cortex-M0+ cores:
 
 The console raises IRQ 0 while CTRL bit 0 is set and STATUS is not 0 (a byte is waiting, or the input
 has ended), in each running core's NVIC. The SIO raises IRQ 1 in a core's own NVIC while its VLD, WOF
-or ROE is set. Any other address stops the core, and cortical reports it. Core 0 resets as an M0+
-does: SP from the vector table's first word, PC from its second. Core 1 waits in a boot ROM until core
+or ROE is set. Any other address stops the core, and cortical reports it. Core 0 resets as every
+M-profile core does: SP from the vector table's first word, PC from its second. Core 1 waits in a boot ROM until core
 0 launches it as on the RP2040 (`multicore_launch_core1_raw`): core 0 pushes 0, 0, 1, VTOR, SP and
-ENTRY through the FIFO, each echoed back, and core 1 starts at ENTRY. Each core takes exceptions as an
-M0+ does — SVC, PendSV, SysTick, IRQs, with priorities, PRIMASK and both stacks; SysTick counts one
-per instruction. [DESIGN.md](DESIGN.md) §2.2 says what is modelled and what is not.
+ENTRY through the FIFO, each echoed back, and core 1 starts at ENTRY. Each core takes exceptions as its
+kind does — SVC, PendSV, SysTick, IRQs, with priorities, PRIMASK and both stacks, and on an M33
+BASEPRI, FAULTMASK and the stack limits; SysTick counts one per instruction. [DESIGN.md](DESIGN.md)
+§2.2 and §2.9 say what is modelled and what is not.
 
 **Both cores run on one host thread, taking turns** of 1000 instructions each, so a run is the same
 every time, to the instruction. A core asleep in `WFI` costs nothing while the other runs, and the
@@ -153,9 +181,15 @@ console's interrupt handler while `main` sleeps in `WFI`, and `dual.c`, in which
 1, sends it numbers through the FIFO to be squared in core 1's FIFO interrupt, and both cores print
 under a spinlock. `count.c`, `pingpong.c` and `order.c` are what the tests run on two threads: both
 cores counting under one spinlock, the FIFO run full both ways, and messages passed through RAM with
-`DMB`s. A program handles an exception by defining the function `start.c`'s vector table
-names (`console_handler`, `sio_handler`, `systick_handler`, `svc_handler`, …). Build them with
-`arm-none-eabi-gcc` on the PATH:
+`DMB`s. `crunch.c` is integer arithmetic a compiler makes most of the instruction set of — 64-bit
+division, bitfields, switch tables, saturation, conditional selection — and prints what the same C
+built for the host prints (`crunch.out`). For the M33 alone, `exclusive.c` has both cores add to
+shared counters with no lock, through `LDREX`/`STREX`, and `isa.c` hashes 96 instructions over edge
+values and flag states, which QEMU's Cortex-M33 hashes the same (`isa.qemu`, made by
+`examples/qemu/build.sh`). A program handles an exception by defining the function `start.c`'s
+vector table names (`console_handler`, `sio_handler`, `systick_handler`, `svc_handler`, …). Each
+program is built for `virt` as `<program>.elf` and for `virt33` as `<program>-m33.elf`; build them
+with `arm-none-eabi-gcc` on the PATH:
 
 ```
 zsh examples/virt/build.sh
@@ -163,6 +197,8 @@ zsh examples/virt/build.sh
 ./cortical run examples/virt/irq.elf
 ./cortical run examples/virt/dual.elf
 ./cortical run --threads examples/virt/dual.elf
+./cortical run --board virt33 examples/virt/crunch-m33.elf
+./cortical run --board virt33 --threads examples/virt/exclusive-m33.elf
 ./cortical run --board examples/virt/moved.hocon examples/virt/irq-moved.elf
 ```
 
