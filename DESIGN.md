@@ -1,11 +1,11 @@
 # cortical — a Cortex-M board emulator written in sysl
 
-**Status: a design note. No code exists.** The repo is `sysl-lang/cortical`.
+**Status: the ARMv6-M core runs, in `sh.sysl.cortical.v6m`, on the virtual board (§11); no real
+board is emulated yet. The rest is design.** The repo is `sysl-lang/cortical`.
 
 cortical emulates Cortex-M boards well enough to run, unmodified, the firmware a developer would
 flash onto them: each core on a host thread, a board's display in a Mac window, its UART on a
-terminal, and skiff on every core. It is an interpreter now and is shaped so that a JIT can replace
-the inner loop later. It is written in sysl, and part of its job is to stress the language. A gap
+terminal, and skiff on every core. It is an interpreter. **JIT: not planned.** It is written in sysl, and part of its job is to stress the language. A gap
 found while writing it is reported, not worked around (Rule 9). A board is a **description**: a sysl
 package that names its cores, memory, devices, wiring and panel. Another board is another
 description, not another emulator.
@@ -328,7 +328,7 @@ loop
     interpreter does (`forth/README.md` § "Direct threading through guaranteed tail calls").
   - The machine, the record pointer and the retired count ride in parameters across the chain.
   - A `match` over `Op` is the reference implementation the chain is checked against.
-  - **Measured** (`bench/`, ARMv6-M, M5 Pro, sysl 0.5.4): the chain runs at ~1365 MIPS and the
+  - **Measured** (`cortical bench`, ARMv6-M, M5 Pro, sysl 0.5.4): the chain runs at ~1365 MIPS and the
     `match` loop at ~1195 MIPS over the same records and semantics, so the chain is the executor.
     The records are 16 bytes; register numbers are `u4`, so indexing the sixteen registers needs no
     bounds check (with `u8` fields the chain ran at ~1180 MIPS).
@@ -348,7 +348,8 @@ loop
     measurable: a chain of dependent `ADDS` runs as fast as an independent one.
   - **The profile says where the next factor is not.** 44% of the workload is a nine-instruction
     straight-line CRC loop with no pair as frequent as `CMP`/`B<cond>`, so further fusion reaches
-    little of it; fewer dispatches there means compiling a block, which is the JIT.
+    little of it; fewer dispatches there means compiling a block, which is a JIT, and a JIT is not
+    planned.
 - **A block** is a straight run of decoded instructions ending at a branch, an exception return, a
   write to PC, an instruction that changes interrupt masking (`CPSIE`, `MSR BASEPRI`), an `SVC`, a
   `WFI`/`WFE`, a barrier, or 64 instructions. Interrupts are taken only between blocks, which is legal
@@ -380,9 +381,11 @@ loop
   sub-4 KB region are marked slow and checked per access against the region list. skiff's 64-byte
   stack guard makes the page holding each stack's base a slow page, which is acceptable.
 
-### 2.5 The interface a JIT plugs into
+### 2.5 The interface a JIT would plug into
 
-The interpreter and a future JIT meet at the **block**:
+**JIT: not planned.** The block boundary below is where one would meet the interpreter, and it costs
+the interpreter nothing to keep, so the shape is recorded; nothing is built for it. The two would meet
+at the **block**:
 
 ```
 trait Exec
@@ -411,8 +414,8 @@ same interpreter written in C. The comparison points are predecoded, switch-disp
 interpreters on a current Apple P-core, which reach 100–300 million guest instructions per second
 before any JIT. Against that:
 
-**The first measurement beat this table's estimates by about ten.** The `become` chain in `bench/`
-runs an ARMv6-M workload at ~1365 MIPS on one M5 Pro P-core, with the page-table memory path
+**The first measurement beat this table's estimates by about ten.** The `become` chain, measured
+with `cortical bench` (§2.3), runs an ARMv6-M workload at ~1365 MIPS on one M5 Pro P-core, with the page-table memory path
 and lazy N/Z flags but no interrupts, MPU or IT blocks yet; compare-and-branch fusion and lazy V
 have since cut its cycles per guest instruction by a further 12%. The estimates below are kept as the
 floor to defend; the benchmark after milestone 1 replaces them with Thumb-2 figures.
@@ -422,7 +425,7 @@ floor to defend; the benchmark after milestone 1 replaces them with Thumb-2 figu
 | first correct version (milestone 1 on the M33; the H7 at milestone 5) | 40–60 MIPS | ~10% | ~30% |
 | **target**: predecoded blocks, fast table, lazy flags | **120–180 MIPS** | **~25–35%** | **~70–100%** |
 | stretch: superinstructions for hot pairs, flag liveness | 200–250 MIPS | ~40–50% | real time |
-| a JIT (later) | 800–2000 MIPS | real time | real time |
+| a JIT (not planned) | 800–2000 MIPS | real time | real time |
 
 The two cores are independent host threads on two P-cores, so the figures do not halve. The M4 at
 real speed is within reach of an interpreter. The M7 is not, since dual issue makes it about 520 M
@@ -823,7 +826,7 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
 | wifi | module TBD | — |
 | GDB stub (remote serial protocol over TCP, per core) | very useful for firmware debugging | 2 |
 | `--dcache-model` | §1.5 | 2–3 |
-| a JIT | AArch64 code generation per block behind §2.5 | 15–25 |
+| a JIT — **not planned** | AArch64 code generation per block behind §2.5 | 15–25 |
 
 ---
 
@@ -832,8 +835,8 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
 ### 8.1 Risks
 
 1. **The M7's speed target.** An interpreter will not reach 400 MHz-class M7 throughput, so a UI that
-   is smooth on the board will be choppy in cortical until the JIT exists. §2.6 says what to expect,
-   and the benchmark decides.
+   is smooth on the board will be choppy in cortical, and no JIT is planned to close the gap. §2.6
+   says what to expect, and the benchmark decides.
 2. **Exclusives across cores.** What the H747's interconnect does with an exclusive store to shared
    SRAM (succeed without excluding, or fail) has to be read from RM0399 and the Cortex-M7 TRM, and
    ideally run on the board. Getting it wrong either way hides a skiff bug or invents one. The option
@@ -1199,3 +1202,34 @@ Pico (`picokit/README.md:94–104`). If the Pico in the user's kit is a plain Pi
 change its README describes (call `stdio_init_all` directly) before it runs on that board or in
 cortical. If it is a Pico W, cortical needs the CYW43 item (§7, later) for `cyw43_arch_init` to
 succeed. Which Pico is under the kit decides it, and that is the user's to say.
+
+---
+
+## 11. The virtual board
+
+**What it is for: running a program and talking to it with nothing but the core.** It is
+deliberately not a real chip, so there is no datasheet to follow and no oracle board; a program built
+for it exercises the instruction set, the memory path and a console, and nothing else stands between
+the core and the terminal. It is how the ARMv6-M core runs real C before any real board's devices
+exist, and the smallest machine a test can boot.
+
+- **The core** is `sh.sysl.cortical.v6m`: the ARMv6-M interpreter (§2.8) with its two executors,
+  the `become` chain and the `match` loop (§2.3), 1 MB of RAM from address 0 behind a page table, a
+  guard record past the end of RAM, and an `io_read`/`io_write` pair the board fills for every
+  address with no page. A stop names its kind and its address (`stop_at`): a breakpoint, an undefined
+  instruction, an access or a jump where nothing is, or the guest asking to exit.
+- **The board** is `sh.sysl.cortical.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
+  (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
+  the input has ended) and EXIT (end with this status). Every other address stops the core with
+  `Unmapped`. The core resets as an M0+ does, SP and PC from the vector table at 0.
+- **The console's input is a channel.** `cortical run` fills it from a thread reading the terminal in
+  raw mode a byte at a time; a test fills it itself and closes it, which the guest sees as STATUS's
+  ENDED. Output is buffered and written at a line's end, when the guest reads STATUS or DATA (so a
+  prompt shows before it waits), and when it stops. **Ctrl-]** ends cortical with status 130 whatever
+  the guest is doing, as telnet's escape does.
+- **Images** are ELF-32 little-endian ARM files, loaded by `sysl-lang/elf` at their physical
+  addresses (the package is built with `elf64` and `big_endian` off, so it refuses the others as
+  unsupported), or raw bytes from address 0, up to the RAM's 1 MB.
+- **`examples/virt`** is the C runtime for it (`virt.h`'s register macros, `start.c`'s vector table
+  and reset, `virt.ld`) and `echo.c`, built with `arm-none-eabi-gcc`. The board's tests boot the
+  committed `echo.elf` and check its whole conversation byte for byte.
