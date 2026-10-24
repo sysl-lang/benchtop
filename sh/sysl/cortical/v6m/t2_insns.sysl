@@ -1,0 +1,342 @@
+module sh.sysl.cortical.v6m
+@tests
+
+// The ARMv8-M Mainline instructions one at a time, against the ARMv8-M ARM's pseudocode for each
+// (DDI0553): the result, all four flags, Q, memory and the stack pointer, at the edges where each
+// changes. As insns.sysl does for ARMv6-M, every case runs under both executors, which must also
+// agree with each other on everything, ITSTATE and the exclusive monitor included. The encodings are
+// the GNU assembler's, written beside each case.
+//
+// Flags are a nibble, NZCV, as in insns.sysl.
+
+// `execute` on an M33.
+execute8(code: []const u16, regs: []const u32, nzcv: u32, mem: [][2]u32) -> Cpu
+    var a: Cpu
+    var b: Cpu
+    var words: [(HIGH - LOW) / 4]u32
+
+    a.kind = Kind.V8mMain
+    b.kind = Kind.V8mMain
+
+    prepare(&a, code, regs, nzcv, mem)
+    finish(&a, &run_match)
+    for i in 0..<words.len do words[i] = load32(&a, LOW + u32(i) * 4)
+
+    prepare(&b, code, regs, nzcv, mem)
+    finish(&b, &run_threaded)
+
+    for i in 0..<16 do assert(a.r[i] == b.r[i], s"the executors agree on r$i")
+    assert(flags(&a) == flags(&b) && a.q == b.q, "the executors agree on the flags")
+    assert(a.stop == b.stop && a.stop_at == b.stop_at && a.retired == b.retired && a.pc == b.pc, "and on the stop")
+    assert(a.it == b.it && a.excl == b.excl && a.excl_addr == b.excl_addr, "and on ITSTATE and the monitor")
+    for i in 0..<words.len do assert(words[i] == load32(&b, LOW + u32(i) * 4), "and on memory")
+
+    b
+
+// One instruction gives `value` in `reg` and the flags `want`, at the breakpoint after it.
+gives8(code: []const u16, regs: []const u32, nzcv: u32, reg: u4, value: u32, want: u32) -> bool
+    var c = execute8(code, regs, nzcv, [])
+
+    if c.stop != Stop.Breakpoint || c.retired != 1
+        print(s"stopped at ${c.stop} 0x${c.stop_at} after ${c.retired}")
+        return false
+
+    if c.r[reg] != value || flags(&c) != want
+        print(f"r$reg = 0x${c.r[reg]}%08x, flags ${flags(&c)}%04b")
+        return false
+
+    true
+
+// The same for an instruction that writes a pair or more: each `[register, value]` of `want`.
+gives_all(code: []const u16, regs: []const u32, nzcv: u32, want: [][2]u32) -> bool
+    var c = execute8(code, regs, nzcv, [])
+
+    if c.stop != Stop.Breakpoint then return false
+
+    for w in want
+        if c.r[w[0]] != w[1]
+            print(f"r${w[0]} = 0x${c.r[w[0]]}%08x, not 0x${w[1]}%08x")
+            return false
+
+    true
+
+// ---------------------------------------------------------------------------------------------------
+// Data processing with a modified immediate (`ThumbExpandImm_C`).
+
+@test("a rotated modified immediate's carry-out is its bit 31, and sets C in a flag-setting logical operation")
+t2i_imm_carry_rotated()
+    // ands.w r0, r1, #0x80000000: 0x80 rotated right by 8
+    assert(gives8([0xF011, 0x4000], [0, 0xFFFFFFFF], 0, 0, 0x80000000, 0b1010), "ANDS: C from bit 31, N")
+    assert(gives8([0xF011, 0x4000], [0, 0xFFFFFFFF], 0b0001, 0, 0x80000000, 0b1011), "ANDS keeps V")
+    assert(gives8([0xF011, 0x4000], [0, 0x7FFFFFFF], 0, 0, 0, 0b0110), "ANDS to zero, C still set")
+    // tst.w r1, #0x40000000: rotated, bit 31 clear, so C is cleared
+    assert(gives8([0xF011, 0x4F80], [0, 0x40000000], 0b0010, 1, 0x40000000, 0b0000), "TST clears C")
+    assert(gives8([0xF011, 0x4F80], [0, 0], 0b0010, 1, 0, 0b0100), "TST to zero")
+    // orrs.w r0, r1, #0x3FC: 0xFF rotated right by 30, bit 31 clear
+    assert(gives8([0xF451, 0x707F], [0, 0], 0b0010, 0, 0x3FC, 0b0000), "ORRS clears C")
+    // movs.w r0, #0x80000000
+    assert(gives8([0xF05F, 0x4000], [], 0, 0, 0x80000000, 0b1010), "MOVS")
+
+@test("an unrotated modified immediate leaves C as it was")
+t2i_imm_carry_kept()
+    // ands.w r0, r1, #0xFF
+    assert(gives8([0xF011, 0x00FF], [0, 0x100], 0b0010, 0, 0, 0b0110), "ANDS #0xFF keeps C set")
+    assert(gives8([0xF011, 0x00FF], [0, 0x1FF], 0, 0, 0xFF, 0b0000), "ANDS #0xFF keeps C clear")
+    // ands.w r0, r1, #0x00FF00FF, the 00XY00XY pattern
+    assert(gives8([0xF011, 0x10FF], [0, 0xFFFFFFFF], 0b0011, 0, 0x00FF00FF, 0b0011), "00XY00XY")
+    // eors.w r0, r1, #0xAB00AB00, the XY00XY00 pattern
+    assert(gives8([0xF091, 0x20AB], [0, 0xAB00AB00], 0b0011, 0, 0, 0b0111), "XY00XY00")
+    // teq.w r1, #0xABABABAB, the XYXYXYXY pattern
+    assert(gives8([0xF091, 0x3FAB], [0, 0x2B2B2B2B], 0b0010, 1, 0x2B2B2B2B, 0b1010), "XYXYXYXY")
+
+@test("BICS, ORNS and MVNS take the carry of the immediate before its complement")
+t2i_imm_complement()
+    // bics.w r0, r1, #0x80000000
+    assert(gives8([0xF031, 0x4000], [0, 0xFFFFFFFF], 0, 0, 0x7FFFFFFF, 0b0010), "BICS")
+    // mvns.w r0, #0x80000000
+    assert(gives8([0xF07F, 0x4000], [], 0, 0, 0x7FFFFFFF, 0b0010), "MVNS")
+    // orns r0, r1, #0xFF00: 0xFF rotated right by 24, bit 31 clear
+    assert(gives8([0xF471, 0x407F], [0, 0], 0b0010, 0, 0xFFFF00FF, 0b1000), "ORNS")
+
+@test("the plain immediate forms write the register and leave every flag")
+t2i_imm_plain()
+    // and.w r0, r1, #0x80000000
+    assert(gives8([0xF001, 0x4000], [0, 0xFFFFFFFF], 0b0101, 0, 0x80000000, 0b0101), "AND")
+    // mov.w r0, #0xFF00FF00
+    assert(gives8([0xF04F, 0x20FF], [], 0b1010, 0, 0xFF00FF00, 0b1010), "MOV")
+    // mvn.w r0, #0
+    assert(gives8([0xF06F, 0x0000], [], 0b0101, 0, 0xFFFFFFFF, 0b0101), "MVN")
+    // add.w r0, r1, #0x10000; sub.w r0, r1, #0x10000
+    assert(gives8([0xF501, 0x3080], [0, 0xFFFF0000], 0, 0, 0, 0), "ADD wraps without flags")
+    assert(gives8([0xF5A1, 0x3080], [0, 0], 0, 0, 0xFFFF0000, 0), "SUB")
+    // adc.w r0, r1, #0x1000 with C; sbc.w r0, r1, #0x1000 without
+    assert(gives8([0xF541, 0x5080], [0, 1], 0b0010, 0, 0x1002, 0b0010), "ADC")
+    assert(gives8([0xF561, 0x5080], [0, 0x2000], 0, 0, 0xFFF, 0), "SBC")
+    // rsb r0, r1, #256
+    assert(gives8([0xF5C1, 0x7080], [0, 1], 0b1001, 0, 255, 0b1001), "RSB")
+    // addw r0, r1, #4095; subw r0, r1, #4095
+    assert(gives8([0xF601, 0x70FF], [0, 1], 0, 0, 4096, 0), "ADDW")
+    assert(gives8([0xF6A1, 0x70FF], [0, 0], 0, 0, 0xFFFFF001, 0), "SUBW")
+    // movw r0, #0xBEEF clears the top half; movt r0, #0xDEAD keeps the bottom
+    assert(gives8([0xF64B, 0x60EF], [0xFFFFFFFF], 0, 0, 0xBEEF, 0), "MOVW")
+    assert(gives8([0xF6CD, 0x60AD], [0x1234BEEF], 0, 0, 0xDEADBEEF, 0), "MOVT")
+    // adr.w r0, . + 0x100 and . - 0x10, from address 0: Align(PC, 4) is 4
+    assert(gives8([0xF20F, 0x00FC], [], 0, 0, 0x100, 0), "ADR forward")
+    assert(gives8([0xF2AF, 0x0014], [], 0, 0, 0xFFFFFFF0, 0), "ADR back")
+
+@test("the flag-setting arithmetic immediates at the edges of C and V")
+t2i_imm_arith()
+    // adds.w r0, r1, #1
+    assert(gives8([0xF111, 0x0001], [0, 0x7FFFFFFF], 0, 0, 0x80000000, 0b1001), "ADDS overflow")
+    assert(gives8([0xF111, 0x0001], [0, 0xFFFFFFFF], 0, 0, 0, 0b0110), "ADDS carry")
+    // subs.w r0, r1, #1
+    assert(gives8([0xF1B1, 0x0001], [0, 0], 0, 0, 0xFFFFFFFF, 0b1000), "SUBS borrow")
+    assert(gives8([0xF1B1, 0x0001], [0, 0x80000000], 0, 0, 0x7FFFFFFF, 0b0011), "SUBS overflow")
+    // adcs.w r0, r1, #0 with C in
+    assert(gives8([0xF151, 0x0000], [0, 0xFFFFFFFF], 0b0010, 0, 0, 0b0110), "ADCS")
+    // sbcs.w r0, r1, #0: no C in is a borrow
+    assert(gives8([0xF171, 0x0000], [0, 0], 0, 0, 0xFFFFFFFF, 0b1000), "SBCS borrow in")
+    assert(gives8([0xF171, 0x0000], [0, 0x80000000], 0b0010, 0, 0x80000000, 0b1010), "SBCS no borrow")
+    // rsbs r0, r1, #0
+    assert(gives8([0xF1D1, 0x0000], [0, 0x80000000], 0, 0, 0x80000000, 0b1001), "RSBS overflow")
+    assert(gives8([0xF1D1, 0x0000], [0, 0], 0, 0, 0, 0b0110), "RSBS zero")
+    // cmp.w r1, #0x80000000; cmn.w r1, #1
+    assert(gives8([0xF1B1, 0x4F00], [0, 0x7FFFFFFF], 0, 1, 0x7FFFFFFF, 0b1001), "CMP")
+    assert(gives8([0xF111, 0x0F01], [0, 0xFFFFFFFF], 0, 1, 0xFFFFFFFF, 0b0110), "CMN")
+
+// ---------------------------------------------------------------------------------------------------
+// Data processing with a shifted register (`DecodeImmShift`, `Shift_C`).
+
+@test("the immediate shifts: LSR and ASR by 32, ROR, RRX and LSL #31, with their carries")
+t2i_shift_imm()
+    // lsrs.w r0, r1, #32
+    assert(gives8([0xEA5F, 0x0011], [0, 0x80000000], 0, 0, 0, 0b0110), "LSRS #32, C from bit 31")
+    assert(gives8([0xEA5F, 0x0011], [0, 0x7FFFFFFF], 0b0010, 0, 0, 0b0100), "LSRS #32 clears C")
+    // asrs.w r0, r1, #32
+    assert(gives8([0xEA5F, 0x0021], [0, 0x80000000], 0, 0, 0xFFFFFFFF, 0b1010), "ASRS #32 negative")
+    assert(gives8([0xEA5F, 0x0021], [0, 0x40000000], 0b0010, 0, 0, 0b0100), "ASRS #32 positive")
+    // rors.w r0, r1, #1
+    assert(gives8([0xEA5F, 0x0071], [0, 1], 0, 0, 0x80000000, 0b1010), "RORS #1")
+    // rrxs r0, r1: C shifts in at the top, bit 0 out to C
+    assert(gives8([0xEA5F, 0x0031], [0, 1], 0, 0, 0, 0b0110), "RRXS out")
+    assert(gives8([0xEA5F, 0x0031], [0, 2], 0b0010, 0, 0x80000001, 0b1000), "RRXS in")
+    // lsls.w r0, r1, #31
+    assert(gives8([0xEA5F, 0x70C1], [0, 3], 0, 0, 0x80000000, 0b1010), "LSLS #31")
+    // movs.w r0, r1: LSL #0 leaves C
+    assert(gives8([0xEA5F, 0x0001], [0, 0], 0b0011, 0, 0, 0b0111), "MOVS keeps C and V")
+    // asr.w r0, r1, #1: no flags
+    assert(gives8([0xEA4F, 0x0061], [0, 0x80000000], 0b0110, 0, 0xC0000000, 0b0110), "ASR")
+
+@test("arithmetic with a shifted register, the shifter's carry ignored and RRX reading the old C")
+t2i_shifted_arith()
+    // add.w r0, r1, r2, lsl #2
+    assert(gives8([0xEB01, 0x0082], [0, 1, 3], 0, 0, 13, 0), "ADD LSL #2")
+    // adds.w r0, r1, r2, lsr #1
+    assert(gives8([0xEB11, 0x0052], [0, 0x7FFFFFFF, 2], 0, 0, 0x80000000, 0b1001), "ADDS LSR #1")
+    // adcs.w r0, r1, r2, rrx: RRX of 0 with C is 0x80000000, and the C added is the old one
+    assert(gives8([0xEB51, 0x0032], [0, 0, 0], 0b0010, 0, 0x80000001, 0b1000), "ADCS RRX")
+    // sub.w r0, r1, r2, asr #3
+    assert(gives8([0xEBA1, 0x00E2], [0, 0, 0x80000000], 0, 0, 0x10000000, 0), "SUB ASR #3")
+    // subs.w r0, r1, r2
+    assert(gives8([0xEBB1, 0x0002], [0, 5, 5], 0, 0, 0, 0b0110), "SUBS equal")
+    // rsb r0, r1, r2, lsl #4; rsbs r0, r1, r2
+    assert(gives8([0xEBC1, 0x1002], [0, 1, 1], 0, 0, 15, 0), "RSB")
+    assert(gives8([0xEBD1, 0x0002], [0, 1, 0], 0, 0, 0xFFFFFFFF, 0b1000), "RSBS borrow")
+    // sbcs.w r0, r1, r2
+    assert(gives8([0xEB71, 0x0002], [0, 0x80000000, 1], 0b0010, 0, 0x7FFFFFFF, 0b0011), "SBCS overflow")
+    // cmp.w r1, r2, lsl #1; cmn.w r1, r2
+    assert(gives8([0xEBB1, 0x0F42], [0, 2, 1], 0, 1, 2, 0b0110), "CMP LSL #1")
+    assert(gives8([0xEB11, 0x0F02], [0, 0x7FFFFFFF, 1], 0, 1, 0x7FFFFFFF, 0b1001), "CMN overflow")
+
+@test("logical operations with a shifted register take C from the shifter")
+t2i_shifted_logic()
+    // ands.w r0, r1, r2, lsl #1: bit 31 of r2 shifts out
+    assert(gives8([0xEA11, 0x0042], [0, 0xFFFFFFFF, 0x80000001], 0, 0, 2, 0b0010), "ANDS")
+    // bic.w r0, r1, r2, ror #8
+    assert(gives8([0xEA21, 0x2032], [0, 0xFFFFFFFF, 0xFF], 0, 0, 0x00FFFFFF, 0), "BIC ROR #8")
+    // bics.w r0, r1, r2, lsl #1
+    assert(gives8([0xEA31, 0x0042], [0, 0xFFFFFFFF, 0x80000000], 0, 0, 0xFFFFFFFF, 0b1010), "BICS")
+    // orn r0, r1, r2; orns r0, r1, r2, lsr #1
+    assert(gives8([0xEA61, 0x0002], [0, 0, 0x0F0F0F0F], 0, 0, 0xF0F0F0F0, 0), "ORN")
+    assert(gives8([0xEA71, 0x0052], [0, 0, 0xFFFFFFFF], 0, 0, 0x80000000, 0b1010), "ORNS")
+    // mvns.w r0, r1, lsr #1
+    assert(gives8([0xEA7F, 0x0051], [0, 1], 0, 0, 0xFFFFFFFF, 0b1010), "MVNS")
+    // eors.w r0, r1, r2, asr #31: bit 30 is the carry
+    assert(gives8([0xEA91, 0x70E2], [0, 0, 0x80000000], 0b0010, 0, 0xFFFFFFFF, 0b1000), "EORS ASR #31")
+    // teq r1, r2, lsl #1; tst.w r1, r2, lsr #1
+    assert(gives8([0xEA91, 0x0F42], [0, 2, 1], 0b0010, 1, 2, 0b0100), "TEQ")
+    assert(gives8([0xEA11, 0x0F52], [0, 0x80000000, 0xFFFFFFFF], 0, 1, 0x80000000, 0b0110), "TST")
+    // orr.w r0, r1, r2, lsl #16
+    assert(gives8([0xEA41, 0x4002], [0, 0x1234, 0x5678], 0, 0, 0x56781234, 0), "ORR LSL #16")
+
+// The shifts by a register, r0 = r1 shifted by r2, `op` the first halfword of the encoding.
+shifted_by(op: u16, x: u32, by: u32, nzcv: u32, value: u32, want: u32) -> bool = gives8([op, 0xF002], [0, x, by], nzcv, 0, value, want)
+
+@test("shifts by a register: amounts 0, 1, 31, 32, 33 and 255, and only the bottom byte counts")
+t2i_shift_reg()
+    val x: u32 = 0x80000001
+    // lsl.w and lsls.w
+    assert(shifted_by(0xFA01, x, 0, 0, x, 0), "LSL 0")
+    assert(shifted_by(0xFA01, x, 1, 0, 2, 0), "LSL 1")
+    assert(shifted_by(0xFA01, x, 32, 0, 0, 0), "LSL 32")
+    assert(shifted_by(0xFA01, x, 256, 0, x, 0), "LSL 256 is LSL 0")
+    assert(shifted_by(0xFA11, x, 0, 0b0010, x, 0b1010), "LSLS 0 keeps C")
+    assert(shifted_by(0xFA11, x, 1, 0, 2, 0b0010), "LSLS 1")
+    assert(shifted_by(0xFA11, x, 31, 0b0010, 0x80000000, 0b1000), "LSLS 31")
+    assert(shifted_by(0xFA11, x, 32, 0, 0, 0b0110), "LSLS 32: C is bit 0")
+    assert(shifted_by(0xFA11, x, 33, 0b0010, 0, 0b0100), "LSLS 33")
+    assert(shifted_by(0xFA11, x, 255, 0b0010, 0, 0b0100), "LSLS 255")
+    // lsr.w and lsrs.w
+    assert(shifted_by(0xFA21, x, 33, 0, 0, 0), "LSR 33")
+    assert(shifted_by(0xFA31, x, 1, 0, 0x40000000, 0b0010), "LSRS 1")
+    assert(shifted_by(0xFA31, x, 31, 0b0010, 1, 0b0000), "LSRS 31")
+    assert(shifted_by(0xFA31, x, 32, 0, 0, 0b0110), "LSRS 32: C is bit 31")
+    assert(shifted_by(0xFA31, x, 33, 0b0010, 0, 0b0100), "LSRS 33")
+    // asr.w and asrs.w
+    assert(shifted_by(0xFA41, x, 255, 0, 0xFFFFFFFF, 0), "ASR 255")
+    assert(shifted_by(0xFA51, x, 1, 0, 0xC0000000, 0b1010), "ASRS 1")
+    assert(shifted_by(0xFA51, x, 31, 0b0010, 0xFFFFFFFF, 0b1000), "ASRS 31")
+    assert(shifted_by(0xFA51, x, 32, 0, 0xFFFFFFFF, 0b1010), "ASRS 32")
+    assert(shifted_by(0xFA51, x, 33, 0, 0xFFFFFFFF, 0b1010), "ASRS 33")
+    // ror.w and rors.w
+    assert(shifted_by(0xFA61, x, 33, 0, 0xC0000000, 0), "ROR 33 is ROR 1")
+    assert(shifted_by(0xFA71, x, 0, 0, x, 0b1000), "RORS 0 keeps C")
+    assert(shifted_by(0xFA71, x, 1, 0, 0xC0000000, 0b1010), "RORS 1")
+    assert(shifted_by(0xFA71, x, 32, 0, x, 0b1010), "RORS 32: C is bit 31")
+
+// ---------------------------------------------------------------------------------------------------
+// Bitfields, bits and bytes, extends.
+
+@test("BFI, BFC, UBFX and SBFX, from a bit to the whole word")
+t2i_bitfield()
+    // bfi r0, r1, #4, #8; bfi r0, r1, #0, #32
+    assert(gives8([0xF361, 0x100B], [0xFFFFFFFF, 0x12345678], 0, 0, 0xFFFFF78F, 0), "BFI")
+    assert(gives8([0xF361, 0x001F], [0, 0xDEADBEEF], 0, 0, 0xDEADBEEF, 0), "BFI 32 bits")
+    // bfc r0, #31, #1
+    assert(gives8([0xF36F, 0x70DF], [0xFFFFFFFF], 0, 0, 0x7FFFFFFF, 0), "BFC")
+    // ubfx r0, r1, #4, #8; ubfx r0, r1, #0, #32
+    assert(gives8([0xF3C1, 0x1007], [0, 0x12345678], 0, 0, 0x67, 0), "UBFX")
+    assert(gives8([0xF3C1, 0x001F], [0, 0x87654321], 0, 0, 0x87654321, 0), "UBFX 32 bits")
+    // sbfx r0, r1, #4, #8; sbfx r0, r1, #31, #1
+    assert(gives8([0xF341, 0x1007], [0, 0xF80], 0, 0, 0xFFFFFFF8, 0), "SBFX negative")
+    assert(gives8([0xF341, 0x70C0], [0, 0x80000000], 0, 0, 0xFFFFFFFF, 0), "SBFX one bit set")
+    assert(gives8([0xF341, 0x70C0], [0, 0x7FFFFFFF], 0, 0, 0, 0), "SBFX one bit clear")
+
+@test("CLZ, RBIT, REV, REV16 and REVSH")
+t2i_bits()
+    // clz r0, r1
+    assert(gives8([0xFAB1, 0xF081], [0, 0], 0, 0, 32, 0), "CLZ 0")
+    assert(gives8([0xFAB1, 0xF081], [0, 1], 0, 0, 31, 0), "CLZ 1")
+    assert(gives8([0xFAB1, 0xF081], [0, 0x80000000], 0, 0, 0, 0), "CLZ top")
+    assert(gives8([0xFAB1, 0xF081], [0, 0x00010000], 0, 0, 15, 0), "CLZ 15")
+    // rbit r0, r1
+    assert(gives8([0xFA91, 0xF0A1], [0, 1], 0, 0, 0x80000000, 0), "RBIT 1")
+    assert(gives8([0xFA91, 0xF0A1], [0, 0x12345678], 0, 0, 0x1E6A2C48, 0), "RBIT")
+    // rev.w, rev16.w, revsh.w r0, r1
+    assert(gives8([0xFA91, 0xF081], [0, 0x12345678], 0, 0, 0x78563412, 0), "REV")
+    assert(gives8([0xFA91, 0xF091], [0, 0x12345678], 0, 0, 0x34127856, 0), "REV16")
+    assert(gives8([0xFA91, 0xF0B1], [0, 0x12345680], 0, 0, 0xFFFF8056, 0), "REVSH")
+
+@test("the extends rotate first: SXTB ROR #8, SXTH ROR #16, UXTB ROR #24, UXTH")
+t2i_extend()
+    assert(gives8([0xFA4F, 0xF091], [0, 0x00008000], 0, 0, 0xFFFFFF80, 0), "SXTB ROR #8")
+    assert(gives8([0xFA0F, 0xF0A1], [0, 0x80000000], 0, 0, 0xFFFF8000, 0), "SXTH ROR #16")
+    assert(gives8([0xFA5F, 0xF0B1], [0, 0x12000000], 0, 0, 0x12, 0), "UXTB ROR #24")
+    assert(gives8([0xFA1F, 0xF081], [0, 0xFFFF8001], 0, 0, 0x8001, 0), "UXTH")
+
+// ---------------------------------------------------------------------------------------------------
+// Multiplies, divides, saturation.
+
+@test("MUL, MLA and MLS keep the low word, and set no flags")
+t2i_multiply()
+    assert(gives8([0xFB01, 0xF002], [0, 0xFFFFFFFF, 3], 0b0110, 0, 0xFFFFFFFD, 0b0110), "MUL")
+    assert(gives8([0xFB01, 0x3002], [0, 2, 3, 4], 0, 0, 10, 0), "MLA")
+    assert(gives8([0xFB01, 0x3012], [0, 2, 3, 4], 0, 0, 0xFFFFFFFE, 0), "MLS")
+
+@test("the long multiplies: both halves, signed and not, and the accumulate's carry between them")
+t2i_long_multiply()
+    // umull r0, r1, r2, r3
+    assert(gives_all([0xFBA2, 0x0103], [0, 0, 0xFFFFFFFF, 0xFFFFFFFF], 0, [[0, 1], [1, 0xFFFFFFFE]]), "UMULL")
+    // smull r0, r1, r2, r3
+    assert(gives_all([0xFB82, 0x0103], [0, 0, 0xFFFFFFFF, 0xFFFFFFFF], 0, [[0, 1], [1, 0]]), "SMULL -1 * -1")
+    assert(gives_all([0xFB82, 0x0103], [0, 0, 0x80000000, 0x80000000], 0, [[0, 0], [1, 0x40000000]]), "SMULL min * min")
+    // umlal r0, r1, r2, r3: 0x1_FFFFFFFF + 0xFFFFFFFF * 2
+    assert(gives_all([0xFBE2, 0x0103], [0xFFFFFFFF, 1, 0xFFFFFFFF, 2], 0, [[0, 0xFFFFFFFD], [1, 3]]), "UMLAL")
+    // smlal r0, r1, r2, r3: 0 + -1 * 2, and 1 + -1 * 2
+    assert(gives_all([0xFBC2, 0x0103], [0, 0, 0xFFFFFFFF, 2], 0, [[0, 0xFFFFFFFE], [1, 0xFFFFFFFF]]), "SMLAL")
+    assert(gives_all([0xFBC2, 0x0103], [0, 1, 0xFFFFFFFF, 2], 0, [[0, 0xFFFFFFFE], [1, 0]]), "SMLAL carries")
+
+@test("UDIV and SDIV round towards zero, divide by zero to 0 with DIV_0_TRP clear, and 0x80000000 / -1 is itself")
+t2i_divide()
+    // udiv r0, r1, r2
+    assert(gives8([0xFBB1, 0xF0F2], [9, 7, 2], 0, 0, 3, 0), "UDIV")
+    assert(gives8([0xFBB1, 0xF0F2], [9, 7, 0], 0, 0, 0, 0), "UDIV by 0")
+    assert(gives8([0xFBB1, 0xF0F2], [9, 0xFFFFFFFF, 1], 0, 0, 0xFFFFFFFF, 0), "UDIV by 1")
+    // sdiv r0, r1, r2
+    assert(gives8([0xFB91, 0xF0F2], [9, 0xFFFFFFF9, 2], 0, 0, 0xFFFFFFFD, 0), "SDIV -7 / 2")
+    assert(gives8([0xFB91, 0xF0F2], [9, 7, 0xFFFFFFFE], 0, 0, 0xFFFFFFFD, 0), "SDIV 7 / -2")
+    assert(gives8([0xFB91, 0xF0F2], [9, 0x80000000, 0xFFFFFFFF], 0, 0, 0x80000000, 0), "SDIV min / -1")
+    assert(gives8([0xFB91, 0xF0F2], [9, 5, 0], 0, 0, 0, 0), "SDIV by 0")
+
+// One saturation, r0 from r1: the value and Q.
+saturates(code: [2]u16, x: u32, value: u32, q: u32) -> bool
+    var c = execute8(code[..], [0, x], 0, [])
+
+    c.stop == Stop.Breakpoint && c.r[0] == value && c.q == q
+
+@test("SSAT and USAT clamp to their range, after the shift, and set Q only when they clamp")
+t2i_saturate()
+    // ssat r0, #8, r1
+    assert(saturates([0xF301, 0x0007], 200, 127, 1), "SSAT 8 high")
+    assert(saturates([0xF301, 0x0007], 0xFFFFFF38, 0xFFFFFF80, 1), "SSAT 8 low")
+    assert(saturates([0xF301, 0x0007], 100, 100, 0), "SSAT 8 in range")
+    // ssat r0, #16, r1, lsl #4; ssat r0, #32, r1, asr #1
+    assert(saturates([0xF301, 0x100F], 0x1000, 0x7FFF, 1), "SSAT 16 LSL #4")
+    assert(saturates([0xF321, 0x005F], 0x80000000, 0xC0000000, 0), "SSAT 32 ASR #1")
+    // usat r0, #8, r1; usat r0, #0, r1; usat r0, #31, r1, asr #31
+    assert(saturates([0xF381, 0x0008], 300, 255, 1), "USAT 8 high")
+    assert(saturates([0xF381, 0x0008], 0xFFFFFFFB, 0, 1), "USAT 8 negative")
+    assert(saturates([0xF381, 0x0008], 77, 77, 0), "USAT 8 in range")
+    assert(saturates([0xF381, 0x0000], 5, 0, 1), "USAT 0")
+    assert(saturates([0xF381, 0x0000], 0, 0, 0), "USAT 0 of 0")
+    assert(saturates([0xF3A1, 0x70DF], 0x80000000, 0, 1), "USAT 31 ASR #31")
