@@ -88,8 +88,19 @@ Sources, and how far each was checked:
 | core 1 (CM4) | the interpreter for the M4 | the same for the M4 |
 | io | blocking host I/O: the UART back-end (stdio, pty or TCP) and the files that tests write | host descriptors |
 
-- **Devices run on no thread of their own.** A device is a passive object: an MMIO access runs its
-  handler on the thread of the core that made it. A timed event (a timer overflow, the end of a UART
+- **Which work runs on a core's thread and which on a worker follows the real hardware.**
+  - Whatever a register access does within its own bus cycle runs inline, on the thread of the core
+    that made it: register decode, timers, the NVIC and SysTick, and the immediate effects of a
+    register write.
+  - Whatever the real chip does concurrently with the core runs on worker threads, on other host
+    cores: DMA, LTDC and DMA2D compositing and drawing to the host window, audio output, the USB
+    bridge, file-backed storage.
+  - A worker's result takes effect at a virtual time the core decides (§1.3), and the core waits for
+    it there if the worker is late. The parallelism changes only the speed, never a result.
+  - The virtual board's console (§11) is the existing case: a thread pumps the terminal's input into
+    a channel, and the core takes a byte from it only when the guest reads DATA or between runs.
+- **Device registers run on no thread of their own.** A device is a passive object: an MMIO access
+  runs its handler on the thread of the core that made it. A timed event (a timer overflow, the end of a UART
   character, LTDC vsync) runs on whichever core thread first finds it due (§1.3).
 - **Each device has one lock**, held for an access or an event. Both cores really do reach the same
   devices on the H747 (RCC, GPIO, EXTI, HSEM), so the lock is necessary. It is uncontended in the
@@ -363,6 +374,38 @@ cannot either the core stops at `Asleep`, its PC after the `WFI`.
 
 **N and Z both set**, which `MSR APSR` or a crafted frame can write and no instruction can produce, is
 kept as Z alone: the lazy flags (§2.3) hold N and Z as one word, whose sign is N and whose zeroness Z.
+
+**Where a stop leaves the core.** A stop records its kind and an address (`stop_at`), and leaves `pc`
+and `retired` where the guest was, the same under both executors:
+
+- **An access that stops the core** — to nothing (`Unmapped`), or one the device answers by stopping
+  it (`Exit`, `Reset`) — stops it **on the instruction that made it**. `pc` is that instruction,
+  `retired` does not count it, `stop_at` is the address accessed, and nothing after it runs. A load
+  writes no register and a single store writes nothing; the device has acted on a write it stopped
+  on, so the guest's exit status is the value it stored. A transfer of several words (`LDM`, `STM`,
+  `PUSH`, `POP`) ends at the word that stopped it, with its base register or SP as it was. The words
+  before it have moved, as an M0+ abandoning the instruction would have moved them: a store has
+  written them, and a load has written their registers, which the ARMv6-M ARM leaves UNKNOWN.
+- **A jump off the RAM** stops at its target: `pc` and `stop_at` are both the target with bit 0
+  clear, and the branch is retired. That covers `BX`, `BLX`, `MOV pc`, `POP {pc}`, an exception
+  return whose stacked return address is off the RAM, a direct `B`, `BL` or `B<cond>` (decoded as a
+  `Leave` record that keeps the target, and never fused with a compare), and running off the end of
+  RAM, where both are `0x0010_0000`.
+- **An exception return whose frame is off the RAM** stops on the `BX` or `POP` that made it, the
+  branch retired and nothing restored; **an exception entry whose frame or vector is off the RAM**
+  stops with nothing of the exception state changed, `pc` on the `SVC` or where the interrupted
+  code would have resumed. `Fault` stops on the instruction (or, for a vector without its Thumb bit,
+  with `pc` the vector's address); `Breakpoint` and `Undefined` on the instruction, not retired;
+  `Asleep` after the `WFI`.
+
+None of this is on the fast path. A load or store answers whether its access was made, and only its
+slow path can answer no: on the fast path the answer is a constant and the handler's test of it
+folds away, so the fast paths of the loads, stores and branches compile to the same instructions as
+before. A handler whose access stopped the core returns from that slow path instead of going on to
+the next record. A taken branch that finds its budget spent leaves `pc` alone when a stop has set it,
+a test made only on that already-slow exit. Measured as above, 15 runs each way on a loaded machine:
+3.28 cycles and 14.64 host instructions per guest instruction before, 3.31 and 14.58 after — the
+cycle difference within the runs' spread, the instruction count lower.
 
 ### 2.3 The dispatch loop
 
@@ -1276,7 +1319,9 @@ exist, and the smallest machine a test can boot.
   address with no page, outside the system control space at `0xE000_E000` that the core answers
   itself (§2.2's ARMv6-M paragraph: SysTick, the NVIC, the SCB). A stop names its kind and its
   address (`stop_at`): a breakpoint, an undefined instruction, an access or a jump where nothing is,
-  the guest asking to exit, a `WFI` nothing can wake, a fault it cannot take, or a reset request.
+  the guest asking to exit, a `WFI` nothing can wake, a fault it cannot take, or a reset request; it
+  leaves `pc` where the guest was (§2.2, "Where a stop leaves the core"), and `cortical run`'s message
+  names both.
 - **The board** is `sh.sysl.cortical.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
   (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
   the input has ended), EXIT (end with this status) and CTRL (bit 0 enables the console's interrupt).
