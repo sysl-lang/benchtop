@@ -13,6 +13,14 @@ module sh.sysl.cortical.v6m
 // core's own (except.sysl). Devices live at addresses the page table leaves empty, and the core hands
 // such an access to the board through `io_read` and `io_write`.
 //
+// **A store never leaves a stale record behind.** Writes have a page table of their own, the same as
+// the reads' except that a page holding a decoded record has no entry in it: decoding takes the page
+// out. A store to such a page goes the slow way, writes the RAM, and puts back to "not decoded" every
+// record whose bytes it touched — the records of the halfwords written and the one before them, which
+// may be a 32-bit instruction or a compare fused with the branch after it. The records and both
+// tables are the machine's, shared by every core, so code one core writes is decoded afresh when any
+// core next runs it. A page of data alone keeps its entry, and its stores stay on the fast path.
+//
 // **The flags are kept lazily.** N and Z are both read from `nz`, the last flag-setting result: N is
 // its top bit and Z is whether it is zero. C is 0 or 1. V is kept as the last addition that set it —
 // its two operands and its result — and worked out only when a condition reads it, which a signed
@@ -26,6 +34,9 @@ const RAM_BYTES: u32 = 1024 * 1024
 // page's first byte, or 0 for a page with no fast path.
 const PAGE_SHIFT: u32 = 12
 const PAGES = 1 << 20
+
+// A line of RAM is the unit a store is checked against for code, once it is on a page that holds some.
+const LINE_SHIFT: u32 = 6
 
 // The handler type: every handler takes the machine, the record it is to execute, and the count of
 // instructions retired so far, and replaces its own frame with the next handler's.
@@ -86,6 +97,8 @@ struct Cpu
     stop_at: u32
     exit_code: u32
     pages: *usize
+    // The machine's `code_lines`.
+    lines: *u8
     dec: *Insn
     io_read: IoRead
     io_write: IoWrite
@@ -123,6 +136,9 @@ struct Cpu
 
 var ram: [1048576]u8
 var page_table: [1048576]usize
+// One byte per 64-byte line of RAM, set once a record has been decoded from it or from the 3 bytes
+// after it.
+var code_lines: [16384]u8
 // One record per halfword of RAM, and the record for everywhere else.
 var decoded: [524289]Insn
 
@@ -132,10 +148,8 @@ reset(cpu: *Cpu, image: []const u8, entry: u32)
     for i in 0..<image.len do ram[i] = image[i]
     for i in 0..<page_table.len do page_table[i] = 0
     for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do page_table[p] = usize(&ram[p << PAGE_SHIFT])
-
-    val blank = Insn(&h_decode, 0, Op.Undecoded, 0, 0, 0)
-
-    for i in 0..<decoded.len do decoded[i] = blank
+    for i in 0..<code_lines.len do code_lines[i] = 0
+    for i in 0..<decoded.len do decoded[i] = undecoded()
 
     clear(cpu, entry)
     cpu.io_read = &no_device_read
@@ -156,6 +170,7 @@ clear(cpu: *Cpu, entry: u32)
     cpu.stop_at = 0
     cpu.exit_code = 0
     cpu.pages = &page_table[0]
+    cpu.lines = &code_lines[0]
     cpu.dec = &decoded[0]
     clear_exceptions(cpu)
 
@@ -199,6 +214,34 @@ no_device_read(cpu: *Cpu, a: u32, width: u32) -> u32
     0
 
 no_device_write(cpu: *Cpu, a: u32, width: u32, x: u32) = halt(cpu, Stop.Unmapped, a)
+
+// A record that decodes itself the first time control reaches it.
+@inline
+undecoded() -> Insn = Insn(&h_decode, 0, Op.Undecoded, 0, 0, 0)
+
+// The record at RAM address `pc` is being decoded from the bytes `pc` to `pc + 3`. A store whose
+// first byte is within 3 of them may write one of them, so the lines holding `pc - 3` to `pc + 3` are
+// marked as holding code.
+holds_code(pc: u32)
+    val from = if pc >= 4 then pc - 4 else 0
+    val to = if pc + 2 < RAM_BYTES then pc + 2 else RAM_BYTES - 1
+
+    for a in from..to do code_lines[a >> LINE_SHIFT] = 1
+
+// The store of `width` bytes just made at RAM address `a`: where it is on a line holding code, every
+// record that read any of its bytes is decoded again when control next reaches it.
+@inline
+stored(cpu: *Cpu, a: u32, width: u32)
+    if cpu.lines[a >> LINE_SHIFT] != 0 then forget(cpu, a, width)
+
+// Put back to "not decoded" the records that read the `width` bytes at `a`: the halfwords' own, and
+// the one before them.
+@noinline
+@cold
+forget(cpu: *Cpu, a: u32, width: u32)
+    val first = if a >= 2 then (a >> 1) - 1 else 0
+
+    for i in first..((a + width - 1) >> 1) do if cpu.dec[i].op != Op.Undecoded then cpu.dec[i] = undecoded()
 
 // The record a direct branch goes to: its `imm` is a signed count of records from its own.
 @inline
@@ -299,6 +342,7 @@ store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
         return cpu.stop == Stop.Budget
 
     host_write(page, a, width, x)
+    stored(cpu, a, width)
     true
 
 // The same accesses where nothing stops on them: the exception model's stacking and the host's own.
@@ -327,34 +371,24 @@ read8(cpu: *Cpu, a: u32, n: u64) -> u32
     host_read(page, a, 1)
 
 @inline
-write32(cpu: *Cpu, a: u32, x: u32, n: u64)
+write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
     val page = page_of(cpu, a)
 
     if page == 0
-        slow_write(cpu, a, 4, x, n)
+        slow_write(cpu, a, width, low_bytes(x, width), n)
         return
 
-    host_write(page, a, 4, x)
+    host_write(page, a, width, x)
+    stored(cpu, a, width)
 
 @inline
-write16(cpu: *Cpu, a: u32, x: u32, n: u64)
-    val page = page_of(cpu, a)
-
-    if page == 0
-        slow_write(cpu, a, 2, x & 0xFFFF, n)
-        return
-
-    host_write(page, a, 2, x)
+write32(cpu: *Cpu, a: u32, x: u32, n: u64) = write(cpu, a, 4, x, n)
 
 @inline
-write8(cpu: *Cpu, a: u32, x: u32, n: u64)
-    val page = page_of(cpu, a)
+write16(cpu: *Cpu, a: u32, x: u32, n: u64) = write(cpu, a, 2, x, n)
 
-    if page == 0
-        slow_write(cpu, a, 1, x & 0xFF, n)
-        return
-
-    host_write(page, a, 1, x)
+@inline
+write8(cpu: *Cpu, a: u32, x: u32, n: u64) = write(cpu, a, 1, x, n)
 
 load32(cpu: *Cpu, a: u32) -> u32 = read32(cpu, a, cpu.retired)
 
