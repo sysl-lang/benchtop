@@ -256,3 +256,71 @@ t2m_table()
     // tbb [r1, r0]: the table in data
     var c = execute8([0xE8D1, 0xF000, 0xBE01, 0xBE02], [1, 0x1000], 0, [[0x1000, 0x0100]])
     assert(c.stop_at == 6 && c.retired == 1, "TBB from a register")
+
+// `cmp.w r0, #imm` (`cmp`, its two halfwords), then `B<cond>` over a `MOVS r2, #1` to a `MOVS r2, #2`,
+// on an M33: both executors take the branch exactly when the comparison holds, and retire three.
+wide_branches_as_compared(cmp: [2]u16, cond: u32, a: u32, b: u32) -> bool
+    val code: []const u16 = [cmp[0], cmp[1], u16(0xD001 | (cond << 8)), 0x2201, 0xBE00, 0x2202, 0xBE00]
+    val want: u32 = if compare_holds(cond, a, b) then 2 else 1
+    var cpu: Cpu
+
+    cpu.kind = Kind.V8mMain
+
+    for exec in [&run_match, &run_threaded]
+        program(&cpu, exec, code, a, 0, 1000)
+
+        if cpu.stop != Stop.Breakpoint || cpu.r[2] != want || cpu.retired != 3 then return false
+
+    true
+
+@test("a 32-bit CMP fused with the 16-bit B<cond> after it branches exactly when the comparison holds")
+t2m_fused_wide()
+    val values: []u32 = [0, 1, 2, 0x7FFFFFFF, 0x80000000, 0x80000001, 0xFF00FF00, 0xFFFFFFFF]
+
+    for cond in 0u32..<14
+        for a in values
+            // cmp.w r0, #0x80000000; cmp.w r0, #1; cmp.w r0, #0xFF00FF00
+            assert(wide_branches_as_compared([0xF1B0, 0x4F00], cond, a, 0x80000000), s"#0x80000000, condition $cond, $a")
+            assert(wide_branches_as_compared([0xF1B0, 0x0F01], cond, a, 1), s"#1, condition $cond, $a")
+            assert(wide_branches_as_compared([0xF1B0, 0x2FFF], cond, a, 0xFF00FF00), s"#0xFF00FF00, condition $cond, $a")
+
+@test("a fused 32-bit CMP and branch: every budget stops both executors at the same place, and a branch to the branch half runs it alone")
+t2m_fused_wide_budget()
+    var cpu: Cpu
+
+    cpu.kind = Kind.V8mMain
+
+    // adds r0, #1; cmp.w r0, #1000; bne back
+    for exec in [&run_match, &run_threaded]
+        for quantum in [1u64, 2, 7, 1000]
+            program(&cpu, exec, [0x3001, 0xF5B0, 0x7F7A, 0xD1FB, 0xBE00], 0, 0, quantum)
+            assert(cpu.stop == Stop.Breakpoint && cpu.r[0] == 1000 && cpu.retired == 3000, s"quantum $quantum: ${cpu.stop} ${cpu.r[0]} ${cpu.retired} ${cpu.pc}")
+
+    // movs r2, #0; cmp.w r0, #0; beq 14; adds r2, #1; subs r0, #1; b 6 (to the beq); bkpt
+    for exec in [&run_match, &run_threaded]
+        program(&cpu, exec, [0x2200, 0xF1B0, 0x0F00, 0xD002, 0x3201, 0x3801, 0xE7FB, 0xBE00], 3, 0, 1000)
+        assert(cpu.stop == Stop.Breakpoint && cpu.r[2] == 3, "into the branch half")
+
+@test("a store over the branch of a fused 32-bit CMP decodes the pair again")
+t2m_fused_wide_rewritten()
+    var cpu: Cpu
+
+    cpu.kind = Kind.V8mMain
+
+    // cmp.w r0, #0; beq over movs r2, #1 to movs r2, #2
+    for exec in [&run_match, &run_threaded]
+        program(&cpu, exec, [0xF1B0, 0x0F00, 0xD001, 0x2201, 0xBE00, 0x2202, 0xBE00], 0, 0, 1000)
+        assert(cpu.r[2] == 2, "BEQ taken")
+
+        // The same records again, the branch now BNE.
+        store16(&cpu, 4, 0xD101)
+        cpu.r[2] = 0
+        cpu.pc = 0
+        cpu.retired = 0
+        cpu.stop = Stop.Budget
+
+        while cpu.stop == Stop.Budget
+            cpu.limit = cpu.retired + 1000
+            exec(&cpu)
+
+        assert(cpu.stop == Stop.Breakpoint && cpu.r[2] == 1 && cpu.retired == 3, "BNE not taken, and the pair no longer fused")
