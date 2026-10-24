@@ -158,21 +158,38 @@ clear(cpu: *Cpu, entry: u32)
     clear_exceptions(cpu)
 
 // The record for guest address `a`: past the end of RAM, the one record that stands for everywhere
-// else, which stops the core there, the address it was asked for kept as `stop_at`.
+// else, and the core stopped at `a`, both its `stop_at` and its `pc`. A branch to it comes back at
+// once, since the stop has spent the budget.
 @inline
 insn_at(cpu: *Cpu, a: u32) -> *Insn
     if a < RAM_BYTES then return &cpu.dec[a >> 1]
 
+    if cpu.stop == Stop.Budget then cpu.pc = a
     halt(cpu, Stop.Unmapped, a)
     &cpu.dec[RAM_BYTES >> 1]
 
-// Stop the core for `why` at `at`: it comes back at its next taken branch, since its budget is gone.
+// Stop the core for `why` at `at`, unless it has already stopped. A taken branch then comes back at
+// once, since the budget is gone, and leaves `pc` alone: whatever stops the core says where.
 halt(cpu: *Cpu, why: Stop, at: u32)
     if cpu.stop != Stop.Budget then return
 
     cpu.stop = why
     cpu.stop_at = at
     cpu.limit = 0
+
+// The instruction at `ip`, `n` retired before it, made an access that stopped the core: it stops
+// there, not retired, with nothing after the access in it done.
+stop_access(cpu: *Cpu, ip: *Insn, n: u64)
+    cpu.pc = addr_of(cpu, ip)
+    cpu.retired = n
+
+// A taken `Leave` at `ip`, `n` retired before it: the branch retires, and the core stops at its target.
+leave(cpu: *Cpu, ip: *Insn, n: u64)
+    if ip.a != 0 then cpu.r[14] = (addr_of(cpu, ip) + 4) | 1
+
+    halt(cpu, Stop.Unmapped, ip.imm)
+    cpu.pc = ip.imm
+    cpu.retired = n + 1
 
 // A machine with no devices: every access off the page table stops the core.
 no_device_read(cpu: *Cpu, a: u32, width: u32) -> u32
@@ -217,15 +234,79 @@ slow_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
 
     cpu.io_write(cpu, a, width, x)
 
+// The `width` bytes at `a` on the host page `page`, zero-extended; and storing them.
+@inline
+host_read(page: usize, a: u32, width: u32) -> u32
+    val at = page + (a & 0xFFF)
+
+    width match
+        4 ->
+            val p: *u32 = ptr_cast(at)
+            p[0]
+        2 ->
+            val p: *u16 = ptr_cast(at)
+            p[0]
+        _ ->
+            val p: *u8 = ptr_cast(at)
+            p[0]
+
+@inline
+host_write(page: usize, a: u32, width: u32, x: u32)
+    val at = page + (a & 0xFFF)
+
+    width match
+        4 ->
+            val p: *u32 = ptr_cast(at)
+            p[0] = x
+        2 ->
+            val p: *u16 = ptr_cast(at)
+            p[0] = u16(x)
+        _ ->
+            val p: *u8 = ptr_cast(at)
+            p[0] = u8(x)
+
+// The low `width` bytes of `x`.
+@inline
+low_bytes(x: u32, width: u32) -> u32 = if width == 4 then x else x & ((1 << (width * 8)) - 1)
+
+// An instruction's own access: the `width` bytes at `a` into `into`, or `x`'s low `width` bytes to
+// `a`, answering whether the access was made. One that stops the core is not: a read leaves `into`
+// as it was, and the instruction stops on it (`stop_access`). The test is in the slow path alone; on
+// the fast path the answer is a constant, and the handler's check of it folds away.
+@inline
+load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
+    val page = page_of(cpu, a)
+
+    if page == 0
+        val x = slow_read(cpu, a, width, n)
+
+        if cpu.stop != Stop.Budget then return false
+
+        into[0] = x
+        return true
+
+    into[0] = host_read(page, a, width)
+    true
+
+@inline
+store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
+    val page = page_of(cpu, a)
+
+    if page == 0
+        slow_write(cpu, a, width, low_bytes(x, width), n)
+        return cpu.stop == Stop.Budget
+
+    host_write(page, a, width, x)
+    true
+
+// The same accesses where nothing stops on them: the exception model's stacking and the host's own.
 @inline
 read32(cpu: *Cpu, a: u32, n: u64) -> u32
     val page = page_of(cpu, a)
 
     if page == 0 then return slow_read(cpu, a, 4, n)
 
-    val p: *u32 = ptr_cast(page + (a & 0xFFF))
-
-    p[0]
+    host_read(page, a, 4)
 
 @inline
 read16(cpu: *Cpu, a: u32, n: u64) -> u32
@@ -233,9 +314,7 @@ read16(cpu: *Cpu, a: u32, n: u64) -> u32
 
     if page == 0 then return slow_read(cpu, a, 2, n)
 
-    val p: *u16 = ptr_cast(page + (a & 0xFFF))
-
-    p[0]
+    host_read(page, a, 2)
 
 @inline
 read8(cpu: *Cpu, a: u32, n: u64) -> u32
@@ -243,9 +322,7 @@ read8(cpu: *Cpu, a: u32, n: u64) -> u32
 
     if page == 0 then return slow_read(cpu, a, 1, n)
 
-    val p: *u8 = ptr_cast(page + (a & 0xFFF))
-
-    p[0]
+    host_read(page, a, 1)
 
 @inline
 write32(cpu: *Cpu, a: u32, x: u32, n: u64)
@@ -255,9 +332,7 @@ write32(cpu: *Cpu, a: u32, x: u32, n: u64)
         slow_write(cpu, a, 4, x, n)
         return
 
-    val p: *u32 = ptr_cast(page + (a & 0xFFF))
-
-    p[0] = x
+    host_write(page, a, 4, x)
 
 @inline
 write16(cpu: *Cpu, a: u32, x: u32, n: u64)
@@ -267,9 +342,7 @@ write16(cpu: *Cpu, a: u32, x: u32, n: u64)
         slow_write(cpu, a, 2, x & 0xFFFF, n)
         return
 
-    val p: *u16 = ptr_cast(page + (a & 0xFFF))
-
-    p[0] = u16(x)
+    host_write(page, a, 2, x)
 
 @inline
 write8(cpu: *Cpu, a: u32, x: u32, n: u64)
@@ -279,9 +352,7 @@ write8(cpu: *Cpu, a: u32, x: u32, n: u64)
         slow_write(cpu, a, 1, x & 0xFF, n)
         return
 
-    val p: *u8 = ptr_cast(page + (a & 0xFFF))
-
-    p[0] = u8(x)
+    host_write(page, a, 1, x)
 
 load32(cpu: *Cpu, a: u32) -> u32 = read32(cpu, a, cpu.retired)
 

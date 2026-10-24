@@ -198,6 +198,7 @@ best_pending(cpu: *Cpu) -> int
 take_pending(cpu: *Cpu)
     val e = best_pending(cpu)
 
+    // An entry that stops the core leaves `pc` where the exception would have returned to.
     if e >= 0 && priority(cpu, u32(e)) < running_priority(cpu, true)
         enter(cpu, u32(e), cpu.pc, cpu.retired)
 
@@ -230,13 +231,19 @@ set_apsr(cpu: *Cpu, psr: u32)
 // Take exception `e`, to come back to `ret`, at `n` instructions retired: stack eight words on the
 // stack in use, aligned to 8 with bit 9 of the stacked xPSR saying whether a word was skipped, set LR
 // to the EXC_RETURN for where it came from, switch to handler mode on the main stack, and go to the
-// handler the vector table names.
-enter(cpu: *Cpu, e: u32, ret: u32, n: u64)
+// handler the vector table names. Answers whether it was taken: a frame or a vector where nothing is
+// stops the core, with nothing of the exception's state changed and `pc` left for the caller.
+enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     val sp = cpu.r[13]
     val frame = (sp - 0x20) & ~4
     val words: [8]u32 = [cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[12], cpu.r[14], ret, xpsr(cpu) | (((sp >> 2) & 1) << 9)]
 
     for k in 0..<8 do write32(cpu, frame + u32(k) * 4, words[k], n)
+
+    val at = cpu.vtor + e * 4
+    val vector = read32(cpu, at, n)
+
+    if cpu.stop != Stop.Budget then return false
 
     cpu.r[14] = if cpu.ipsr != 0 then 0xFFFFFFF1 else if cpu.control & 2 != 0 then 0xFFFFFFFD else 0xFFFFFFF9
 
@@ -250,12 +257,9 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64)
     cpu.control &= ~2
     cpu.active |= u64(1) << e
     cpu.pending &= ~(u64(1) << e)
-
-    val at = cpu.vtor + e * 4
-    val vector = read32(cpu, at, n)
-
     cpu.pc = vector & ~1
     if vector & 1 == 0 then halt(cpu, Stop.Fault, at)
+    true
 
 // The record a `BX` or `POP {pc}` at `from` goes to with `v` off the RAM: in handler mode, an
 // EXC_RETURN value returns from the exception; anything else stops the core at `Unmapped`.
@@ -268,17 +272,24 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
 
     val to_process = kind == 0xD
     val frame = if to_process then cpu.sp_other else cpu.r[13]
-    val psr = read32(cpu, frame + 28, n)
+    var words: [8]u32
+
+    for k in 0..<8 do words[k] = read32(cpu, frame + u32(k) * 4, n)
+
+    // A frame where nothing is: the core stops on the return, with nothing restored.
+    if cpu.stop != Stop.Budget then return stopped_on(cpu, from)
+
+    val psr = words[7]
     val ipsr = psr & 0x3F
 
     // Back to handler mode with no exception, or to thread mode with one: the M0+ would fault.
     if (kind == 0x1) != (ipsr != 0) then return fault_at(cpu, from)
 
-    for k in 0..<4 do cpu.r[k] = read32(cpu, frame + u32(k) * 4, n)
-    cpu.r[12] = read32(cpu, frame + 16, n)
-    cpu.r[14] = read32(cpu, frame + 20, n)
+    for k in 0..<4 do cpu.r[k] = words[k]
+    cpu.r[12] = words[4]
+    cpu.r[14] = words[5]
 
-    val pc = read32(cpu, frame + 24, n)
+    val pc = words[6]
     val sp = (frame + 0x20) | (((psr >> 9) & 1) << 2)
 
     cpu.active &= ~(u64(1) << cpu.ipsr)
@@ -299,6 +310,12 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
 // Stop at `Fault` on the instruction at `from`, answering its record.
 fault_at(cpu: *Cpu, from: u32) -> *Insn
     halt(cpu, Stop.Fault, from)
+    stopped_on(cpu, from)
+
+// The record of the instruction at `from`, a branch or an `SVC` the core has stopped on, `pc` set to
+// it. The branch that goes there comes back at once and retires the instruction.
+stopped_on(cpu: *Cpu, from: u32) -> *Insn
+    cpu.pc = from
     &cpu.dec[from >> 1]
 
 // The record a `BX` or `POP {pc}` at `ip` goes to, given the value `v` it puts in the PC. A value in
@@ -320,8 +337,8 @@ svc(cpu: *Cpu, ip: *Insn, n: u64) -> *Insn
     val e = if priority(cpu, SVCALL) < running then SVCALL else HARD_FAULT
 
     if priority(cpu, e) >= running then return fault_at(cpu, from)
+    if !enter(cpu, e, from + 2, n) then return stopped_on(cpu, from)
 
-    enter(cpu, e, from + 2, n)
     insn_at(cpu, cpu.pc)
 
 // `CPSID i` (imm 1) or `CPSIE i` (imm 0).
