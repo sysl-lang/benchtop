@@ -79,6 +79,21 @@ enum Stop
     Fault
     // The guest asked for a system reset (AIRCR.SYSRESETREQ); what that does is the board's.
     Reset
+    // ARMv8-M Mainline: an instruction or an exception entry would have moved the stack pointer in use
+    // below its limit (MSPLIM or PSPLIM), which is a UsageFault (STKOF) cortical does not take. `stop_at`
+    // is the instruction, or for an entry the address it would have returned to; nothing was stored.
+    StackLimit
+
+// The architecture a core implements. The decoder consults it once per instruction it decodes, and
+// the exception model where the two differ; no handler reads it.
+//
+// - `V6m`: ARMv6-M, the Cortex-M0 and M0+. The zero value, so a `Cpu` nobody has given a kind is one.
+// - `V8mMain`: ARMv8-M Mainline without the Security, Floating-point, DSP and MPU extensions — the
+//   integer Thumb-2 instruction set, IT blocks, exclusives, the stack limits, BASEPRI and FAULTMASK
+//   (thumb2.sysl). The Cortex-M33 in that configuration.
+enum Kind: u8
+    V6m = 0
+    V8mMain
 
 // A decoded instruction. `h` is its handler for the threaded executor and `op` its case for the
 // `match` executor; the rest are its operands, extracted once. A register number is a `u4`, so
@@ -154,6 +169,32 @@ struct Cpu
     // one bit per line, and whether any bit is set.
     stale: [256]u64
     stale_any: u32
+    // What the core is. `reset` and `clear` leave it, so whoever makes a core of another kind sets it
+    // before resetting it.
+    kind: Kind
+    // ARMv8-M Mainline's state; an ARMv6-M core keeps every one of these 0.
+    //
+    // ITSTATE, the IT block's condition and mask (EPSR.IT), as IT sets it and each instruction of the
+    // block advances it. Only IT and the instructions it governs touch it (thumb2.sysl), so code
+    // outside an IT block pays nothing for it.
+    it: u32
+    // The sticky saturation flag, APSR.Q: 0 or 1.
+    q: u32
+    // BASEPRI and FAULTMASK, and the stack limits.
+    basepri: u32
+    faultmask: u32
+    msplim: u32
+    psplim: u32
+    // AIRCR.PRIGROUP, and the SCB's configuration registers, stored: SHCSR's enables, CCR.
+    prigroup: u32
+    shcsr: u32
+    ccr: u32
+    // The local exclusive monitor: whether it is set, and the address, size in bytes and value a
+    // load-exclusive left in it (t2sem.sysl).
+    excl: bool
+    excl_addr: u32
+    excl_size: u32
+    excl_value: u32
 
 var ram: [1048576]u8
 var page_table: [1048576]usize
@@ -178,7 +219,8 @@ reset(cpu: *Cpu, image: []const u8, entry: u32)
     cpu.io_read = &no_device_read
     cpu.io_write = &no_device_write
 
-// The core's own state as a reset leaves it, to start at `entry`. Memory is the machine's, untouched.
+// The core's own state as a reset leaves it, to start at `entry`. Memory is the machine's, untouched,
+// and so is the core's kind.
 clear(cpu: *Cpu, entry: u32)
     for i in 0..<16 do cpu.r[i] = 0
     cpu.nz = 1
@@ -198,6 +240,12 @@ clear(cpu: *Cpu, entry: u32)
     cpu.peer = null
     for w in 0..<cpu.stale.len do cpu.stale[w] = 0
     cpu.stale_any = 0
+    cpu.it = 0
+    cpu.q = 0
+    cpu.excl = false
+    cpu.excl_addr = 0
+    cpu.excl_size = 0
+    cpu.excl_value = 0
     clear_exceptions(cpu)
 
 /** Give each of two cores records of its own, so each can run on a thread of its own: `first` keeps
@@ -307,18 +355,37 @@ forget(cpu: *Cpu, a: u32, width: u32)
 
     if other == null then return
 
-    val from = (if a >= 2 then a - 2 else 0) >> LINE_SHIFT
+    val back = reach_back(cpu)
+    val from = (if a >= back then a - back else 0) >> LINE_SHIFT
 
-    for line in from..((a + width - 1) >> LINE_SHIFT)
+    for line in from..(last_reached(cpu, a, width) >> LINE_SHIFT)
         atomic_or(&other.stale[line >> 6], u64(1) << (line & 63), Relaxed)
 
     atomic_store(&other.stale_any, 1, Release)
 
-// The core's own records that read any of the `width` bytes at `a`, put back to "not decoded".
-private drop_records(cpu: *Cpu, a: u32, width: u32)
-    val first = if a >= 2 then (a >> 1) - 1 else 0
+// How far before a byte written the records that depend on it may start: the halfword before, for a
+// 32-bit instruction or a compare fused with the branch after it. On ARMv8-M an IT's decode is what
+// gives the instructions of its block their conditions (thumb2.sysl), so a block and its IT are
+// forgotten together: 16 bytes back reaches the IT of a block the store is in, and 18 bytes on
+// reaches the end of the block of an IT the store overwrites.
+@inline
+private reach_back(cpu: *Cpu) -> u32 = if cpu.kind == Kind.V6m then 2 else 16
 
-    for i in first..((a + width - 1) >> 1) do if cpu.dec[i].op != Op.Undecoded then cpu.dec[i] = undecoded()
+// The last byte whose record may depend on the `width` bytes stored at `a`.
+@inline
+private last_reached(cpu: *Cpu, a: u32, width: u32) -> u32
+    val last = a + width - 1
+
+    if cpu.kind == Kind.V6m then return last
+
+    if last + 18 < RAM_BYTES then last + 18 else RAM_BYTES - 1
+
+// The core's own records that depend on any of the `width` bytes at `a`, put back to "not decoded".
+private drop_records(cpu: *Cpu, a: u32, width: u32)
+    val back = reach_back(cpu)
+    val first = (if a >= back then a - back else 0) >> 1
+
+    for i in first..(last_reached(cpu, a, width) >> 1) do if cpu.dec[i].op != Op.Undecoded then cpu.dec[i] = undecoded()
 
 /** Forget the core's own records on every line the other core has posted since the last time, so a
  * record of code the other core has written is decoded afresh. The core's own thread calls it, at a

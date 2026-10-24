@@ -88,6 +88,13 @@ clear_exceptions(cpu: *Cpu)
     cpu.tick_value = 0
     cpu.tick_zero = NEVER
     cpu.tick_last = NEVER
+    cpu.basepri = 0
+    cpu.faultmask = 0
+    cpu.msplim = 0
+    cpu.psplim = 0
+    cpu.prigroup = 0
+    cpu.shcsr = 0
+    cpu.ccr = if cpu.kind == Kind.V6m then 0 else CCR_RESET
 
 // ---------------------------------------------------------------------------------------------------
 // Runs.
@@ -163,7 +170,7 @@ wake_by(cpu: *Cpu, horizon: u64) -> bool
 
     val e = best_pending(cpu)
 
-    if e < 0 || priority(cpu, u32(e)) >= running_priority(cpu, false)
+    if e < 0 || group(cpu, priority(cpu, u32(e))) >= running_priority(cpu, false)
         val due = next_wake(cpu)
 
         if due == NEVER || due > horizon
@@ -187,7 +194,7 @@ next_wake(cpu: *Cpu) -> u64
 
 // Whether exception `e`, were it pending, would wake a sleeping core.
 could_wake(cpu: *Cpu, e: u32) -> bool
-    eligible(cpu, e) && priority(cpu, e) < running_priority(cpu, false)
+    eligible(cpu, e) && group(cpu, priority(cpu, e)) < running_priority(cpu, false)
 
 // ---------------------------------------------------------------------------------------------------
 // Priorities.
@@ -199,19 +206,29 @@ priority(cpu: *Cpu, e: u32) -> int
 
     int(cpu.prio[e])
 
-// The priority the core runs at: the highest of the active exceptions', raised to 0 by PRIMASK when
-// `masked`.
+// The group priority of priority `p`, which is what decides preemption: the bits above the
+// subpriority's, which AIRCR.PRIGROUP sets (0 on ARMv6-M, where it does not exist).
+@inline
+group(cpu: *Cpu, p: int) -> int = if p < 0 then p else p & ~((2 << int(cpu.prigroup)) - 1)
+
+// The priority the core runs at: the highest group priority of the active exceptions', raised by
+// BASEPRI and FAULTMASK, and by PRIMASK when `masked` (ARMv8-M ARM, `ExecutionPriority`). The two
+// ARMv8-M masks are 0 on ARMv6-M.
 running_priority(cpu: *Cpu, masked: bool) -> int
     var p = BASE_PRIORITY
     var rest = cpu.active
     var e: u32 = 0
 
     while rest != 0
-        if rest & 1 != 0 && priority(cpu, e) < p then p = priority(cpu, e)
+        if rest & 1 != 0 && group(cpu, priority(cpu, e)) < p then p = group(cpu, priority(cpu, e))
         rest >>= 1
         e += 1
 
-    if masked && cpu.primask != 0 && p > 0 then 0 else p
+    if cpu.basepri != 0 && group(cpu, int(cpu.basepri)) < p then p = group(cpu, int(cpu.basepri))
+    if masked && cpu.primask != 0 && p > 0 then p = 0
+    if cpu.faultmask != 0 && p > -1 then p = -1
+
+    p
 
 // Whether exception `e` is enabled: an IRQ has its bit in the NVIC, a system exception always is.
 eligible(cpu: *Cpu, e: u32) -> bool
@@ -237,7 +254,7 @@ take_pending(cpu: *Cpu)
     val e = best_pending(cpu)
 
     // An entry that stops the core leaves `pc` where the exception would have returned to.
-    if e >= 0 && priority(cpu, u32(e)) < running_priority(cpu, true)
+    if e >= 0 && group(cpu, priority(cpu, u32(e))) < running_priority(cpu, true)
         enter(cpu, u32(e), cpu.pc, cpu.retired)
 
 // ---------------------------------------------------------------------------------------------------
@@ -251,30 +268,46 @@ main_sp(cpu: *Cpu) -> u32 = if on_process_stack(cpu) then cpu.sp_other else cpu.
 
 process_sp(cpu: *Cpu) -> u32 = if on_process_stack(cpu) then cpu.r[13] else cpu.sp_other
 
-// APSR's flags, the T bit and IPSR: the xPSR an exception stacks.
+// APSR's flags, the T bit and IPSR: the xPSR an exception stacks. On ARMv8-M, also Q and EPSR's
+// ITSTATE (bits 26–25 its low two bits, 15–10 the rest), both 0 on ARMv6-M.
 xpsr(cpu: *Cpu) -> u32
     val z: u32 = if flag_z(cpu) then 1 else 0
+    val it = ((cpu.it & 3) << 25) | ((cpu.it >> 2) << 10)
 
-    (flag_n(cpu) << 31) | (z << 30) | (cpu.c << 29) | (flag_v(cpu) << 28) | (1 << 24) | cpu.ipsr
+    (flag_n(cpu) << 31) | (z << 30) | (cpu.c << 29) | (flag_v(cpu) << 28) | (cpu.q << 27) | it | (1 << 24) | cpu.ipsr
 
-// The flags from bits 31–28 of `psr`. N and Z both set, which no instruction produces, is kept as Z
-// alone: the flags are one word whose sign is N and whose zeroness is Z.
+// The ITSTATE in an xPSR.
+@inline
+it_of_psr(psr: u32) -> u32 = ((psr >> 25) & 3) | (((psr >> 10) & 0x3F) << 2)
+
+// The flags from bits 31–28 of `psr`, and on ARMv8-M Q from bit 27. N and Z both set, which no
+// instruction produces, is kept as Z alone: the flags are one word whose sign is N and whose zeroness
+// is Z. An `MSR APSR_nzcvq` writing both is the one way a guest can ask for it, and it reads back Z.
 set_apsr(cpu: *Cpu, psr: u32)
     cpu.nz = if (psr >> 30) & 1 != 0 then 0 else if psr >> 31 != 0 then 0x80000000 else 1
     cpu.c = (psr >> 29) & 1
     cpu.va = 0
     cpu.vb = 0
     cpu.vr = ((psr >> 28) & 1) << 31
+    if cpu.kind != Kind.V6m then cpu.q = (psr >> 27) & 1
 
 // Take exception `e`, to come back to `ret`, at `n` instructions retired: stack eight words on the
 // stack in use, aligned to 8 with bit 9 of the stacked xPSR saying whether a word was skipped, set LR
 // to the EXC_RETURN for where it came from, switch to handler mode on the main stack, and go to the
 // handler the vector table names. Answers whether it was taken: a frame or a vector where nothing is
 // stops the core, with nothing of the exception's state changed and `pc` left for the caller.
+//
+// On ARMv8-M, a frame below the stack's limit is the UsageFault STKOF, which cortical does not take:
+// the core stops at `StackLimit`, `stop_at` the address the exception would have returned to, nothing
+// stacked. The handler starts outside any IT block, and with the local exclusive monitor clear.
 enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     val sp = cpu.r[13]
     val frame = (sp - 0x20) & ~4
     val words: [8]u32 = [cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[12], cpu.r[14], ret, xpsr(cpu) | (((sp >> 2) & 1) << 9)]
+
+    if cpu.kind != Kind.V6m && frame < sp_limit(cpu)
+        halt(cpu, Stop.StackLimit, ret)
+        return false
 
     for k in 0..<8 do write32(cpu, frame + u32(k) * 4, words[k], n)
 
@@ -295,6 +328,8 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     cpu.control &= ~2
     cpu.active |= u64(1) << e
     cpu.pending &= ~(u64(1) << e)
+    cpu.it = 0
+    cpu.excl = false
     cpu.pc = vector & ~1
     if vector & 1 == 0 then halt(cpu, Stop.Fault, at)
     true
@@ -329,6 +364,15 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
 
     val pc = words[6]
     val sp = (frame + 0x20) | (((psr >> 9) & 1) << 2)
+
+    // ARMv8-M: FAULTMASK clears on the return from any exception but NMI, the monitor clears, and an
+    // IT block the exception interrupted goes on under the ITSTATE its frame holds: what is left of
+    // it is decoded under that state, whatever its records held (thumb2.sysl).
+    if cpu.kind != Kind.V6m
+        if cpu.ipsr != NMI then cpu.faultmask = 0
+        cpu.excl = false
+        cpu.it = it_of_psr(psr)
+        if cpu.it != 0 && pc < RAM_BYTES then decode_block(cpu, pc & ~1, cpu.it)
 
     cpu.active &= ~(u64(1) << cpu.ipsr)
     cpu.ipsr = ipsr
@@ -372,9 +416,9 @@ branch_to(cpu: *Cpu, v: u32, ip: *Insn, n: u64) -> *Insn
 svc(cpu: *Cpu, ip: *Insn, n: u64) -> *Insn
     val from = addr_of(cpu, ip)
     val running = running_priority(cpu, true)
-    val e = if priority(cpu, SVCALL) < running then SVCALL else HARD_FAULT
+    val e = if group(cpu, priority(cpu, SVCALL)) < running then SVCALL else HARD_FAULT
 
-    if priority(cpu, e) >= running then return fault_at(cpu, from)
+    if group(cpu, priority(cpu, e)) >= running then return fault_at(cpu, from)
     if !enter(cpu, e, from + 2, n) then return stopped_on(cpu, from)
 
     insn_at(cpu, cpu.pc)
@@ -477,6 +521,8 @@ tick_start(cpu: *Cpu, now: u64)
 // that is not a register here, stops the core at `Unmapped` as an access where nothing is would.
 
 scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if cpu.kind != Kind.V6m && width != 4 && byte_wide(a, width) then return part_of(scs_read(cpu, a & ~3, 4, n), a, width)
+
     if width != 4 || a & 3 != 0
         halt(cpu, Stop.Unmapped, a)
         return 0
@@ -504,7 +550,7 @@ scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
         NVIC_ISER | NVIC_ICER -> cpu.enabled
         NVIC_ISPR | NVIC_ICPR -> u32(cpu.pending >> IRQ0)
         // The Cortex-M0+, r0p1.
-        SCB_CPUID -> 0x410CC601
+        SCB_CPUID -> if cpu.kind == Kind.V6m then 0x410CC601 else M33_CPUID
         SCB_ICSR ->
             val best = best_pending(cpu)
             val vectpending: u32 = if best < 0 then 0 else u32(best)
@@ -513,14 +559,14 @@ scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
             (bit_of(cpu.pending, NMI) << 31) | (bit_of(cpu.pending, PENDSV) << 28) | (bit_of(cpu.pending, SYSTICK) << 26) | irq | (vectpending << 12) | cpu.ipsr
         SCB_VTOR -> cpu.vtor
         // VECTKEYSTAT, little-endian.
-        SCB_AIRCR -> 0xFA050000
+        SCB_AIRCR -> 0xFA050000 | (cpu.prigroup << 8)
         SCB_SHPR2 -> u32(cpu.prio[SVCALL]) << 24
         SCB_SHPR3 -> u32(cpu.prio[PENDSV]) << 16 | u32(cpu.prio[SYSTICK]) << 24
-        _ ->
-            halt(cpu, Stop.Unmapped, a)
-            0
+        _ -> scs_read8(cpu, a)
 
 scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if cpu.kind != Kind.V6m && width != 4 && byte_wide(a, width) then return scs_write(cpu, a & ~3, 4, with_part(scs_read(cpu, a & ~3, 4, n), a, width, x), n)
+
     if width != 4 || a & 3 != 0
         halt(cpu, Stop.Unmapped, a)
         return
@@ -534,7 +580,7 @@ scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
     if a >= NVIC_IPR && a < NVIC_IPR + 32
         val first = IRQ0 + (a - NVIC_IPR)
 
-        for k in 0u32..<4 do cpu.prio[first + k] = u8((x >> (k * 8)) & 0xC0)
+        for k in 0u32..<4 do cpu.prio[first + k] = u8((x >> (k * 8)) & prio_mask(cpu))
         return
 
     a match
@@ -564,14 +610,15 @@ scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
         SCB_VTOR -> cpu.vtor = x & ~0xFF
         // SYSRESETREQ, under the key: the board decides what a reset is.
         SCB_AIRCR ->
+            if x >> 16 == 0x05FA && cpu.kind != Kind.V6m then cpu.prigroup = (x >> 8) & 7
             if x >> 16 == 0x05FA && x & 4 != 0 then halt(cpu, Stop.Reset, a)
-        SCB_SHPR2 -> cpu.prio[SVCALL] = u8((x >> 24) & 0xC0)
+        SCB_SHPR2 -> cpu.prio[SVCALL] = u8((x >> 24) & prio_mask(cpu))
         SCB_SHPR3 ->
-            cpu.prio[PENDSV] = u8((x >> 16) & 0xC0)
-            cpu.prio[SYSTICK] = u8((x >> 24) & 0xC0)
+            cpu.prio[PENDSV] = u8((x >> 16) & prio_mask(cpu))
+            cpu.prio[SYSTICK] = u8((x >> 24) & prio_mask(cpu))
         // CPUID is read-only.
         SCB_CPUID -> ()
-        _ -> halt(cpu, Stop.Unmapped, a)
+        _ -> scs_write8(cpu, a, x)
 
 @inline
 bit_of(x: u64, k: u32) -> u32 = u32((x >> k) & 1)
