@@ -333,8 +333,22 @@ loop
     The records are 16 bytes; register numbers are `u4`, so indexing the sixteen registers needs no
     bounds check (with `u8` fields the chain ran at ~1180 MIPS).
   - **One record per halfword of guest address** is the spike's decode cache: the next instruction
-    is the next record and a direct branch target is an index, so a branch costs no lookup. Whether
-    blocks (below) buy anything over it is measured once interrupts and the MPU exist.
+    is the next record and a direct branch target is a signed record count from the branch's own, so
+    taking a branch is one add. Whether blocks (below) buy anything over it is measured once
+    interrupts and the MPU exist.
+  - **Measured by cycles, not wall time**: `time -l`'s per-process cycle and instruction counts are
+    unmoved by other load on the machine, where MIPS swung by 3× between runs. Three changes took the
+    chain from 3.83 to 3.38 cycles (16.0 to 13.7 host instructions) per guest instruction, −12%:
+    a `CMP` and the `B<cond>` after it run as one handler, with the condition a value parameter
+    (`h_cmp_imm_bcond[const K: u32]`), still decoding the branch into its own record so a jump
+    straight to it finds it; V is kept as the operands and result of the last addition and worked out
+    only when a signed condition reads it; and the memory fast path tests the page entry, not the
+    byte's address. A NOP costs ~1.6 cycles and a simple ALU instruction ~3.2, so what remains is
+    dispatch and handler length about equally. Guest registers living in memory cost nothing
+    measurable: a chain of dependent `ADDS` runs as fast as an independent one.
+  - **The profile says where the next factor is not.** 44% of the workload is a nine-instruction
+    straight-line CRC loop with no pair as frequent as `CMP`/`B<cond>`, so further fusion reaches
+    little of it; fewer dispatches there means compiling a block, which is the JIT.
 - **A block** is a straight run of decoded instructions ending at a branch, an exception return, a
   write to PC, an instruction that changes interrupt masking (`CPSIE`, `MSR BASEPRI`), an `SVC`, a
   `WFI`/`WFE`, a barrier, or 64 instructions. Interrupts are taken only between blocks, which is legal
@@ -399,7 +413,8 @@ before any JIT. Against that:
 
 **The first measurement beat this table's estimates by about ten.** The `become` chain in `bench/`
 runs an ARMv6-M workload at ~1365 MIPS on one M5 Pro P-core, with the page-table memory path
-and lazy N/Z flags but no interrupts, MPU or IT blocks yet. The estimates below are kept as the
+and lazy N/Z flags but no interrupts, MPU or IT blocks yet; compare-and-branch fusion and lazy V
+have since cut its cycles per guest instruction by a further 12%. The estimates below are kept as the
 floor to defend; the benchmark after milestone 1 replaces them with Thumb-2 figures.
 
 | stage | per core | M7 (as a share of 400 MHz × ~1.3 IPC) | M4 (200 MHz × ~0.9 IPC) |

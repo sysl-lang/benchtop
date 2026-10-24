@@ -9,8 +9,10 @@ module sh.sysl.dispatch
 // and is decoded the first time control reaches it.
 //
 // **The flags are kept lazily.** N and Z are both read from `nz`, the last flag-setting result: N is
-// its top bit and Z is whether it is zero. C and V are 0 or 1 each. An instruction that sets flags
-// stores one word for N and Z rather than computing two bits.
+// its top bit and Z is whether it is zero. C is 0 or 1. V is kept as the last addition that set it —
+// its two operands and its result — and worked out only when a condition reads it, which a signed
+// comparison does and almost nothing else. An instruction that sets flags stores words rather than
+// computing bits.
 
 // The guest's RAM, from address 0. Code and data share it, as they do on an M0+ running from SRAM.
 const RAM_BYTES: u32 = 256 * 1024
@@ -46,7 +48,10 @@ struct Cpu
     r: [16]u32
     nz: u32
     c: u32
-    v: u32
+    // V is the signed overflow of `va + vb`, which came to `vr`.
+    va: u32
+    vb: u32
+    vr: u32
     // Where to resume, as a guest address, after `run` comes back.
     pc: u32
     // `run` comes back at the first taken branch at or past this many instructions.
@@ -75,7 +80,9 @@ reset(cpu: *Cpu, image: []const u8, entry: u32)
     for i in 0..<16 do cpu.r[i] = 0
     cpu.nz = 1
     cpu.c = 0
-    cpu.v = 0
+    cpu.va = 0
+    cpu.vb = 0
+    cpu.vr = 0
     cpu.pc = entry
     cpu.limit = 0
     cpu.retired = 0
@@ -88,6 +95,10 @@ reset(cpu: *Cpu, image: []const u8, entry: u32)
 @inline
 insn_at(cpu: *Cpu, a: u32) -> *Insn = &cpu.dec[a >> 1]
 
+// The record a direct branch goes to: its `imm` is a signed count of records from its own.
+@inline
+target_of(ip: *Insn) -> *Insn = &ip[i32(ip.imm)]
+
 // The guest address of a record.
 @inline
 addr_of(cpu: *Cpu, ip: *Insn) -> u32 = u32(ip - cpu.dec) << 1
@@ -96,77 +107,74 @@ addr_of(cpu: *Cpu, ip: *Insn) -> u32 = u32(ip - cpu.dec) << 1
 // Memory. The fast path is one table load, one test and one host access; everything else (a page
 // with no entry: MMIO, unmapped) is the slow path, which this machine answers by stopping.
 
+// The host address of the first byte of the page holding `a`, or 0 for a page with no fast path. The
+// test is made on this, not on the byte's own address, which nothing stops from being 0.
 @inline
-host(cpu: *Cpu, a: u32) -> usize
-    val page = cpu.pages[a >> PAGE_SHIFT]
-
-    if page == 0 then return 0
-
-    page + (a & 0xFFF)
+page_of(cpu: *Cpu, a: u32) -> usize = cpu.pages[a >> PAGE_SHIFT]
 
 @inline
 load32(cpu: *Cpu, a: u32) -> u32
-    val h = host(cpu, a)
+    val page = page_of(cpu, a)
 
-    if h == 0 then return unmapped(cpu, a)
+    if page == 0 then return unmapped(cpu, a)
 
-    val p: *u32 = ptr_cast(h)
+    val p: *u32 = ptr_cast(page + (a & 0xFFF))
 
     p[0]
 
 @inline
 load16(cpu: *Cpu, a: u32) -> u32
-    val h = host(cpu, a)
+    val page = page_of(cpu, a)
 
-    if h == 0 then return unmapped(cpu, a)
+    if page == 0 then return unmapped(cpu, a)
 
-    val p: *u16 = ptr_cast(h)
+    val p: *u16 = ptr_cast(page + (a & 0xFFF))
 
     p[0]
 
 @inline
 load8(cpu: *Cpu, a: u32) -> u32
-    val h = host(cpu, a)
+    val page = page_of(cpu, a)
 
-    if h == 0 then return unmapped(cpu, a)
+    if page == 0 then return unmapped(cpu, a)
 
-    val p: *u8 = ptr_cast(h)
+    val p: *u8 = ptr_cast(page + (a & 0xFFF))
 
     p[0]
 
 @inline
 store32(cpu: *Cpu, a: u32, x: u32)
-    val h = host(cpu, a)
+    val page = page_of(cpu, a)
 
-    if h == 0
+    if page == 0
         unmapped(cpu, a)
         return
 
-    val p: *u32 = ptr_cast(h)
+    val p: *u32 = ptr_cast(page + (a & 0xFFF))
 
     p[0] = x
 
 @inline
 store16(cpu: *Cpu, a: u32, x: u32)
-    val h = host(cpu, a)
+    val page = page_of(cpu, a)
 
-    if h == 0
+    if page == 0
         unmapped(cpu, a)
         return
 
-    val p: *u16 = ptr_cast(h)
+    val p: *u16 = ptr_cast(page + (a & 0xFFF))
 
     p[0] = u16(x)
 
 @inline
 store8(cpu: *Cpu, a: u32, x: u32)
-    val h = host(cpu, a)
+    val page = page_of(cpu, a)
 
-    if h == 0
+    if page == 0
         unmapped(cpu, a)
         return
 
-    val p: *u8 = ptr_cast(h)
+    val p: *u8 = ptr_cast(page + (a & 0xFFF))
 
     p[0] = u8(x)
 
@@ -194,7 +202,9 @@ add_flags(cpu: *Cpu, a: u32, b: u32, carry: u32) -> u32
 
     cpu.nz = res
     cpu.c = u32(wide >> 32)
-    cpu.v = ((a ^ res) & (b ^ res)) >> 31
+    cpu.va = a
+    cpu.vb = b
+    cpu.vr = res
     res
 
 // `a - b` is `a + ~b + 1`, and `SBC` is `a + ~b + C`; C is "no borrow".
@@ -207,6 +217,10 @@ flag_n(cpu: *Cpu) -> u32 = cpu.nz >> 31
 @inline
 flag_z(cpu: *Cpu) -> bool = cpu.nz == 0
 
+// Overflow: the operands agreed in sign and the result does not.
+@inline
+flag_v(cpu: *Cpu) -> u32 = ((cpu.va ^ cpu.vr) & (cpu.vb ^ cpu.vr)) >> 31
+
 // Condition `cond` (the four-bit field of a `B<cond>`) against the flags.
 @inline
 holds(cpu: *Cpu, cond: u32) -> bool = cond match
@@ -216,14 +230,14 @@ holds(cpu: *Cpu, cond: u32) -> bool = cond match
     3 -> cpu.c == 0
     4 -> flag_n(cpu) != 0
     5 -> flag_n(cpu) == 0
-    6 -> cpu.v != 0
-    7 -> cpu.v == 0
+    6 -> flag_v(cpu) != 0
+    7 -> flag_v(cpu) == 0
     8 -> cpu.c != 0 && cpu.nz != 0
     9 -> cpu.c == 0 || cpu.nz == 0
-    10 -> flag_n(cpu) == cpu.v
-    11 -> flag_n(cpu) != cpu.v
-    12 -> cpu.nz != 0 && flag_n(cpu) == cpu.v
-    13 -> cpu.nz == 0 || flag_n(cpu) != cpu.v
+    10 -> flag_n(cpu) == flag_v(cpu)
+    11 -> flag_n(cpu) != flag_v(cpu)
+    12 -> cpu.nz != 0 && flag_n(cpu) == flag_v(cpu)
+    13 -> cpu.nz == 0 || flag_n(cpu) != flag_v(cpu)
     _ -> true
 
 // ---------------------------------------------------------------------------------------------------

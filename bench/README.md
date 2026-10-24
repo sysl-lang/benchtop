@@ -22,12 +22,29 @@ caffeinate -dimsu ./dispatch ../guest/kernel.bin 1380735027
 sysl test .
 ```
 
-On an Apple M5 Pro, sysl 0.5.4, 667.5 M guest instructions:
+On an Apple M5 Pro, sysl 0.5.4, 667.5 M guest instructions, on a quiet machine:
 
 | executor | MIPS |
 |---|---|
 | `match` loop | ~1195 |
 | `become` chain | **~1365** |
 
-That is about ten times an RP2040 core's real speed. The threaded handler for `ADDS r2, r0, r1` is
-fifteen AArch64 instructions with no frame, ending in `ldr x3, [x1, #0x10]!` and `br x3`.
+That is about ten times an RP2040 core's real speed.
+
+Wall time moves with whatever else the machine is doing. The per-process counters do not, so a
+change is judged by them. Name one executor so the counters see it alone:
+
+```
+/usr/bin/time -l ./dispatch ../guest/kernel.bin 1380735027 threaded
+```
+
+and divide `cycles elapsed` and `instructions retired` by three rounds of guest instructions. For
+the `become` chain, sysl 0.5.5:
+
+| | cycles / guest insn | host insns / guest insn |
+|---|---|---|
+| before `CMP`+`B<cond>` fusion, lazy V and the page-entry test | 3.83 | 16.0 |
+| now | **3.38** | **13.7** |
+
+The handler for `EORS` is ten AArch64 instructions with no frame, ending in `ldr x3, [x1, #0x10]!`
+and `br x3`.
