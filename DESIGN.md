@@ -1,11 +1,11 @@
 # cortical — a Cortex-M board emulator written in sysl
 
-**Status: a design note. No code exists.** The repo is `sysl-lang/cortical`.
+**Status: the ARMv6-M core runs, in `sh.sysl.cortical.v6m`, on the virtual board (§11); no real
+board is emulated yet. The rest is design.** The repo is `sysl-lang/cortical`.
 
 cortical emulates Cortex-M boards well enough to run, unmodified, the firmware a developer would
 flash onto them: each core on a host thread, a board's display in a Mac window, its UART on a
-terminal, and skiff on every core. It is an interpreter now and is shaped so that a JIT can replace
-the inner loop later. It is written in sysl, and part of its job is to stress the language. A gap
+terminal, and skiff on every core. It is an interpreter. **JIT: not planned.** It is written in sysl, and part of its job is to stress the language. A gap
 found while writing it is reported, not worked around (Rule 9). A board is a **description**: a sysl
 package that names its cores, memory, devices, wiring and panel. Another board is another
 description, not another emulator.
@@ -88,8 +88,19 @@ Sources, and how far each was checked:
 | core 1 (CM4) | the interpreter for the M4 | the same for the M4 |
 | io | blocking host I/O: the UART back-end (stdio, pty or TCP) and the files that tests write | host descriptors |
 
-- **Devices run on no thread of their own.** A device is a passive object: an MMIO access runs its
-  handler on the thread of the core that made it. A timed event (a timer overflow, the end of a UART
+- **Which work runs on a core's thread and which on a worker follows the real hardware.**
+  - Whatever a register access does within its own bus cycle runs inline, on the thread of the core
+    that made it: register decode, timers, the NVIC and SysTick, and the immediate effects of a
+    register write.
+  - Whatever the real chip does concurrently with the core runs on worker threads, on other host
+    cores: DMA, LTDC and DMA2D compositing and drawing to the host window, audio output, the USB
+    bridge, file-backed storage.
+  - A worker's result takes effect at a virtual time the core decides (§1.3), and the core waits for
+    it there if the worker is late. The parallelism changes only the speed, never a result.
+  - The virtual board's console (§11) is the existing case: a thread pumps the terminal's input into
+    a channel, and the core takes a byte from it only when the guest reads DATA or between runs.
+- **Device registers run on no thread of their own.** A device is a passive object: an MMIO access
+  runs its handler on the thread of the core that made it. A timed event (a timer overflow, the end of a UART
   character, LTDC vsync) runs on whichever core thread first finds it due (§1.3).
 - **Each device has one lock**, held for an access or an event. Both cores really do reach the same
   devices on the H747 (RCC, GPIO, EXTI, HSEM), so the lock is necessary. It is uncontended in the
@@ -101,6 +112,20 @@ Sources, and how far each was checked:
   skiff's AN521 boots flaky (skiff `CLAUDE.md`, milestone 2: a tick delivered up to 5 ticks late), and
   cortical should not repeat that. `--seed n` jitters the quanta, which explores interleavings
   reproducibly: a skiff race found at seed 1234 recurs at seed 1234.
+- **The virtual board (§11) runs its two M0+ cores this way, and only this way.** A round gives core
+  0 a turn and then core 1, each running until its clock (instructions retired plus the time skipped
+  asleep) reaches the round's end, `quantum` past the last one's: 1000 instructions by default, a
+  board parameter. A turn ends at the core's first taken branch at or past that time, as every run
+  does (§2.3), so the clocks stay within a quantum plus one straight run of code of each other, and
+  whatever one core writes in its turn the other sees from its next turn on, never mid-turn. The
+  default is a compromise between the cost of a switch (a run's start — waking, bringing SysTick up,
+  taking a pending exception — and raising the board's interrupts: a handful of calls, against the
+  roughly 0.7 µs a 1000-instruction turn takes) and how late a core sees the other: at the RP2040's
+  125 MHz, a quantum is 8 µs, so a FIFO round trip costs at most two turns, about an interrupt's
+  latency. Tests set a quantum of a dozen instructions to pin an exact
+  interleaving. There is no `--seed` yet; the quantum is the one input to the interleaving, and the
+  same image, input and quantum give the same run, counts and all. This single-threaded run is the
+  oracle the threaded mode will be checked against.
 
 ### 1.2 The bus and memory map
 
@@ -182,6 +207,12 @@ checked against the SVD):
 ### 1.4 Inter-core state
 
 - **Shared RAM** is the same host memory in both views, so there is nothing to synchronise beyond §1.5.
+- **On the virtual board (§11) the split is the RP2040's.** Shared by both cores: the RAM, the page
+  table, the decoded records and the map of which RAM lines hold code (§11), and the SIO with its
+  FIFOs and spinlocks. Each core's own: its `Cpu` — registers, flags, PRIMASK, CONTROL, MSP/PSP,
+  VTOR — and its exception state, which is its NVIC's pending, active and enable bits and its
+  priorities, and its SysTick. A device's interrupt is raised in each NVIC separately (the console's
+  in both, the FIFO's in the reading core's alone), and each core enables its own.
 - **HSEM** (32 semaphores, RM0399 "Hardware semaphore"): each `R[n]` is a host `Atomic[u32]` holding
   `LOCK | COREID<<8 | PROCID`. A 2-step write-lock or a 1-step read-lock (`RLR[n]`) is a
   compare-and-swap against the unlocked value. Unlock requires a matching COREID/PROCID. The core IDs
@@ -226,6 +257,17 @@ checked against the SVD):
   exclusives between its two M33s must exclude: the RP2350 chip description selects `--exclusives
   global`, a monitor shared by both cores over SRAM. The RP2040's M0+s have no exclusives at all.
 - **Device (MMIO) accesses are strongly ordered and serialised** by the device lock.
+- **On one host thread (the virtual board, §11) memory is sequentially consistent by construction**:
+  only one core runs at a time, so every access is in one global order and `DMB`/`DSB`/`ISB` need do
+  nothing beyond being a point where the budget is checked. Giving each core its own thread will need:
+  guest RAM accesses that stay single-copy atomic up to a word (they are host accesses of the same
+  width, so this holds on AArch64), `DMB`/`DSB` as `dmb ish`; the SIO's FIFOs and spinlocks under its
+  lock, a spinlock claim a compare-and-swap; an interrupt raised by one core's thread in the other's
+  NVIC as an atomic pending bit plus a poke of that core's `limit`; and the decoded records made safe
+  to forget while the other thread runs them — today a store puts a 16-byte record back to "not
+  decoded" with a plain write, which a racing reader could see torn, so the threaded stage swaps the
+  handler word alone (atomically, to the decoder) or moves to the generation check of §2.4, and marks
+  the code-line map with atomic stores.
 - **Caches are no-ops (the brief).** That makes cortical *more* coherent than silicon: a missing clean
   or invalidate works in cortical and fails on the board. Since skiff's milestone 9 is exactly "shared
   state uncached on the M7, then the cache trait", a **later** option, `--dcache-model`, keeps a
@@ -307,6 +349,95 @@ checked against the SVD):
 - **Semihosting** (`BKPT 0xAB`, SYS_WRITE0/WRITEC/WRITE/EXIT_EXTENDED) is on by an option. It is how
   skiff's boot tests halt, so the same scripts can drive cortical and QEMU.
 
+**What the ARMv6-M core models** (`sh.sysl.cortical.v6m`, `except.sysl`; ARMv6-M ARM B1, the M0+
+subset of the above):
+
+- **State**: MSP and PSP with CONTROL.SPSEL (`r13` is the one in use, the other kept beside it),
+  handler and thread mode (handler mode is exactly IPSR ≠ 0), PRIMASK, CONTROL.nPRIV (kept, and
+  restricting nothing), and xPSR as stacked: APSR's flags, the T bit and IPSR. VTOR is a register,
+  reset to 0.
+- **Instructions**: `MRS`/`MSR` of APSR, IAPSR, EAPSR, xPSR, IPSR, EPSR, IEPSR, MSP, PSP, PRIMASK
+  and CONTROL (any other SYSm, or SP or PC as the general register, is undefined; EPSR reads as 0;
+  IPSR and EPSR ignore writes, and so does SPSEL in handler mode), `CPSIE i`/`CPSID i`, `SVC`, `WFI`.
+  `WFE`, `SEV` and `YIELD` are `NOP`s: the event register is not modelled, which the architecture
+  permits. `DSB`, `DMB` and `ISB` order nothing on one core.
+- **Entry and return**: eight words on the stack in use, aligned to 8 with xPSR bit 9 recording the
+  skipped word; the vector from VTOR; LR = `0xFFFFFFF1`, `F9` or `FD`; return when `BX` or `POP {pc}`
+  in handler mode puts `0xFFFFFFFx` in PC. That check is free on the hot path: a value off the RAM
+  already takes `branch_to`'s slow path. A tail-chain is a return followed by an entry, which stacks
+  the same frame.
+- **Priorities**: the 2-bit priorities of SVCall, PendSV, SysTick (SHPR2/SHPR3) and 32 IRQs (IPR);
+  NMI and HardFault fixed above them. A pending, enabled exception is taken when its priority is
+  higher than the execution priority — the highest active one's, or 0 under PRIMASK — the lowest
+  exception number winning a tie. `SVC` where SVCall cannot preempt escalates to HardFault.
+- **Registers**: NVIC ISER/ICER/ISPR/ICPR/IPR; SCB CPUID, ICSR (NMIPENDSET, PENDSV and PENDST set and
+  clear, ISRPENDING, VECTPENDING, VECTACTIVE), VTOR, AIRCR (SYSRESETREQ under the key stops the core
+  at `Reset`; what a reset means is the board's), SHPR2, SHPR3; SysTick CSR/RVR/CVR/CALIB. Each is a
+  word; any other width, or any other address in the system control space, stops at `Unmapped`.
+- **Not modelled**: lockup, the MPU, and HardFault for an undefined instruction or a bad access,
+  which stop the core at `Undefined` or `Unmapped` as they always have. An exception that cannot be
+  taken — `SVC` inside HardFault, an EXC_RETURN naming no return, a return whose stacked IPSR
+  disagrees with the mode it names, a vector without its Thumb bit (an unset one is 0) — stops at
+  `Fault`. An access off the RAM while stacking or unstacking stops at `Unmapped` like any other.
+
+**The clock is the instruction count.** SysTick counts down once per instruction retired, plus the
+time a `WFI` skips; it is worked out from the clock when a register is read, not decremented. A guest
+access happens at the count of instructions retired before it, which every load and store carries
+into the slow path at no cost to the fast one. Started at clock *t* from 0, SysTick next reaches 0
+at *t* + RELOAD + 1 and every RELOAD + 1 after.
+
+**Where pending exceptions are checked: between runs, never per instruction.** A run comes back at
+its first taken branch past its budget, and every run begins by bringing SysTick up to the clock,
+taking the exception that should run, and cutting the budget at SysTick's next expiry. So whatever
+can make an exception ready cuts the budget to 0: any write to the system control space, `CPSIE`,
+`MSR`, an exception return with another one still pending. `DSB`, `DMB`, `ISB`, `CPS`, `MSR` and
+`WFI` check the budget as a taken branch does, so such a change is acted on at the next taken branch
+or barrier — where the architecture asks software to put a barrier anyway. A SysTick exception is
+taken at the first taken branch at or after its expiry: in a loop of branches, at the expiry exactly.
+`SVC` takes its exception at once. **The cost** of all of it on the benchmark (`bench/`, the `become`
+chain, `/usr/bin/time -l`, a loaded machine, three runs each way): 3.25–3.27 cycles and 14.58 host
+instructions per guest instruction before, 3.26–3.29 and 14.65 after — about half a percent.
+
+**`WFI`** sleeps; the next run wakes it when an exception is pending that would preempt with PRIMASK
+clear (taking it only if PRIMASK is clear). When nothing pending would, but SysTick's expiry will,
+the clock skips to the expiry. When nothing in the core can wake it the board may (§11), and if it
+cannot either the core stops at `Asleep`, its PC after the `WFI`.
+
+**N and Z both set**, which `MSR APSR` or a crafted frame can write and no instruction can produce, is
+kept as Z alone: the lazy flags (§2.3) hold N and Z as one word, whose sign is N and whose zeroness Z.
+
+**Where a stop leaves the core.** A stop records its kind and an address (`stop_at`), and leaves `pc`
+and `retired` where the guest was, the same under both executors:
+
+- **An access that stops the core** — to nothing (`Unmapped`), or one the device answers by stopping
+  it (`Exit`, `Reset`) — stops it **on the instruction that made it**. `pc` is that instruction,
+  `retired` does not count it, `stop_at` is the address accessed, and nothing after it runs. A load
+  writes no register and a single store writes nothing; the device has acted on a write it stopped
+  on, so the guest's exit status is the value it stored. A transfer of several words (`LDM`, `STM`,
+  `PUSH`, `POP`) ends at the word that stopped it, with its base register or SP as it was. The words
+  before it have moved, as an M0+ abandoning the instruction would have moved them: a store has
+  written them, and a load has written their registers, which the ARMv6-M ARM leaves UNKNOWN.
+- **A jump off the RAM** stops at its target: `pc` and `stop_at` are both the target with bit 0
+  clear, and the branch is retired. That covers `BX`, `BLX`, `MOV pc`, `POP {pc}`, an exception
+  return whose stacked return address is off the RAM, a direct `B`, `BL` or `B<cond>` (decoded as a
+  `Leave` record that keeps the target, and never fused with a compare), and running off the end of
+  RAM, where both are `0x0010_0000`.
+- **An exception return whose frame is off the RAM** stops on the `BX` or `POP` that made it, the
+  branch retired and nothing restored; **an exception entry whose frame or vector is off the RAM**
+  stops with nothing of the exception state changed, `pc` on the `SVC` or where the interrupted
+  code would have resumed. `Fault` stops on the instruction (or, for a vector without its Thumb bit,
+  with `pc` the vector's address); `Breakpoint` and `Undefined` on the instruction, not retired;
+  `Asleep` after the `WFI`.
+
+None of this is on the fast path. A load or store answers whether its access was made, and only its
+slow path can answer no: on the fast path the answer is a constant and the handler's test of it
+folds away, so the fast paths of the loads, stores and branches compile to the same instructions as
+before. A handler whose access stopped the core returns from that slow path instead of going on to
+the next record. A taken branch that finds its budget spent leaves `pc` alone when a stop has set it,
+a test made only on that already-slow exit. Measured as above, 15 runs each way on a loaded machine:
+3.28 cycles and 14.64 host instructions per guest instruction before, 3.31 and 14.58 after — the
+cycle difference within the runs' spread, the instruction count lower.
+
 ### 2.3 The dispatch loop
 
 ```
@@ -326,8 +457,30 @@ loop
   - Each decoded op carries its handler's address. Each handler ends with `become next.handler(…)`,
     sysl's guaranteed tail call (LLVM `musttail`), the way `sysl-lang/forth`'s direct-threaded inner
     interpreter does (`forth/README.md` § "Direct threading through guaranteed tail calls").
-  - The core's registers ride in parameters across the chain.
+  - The machine, the record pointer and the retired count ride in parameters across the chain.
   - A `match` over `Op` is the reference implementation the chain is checked against.
+  - **Measured** (`cortical bench`, ARMv6-M, M5 Pro, sysl 0.5.4): the chain runs at ~1365 MIPS and the
+    `match` loop at ~1195 MIPS over the same records and semantics, so the chain is the executor.
+    The records are 16 bytes; register numbers are `u4`, so indexing the sixteen registers needs no
+    bounds check (with `u8` fields the chain ran at ~1180 MIPS).
+  - **One record per halfword of guest address** is the spike's decode cache: the next instruction
+    is the next record and a direct branch target is a signed record count from the branch's own, so
+    taking a branch is one add. Whether blocks (below) buy anything over it is measured once
+    interrupts and the MPU exist.
+  - **Measured by cycles, not wall time**: `time -l`'s per-process cycle and instruction counts are
+    unmoved by other load on the machine, where MIPS swung by 3× between runs. Three changes took the
+    chain from 3.83 to 3.38 cycles (16.0 to 13.7 host instructions) per guest instruction, −12%:
+    a `CMP` and the `B<cond>` after it run as one handler, with the condition a value parameter
+    (`h_cmp_imm_bcond[const K: u32]`), still decoding the branch into its own record so a jump
+    straight to it finds it; V is kept as the operands and result of the last addition and worked out
+    only when a signed condition reads it; and the memory fast path tests the page entry, not the
+    byte's address. A NOP costs ~1.6 cycles and a simple ALU instruction ~3.2, so what remains is
+    dispatch and handler length about equally. Guest registers living in memory cost nothing
+    measurable: a chain of dependent `ADDS` runs as fast as an independent one.
+  - **The profile says where the next factor is not.** 44% of the workload is a nine-instruction
+    straight-line CRC loop with no pair as frequent as `CMP`/`B<cond>`, so further fusion reaches
+    little of it; fewer dispatches there means compiling a block, which is a JIT, and a JIT is not
+    planned.
 - **A block** is a straight run of decoded instructions ending at a branch, an exception return, a
   write to PC, an instruction that changes interrupt masking (`CPSIE`, `MSR BASEPRI`), an `SVC`, a
   `WFI`/`WFE`, a barrier, or 64 instructions. Interrupts are taken only between blocks, which is legal
@@ -359,9 +512,11 @@ loop
   sub-4 KB region are marked slow and checked per access against the region list. skiff's 64-byte
   stack guard makes the page holding each stack's base a slow page, which is acceptable.
 
-### 2.5 The interface a JIT plugs into
+### 2.5 The interface a JIT would plug into
 
-The interpreter and a future JIT meet at the **block**:
+**JIT: not planned.** The block boundary below is where one would meet the interpreter, and it costs
+the interpreter nothing to keep, so the shape is recorded; nothing is built for it. The two would meet
+at the **block**:
 
 ```
 trait Exec
@@ -390,12 +545,18 @@ same interpreter written in C. The comparison points are predecoded, switch-disp
 interpreters on a current Apple P-core, which reach 100–300 million guest instructions per second
 before any JIT. Against that:
 
+**The first measurement beat this table's estimates by about ten.** The `become` chain, measured
+with `cortical bench` (§2.3), runs an ARMv6-M workload at ~1365 MIPS on one M5 Pro P-core, with the page-table memory path
+and lazy N/Z flags but no interrupts, MPU or IT blocks yet; compare-and-branch fusion and lazy V
+have since cut its cycles per guest instruction by a further 12%. The estimates below are kept as the
+floor to defend; the benchmark after milestone 1 replaces them with Thumb-2 figures.
+
 | stage | per core | M7 (as a share of 400 MHz × ~1.3 IPC) | M4 (200 MHz × ~0.9 IPC) |
 |---|---|---|---|
 | first correct version (milestone 1 on the M33; the H7 at milestone 5) | 40–60 MIPS | ~10% | ~30% |
 | **target**: predecoded blocks, fast table, lazy flags | **120–180 MIPS** | **~25–35%** | **~70–100%** |
 | stretch: superinstructions for hot pairs, flag liveness | 200–250 MIPS | ~40–50% | real time |
-| a JIT (later) | 800–2000 MIPS | real time | real time |
+| a JIT (not planned) | 800–2000 MIPS | real time | real time |
 
 The two cores are independent host threads on two P-cores, so the figures do not halve. The M4 at
 real speed is within reach of an interpreter. The M7 is not, since dual issue makes it about 520 M
@@ -796,7 +957,7 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
 | wifi | module TBD | — |
 | GDB stub (remote serial protocol over TCP, per core) | very useful for firmware debugging | 2 |
 | `--dcache-model` | §1.5 | 2–3 |
-| a JIT | AArch64 code generation per block behind §2.5 | 15–25 |
+| a JIT — **not planned** | AArch64 code generation per block behind §2.5 | 15–25 |
 
 ---
 
@@ -805,8 +966,8 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
 ### 8.1 Risks
 
 1. **The M7's speed target.** An interpreter will not reach 400 MHz-class M7 throughput, so a UI that
-   is smooth on the board will be choppy in cortical until the JIT exists. §2.6 says what to expect,
-   and the benchmark decides.
+   is smooth on the board will be choppy in cortical, and no JIT is planned to close the gap. §2.6
+   says what to expect, and the benchmark decides.
 2. **Exclusives across cores.** What the H747's interconnect does with an exclusive store to shared
    SRAM (succeed without excluding, or fail) has to be read from RM0399 and the Cortex-M7 TRM, and
    ideally run on the board. Getting it wrong either way hides a skiff bug or invents one. The option
@@ -1172,3 +1333,92 @@ Pico (`picokit/README.md:94–104`). If the Pico in the user's kit is a plain Pi
 change its README describes (call `stdio_init_all` directly) before it runs on that board or in
 cortical. If it is a Pico W, cortical needs the CYW43 item (§7, later) for `cyw43_arch_init` to
 succeed. Which Pico is under the kit decides it, and that is the user's to say.
+
+---
+
+## 11. The virtual board
+
+**What it is for: running a program and talking to it with nothing but the core.** It is
+deliberately not a real chip, so there is no datasheet to follow and no oracle board; a program built
+for it exercises the instruction set, the memory path and a console, and nothing else stands between
+the core and the terminal. It is how the ARMv6-M core runs real C before any real board's devices
+exist, and the smallest machine a test can boot.
+
+- **The core** is `sh.sysl.cortical.v6m`: the ARMv6-M interpreter (§2.8) with its two executors,
+  the `become` chain and the `match` loop (§2.3), 1 MB of RAM from address 0 behind a page table, a
+  guard record past the end of RAM, and an `io_read`/`io_write` pair the board fills for every
+  address with no page, outside the system control space at `0xE000_E000` that the core answers
+  itself (§2.2's ARMv6-M paragraph: SysTick, the NVIC, the SCB). A stop names its kind and its
+  address (`stop_at`): a breakpoint, an undefined instruction, an access or a jump where nothing is,
+  the guest asking to exit, a `WFI` nothing can wake, a fault it cannot take, or a reset request; it
+  leaves `pc` where the guest was (§2.2, "Where a stop leaves the core"), and `cortical run`'s message
+  names both.
+- **A store never leaves a stale decoded record.** A byte per 64-byte line of RAM records whether a
+  record has been decoded from it (or from the 3 bytes after it); every store on the fast path tests
+  its line, one load and a branch, and a store to a code line puts back to "not decoded" the records
+  of the halfwords written and the one before them, which may be a 32-bit instruction or a compare
+  fused with the branch after it (§2.4). The records and the map are the machine's, so code one core
+  writes is decoded afresh wherever either core next runs it. The line, not the 4 KB page, is the
+  unit because a C program's data follows its code: on the benchmark, whose hot data shares a page
+  with its code, the check costs about 3% more host instructions and no measurable cycles, where a
+  page-granular one would send every one of those stores down the slow path.
+- **The board** is `sh.sysl.cortical.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
+  (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
+  the input has ended), EXIT (end with this status) and CTRL (bit 0 enables the console's interrupt).
+  Every other address stops the core with `Unmapped`. Core 0 resets as an M0+ does, SP and PC from
+  the vector table at 0, and an AIRCR reset request ends the board.
+- **Two cores, and an SIO after the RP2040's** at `0xD000_0000`, which answers each core by which one
+  made the access (the board compares the `Cpu` it is handed):
+
+  | offset | register | behaviour |
+  |---|---|---|
+  | `0x000` | CPUID | 0 on core 0, 1 on core 1; writes are ignored |
+  | `0x050` | FIFO_ST | bit 0 VLD: this core's RX FIFO holds a word; bit 1 RDY: its TX FIFO has room; bit 2 WOF: it wrote to a full TX FIFO; bit 3 ROE: it read an empty RX FIFO. Writing 1 to WOF or ROE clears it |
+  | `0x054` | FIFO_WR | push to the other core's RX FIFO, 8 words deep as on the RP2040; when full, the word is lost and WOF set |
+  | `0x058` | FIFO_RD | pop this core's RX FIFO; when empty, 0, and ROE set |
+  | `0x05C` | SPINLOCK_ST | bit k set while spinlock k is claimed |
+  | `0x100` + 4k | SPINLOCK0–31 | read: claim, answering `1 << k` if the lock was free and 0 if it was claimed (by either core); write: release |
+
+  The FIFO is the RP2040's rather than doorbell bits because the SDK's multicore code — and its launch
+  protocol — is written against it, so a program for the board reads like one for the Pico. Its
+  interrupt is **IRQ 1, raised in the reading core's NVIC alone** while its VLD, WOF or ROE is set,
+  between runs as the console's is. The console's IRQ 0 is raised in both running cores' NVICs.
+- **Core 1 is launched by the RP2040's sequence (§9.6)**, with the board playing core 1's boot ROM
+  until it runs: every word core 0 pushes is echoed into core 0's RX FIFO (and lost if that is full),
+  and the sequence 0, 0, 1, VTOR, SP, ENTRY starts core 1 at ENTRY with that SP and VTOR, its clock
+  set to core 0's. Zeros at the sequence's start keep the last two; any other word out of place
+  starts it again; VTOR, SP and ENTRY may be any word, so a vector table at 0 launches. An ENTRY
+  without its Thumb bit stops core 1 at `Fault` there, which ends the board. Once core 1 runs the
+  same words are only data in its FIFO: there is no second launch.
+- **The cores take turns on one host thread** (§1.1): `quantum` instructions each, 1000 by default.
+  Before core 1 is launched core 0 runs alone a million instructions at a time, exactly as a
+  single-core board, so `cortical run` on a one-core program and `cortical bench` are unchanged. A
+  core asleep in `WFI` skips to the end of the round, or wakes within it on its own SysTick or on an
+  interrupt the other core raised in an earlier turn; when every running core ends a round asleep,
+  the board wakes one an interrupt was raised for, else skips to the first SysTick that wakes one,
+  else waits for the console where its interrupt would wake one, and else stops both at `Asleep`. A
+  stop of either core ends the board — core 1's `EXIT`, for one — and `run_board` answers the core
+  that stopped, which `cortical run`'s message names. `WFE` and `SEV` are hints that do nothing, so
+  the SDK's FIFO waits spin rather than sleep.
+- **The console's interrupt is IRQ 0**, raised while CTRL bit 0 is set and STATUS is not 0 — a byte
+  waiting, or the input ended — so a handler reads until STATUS is 0, or turns CTRL off once the input
+  has ended. The board raises it between runs, a million instructions apart at most. When the core
+  sleeps in `WFI` with nothing in it to wake it, the board blocks on the console's input if the
+  interrupt that input raises would wake the core, and otherwise lets the core stop at `Asleep`.
+- **The console's input is a channel.** `cortical run` fills it from a thread reading the terminal in
+  raw mode a byte at a time; a test fills it itself and closes it, which the guest sees as STATUS's
+  ENDED. Output is buffered and written at a line's end, when the guest reads STATUS or DATA (so a
+  prompt shows before it waits), and when it stops. **Ctrl-]** ends cortical with status 130 whatever
+  the guest is doing, as telnet's escape does.
+- **Images** are ELF-32 little-endian ARM files, loaded by `sysl-lang/elf` at their physical
+  addresses (the package is built with `elf64` and `big_endian` off, so it refuses the others as
+  unsupported), or raw bytes from address 0, up to the RAM's 1 MB.
+- **`examples/virt`** is the C runtime for it (`virt.h`'s register macros, `start.c`'s vector table
+  of weak handlers and reset, `virt.ld`), `echo.c`, which polls the console, and `irq.c`, which echoes
+  from the console's interrupt handler while `main` sleeps in `WFI`, and `dual.c`, built with
+  `arm-none-eabi-gcc`. In `dual.c` core 0 launches core 1 with `virt.h`'s `launch_core1` (the
+  RP2040 sequence), sends it 1 to 4 through the FIFO, and prints the squares core 1 sends back from
+  its FIFO interrupt; then both print lines at once, each line under spinlock 0, and core 1 reports
+  that it has finished through the FIFO before core 0 exits. The board's tests boot the committed
+  `echo.elf`, `irq.elf` and `dual.elf` and check each whole conversation byte for byte, and
+  `dual.elf` twice for the same counts and `pc` on both cores.

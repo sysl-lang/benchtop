@@ -1,0 +1,106 @@
+// cortical: a Cortex-M board emulator.
+//
+//     cortical run <image.elf | image.bin>
+//         Boot the image on the virtual board (`sh.sysl.cortical.virt`), its console on this
+//         terminal, a keystroke at a time. Ctrl-] ends cortical whatever the guest is doing.
+//         The exit status is the guest's, written to the console's EXIT register.
+//
+//     cortical bench <image.bin> [expected r0] [match | threaded]
+//         Run a raw image from address 0 under both executors, three rounds each, and report each
+//         one's speed. Naming one executor runs only that one, so a process-wide counter (`time -l`'s
+//         cycles and instructions) measures it alone.
+
+import sh.sysl.cortical.v6m.{Cpu, Stop, reset, run_match, run_threaded}
+import sh.sysl.cortical.virt.{boot, image_of, listen, open_console, run_board, stop_message}
+import sysl.fs.read_bytes
+import sysl.text.parse_int
+import sysl.time.monotonic
+import sysl.tty.raw
+
+const QUANTUM: u64 = 1000000
+
+var cpu: Cpu
+
+usage()
+    print("usage: cortical run <image.elf | image.bin>")
+    print("       cortical bench <image.bin> [expected r0] [match | threaded]")
+    exit(2)
+
+die(why: string) -> never
+    eprints(s"cortical: $why\n")
+    exit(1)
+
+read_or_die(file: string) -> []u8 = read_bytes(file) match
+    Ok(b) -> b
+    Err(e) -> die(s"cannot read $file: $e")
+
+main(args: []string)
+    if args.len < 3 then usage()
+
+    args[1] match
+        "run" -> run(args[2])
+        "bench" -> bench(args)
+        _ -> usage()
+
+// ---------------------------------------------------------------------------------------------------
+// run
+
+run(file: string)
+    val image = image_of(read_or_die(file)) match
+        Ok(b) -> b
+        Err(why) -> die(s"$file: $why")
+
+    open_console()
+    boot(&cpu, image.view())
+    raw()
+
+    if !listen() then die("cannot start the console's input thread")
+
+    val core = run_board(&cpu)
+
+    core.stop match
+        Exit -> exit(int(core.exit_code))
+        Budget -> ()
+        Breakpoint | Reset -> eprints(s"\r\ncortical: ${stop_message(core)}\r\n")
+        _ ->
+            eprints(s"\r\ncortical: ${stop_message(core)}\r\n")
+            exit(3)
+
+// ---------------------------------------------------------------------------------------------------
+// bench
+
+// Run the guest to its breakpoint with `exec`, and answer the microseconds it took.
+measure(image: []u8, exec: *extern(*Cpu) -> unit) -> long
+    reset(&cpu, image, 0)
+
+    val start = monotonic()
+
+    while cpu.stop == Stop.Budget
+        cpu.limit = cpu.retired + QUANTUM
+        exec(&cpu)
+
+    (monotonic() - start).us
+
+report(name: string, us: long, expected: u32) -> bool
+    val mips = real(cpu.retired) / real(us)
+    val ok = cpu.stop == Stop.Breakpoint && cpu.r[0] == expected
+
+    print(s"$name: ${cpu.retired} instructions in $us us, $mips MIPS, r0 = ${cpu.r[0]}, ${cpu.stop}")
+
+    if !ok then print(s"  FAILED: expected r0 = $expected at a breakpoint, stopped at ${cpu.stop_at}")
+
+    ok
+
+bench(args: []string)
+    val image = read_or_die(args[2])
+    val expected: u32 = if args.len > 3 then u32(parse_int(args[3]).unwrap_or(0)) else 0
+    val only = if args.len > 4 then args[4] else ""
+    var good = true
+
+    for round in 0..<3
+        if only != "threaded"
+            good = report("match   ", measure(image, &run_match), expected) && good
+        if only != "match"
+            good = report("threaded", measure(image, &run_threaded), expected) && good
+
+    if !good then exit(1)
