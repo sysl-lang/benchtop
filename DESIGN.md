@@ -112,6 +112,20 @@ Sources, and how far each was checked:
   skiff's AN521 boots flaky (skiff `CLAUDE.md`, milestone 2: a tick delivered up to 5 ticks late), and
   cortical should not repeat that. `--seed n` jitters the quanta, which explores interleavings
   reproducibly: a skiff race found at seed 1234 recurs at seed 1234.
+- **The virtual board (§11) runs its two M0+ cores this way, and only this way.** A round gives core
+  0 a turn and then core 1, each running until its clock (instructions retired plus the time skipped
+  asleep) reaches the round's end, `quantum` past the last one's: 1000 instructions by default, a
+  board parameter. A turn ends at the core's first taken branch at or past that time, as every run
+  does (§2.3), so the clocks stay within a quantum plus one straight run of code of each other, and
+  whatever one core writes in its turn the other sees from its next turn on, never mid-turn. The
+  default is a compromise between the cost of a switch (a run's start — waking, bringing SysTick up,
+  taking a pending exception — and raising the board's interrupts: a handful of calls, against the
+  roughly 0.7 µs a 1000-instruction turn takes) and how late a core sees the other: at the RP2040's
+  125 MHz, a quantum is 8 µs, so a FIFO round trip costs at most two turns, about an interrupt's
+  latency. Tests set a quantum of a dozen instructions to pin an exact
+  interleaving. There is no `--seed` yet; the quantum is the one input to the interleaving, and the
+  same image, input and quantum give the same run, counts and all. This single-threaded run is the
+  oracle the threaded mode will be checked against.
 
 ### 1.2 The bus and memory map
 
@@ -193,6 +207,12 @@ checked against the SVD):
 ### 1.4 Inter-core state
 
 - **Shared RAM** is the same host memory in both views, so there is nothing to synchronise beyond §1.5.
+- **On the virtual board (§11) the split is the RP2040's.** Shared by both cores: the RAM, the page
+  table, the decoded records and the map of which RAM lines hold code (§11), and the SIO with its
+  FIFOs and spinlocks. Each core's own: its `Cpu` — registers, flags, PRIMASK, CONTROL, MSP/PSP,
+  VTOR — and its exception state, which is its NVIC's pending, active and enable bits and its
+  priorities, and its SysTick. A device's interrupt is raised in each NVIC separately (the console's
+  in both, the FIFO's in the reading core's alone), and each core enables its own.
 - **HSEM** (32 semaphores, RM0399 "Hardware semaphore"): each `R[n]` is a host `Atomic[u32]` holding
   `LOCK | COREID<<8 | PROCID`. A 2-step write-lock or a 1-step read-lock (`RLR[n]`) is a
   compare-and-swap against the unlocked value. Unlock requires a matching COREID/PROCID. The core IDs
@@ -237,6 +257,17 @@ checked against the SVD):
   exclusives between its two M33s must exclude: the RP2350 chip description selects `--exclusives
   global`, a monitor shared by both cores over SRAM. The RP2040's M0+s have no exclusives at all.
 - **Device (MMIO) accesses are strongly ordered and serialised** by the device lock.
+- **On one host thread (the virtual board, §11) memory is sequentially consistent by construction**:
+  only one core runs at a time, so every access is in one global order and `DMB`/`DSB`/`ISB` need do
+  nothing beyond being a point where the budget is checked. Giving each core its own thread will need:
+  guest RAM accesses that stay single-copy atomic up to a word (they are host accesses of the same
+  width, so this holds on AArch64), `DMB`/`DSB` as `dmb ish`; the SIO's FIFOs and spinlocks under its
+  lock, a spinlock claim a compare-and-swap; an interrupt raised by one core's thread in the other's
+  NVIC as an atomic pending bit plus a poke of that core's `limit`; and the decoded records made safe
+  to forget while the other thread runs them — today a store puts a 16-byte record back to "not
+  decoded" with a plain write, which a racing reader could see torn, so the threaded stage swaps the
+  handler word alone (atomically, to the decoder) or moves to the generation check of §2.4, and marks
+  the code-line map with atomic stores.
 - **Caches are no-ops (the brief).** That makes cortical *more* coherent than silicon: a missing clean
   or invalidate works in cortical and fails on the board. Since skiff's milestone 9 is exactly "shared
   state uncached on the M7, then the cache trait", a **later** option, `--dcache-model`, keeps a
@@ -1322,11 +1353,53 @@ exist, and the smallest machine a test can boot.
   the guest asking to exit, a `WFI` nothing can wake, a fault it cannot take, or a reset request; it
   leaves `pc` where the guest was (§2.2, "Where a stop leaves the core"), and `cortical run`'s message
   names both.
+- **A store never leaves a stale decoded record.** A byte per 64-byte line of RAM records whether a
+  record has been decoded from it (or from the 3 bytes after it); every store on the fast path tests
+  its line, one load and a branch, and a store to a code line puts back to "not decoded" the records
+  of the halfwords written and the one before them, which may be a 32-bit instruction or a compare
+  fused with the branch after it (§2.4). The records and the map are the machine's, so code one core
+  writes is decoded afresh wherever either core next runs it. The line, not the 4 KB page, is the
+  unit because a C program's data follows its code: on the benchmark, whose hot data shares a page
+  with its code, the check costs about 3% more host instructions and no measurable cycles, where a
+  page-granular one would send every one of those stores down the slow path.
 - **The board** is `sh.sysl.cortical.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
   (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
   the input has ended), EXIT (end with this status) and CTRL (bit 0 enables the console's interrupt).
-  Every other address stops the core with `Unmapped`. The core resets as an M0+ does, SP and PC from
+  Every other address stops the core with `Unmapped`. Core 0 resets as an M0+ does, SP and PC from
   the vector table at 0, and an AIRCR reset request ends the board.
+- **Two cores, and an SIO after the RP2040's** at `0xD000_0000`, which answers each core by which one
+  made the access (the board compares the `Cpu` it is handed):
+
+  | offset | register | behaviour |
+  |---|---|---|
+  | `0x000` | CPUID | 0 on core 0, 1 on core 1; writes are ignored |
+  | `0x050` | FIFO_ST | bit 0 VLD: this core's RX FIFO holds a word; bit 1 RDY: its TX FIFO has room; bit 2 WOF: it wrote to a full TX FIFO; bit 3 ROE: it read an empty RX FIFO. Writing 1 to WOF or ROE clears it |
+  | `0x054` | FIFO_WR | push to the other core's RX FIFO, 8 words deep as on the RP2040; when full, the word is lost and WOF set |
+  | `0x058` | FIFO_RD | pop this core's RX FIFO; when empty, 0, and ROE set |
+  | `0x05C` | SPINLOCK_ST | bit k set while spinlock k is claimed |
+  | `0x100` + 4k | SPINLOCK0–31 | read: claim, answering `1 << k` if the lock was free and 0 if it was claimed (by either core); write: release |
+
+  The FIFO is the RP2040's rather than doorbell bits because the SDK's multicore code — and its launch
+  protocol — is written against it, so a program for the board reads like one for the Pico. Its
+  interrupt is **IRQ 1, raised in the reading core's NVIC alone** while its VLD, WOF or ROE is set,
+  between runs as the console's is. The console's IRQ 0 is raised in both running cores' NVICs.
+- **Core 1 is launched by the RP2040's sequence (§9.6)**, with the board playing core 1's boot ROM
+  until it runs: every word core 0 pushes is echoed into core 0's RX FIFO (and lost if that is full),
+  and the sequence 0, 0, 1, VTOR, SP, ENTRY starts core 1 at ENTRY with that SP and VTOR, its clock
+  set to core 0's. Zeros at the sequence's start keep the last two; any other word out of place
+  starts it again; VTOR, SP and ENTRY may be any word, so a vector table at 0 launches. An ENTRY
+  without its Thumb bit stops core 1 at `Fault` there, which ends the board. Once core 1 runs the
+  same words are only data in its FIFO: there is no second launch.
+- **The cores take turns on one host thread** (§1.1): `quantum` instructions each, 1000 by default.
+  Before core 1 is launched core 0 runs alone a million instructions at a time, exactly as a
+  single-core board, so `cortical run` on a one-core program and `cortical bench` are unchanged. A
+  core asleep in `WFI` skips to the end of the round, or wakes within it on its own SysTick or on an
+  interrupt the other core raised in an earlier turn; when every running core ends a round asleep,
+  the board wakes one an interrupt was raised for, else skips to the first SysTick that wakes one,
+  else waits for the console where its interrupt would wake one, and else stops both at `Asleep`. A
+  stop of either core ends the board — core 1's `EXIT`, for one — and `run_board` answers the core
+  that stopped, which `cortical run`'s message names. `WFE` and `SEV` are hints that do nothing, so
+  the SDK's FIFO waits spin rather than sleep.
 - **The console's interrupt is IRQ 0**, raised while CTRL bit 0 is set and STATUS is not 0 — a byte
   waiting, or the input ended — so a handler reads until STATUS is 0, or turns CTRL off once the input
   has ended. The board raises it between runs, a million instructions apart at most. When the core
@@ -1342,6 +1415,10 @@ exist, and the smallest machine a test can boot.
   unsupported), or raw bytes from address 0, up to the RAM's 1 MB.
 - **`examples/virt`** is the C runtime for it (`virt.h`'s register macros, `start.c`'s vector table
   of weak handlers and reset, `virt.ld`), `echo.c`, which polls the console, and `irq.c`, which echoes
-  from the console's interrupt handler while `main` sleeps in `WFI`, built with `arm-none-eabi-gcc`.
-  The board's tests boot the committed `echo.elf` and `irq.elf` and check each whole conversation byte
-  for byte.
+  from the console's interrupt handler while `main` sleeps in `WFI`, and `dual.c`, built with
+  `arm-none-eabi-gcc`. In `dual.c` core 0 launches core 1 with `virt.h`'s `launch_core1` (the
+  RP2040 sequence), sends it 1 to 4 through the FIFO, and prints the squares core 1 sends back from
+  its FIFO interrupt; then both print lines at once, each line under spinlock 0, and core 1 reports
+  that it has finished through the FIFO before core 0 exits. The board's tests boot the committed
+  `echo.elf`, `irq.elf` and `dual.elf` and check each whole conversation byte for byte, and
+  `dual.elf` twice for the same counts and `pc` on both cores.
