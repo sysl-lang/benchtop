@@ -1,0 +1,511 @@
+module sh.sysl.cortical
+@tests
+
+// The board format: every form it reads, every mistake it reports with its exact text and the line
+// and column it points at, the three board files in `boards/`, and a board written back reading as
+// itself.
+
+import sh.sysl.parsing.{Source, source_of}
+import sysl.buf.{Buf, buf}
+import sysl.text.{replace_all, str_builder}
+
+val VIRT = embed("../../../boards/virt.hocon")
+val KIT = embed("../../../boards/pico-breadboard-kit.hocon")
+val PICO2W = embed("../../../boards/pico2w.hocon")
+
+// Every diagnostic `text` gets, a line each: where it points, then what it says.
+private diags_with(text: string, reg: Registry) -> string
+    val src = source_of("t.hocon", text)
+    val got = load(src, reg)
+    var out = str_builder()
+
+    for i in 0..<got.report.len()
+        val d = got.report.at(i)
+
+        out.push(s"${src.locate(d.span.start)} ${d.message}\n")
+
+    out.finish()
+
+private diags(text: string) -> string = diags_with(text, library())
+
+private expect(text: string, want: string)
+    val got = diags(text)
+
+    assert(got == want, s"for\n$text\nwanted\n${want}got\n$got")
+
+// A board on the RP2040 whose parts are `lines`, from line 3; `more` follows from the line after them.
+private kit(lines: string, more: string = "") -> string =
+    s"board { name = t, chip = rp2040 }\nparts {\n$lines}\n$more"
+
+// A board of two M0+ cores whose parts are `lines`, from line 3.
+private cores(lines: string) -> string =
+    s"board { name = v, cores = [cortex-m0plus, cortex-m0plus] }\nparts {\n$lines}\n"
+
+// The model a text reads to, which must check clean.
+private clean(text: string) -> Board
+    val got = load(source_of("t.hocon", text), library())
+
+    assert(!got.report.has_errors(), diags(text))
+    got.board
+
+// A board read, written, read and written again: the two writings are the same text.
+private round_trip(text: string, reg: Registry) -> string
+    val once = board_text(load(source_of("a.hocon", text), reg).board)
+    val again = load(source_of("b.hocon", once), reg)
+
+    assert(!again.report.has_errors(), s"the written board does not check:\n$once")
+
+    val twice = board_text(again.board)
+
+    assert(once == twice, s"once:\n${once}twice:\n$twice")
+    once
+
+private str_of(b: []const u8) -> string = str_cast(b)
+
+// -- the board files -------------------------------------------------------------------------------
+
+@test("the three board files check clean")
+boards_clean()
+    expect(str_of(VIRT), "")
+    expect(str_of(KIT), "")
+    expect(str_of(PICO2W), "")
+
+@test("virt.hocon reads as two M0+ cores, a 1M RAM at 0, the console at 0x40000000 on IRQ 0, and the SIO")
+boards_virt_model()
+    val b = clean(str_of(VIRT))
+
+    assert(b.name == "virt" && b.chip.is_empty() && b.cores.len() == 2)
+    assert(b.cores.at(0).name == "cortex-m0plus" && b.cores.at(1).name == "cortex-m0plus")
+    assert(b.parts.len() == 3)
+
+    val ram = b.parts.at(0)
+
+    assert(ram.kind == "ram" && ram.at.unwrap().n == 0 && ram.size.unwrap().n == 1048576 && ram.irq.is_none())
+    assert(ram.size.unwrap().written == "1M" && ram.at.unwrap().written == "0x00000000")
+
+    val console = b.parts.at(1)
+
+    assert(console.kind == "debug-console" && console.at.unwrap().n == 0x40000000 && console.irq.unwrap().n == 0)
+    assert(b.parts.at(2).at.unwrap().n == 0xD0000000 && b.parts.at(2).irq.unwrap().n == 1)
+
+@test("each board file written back reads as itself, and virt.hocon keeps how its places were written")
+boards_round_trip()
+    val reg = library()
+    val virt = round_trip(str_of(VIRT), reg)
+
+    assert(virt == """
+        board {
+          name = "virt"
+          cores = [cortex-m0plus, cortex-m0plus]
+        }
+        parts {
+          ram {
+            part = ram
+            at = 0x00000000
+            size = 1M
+          }
+          console {
+            part = debug-console
+            at = 0x40000000
+            irq = 0
+          }
+          sio {
+            part = virt-sio
+            at = 0xD0000000
+            irq = 1
+          }
+        }
+        """, virt)
+
+    round_trip(str_of(KIT), reg)
+    round_trip(str_of(PICO2W), reg)
+
+@test("cortical check's summary of each board file")
+boards_summary()
+    val reg = library()
+
+    assert(summary(clean(str_of(VIRT)), reg) == """
+        virt: two cortex-m0plus cores
+          ram      ram            0x00000000 to 0x000fffff
+          console  debug-console  0x40000000 to 0x4000000f, IRQ 0
+          sio      virt-sio       0xd0000000 to 0xd000017f, IRQ 1
+        """, summary(clean(str_of(VIRT)), reg))
+
+    val p = summary(clean(str_of(PICO2W)), reg)
+
+    assert(p == """
+        Raspberry Pi Pico 2 W: the rp2350 (Raspberry Pi RP2350A: two Cortex-M33 at 150 MHz)
+          wifi     cyw43439  wl_on = GP23, data = GP24, cs = GP25, clock = GP29 (not modelled)
+          led      led       anode = wifi.gpio0, color = green (driven through `wifi`, which is not modelled)
+          console  terminal  uart = uart0
+          bus uart0: tx = GP0, rx = GP1
+          panel 168 x 408, 5 elements
+        """, p)
+
+    val k = summary(clean(str_of(KIT)), reg)
+
+    assert(k.starts_with("Pico Breadboard Kit: the rp2040 (Raspberry Pi RP2040: two Cortex-M0+ at 133 MHz)\n"), k)
+    assert(k.contains("  lcd       st7796    spi = spi0, cs = GP5, dc = GP6, reset = GP7, width = 320, height = 480, invert = true\n"), k)
+    assert(k.ends_with("  panel 922 x 499, 11 elements\n  input: 6 keys, 1 pointer binding\n"), k)
+
+// -- forms -----------------------------------------------------------------------------------------
+
+@test("an empty file has no board and no parts, and says only that")
+forms_empty()
+    expect("", "1:1 there is no `board` section\n1:1 there is no `parts` section\n")
+    expect("// nothing but a comment\n", "1:1 there is no `board` section\n1:1 there is no `parts` section\n")
+
+@test("every form a description may take: blocks, dotted keys, quoted keys, both comments, `:` and `=`, hex, K and M")
+forms_all()
+    val b = clean("""
+        # a hash comment
+        board: { name: "every form", chip = rp2040 }   // a slash comment
+        parts {
+          d1 { part = led, color = red, wire { anode = GP16 } }
+          d2.part = led
+          d2.wire.anode = GP17
+          "btn 1" { part = button, active = low
+                    wire { pin = GP15 } }
+          touch { part = gt911, address = 0x5d, wire { i2c = i2c0 } }
+        }
+        buses { i2c0 { sda = GP8, scl = GP9 } }
+        panel {
+          size = [100, 60]
+          elements {
+            d1 { show = d1, at = [0, 0], size = [10, 10] }
+            caption { text = "D1", at = [20, 0], size = [30, 10] }
+            fill { box = "#202020", at = [0, 20], size = [100, 40], look { color = "#20c040" } }
+          }
+        }
+        input { keys { "1" = "btn 1" }, pointer { fill = touch } }
+        """)
+
+    assert(b.name == "every form" && b.chip == "rp2040")
+    assert(b.parts.len() == 4)
+    assert(b.parts.at(1).name == "d2" && b.parts.at(1).kind == "led" && target_text(b.parts.at(1).wires.at(0).to) == "GP17")
+    assert(b.parts.at(2).name == "btn 1")
+
+    param_named(b.parts.at(3).params, "address") match
+        Some(p) -> assert(setting_text(p.value) == "93")
+        None -> assert(false, "no address")
+
+    assert(b.keys.at(0).key == "1" && b.keys.at(0).part == "btn 1" && b.keys.at(0).control.is_empty())
+    assert(b.panel.elements.len() == 3)
+
+    b.panel.elements.at(1).shows match
+        Caption(t) -> assert(t == "D1")
+        _ -> assert(false, "the caption")
+
+@test("a size is decimal, hexadecimal, or K or M of 1024 and 1048576 bytes, and each runs to the same size")
+forms_sizes()
+    for size in ["1M", "1024K", "0x100000", "1048576"]
+        val b = clean(cores(s"  ram { part = ram, at = 0, size = $size }\n"))
+
+        assert(b.parts.at(0).size.unwrap().n == 1048576, size)
+        assert(b.parts.at(0).size.unwrap().written == size, size)
+
+    assert(clean(cores("  ram { part = ram, at = 0, size = 4K }\n")).parts.at(0).size.unwrap().n == 4096)
+
+@test("unicode in names, labels and captions reads, checks, and is written back as it was")
+forms_unicode()
+    val text = """
+        board { name = "Ünïcødé board ✓", chip = rp2040 }
+        parts { "дёнь" { part = led, wire { anode = GP16 } } }
+        panel {
+          size = [100, 100]
+          elements { "λ" { show = "дёнь", at = [0, 0], size = [10, 10], label = "温度 ✓" } }
+        }
+        """
+    val b = clean(text)
+
+    assert(b.name == "Ünïcødé board ✓" && b.parts.at(0).name == "дёнь")
+    assert(b.panel.elements.at(0).label == "温度 ✓")
+
+    val written = round_trip(text, library())
+
+    assert(written.contains("\"温度 ✓\"") && written.contains("\"Ünïcødé board ✓\""), written)
+
+@test("a diagnostic after a unicode line points at the column a person counts, in characters")
+forms_unicode_column()
+    expect("board { name = \"✓✓\", chip = rp2041 }\nparts {}\n", "1:28 unknown chip `rp2041`\n")
+
+@test("comments anywhere change nothing, and are not written back")
+forms_comments()
+    val plain = cores("  ram { part = ram, at = 0, size = 1M }\n")
+    val commented = """
+        // before
+        board { name = v, cores = [cortex-m0plus, /* not a comment form */ cortex-m0plus] }
+        """
+
+    // HOCON has no block comments: the reader refuses the text, and the board reports it.
+    assert(!diags(commented).is_empty())
+
+    val with_comments = """
+        // before
+        board {  # the board
+          name = v // its name
+          cores = [cortex-m0plus, cortex-m0plus]
+        }
+        parts {
+          // the RAM
+          ram { part = ram, at = 0, size = 1M }  # 1 MB
+        }
+        // after
+        """
+
+    assert(round_trip(with_comments, library()) == round_trip(plain, library()))
+
+// -- the board section -----------------------------------------------------------------------------
+
+@test("the board section: a name, and exactly one of a chip and cores")
+board_section()
+    expect("board { chip = rp2040 }\nparts {}\n", "1:1 the board has no name\n")
+    expect("board { name = t }\nparts {}\n", "1:1 the board names neither a chip nor its cores\n")
+    expect("board { name = v, chip = rp2040, cores = [cortex-m0plus] }\nparts {}\n",
+        "1:42 the board names both a chip and cores\n")
+    expect("parts {}\n", "1:1 there is no `board` section\n")
+    expect("board { name = t, chip = rp2040 }\n", "1:1 there is no `parts` section\n")
+    expect("board = 1\nparts {}\n", "1:9 the `board` section must be a block, not a number\n1:1 there is no `board` section\n")
+
+@test("cores: a list of words, each a core the library knows")
+board_cores()
+    expect("board { name = v, cores = cortex-m0plus }\nparts {}\n", "1:27 `board.cores` must be a list of cores, not a string\n")
+    expect("board { name = v, cores = [] }\nparts {}\n", "1:27 `board.cores` names no core\n")
+    expect("board { name = v, cores = [1] }\nparts {}\n", "1:28 a core is named by a word, not a number\n")
+    expect("board { name = v, cores = [cortex-m0, cortex-m0plus] }\nparts {}\n", "1:28 unknown core `cortex-m0`\n")
+    expect("board { name = v, cores = [cortex-m33] }\nparts {}\n", "")
+
+@test("an unknown chip, and a setting the board section does not have")
+board_unknown()
+    expect("board { name = t, chip = rp2041 }\nparts {}\n", "1:26 unknown chip `rp2041`\n")
+    expect("board { name = t, chip = rp2040, clock = 1 }\nparts {}\n", "1:34 unknown setting `clock` in `board`\n")
+    expect("board { name = [1], chip = rp2040 }\nparts {}\n", "1:16 `board.name` must be a word or a quoted string, not an array\n")
+
+// -- the cores' bus --------------------------------------------------------------------------------
+
+@test("a mapped part needs an address, aligned to what the part needs")
+mapped_at()
+    expect(cores("  c { part = debug-console }\n"), "3:3 `c` has no address\n")
+    expect(cores("  c { part = debug-console, at = 0x40000004 }\n"), "3:34 `c.at` is not aligned: a debug-console's base is a multiple of 0x10\n")
+    expect(cores("  s { part = virt-sio, at = 0xD0000100 }\n"), "3:29 `s.at` is not aligned: a virt-sio's base is a multiple of 0x1000\n")
+    expect(cores("  c { part = debug-console, at = zero }\n"), "3:34 `c.at` must be a whole number such as `7` or `0x40000000`\n")
+    expect(cores("  c { part = debug-console, at = -16 }\n"), "3:34 `c.at` must be a whole number such as `7` or `0x40000000`\n")
+
+@test("a mapped part's size: fixed for some parts, required and more than 0 for a RAM, in one of the size forms")
+mapped_size()
+    expect(cores("  c { part = debug-console, at = 0x40000000, size = 32 }\n"), "3:46 the size of a debug-console is fixed, at 16 bytes (0x10)\n")
+    expect(cores("  ram { part = ram, at = 0, size = 0 }\n"), "3:36 `ram.size` must be more than 0\n")
+    expect(cores("  ram { part = ram, at = 0 }\n"), "3:3 `ram` has no size\n")
+    expect(cores("  ram { part = ram, at = 0, size = 1G }\n"), "3:36 `ram.size` must be a whole number such as `4096`, `0x1000`, `64K` or `1M`\n")
+    expect(cores("  ram { part = ram, at = 0, size = M }\n"), "3:36 `ram.size` must be a whole number such as `4096`, `0x1000`, `64K` or `1M`\n")
+
+@test("an IRQ: only on a part that raises one, within the cores' count, and never two parts on one")
+mapped_irq()
+    expect(cores("  ram { part = ram, at = 0, size = 1M, irq = 3 }\n"), "3:40 a ram raises no interrupt, so `ram.irq` means nothing\n")
+    expect(cores("  c { part = debug-console, at = 0x40000000, irq = 32 }\n"), "3:52 IRQ 32 is beyond the cortex-m0plus's 32 interrupts\n")
+    expect(cores("  c { part = debug-console, at = 0x40000000, irq = 31 }\n"), "")
+    expect(cores("  c { part = debug-console, at = 0x40000000, irq = 5 }\n  s { part = virt-sio, at = 0xD0000000, irq = 5 }\n"),
+        "4:47 IRQ 5 is used twice\n")
+    expect(cores("  c { part = debug-console, at = 0x40000000, irq = 5 }\n  s { part = virt-sio, at = 0xD0000000, irq = 6 }\n"), "")
+    // A chip's core sets the count: an M33 takes 480.
+    expect("board { name = v, cores = [cortex-m33] }\nparts {\n  c { part = debug-console, at = 0x40000000, irq = 100 }\n}\n", "")
+
+@test("windows that meet overlap, whichever comes first; windows that touch do not")
+mapped_overlap()
+    expect(cores("  ram { part = ram, at = 0, size = 1M }\n  c { part = debug-console, at = 0x000FFFF0 }\n"),
+        "4:34 `c` (0x000ffff0 to 0x000fffff) overlaps `ram` (0x00000000 to 0x000fffff)\n")
+    expect(cores("  c { part = debug-console, at = 0x000FFFF0 }\n  ram { part = ram, at = 0, size = 1M }\n"),
+        "4:26 `ram` (0x00000000 to 0x000fffff) overlaps `c` (0x000ffff0 to 0x000fffff)\n")
+    expect(cores("  ram { part = ram, at = 0, size = 1M }\n  c { part = debug-console, at = 0x00100000 }\n"), "")
+    expect(cores("  a { part = debug-console, at = 0x40000000 }\n  b { part = debug-console, at = 0x40000000 }\n"),
+        "4:34 `b` (0x40000000 to 0x4000000f) overlaps `a` (0x40000000 to 0x4000000f)\n")
+    expect(cores("  a { part = debug-console, at = 0x40000000 }\n  b { part = debug-console, at = 0x40000010 }\n"), "")
+
+@test("a window over the cores' own block, or past the top of the address space, is refused")
+mapped_reserved()
+    expect(cores("  c { part = debug-console, at = 0xE000E000 }\n"),
+        "3:34 `c` (0xe000e000 to 0xe000e00f) overlaps the cores' own private peripheral bus\n")
+    expect(cores("  c { part = debug-console, at = 0xE00FFFF0 }\n"),
+        "3:34 `c` (0xe00ffff0 to 0xe00fffff) overlaps the cores' own private peripheral bus\n")
+    expect(cores("  c { part = debug-console, at = 0xE0100000 }\n  d { part = debug-console, at = 0xDFFFFFF0 }\n"), "")
+    expect(cores("  ram { part = ram, at = 0xFFFFF000, size = 64K }\n"),
+        "3:26 `ram` runs past the end of the address space: 65536 bytes from 0xfffff000 end beyond 0xffffffff\n")
+    expect(cores("  ram { part = ram, at = 0xFFFFF000, size = 4K }\n"), "")
+
+@test("a part off the cores' bus has no address, size or IRQ")
+mapped_unmapped()
+    expect(kit("  d1 { part = led, at = 0x40000000, size = 4, irq = 2, wire { anode = GP16 } }\n"),
+        "3:20 a led is not on the cores' bus, so `d1.at` means nothing\n" +
+        "3:37 a led is not on the cores' bus, so `d1.size` means nothing\n" +
+        "3:47 a led is not on the cores' bus, so `d1.irq` means nothing\n")
+
+// -- parts and wiring ------------------------------------------------------------------------------
+
+@test("parts: a section of blocks, each naming its library part")
+parts_shape()
+    expect("board { name = t, chip = rp2040 }\nparts = 1\n", "2:9 `parts` must be a block, not a number\n")
+    expect(kit("  d1 = led\n"), "3:8 the part `d1` must be a block, not a string\n")
+    expect(kit("  d1 { wire { anode = GP16 } }\n"), "3:3 `d1` names no part\n")
+    expect(kit("  d1 { part = lde, wire { anode = GP16 } }\n"), "3:15 unknown part `lde`\n")
+    expect(kit("  d1 { part = led, color = [1], wire { anode = GP16 } }\n"), "3:28 `d1.color` must be a single value, not an array\n")
+
+@test("wires: to a pin of the chip, once each")
+wires_pins()
+    expect(kit("  d1 { part = led, wire { anode = GP16 } }\n  d2 { part = led, wire { anode = GP16 } }\n"), "4:35 GP16 is wired twice\n")
+    expect(kit("  d1 { part = led, wire { anode = GP30 } }\n"), "3:35 GP30 is not a pin of the rp2040\n")
+    expect(kit("  d1 { part = led, wire { cathode = GP16 } }\n"), "3:27 `d1` (led) has no port `cathode`\n3:3 `d1.anode` is not wired\n")
+    expect(kit("  d1 { part = led }\n"), "3:3 `d1.anode` is not wired\n")
+    expect(kit("  d1 { part = led, wire { anode = [1] } }\n"), "3:35 `d1.wire.anode` must be a pin, a bus or a part's port, not an array\n")
+    expect(kit("  d1 { part = led, wire { anode = spi0 } }\n"), "3:35 `d1.anode` takes a pin, and `spi0` is a bus\n")
+
+@test("an ADC port takes a pin with an ADC channel")
+wires_adc()
+    expect(kit("  j { part = joystick, wire { x = GP2, y = GP27 } }\n"), "3:35 `j.x` takes an ADC pin, and GP2 has no ADC channel\n")
+
+val WIFI = "  w { part = cyw43439, wire { wl_on = GP23, data = GP24, cs = GP25, clock = GP29 } }\n"
+
+@test("a pin another part offers: wired once, by a pin port, and only where it is offered")
+wires_offered()
+    expect(kit(s"$WIFI  j { part = joystick, wire { x = w.gpio0, y = GP27 } }\n"), "4:35 `j.x` takes an ADC pin, and `w.gpio0` is a part's port\n")
+    expect(kit(s"$WIFI  a { part = led, wire { anode = w.gpio0 } }\n  b { part = led, wire { anode = w.gpio0 } }\n"), "5:34 `w.gpio0` is wired twice\n")
+    expect(kit("  d1 { part = led, wire { anode = x.gpio0 } }\n"), "3:35 `x` is not a part\n")
+    expect(kit(s"$WIFI  d1 { part = led, wire { anode = w.gpio9 } }\n"), "4:35 `w` (cyw43439) has no port `gpio9`\n")
+    expect(kit(s"$WIFI  d1 { part = led, wire { anode = w.cs } }\n"), "4:35 `w.cs` is not a pin another part can be wired to\n")
+    expect(kit("  w { part = cyw43439, wire { wl_on = GP23, data = GP24, cs = GP25, clock = GP29, gpio0 = GP2 } }\n"),
+        "3:84 `w.gpio0` is a pin `w` offers to other parts\n")
+
+@test("a bus port takes a bus of its kind that `buses` wires")
+wires_buses()
+    expect(kit("  c { part = terminal, wire { uart = GP0 } }\n"), "3:38 `c.uart` takes a UART bus, and `GP0` is not one\n")
+    expect(kit("  c { part = terminal, wire { uart = uart9 } }\n"), "3:38 the rp2040 has no bus `uart9`\n")
+    expect(kit("  c { part = terminal, wire { uart = spi0 } }\n", "buses { spi0 { sck = GP2 } }\n"), "3:38 `c.uart` takes a UART bus, and `spi0` is an SPI bus\n")
+    expect(kit("  c { part = terminal, wire { uart = uart0 } }\n"), "3:38 `c.uart` uses `uart0`, which `buses` does not wire\n")
+
+@test("buses: the chip's controllers, their signals, on pins that can carry them")
+buses_section()
+    expect(kit("", "buses { spi9 { sck = GP2 } }\n"), "4:9 the rp2040 has no bus `spi9`\n")
+    expect(kit("", "buses { spi0 { clk = GP2 } }\n"), "4:16 `spi0` has no signal `clk`\n")
+    expect(kit("", "buses { spi0 { sck = GP3 } }\n"), "4:22 GP3 cannot carry `spi0.sck`\n")
+    expect(kit("", "buses { spi0 { sck = X2 } }\n"), "4:22 `spi0.sck` must be a pin such as `GP2`\n")
+    expect(kit("  spi0 { part = led, wire { anode = GP16 } }\n", "buses { spi0 { sck = GP2 } }\n"), "3:3 duplicate name `spi0`\n")
+    expect(kit("", "buses { spi0 { sck = GP2 }, i2c0 { sda = GP2 } }\n"), "4:42 GP2 is wired twice\n")
+
+@test("parameters: known to the part, of its type and range, and the required ones given")
+params()
+    expect(kit("  d1 { part = led, colour = red, wire { anode = GP16 } }\n"), "3:20 `d1` (led) has no parameter `colour`\n")
+    expect(kit("  b { part = buzzer, kind = passive, tone = 5, wire { pin = GP13 } }\n"), "3:45 `b.tone` must be from 20 to 20000, not 5\n")
+    expect(kit("  b { part = buzzer, kind = passive, tone = high, wire { pin = GP13 } }\n"), "3:45 `b.tone` must be a whole number, not `high`\n")
+    expect(kit("  d1 { part = led, color = purple, wire { anode = GP16 } }\n"), "3:28 `d1.color` must be one of `red`, `green`, `blue`, `yellow`, `orange` and `white`, not `purple`\n")
+    expect(kit("  b { part = buzzer, wire { pin = GP13 } }\n"), "3:3 `b` (buzzer) needs `kind`\n")
+    expect(kit("  l { part = st7796, width = 320, height = 480, invert = maybe, wire { spi = spi0, cs = GP5, dc = GP6 } }\n", "buses { spi0 { sck = GP2, tx = GP3 } }\n"),
+        "3:58 `l.invert` must be `true` or `false`, not `maybe`\n")
+
+@test("a number and a text parameter, through a registry of the test's own")
+params_own_registry()
+    var reg = library()
+
+    reg.parts.push(PartSpec("probe", "a part for this test", true, false,
+        listed_specs([ParamSpec("gain", PNumber, false), ParamSpec("tag", PText, false)]), buf(), buf(), None))
+
+    assert(diags_with(kit("  p { part = probe, gain = 1.5, tag = x }\n"), reg) == "")
+    assert(diags_with(kit("  p { part = probe, gain = high }\n"), reg) == "3:27 `p.gain` must be a number, not `high`\n", diags_with(kit("  p { part = probe, gain = high }\n"), reg))
+    assert(diags_with(kit("  p { part = probe, tag = 7 }\n"), reg) == "3:26 `p.tag` must be text, not `7`\n", diags_with(kit("  p { part = probe, tag = 7 }\n"), reg))
+
+private listed_specs(xs: []const ParamSpec) -> Buf[ParamSpec]
+    var out: Buf[ParamSpec] = buf()
+
+    out.extend(xs)
+    out
+
+// -- the panel and input ---------------------------------------------------------------------------
+
+val LED = "  d1 { part = led, wire { anode = GP16 } }\n"
+
+@test("the panel: a size, and elements that draw one thing each, placed and sized on it")
+panel()
+    expect(kit("", "panel { background = black }\n"), "4:1 the panel has no size\n")
+    expect(kit("", "panel { size = [0, 10] }\n"), "4:1 the panel's size must be positive, not 0 × 10\n")
+    expect(kit("", "panel { size = [10] }\n"), "4:16 `panel.size` must be [width, height], two whole numbers\n")
+    expect(kit("", "panel { size = [9, 9], colour = red }\n"), "4:24 unknown setting `colour` in `panel`\n")
+    expect(kit(LED, "panel { size = [100, 100], elements { e { at = [0, 0] } } }\n"), "4:39 the element `e` does not say what it draws\n")
+    expect(kit(LED, "panel { size = [100, 100], elements { e { show = d1, text = x, at = [0, 0], size = [1, 1] } } }\n"),
+        "4:39 the element `e` says both `show` and `text`\n")
+    expect(kit(LED, "panel { size = [100, 100], elements { e { show = d1, size = [1, 1] } } }\n"), "4:39 the element `e` has no place on the panel\n")
+    expect(kit(LED, "panel { size = [100, 100], elements { e { show = nope, at = [0, 0], size = [1, 1] } } }\n"),
+        "4:43 the element `e` shows `nope`, which is not a part\n")
+    expect(kit(LED, "panel { size = [100, 100], elements { e { show = d1, at = [0, 0] } } }\n"), "4:39 the element `e` has no size\n")
+    expect(kit(LED, "panel { size = [100, 100], elements { e { show = d1, at = [0, 0], size = [0, 5] } } }\n"),
+        "4:39 the element `e` must have a positive size, not 0 × 5\n")
+    expect(kit(LED, "panel { size = [100, 100], elements { e { show = d1, at = [95, 0], size = [10, 10] } } }\n"),
+        "4:39 the element `e` lies outside the panel\n")
+    expect(kit(LED, "panel { size = [100, 100], elements { e { show = d1, at = [90, 90], size = [10, 10], spin = 1 } } }\n"),
+        "4:83 unknown setting `spin` in the element `e`\n")
+
+@test("an element's look: a colour, a shape, a quarter-turn rotation, and nothing else")
+panel_look()
+    val at = "panel { size = [100, 100], elements { e { show = d1, at = [0, 0], size = [9, 9], look { "
+
+    expect(kit(LED, s"${at}color = 5 } } } }\n"), "4:89 `e.look.color` must be a colour, as \"#20c040\" or `green`\n")
+    expect(kit(LED, s"${at}shape = oval } } } }\n"), "4:89 `e.look.shape` must be `round` or `square`, not `oval`\n")
+    expect(kit(LED, s"${at}rotate = 45 } } } }\n"), "4:90 `e.look.rotate` must be 0, 90, 180 or 270, not `45`\n")
+    expect(kit(LED, s"${at}colr = red } } } }\n"), "4:81 unknown look `colr` in the element `e`\n")
+    expect(kit(LED, s"${at}color = \"#20c040\", shape = round, rotate = 270 } } } }\n"), "")
+
+val KEYS = "  j { part = joystick, wire { x = GP26, y = GP27 } }\n  d1 { part = led, wire { anode = GP16 } }\n"
+
+@test("input: each key a known key driving a control of a part; each pointer an element over a part that takes a point")
+input()
+    expect(kit(KEYS, "input { keys { upp = j.up } }\n"), "5:16 unknown key `upp`\n")
+    expect(kit(KEYS, "input { keys { up = nope } }\n"), "5:21 `nope` is not a part\n")
+    expect(kit(KEYS, "input { keys { up = d1 } }\n"), "5:21 `d1` (led) has no control a key can drive\n")
+    expect(kit(KEYS, "input { keys { up = j } }\n"), "5:21 `j` has several controls: name one, as `j.up`\n")
+    expect(kit(KEYS, "input { keys { up = j.upp } }\n"), "5:21 `j` (joystick) has no control `upp`\n")
+    expect(kit(KEYS, "input { keys { up = j.up, up = j.down } }\n"), "5:27 the key `up` is bound twice\n")
+    expect(kit(KEYS, "input { pointer { nope = d1 } }\n"), "5:19 `nope` is not an element of the panel\n")
+    expect(kit(KEYS, "input { mouse { } }\n"), "5:9 unknown setting `mouse` in `input`\n")
+
+@test("a name written twice is a mistake, pointed at the second")
+repeats()
+    expect(kit(s"$LED  d1 { part = led, wire { anode = GP17 } }\n"), "4:3 duplicate name `d1`\n")
+    expect(kit("  d1 { part = led, color = red, color = red, wire { anode = GP16 } }\n"), "3:33 `d1.color` is set twice\n")
+    expect(kit("  d1 { part = led, wire { anode = GP16, anode = GP17 } }\n"), "3:41 `d1.anode` is wired twice\n")
+    expect("board { name = t, name = u, chip = rp2040 }\nparts {}\n", "1:19 `board.name` is set twice\n")
+    expect(kit("", "buses { spi0 { sck = GP2 }, spi0 { tx = GP3 } }\n"), "4:29 duplicate name `spi0`\n")
+
+@test("an unknown section is named, with the nearest one")
+unknown_section()
+    expect(kit("", "boards {}\n"), "4:1 unknown section `boards`\n")
+
+// -- a large board ---------------------------------------------------------------------------------
+
+@test("a board of 2000 LEDs on a 4000-pin chip, each drawn, checks clean and writes back as itself")
+large_board()
+    var reg = library()
+    var pins: Buf[int] = buf()
+
+    reg.chips.push(ChipSpec("big", "a chip with 4000 pins", "cortex-m0plus", 4000, pins, buf()))
+
+    var text = str_builder()
+
+    text.push("board { name = big, chip = big }\nparts {\n")
+
+    for i in 0..<2000 do text.push(s"  d$i { part = led, color = red, wire { anode = GP${i * 2} } }\n")
+
+    text.push("}\npanel {\n  size = [2000, 100]\n  elements {\n")
+
+    for i in 0..<2000 do text.push(s"    e$i { show = d$i, at = [$i, 0], size = [1, 1] }\n")
+
+    text.push("  }\n}\n")
+
+    val src = text.finish()
+
+    assert(diags_with(src, reg) == "", diags_with(src, reg))
+
+    val written = round_trip(src, reg)
+
+    assert(written.contains("d1999 {") && written.contains("anode = GP3998"))
+
+    // One more LED on a pin already taken is the one mistake.
+    val wrong = replace_all(src, "anode = GP3998", "anode = GP0")
+
+    assert(diags_with(wrong, reg) == "2001:40 GP0 is wired twice\n", diags_with(wrong, reg))
