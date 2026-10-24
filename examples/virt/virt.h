@@ -3,17 +3,31 @@
 #ifndef VIRT_H
 #define VIRT_H
 
-#define CONSOLE_DATA   (*(volatile unsigned *)0x40000000)
-#define CONSOLE_STATUS (*(volatile unsigned *)0x40000004)
-#define CONSOLE_EXIT   (*(volatile unsigned *)0x40000008)
-#define CONSOLE_CTRL   (*(volatile unsigned *)0x4000000C)
+// Where boards/virt.hocon puts the console and the SIO, and the interrupts they raise. A program for a
+// board that moves them is built with these defined, as `-DCONSOLE_BASE=0x50000000 -DCONSOLE_IRQ=7`.
+#ifndef CONSOLE_BASE
+#define CONSOLE_BASE 0x40000000
+#endif
+#ifndef CONSOLE_IRQ
+#define CONSOLE_IRQ 0
+#endif
+#ifndef SIO_BASE
+#define SIO_BASE 0xD0000000
+#endif
+#ifndef SIO_IRQ
+#define SIO_IRQ 1
+#endif
+
+#define CONSOLE_DATA   (*(volatile unsigned *)(CONSOLE_BASE + 0x0))
+#define CONSOLE_STATUS (*(volatile unsigned *)(CONSOLE_BASE + 0x4))
+#define CONSOLE_EXIT   (*(volatile unsigned *)(CONSOLE_BASE + 0x8))
+#define CONSOLE_CTRL   (*(volatile unsigned *)(CONSOLE_BASE + 0xC))
 
 #define CONSOLE_WAITING 1u
 #define CONSOLE_ENDED   2u
 
-// CONSOLE_CTRL's bit: raise IRQ 0 while STATUS is not 0.
+// CONSOLE_CTRL's bit: raise CONSOLE_IRQ while STATUS is not 0.
 #define CONSOLE_RX_INTERRUPT 1u
-#define CONSOLE_IRQ          0
 
 // The NVIC's set-enable register: bit n enables IRQ n.
 #define NVIC_ISER (*(volatile unsigned *)0xE000E100)
@@ -23,12 +37,12 @@
 
 // The SIO, shared by the two cores and answering each by which one asks: CPUID, the inter-core FIFOs
 // (8 words each way) and 32 spinlocks, laid out as the RP2040's.
-#define SIO_CPUID       (*(volatile unsigned *)0xD0000000)
-#define SIO_FIFO_ST     (*(volatile unsigned *)0xD0000050)
-#define SIO_FIFO_WR     (*(volatile unsigned *)0xD0000054)
-#define SIO_FIFO_RD     (*(volatile unsigned *)0xD0000058)
-#define SIO_SPINLOCK_ST (*(volatile unsigned *)0xD000005C)
-#define SIO_SPINLOCK(k) (*(volatile unsigned *)(0xD0000100 + 4 * (k)))
+#define SIO_CPUID       (*(volatile unsigned *)(SIO_BASE + 0x00))
+#define SIO_FIFO_ST     (*(volatile unsigned *)(SIO_BASE + 0x50))
+#define SIO_FIFO_WR     (*(volatile unsigned *)(SIO_BASE + 0x54))
+#define SIO_FIFO_RD     (*(volatile unsigned *)(SIO_BASE + 0x58))
+#define SIO_SPINLOCK_ST (*(volatile unsigned *)(SIO_BASE + 0x5C))
+#define SIO_SPINLOCK(k) (*(volatile unsigned *)(SIO_BASE + 0x100 + 4 * (k)))
 
 // FIFO_ST's bits: this core's RX FIFO holds a word; its TX FIFO has room; it wrote to a full TX
 // FIFO; it read an empty RX FIFO.
@@ -37,8 +51,7 @@
 #define SIO_FIFO_WOF 4u
 #define SIO_FIFO_ROE 8u
 
-// Raised in a core's own NVIC while its VLD, WOF or ROE is set.
-#define SIO_IRQ 1
+// SIO_IRQ is raised in a core's own NVIC while its VLD, WOF or ROE is set.
 
 static inline void put_char(char c) { CONSOLE_DATA = (unsigned char)c; }
 

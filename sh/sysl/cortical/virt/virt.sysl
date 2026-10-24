@@ -1,19 +1,25 @@
 module sh.sysl.cortical.virt
 
-// The virtual board: a machine that exists only in cortical, for running a program and talking to it
-// with nothing between them but the core. Its RAM is the core's, 1 MB from address 0, holding the
-// vector table, the code, the data and the stack. Its one device is the debug console:
+// The machine cortical runs: two M0+ cores and the parts on their bus that cortical emulates, put
+// there by a board description (`assemble`, in machine.sysl). `boards/virt.hocon` is the virtual
+// board, a machine that exists only in cortical, for running a program and talking to it with
+// nothing between them but the core; the addresses and IRQs below are the ones it gives.
 //
-//     0x4000_0000  DATA    write: the low byte goes to the host's standard output.
-//                          read: the next byte typed, or 0xFFFF_FFFF when none is waiting.
-//     0x4000_0004  STATUS  bit 0: a byte is waiting. bit 1: input has ended and nothing is waiting.
-//     0x4000_0008  EXIT    write: cortical ends, with the value as its exit status.
-//     0x4000_000C  CTRL    bit 0: the console's interrupt, IRQ 0, is enabled. Reads back.
+// Its RAM is the core's, 1 MB from address 0, holding the vector table, the code, the data and the
+// stack. The debug console (`debug-console`) answers four registers from its base, 0x4000_0000 on
+// the virtual board:
 //
-// The console raises IRQ 0 while its interrupt is enabled and STATUS is not 0 — a byte is waiting, or
-// the input has ended — so a handler that reads until STATUS is 0, or turns CTRL off, ends it. The
-// core's own system control space (SysTick, the NVIC, the SCB) is at 0xE000_E000. Every other
-// address off the RAM stops the core with `Stop.Unmapped`.
+//     +0x0  DATA    write: the low byte goes to the host's standard output.
+//                   read: the next byte typed, or 0xFFFF_FFFF when none is waiting.
+//     +0x4  STATUS  bit 0: a byte is waiting. bit 1: input has ended and nothing is waiting.
+//     +0x8  EXIT    write: cortical ends, with the value as its exit status.
+//     +0xC  CTRL    bit 0: the console's interrupt is enabled. Reads back.
+//
+// The console raises its IRQ (0 on the virtual board; none where the board gives it none) while its
+// interrupt is enabled and STATUS is not 0 — a byte is waiting, or the input has ended — so a handler
+// that reads until STATUS is 0, or turns CTRL off, ends it. The core's own system control space
+// (SysTick, the NVIC, the SCB) is at 0xE000_E000. Every other address off the RAM and outside every
+// device's window stops the core with `Stop.Unmapped`.
 //
 // **The interrupt is raised between runs**, which a million instructions apart is often enough for
 // typing; and when the core sleeps in `WFI` with nothing in it to wake it, the board waits for the
@@ -22,21 +28,22 @@ module sh.sysl.cortical.virt
 //
 // **The board has two M0+ cores**, sharing the RAM and the decoded records. Core 0 boots from the
 // vector table; core 1 sleeps until core 0 launches it. Both run on the one host thread, a quantum at
-// a time each, so a run is the same every time. Their shared block, a small SIO after the RP2040's,
-// answers each core by which one made the access:
+// a time each, so a run is the same every time. Their shared block (`virt-sio`), a small SIO after the
+// RP2040's, answers each core by which one made the access, from its base, 0xD000_0000 on the virtual
+// board:
 //
-//     0xD000_0000  CPUID        read: 0 on core 0, 1 on core 1.
-//     0xD000_0050  FIFO_ST      bit 0 VLD: this core's RX FIFO holds a word. bit 1 RDY: its TX FIFO
-//                               has room. bit 2 WOF: it wrote to a full TX FIFO. bit 3 ROE: it read
-//                               an empty RX FIFO. Writing a 1 to WOF or ROE clears it.
-//     0xD000_0054  FIFO_WR      write: push a word to the other core's RX FIFO (8 deep); when full,
-//                               the word is lost and WOF is set.
-//     0xD000_0058  FIFO_RD      read: pop this core's RX FIFO; when empty, 0, and ROE is set.
-//     0xD000_005C  SPINLOCK_ST  read: bit k set while spinlock k is claimed.
-//     0xD000_0100  SPINLOCK0-31 (every 4 bytes) read: claim the lock, answering 1 << k if it was free
-//                               and 0 if it was already claimed. write: release it.
+//     +0x000  CPUID        read: 0 on core 0, 1 on core 1.
+//     +0x050  FIFO_ST      bit 0 VLD: this core's RX FIFO holds a word. bit 1 RDY: its TX FIFO has
+//                          room. bit 2 WOF: it wrote to a full TX FIFO. bit 3 ROE: it read an empty
+//                          RX FIFO. Writing a 1 to WOF or ROE clears it.
+//     +0x054  FIFO_WR      write: push a word to the other core's RX FIFO (8 deep); when full, the
+//                          word is lost and WOF is set.
+//     +0x058  FIFO_RD      read: pop this core's RX FIFO; when empty, 0, and ROE is set.
+//     +0x05C  SPINLOCK_ST  read: bit k set while spinlock k is claimed.
+//     +0x100  SPINLOCK0-31 (every 4 bytes) read: claim the lock, answering 1 << k if it was free and
+//                          0 if it was already claimed. write: release it.
 //
-// **The FIFO's interrupt is IRQ 1**, raised in a core's own NVIC while its VLD, WOF or ROE is set, and
+// **The FIFO's interrupt is the SIO's IRQ** (1 on the virtual board), raised in a core's own NVIC while its VLD, WOF or ROE is set, and
 // only there; like the console's, it is raised between runs. **Core 1 is launched as on the RP2040**
 // (`multicore_launch_core1_raw`): until it runs, the board plays its boot ROM, echoing every word core
 // 0 pushes back into core 0's RX FIFO and launching core 1 after the sequence 0, 0, 1, VTOR, SP,
@@ -66,28 +73,27 @@ import sysl.buf.{Buf, buf}
 import sysl.threads.{Channel, channel, spawn}
 import sysl.io.stdin
 
-const CONSOLE: u32 = 0x40000000
-const DATA: u32 = 0x40000000
-const STATUS: u32 = 0x40000004
-const EXIT: u32 = 0x40000008
-const CTRL: u32 = 0x4000000C
+// The console's registers, from its base.
+const DATA: u32 = 0x0
+const STATUS: u32 = 0x4
+const EXIT: u32 = 0x8
+const CTRL: u32 = 0xC
 
 // STATUS bits.
 const WAITING: u32 = 1
 const ENDED: u32 = 2
 
-// CTRL's bit, and the IRQ it enables.
+// CTRL's bit, which enables the console's interrupt.
 const RX_INTERRUPT: u32 = 1
-const CONSOLE_IRQ: u32 = 0
 
-// The SIO block.
-const CPUID: u32 = 0xD0000000
-const FIFO_ST: u32 = 0xD0000050
-const FIFO_WR: u32 = 0xD0000054
-const FIFO_RD: u32 = 0xD0000058
-const SPINLOCK_ST: u32 = 0xD000005C
-const SPINLOCK0: u32 = 0xD0000100
-const SPINLOCK31: u32 = 0xD000017C
+// The SIO's registers, from its base.
+const CPUID: u32 = 0x00
+const FIFO_ST: u32 = 0x50
+const FIFO_WR: u32 = 0x54
+const FIFO_RD: u32 = 0x58
+const SPINLOCK_ST: u32 = 0x5C
+const SPINLOCK0: u32 = 0x100
+const SPINLOCK31: u32 = 0x17C
 
 // FIFO_ST bits.
 const VLD: u32 = 1
@@ -96,7 +102,26 @@ const WOF: u32 = 4
 const ROE: u32 = 8
 
 const FIFO_DEPTH = 8
-const FIFO_IRQ: u32 = 1
+
+/** A device on the cores' bus: what it is, the addresses it answers, `base` to `last`, and the IRQ it
+ * raises, or -1 for none.
+ */
+struct Mapped
+    device: Device
+    base: u32
+    last: u32
+    irq: int
+
+enum Device
+    Console
+    Sio
+end Device
+
+// The devices on the bus, which `attach` sets; and the IRQs the console and the SIO raise, -1 where
+// the board has no such device or gave it no IRQ.
+var devices: Buf[Mapped] = buf()
+var console_irq: int = -1
+var fifo_irq: int = -1
 
 // Instructions each core runs in its turn, and the run of core 0 alone.
 const QUANTUM: u64 = 1000
@@ -192,9 +217,9 @@ private status() -> u32
 
     0
 
-// The board's half of an access off the RAM.
-console_read(cpu: *Cpu, a: u32, width: u32) -> u32
-    a match
+// The console's half of an access to address `a`, register `o` from its base.
+private console_read(cpu: *Cpu, a: u32, o: u32) -> u32
+    o match
         DATA ->
             flush_console()
 
@@ -210,8 +235,8 @@ console_read(cpu: *Cpu, a: u32, width: u32) -> u32
             halt(cpu, Stop.Unmapped, a)
             0
 
-console_write(cpu: *Cpu, a: u32, width: u32, x: u32)
-    a match
+private console_write(cpu: *Cpu, a: u32, o: u32, x: u32)
+    o match
         DATA ->
             out.push(u8(x & 0xFF))
             if x & 0xFF == 10 || out.len() >= 4096 then flush_console()
@@ -353,7 +378,8 @@ private settle(cpu: *Cpu) -> bool
         now = due
         return true
 
-    val console_wakes = could_wake(cpu, IRQ0 + CONSOLE_IRQ) || (launched && could_wake(&second, IRQ0 + CONSOLE_IRQ))
+    val n = u32(console_irq)
+    val console_wakes = console_irq >= 0 && (could_wake(cpu, IRQ0 + n) || (launched && could_wake(&second, IRQ0 + n)))
 
     if ctrl & RX_INTERRUPT != 0 && console_wakes
         // Input that came since the interrupts were raised is raised in the next round.
@@ -396,11 +422,11 @@ private stopped(cpu: *Cpu, why: string) -> string
 // Raise a core's interrupts: the console's while it is enabled and STATUS is not 0, and the FIFO's
 // while the core's VLD, WOF or ROE is set.
 private signal(cpu: *Cpu)
-    if ctrl & RX_INTERRUPT != 0 && status() != 0 then raise(cpu, CONSOLE_IRQ)
+    if console_irq >= 0 && ctrl & RX_INTERRUPT != 0 && status() != 0 then raise(cpu, u32(console_irq))
 
     val k = core_of(cpu)
 
-    if fifo_len[k] > 0 || fifo_errors[k] != 0 then raise(cpu, FIFO_IRQ)
+    if fifo_irq >= 0 && (fifo_len[k] > 0 || fifo_errors[k] != 0) then raise(cpu, u32(fifo_irq))
 
 // ---------------------------------------------------------------------------------------------------
 // The SIO.
@@ -408,22 +434,52 @@ private signal(cpu: *Cpu)
 // The core that made an access: 1 for core 1, 0 for core 0.
 private core_of(cpu: *Cpu) -> int = if cpu == &second then 1 else 0
 
-// The board's half of an access off the RAM: the SIO's, or else the console's.
+// The board's half of an access off the RAM, which the core makes through its device hook: the device
+// whose window holds the address answers it, with the register's offset from its base. An address
+// in no window stops the core at `Unmapped`. The RAM's own accesses never come here.
 board_read(cpu: *Cpu, a: u32, width: u32) -> u32
-    if a >= CPUID && a <= SPINLOCK31 then sio_read(cpu, a) else console_read(cpu, a, width)
+    for m in devices
+        if a >= m.base && a <= m.last then
+            return m.device match
+                Console -> console_read(cpu, a, a - m.base)
+                Sio -> sio_read(cpu, a, a - m.base)
+
+    halt(cpu, Stop.Unmapped, a)
+    0
 
 board_write(cpu: *Cpu, a: u32, width: u32, x: u32)
-    if a >= CPUID && a <= SPINLOCK31 then sio_write(cpu, a, x) else console_write(cpu, a, width, x)
+    for m in devices
+        if a >= m.base && a <= m.last then
+            m.device match
+                Console -> console_write(cpu, a, a - m.base, x)
+                Sio -> sio_write(cpu, a, a - m.base, x)
+            return
 
-// Spinlock k's bit, for an address that is one of the spinlocks; 0 for any other.
-private lock_bit(a: u32) -> u32
-    if a < SPINLOCK0 || a > SPINLOCK31 || a & 3 != 0 then return 0
+    halt(cpu, Stop.Unmapped, a)
 
-    1 << ((a - SPINLOCK0) >> 2)
+/** Put `ds` on the cores' bus in place of whatever was there, for the boards booted from now on. */
+attach(ds: []const Mapped)
+    devices = buf()
+    console_irq = -1
+    fifo_irq = -1
 
-sio_read(cpu: *Cpu, a: u32) -> u32
+    for m in ds
+        devices.push(m)
+
+        m.device match
+            Console -> console_irq = m.irq
+            Sio -> fifo_irq = m.irq
+
+// Spinlock k's bit, for a register that is one of the spinlocks; 0 for any other.
+private lock_bit(o: u32) -> u32
+    if o < SPINLOCK0 || o > SPINLOCK31 || o & 3 != 0 then return 0
+
+    1 << ((o - SPINLOCK0) >> 2)
+
+// The SIO's half of an access to address `a`, register `o` from its base.
+private sio_read(cpu: *Cpu, a: u32, o: u32) -> u32
     val k = core_of(cpu)
-    val bit = lock_bit(a)
+    val bit = lock_bit(o)
 
     if bit != 0
         if locks & bit != 0 then return 0
@@ -431,7 +487,7 @@ sio_read(cpu: *Cpu, a: u32) -> u32
         locks |= bit
         return bit
 
-    a match
+    o match
         CPUID -> u32(k)
         FIFO_ST -> fifo_status(k)
         FIFO_WR -> 0
@@ -446,15 +502,15 @@ sio_read(cpu: *Cpu, a: u32) -> u32
             halt(cpu, Stop.Unmapped, a)
             0
 
-sio_write(cpu: *Cpu, a: u32, x: u32)
+private sio_write(cpu: *Cpu, a: u32, o: u32, x: u32)
     val k = core_of(cpu)
-    val bit = lock_bit(a)
+    val bit = lock_bit(o)
 
     if bit != 0
         locks &= ~bit
         return
 
-    a match
+    o match
         FIFO_ST -> fifo_errors[k] &= ~(x & (WOF | ROE))
         FIFO_WR ->
             if k == 0 && !launched

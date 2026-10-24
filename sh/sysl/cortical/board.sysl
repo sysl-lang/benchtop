@@ -58,14 +58,29 @@ build(src: Source, doc: Document, r: *Report) -> Board
             unknown(r, f, "section", "", ["board", "parts", "buses", "panel", "input"])
     end for
 
-    if b.chip.is_empty() then
-        val at = root.field("board") match
-            Some(f) -> f.key_span
-            None -> Span(0, 0)
+    root.field("board") match
+        Some(f) ->
+            if f.value.is_obj() then
+                val g = f.value
 
-        r.add(error(at, "the board names no chip")
-            .with_note("say which chip the parts are wired to, as `board { chip = rp2040 }`"))
-    end if
+                if !has_field(g, "name") then
+                    r.add(error(f.key_span, "the board has no name")
+                        .with_note("give it one, as `name = \"Pico Breadboard Kit\"`"))
+
+                if !has_field(g, "chip") && !has_field(g, "cores") then
+                    r.add(error(f.key_span, "the board names neither a chip nor its cores")
+                        .with_note("say which chip the parts are wired to, as `chip = rp2040`, or, for a board with no real chip, its cores, as `cores = [cortex-m0plus]`"))
+                elif has_field(g, "chip") && has_field(g, "cores") then
+                    r.add(error(b.cores_span, "the board names both a chip and cores")
+                        .with_note("a chip brings its own cores; name `cores` only on a board with no real chip"))
+            end if
+        None ->
+            r.add(error(Span(0, 0), "there is no `board` section")
+                .with_note("every description starts with one, as `board { name = \"virt\", cores = [cortex-m0plus] }`"))
+
+    if !has_field(root, "parts") then
+        r.add(error(Span(0, 0), "there is no `parts` section")
+            .with_note("every board has parts, as `parts { ram { part = ram, at = 0x00000000, size = 1M } }`"))
 
     repeats(src, doc, r)
     b
@@ -82,8 +97,22 @@ private read_board_block(b: *Board, f: Field, r: *Report)
         elif g.key == "chip" then
             b.chip = text(g, "`board.chip`", r)
             b.chip_span = g.value.span
+        elif g.key == "cores" then
+            b.cores_span = g.value.span
+
+            if !g.value.is_arr() then
+                r.add(error(g.value.span, s"`board.cores` must be a list of cores, not ${g.value.kind_name()}")
+                    .with_note("name each core, as `cores = [cortex-m0plus, cortex-m0plus]`"))
+            elif g.value.items().is_empty() then
+                r.add(error(g.value.span, "`board.cores` names no core")
+                    .with_note("name each core, as `cores = [cortex-m0plus, cortex-m0plus]`"))
+            else
+                for v in g.value.items()
+                    v.as_text() match
+                        Some(t) -> b.cores.push(Core(t, v.span))
+                        None -> r.add(error(v.span, s"a core is named by a word, not ${v.kind_name()}"))
         else
-            unknown(r, g, "setting", " in `board`", ["name", "chip"])
+            unknown(r, g, "setting", " in `board`", ["name", "chip", "cores"])
 end read_board_block
 
 // -- parts -----------------------------------------------------------------------------------------
@@ -94,16 +123,24 @@ private read_parts(b: *Board, f: Field, r: *Report)
     for g in f.value.fields()
         if !is_block(g, s"the part `${g.key}`", r) then continue
 
-        var p = Part(g.key, g.key_span, "", g.key_span, buf(), buf())
+        var p = Part(g.key, g.key_span, "", g.key_span, buf(), buf(), None, None, None)
 
         for h in g.value.fields()
+            val what = s"`${g.key}.${h.key}`"
+
             if h.key == "part" then
-                p.kind = text(h, s"`${g.key}.part`", r)
+                p.kind = text(h, what, r)
                 p.kind_span = h.value.span
             elif h.key == "wire" then
                 read_wires(&p, h, r)
+            elif h.key == "at" then
+                p.at = amount(h, what, false, r)
+            elif h.key == "size" then
+                p.size = amount(h, what, true, r)
+            elif h.key == "irq" then
+                p.irq = amount(h, what, false, r)
             else
-                setting(h, s"`${g.key}.${h.key}`", r) match
+                setting(h, what, r) match
                     Some(s) -> p.params.push(Param(h.key, h.key_span, s, h.value.span))
                     None -> ()
         end for
@@ -410,6 +447,52 @@ private setting(f: Field, what: string, r: *Report) -> Option[Setting]
             r.add(error(f.value.span, s"$what must be a single value, not ${f.value.kind_name()}"))
             None
 end setting
+
+// A part's address, IRQ or size: a whole number, written in decimal (`7`) or hexadecimal
+// (`0x40000000`); a size may also be written in kibibytes or mebibytes (`64K`, `1M`).
+private amount(f: Field, what: string, sized: bool, r: *Report) -> Option[Amount]
+    val v = f.value
+    val n: Option[long] = v.kind match
+        Int(n, _) -> if n >= 0 then Some(n) else None
+        Word(w) -> amount_of(w, sized)
+        _ -> None
+
+    n match
+        Some(x) -> Some(Amount(x, written_text(v), f.key_span, v.span))
+        None ->
+            val forms = if sized then "a whole number such as `4096`, `0x1000`, `64K` or `1M`" else "a whole number such as `7` or `0x40000000`"
+
+            r.add(error(v.span, s"$what must be $forms"))
+            None
+end amount
+
+// The value a word spells as an amount, or `None`.
+private amount_of(w: string, sized: bool) -> Option[long]
+    if w.starts_with("0x") && w.bytes.len > 2 then
+        return parse_long_base(w[2..], 16) match
+            Ok(n) -> if n >= 0 then Some(n) else None
+            Err(_) -> None
+
+    val k = w.bytes.len
+
+    if !sized || k < 2 then return None
+
+    val unit: long = w.bytes[k - 1] match
+        'K' -> 1024
+        'M' -> 1048576
+        _ -> return None
+
+    parse_long_base(w[0..<(k - 1)], 10) match
+        Ok(n) -> if n >= 0 && n <= 4096 * 1024 then Some(n * unit) else None
+        Err(_) -> None
+end amount_of
+
+// A value's text as it was written: a number's own, a word as it stands.
+private written_text(v: Value) -> string
+    v.kind match
+        Int(_, w) -> w
+        Word(w) -> w
+        _ -> ""
 
 // A name that is not one the format knows, with a guess at the one that was meant.
 private unknown(r: *Report, f: Field, what: string, where: string, known: []const string)

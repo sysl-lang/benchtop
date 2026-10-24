@@ -20,13 +20,164 @@ check(b: *Board, reg: Registry, src: Source, r: *Report)
         r.add(guessed(error(b.chip_span, s"unknown chip `${b.chip}`"), b.chip, reg.chip_names())
             .with_note(s"the chips cortical knows are ${listing(reg.chip_names())}"))
 
+    for c in b.cores
+        if reg.core(c.name).is_none() then
+            r.add(guessed(error(c.span, s"unknown core `${c.name}`"), c.name, reg.core_names())
+                .with_note(s"the cores cortical knows are ${listing(reg.core_names())}"))
+
     var pins = PinUses(buf(), buf())
 
     check_buses(b, chip, src, r, &pins)
     check_parts(b, chip, reg, src, r, &pins)
+    check_mapped(b, chip, reg, src, r)
     check_panel(b, reg, r)
     check_input(b, reg, r)
 end check
+
+// -- the cores' bus --------------------------------------------------------------------------------
+
+// The block of addresses every Cortex-M keeps for itself: the NVIC, SysTick and the SCB live here, and
+// a part placed over it would never be reached.
+const PPB_BASE: long = 0xE0000000
+const PPB_END: long = 0xE0100000
+const SPACE_END: long = 0x100000000
+
+// A mapped part's window, from `base` up to but not including `end`, and the place `at` was written.
+private struct Placed
+    name: string
+    base: long
+    end: long
+    span: Span
+end Placed
+
+/** Each part on the cores' bus has an aligned address, a window inside the address space that meets no
+ * other part's and not the cores' own, and an IRQ the cores have and no other part raises. A part off
+ * the bus has none of `at`, `size` and `irq`.
+ */
+private check_mapped(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Source, r: *Report)
+    val (irqs, core) = irq_count(b, chip, reg)
+    var placed: Buf[Placed] = buf()
+    var raised: Buf[(long, string, Span)] = buf()
+
+    for p in b.parts
+        val spec = reg.part(p.kind) match
+            Some(s) -> s
+            None -> continue
+
+        val w = spec.window match
+            Some(w) -> w
+            None ->
+                unmapped(p, p.at, "at", spec, r)
+                unmapped(p, p.size, "size", spec, r)
+                unmapped(p, p.irq, "irq", spec, r)
+                continue
+
+        val size: long = p.size match
+            Some(s) ->
+                if !w.sized then
+                    r.add(error(s.name_span, f"the size of ${article_of(spec.name)} ${spec.name} is fixed, at ${w.size} bytes (0x${w.size}%x)")
+                        .with_note(s"leave `${p.name}.size` out"))
+                    w.size
+                elif s.n == 0 then
+                    r.add(error(s.span, s"`${p.name}.size` must be more than 0"))
+                    0
+                else
+                    s.n
+            None ->
+                if w.size == 0 then
+                    r.add(error(p.name_span, s"`${p.name}` has no size")
+                        .with_note(s"the size of ${article_of(spec.name)} ${spec.name} is the board's to give, as `size = 1M`"))
+                w.size
+
+        p.irq match
+            Some(q) ->
+                if !w.raises then
+                    r.add(error(q.name_span, s"${article_of(spec.name)} ${spec.name} raises no interrupt, so `${p.name}.irq` means nothing"))
+                elif irqs >= 0 && q.n >= irqs then
+                    r.add(error(q.span, s"IRQ ${q.n} is beyond the $core's ${irqs}")
+                        .with_note(s"its interrupts are IRQ 0 to IRQ ${irqs - 1}"))
+                else
+                    var again = false
+
+                    for (n, who, at) in raised
+                        if !again && n == q.n then
+                            r.add(error(q.span, s"IRQ ${q.n} is used twice")
+                                .with_note(s"`$who` already raises it, at ${src.locate(at.start)}"))
+                            again = true
+
+                    if !again then raised.push((q.n, p.name, q.span))
+            None -> ()
+
+        val a = p.at match
+            Some(a) -> a
+            None ->
+                r.add(error(p.name_span, s"`${p.name}` has no address")
+                    .with_note(s"${article_of(spec.name)} ${spec.name} is on the cores' bus; give it its base, as `at = 0x40000000`"))
+                continue
+
+        if a.n % w.align != 0 then
+            r.add(error(a.span, f"`${p.name}.at` is not aligned: ${article_of(spec.name)} ${spec.name}'s base is a multiple of 0x${w.align}%x"))
+            continue
+
+        if size == 0 then continue
+
+        val end = a.n + size
+
+        if end > SPACE_END then
+            r.add(error(a.span, f"`${p.name}` runs past the end of the address space: ${size} bytes from 0x${a.n}%08x end beyond 0xffffffff"))
+            continue
+
+        if a.n < PPB_END && PPB_BASE < end then
+            r.add(error(a.span, f"`${p.name}` (0x${a.n}%08x to 0x${end - 1}%08x) overlaps the cores' own private peripheral bus")
+                .with_note("every Cortex-M keeps 0xe0000000 to 0xe00fffff for its NVIC, SysTick and system control block"))
+            continue
+
+        var clear = true
+
+        for q in placed
+            if clear && a.n < q.end && q.base < end then
+                r.add(error(a.span, f"`${p.name}` (0x${a.n}%08x to 0x${end - 1}%08x) overlaps `${q.name}` (0x${q.base}%08x to 0x${q.end - 1}%08x)")
+                    .with_note(s"`${q.name}` is placed at ${src.locate(q.span.start)}"))
+                clear = false
+
+        if clear then placed.push(Placed(p.name, a.n, end, a.span))
+    end for
+end check_mapped
+
+// How many IRQs the board's cores take, and the core that says so: the chip's core, or the fewest of
+// the named cores'. -1 where no core is known.
+private irq_count(b: *Board, chip: Option[ChipSpec], reg: Registry) -> (int, string)
+    var irqs = -1
+    var name = ""
+
+    chip match
+        Some(c) ->
+            reg.core(c.core) match
+                Some(k) ->
+                    irqs = k.irqs
+                    name = k.name
+                None -> ()
+        None -> ()
+
+    for c in b.cores
+        reg.core(c.name) match
+            Some(k) ->
+                if irqs < 0 || k.irqs < irqs then
+                    irqs = k.irqs
+                    name = k.name
+            None -> ()
+
+    (irqs, name)
+end irq_count
+
+// A part off the cores' bus that was given a place on it.
+private unmapped(p: Part, a: Option[Amount], key: string, spec: PartSpec, r: *Report)
+    a match
+        Some(x) ->
+            r.add(error(x.name_span, s"${article_of(spec.name)} ${spec.name} is not on the cores' bus, so `${p.name}.$key` means nothing")
+                .with_note("only a part the cores reach by address has `at`, `size` and `irq`"))
+        None -> ()
+end unmapped
 
 // Who holds each pin, by number: the index of its owner's name and place, or -1.
 private struct PinUses
@@ -554,7 +705,8 @@ end part_list
 private bus_kind(kind: string) -> string =
     if kind == "spi" then "an SPI" elif kind == "i2c" then "an I2C" elif kind == "uart" then "a UART" else s"a $kind"
 
-private article_of(word: string) -> string =
+/** `an` before a word that starts with a vowel, `a` before any other. */
+article_of(word: string) -> string =
     if !word.is_empty() && (word.bytes[0] == u8('a') || word.bytes[0] == u8('e') || word.bytes[0] == u8('i') ||
                             word.bytes[0] == u8('o') || word.bytes[0] == u8('u')) then "an" else "a"
 

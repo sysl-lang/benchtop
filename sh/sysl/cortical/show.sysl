@@ -1,0 +1,292 @@
+module sh.sysl.cortical
+
+import sh.sysl.hocon.{Kind, Value, object_of, render}
+import sh.sysl.parsing.Span
+import sysl.buf.{Buf, buf}
+import sysl.text.str_builder
+
+// A checked board, shown: as a summary for a person (`cortical check`), and as a board file again.
+//
+// **`board_text` writes the model back as HOCON**, which is the model's own idea of sameness: two
+// boards are the same board when they are written identically. Spans, comments and the order a part's
+// settings were written in are not part of a board; a part's `at`, `size` and `irq` keep the text they
+// were written in (`0x40000000`, `1M`), since a reader of the file chose it.
+
+/** What `cortical check` prints for a board that checks clean: the board, then each part on a line
+ * with what it is, where it sits or what it is wired to, and whether cortical emulates it.
+ */
+summary(b: Board, reg: Registry) -> string
+    var out = str_builder()
+    val name = if b.name.is_empty() then "the board" else b.name
+
+    if !b.chip.is_empty() then
+        val about = reg.chip(b.chip) match
+            Some(c) -> s" (${c.summary})"
+            None -> ""
+
+        out.push(s"$name: the ${b.chip}$about\n")
+    else
+        out.push(s"$name: ${core_listing(b.cores)}\n")
+
+    var width = 0
+    var kinds = 0
+
+    for p in b.parts
+        if p.name.bytes.len > width then width = p.name.bytes.len
+        if p.kind.bytes.len > kinds then kinds = p.kind.bytes.len
+
+    for p in b.parts
+        out.push(s"  ${padded(p.name, width)}  ${padded(p.kind, kinds)}  ${part_line(b, p, reg)}\n")
+
+    for bus in b.buses
+        var sigs: Buf[string] = buf()
+
+        for s in bus.signals do sigs.push(s"${s.name} = ${pin_name(s.pin)}")
+
+        out.push(s"  bus ${bus.name}: ${joined(sigs, ", ")}\n")
+
+    if b.panel.width > 0 || !b.panel.elements.is_empty() then
+        out.push(s"  panel ${b.panel.width} x ${b.panel.height}, ${counted(b.panel.elements.len(), "element")}\n")
+
+    if !b.keys.is_empty() || !b.pointers.is_empty() then
+        out.push(s"  input: ${counted(b.keys.len(), "key")}, ${counted(b.pointers.len(), "pointer binding")}\n")
+
+    out.finish()
+end summary
+
+// One part's line: its place on the bus or its wires, its parameters, and a word where it is not
+// emulated.
+private part_line(b: Board, p: Part, reg: Registry) -> string
+    var bits: Buf[string] = buf()
+
+    p.at match
+        Some(a) ->
+            val size: long = p.size match
+                Some(s) -> s.n
+                None -> reg.part(p.kind) match
+                    Some(spec) -> spec.window match
+                        Some(w) -> w.size
+                        None -> 0
+                    None -> 0
+
+            bits.push(if size > 0 then f"0x${a.n}%08x to 0x${a.n + size - 1}%08x" else f"at 0x${a.n}%08x")
+        None -> ()
+
+    p.irq match
+        Some(q) -> bits.push(s"IRQ ${q.n}")
+        None -> ()
+
+    for w in p.wires do bits.push(s"${w.port} = ${target_text(w.to)}")
+    for q in p.params do bits.push(s"${q.name} = ${setting_text(q.value)}")
+
+    var line = joined(bits, ", ")
+
+    reg.part(p.kind) match
+        Some(spec) ->
+            if !spec.modelled then
+                line = s"$line (not modelled)"
+            else
+                for w in p.wires
+                    w.to match
+                        Port(other, _) ->
+                            part_named(b, other) match
+                                Some(o) ->
+                                    reg.part(o.kind) match
+                                        Some(os) ->
+                                            if !os.modelled then line = s"$line (driven through `$other`, which is not modelled)"
+                                        None -> ()
+                                None -> ()
+                        _ -> ()
+        None -> ()
+
+    line
+end part_line
+
+// `two cortex-m0plus cores`, `a cortex-m0plus core`, `a cortex-m33 and a cortex-m0plus`.
+private core_listing(cores: Buf[Core]) -> string
+    if cores.is_empty() then return "no cores"
+
+    var same = true
+
+    for c in cores
+        if c.name != cores.at(0).name then same = false
+
+    val first = cores.at(0).name
+
+    if same then
+        return if cores.len() == 1 then s"${article_of(first)} $first core" else s"${number_word(cores.len())} $first cores"
+
+    var names: Buf[string] = buf()
+
+    for c in cores do names.push(c.name)
+
+    s"cores ${joined(names, ", ")}"
+end core_listing
+
+private number_word(n: usize) -> string = n match
+    2 -> "two"
+    3 -> "three"
+    4 -> "four"
+    _ -> str(n)
+
+private counted(n: usize, what: string) -> string = if n == 1 then s"1 $what" else s"$n ${what}s"
+
+private padded(s: string, width: usize) -> string
+    var out = str_builder()
+
+    out.push(s)
+
+    for i in s.bytes.len..<width do out.push(" ")
+
+    out.finish()
+
+private joined(xs: Buf[string], sep: string) -> string
+    var out = str_builder()
+
+    for i in 0..<xs.len()
+        if i > 0 then out.push(sep)
+
+        out.push(xs.at(i))
+
+    out.finish()
+
+// -- the board as a file ---------------------------------------------------------------------------
+
+/** The board as a board file. Reading the text back and writing it again gives the same text. */
+board_text(b: Board) -> string
+    var top: Buf[(string, Value)] = buf()
+    var head: Buf[(string, Value)] = buf()
+
+    if !b.name.is_empty() then head.push(("name", str_value(b.name)))
+    if !b.chip.is_empty() then head.push(("chip", word(b.chip)))
+
+    if !b.cores.is_empty() then
+        var cores: Buf[Value] = buf()
+
+        for c in b.cores do cores.push(word(c.name))
+
+        head.push(("cores", value(Arr(cores))))
+
+    top.push(("board", object_of(head)))
+
+    var parts: Buf[(string, Value)] = buf()
+
+    for p in b.parts
+        var fs: Buf[(string, Value)] = buf()
+
+        fs.push(("part", word(p.kind)))
+        amount_field(&fs, "at", p.at)
+        amount_field(&fs, "size", p.size)
+        amount_field(&fs, "irq", p.irq)
+
+        for q in p.params do fs.push((q.name, setting_value(q.value)))
+
+        if !p.wires.is_empty() then
+            var ws: Buf[(string, Value)] = buf()
+
+            for w in p.wires do ws.push((w.port, word(target_text(w.to))))
+
+            fs.push(("wire", object_of(ws)))
+
+        parts.push((p.name, object_of(fs)))
+    end for
+
+    top.push(("parts", object_of(parts)))
+
+    if !b.buses.is_empty() then
+        var buses: Buf[(string, Value)] = buf()
+
+        for bus in b.buses
+            var sigs: Buf[(string, Value)] = buf()
+
+            for s in bus.signals do sigs.push((s.name, word(pin_name(s.pin))))
+
+            buses.push((bus.name, object_of(sigs)))
+
+        top.push(("buses", object_of(buses)))
+
+    if b.panel.width > 0 || !b.panel.elements.is_empty() then top.push(("panel", panel_value(b.panel)))
+
+    if !b.keys.is_empty() || !b.pointers.is_empty() then
+        var input: Buf[(string, Value)] = buf()
+
+        if !b.keys.is_empty() then
+            var keys: Buf[(string, Value)] = buf()
+
+            for k in b.keys
+                keys.push((k.key, word(if k.control.is_empty() then k.part else s"${k.part}.${k.control}")))
+
+            input.push(("keys", object_of(keys)))
+
+        if !b.pointers.is_empty() then
+            var ps: Buf[(string, Value)] = buf()
+
+            for q in b.pointers do ps.push((q.element, word(q.part)))
+
+            input.push(("pointer", object_of(ps)))
+
+        top.push(("input", object_of(input)))
+    end if
+
+    render(object_of(top))
+end board_text
+
+private panel_value(panel: Panel) -> Value
+    var fs: Buf[(string, Value)] = buf()
+
+    fs.push(("size", pair_value(panel.width, panel.height)))
+    if !panel.background.is_empty() then fs.push(("background", word(panel.background)))
+
+    var els: Buf[(string, Value)] = buf()
+
+    for e in panel.elements
+        var es: Buf[(string, Value)] = buf()
+
+        e.shows match
+            ShowPart(name) -> es.push(("show", word(name)))
+            Caption(t) -> es.push(("text", str_value(t)))
+            Fill(c) -> es.push(("box", str_value(c)))
+
+        es.push(("at", pair_value(e.x, e.y)))
+        if e.has_size && !e.natural then es.push(("size", pair_value(e.w, e.h)))
+        if !e.label.is_empty() then es.push(("label", str_value(e.label)))
+
+        if !e.look.is_empty() then
+            var look: Buf[(string, Value)] = buf()
+
+            for q in e.look do look.push((q.name, setting_value(q.value)))
+
+            es.push(("look", object_of(look)))
+
+        els.push((e.name, object_of(es)))
+    end for
+
+    if !els.is_empty() then fs.push(("elements", object_of(els)))
+
+    object_of(fs)
+end panel_value
+
+private amount_field(fs: *Buf[(string, Value)], key: string, a: Option[Amount])
+    a match
+        Some(x) ->
+            val text = if x.written.is_empty() then str(x.n) else x.written
+
+            fs.push((key, if text == str(x.n) then value(Int(x.n, text)) else word(text)))
+        None -> ()
+
+private setting_value(s: Setting) -> Value = s match
+    Whole(n) -> value(Int(n, ""))
+    Number(x) -> value(Real(x, ""))
+    Text(t) -> word(t)
+    Flag(on) -> value(Bool(on))
+
+private pair_value(a: int, b: int) -> Value
+    var xs: Buf[Value] = buf()
+
+    xs.push(value(Int(long(a), "")))
+    xs.push(value(Int(long(b), "")))
+    value(Arr(xs))
+
+private value(k: Kind) -> Value = Value(Span(0, 0), k)
+private word(s: string) -> Value = value(Word(s))
+private str_value(s: string) -> Value = value(Str(s))
