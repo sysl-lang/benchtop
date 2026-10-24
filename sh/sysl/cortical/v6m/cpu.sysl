@@ -1,7 +1,10 @@
 module sh.sysl.cortical.v6m
 
+import sysl.sync.*
+
 // The ARMv6-M core (the Cortex-M0 and M0+): the registers, the flags, guest memory behind a page
-// table, and the decoded-instruction array, which every core of a machine shares.
+// table, and the decoded-instruction array, which the cores of a machine share while they take turns
+// on one thread, and of which each has its own while each runs on a thread of its own.
 //
 // **Decoding is one record per halfword of guest address.** The instruction at guest address `a` is
 // decoded into `dec[a >> 1]`, so the next instruction is the next record (or the one after, for a
@@ -13,13 +16,21 @@ module sh.sysl.cortical.v6m
 // core's own (except.sysl). Devices live at addresses the page table leaves empty, and the core hands
 // such an access to the board through `io_read` and `io_write`.
 //
-// **A store never leaves a stale record behind.** Writes have a page table of their own, the same as
-// the reads' except that a page holding a decoded record has no entry in it: decoding takes the page
-// out. A store to such a page goes the slow way, writes the RAM, and puts back to "not decoded" every
-// record whose bytes it touched — the records of the halfwords written and the one before them, which
-// may be a 32-bit instruction or a compare fused with the branch after it. The records and both
-// tables are the machine's, shared by every core, so code one core writes is decoded afresh when any
-// core next runs it. A page of data alone keeps its entry, and its stores stay on the fast path.
+// **A store never leaves a stale record behind.** A map of the RAM's 64-byte lines marks each line a
+// record has been decoded from, and a store to a marked line puts back to "not decoded" every record
+// whose bytes it touched — the records of the halfwords written and the one before them, which may be
+// a 32-bit instruction or a compare fused with the branch after it. A store to a line of data alone
+// costs one test of the map. Where the cores share the records, code one core writes is decoded
+// afresh when any core next runs it. Where each core has its own (`pair`), a store forgets the
+// writer's records at once and posts the line to the other core, which forgets its own records there
+// at its next barrier (`DMB`, `DSB`, `ISB`) or between runs (`refresh`): the point at which ARMv6-M
+// requires a core to see code another has written, since it must execute an `ISB` first.
+//
+// **Two threads may reach the RAM, the line map and a core's `limit` at once**, so every access to
+// them is atomic. A relaxed access is the host's plain load or store of the same width, so it costs
+// the one-thread machine nothing, and it is what makes a guest's racing accesses defined behaviour
+// on the host: each is single-copy atomic up to a word, as the architecture asks, and ordered only
+// where a barrier orders it.
 //
 // **The flags are kept lazily.** N and Z are both read from `nz`, the last flag-setting result: N is
 // its top bit and Z is whether it is zero. C is 0 or 1. V is kept as the last addition that set it —
@@ -90,7 +101,8 @@ struct Cpu
     vr: u32
     // Where to resume, as a guest address, after `run` comes back.
     pc: u32
-    // `run` comes back at the first taken branch at or past this many instructions.
+    // `run` comes back at the first taken branch at or past this many instructions. Another core's
+    // thread cuts it to 0, so it is read and written with `limit_of`, `set_limit` and `lower_limit`.
     limit: u64
     retired: u64
     stop: Stop
@@ -133,6 +145,15 @@ struct Cpu
     tick_value: u32
     tick_zero: u64
     tick_last: u64
+    // The IRQs another core's thread has raised in this core (`poke`), one bit per exception number,
+    // taken into `pending` by the core's own thread between runs (`take_incoming`).
+    incoming: u64
+    // The other core, where each core has records of its own; null where the cores share them.
+    peer: *Cpu
+    // The lines of RAM the other core has stored to since this core last forgot its records there,
+    // one bit per line, and whether any bit is set.
+    stale: [256]u64
+    stale_any: u32
 
 var ram: [1048576]u8
 var page_table: [1048576]usize
@@ -141,6 +162,8 @@ var page_table: [1048576]usize
 var code_lines: [16384]u8
 // One record per halfword of RAM, and the record for everywhere else.
 var decoded: [524289]Insn
+// The same, for the second core while it has records of its own.
+var decoded_own: [524289]Insn
 
 // A machine with `image` at address 0, ready to start at `entry`, and no devices.
 reset(cpu: *Cpu, image: []const u8, entry: u32)
@@ -164,7 +187,7 @@ clear(cpu: *Cpu, entry: u32)
     cpu.vb = 0
     cpu.vr = 0
     cpu.pc = entry
-    cpu.limit = 0
+    set_limit(cpu, 0)
     cpu.retired = 0
     cpu.stop = Stop.Budget
     cpu.stop_at = 0
@@ -172,7 +195,46 @@ clear(cpu: *Cpu, entry: u32)
     cpu.pages = &page_table[0]
     cpu.lines = &code_lines[0]
     cpu.dec = &decoded[0]
+    cpu.peer = null
+    for w in 0..<cpu.stale.len do cpu.stale[w] = 0
+    cpu.stale_any = 0
     clear_exceptions(cpu)
+
+/** Give each of two cores records of its own, so each can run on a thread of its own: `first` keeps
+ * the machine's, and `second` starts with its own, all "not decoded". A store from then on forgets
+ * the writer's records and posts its line to the other core (`forget`).
+ */
+pair(first: *Cpu, second: *Cpu)
+    for i in 0..<decoded_own.len do decoded_own[i] = undecoded()
+
+    second.dec = &decoded_own[0]
+    first.peer = second
+    second.peer = first
+
+/** Undo `pair` before `second` has run on its own records: both cores share the machine's again. */
+unpair(first: *Cpu, second: *Cpu)
+    second.dec = &decoded[0]
+    first.peer = null
+    second.peer = null
+
+// `limit`, read and written by the core's own thread while another may cut it. Relaxed: the plain
+// load and store of the host.
+@inline
+limit_of(cpu: *Cpu) -> u64 = atomic_load(&cpu.limit, Relaxed)
+
+@inline
+set_limit(cpu: *Cpu, n: u64) = atomic_store(&cpu.limit, n, Relaxed)
+
+// Lower `limit` to `n` where it is above it, never undoing a cut another thread made meanwhile.
+lower_limit(cpu: *Cpu, n: u64)
+    var seen = limit_of(cpu)
+
+    while n < seen
+        val got = atomic_cas(&cpu.limit, seen, n, Relaxed)
+
+        if got == seen then return
+
+        seen = got
 
 // The record for guest address `a`: past the end of RAM, the one record that stands for everywhere
 // else, and the core stopped at `a`, both its `stop_at` and its `pc`. A branch to it comes back at
@@ -192,7 +254,7 @@ halt(cpu: *Cpu, why: Stop, at: u32)
 
     cpu.stop = why
     cpu.stop_at = at
-    cpu.limit = 0
+    set_limit(cpu, 0)
 
 // The instruction at `ip`, `n` retired before it, made an access that stopped the core: it stops
 // there, not retired, with nothing after the access in it done.
@@ -226,22 +288,73 @@ holds_code(pc: u32)
     val from = if pc >= 4 then pc - 4 else 0
     val to = if pc + 2 < RAM_BYTES then pc + 2 else RAM_BYTES - 1
 
-    for a in from..to do code_lines[a >> LINE_SHIFT] = 1
+    for a in from..to do atomic_store(&code_lines[a >> LINE_SHIFT], 1, Relaxed)
 
 // The store of `width` bytes just made at RAM address `a`: where it is on a line holding code, every
 // record that read any of its bytes is decoded again when control next reaches it.
 @inline
 stored(cpu: *Cpu, a: u32, width: u32)
-    if cpu.lines[a >> LINE_SHIFT] != 0 then forget(cpu, a, width)
+    if atomic_load(&cpu.lines[a >> LINE_SHIFT], Relaxed) != 0 then forget(cpu, a, width)
 
 // Put back to "not decoded" the records that read the `width` bytes at `a`: the halfwords' own, and
-// the one before them.
+// the one before them; and where the other core has records of its own, post it the lines they are on.
 @noinline
 @cold
 forget(cpu: *Cpu, a: u32, width: u32)
+    drop_records(cpu, a, width)
+
+    val other = cpu.peer
+
+    if other == null then return
+
+    val from = (if a >= 2 then a - 2 else 0) >> LINE_SHIFT
+
+    for line in from..((a + width - 1) >> LINE_SHIFT)
+        atomic_or(&other.stale[line >> 6], u64(1) << (line & 63), Relaxed)
+
+    atomic_store(&other.stale_any, 1, Release)
+
+// The core's own records that read any of the `width` bytes at `a`, put back to "not decoded".
+private drop_records(cpu: *Cpu, a: u32, width: u32)
     val first = if a >= 2 then (a >> 1) - 1 else 0
 
     for i in first..((a + width - 1) >> 1) do if cpu.dec[i].op != Op.Undecoded then cpu.dec[i] = undecoded()
+
+/** Forget the core's own records on every line the other core has posted since the last time, so a
+ * record of code the other core has written is decoded afresh. The core's own thread calls it, at a
+ * barrier and between runs.
+ */
+@inline
+refresh(cpu: *Cpu)
+    if atomic_load(&cpu.stale_any, Relaxed) != 0 then drop_stale(cpu)
+
+/** A `DMB`, `DSB` or `ISB`: a full host fence, so the guest's accesses on each side of it are ordered
+ * as the architecture orders them, and the point at which code the other core has written is seen.
+ * ARMv6-M has the three for different orderings; one sequentially consistent fence gives every one of
+ * them.
+ */
+@inline
+barrier(cpu: *Cpu)
+    atomic_fence(SeqCst)
+    refresh(cpu)
+
+@noinline
+@cold
+private drop_stale(cpu: *Cpu)
+    // Pairs with the release that posted the lines, so the bits it set are seen. A line posted after
+    // this sets the flag again, for the next time.
+    if atomic_swap(&cpu.stale_any, 0, Acquire) == 0 then return
+
+    for w in 0..<cpu.stale.len
+        if atomic_load(&cpu.stale[w], Relaxed) == 0 then continue
+
+        var lines = atomic_swap(&cpu.stale[w], 0, Acquire)
+        var line = u32(w) << 6
+
+        while lines != 0
+            if lines & 1 != 0 then drop_records(cpu, line << LINE_SHIFT, 1 << LINE_SHIFT)
+            lines >>= 1
+            line += 1
 
 // The record a direct branch goes to: its `imm` is a signed count of records from its own.
 @inline
@@ -287,13 +400,13 @@ host_read(page: usize, a: u32, width: u32) -> u32
     width match
         4 ->
             val p: *u32 = ptr_cast(at)
-            p[0]
+            atomic_load(p, Relaxed)
         2 ->
             val p: *u16 = ptr_cast(at)
-            p[0]
+            atomic_load(p, Relaxed)
         _ ->
             val p: *u8 = ptr_cast(at)
-            p[0]
+            atomic_load(p, Relaxed)
 
 @inline
 host_write(page: usize, a: u32, width: u32, x: u32)
@@ -302,13 +415,13 @@ host_write(page: usize, a: u32, width: u32, x: u32)
     width match
         4 ->
             val p: *u32 = ptr_cast(at)
-            p[0] = x
+            atomic_store(p, x, Relaxed)
         2 ->
             val p: *u16 = ptr_cast(at)
-            p[0] = u16(x)
+            atomic_store(p, u16(x), Relaxed)
         _ ->
             val p: *u8 = ptr_cast(at)
-            p[0] = u8(x)
+            atomic_store(p, u8(x), Relaxed)
 
 // The low `width` bytes of `x`.
 @inline

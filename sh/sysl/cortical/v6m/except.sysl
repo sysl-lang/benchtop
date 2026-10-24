@@ -1,5 +1,7 @@
 module sh.sysl.cortical.v6m
 
+import sysl.sync.*
+
 // The ARMv6-M exception model (ARMv6-M ARM, DDI0419, chapter B1): the two stack pointers, handler
 // and thread mode, PRIMASK, the system instructions, exception entry and return, and the system
 // control space's NVIC, SCB and SysTick.
@@ -108,7 +110,7 @@ begin_run(cpu: *Cpu) -> bool
     if cpu.tick_ctrl == TICK_RUNNING && cpu.tick_zero != NEVER
         val due = cpu.tick_zero - cpu.slept
 
-        if due < cpu.limit then cpu.limit = due
+        lower_limit(cpu, due)
 
     true
 
@@ -119,11 +121,30 @@ clock(cpu: *Cpu, n: u64) -> u64 = n + cpu.slept
 // Make the run come back at its next taken branch, so the next one's `begin_run` looks again.
 @inline
 recheck(cpu: *Cpu)
-    if cpu.pending != 0 then cpu.limit = 0
+    if cpu.pending != 0 then set_limit(cpu, 0)
 
 // Raise IRQ `irq`, from a device: it is pending until it is taken or cleared.
 raise(cpu: *Cpu, irq: u32)
     cpu.pending |= u64(1) << (IRQ0 + irq)
+
+/** Raise IRQ `irq` in `cpu` from another core's thread, while `cpu` may be running on its own. The
+ * IRQ joins `incoming`, and the run's limit is cut to 0, so the core comes back at its next taken
+ * branch — or, where its own thread set a new limit over the cut, at the end of that run — and takes
+ * it in between runs (`take_incoming`). Nothing is checked per instruction.
+ */
+poke(cpu: *Cpu, irq: u32)
+    atomic_or(&cpu.incoming, u64(1) << (IRQ0 + irq), SeqCst)
+    cut(cpu)
+
+/** Make `cpu`'s run come back at its next taken branch, from any thread. */
+cut(cpu: *Cpu) = atomic_store(&cpu.limit, 0, SeqCst)
+
+/** Take what other threads have raised in the core into its pending exceptions. The core's own thread
+ * calls it, between runs.
+ */
+@inline
+take_incoming(cpu: *Cpu)
+    if atomic_load(&cpu.incoming, Relaxed) != 0 then cpu.pending |= atomic_swap(&cpu.incoming, 0, Acquire)
 
 // A sleeping core wakes when an exception is pending that would preempt if PRIMASK were clear; one
 // that is masked wakes it without being taken. When nothing pending would, but SysTick's will, the
@@ -411,7 +432,7 @@ msr(cpu: *Cpu, ip: *Insn)
 // `WFI`: sleep, to be woken (or stopped at `Asleep`) by the next run's `begin_run`.
 wfi(cpu: *Cpu)
     cpu.sleeping = true
-    cpu.limit = 0
+    set_limit(cpu, 0)
 
 // ---------------------------------------------------------------------------------------------------
 // SysTick. While it runs, it counts down once per clock; it reads 0 at `tick_last`, and next reaches
@@ -508,7 +529,7 @@ scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
 
     tick(cpu, now)
     // Whatever changes here, the run comes back at its next taken branch to look at it.
-    cpu.limit = 0
+    set_limit(cpu, 0)
 
     if a >= NVIC_IPR && a < NVIC_IPR + 32
         val first = IRQ0 + (a - NVIC_IPR)

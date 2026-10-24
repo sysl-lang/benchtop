@@ -1,0 +1,262 @@
+module sh.sysl.cortical.virt
+
+// The board with each core on a host thread of its own (`set_threads`, `cortical run --threads`).
+// Core 0 runs alone on the caller's thread until it launches core 1, exactly as on one thread; core 1
+// then gets a thread of its own and records of its own (`pair`), and the two run at once.
+//
+// **Each core keeps its own clock, and neither runs more than `LAG_QUANTA` quanta ahead of the
+// other.** A core runs a quantum at a time; between runs it publishes its clock, takes in what the
+// other raised in it, and looks at its interrupts as on one thread. A core whose clock has reached the
+// other's plus the lag bound yields until the other catches up. The bound is 4 quanta, 4000 clocks by
+// default — 32 µs at the RP2040's 125 MHz — so a word one core pushes is seen by the other within
+// that much virtual time of when it was sent, earlier or later, where on one thread it is seen within
+// a quantum. Each core's SysTick counts its own clock, so a tick is exact to its core whatever the
+// other does.
+//
+// **A core asleep in `WFI` blocks its thread.** Its clock follows the other core's: it wakes when the
+// other raises an interrupt in it (`wake_core`, from the FIFO), when the other's clock passes its own
+// SysTick's expiry, or when the board ends. While the other runs on, the sleeper does not hold it back.
+// When both are asleep, the last to sleep decides, under the board's lock, with the other's state
+// still: it wakes the core whose SysTick fires first, the board's clock skipping there; failing that it
+// waits for the console where its interrupt would wake either; failing that both stop at `Asleep`.
+// Every change to whether a core is asleep, and every look at both, is made under that lock, so the
+// board never stops while an interrupt is on its way to a core.
+//
+// **The board ends when either core stops**: that core's thread cuts the other's run short, and both
+// threads leave. `run_board` answers the core that stopped, core 0 where both did.
+//
+// **Shared state is safe across the threads by construction** (DESIGN.md §1.4, §1.5): the RAM, the
+// line map and every `limit` are reached with atomic accesses; each core has its own records, and a
+// store posts the lines it writes to the other core; the FIFOs are single-producer single-consumer
+// rings; a spinlock is an atomic test-and-set; and the console is under its lock.
+
+import sh.sysl.cortical.v6m.{Cpu, Stop, IRQ0, NEVER, clock, could_wake, cut, halt, next_wake, pair, poke, refresh, run_threaded, set_limit, take_incoming, unpair, wake_by}
+import sysl.sync.*
+import sysl.threads.{Condvar, Mutex, spawn, yield_now}
+
+// How many quanta a running core may get ahead of the other.
+const LAG_QUANTA: u64 = 4
+
+// How long a sleeping core whose console interrupt would wake it waits before looking at the console
+// again, while the other core runs: the console has no thread of its own to wake it.
+const CONSOLE_POLL_NS: i64 = 1000000
+
+const CORE1_STACK: usize = 1 << 20
+
+// The board's lock and the condition a sleeping core's thread waits on.
+var gate = Mutex.new(0)
+var wakeup = Condvar.new()
+var cores: [2]*Cpu
+// Each core's clock as of its last run, for the other.
+var clocks: [2]u64
+// 1 while a core's thread is blocked asleep, set and cleared under `gate`; and the clock its SysTick
+// wakes it at, `NEVER` for none.
+var dozing: [2]u32
+var wake_at: [2]u64
+// Where both cores sleep, the clock the board has skipped to.
+var floor: u64 = 0
+// 1 once a core has stopped.
+var ended: u32 = 0
+
+/** Run each core of the boards booted from now until the next `boot` on a thread of its own. */
+set_threads()
+    threads = true
+
+private[virt] run_threads(cpu: *Cpu) -> *Cpu
+    cores[0] = cpu
+    cores[1] = &second
+
+    for k in 0..<2
+        atomic_store(&dozing[k], 0, SeqCst)
+        atomic_store(&wake_at[k], NEVER, SeqCst)
+
+    atomic_store(&ended, 0, SeqCst)
+
+    while !launched
+        if !round(cpu) then return answer(cpu)
+
+    pair(cpu, &second)
+    floor = now
+
+    for k in 0..<2 do atomic_store(&clocks[k], clock(cores[k], cores[k].retired), SeqCst)
+
+    spawn(&core1_body, &second, CORE1_STACK) match
+        Some(t) ->
+            run_core(cpu, 0)
+            t.join()
+        None ->
+            // No second thread to be had: the cores take turns on this one.
+            unpair(cpu, &second)
+            threads = false
+            while round(cpu) do ()
+
+    answer(cpu)
+
+private answer(cpu: *Cpu) -> *Cpu
+    flush_console()
+    if cpu.stop == Stop.Budget then &second else cpu
+
+private core1_body(c: *Cpu) = run_core(c, 1)
+
+// Core k's thread: run a quantum at a time until either core stops.
+private run_core(cpu: *Cpu, k: int)
+    val o = 1 - k
+
+    while atomic_load(&ended, SeqCst) == 0
+        take_incoming(cpu)
+        refresh(cpu)
+        signal(cpu)
+
+        if !wake_by(cpu, clock(cpu, cpu.retired))
+            doze(cpu, k)
+            continue
+
+        val mine = clock(cpu, cpu.retired)
+        val bound = ahead_of(o)
+
+        if mine >= bound
+            hold_back(o, mine)
+            continue
+
+        set_limit(cpu, (if mine + quantum < bound then mine + quantum else bound) - cpu.slept)
+        run_threaded(cpu)
+        publish(k, cpu)
+        alert(o, clock(cpu, cpu.retired))
+
+        if cpu.stop != Stop.Budget
+            atomic_store(&ended, 1, SeqCst)
+            cut(cores[o])
+            nudge()
+            return
+    end while
+end run_core
+
+// The clock a running core may not reach: the lag bound past the other core's clock, or past the
+// SysTick expiry of the other where it sleeps; `NEVER` where it sleeps with none.
+private ahead_of(o: int) -> u64
+    val h = if atomic_load(&dozing[o], SeqCst) != 0 then atomic_load(&wake_at[o], SeqCst) else atomic_load(&clocks[o], SeqCst)
+
+    if h == NEVER then NEVER else h + LAG_QUANTA * quantum
+
+// A core at `mine` has got as far ahead of core o as it may: yield until o catches up, sleeps with
+// nothing to hold this one back, or the board ends.
+private hold_back(o: int, mine: u64)
+    while atomic_load(&ended, SeqCst) == 0
+        alert(o, mine)
+        if mine < ahead_of(o) then return
+        yield_now()
+
+private publish(k: int, cpu: *Cpu) = atomic_store(&clocks[k], clock(cpu, cpu.retired), SeqCst)
+
+// Wake core o where it sleeps until a SysTick expiry that the clock `t` has passed.
+private alert(o: int, t: u64)
+    if atomic_load(&dozing[o], SeqCst) != 0 && t >= atomic_load(&wake_at[o], SeqCst) then nudge()
+
+private nudge()
+    gate.lock_raw()
+    wakeup.notify_all()
+    gate.unlock_raw()
+
+/** Raise IRQ `irq` in core k from the other core's thread, and wake it where it sleeps. */
+private[virt] wake_core(k: int, irq: u32)
+    poke(cores[k], irq)
+    if atomic_load(&dozing[k], SeqCst) != 0 then nudge()
+
+// Core k is asleep, with nothing to wake it at its own clock: block its thread until something does,
+// or until the board ends.
+private doze(cpu: *Cpu, k: int)
+    val o = 1 - k
+
+    gate.lock_raw()
+
+    while atomic_load(&ended, SeqCst) == 0
+        // The time has come as far as the other core's clock, or the board's where it sleeps too.
+        val t = if atomic_load(&dozing[o], SeqCst) == 0 then atomic_load(&clocks[o], SeqCst) else floor
+
+        if wake_by(cpu, t) then break
+
+        take_incoming(cpu)
+        signal(cpu)
+
+        if wake_by(cpu, clock(cpu, cpu.retired)) then break
+
+        publish(k, cpu)
+        atomic_store(&wake_at[k], next_wake(cpu), SeqCst)
+        atomic_store(&dozing[k], 1, SeqCst)
+
+        // Each core sets its flag before looking at the other's state, and raises or publishes before
+        // looking at the other's flag, so of an interrupt raised here and this core going to sleep,
+        // one sees the other.
+        if atomic_load(&cpu.incoming, SeqCst) == 0
+            if atomic_load(&dozing[o], SeqCst) == 0
+                if atomic_load(&clocks[o], SeqCst) < atomic_load(&wake_at[k], SeqCst) then wait_awake(cpu)
+            elif !both_asleep(cpu, k)
+                break
+
+        atomic_store(&dozing[k], 0, SeqCst)
+    end while
+
+    atomic_store(&dozing[k], 0, SeqCst)
+    publish(k, cpu)
+    gate.unlock_raw()
+end doze
+
+// Wait, under `gate`, for the running core to wake this one; or, where the console's interrupt would
+// wake it, for a while, to look at the console again.
+private wait_awake(cpu: *Cpu)
+    if console_wakes(cpu)
+        wakeup.wait_for(&gate, CONSOLE_POLL_NS)
+    else
+        wakeup.wait(&gate)
+
+private console_wakes(cpu: *Cpu) -> bool = console_irq >= 0 && atomic_load(&ctrl, Relaxed) & RX_INTERRUPT != 0 && could_wake(cpu, IRQ0 + u32(console_irq))
+
+// Both cores are asleep, core k the last, under `gate`: the other's thread is blocked, so its state
+// holds still. Wake whichever SysTick fires first, the board's clock skipping there; failing that,
+// wait for the console where its interrupt would wake either; failing that stop both at `Asleep`.
+// Answers whether the board runs on.
+private both_asleep(cpu: *Cpu, k: int) -> bool
+    val o = 1 - k
+    val other = cores[o]
+
+    // Woken already, and yet to run.
+    if atomic_load(&other.incoming, SeqCst) != 0
+        wakeup.notify_all()
+        wakeup.wait(&gate)
+        return true
+
+    val mine = atomic_load(&wake_at[k], SeqCst)
+    val theirs = atomic_load(&wake_at[o], SeqCst)
+
+    if mine != NEVER || theirs != NEVER
+        val due = if mine < theirs then mine else theirs
+
+        if due > floor then floor = due
+
+        // This core's own wakes it at the top of its loop; the other's, when it is told.
+        if mine != due
+            wakeup.notify_all()
+            wakeup.wait(&gate)
+
+        return true
+
+    if console_wakes(cpu) || console_wakes(other)
+        if !console_raising()
+            flush_console()
+            gate.unlock_raw()
+
+            val got = typed.receive()
+
+            hold_input(got)
+            gate.lock_raw()
+
+        wakeup.notify_all()
+        if !console_wakes(cpu) then wakeup.wait(&gate)
+        return true
+
+    halt(cpu, Stop.Asleep, cpu.pc)
+    halt(other, Stop.Asleep, other.pc)
+    atomic_store(&ended, 1, SeqCst)
+    wakeup.notify_all()
+    false
+end both_asleep
