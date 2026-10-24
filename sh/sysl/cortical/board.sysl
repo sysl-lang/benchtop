@@ -5,92 +5,100 @@ import sh.sysl.parsing.{Diagnostic, Report, Source, Span, error, full_report, ne
 import sysl.buf.{Buf, buf}
 import sysl.text.{parse_long_base, str_builder}
 
-// A board file read into the model: the HOCON tree, held to the board format's shape.
+// A description file read into the model: the HOCON tree, held to the format's shape.
 //
 // **This half knows the format and nothing about the library.** It says a section is unknown, a size
 // is not two numbers, an element says both what part it shows and what text it is; whether `st7796`
-// is a part, or GP30 a pin, is `check.sysl`'s question, asked of the registry. Every mistake is
-// recorded and reading goes on, so a person editing a file sees all of its mistakes at once rather
-// than one per save.
+// is a part, GP30 a pin, or `pico` a board cortical has, is asked of the registry and the shelf
+// later. Every mistake is recorded and reading goes on, so a person editing a file sees all of its
+// mistakes at once rather than one per save.
 
-/** A board file read: the model as far as it could be built, and everything wrong with it. */
+/** A description read: the model as far as it could be built, and everything wrong with it. */
 struct Loaded
-    board: Board
+    description: Description
     report: Report
 
-/** Read, build and check a board description. */
-load(src: Source, reg: Registry) -> Loaded
+/** Read, build, find the boards of and check a description. `shelf` is where a board named by
+ * another (`board = pico2w`, a product's `board = pico`) is found.
+ */
+load(src: Source, reg: Registry, shelf: Shelf = built_in_shelf()) -> Loaded = load_at(src, reg, shelf, 0)
+
+/** `load`, `depth` boards deep in a chain of boards naming boards. */
+load_at(src: Source, reg: Registry, shelf: Shelf, depth: int) -> Loaded
     var r = full_report()
 
     val doc = parse(src) match
         Ok(d) -> d
         Err(d) ->
             r.add(d)
-            return Loaded(empty_board(), r)
+            return Loaded(empty_description(), r)
 
-    var b = build(src, doc, &r)
+    var d = build(src, doc, &r)
 
-    check(&b, reg, src, &r)
-    Loaded(b, r)
-end load
+    find_boards(&d, src, reg, shelf, depth, &r)
+    check_description(&d, reg, src, &r)
+    Loaded(d, r)
+end load_at
 
 /** The model a document describes, with every shape mistake added to `r`. */
-build(src: Source, doc: Document, r: *Report) -> Board
-    var b = empty_board()
+build(src: Source, doc: Document, r: *Report) -> Description
+    var d = empty_description()
     val root = doc.root
 
     if !root.is_obj() then
-        r.add(error(root.span, s"a board description is a block of sections, not ${root.kind_name()}"))
-        return b
+        r.add(error(root.span, s"a description is `board { ... }` or `product { ... }`, not ${root.kind_name()}"))
+        return d
+
+    var first_form = ""
 
     for f in root.fields()
+        if f.key == "board" || f.key == "product" then
+            if first_form.is_empty() then
+                first_form = f.key
+            elif first_form != f.key then
+                r.add(error(f.key_span, "the description is both a board and a product")
+                    .with_note("a file describes one board or one product; a product's boards go in its `boards`"))
+                continue
+        end if
+
         if f.key == "board" then
-            read_board_block(&b, f, r)
-        elif f.key == "parts" then
-            read_parts(&b, f, r)
-        elif f.key == "buses" then
-            read_buses(&b, f, r)
-        elif f.key == "panel" then
-            read_panel(&b, f, r)
-        elif f.key == "input" then
-            read_input(&b, f, r)
+            d.form = BoardForm
+
+            if f.value.is_obj() then
+                read_board(&d.board, f, r)
+            else
+                f.value.as_text() match
+                    Some(t) ->
+                        d.named = t
+                        d.named_span = f.value.span
+                    None ->
+                        r.add(error(f.value.span, s"`board` must be a block, or the name of a board, not ${f.value.kind_name()}")
+                            .with_note("write a board out as `board { ... }`, or name one, as `board = pico2w` or `board = \"boards/mine.hocon\"`"))
+        elif f.key == "product" then
+            d.form = ProductForm
+            read_product(&d.product, f, r)
+        elif in_section(f.key) then
+            r.add(error(f.key_span, s"`${f.key}` belongs inside `board { ... }` or `product { ... }`"))
         else
-            unknown(r, f, "section", "", ["board", "parts", "buses", "panel", "input"])
+            unknown(r, f, "section", "", ["board", "product"])
     end for
 
-    root.field("board") match
-        Some(f) ->
-            if f.value.is_obj() then
-                val g = f.value
-
-                if !has_field(g, "name") then
-                    r.add(error(f.key_span, "the board has no name")
-                        .with_note("give it one, as `name = \"Pico Breadboard Kit\"`"))
-
-                if !has_field(g, "chip") && !has_field(g, "cores") then
-                    r.add(error(f.key_span, "the board names neither a chip nor its cores")
-                        .with_note("say which chip the parts are wired to, as `chip = rp2040`, or, for a board with no real chip, its cores, as `cores = [cortex-m0plus]`"))
-                elif has_field(g, "chip") && has_field(g, "cores") then
-                    r.add(error(b.cores_span, "the board names both a chip and cores")
-                        .with_note("a chip brings its own cores; name `cores` only on a board with no real chip"))
-            end if
-        None ->
-            r.add(error(Span(0, 0), "there is no `board` section")
-                .with_note("every description starts with one, as `board { name = \"virt\", cores = [cortex-m0plus] }`"))
-
-    if !has_field(root, "parts") then
-        r.add(error(Span(0, 0), "there is no `parts` section")
-            .with_note("every board has parts, as `parts { ram { part = ram, at = 0x00000000, size = 1M } }`"))
+    if d.form == NoForm && first_form.is_empty() then
+        r.add(error(Span(0, 0), "the description is neither a board nor a product")
+            .with_note("a description is `board { ... }`, `product { ... }`, or a board cortical has built in, as `board = pico2w`"))
 
     repeats(src, doc, r)
-    b
+    d
 end build
 
-// -- board -----------------------------------------------------------------------------------------
+// The names a board or a product holds, written at the top of a file instead.
+private in_section(key: string) -> bool =
+    key == "name" || key == "chip" || key == "cores" || key == "parts" || key == "buses" || key == "exposes" ||
+    key == "view" || key == "input" || key == "boards"
 
-private read_board_block(b: *Board, f: Field, r: *Report)
-    if !is_block(f, "the `board` section", r) then return
+// -- a board ---------------------------------------------------------------------------------------
 
+private read_board(b: *Board, f: Field, r: *Report)
     for g in f.value.fields()
         if g.key == "name" then
             b.name = text(g, "`board.name`", r)
@@ -111,13 +119,162 @@ private read_board_block(b: *Board, f: Field, r: *Report)
                     v.as_text() match
                         Some(t) -> b.cores.push(Core(t, v.span))
                         None -> r.add(error(v.span, s"a core is named by a word, not ${v.kind_name()}"))
+        elif g.key == "parts" then
+            read_parts(&b.parts, g, r)
+        elif g.key == "buses" then
+            if is_block(g, "`buses`", r) then
+                for h in g.value.fields() do read_bus(&b.buses, "", h.key_span, h, r)
+        elif g.key == "exposes" then
+            read_exposes(b, g, r)
+        elif g.key == "view" then
+            read_view(&b.view, g, r)
+        elif g.key == "input" then
+            read_input(&b.keys, &b.pointers, g, r)
         else
-            unknown(r, g, "setting", " in `board`", ["name", "chip", "cores"])
-end read_board_block
+            unknown(r, g, "setting", " in `board`", ["name", "chip", "cores", "parts", "buses", "exposes", "view", "input"])
+    end for
+
+    val v = f.value
+
+    if !has_field(v, "name") then
+        r.add(error(f.key_span, "the board has no name")
+            .with_note("give it one, as `name = \"Raspberry Pi Pico\"`"))
+
+    if !has_field(v, "chip") && !has_field(v, "cores") then
+        r.add(error(f.key_span, "the board names neither a chip nor its cores")
+            .with_note("say which chip the parts are wired to, as `chip = rp2040`, or, for a board with no real chip, its cores, as `cores = [cortex-m0plus]`"))
+    elif has_field(v, "chip") && has_field(v, "cores") then
+        r.add(error(b.cores_span, "the board names both a chip and cores")
+            .with_note("a chip brings its own cores; name `cores` only on a board with no real chip"))
+end read_board
+
+private read_exposes(b: *Board, f: Field, r: *Report)
+    if !is_block(f, "`exposes`", r) then return
+
+    b.exposes_span = f.key_span
+
+    for g in f.value.fields()
+        val pins = g.key == "pins"
+
+        if !pins && g.key != "buses" then
+            unknown(r, g, "setting", " in `exposes`", ["pins", "buses"])
+            continue
+
+        if !g.value.is_arr() then
+            r.add(error(g.value.span, s"`exposes.${g.key}` must be a list, not ${g.value.kind_name()}")
+                .with_note(if pins then "list the pins, as `pins = [GP0, GP1]`" else "list the buses, as `buses = [spi0, i2c0]`"))
+            continue
+
+        for v in g.value.items()
+            val t = v.as_text() match
+                Some(t) -> t
+                None -> ""
+
+            if !pins then
+                if t.is_empty() then
+                    r.add(error(v.span, s"`exposes.buses` lists buses such as `spi0`, not ${v.kind_name()}"))
+                else
+                    b.exposed_buses.push(Exposed(t, -1, v.span))
+            else
+                pin_number(t) match
+                    Some(n) -> b.exposed_pins.push(Exposed(t, n, v.span))
+                    None -> r.add(error(v.span, s"`exposes.pins` lists pins such as `GP15`, and `${if t.is_empty() then v.kind_name() else t}` is not one"))
+        end for
+    end for
+end read_exposes
+
+// -- a product -------------------------------------------------------------------------------------
+
+private read_product(p: *Product, f: Field, r: *Report)
+    if !is_block(f, "the `product` section", r) then return
+
+    for g in f.value.fields()
+        if g.key == "name" then
+            p.name = text(g, "`product.name`", r)
+        elif g.key == "boards" then
+            read_instances(p, g, r)
+        elif g.key == "parts" then
+            read_parts(&p.parts, g, r)
+        elif g.key == "buses" then
+            // A product's buses are its boards': `pico.spi0 { sck = GP2 }`, the board first.
+            if is_block(g, "`buses`", r) then
+                for h in g.value.fields()
+                    if is_block(h, s"the buses of `${h.key}`", r) then
+                        for k in h.value.fields() do read_bus(&p.buses, h.key, h.key_span, k, r)
+        elif g.key == "view" then
+            read_view(&p.view, g, r)
+        elif g.key == "input" then
+            read_input(&p.keys, &p.pointers, g, r)
+        else
+            unknown(r, g, "setting", " in `product`", ["name", "boards", "parts", "buses", "view", "input"])
+    end for
+
+    if !has_field(f.value, "name") then
+        r.add(error(f.key_span, "the product has no name")
+            .with_note("give it one, as `name = \"Pico Breadboard Kit\"`"))
+
+    if p.boards.is_empty() && !has_field(f.value, "boards") then
+        r.add(error(f.key_span, "the product has no boards")
+            .with_note("name each, as `boards { pico { board = pico } }`"))
+end read_product
+
+private read_instances(p: *Product, f: Field, r: *Report)
+    if !is_block(f, "`boards`", r) then return
+
+    p.boards_span = f.key_span
+
+    if f.value.fields().is_empty() then
+        r.add(error(f.key_span, "the product has no boards")
+            .with_note("name each, as `boards { pico { board = pico } }`"))
+
+    for g in f.value.fields()
+        if !is_block(g, s"the board `${g.key}`", r) then continue
+
+        var inst = Instance(g.key, g.key_span, "", g.key_span, buf(), empty_board(), false)
+
+        for h in g.value.fields()
+            if h.key == "board" then
+                inst.of = text(h, s"`${g.key}.board`", r)
+                inst.of_span = h.value.span
+            elif h.key == "parts" then
+                read_overrides(&inst, h, r)
+            else
+                unknown(r, h, "setting", s" in the board `${g.key}`", ["board", "parts"])
+        end for
+
+        if !has_field(g.value, "board") then
+            r.add(error(g.key_span, s"`${g.key}` names no board")
+                .with_note("say which board it is, as `board = pico`, or a file's path, as `board = \"boards/mine.hocon\"`"))
+
+        p.boards.push(inst)
+    end for
+end read_instances
+
+// An instance's overrides: `parts { led { color = red } }`, or `parts.led.color = red`.
+private read_overrides(inst: *Instance, f: Field, r: *Report)
+    if !is_block(f, s"`${inst.name}.parts`", r) then return
+
+    for g in f.value.fields()
+        if !is_block(g, s"`${inst.name}.parts.${g.key}`", r) then continue
+
+        for h in g.value.fields()
+            val what = s"`${inst.name}.parts.${g.key}.${h.key}`"
+
+            if h.key == "part" || h.key == "wire" || h.key == "at" || h.key == "size" || h.key == "irq" then
+                r.add(error(h.key_span, s"$what cannot be overridden")
+                    .with_note("an override sets a part's parameters; which part it is, its wiring and its place on the bus stay as the board has them"))
+                continue
+
+            setting(h, what, r) match
+                Some(s) -> inst.overrides.push(Override(g.key, g.key_span, Param(h.key, h.key_span, s, h.value.span)))
+                None -> ()
+        end for
+    end for
+end read_overrides
 
 // -- parts -----------------------------------------------------------------------------------------
 
-private read_parts(b: *Board, f: Field, r: *Report)
+private read_parts(parts: *Buf[Part], f: Field, r: *Report)
     if !is_block(f, "`parts`", r) then return
 
     for g in f.value.fields()
@@ -149,7 +306,7 @@ private read_parts(b: *Board, f: Field, r: *Report)
             r.add(error(g.key_span, s"`${g.key}` names no part")
                 .with_note("every part says which library part it is, as `part = led`"))
 
-        b.parts.push(p)
+        parts.push(p)
     end for
 end read_parts
 
@@ -165,8 +322,8 @@ private read_wires(p: *Part, f: Field, r: *Report)
                 .with_note("a wire names a pin as `GP16`, a bus as `spi0`, or another part's port as `wifi.gpio0`"))
 end read_wires
 
-/** What a wire's text names. `GP` and digits is a pin; a dotted name is a part's port; anything else
- * is a bus, which the checker looks for among the chip's.
+/** What a wire's text names. `GP` and digits is a pin; a dotted name is a part's port, or in a
+ * product a board's pin or bus; anything else is a bus, which the checker looks for among the chip's.
  */
 target_of(t: string) -> Target
     pin_number(t) match
@@ -197,59 +354,58 @@ end pin_number
 
 // -- buses -----------------------------------------------------------------------------------------
 
-private read_buses(b: *Board, f: Field, r: *Report)
-    if !is_block(f, "`buses`", r) then return
+// One bus, `spi0 { sck = GP2, tx = GP3 }`, of the chip of `board` (empty on a board's own).
+private read_bus(buses: *Buf[Bus], board: string, board_span: Span, g: Field, r: *Report)
+    val qualified = if board.is_empty() then g.key else s"$board.${g.key}"
 
-    for g in f.value.fields()
-        if !is_block(g, s"the bus `${g.key}`", r) then continue
+    if !is_block(g, s"the bus `$qualified`", r) then return
 
-        var bus = Bus(g.key, g.key_span, buf())
+    var bus = Bus(board, board_span, g.key, g.key_span, buf())
 
-        for h in g.value.fields()
-            val pin = h.value.as_text() match
-                Some(t) -> pin_number(t)
-                None -> None
+    for h in g.value.fields()
+        val pin = h.value.as_text() match
+            Some(t) -> pin_number(t)
+            None -> None
 
-            pin match
-                Some(n) -> bus.signals.push(Signal(h.key, h.key_span, n, h.value.span))
-                None -> r.add(error(h.value.span, s"`${g.key}.${h.key}` must be a pin such as `GP2`"))
-        end for
-
-        b.buses.push(bus)
+        pin match
+            Some(n) -> bus.signals.push(Signal(h.key, h.key_span, n, h.value.span))
+            None -> r.add(error(h.value.span, s"`$qualified.${h.key}` must be a pin such as `GP2`"))
     end for
-end read_buses
 
-// -- the panel -------------------------------------------------------------------------------------
+    buses.push(bus)
+end read_bus
 
-private read_panel(b: *Board, f: Field, r: *Report)
-    if !is_block(f, "`panel`", r) then return
+// -- the view --------------------------------------------------------------------------------------
 
-    b.panel.span = f.key_span
+private read_view(view: *View, f: Field, r: *Report)
+    if !is_block(f, "`view`", r) then return
+
+    view.span = f.key_span
 
     var sized = false
 
     for g in f.value.fields()
         if g.key == "size" then
-            pair(g.value, "`panel.size`", "[width, height]", r) match
+            pair(g.value, "`view.size`", "[width, height]", r) match
                 Some((w, h)) ->
-                    b.panel.width = w
-                    b.panel.height = h
+                    view.width = w
+                    view.height = h
                     sized = true
                 None -> ()
         elif g.key == "background" then
-            b.panel.background = text(g, "`panel.background`", r)
+            view.background = text(g, "`view.background`", r)
         elif g.key == "elements" then
-            read_elements(b, g, r)
+            read_elements(view, g, r)
         else
-            unknown(r, g, "setting", " in `panel`", ["size", "background", "elements"])
+            unknown(r, g, "setting", " in `view`", ["size", "background", "elements"])
     end for
 
     if !sized && !has_field(f.value, "size") then
-        r.add(error(f.key_span, "the panel has no size").with_note("give it one, as `size = [922, 499]`"))
-end read_panel
+        r.add(error(f.key_span, "the view has no size").with_note("give it one, as `size = [922, 499]`"))
+end read_view
 
-private read_elements(b: *Board, f: Field, r: *Report)
-    if !is_block(f, "`panel.elements`", r) then return
+private read_elements(view: *View, f: Field, r: *Report)
+    if !is_block(f, "`view.elements`", r) then return
 
     for g in f.value.fields()
         if !is_block(g, s"the element `${g.key}`", r) then continue
@@ -301,16 +457,16 @@ private read_elements(b: *Board, f: Field, r: *Report)
                 .with_note("an element draws one thing: a part, a caption or a box"))
 
         if !placed then
-            r.add(error(g.key_span, s"the element `${g.key}` has no place on the panel")
+            r.add(error(g.key_span, s"the element `${g.key}` has no place in the view")
                 .with_note("give it one, as `at = [20, 40]`: its top-left corner, in pixels"))
 
-        b.panel.elements.push(e)
+        view.elements.push(e)
     end for
 end read_elements
 
 // -- input -----------------------------------------------------------------------------------------
 
-private read_input(b: *Board, f: Field, r: *Report)
+private read_input(keys: *Buf[KeyBinding], pointers: *Buf[PointerBinding], f: Field, r: *Report)
     if !is_block(f, "`input`", r) then return
 
     for g in f.value.fields()
@@ -323,13 +479,13 @@ private read_input(b: *Board, f: Field, r: *Report)
                     Some(dot) -> (t[0..<dot], t[(dot + 1)..])
                     None -> (t, "")
 
-                b.keys.push(KeyBinding(h.key, h.key_span, part, control, h.value.span))
+                keys.push(KeyBinding(h.key, h.key_span, part, control, h.value.span))
             end for
         elif g.key == "pointer" then
             if !is_block(g, "`input.pointer`", r) then continue
 
             for h in g.value.fields()
-                b.pointers.push(PointerBinding(h.key, h.key_span, text(h, s"`input.pointer.${h.key}`", r), h.value.span))
+                pointers.push(PointerBinding(h.key, h.key_span, text(h, s"`input.pointer.${h.key}`", r), h.value.span))
         else
             unknown(r, g, "setting", " in `input`", ["keys", "pointer"])
     end for
@@ -337,37 +493,67 @@ end read_input
 
 // -- names written twice ---------------------------------------------------------------------------
 
-// HOCON merges a name written twice; on a board it is a mistake, so every repeat the reader recorded
-// at a place where names are identities is reported, pointing at the second and naming the first.
+// HOCON merges a name written twice; in a description it is a mistake, so every repeat the reader
+// recorded at a place where names are identities is reported, pointing at the second and naming the
+// first. A whole block written twice is one mistake: what the two copies share beneath it is not
+// reported again.
 private repeats(src: Source, doc: Document, r: *Report)
-    for rep in doc.repeats
-        val segs = split_path(rep.path)
-        val first = s"${src.locate(rep.first.start)}"
-        val n = segs.len()
-        val last = segs.at(n - 1)
+    var whole: Buf[string] = buf()
 
-        val message =
-            if n == 2 && (segs.at(0) == "parts" || segs.at(0) == "buses") then
-                s"duplicate name `$last`"
-            elif n == 3 && segs.at(0) == "panel" && segs.at(1) == "elements" then
-                s"duplicate name `$last`"
-            elif n == 3 && segs.at(0) == "input" && segs.at(1) == "keys" then
-                s"the key `$last` is bound twice"
-            elif n == 3 && segs.at(0) == "input" && segs.at(1) == "pointer" then
-                s"the element `$last` is bound twice"
-            elif n == 3 && segs.at(0) == "parts" then
-                s"`${segs.at(1)}.$last` is set twice"
-            elif n == 4 && segs.at(0) == "parts" && segs.at(2) == "wire" then
-                s"`${segs.at(1)}.$last` is wired twice"
-            elif n == 2 && segs.at(0) == "board" then
-                s"`board.$last` is set twice"
-            else
-                ""
+    for rep in doc.repeats
+        val (_, is_whole) = repeat_message(split_path(rep.path))
+
+        if is_whole then whole.push(rep.path)
+
+    for rep in doc.repeats
+        if beneath(rep.path, whole) then continue
+
+        val (message, _) = repeat_message(split_path(rep.path))
 
         if !message.is_empty() then
-            r.add(error(rep.again, message).with_note(s"it was first written at $first"))
+            r.add(error(rep.again, message).with_note(s"it was first written at ${src.locate(rep.first.start)}"))
     end for
 end repeats
+
+// Whether `path` is inside one of the blocks `whole` names.
+private beneath(path: string, whole: Buf[string]) -> bool
+    for w in whole
+        if path.starts_with(s"$w.") then return true
+
+    false
+
+// What a repeat at the path `segs` is, and whether it is a whole named block written twice. An empty
+// message is a merge the format allows.
+private repeat_message(segs: Buf[string]) -> (string, bool)
+    val top = segs.at(0)
+
+    if top != "board" && top != "product" then return ("", false)
+
+    val n = segs.len() - 1
+
+    if n == 0 then return (s"`$top` is written twice", true)
+
+    val s1 = segs.at(1)
+    val s2 = if n >= 2 then segs.at(2) else ""
+    val s3 = if n >= 3 then segs.at(3) else ""
+
+    if n == 1 then
+        return if s1 == "name" || s1 == "chip" || s1 == "cores" then (s"`$top.$s1` is set twice", false) else ("", false)
+
+    if n == 2 && (s1 == "parts" || s1 == "boards" || (s1 == "buses" && top == "board")) then
+        return (s"duplicate name `$s2`", true)
+
+    if n == 3 && s1 == "buses" && top == "product" then return (s"duplicate name `$s2.$s3`", true)
+    if n == 3 && s1 == "view" && s2 == "elements" then return (s"duplicate name `$s3`", true)
+    if n == 3 && s1 == "input" && s2 == "keys" then return (s"the key `$s3` is bound twice", false)
+    if n == 3 && s1 == "input" && s2 == "pointer" then return (s"the element `$s3` is bound twice", false)
+    if n == 3 && s1 == "parts" then return (s"`$s2.$s3` is set twice", false)
+    if n == 3 && s1 == "boards" then return (s"`$s2.$s3` is set twice", false)
+    if n == 4 && s1 == "parts" && s3 == "wire" then return (s"`$s2.${segs.at(4)}` is wired twice", false)
+    if n == 5 && s1 == "boards" && s3 == "parts" then return (s"`$s2.parts.${segs.at(4)}.${segs.at(5)}` is set twice", false)
+
+    ("", false)
+end repeat_message
 
 // A repeat's path, `parts.d1` or `parts."a.b"`, split into its names.
 private split_path(p: string) -> Buf[string]
