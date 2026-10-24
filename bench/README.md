@@ -6,8 +6,9 @@ the decoder, the instruction semantics, the page-table memory path and the lazy 
 step from one instruction to the next differs.
 
 `guest/` is the workload: `kernel.c` (a bitwise CRC, a sieve, an insertion sort, a recursive
-Fibonacci) built for the M0+. `kernel.bin` is committed because the tests embed it, and so is
-`dual.elf`, the two-core workload below; `zsh bench/guest/build.sh` rebuilds both.
+Fibonacci) built for the M0+, and `kernel33.bin` the same for the M33. Both are committed because
+the tests embed them, and so are `dual.elf` and `dual33.elf`, the two-core workload below; `zsh
+bench/guest/build.sh` rebuilds them all.
 
 Run it from the repository's root, with the answer the same C computes on the host for 1000 rounds:
 
