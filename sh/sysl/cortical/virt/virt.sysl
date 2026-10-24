@@ -17,7 +17,41 @@ module sh.sysl.cortical.virt
 //
 // **The interrupt is raised between runs**, which a million instructions apart is often enough for
 // typing; and when the core sleeps in `WFI` with nothing in it to wake it, the board waits for the
-// console, if its interrupt would.
+// console, if its interrupt would. It is raised in each running core's NVIC; a core that has not
+// enabled IRQ 0 is not interrupted by it.
+//
+// **The board has two M0+ cores**, sharing the RAM and the decoded records. Core 0 boots from the
+// vector table; core 1 sleeps until core 0 launches it. Both run on the one host thread, a quantum at
+// a time each, so a run is the same every time. Their shared block, a small SIO after the RP2040's,
+// answers each core by which one made the access:
+//
+//     0xD000_0000  CPUID        read: 0 on core 0, 1 on core 1.
+//     0xD000_0050  FIFO_ST      bit 0 VLD: this core's RX FIFO holds a word. bit 1 RDY: its TX FIFO
+//                               has room. bit 2 WOF: it wrote to a full TX FIFO. bit 3 ROE: it read
+//                               an empty RX FIFO. Writing a 1 to WOF or ROE clears it.
+//     0xD000_0054  FIFO_WR      write: push a word to the other core's RX FIFO (8 deep); when full,
+//                               the word is lost and WOF is set.
+//     0xD000_0058  FIFO_RD      read: pop this core's RX FIFO; when empty, 0, and ROE is set.
+//     0xD000_005C  SPINLOCK_ST  read: bit k set while spinlock k is claimed.
+//     0xD000_0100  SPINLOCK0-31 (every 4 bytes) read: claim the lock, answering 1 << k if it was free
+//                               and 0 if it was already claimed. write: release it.
+//
+// **The FIFO's interrupt is IRQ 1**, raised in a core's own NVIC while its VLD, WOF or ROE is set, and
+// only there; like the console's, it is raised between runs. **Core 1 is launched as on the RP2040**
+// (`multicore_launch_core1_raw`): until it runs, the board plays its boot ROM, echoing every word core
+// 0 pushes back into core 0's RX FIFO and launching core 1 after the sequence 0, 0, 1, VTOR, SP,
+// ENTRY. A word out of place starts the sequence again, a 0 there as the sequence's first word. Core 1 then
+// starts at ENTRY, which must have its Thumb bit (without it core 1 stops at `Stop.Fault`, at ENTRY),
+// with SP and VTOR as sent. Once core 1 runs, the same words are only data in its FIFO.
+//
+// **The cores take turns.** In a round each runs until its clock — instructions retired plus the time
+// skipped asleep — reaches the round's end, `quantum` (1000 by default) past the last one's, at its
+// first taken branch from there; so the two clocks stay within a quantum and a straight run of code
+// of each other, and what one core writes in its turn the other first sees in its next. A core asleep
+// in `WFI` skips to the round's end, or wakes before it on its own SysTick or on an interrupt the other
+// core raised in an earlier turn. Before core 1 is launched, core 0 runs alone a million instructions
+// at a time. The board stops at `Asleep` only when every running core sleeps with nothing that can
+// wake it, and it ends when any core stops: `run_board` answers that core.
 //
 // **The console's input is a channel**, so where it comes from is the caller's: `listen` starts a
 // thread that copies the host's standard input into it a byte at a time, and a test sends its bytes
@@ -25,7 +59,7 @@ module sh.sysl.cortical.virt
 // for input (so a prompt shows before the guest waits), when it exits, and at `flush_console` —
 // unless `capture` asked to keep it, which is what a test reads.
 
-import sh.sysl.cortical.v6m.{Cpu, Stop, IRQ0, RAM_BYTES, could_wake, halt, load32, raise, reset, run_threaded, wake}
+import sh.sysl.cortical.v6m.{Cpu, Stop, IRQ0, NEVER, RAM_BYTES, clear, clock, could_wake, halt, load32, next_wake, raise, reset, run_threaded, wake_by}
 import sh.sysl.elf as elf
 import sysl.buf.{Buf, buf}
 import sysl.threads.{Channel, channel, spawn}
@@ -45,6 +79,28 @@ const ENDED: u32 = 2
 const RX_INTERRUPT: u32 = 1
 const CONSOLE_IRQ: u32 = 0
 
+// The SIO block.
+const CPUID: u32 = 0xD0000000
+const FIFO_ST: u32 = 0xD0000050
+const FIFO_WR: u32 = 0xD0000054
+const FIFO_RD: u32 = 0xD0000058
+const SPINLOCK_ST: u32 = 0xD000005C
+const SPINLOCK0: u32 = 0xD0000100
+const SPINLOCK31: u32 = 0xD000017C
+
+// FIFO_ST bits.
+const VLD: u32 = 1
+const RDY: u32 = 2
+const WOF: u32 = 4
+const ROE: u32 = 8
+
+const FIFO_DEPTH = 8
+const FIFO_IRQ: u32 = 1
+
+// Instructions each core runs in its turn, and the run of core 0 alone.
+const QUANTUM: u64 = 1000
+const ALONE: u64 = 1000000
+
 var typed_slots: [4096]u8
 var typed = channel(typed_slots[..])
 // A byte taken from the channel to answer STATUS, and not yet read through DATA; -1 for none.
@@ -52,6 +108,24 @@ var held: int = -1
 var out: Buf[u8] = buf()
 var capturing = false
 var ctrl: u32 = 0
+
+// Core 1; whether core 0 has launched it; and whether that happened in the turn now ending, so its
+// clock is still to be set to core 0's.
+var second: Cpu
+var launched = false
+var starting = false
+// The boot ROM's place in the launch sequence, 0 to 5, and the VTOR and SP it has taken.
+var step = 0
+var sent: [2]u32
+// Core k's RX FIFO: `fifo_len[k]` words from `fifo_head[k]` round `fifo[k]`; its WOF and ROE.
+var fifo: [2][8]u32
+var fifo_head: [2]int
+var fifo_len: [2]int
+var fifo_errors: [2]u32
+var locks: u32 = 0
+var quantum: u64 = QUANTUM
+// The board's clock: the end of the last round, which every running core has reached.
+var now: u64 = 0
 
 // Ready the console with an empty input, its output going to the host, and its interrupt off.
 open_console()
@@ -167,26 +241,136 @@ image_of(file: []const u8) -> Result[Buf[u8], string]
 
     Ok(image)
 
-// A virtual board with `image` loaded at 0 and its one core reset as an M0+ resets: SP from the
-// vector table's first word, PC from its second.
+// A virtual board with `image` loaded at 0, core 0 reset as an M0+ resets — SP from the vector
+// table's first word, PC from its second — and core 1 waiting in its boot ROM, with the SIO's FIFOs
+// empty, every spinlock free, and the default quantum.
 boot(cpu: *Cpu, image: []const u8)
     reset(cpu, image, 0)
-    cpu.io_read = &console_read
-    cpu.io_write = &console_write
+    cpu.io_read = &board_read
+    cpu.io_write = &board_write
     cpu.r[13] = load32(cpu, 0)
     cpu.pc = load32(cpu, 4) & ~1
 
-// Run the board until its core stops, a million instructions at a time, writing out the console's
-// output and raising its interrupt between them.
-run_board(cpu: *Cpu)
-    while cpu.stop == Stop.Budget
-        interrupt(cpu)
-        if cpu.sleeping then doze(cpu)
-        cpu.limit = cpu.retired + 1000000
-        run_threaded(cpu)
-        flush_console()
+    clear(&second, 0)
+    launched = false
+    starting = false
+    step = 0
+
+    for k in 0..<2
+        fifo_head[k] = 0
+        fifo_len[k] = 0
+        fifo_errors[k] = 0
+
+    locks = 0
+    quantum = QUANTUM
+    now = 0
+
+// Core 1.
+core1() -> *Cpu = &second
+
+// Whether core 1 has been launched.
+running_both() -> bool = launched
+
+// Set the instructions each core runs in its turn.
+set_quantum(n: u64)
+    quantum = n
+
+// Start core 1 at `entry` with `sp` and `vtor`, as the boot ROM does at the end of the launch
+// sequence. An entry without its Thumb bit stops core 1 at `Stop.Fault`, there.
+launch(vtor: u32, sp: u32, entry: u32)
+    clear(&second, entry & ~1)
+    second.io_read = &board_read
+    second.io_write = &board_write
+    second.vtor = vtor
+    second.r[13] = sp
+    launched = true
+    starting = true
+
+    if entry & 1 == 0
+        second.pc = entry
+        halt(&second, Stop.Fault, entry)
+
+// Run the board until a core stops, writing out the console's output and raising the interrupts
+// between runs; answer the core that stopped. Where both stop together, at `Asleep`, it is core 0.
+run_board(cpu: *Cpu) -> *Cpu
+    while round(cpu) do ()
 
     flush_console()
+    if cpu.stop == Stop.Budget then &second else cpu
+
+// One round: core 0's turn and then, once it is launched, core 1's, each to the same clock. Answers
+// whether every core is still running.
+round(cpu: *Cpu) -> bool
+    val until = now + (if launched then quantum else ALONE)
+
+    turn(cpu, until)
+
+    if starting
+        // Core 1 starts at the time core 0 launched it, and the rounds start from there.
+        starting = false
+        now = clock(cpu, cpu.retired)
+        second.slept = now
+        flush_console()
+        return cpu.stop == Stop.Budget && second.stop == Stop.Budget
+
+    if launched && cpu.stop == Stop.Budget then turn(&second, until)
+
+    flush_console()
+
+    if cpu.stop != Stop.Budget || second.stop != Stop.Budget then return false
+
+    now = until
+    if !cpu.sleeping || (launched && !second.sleeping) then return true
+
+    settle(cpu)
+
+// A core's turn: run it until its clock reaches `until`, or it sleeps past it, or it stops.
+private turn(cpu: *Cpu, until: u64)
+    while cpu.stop == Stop.Budget && !starting
+        signal(cpu)
+        if !wake_by(cpu, until) then return
+        if clock(cpu, cpu.retired) >= until then return
+
+        cpu.limit = until - cpu.slept
+        run_threaded(cpu)
+
+// Every running core ended the round asleep. One the other core interrupted in its last turn wakes
+// now; failing that, the board's clock skips to the first SysTick that wakes one; failing that, the
+// board waits for the console's input where its interrupt would wake a core. Otherwise every running
+// core stops at `Asleep`. Answers whether the board runs on.
+private settle(cpu: *Cpu) -> bool
+    if roused(cpu) || (launched && roused(&second)) then return true
+
+    var due = next_wake(cpu)
+
+    if launched
+        val other = next_wake(&second)
+
+        if other < due then due = other
+
+    if due != NEVER
+        now = due
+        return true
+
+    val console_wakes = could_wake(cpu, IRQ0 + CONSOLE_IRQ) || (launched && could_wake(&second, IRQ0 + CONSOLE_IRQ))
+
+    if ctrl & RX_INTERRUPT != 0 && status() == 0 && console_wakes
+        flush_console()
+
+        typed.receive() match
+            Some(b) -> held = int(b)
+            None -> ()
+
+        return true
+
+    halt(cpu, Stop.Asleep, cpu.pc)
+    if launched then halt(&second, Stop.Asleep, second.pc)
+    false
+
+// Whether a sleeping core wakes on an interrupt raised now, its clock where it is.
+private roused(cpu: *Cpu) -> bool
+    signal(cpu)
+    wake_by(cpu, clock(cpu, cpu.retired))
 
 // What `cortical run` says when the board's core has stopped: why, and for a stop the guest did not
 // ask for, where the core stopped and after how many instructions.
@@ -200,22 +384,124 @@ stop_message(cpu: *Cpu) -> string = cpu.stop match
     Asleep -> stopped(cpu, f"a WFI nothing can wake, before 0x${cpu.stop_at}%08x")
     Fault -> stopped(cpu, f"a fault it cannot take, at 0x${cpu.stop_at}%08x")
 
-private stopped(cpu: *Cpu, why: string) -> string = f"the guest stopped at $why (pc 0x${cpu.pc}%08x, ${cpu.retired} instructions)"
+private stopped(cpu: *Cpu, why: string) -> string
+    val core = if cpu == &second then "core 1, " else ""
 
-// Raise the console's IRQ while it is enabled and STATUS is not 0.
-private interrupt(cpu: *Cpu)
+    f"the guest stopped at $why (${core}pc 0x${cpu.pc}%08x, ${cpu.retired} instructions)"
+
+// Raise a core's interrupts: the console's while it is enabled and STATUS is not 0, and the FIFO's
+// while the core's VLD, WOF or ROE is set.
+private signal(cpu: *Cpu)
     if ctrl & RX_INTERRUPT != 0 && status() != 0 then raise(cpu, CONSOLE_IRQ)
 
-// A core asleep with nothing in it to wake it waits for the console's input — a byte, or its end —
-// where the interrupt that raises would wake it. Otherwise the run that follows stops it at `Asleep`.
-private doze(cpu: *Cpu)
-    if wake(cpu) then return
-    if ctrl & RX_INTERRUPT == 0 || status() != 0 || !could_wake(cpu, IRQ0 + CONSOLE_IRQ) then return
+    val k = core_of(cpu)
 
-    flush_console()
+    if fifo_len[k] > 0 || fifo_errors[k] != 0 then raise(cpu, FIFO_IRQ)
 
-    typed.receive() match
-        Some(b) -> held = int(b)
-        None -> ()
+// ---------------------------------------------------------------------------------------------------
+// The SIO.
 
-    interrupt(cpu)
+// The core that made an access: 1 for core 1, 0 for core 0.
+private core_of(cpu: *Cpu) -> int = if cpu == &second then 1 else 0
+
+// The board's half of an access off the RAM: the SIO's, or else the console's.
+board_read(cpu: *Cpu, a: u32, width: u32) -> u32
+    if a >= CPUID && a <= SPINLOCK31 then sio_read(cpu, a) else console_read(cpu, a, width)
+
+board_write(cpu: *Cpu, a: u32, width: u32, x: u32)
+    if a >= CPUID && a <= SPINLOCK31 then sio_write(cpu, a, x) else console_write(cpu, a, width, x)
+
+// Spinlock k's bit, for an address that is one of the spinlocks; 0 for any other.
+private lock_bit(a: u32) -> u32
+    if a < SPINLOCK0 || a > SPINLOCK31 || a & 3 != 0 then return 0
+
+    1 << ((a - SPINLOCK0) >> 2)
+
+sio_read(cpu: *Cpu, a: u32) -> u32
+    val k = core_of(cpu)
+    val bit = lock_bit(a)
+
+    if bit != 0
+        if locks & bit != 0 then return 0
+
+        locks |= bit
+        return bit
+
+    a match
+        CPUID -> u32(k)
+        FIFO_ST -> fifo_status(k)
+        FIFO_WR -> 0
+        FIFO_RD ->
+            if fifo_len[k] == 0
+                fifo_errors[k] |= ROE
+                return 0
+
+            pop(k)
+        SPINLOCK_ST -> locks
+        _ ->
+            halt(cpu, Stop.Unmapped, a)
+            0
+
+sio_write(cpu: *Cpu, a: u32, x: u32)
+    val k = core_of(cpu)
+    val bit = lock_bit(a)
+
+    if bit != 0
+        locks &= ~bit
+        return
+
+    a match
+        FIFO_ST -> fifo_errors[k] &= ~(x & (WOF | ROE))
+        FIFO_WR ->
+            if k == 0 && !launched
+                boot_rom(cpu, x)
+            else if !push(1 - k, x)
+                fifo_errors[k] |= WOF
+        CPUID | FIFO_RD | SPINLOCK_ST -> ()
+        _ -> halt(cpu, Stop.Unmapped, a)
+
+private fifo_status(k: int) -> u32
+    var st = fifo_errors[k]
+
+    if fifo_len[k] > 0 then st |= VLD
+    if (k == 0 && !launched) || fifo_len[1 - k] < FIFO_DEPTH then st |= RDY
+    st
+
+// Push `x` to core k's RX FIFO, answering whether it had room.
+private push(k: int, x: u32) -> bool
+    if fifo_len[k] == FIFO_DEPTH then return false
+
+    fifo[k][(fifo_head[k] + fifo_len[k]) % FIFO_DEPTH] = x
+    fifo_len[k] += 1
+    true
+
+// Pop core k's RX FIFO, which holds a word.
+private pop(k: int) -> u32
+    val x = fifo[k][fifo_head[k]]
+
+    fifo_head[k] = (fifo_head[k] + 1) % FIFO_DEPTH
+    fifo_len[k] -= 1
+    x
+
+// Core 1's boot ROM taking word `w` from core 0: it echoes it, and follows the launch sequence 0, 0,
+// 1, VTOR, SP, ENTRY. Zeros at its start keep the last two; any other word out of place starts it
+// again. VTOR, SP and ENTRY may be any word. The echo of ENTRY is the last, and core 1 starts after it.
+private boot_rom(cpu: *Cpu, w: u32)
+    push(0, w)
+
+    if step < 2
+        step = if w == 0 then step + 1 else 0
+        return
+
+    if step == 2
+        step = if w == 1 then 3 else if w == 0 then 2 else 0
+        return
+
+    if step < 5
+        sent[step - 3] = w
+        step += 1
+        return
+
+    step = 0
+    launch(sent[0], sent[1], w)
+    cpu.limit = 0

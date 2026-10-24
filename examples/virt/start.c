@@ -2,7 +2,8 @@
 // it answers. Code and data are both loaded into RAM where they run, so nothing is copied.
 //
 // A program handles an exception by defining the function its entry names: `svc_handler`,
-// `pendsv_handler`, `systick_handler`, `console_handler` (IRQ 0) and so on. An entry no program
+// `pendsv_handler`, `systick_handler`, `console_handler` (IRQ 0), `sio_handler` (IRQ 1) and so on.
+// Core 1, once launched, shares the table. An entry no program
 // defines is 0, and cortical stops at that exception with a fault on the vector's address.
 
 #include "virt.h"
@@ -17,6 +18,7 @@ void svc_handler(void) __attribute__((weak));
 void pendsv_handler(void) __attribute__((weak));
 void systick_handler(void) __attribute__((weak));
 void console_handler(void) __attribute__((weak));
+void sio_handler(void) __attribute__((weak));
 
 void __attribute__((noreturn)) reset(void) {
     for (unsigned *p = __bss_start; p < __bss_end; p++) *p = 0;
@@ -33,4 +35,5 @@ __attribute__((section(".vectors"), used)) const void *const vectors[48] = {
     [14] = (const void *)pendsv_handler,
     [15] = (const void *)systick_handler,
     [16 + CONSOLE_IRQ] = (const void *)console_handler,
+    [16 + SIO_IRQ] = (const void *)sio_handler,
 };
