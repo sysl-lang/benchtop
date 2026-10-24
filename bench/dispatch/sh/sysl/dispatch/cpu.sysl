@@ -1,0 +1,276 @@
+module sh.sysl.dispatch
+
+// The machine both executors share: the registers, the flags, guest memory behind a page table, and
+// the decoded-instruction array.
+//
+// **Decoding is one record per halfword of guest address.** The instruction at guest address `a` is
+// decoded into `dec[a >> 1]`, so the next instruction is the next record (or the one after, for a
+// 32-bit encoding) and a branch target is an index, not a lookup. A record starts as "not decoded"
+// and is decoded the first time control reaches it.
+//
+// **The flags are kept lazily.** N and Z are both read from `nz`, the last flag-setting result: N is
+// its top bit and Z is whether it is zero. C and V are 0 or 1 each. An instruction that sets flags
+// stores one word for N and Z rather than computing two bits.
+
+// The guest's RAM, from address 0. Code and data share it, as they do on an M0+ running from SRAM.
+const RAM_BYTES: u32 = 256 * 1024
+
+// One page-table entry per 4 KB page of the 4 GB address space. An entry is the host address of the
+// page's first byte, or 0 for a page with no fast path.
+const PAGE_SHIFT: u32 = 12
+const PAGES = 1 << 20
+
+// The handler type: every handler takes the machine, the record it is to execute, and the count of
+// instructions retired so far, and replaces its own frame with the next handler's.
+type Handler = *extern(*Cpu, *Insn, u64) -> unit
+
+// Why `run` came back.
+enum Stop
+    Budget = 0
+    Breakpoint
+    Undefined
+    Unmapped
+
+// A decoded instruction. `h` is its handler for the threaded executor and `op` its case for the
+// `match` executor; the rest are its operands, extracted once. A register number is a `u4`, so
+// indexing the sixteen registers with one needs no bounds check, and the record is 16 bytes.
+struct Insn
+    h: Handler
+    imm: u32
+    op: Op
+    a: u4
+    b: u4
+    c: u4
+
+struct Cpu
+    r: [16]u32
+    nz: u32
+    c: u32
+    v: u32
+    // Where to resume, as a guest address, after `run` comes back.
+    pc: u32
+    // `run` comes back at the first taken branch at or past this many instructions.
+    limit: u64
+    retired: u64
+    stop: Stop
+    stop_at: u32
+    pages: *usize
+    dec: *Insn
+
+var ram: [262144]u8
+var page_table: [1048576]usize
+var decoded: [131072]Insn
+
+// A machine with `image` at address 0, ready to start at `entry`.
+reset(cpu: *Cpu, image: []const u8, entry: u32)
+    for i in 0..<ram.len do ram[i] = 0
+    for i in 0..<image.len do ram[i] = image[i]
+    for i in 0..<page_table.len do page_table[i] = 0
+    for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do page_table[p] = usize(&ram[p << PAGE_SHIFT])
+
+    val blank = Insn(&h_decode, 0, Op.Undecoded, 0, 0, 0)
+
+    for i in 0..<decoded.len do decoded[i] = blank
+
+    for i in 0..<16 do cpu.r[i] = 0
+    cpu.nz = 1
+    cpu.c = 0
+    cpu.v = 0
+    cpu.pc = entry
+    cpu.limit = 0
+    cpu.retired = 0
+    cpu.stop = Stop.Budget
+    cpu.stop_at = 0
+    cpu.pages = &page_table[0]
+    cpu.dec = &decoded[0]
+
+// The record for guest address `a`.
+@inline
+insn_at(cpu: *Cpu, a: u32) -> *Insn = &cpu.dec[a >> 1]
+
+// The guest address of a record.
+@inline
+addr_of(cpu: *Cpu, ip: *Insn) -> u32 = u32(ip - cpu.dec) << 1
+
+// ---------------------------------------------------------------------------------------------------
+// Memory. The fast path is one table load, one test and one host access; everything else (a page
+// with no entry: MMIO, unmapped) is the slow path, which this machine answers by stopping.
+
+@inline
+host(cpu: *Cpu, a: u32) -> usize
+    val page = cpu.pages[a >> PAGE_SHIFT]
+
+    if page == 0 then return 0
+
+    page + (a & 0xFFF)
+
+@inline
+load32(cpu: *Cpu, a: u32) -> u32
+    val h = host(cpu, a)
+
+    if h == 0 then return unmapped(cpu, a)
+
+    val p: *u32 = ptr_cast(h)
+
+    p[0]
+
+@inline
+load16(cpu: *Cpu, a: u32) -> u32
+    val h = host(cpu, a)
+
+    if h == 0 then return unmapped(cpu, a)
+
+    val p: *u16 = ptr_cast(h)
+
+    p[0]
+
+@inline
+load8(cpu: *Cpu, a: u32) -> u32
+    val h = host(cpu, a)
+
+    if h == 0 then return unmapped(cpu, a)
+
+    val p: *u8 = ptr_cast(h)
+
+    p[0]
+
+@inline
+store32(cpu: *Cpu, a: u32, x: u32)
+    val h = host(cpu, a)
+
+    if h == 0
+        unmapped(cpu, a)
+        return
+
+    val p: *u32 = ptr_cast(h)
+
+    p[0] = x
+
+@inline
+store16(cpu: *Cpu, a: u32, x: u32)
+    val h = host(cpu, a)
+
+    if h == 0
+        unmapped(cpu, a)
+        return
+
+    val p: *u16 = ptr_cast(h)
+
+    p[0] = u16(x)
+
+@inline
+store8(cpu: *Cpu, a: u32, x: u32)
+    val h = host(cpu, a)
+
+    if h == 0
+        unmapped(cpu, a)
+        return
+
+    val p: *u8 = ptr_cast(h)
+
+    p[0] = u8(x)
+
+// An access with no fast path. The benchmark's guest makes none, so this records the first and
+// answers 0; the executors notice `stop` at the next branch.
+unmapped(cpu: *Cpu, a: u32) -> u32
+    if cpu.stop != Stop.Unmapped
+        cpu.stop = Stop.Unmapped
+        cpu.stop_at = a
+        cpu.limit = 0
+
+    0
+
+// ---------------------------------------------------------------------------------------------------
+// Flags.
+
+@inline
+set_nz(cpu: *Cpu, res: u32)
+    cpu.nz = res
+
+@inline
+add_flags(cpu: *Cpu, a: u32, b: u32, carry: u32) -> u32
+    val wide = u64(a) + u64(b) + u64(carry)
+    val res = u32(wide)
+
+    cpu.nz = res
+    cpu.c = u32(wide >> 32)
+    cpu.v = ((a ^ res) & (b ^ res)) >> 31
+    res
+
+// `a - b` is `a + ~b + 1`, and `SBC` is `a + ~b + C`; C is "no borrow".
+@inline
+sub_flags(cpu: *Cpu, a: u32, b: u32, carry: u32) -> u32 = add_flags(cpu, a, ~b, carry)
+
+@inline
+flag_n(cpu: *Cpu) -> u32 = cpu.nz >> 31
+
+@inline
+flag_z(cpu: *Cpu) -> bool = cpu.nz == 0
+
+// Condition `cond` (the four-bit field of a `B<cond>`) against the flags.
+@inline
+holds(cpu: *Cpu, cond: u32) -> bool = cond match
+    0 -> cpu.nz == 0
+    1 -> cpu.nz != 0
+    2 -> cpu.c != 0
+    3 -> cpu.c == 0
+    4 -> flag_n(cpu) != 0
+    5 -> flag_n(cpu) == 0
+    6 -> cpu.v != 0
+    7 -> cpu.v == 0
+    8 -> cpu.c != 0 && cpu.nz != 0
+    9 -> cpu.c == 0 || cpu.nz == 0
+    10 -> flag_n(cpu) == cpu.v
+    11 -> flag_n(cpu) != cpu.v
+    12 -> cpu.nz != 0 && flag_n(cpu) == cpu.v
+    13 -> cpu.nz == 0 || flag_n(cpu) != cpu.v
+    _ -> true
+
+// ---------------------------------------------------------------------------------------------------
+// Shifts by a register, as the data-processing forms define them: the bottom byte of the amount, and
+// the carry out of the last bit shifted (unchanged when the amount is 0).
+
+lsl_reg(cpu: *Cpu, x: u32, by: u32) -> u32
+    val n = by & 0xFF
+
+    if n == 0 then return x
+
+    if n < 32
+        cpu.c = (x >> (32 - n)) & 1
+        return x << n
+
+    cpu.c = if n == 32 then x & 1 else 0
+    0
+
+lsr_reg(cpu: *Cpu, x: u32, by: u32) -> u32
+    val n = by & 0xFF
+
+    if n == 0 then return x
+
+    if n < 32
+        cpu.c = (x >> (n - 1)) & 1
+        return x >> n
+
+    cpu.c = if n == 32 then x >> 31 else 0
+    0
+
+asr_reg(cpu: *Cpu, x: u32, by: u32) -> u32
+    val n = by & 0xFF
+
+    if n == 0 then return x
+
+    if n < 32
+        cpu.c = u32(i32(x) >> (n - 1)) & 1
+        return u32(i32(x) >> n)
+
+    cpu.c = x >> 31
+    u32(i32(x) >> 31)
+
+ror_reg(cpu: *Cpu, x: u32, by: u32) -> u32
+    if by & 0xFF == 0 then return x
+
+    val n = by & 31
+    val res = if n == 0 then x else (x >> n) | (x << (32 - n))
+
+    cpu.c = res >> 31
+    res

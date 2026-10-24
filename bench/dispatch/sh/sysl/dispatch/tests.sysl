@@ -1,0 +1,133 @@
+module sh.sysl.dispatch
+@tests
+
+// Both executors over the same code must agree with each other and with the architecture. The guest
+// kernel's answer comes from the same C built for the host, so it is an oracle neither executor
+// wrote; the single-instruction cases are the ARMv6-M ARM's results for the edges of each operation.
+
+val kernel = embed("../../../../guest/kernel.bin")
+
+// The kernel's `run(20)`, as the host computes it from `kernel.c`.
+const KERNEL_20: u32 = 1743194623
+
+type Exec = *extern(*Cpu) -> unit
+
+// Run from 0 until the guest stops, in quanta as the benchmark does.
+run_to_stop(cpu: *Cpu, exec: Exec)
+    while cpu.stop == Stop.Budget
+        cpu.limit = cpu.retired + 1000
+        exec(cpu)
+
+// The kernel with its round count patched to 20, run to its breakpoint.
+kernel_run(cpu: *Cpu, exec: Exec)
+    reset(cpu, kernel, 0)
+    store32(cpu, 0xC, 20)
+    run_to_stop(cpu, exec)
+
+// `code` at 0 followed by a `BKPT`, with r0, r1 and C set first.
+one(cpu: *Cpu, exec: Exec, code: u16, r0: u32, r1: u32, carry: u32)
+    reset(cpu, [], 0)
+    store16(cpu, 0, code)
+    store16(cpu, 2, 0xBE00)
+    cpu.r[0] = r0
+    cpu.r[1] = r1
+    cpu.c = carry
+    run_to_stop(cpu, exec)
+
+struct Want
+    reg: u4
+    value: u32
+    n: u32
+    z: bool
+    c: u32
+    v: u32
+
+// Both executors give `want` for `code`.
+agrees(code: u16, r0: u32, r1: u32, carry: u32, want: Want) -> bool
+    var cpu: Cpu
+
+    for exec in [&run_match, &run_threaded]
+        one(&cpu, exec, code, r0, r1, carry)
+
+        if cpu.stop != Stop.Breakpoint || cpu.retired != 1 then return false
+        if cpu.r[want.reg] != want.value || flag_n(&cpu) != want.n || flag_z(&cpu) != want.z then return false
+        if cpu.c != want.c || cpu.v != want.v then return false
+
+    true
+
+@test("the kernel's answer under the match executor is the host's")
+dsp_kernel_match()
+    var cpu: Cpu
+
+    kernel_run(&cpu, &run_match)
+    assert(cpu.stop == Stop.Breakpoint, "stopped at a breakpoint")
+    assert(cpu.r[0] == KERNEL_20, "r0 is run(20)")
+
+@test("the kernel's answer under the threaded executor is the host's, in as many instructions")
+dsp_kernel_threaded()
+    var a: Cpu
+    var b: Cpu
+
+    kernel_run(&a, &run_match)
+    kernel_run(&b, &run_threaded)
+    assert(b.stop == Stop.Breakpoint, "stopped at a breakpoint")
+    assert(b.r[0] == KERNEL_20, "r0 is run(20)")
+    assert(a.retired == b.retired, "both retired the same count")
+
+@test("the threaded executor stops at the first taken branch past its budget, and resumes there")
+dsp_budget()
+    var a: Cpu
+    var b: Cpu
+
+    reset(&a, kernel, 0)
+    reset(&b, kernel, 0)
+    a.limit = 5000
+    b.limit = 5000
+    run_match(&a)
+    run_threaded(&b)
+    assert(a.stop == Stop.Budget && b.stop == Stop.Budget, "neither finished")
+    assert(a.retired >= 5000 && a.retired == b.retired && a.pc == b.pc, "both stopped at one branch")
+
+@test("ADDS: unsigned carry, signed overflow, and a zero result")
+dsp_adds()
+    assert(agrees(0x1842, 0xFFFFFFFF, 1, 0, Want(2, 0, 0, true, 1, 0)), "carry, zero")
+    assert(agrees(0x1842, 0x7FFFFFFF, 1, 0, Want(2, 0x80000000, 1, false, 0, 1)), "overflow")
+    assert(agrees(0x1842, 0x80000000, 0x80000000, 0, Want(2, 0, 0, true, 1, 1)), "both")
+
+@test("SUBS: C is 'no borrow', and overflow from the negative edge")
+dsp_subs()
+    assert(agrees(0x1A42, 5, 5, 0, Want(2, 0, 0, true, 1, 0)), "equal: no borrow")
+    assert(agrees(0x1A42, 4, 5, 1, Want(2, 0xFFFFFFFF, 1, false, 0, 0)), "borrow")
+    assert(agrees(0x1A42, 0x80000000, 1, 0, Want(2, 0x7FFFFFFF, 0, false, 1, 1)), "overflow")
+
+@test("ADCS and SBCS take the carry in")
+dsp_adcs_sbcs()
+    assert(agrees(0x4148, 0xFFFFFFFF, 0, 1, Want(0, 0, 0, true, 1, 0)), "ADCS carries through")
+    assert(agrees(0x4148, 1, 2, 0, Want(0, 3, 0, false, 0, 0)), "ADCS without carry")
+    assert(agrees(0x4188, 5, 5, 0, Want(0, 0xFFFFFFFF, 1, false, 0, 0)), "SBCS borrows one more")
+    assert(agrees(0x4188, 5, 5, 1, Want(0, 0, 0, true, 1, 0)), "SBCS with carry is SUBS")
+
+@test("shifts by a register: amounts 0, 32 and over 32, and the carry out")
+dsp_shift_reg()
+    assert(agrees(0x4088, 0x80000001, 0, 1, Want(0, 0x80000001, 1, false, 1, 0)), "LSLS by 0 keeps C")
+    assert(agrees(0x4088, 0x80000001, 1, 0, Want(0, 2, 0, false, 1, 0)), "LSLS by 1")
+    assert(agrees(0x4088, 1, 32, 0, Want(0, 0, 0, true, 1, 0)), "LSLS by 32: C is bit 0")
+    assert(agrees(0x4088, 1, 33, 1, Want(0, 0, 0, true, 0, 0)), "LSLS by 33")
+    assert(agrees(0x4088, 1, 0x100, 1, Want(0, 1, 0, false, 1, 0)), "only the bottom byte counts")
+    assert(agrees(0x40C8, 0x80000000, 32, 0, Want(0, 0, 0, true, 1, 0)), "LSRS by 32: C is bit 31")
+    assert(agrees(0x4108, 0x80000000, 40, 0, Want(0, 0xFFFFFFFF, 1, false, 1, 0)), "ASRS past 32")
+    assert(agrees(0x41C8, 0x00000001, 1, 0, Want(0, 0x80000000, 1, false, 1, 0)), "RORS by 1")
+    assert(agrees(0x41C8, 0x80000000, 32, 0, Want(0, 0x80000000, 1, false, 1, 0)), "RORS by 32")
+
+@test("shifts by an immediate: LSL #0 is MOVS, and LSR/ASR #0 mean 32")
+dsp_shift_imm()
+    assert(agrees(0x0008, 0, 0x80000000, 1, Want(0, 0x80000000, 1, false, 1, 0)), "MOVS keeps C")
+    assert(agrees(0x0808, 0, 0x80000000, 0, Want(0, 0, 0, true, 1, 0)), "LSRS #32")
+    assert(agrees(0x1008, 0, 0x80000000, 0, Want(0, 0xFFFFFFFF, 1, false, 1, 0)), "ASRS #32")
+
+@test("byte reversals and sign extension")
+dsp_rev()
+    assert(agrees(0xBA08, 0, 0x11223344, 0, Want(0, 0x44332211, 0, false, 0, 0)), "REV")
+    assert(agrees(0xBA48, 0, 0x11223344, 0, Want(0, 0x22114433, 0, false, 0, 0)), "REV16")
+    assert(agrees(0xBAC8, 0, 0x000080FF, 0, Want(0, 0xFFFFFF80, 0, false, 0, 0)), "REVSH")
+    assert(agrees(0xB248, 0, 0x00000080, 0, Want(0, 0xFFFFFF80, 0, false, 0, 0)), "SXTB")

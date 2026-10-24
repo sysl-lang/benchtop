@@ -326,8 +326,15 @@ loop
   - Each decoded op carries its handler's address. Each handler ends with `become next.handler(…)`,
     sysl's guaranteed tail call (LLVM `musttail`), the way `sysl-lang/forth`'s direct-threaded inner
     interpreter does (`forth/README.md` § "Direct threading through guaranteed tail calls").
-  - The core's registers ride in parameters across the chain.
+  - The machine, the record pointer and the retired count ride in parameters across the chain.
   - A `match` over `Op` is the reference implementation the chain is checked against.
+  - **Measured** (`bench/`, ARMv6-M, M5 Pro, sysl 0.5.4): the chain runs at ~1365 MIPS and the
+    `match` loop at ~1195 MIPS over the same records and semantics, so the chain is the executor.
+    The records are 16 bytes; register numbers are `u4`, so indexing the sixteen registers needs no
+    bounds check (with `u8` fields the chain ran at ~1180 MIPS).
+  - **One record per halfword of guest address** is the spike's decode cache: the next instruction
+    is the next record and a direct branch target is an index, so a branch costs no lookup. Whether
+    blocks (below) buy anything over it is measured once interrupts and the MPU exist.
 - **A block** is a straight run of decoded instructions ending at a branch, an exception return, a
   write to PC, an instruction that changes interrupt masking (`CPSIE`, `MSR BASEPRI`), an `SVC`, a
   `WFI`/`WFE`, a barrier, or 64 instructions. Interrupts are taken only between blocks, which is legal
@@ -389,6 +396,11 @@ sysl compiles through LLVM, so a careful interpreter in sysl should run within a
 same interpreter written in C. The comparison points are predecoded, switch-dispatched ARM
 interpreters on a current Apple P-core, which reach 100–300 million guest instructions per second
 before any JIT. Against that:
+
+**The first measurement beat this table's estimates by about ten.** The `become` chain in `bench/`
+runs an ARMv6-M workload at ~1365 MIPS on one M5 Pro P-core, with the page-table memory path
+and lazy N/Z flags but no interrupts, MPU or IT blocks yet. The estimates below are kept as the
+floor to defend; the benchmark after milestone 1 replaces them with Thumb-2 figures.
 
 | stage | per core | M7 (as a share of 400 MHz × ~1.3 IPC) | M4 (200 MHz × ~0.9 IPC) |
 |---|---|---|---|
