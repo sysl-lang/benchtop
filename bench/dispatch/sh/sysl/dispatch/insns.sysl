@@ -1,0 +1,441 @@
+module sh.sysl.dispatch
+@tests
+
+// One instruction at a time, against the ARMv6-M Architecture Reference Manual's description of
+// each: the result, all four flags (including the ones an instruction must leave alone), memory, and
+// the stack pointer. Every case runs under both executors, which must also agree with each other on
+// every register, flag, count and memory word, so a case is a check on the decoder, the semantics
+// and both ways of dispatching at once.
+//
+// Flags are written as a nibble, NZCV. N and Z cannot both be set by any result, so a starting state
+// never has both.
+
+// The window of guest memory compared between the executors: data at 0x1000, the stack below 0x2000
+// and the SP-relative offsets above it.
+const LOW: u32 = 0x1000
+const HIGH: u32 = 0x2400
+
+// Start with the flags `nzcv`.
+set_flags(cpu: *Cpu, nzcv: u32)
+    cpu.nz = if nzcv & 4 != 0 then 0 else if nzcv & 8 != 0 then 0x80000000 else 1
+    cpu.c = (nzcv >> 1) & 1
+    // An addition of two non-negative operands that came out negative: V set.
+    cpu.va = 0
+    cpu.vb = 0
+    cpu.vr = (nzcv & 1) << 31
+
+flags(cpu: *Cpu) -> u32
+    val z: u32 = if flag_z(cpu) then 4 else 0
+
+    (flag_n(cpu) << 3) | z | (cpu.c << 1) | flag_v(cpu)
+
+// `code` at 0 with a `BKPT` after it; r0 upward from `regs`, SP at 0x2000, the flags `nzcv`, and each
+// `[address, word]` of `mem` stored first.
+prepare(cpu: *Cpu, code: []const u16, regs: []const u32, nzcv: u32, mem: [][2]u32)
+    reset(cpu, [], 0)
+    for i in 0..<code.len do store16(cpu, u32(i) * 2, code[i])
+    store16(cpu, u32(code.len) * 2, 0xBE00)
+    cpu.r[13] = 0x2000
+    for i in 0..<regs.len do cpu.r[i] = regs[i]
+    set_flags(cpu, nzcv)
+    for m in mem do store32(cpu, m[0], m[1])
+
+finish(cpu: *Cpu, exec: Exec)
+    while cpu.stop == Stop.Budget && cpu.retired < 1000000
+        cpu.limit = cpu.retired + 1000
+        exec(cpu)
+
+// Run the case under both executors, one after the other since they share guest memory, require
+// them to agree on everything, and answer the threaded machine, whose memory is still in place.
+execute(code: []const u16, regs: []const u32, nzcv: u32, mem: [][2]u32) -> Cpu
+    var a: Cpu
+    var b: Cpu
+    var words: [(HIGH - LOW) / 4]u32
+
+    prepare(&a, code, regs, nzcv, mem)
+    finish(&a, &run_match)
+    for i in 0..<words.len do words[i] = load32(&a, LOW + u32(i) * 4)
+
+    prepare(&b, code, regs, nzcv, mem)
+    finish(&b, &run_threaded)
+
+    for i in 0..<16 do assert(a.r[i] == b.r[i], s"the executors agree on r$i")
+    assert(flags(&a) == flags(&b), "the executors agree on the flags")
+    assert(a.stop == b.stop && a.stop_at == b.stop_at && a.retired == b.retired, "and on the stop")
+    for i in 0..<words.len do assert(words[i] == load32(&b, LOW + u32(i) * 4), "and on memory")
+
+    b
+
+// The one-instruction case gives `value` in `reg` and the flags `want`, at the breakpoint after it.
+gives(code: []const u16, regs: []const u32, nzcv: u32, reg: u4, value: u32, want: u32) -> bool
+    var c = execute(code, regs, nzcv, [])
+
+    c.stop == Stop.Breakpoint && c.retired == 1 && c.r[reg] == value && flags(&c) == want
+
+// ---------------------------------------------------------------------------------------------------
+// Arithmetic: every flag, at the edges where each one changes.
+
+@test("ADDS and SUBS with a 3-bit immediate")
+ins_add_sub_imm3()
+    // adds r0, r1, #7
+    assert(gives([0x1DC8], [0, 0xFFFFFFF9], 0, 0, 0, 0b0110), "ADDS: carry out to zero")
+    assert(gives([0x1DC8], [0, 0x7FFFFFFA], 0, 0, 0x80000001, 0b1001), "ADDS: signed overflow")
+    assert(gives([0x1DC8], [0, 1], 0b1011, 0, 8, 0b0000), "ADDS: clears what it does not set")
+    // subs r0, r1, #7
+    assert(gives([0x1FC8], [0, 7], 0, 0, 0, 0b0110), "SUBS: equal is zero, no borrow")
+    assert(gives([0x1FC8], [0, 0], 0, 0, 0xFFFFFFF9, 0b1000), "SUBS: borrow clears C")
+    assert(gives([0x1FC8], [0, 0x80000006], 0, 0, 0x7FFFFFFF, 0b0011), "SUBS: overflow from the negative edge")
+
+@test("ADDS, SUBS, MOVS and CMP with an 8-bit immediate")
+ins_imm8()
+    // adds r0, #255
+    assert(gives([0x30FF], [0xFFFFFF01], 0, 0, 0, 0b0110), "ADDS: carry out to zero")
+    assert(gives([0x30FF], [0x7FFFFF01], 0, 0, 0x80000000, 0b1001), "ADDS: overflow")
+    // subs r0, #255
+    assert(gives([0x38FF], [255], 0, 0, 0, 0b0110), "SUBS: to zero")
+    assert(gives([0x38FF], [254], 0, 0, 0xFFFFFFFF, 0b1000), "SUBS: borrow")
+    // movs r0, #0 and #255: N and Z only, C and V kept
+    assert(gives([0x2000], [5], 0b0011, 0, 0, 0b0111), "MOVS #0 keeps C and V")
+    assert(gives([0x20FF], [5], 0b1011, 0, 255, 0b0011), "MOVS #255 clears N")
+    // cmp r0, #255: flags only
+    assert(gives([0x28FF], [255], 0, 0, 255, 0b0110), "CMP: equal")
+    assert(gives([0x28FF], [0], 0, 0, 0, 0b1000), "CMP: below")
+    assert(gives([0x28FF], [0x80000000], 0, 0, 0x80000000, 0b0011), "CMP: overflow")
+
+@test("CMP and CMN on registers, low and high")
+ins_cmp_cmn()
+    // cmp r0, r1
+    assert(gives([0x4288], [1, 2], 0, 0, 1, 0b1000), "CMP: 1 - 2 borrows")
+    assert(gives([0x4288], [0x80000000, 1], 0, 0, 0x80000000, 0b0011), "CMP: overflow")
+    assert(gives([0x4288], [0xFFFFFFFF, 0xFFFFFFFF], 0, 1, 0xFFFFFFFF, 0b0110), "CMP: equal")
+    // cmn r0, r1
+    assert(gives([0x42C8], [0xFFFFFFFF, 1], 0, 0, 0xFFFFFFFF, 0b0110), "CMN: carry out to zero")
+    assert(gives([0x42C8], [0x7FFFFFFF, 1], 0, 0, 0x7FFFFFFF, 0b1001), "CMN: overflow")
+    assert(gives([0x42C8], [0x80000000, 0x80000000], 0, 0, 0x80000000, 0b0111), "CMN: both")
+    // cmp r8, r0
+    assert(gives([0x4580], [5, 0, 0, 0, 0, 0, 0, 0, 5], 0, 8, 5, 0b0110), "CMP r8: equal")
+    assert(gives([0x4580], [6, 0, 0, 0, 0, 0, 0, 0, 5], 0, 8, 5, 0b1000), "CMP r8: below")
+
+@test("NEGS: zero has no borrow, and the most negative number overflows")
+ins_negs()
+    // negs r0, r1
+    assert(gives([0x4248], [9, 0], 0, 0, 0, 0b0110), "0")
+    assert(gives([0x4248], [9, 1], 0, 0, 0xFFFFFFFF, 0b1000), "1")
+    assert(gives([0x4248], [9, 0x80000000], 0, 0, 0x80000000, 0b1001), "0x80000000")
+    assert(gives([0x4248], [9, 0xFFFFFFFF], 0, 0, 1, 0b0000), "-1")
+
+@test("ADCS and SBCS at the overflow edges")
+ins_adc_sbc_overflow()
+    // adcs r0, r1: the carry in tips 0x7FFFFFFF over
+    assert(gives([0x4148], [0x7FFFFFFF, 0], 0b0010, 0, 0x80000000, 0b1001), "ADCS")
+    // sbcs r0, r1: no carry in is a borrow of one
+    assert(gives([0x4188], [0x80000000, 0], 0, 0, 0x7FFFFFFF, 0b0011), "SBCS")
+    assert(gives([0x4188], [0, 0], 0, 0, 0xFFFFFFFF, 0b1000), "SBCS 0 - 0 - 1")
+
+@test("MULS: the low word, N and Z from it, C and V kept")
+ins_muls()
+    // muls r0, r1, r0
+    assert(gives([0x4348], [7, 6], 0b0011, 0, 42, 0b0011), "7 * 6")
+    assert(gives([0x4348], [0x10000, 0x10000], 0b0011, 0, 0, 0b0111), "wraps to zero")
+    assert(gives([0x4348], [0xFFFFFFFF, 3], 0b0000, 0, 0xFFFFFFFD, 0b1000), "-1 * 3")
+    assert(gives([0x4348], [0x80000001, 0x80000001], 0b0010, 0, 1, 0b0010), "the high word is dropped")
+
+// ---------------------------------------------------------------------------------------------------
+// Logical: N and Z from the result; C and V are never touched.
+
+@test("ANDS, EORS, ORRS, BICS, MVNS and TST keep C and V")
+ins_logical()
+    // ands r0, r1
+    assert(gives([0x4008], [0xF0F0F0F0, 0x0FF00FF0], 0b0011, 0, 0x00F000F0, 0b0011), "ANDS")
+    assert(gives([0x4008], [1, 2], 0b0011, 0, 0, 0b0111), "ANDS to zero")
+    assert(gives([0x4008], [0x80000000, 0x80000001], 0, 0, 0x80000000, 0b1000), "ANDS negative")
+    // eors r0, r1
+    assert(gives([0x4048], [0xDEADBEEF, 0xDEADBEEF], 0b0011, 0, 0, 0b0111), "EORS to zero")
+    assert(gives([0x4048], [0x80000000, 0x00000001], 0b0010, 0, 0x80000001, 0b1010), "EORS negative")
+    // orrs r0, r1
+    assert(gives([0x4308], [0, 0], 0b0001, 0, 0, 0b0101), "ORRS zero")
+    assert(gives([0x4308], [0x80000000, 1], 0b0011, 0, 0x80000001, 0b1011), "ORRS")
+    // bics r0, r1
+    assert(gives([0x4388], [0xFFFFFFFF, 0xFFFFFFFF], 0b0011, 0, 0, 0b0111), "BICS everything")
+    assert(gives([0x4388], [0xFFFFFFFF, 0x7FFFFFFF], 0, 0, 0x80000000, 0b1000), "BICS all but the top")
+    // mvns r0, r1
+    assert(gives([0x43C8], [5, 0xFFFFFFFF], 0b0011, 0, 0, 0b0111), "MVNS to zero")
+    assert(gives([0x43C8], [5, 0], 0b0010, 0, 0xFFFFFFFF, 0b1010), "MVNS of zero")
+    // tst r0, r1: r0 unchanged
+    assert(gives([0x4208], [1, 2], 0b0011, 0, 1, 0b0111), "TST: no bits in common")
+    assert(gives([0x4208], [0x80000000, 0x80000000], 0b0001, 0, 0x80000000, 0b1001), "TST: the top bit")
+
+// ---------------------------------------------------------------------------------------------------
+// Shifts by an immediate: C is the last bit shifted out, V is kept.
+
+@test("LSLS, LSRS and ASRS by 1 and by 31")
+ins_shift_imm()
+    // lsls r0, r1, #1 and #31
+    assert(gives([0x0048], [0, 0x80000001], 0b0001, 0, 2, 0b0011), "LSLS #1 shifts the top bit into C")
+    assert(gives([0x07C8], [0, 3], 0b0001, 0, 0x80000000, 0b1011), "LSLS #31")
+    assert(gives([0x07C8], [0, 2], 0b0000, 0, 0, 0b0110), "LSLS #31 to zero, C from bit 1")
+    // lsrs r0, r1, #1 and #31
+    assert(gives([0x0848], [0, 3], 0b0001, 0, 1, 0b0011), "LSRS #1")
+    assert(gives([0x0FC8], [0, 0x80000000], 0b0011, 0, 1, 0b0001), "LSRS #31, C from bit 30")
+    assert(gives([0x0FC8], [0, 0x40000000], 0b0000, 0, 0, 0b0110), "LSRS #31 to zero")
+    // asrs r0, r1, #1 and #31
+    assert(gives([0x1048], [0, 0x80000001], 0b0001, 0, 0xC0000000, 0b1011), "ASRS #1 keeps the sign")
+    assert(gives([0x17C8], [0, 0x40000000], 0b0000, 0, 0, 0b0110), "ASRS #31 of a positive")
+    assert(gives([0x17C8], [0, 0x80000000], 0b0011, 0, 0xFFFFFFFF, 0b1001), "ASRS #31 of a negative")
+
+// ---------------------------------------------------------------------------------------------------
+// No flags at all.
+
+@test("SXTH, SXTB, UXTH, UXTB and the reversals leave every flag alone")
+ins_extend()
+    // sxth r0, r1
+    assert(gives([0xB208], [0, 0x12348000], 0b1011, 0, 0xFFFF8000, 0b1011), "SXTH negative")
+    assert(gives([0xB208], [0, 0xFFFF7FFF], 0b0100, 0, 0x7FFF, 0b0100), "SXTH positive")
+    // sxtb r0, r1
+    assert(gives([0xB248], [0, 0x1234567F], 0b0000, 0, 0x7F, 0b0000), "SXTB positive")
+    assert(gives([0xB248], [0, 0x12345680], 0b0110, 0, 0xFFFFFF80, 0b0110), "SXTB negative")
+    // uxth r0, r1 and uxtb r0, r1
+    assert(gives([0xB288], [0, 0xFFFF8001], 0b1001, 0, 0x8001, 0b1001), "UXTH")
+    assert(gives([0xB2C8], [0, 0xFFFFFF80], 0b0010, 0, 0x80, 0b0010), "UXTB")
+    // rev, rev16, revsh r0, r1
+    assert(gives([0xBA08], [0, 0x11223344], 0b0111, 0, 0x44332211, 0b0111), "REV")
+    assert(gives([0xBA48], [0, 0x11223344], 0b1010, 0, 0x22114433, 0b1010), "REV16")
+    assert(gives([0xBAC8], [0, 0x0000FF7F], 0b0001, 0, 0x7FFF, 0b0001), "REVSH positive")
+
+@test("ADD and MOV on high registers, and CMP's partner forms, leave every flag alone")
+ins_high()
+    // add r8, r0 wraps
+    assert(gives([0x4480], [5, 0, 0, 0, 0, 0, 0, 0, 0xFFFFFFFE], 0b1011, 8, 3, 0b1011), "ADD r8, r0")
+    // add r0, r9
+    assert(gives([0x4448], [1, 0, 0, 0, 0, 0, 0, 0, 0, 2], 0b0110, 0, 3, 0b0110), "ADD r0, r9")
+    // add sp, r0
+    assert(gives([0x4485], [0x10], 0, 13, 0x2010, 0), "ADD sp, r0")
+    // mov r8, r1 and mov r0, r8
+    assert(gives([0x4688], [0, 7], 0b1001, 8, 7, 0b1001), "MOV r8, r1")
+    assert(gives([0x4640], [0, 0, 0, 0, 0, 0, 0, 0, 9], 0b0100, 0, 9, 0b0100), "MOV r0, r8")
+    // mov sp, r0
+    assert(gives([0x4685], [0x1800], 0, 13, 0x1800, 0), "MOV sp, r0")
+
+@test("the PC read as an operand is the instruction's address plus 4")
+ins_pc_operand()
+    // add r0, pc at 0: r0 + 4
+    assert(gives([0x4478], [1], 0b0011, 0, 5, 0b0011), "ADD r0, pc")
+
+    // nop; mov r0, pc at 2: 6
+    var c = execute([0xBF00, 0x4678], [], 0, [])
+
+    assert(c.r[0] == 6 && c.retired == 2, "MOV r0, pc")
+
+@test("SP-relative arithmetic, ADR and LDR (literal), at both alignments of the PC")
+ins_pc_sp_relative()
+    // add r0, sp, #8 and #1020
+    assert(gives([0xA802], [], 0, 0, 0x2008, 0), "ADD r0, sp, #8")
+    assert(gives([0xA8FF], [], 0, 0, 0x23FC, 0), "ADD r0, sp, #1020")
+    // add sp, #16 / #508 and sub sp, #16 / #508
+    assert(gives([0xB004], [], 0, 13, 0x2010, 0), "ADD sp, #16")
+    assert(gives([0xB07F], [], 0, 13, 0x21FC, 0), "ADD sp, #508")
+    assert(gives([0xB084], [], 0, 13, 0x1FF0, 0), "SUB sp, #16")
+    assert(gives([0xB0FF], [], 0, 13, 0x1E04, 0), "SUB sp, #508")
+
+    // adr r0, #8 at 0 and at 2: Align(PC + 4, 4) + 8 is 12 from both
+    assert(gives([0xA002], [], 0, 0, 12, 0), "ADR at a word boundary")
+
+    var c = execute([0xBF00, 0xA002], [], 0, [])
+
+    assert(c.r[0] == 12, "ADR at a halfword boundary")
+
+    // ldr r0, [pc, #4] at 0 and at 2 both read the word at 8
+    c = execute([0x4801, 0xBE00, 0xBE00, 0xBE00, 0x5678, 0x1234], [], 0, [])
+    assert(c.r[0] == 0x12345678 && c.retired == 1, "LDR (literal) at a word boundary")
+    c = execute([0xBF00, 0x4801, 0xBE00, 0xBE00, 0x5678, 0x1234], [], 0, [])
+    assert(c.r[0] == 0x12345678 && c.retired == 2, "LDR (literal) at a halfword boundary")
+
+// ---------------------------------------------------------------------------------------------------
+// Loads and stores.
+
+// The one-instruction case loads `value` into r0, from r1 = 0x1000 and r2 = `offset`, with the
+// word `word` at 0x1004.
+loads(code: u16, offset: u32, word: u32, value: u32) -> bool
+    var c = execute([code], [0, 0x1000, offset], 0b1011, [[0x1004, word]])
+
+    c.stop == Stop.Breakpoint && c.r[0] == value && flags(&c) == 0b1011
+
+// The one-instruction case stores r0 = 0xAABBCCDD at r1 = 0x1000 plus r2 = `offset`, over the word
+// 0x11223344 at 0x1004, which then reads `word`.
+stores(code: u16, offset: u32, word: u32) -> bool
+    var c = execute([code], [0xAABBCCDD, 0x1000, offset], 0, [[0x1004, 0x11223344]])
+
+    c.stop == Stop.Breakpoint && load32(&c, 0x1004) == word && c.r[0] == 0xAABBCCDD
+
+@test("loads with a register offset: widths, sign extension and each byte lane")
+ins_load_reg()
+    // ldr, ldrh, ldrsh, ldrb, ldrsb r0, [r1, r2]
+    assert(loads(0x5888, 4, 0xF1F28384, 0xF1F28384), "LDR")
+    assert(loads(0x5A88, 4, 0xF1F28384, 0x8384), "LDRH low half")
+    assert(loads(0x5A88, 6, 0xF1F28384, 0xF1F2), "LDRH high half")
+    assert(loads(0x5E88, 4, 0xF1F28384, 0xFFFF8384), "LDRSH negative")
+    assert(loads(0x5E88, 6, 0x01027F03, 0x0102), "LDRSH positive")
+    assert(loads(0x5C88, 4, 0xF1F28384, 0x84), "LDRB lane 0")
+    assert(loads(0x5C88, 7, 0xF1F28384, 0xF1), "LDRB lane 3")
+    assert(loads(0x5688, 4, 0xF1F28384, 0xFFFFFF84), "LDRSB negative")
+    assert(loads(0x5688, 5, 0x01027F03, 0x7F), "LDRSB positive")
+
+@test("stores with a register offset write only their own bytes")
+ins_store_reg()
+    // str, strh, strb r0, [r1, r2]
+    assert(stores(0x5088, 4, 0xAABBCCDD), "STR")
+    assert(stores(0x5288, 4, 0x1122CCDD), "STRH low half")
+    assert(stores(0x5288, 6, 0xCCDD3344), "STRH high half")
+    assert(stores(0x5488, 4, 0x112233DD), "STRB lane 0")
+    assert(stores(0x5488, 5, 0x1122DD44), "STRB lane 1")
+    assert(stores(0x5488, 7, 0xDD223344), "STRB lane 3")
+
+@test("loads and stores with an immediate offset, scaled by the width, to the largest offset")
+ins_imm_offset()
+    var c = execute([0x6848], [0, 0x1000], 0, [[0x1004, 0xCAFEF00D]])
+
+    assert(c.r[0] == 0xCAFEF00D, "LDR r0, [r1, #4]")
+    c = execute([0x6FC8], [0, 0x1000], 0, [[0x107C, 0x600DF00D]])
+    assert(c.r[0] == 0x600DF00D, "LDR r0, [r1, #124]")
+    c = execute([0x6048], [0x12345678, 0x1000], 0, [])
+    assert(load32(&c, 0x1004) == 0x12345678, "STR r0, [r1, #4]")
+    c = execute([0x7848], [0, 0x1000], 0, [[0x1000, 0x44332211]])
+    assert(c.r[0] == 0x22, "LDRB r0, [r1, #1]")
+    c = execute([0x7FC8], [0, 0x1000], 0, [[0x101C, 0x99887766]])
+    assert(c.r[0] == 0x99, "LDRB r0, [r1, #31]")
+    c = execute([0x7048], [0xFFFFFFAB, 0x1000], 0, [[0x1000, 0x44332211]])
+    assert(load32(&c, 0x1000) == 0x4433AB11, "STRB r0, [r1, #1]")
+    c = execute([0x8848], [0, 0x1000], 0, [[0x1000, 0x8899AABB]])
+    assert(c.r[0] == 0x8899, "LDRH r0, [r1, #2]")
+    c = execute([0x8FC8], [0, 0x1000], 0, [[0x103C, 0x5566EEFF]])
+    assert(c.r[0] == 0x5566, "LDRH r0, [r1, #62]")
+    c = execute([0x8048], [0xFFFF1234, 0x1000], 0, [[0x1000, 0x8899AABB]])
+    assert(load32(&c, 0x1000) == 0x1234AABB, "STRH r0, [r1, #2]")
+    // str r0, [sp, #8]; ldr r1, [sp, #1020]
+    c = execute([0x9002], [0x0BADCAFE], 0, [])
+    assert(load32(&c, 0x2008) == 0x0BADCAFE, "STR r0, [sp, #8]")
+    c = execute([0x99FF], [], 0, [[0x23FC, 0x5EED5EED]])
+    assert(c.r[1] == 0x5EED5EED, "LDR r1, [sp, #1020]")
+
+@test("PUSH and POP: the lowest register at the lowest address, and SP moved by the count")
+ins_push_pop()
+    // push {r0, r4, lr}
+    var regs: [15]u32 = [0; 15]
+
+    regs[0] = 1
+    regs[4] = 4
+    regs[13] = 0x2000
+    regs[14] = 0xE
+
+    var c = execute([0xB511], regs, 0, [])
+
+    assert(c.r[13] == 0x1FF4, "SP down by three words")
+    assert(load32(&c, 0x1FF4) == 1 && load32(&c, 0x1FF8) == 4 && load32(&c, 0x1FFC) == 0xE, "in order")
+
+    // pop {r1, r2}
+    c = execute([0xBC06], [], 0, [[0x2000, 0xA], [0x2004, 0xB]])
+    assert(c.r[1] == 0xA && c.r[2] == 0xB && c.r[13] == 0x2008, "POP {r1, r2}")
+
+@test("STM and LDM: writeback, and a base in an LDM's list is loaded rather than written back")
+ins_stm_ldm()
+    // stm r0!, {r1, r2}
+    var c = execute([0xC006], [0x1000, 0xA, 0xB], 0, [])
+
+    assert(load32(&c, 0x1000) == 0xA && load32(&c, 0x1004) == 0xB && c.r[0] == 0x1008, "STM writes back")
+    // stm r0!, {r0, r1}: the base is the lowest, so its original value is stored
+    c = execute([0xC003], [0x1000, 5], 0, [])
+    assert(load32(&c, 0x1000) == 0x1000 && load32(&c, 0x1004) == 5 && c.r[0] == 0x1008, "STM base lowest")
+    // ldm r0!, {r1, r2}
+    c = execute([0xC806], [0x1000], 0, [[0x1000, 0x11], [0x1004, 0x22]])
+    assert(c.r[1] == 0x11 && c.r[2] == 0x22 && c.r[0] == 0x1008, "LDM writes back")
+    // ldm r0, {r0, r1}
+    c = execute([0xC803], [0x1000], 0, [[0x1000, 0x55], [0x1004, 0x66]])
+    assert(c.r[0] == 0x55 && c.r[1] == 0x66, "LDM with the base in the list")
+
+// ---------------------------------------------------------------------------------------------------
+// Control flow.
+
+@test("B, BL forward and backward, BX, BLX, MOV pc and POP {pc}")
+ins_branches()
+    // 0: b 4; 2: movs r0, #1; 4: movs r1, #2
+    var c = execute([0xE000, 0x2001, 0x2102], [], 0, [])
+
+    assert(c.r[0] == 0 && c.r[1] == 2 && c.retired == 2, "B forward")
+
+    // 0: bl 8; 4: bkpt; 6: bkpt; 8: movs r0, #7
+    c = execute([0xF000, 0xF802, 0xBE00, 0xBE00, 0x2007], [], 0, [])
+    assert(c.r[0] == 7 && c.r[14] == 5 && c.retired == 2, "BL forward sets LR to the next instruction, Thumb")
+
+    // 0: adds r0, #1; 2: cmp r0, #2; 4: beq 10; 6: bl 0; 10: bkpt
+    c = execute([0x3001, 0x2802, 0xD001, 0xF7FF, 0xFFFB], [], 0, [])
+    assert(c.r[0] == 2 && c.r[14] == 11 && c.retired == 7, "BL backward")
+
+    // 0: bx r1 (r1 = 9); 2: movs r0, #1; 4: bkpt; 6: bkpt; 8: movs r0, #2
+    c = execute([0x4708, 0x2001, 0xBE00, 0xBE00, 0x2002], [0, 9], 0, [])
+    assert(c.r[0] == 2 && c.retired == 2, "BX")
+
+    // 0: blx r1
+    c = execute([0x4788, 0x2001, 0xBE00, 0xBE00, 0x2002], [0, 9], 0, [])
+    assert(c.r[0] == 2 && c.r[14] == 3, "BLX sets LR")
+
+    // 0: mov pc, r1 (r1 = 8)
+    c = execute([0x468F, 0x2001, 0xBE00, 0xBE00, 0x2002], [0, 8], 0, [])
+    assert(c.r[0] == 2 && c.retired == 2, "MOV pc, r1")
+
+    // 0: pop {r0, pc}; 2: movs r1, #1; 4: bkpt; 6: movs r2, #2
+    c = execute([0xBD01, 0x2101, 0xBE00, 0x2202], [], 0, [[0x2000, 0x77], [0x2004, 7]])
+    assert(c.r[0] == 0x77 && c.r[1] == 0 && c.r[2] == 2 && c.r[13] == 0x2008, "POP {r0, pc}")
+
+// Whether `cond` holds for the flags `nzcv`, as the architecture's table defines it.
+condition_holds(cond: u32, nzcv: u32) -> bool
+    val n = (nzcv >> 3) & 1 == 1
+    val z = (nzcv >> 2) & 1 == 1
+    val c = (nzcv >> 1) & 1 == 1
+    val v = nzcv & 1 == 1
+
+    cond match
+        0 -> z
+        1 -> !z
+        2 -> c
+        3 -> !c
+        4 -> n
+        5 -> !n
+        6 -> v
+        7 -> !v
+        8 -> c && !z
+        9 -> !c || z
+        10 -> n == v
+        11 -> n != v
+        12 -> !z && n == v
+        _ -> z || n != v
+
+@test("every conditional branch on its own, against every reachable flag state")
+ins_conditions()
+    for cond in 0u32..<14
+        for nzcv in 0u32..<16
+            if nzcv & 0b1100 == 0b1100 then continue
+
+            // 0: b<cond> 4; 2: mov r2, r8 (r8 = 1, and no flags); 4: bkpt
+            var c = execute([u16(0xD000 | (cond << 8)), 0x4642], [0, 0, 0, 0, 0, 0, 0, 0, 1], nzcv, [])
+
+            if condition_holds(cond, nzcv)
+                assert(c.r[2] == 0 && c.retired == 1, s"condition $cond taken on flags $nzcv")
+            else
+                assert(c.r[2] == 1 && c.retired == 2, s"condition $cond not taken on flags $nzcv")
+
+            assert(flags(&c) == nzcv, s"condition $cond leaves the flags")
+
+@test("hints, barriers and CPS retire and do nothing; BKPT and an undefined encoding stop where they are")
+ins_system()
+    // nop; yield; cpsid i; dsb; dmb; isb; movs r0, #1
+    var c = execute([0xBF00, 0xBF10, 0xB672, 0xF3BF, 0x8F4F, 0xF3BF, 0x8F5F, 0xF3BF, 0x8F6F, 0x2001], [], 0b1001, [])
+
+    assert(c.r[0] == 1 && c.retired == 7 && c.stop_at == 20, "seven retired, the breakpoint at 20")
+
+    // movs r0, #1; udf
+    c = execute([0x2001, 0xDE00], [], 0, [])
+    assert(c.stop == Stop.Undefined && c.stop_at == 2 && c.retired == 1 && c.pc == 2, "UDF")
+
+    // a 32-bit encoding this core has no meaning for
+    c = execute([0xF000, 0x0000], [], 0, [])
+    assert(c.stop == Stop.Undefined && c.stop_at == 0 && c.retired == 0, "undefined 32-bit")
