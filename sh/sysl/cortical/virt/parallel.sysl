@@ -32,7 +32,7 @@ module sh.sysl.cortical.virt
 
 import sh.sysl.cortical.v6m.{Cpu, Stop, IRQ0, NEVER, clock, could_wake, cut, halt, next_wake, pair, poke, refresh, run_threaded, set_limit, take_incoming, unpair, wake_by}
 import sysl.sync.*
-import sysl.threads.{Condvar, Mutex, spawn, yield_now}
+import sysl.threads.{Condvar, Mutex, spawn}
 
 // How many quanta a running core may get ahead of the other.
 const LAG_QUANTA: u64 = 4
@@ -42,6 +42,9 @@ const LAG_QUANTA: u64 = 4
 const CONSOLE_POLL_NS: i64 = 1000000
 
 const CORE1_STACK: usize = 1 << 20
+
+// How many times a core held back by the lag bound looks at the other's clock before it blocks.
+const HOLD_SPINS = 4000
 
 // The board's lock and the condition a sleeping core's thread waits on.
 var gate = Mutex.new(0)
@@ -53,6 +56,10 @@ var clocks: [2]u64
 // wakes it at, `NEVER` for none.
 var dozing: [2]u32
 var wake_at: [2]u64
+// 1 while a core's thread is blocked by the lag bound, set and cleared under `gate`; and the clock
+// it is held at.
+var holding: [2]u32
+var held_at: [2]u64
 // Where both cores sleep, the clock the board has skipped to.
 var floor: u64 = 0
 // 1 once a core has stopped.
@@ -69,6 +76,7 @@ private[virt] run_threads(cpu: *Cpu) -> *Cpu
     for k in 0..<2
         atomic_store(&dozing[k], 0, SeqCst)
         atomic_store(&wake_at[k], NEVER, SeqCst)
+        atomic_store(&holding[k], 0, SeqCst)
 
     atomic_store(&ended, 0, SeqCst)
 
@@ -115,13 +123,13 @@ private run_core(cpu: *Cpu, k: int)
         val bound = ahead_of(o)
 
         if mine >= bound
-            hold_back(o, mine)
+            hold_back(k, o, mine)
             continue
 
         set_limit(cpu, (if mine + quantum < bound then mine + quantum else bound) - cpu.slept)
         run_threaded(cpu)
         publish(k, cpu)
-        alert(o, clock(cpu, cpu.retired))
+        after_run(o, clock(cpu, cpu.retired))
 
         if cpu.stop != Stop.Budget
             atomic_store(&ended, 1, SeqCst)
@@ -138,15 +146,35 @@ private ahead_of(o: int) -> u64
 
     if h == NEVER then NEVER else h + LAG_QUANTA * quantum
 
-// A core at `mine` has got as far ahead of core o as it may: yield until o catches up, sleeps with
-// nothing to hold this one back, or the board ends.
-private hold_back(o: int, mine: u64)
-    while atomic_load(&ended, SeqCst) == 0
+// Core k at `mine` has got as far ahead of core o as it may: wait until o catches up, sleeps with
+// nothing to hold this one back, or the board ends. The other core is running and catches up within a
+// quantum or two, so the wait spins at first; past that it blocks, and the other wakes it
+// (`after_run`). A yield would not do: the host may park a thread that yields for a whole scheduling
+// quantum, a hundred thousand times the wait.
+private hold_back(k: int, o: int, mine: u64)
+    for i in 0..<HOLD_SPINS
+        if atomic_load(&ended, SeqCst) != 0 || mine < ahead_of(o) then return
         alert(o, mine)
-        if mine < ahead_of(o) then return
-        yield_now()
+
+    gate.lock_raw()
+    atomic_store(&held_at[k], mine, SeqCst)
+    atomic_store(&holding[k], 1, SeqCst)
+
+    while atomic_load(&ended, SeqCst) == 0 && mine >= ahead_of(o)
+        // Where o sleeps until a SysTick this clock has passed, it is to wake; the lock is held here.
+        if atomic_load(&dozing[o], SeqCst) != 0 && mine >= atomic_load(&wake_at[o], SeqCst) then wakeup.notify_all()
+        wakeup.wait(&gate)
+
+    atomic_store(&holding[k], 0, SeqCst)
+    gate.unlock_raw()
 
 private publish(k: int, cpu: *Cpu) = atomic_store(&clocks[k], clock(cpu, cpu.retired), SeqCst)
+
+// Core k's run has brought its clock to `t`: wake core o where it waits for this clock to pass a
+// SysTick expiry of its own, or to come within the lag bound of its own.
+private after_run(o: int, t: u64)
+    alert(o, t)
+    if atomic_load(&holding[o], SeqCst) != 0 && atomic_load(&held_at[o], SeqCst) < t + LAG_QUANTA * quantum then nudge()
 
 // Wake core o where it sleeps until a SysTick expiry that the clock `t` has passed.
 private alert(o: int, t: u64)
@@ -183,6 +211,9 @@ private doze(cpu: *Cpu, k: int)
         publish(k, cpu)
         atomic_store(&wake_at[k], next_wake(cpu), SeqCst)
         atomic_store(&dozing[k], 1, SeqCst)
+
+        // A core held back by this one's clock is held back no longer.
+        if atomic_load(&holding[o], SeqCst) != 0 then wakeup.notify_all()
 
         // Each core sets its flag before looking at the other's state, and raises or publishes before
         // looking at the other's flag, so of an interrupt raised here and this core going to sleep,
