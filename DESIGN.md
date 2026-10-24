@@ -826,10 +826,11 @@ executes without the FP, DSP, Security and MPU extensions. It runs on the `virt3
   These, with the escalation to HardFault and its registers, are a later item.
 - **Undefined in this kind**: the floating-point and coprocessor space, the DSP extension (`QADD`,
   `SADD16`, `SSAT16`, `SMLABB`, the extend-and-adds `SXTAB` and its kin), the Security Extension's
-  `TT`, `SG`, `BXNS` and `BLXNS`, `UDF`, the MPU's registers, and the encodings ARMv8-M calls
-  UNPREDICTABLE that a compiler does not emit (SP or the PC where an encoding may not name them, a
-  load writing back to a register it loads, and the like). A program for this core is built
-  `-mcpu=cortex-m33+nodsp -mfloat-abi=soft`, since GCC's `cortex-m33` has the DSP extension.
+  `TT`, `SG`, `BXNS` and `BLXNS`, `UDF`, and the encodings ARMv8-M calls UNPREDICTABLE that a
+  compiler does not emit (SP or the PC where an encoding may not name them, a load writing back to a
+  register it loads, and the like). The MPU's registers are absent, and an access to one stops at
+  `Unmapped`. A program for this core is built `-mcpu=cortex-m33+nodsp -mfloat-abi=soft`, since
+  GCC's `cortex-m33` has the DSP extension.
 
 **The oracles.** Per-instruction tests against the ARMv8-M ARM's pseudocode run under both executors
 (t2_insns, t2_mem, t2_it, t2_except): the edges of every operand, every shift amount that matters,
