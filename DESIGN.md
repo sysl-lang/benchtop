@@ -966,14 +966,21 @@ control space (`v6m/fpu.sysl`).
   return restores them, and FPCA, from bit 4.
 - **Ties to even whatever the mode**: `VRINTN` and `VCVTN` use `llvm.roundeven`, which rounds that
   way under any FPSCR setting and raises no inexact of its own.
-- **Undefined until the compiler offers strict `f16` conversions**: `VCVTB`/`VCVTT` (half
-  precision). FPSCR.IDC is never set.
+- **Half precision**: `VCVTB` and `VCVTT` convert between the bottom or top half of an S register
+  and single precision, or double on a `dp` unit, keeping the other half. FPSCR.AHP goes to the
+  host's own control, so the alternative format (no infinities or NaNs; 65536 to 131008 instead)
+  is the host's conversion too. A half operand is never flushed and a half result never is, as on
+  the guest.
+- **Input-denormal**: FPSCR.IDC is the host's flag, raised where flush-to-zero reads a subnormal
+  operand. A compare reads both operands whatever the first is, so a NaN beside a subnormal still
+  raises it.
 
 **The oracles.** Per-instruction tests (`v6m/fp_tests.sysl`) under both executors check results and
 flags at the edges: every rounding mode, NaNs quiet and signalling with and without default-NaN,
 flush-to-zero in and out, saturation, the fixed-point scales, the extended frame. `examples/virt/fpu.c`
-runs 32 instructions (FPv4-SP), 48 (FPv5-SP) and 66 (FPv5-DP) over 24 edge values (16 doubles) under
-all 16 FPSCR settings, hashing each result with FPSCR; QEMU's M4 (`mps2-an386`), M33 (`mps2-an505`)
+runs 36 instructions (FPv4-SP), 55 (FPv5-SP) and 79 (FPv5-DP) over 24 edge values (16 doubles) under
+all 16 FPSCR settings (32 with AHP for the half-precision conversions, over 24 halves and singles at
+half precision's edges), hashing each result with all of FPSCR; QEMU's M4 (`mps2-an386`), M33 (`mps2-an505`)
 and M7 (`mps2-an500`) wrote `fpu-m4.qemu`, `fpu-m33.qemu` and `fpu-m7.qemu`, and cortical must match
 every line (`virt/fpu_tests.sysl`). `VMLS`, `VNMLA`, `VNMLS` and `VFMS` at single precision are held
 apart in an ignored test: the compiler's optimizer moves their negation today, so a NaN result can

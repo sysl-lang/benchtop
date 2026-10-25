@@ -143,7 +143,7 @@ options, and writing a description back preserves them. **Integer DSP is impleme
 `dsp = true`: packed arithmetic, saturation, packing/extension, byte selection and the DSP
 multiply/accumulate families, including APSR.GE and exception stacking. It defaults to off.
 `fpu = sp` (or `dp` on the M7) gives a core its floating-point unit, whose results and flags
-match QEMU's (DESIGN §2.13); the half-precision conversions are not emulated yet.
+match QEMU's (DESIGN §2.13).
 `run` currently rejects enabled MPU, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
 unsupported selection; it never silently
 ignores them. A chip's integrated core configuration is defined by its chip model; these options

@@ -7,8 +7,8 @@
 // examples/qemu/build-fpu.sh, and for cortical's boards with the matching unit must print the same
 // lines; fpu-m4.qemu, fpu-m33.qemu and fpu-m7.qemu hold QEMU's.
 //
-// FPv5's instructions are built with -DFPV5, the double-precision ones with -DDOUBLE. FPSCR.IDC, the
-// input-denormal flag, is left out of the hash: cortical does not set it.
+// FPv5's instructions are built with -DFPV5, the double-precision ones with -DDOUBLE. The conversions
+// to and from half precision also run with and without AHP, the alternative format, so 32 settings.
 
 #include <stdint.h>
 
@@ -60,10 +60,24 @@ static const uint32_t values[24] = {
     0xFFC00001, 0x7F800001, 0xFFA00000, 0x4B800001, 0x4F000000, 0xCF000000, 0x4F800000, 0x3F7FFFFF,
 };
 
-// RMode in bits 23-22, FZ bit 24, DN bit 25.
+// RMode in bits 23-22, FZ bit 24, DN bit 25, AHP bit 26.
 static uint32_t mode(int k) {
-    return ((uint32_t)(k & 3) << 22) | ((uint32_t)((k >> 2) & 1) << 24) | ((uint32_t)((k >> 3) & 1) << 25);
+    return ((uint32_t)(k & 3) << 22) | ((uint32_t)((k >> 2) & 1) << 24) | ((uint32_t)((k >> 3) & 1) << 25) |
+           ((uint32_t)((k >> 4) & 1) << 26);
 }
+
+// Half-precision values, two to a word: zeros, subnormals, the smallest normal and the largest, one
+// and a third, infinities (65536 under AHP), quiet and signalling NaNs with payloads.
+static const uint32_t halves[12] = {
+    0x00000001, 0x80003C00, 0x7C00FC00, 0x7E007D01, 0xFE01FD00, 0x7BFF03FF,
+    0x04003555, 0xC0008001, 0x3C01BC00, 0x7FFF0400, 0x5640D640, 0x00FF3800,
+};
+
+// Singles at the edges of half precision: 65504, 65520 (the tie to infinity), just below it, 2^-24,
+// 2^-25 (the tie to zero) and just above it, the smallest normal half, and a subnormal half's worth.
+static const uint32_t near_half[8] = {
+    0x477FE000, 0x477FF000, 0x477FEFFF, 0x33800000, 0x33000000, 0x33000001, 0x38800000, 0x387FC000,
+};
 
 static uint32_t mix(uint32_t h, uint32_t x) {
     h = (h ^ x) * 0x5BD1E995u;
@@ -100,7 +114,7 @@ static uint32_t bits(float f) {
                                      : [d] "+&t"(d), [s] "=&r"(s)                                     \
                                      : [a] "t"(as_float(values[i])), [b] "t"(as_float(values[j])),    \
                                        [f] "r"(mode(k)));                                             \
-                    h = mix(mix(h, bits(d)), s & ~0x80u);                                             \
+                    h = mix(mix(h, bits(d)), s);                                                      \
                 }                                                                                     \
         line(#name, h);                                                                               \
     }
@@ -137,6 +151,44 @@ CASE(vcvt_u32_fixed, "vmov.f32 %[d], %[a]\n\tvcvt.u32.f32 %[d], %[d], #20")
 CASE(vcvt_from_s16_fixed, "vmov.f32 %[d], %[a]\n\tvcvt.f32.s16 %[d], %[d], #3")
 CASE(vcvt_from_u32_fixed, "vmov.f32 %[d], %[a]\n\tvcvt.f32.u32 %[d], %[d], #20")
 CASE(vmov_imm, "vmov.f32 %[d], #-0.1875")
+
+// To single precision from the half in %[a], under all 32 settings.
+#define WIDEN(name, insn)                                                                             \
+    static void name(void) {                                                                          \
+        uint32_t h = 2166136261u;                                                                     \
+        for (int i = 0; i < 12; i++)                                                                  \
+            for (int k = 0; k < 32; k++) {                                                            \
+                float d = as_float(values[(i + k) % 24]);                                             \
+                uint32_t s;                                                                           \
+                __asm__ volatile("vmsr fpscr, %[f]\n\t" insn "\n\tvmrs %[s], fpscr"                   \
+                                 : [d] "+&t"(d), [s] "=&r"(s)                                         \
+                                 : [a] "t"(as_float(halves[i])), [f] "r"(mode(k)));                   \
+                h = mix(mix(h, bits(d)), s);                                                          \
+            }                                                                                         \
+        line(#name, h);                                                                               \
+    }
+
+// To a half in %[d], whose other half holds another, from the single in %[a].
+#define NARROW(name, insn)                                                                            \
+    static void name(void) {                                                                          \
+        uint32_t h = 2166136261u;                                                                     \
+        for (int i = 0; i < 32; i++)                                                                  \
+            for (int k = 0; k < 32; k++) {                                                            \
+                float d = as_float(halves[(i + k) % 12]);                                             \
+                uint32_t s;                                                                           \
+                __asm__ volatile("vmsr fpscr, %[f]\n\t" insn "\n\tvmrs %[s], fpscr"                   \
+                                 : [d] "+&t"(d), [s] "=&r"(s)                                         \
+                                 : [a] "t"(as_float(i < 24 ? values[i] : near_half[i - 24])),         \
+                                   [f] "r"(mode(k)));                                                 \
+                h = mix(mix(h, bits(d)), s);                                                          \
+            }                                                                                         \
+        line(#name, h);                                                                               \
+    }
+
+WIDEN(vcvtb_from_half, "vcvtb.f32.f16 %[d], %[a]")
+WIDEN(vcvtt_from_half, "vcvtt.f32.f16 %[d], %[a]")
+NARROW(vcvtb_to_half, "vcvtb.f16.f32 %[d], %[a]")
+NARROW(vcvtt_to_half, "vcvtt.f16.f32 %[d], %[a]")
 
 #ifdef FPV5
 CASE(vmaxnm, "vmaxnm.f32 %[d], %[a], %[b]")
@@ -214,7 +266,7 @@ static uint64_t dbits(double f) {
                                      : [a] "w"(as_double(doubles[i])), [b] "w"(as_double(doubles[j])), \
                                        [f] "r"(mode(k)));                                             \
                     uint64_t x = dbits(d);                                                            \
-                    h = mix(mix(mix(h, (uint32_t)x), (uint32_t)(x >> 32)), s & ~0x80u);               \
+                    h = mix(mix(mix(h, (uint32_t)x), (uint32_t)(x >> 32)), s);                        \
                 }                                                                                     \
         line(#name, h);                                                                               \
     }
@@ -233,7 +285,7 @@ static uint64_t dbits(double f) {
                                  : "+w"(d), [s] "=&r"(s)                                              \
                                  : "w"(a), [f] "r"(mode(k)));                                         \
                 uint64_t x = dbits(d);                                                                \
-                h = mix(mix(mix(h, (uint32_t)x), (uint32_t)(x >> 32)), s & ~0x80u);                   \
+                h = mix(mix(mix(h, (uint32_t)x), (uint32_t)(x >> 32)), s);                            \
             }                                                                                         \
         line(#name, h);                                                                               \
     }
@@ -258,6 +310,30 @@ MCASE(dcvt_f32, "vcvt.f32.f64 s0, d1")
 MCASE(dcvt_f64, "vcvt.f64.f32 d0, s2")
 MCASE(dcvt_from_s32, "vcvt.f64.s32 d0, s2")
 MCASE(dcvt_fixed, "vmov.f64 d0, d1\n\tvcvt.s32.f64 d0, d0, #16")
+
+// Between double and half precision, under all 32 settings: D0 from the half in S2 (D1's low half),
+// and S0, already holding two halves, from D1.
+#define DHALF(name, insn, narrowing)                                                                  \
+    static void name(void) {                                                                          \
+        uint32_t h = 2166136261u;                                                                     \
+        for (int i = 0; i < (narrowing ? 16 : 12); i++)                                               \
+            for (int k = 0; k < 32; k++) {                                                            \
+                register double d __asm__("d0") = as_double(halves[(i + k) % 12]);                    \
+                register double a __asm__("d1") = as_double(narrowing ? doubles[i] : halves[i]);      \
+                uint32_t s;                                                                           \
+                __asm__ volatile("vmsr fpscr, %[f]\n\t" insn "\n\tvmrs %[s], fpscr"                   \
+                                 : "+w"(d), [s] "=&r"(s)                                              \
+                                 : "w"(a), [f] "r"(mode(k)));                                         \
+                uint64_t x = dbits(d);                                                                \
+                h = mix(mix(mix(h, (uint32_t)x), (uint32_t)(x >> 32)), s);                            \
+            }                                                                                         \
+        line(#name, h);                                                                               \
+    }
+
+DHALF(dcvtb_from_half, "vcvtb.f64.f16 d0, s2", 0)
+DHALF(dcvtt_from_half, "vcvtt.f64.f16 d0, s2", 0)
+DHALF(dcvtb_to_half, "vcvtb.f16.f64 s0, d1", 1)
+DHALF(dcvtt_to_half, "vcvtt.f16.f64 s0, d1", 1)
 #endif
 
 int main(void) {
@@ -297,6 +373,10 @@ int main(void) {
     vcvt_from_s16_fixed();
     vcvt_from_u32_fixed();
     vmov_imm();
+    vcvtb_from_half();
+    vcvtt_from_half();
+    vcvtb_to_half();
+    vcvtt_to_half();
 #ifdef FPV5
     vmaxnm();
     vminnm();
@@ -334,6 +414,10 @@ int main(void) {
     drintn();
     dcvt_s32();
     dcvtn_s32();
+    dcvtb_from_half();
+    dcvtt_from_half();
+    dcvtb_to_half();
+    dcvtt_to_half();
     dcvtr_u32();
     dcvt_f32();
     dcvt_f64();
