@@ -53,3 +53,18 @@ surface without initializing SDL. A system font is required in both modes.
 The window handles display density and resizing through the toolkit driver;
 the inspector scrolls when its contents exceed the available space. Console
 capture retains a bounded recent tail for long-running firmware.
+
+Build and reload automatically while editing sysl firmware:
+
+```sh
+./benchtop run --window --board workbench --watch \
+  --build ./examples/visual/build.sh \
+  --watch-source examples/visual/main.sysl \
+  --watch-source examples/visual/demo.ld \
+  examples/visual/demo.elf
+```
+
+Run this from the repository root with libuv installed. Kairos runs the child build,
+reads stdout and stderr asynchronously, and watches for file changes. Use the Build
+button or B to rebuild, and the Build console tab for diagnostics. A successful
+changed image resets the guest; a failed build leaves its previous firmware running.

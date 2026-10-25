@@ -21,7 +21,7 @@ devices, how fidelity is tested against real boards, and the milestones with the
 ## Try the visual workbench
 
 The desktop uses **syslUI**, its shared **SDL3 driver**, and **PlutoVG** for vector
-graphics and font rendering. Install SDL3 and pkg-config (`brew install sdl3 pkg-config`
+graphics and font rendering. Install SDL3, libuv and pkg-config (`brew install sdl3 libuv pkg-config`
 on macOS), then use sysl 0.6.2:
 
 ```sh
@@ -56,6 +56,38 @@ syslUI view tree and PlutoVG renderer at a standard
 1200×760 size. Headless rendering also needs an installed system font (Arial on
 macOS, or DejaVu Sans/Liberation Sans on Linux); it needs no display server. See [examples/visual](examples/visual/README.md) to build
 and modify the firmware and for the virtual GPIO register map.
+
+## Build, watch and reload firmware
+
+Host development workflows use **Kairos async/await with libuv**. Install libuv
+(`brew install libuv` on macOS, `libuv1-dev` on Debian/Ubuntu) alongside SDL3.
+The ordinary `demo` command keeps its existing controls and behavior.
+
+```sh
+./benchtop run --window --board workbench --watch \
+  --build ./examples/visual/build.sh \
+  --watch-source examples/visual/main.sysl \
+  --watch-source examples/visual/demo.ld \
+  examples/visual/demo.elf
+```
+
+This builds once on startup. The **Build** button or **B** builds again; edits to
+explicitly watched source files trigger a debounced build. **Guest / Build** tabs
+switch the console between guest output and streamed compiler stdout/stderr.
+`--build` names an executable or script, executed in Benchtop's working directory;
+repeat `--build-arg <argument>` to pass arguments without shell parsing.
+
+`--watch` alone reloads the firmware when another tool writes it. Watching parent
+directories allows editors and linkers to replace files atomically. Only the named
+source files trigger builds, so generated files do not cause rebuild loops. A source
+edit during a build queues one more build. Reloads wait for stable bytes, validate
+the image and its reset vectors, and reset the guest between CPU slices. Identical
+images keep running; failed builds or invalid images preserve the current guest.
+An initially missing output can be created by the startup build.
+
+These options require `run --window` and a firmware file. A finite headless run can
+exercise the same host workflow with `--headless --frames 400 --screenshot build.png`.
+Host tasks use real time; guest timers still use deterministic emulated time.
 
 ## The `benchtop` command
 

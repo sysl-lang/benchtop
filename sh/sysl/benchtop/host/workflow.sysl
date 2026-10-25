@@ -1,0 +1,292 @@
+module sh.sysl.benchtop.host
+
+import sh.sysl.kairos.{Loop, Job, PassMode, event_loop}
+import sh.sysl.kairos.uv.{Uv, Watch, Pipe, Process, Stdio, uv_on}
+import sh.sysl.libuv as uv
+import sh.sysl.benchtop.virt.image_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, current_dir}
+import sysl.path.{join, normalize, is_absolute, parent, file_name}
+import sysl.slices.equal
+import sysl.time.{Duration, millis}
+
+struct Config
+    watch: bool
+    program: string
+    args: Buf[string]
+    sources: Buf[string]
+
+config() -> Config = Config(false, "", buf(), buf())
+enabled(c: Config) -> bool = c.watch || !c.program.is_empty() || c.sources.len() > 0 || c.args.len() > 0
+
+/** Host state is owned by the UI thread. Tasks only stage images; the frame boundary applies them. */
+struct Workflow
+    config: Config
+    firmware: string
+    native: &uv.Loop
+    io: &Uv
+    lp: &Loop[Uv]
+    watchers: Buf[&Watch]
+    jobs: Buf[Job]
+    readers: Buf[Job]
+    process: Option[&Process]
+    closed: bool
+    building: bool
+    build_requested: bool
+    reload_requested: bool
+    ready_at: Duration
+    last_good: []const u8
+    pending: Option[Buf[u8]]
+    log: Buf[u8]
+    status: string
+    builds: u64
+    reloads: u64
+    failed: bool
+
+validate(c: Config, firmware: string) -> Result[unit, string]
+    if !enabled(c) then return Ok(())
+    if firmware.is_empty() then return Err("host development options need a firmware file; use run --window")
+    if c.sources.len() > 0 && c.program.is_empty() then return Err("--watch-source requires --build <program>")
+    if c.args.len() > 0 && c.program.is_empty() then return Err("--build-arg requires --build <program>")
+    for path in c.sources
+        if !is_file(path) then return Err(s"watch source is not a file: $path")
+        if absolute(path) == absolute(firmware) then return Err("the firmware output cannot also be a watched build source")
+    Ok(())
+
+private absolute(path: string) -> string = normalize(if is_absolute(path) then path else join(current_dir().unwrap(), path))
+
+/** Watch parent directories and filter names, so editor/ linker atomic replacement keeps working. */
+open(c: Config, firmware: string, initial: []const u8 = []) -> Result[&Workflow, string]
+    validate(c, firmware)?
+    val native = uv.new_loop() match
+        Ok(n) -> n
+        Err(e) -> return Err(s"libuv loop: ${e.name()}")
+    val io = uv_on(native)
+    val lp = event_loop(io)
+    val w: &Workflow = Workflow(c, absolute(firmware), native, io, lp, buf(), buf(), buf(), None, false,
+        false, !c.program.is_empty(), c.program.is_empty() && c.watch, lp.now(), initial, None, buf(), "Watching firmware", 0, 0, false)
+    var paths: Buf[string] = buf()
+    if c.watch || !c.program.is_empty() then paths.push(w.firmware)
+    for source in c.sources do paths.push(absolute(source))
+    for path in paths
+        val dir = parent(path).unwrap_or(".")
+        val watcher = io.watch(dir) match
+            Ok(it) -> it
+            Err(e) ->
+                close(w)
+                return Err(s"cannot watch $dir: ${e.name()}")
+        w.watchers.push(watcher)
+        w.jobs.push(lp.spawn(watch_file(w, watcher, file_name(path).unwrap(), path != w.firmware)))
+    w.jobs.push(lp.spawn(service(w)))
+    if !c.program.is_empty() then w.status = "Build queued"
+    note(w, if c.program.is_empty() then s"Watching $firmware" else s"Build program: ${c.program}")
+    Ok(w)
+
+note(w: &Workflow, text: string)
+    append(w, text.bytes)
+    append(w, "\n".bytes)
+
+/** Bound captured diagnostics even when a compiler emits an unlimited stream. */
+private append(w: &Workflow, bytes: []const u8)
+    val limit: usize = 16384
+    if bytes.len >= limit
+        var tail: Buf[u8] = buf()
+        tail.extend(bytes[(bytes.len - limit)..])
+        w.log = tail
+        return
+    if w.log.len() + bytes.len > limit
+        var tail: Buf[u8] = buf()
+        val keep = limit / 2
+        val start = if w.log.len() > keep then w.log.len() - keep else 0
+        tail.extend(w.log.view()[start..])
+        w.log = tail
+    w.log.extend(bytes)
+
+request_build(w: &Workflow)
+    if w.closed || w.config.program.is_empty() then return
+    w.build_requested = true
+    w.ready_at = w.lp.now()
+    if !w.building then w.status = "Build queued"
+
+private async watch_file(w: &Workflow, watcher: &Watch, name: string, source: bool)
+    loop
+        val change = (await watcher.next()) match
+            Ok(c) -> c
+            Err(e) ->
+                if !w.closed then note(w, s"Watch failed: ${e.name()}")
+                return
+        if w.closed then return
+        change.filename match
+            Some(file) -> if file != name then continue
+            None -> ()
+        if source then w.build_requested = true else w.reload_requested = true
+        w.ready_at = w.lp.now() + millis(150)
+
+private async service(w: &Workflow)
+    // Let native directory watching settle, then reconcile the output once. Early edits
+    // cannot be lost even when the OS coalesces changes made while starting the watch.
+    await w.lp.sleep(millis(150))
+    while !w.closed
+        if w.lp.now() >= w.ready_at
+            if w.build_requested
+                w.build_requested = false
+                await build(w)
+            elif w.reload_requested
+                w.reload_requested = false
+                await reload(w)
+        await w.lp.sleep(millis(20))
+
+private struct Drain
+    done: bool
+
+private async drain(w: &Workflow, pipe: &Pipe, drained: &Drain)
+    defer pipe.close()
+    defer drained.done = true
+    loop
+        val bytes = (await pipe.read()) match
+            Ok(b) -> b
+            Err(e) ->
+                if !w.closed then note(w, s"Build stream: ${e.name()}")
+                return
+        if bytes.len == 0 then return
+        append(w, bytes)
+
+private async build(w: &Workflow)
+    w.building = true
+    w.failed = false
+    w.status = "Building…"
+    w.builds += 1
+    note(w, s"Build ${w.builds}: ${w.config.program}")
+    val child = w.io.spawn(w.config.program, w.config.args.view(), stdin = Stdio.Ignore,
+        stdout = Stdio.Piped, stderr = Stdio.Piped) match
+        Ok(p) -> p
+        Err(e) ->
+            w.building = false
+            w.failed = true
+            w.status = s"Build could not start: ${e.name()}"
+            note(w, w.status)
+            return
+    w.process = Some(child)
+    val out_done: &Drain = Drain(false)
+    val err_done: &Drain = Drain(false)
+    val out = w.lp.spawn(drain(w, child.stdout().unwrap(), out_done))
+    val err = w.lp.spawn(drain(w, child.stderr().unwrap(), err_done))
+    w.readers.push(out)
+    w.readers.push(err)
+    val ended = await child.exit()
+    w.process = None
+    w.building = false
+    // Drain both pipes concurrently, including output larger than the pipe buffers.
+    val deadline = w.lp.now() + millis(500)
+    while (!out_done.done || !err_done.done) && w.lp.now() < deadline
+        await w.lp.sleep(millis(10))
+    w.lp.abort(out)
+    w.lp.abort(err)
+    w.readers.clear()
+    if ended.status != 0 || ended.signal != 0
+        w.failed = true
+        w.status = if ended.signal != 0 then s"Build ended by signal ${ended.signal}" else s"Build failed (exit ${ended.status})"
+        w.reload_requested = false
+        note(w, w.status + "; keeping the running firmware")
+        return
+    w.status = "Build succeeded"
+    note(w, w.status)
+    // A source edit during a build queues one more build; never reload that stale intermediate image.
+    if !w.build_requested
+        w.reload_requested = false
+        await reload(w)
+
+private async read_image(w: &Workflow) -> Result[[]u8, string]
+    val stat = (await w.io.stat(w.firmware)) match
+        Ok(s) -> s
+        Err(e) -> return Err(e.name())
+    if !stat.is_file() || stat.size > 33554432 then return Err("firmware must be a regular file of at most 32 MB")
+    (await w.io.read_file(w.firmware)) match
+        Ok(bytes) -> Ok(bytes)
+        Err(e) -> Err(e.name())
+
+private async reload(w: &Workflow)
+    w.status = "Loading firmware…"
+    var why = "file is still changing"
+    for attempt in 0..<3
+        val first = (await read_image(w)) match
+            Ok(b) -> b
+            Err(e) ->
+                why = e
+                await w.lp.sleep(millis(100))
+                continue
+        await w.lp.sleep(millis(75))
+        val bytes = (await read_image(w)) match
+            Ok(b) -> b
+            Err(e) ->
+                why = e
+                continue
+        if !equal(first, bytes) then continue
+        if w.build_requested then return
+        if equal(w.last_good, bytes)
+            w.status = "Firmware unchanged"
+            return
+        val image = checked_image(bytes) match
+            Ok(i) -> i
+            Err(e) ->
+                why = e
+                await w.lp.sleep(millis(100))
+                continue
+        w.last_good = bytes
+        w.pending = Some(image)
+        w.status = "Firmware ready"
+        w.failed = false
+        return
+    w.status = "Reload rejected"
+    w.failed = true
+    note(w, s"Reload rejected: $why; keeping the running firmware")
+
+/** Refuse empty/truncated images before replacing the guest's last known working state. */
+checked_image(bytes: []const u8) -> Result[Buf[u8], string]
+    if bytes.len < 8 then return Err("firmware has no reset vectors")
+    val image = image_of(bytes)?
+    val data = image.view()
+    val sp = word(data, 0)
+    val pc = word(data, 4)
+    if sp < 8 || sp > 1048576 || (sp & 3) != 0 || (pc & 1) == 0 || pc < 9 || pc >= 1048576 then return Err("firmware has invalid virtual-board reset vectors")
+    Ok(image)
+
+private word(b: []const u8, i: usize) -> u32 = u32(b[i]) | (u32(b[i + 1]) << 8) | (u32(b[i + 2]) << 16) | (u32(b[i + 3]) << 24)
+
+/** Nonblocking in the desktop loop; a bounded wait is useful in a headless host workflow. */
+poll(w: &Workflow, wait: bool = false)
+    if !w.closed then w.lp.pass(if wait then PassMode.Until(millis(5)) else PassMode.NoWait)
+
+take_image(w: &Workflow) -> Option[Buf[u8]]
+    val pending = w.pending
+    w.pending = None
+    if pending.is_some()
+        w.reloads += 1
+        w.status = "Firmware reloaded"
+        note(w, s"Reload ${w.reloads}: ${w.firmware}")
+    pending
+
+/** Close watchers, cancel parked tasks, terminate an active child, then reap libuv handles. */
+close(w: &Workflow) -> Result[unit, string]
+    if w.closed then return Ok(())
+    w.closed = true
+    for watcher in w.watchers do watcher.close()
+    w.process match
+        Some(p) ->
+            p.kill(9)
+            p.stdout().unwrap().close()
+            p.stderr().unwrap().close()
+        None -> ()
+    for job in w.readers do w.lp.abort(job)
+    w.readers.clear()
+    for job in w.jobs do w.lp.abort(job)
+    w.jobs.clear()
+    w.watchers.clear()
+    w.io.close()
+    w.native.run() match
+        Err(e) -> return Err(s"libuv shutdown: ${e.name()}")
+        Ok(_) -> ()
+    w.process = None
+    w.native.close() match
+        Ok(_) -> Ok(())
+        Err(e) -> Err(s"libuv handles remain: ${e.name()}")

@@ -2,6 +2,7 @@ module sh.sysl.benchtop.ui
 
 import sh.sysl.sdl3 as sdl
 import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.host as host
 import sh.sysl.benchtop.v6m.{Cpu, Stop}
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_bytes
@@ -57,29 +58,55 @@ private let_running(running: bool, st: *State, cpu: *Cpu)
     st.notice = virt.stop_message(stopped)
 
 /** Load/check before opening a window. Both modes use the same syslUI tree. */
-launch(which: string, file: string, demo: bool = false, frames: u64 = 0, screenshot: string = "", headless: bool = false) -> Result[int, string]
+launch(which: string, file: string, demo: bool = false, frames: u64 = 0, screenshot: string = "", headless: bool = false, develop: host.Config = host.config()) -> Result[int, string]
+    host.validate(develop, file)?
     val s = open_scene(which)?
     val live = demo || !file.is_empty()
     var image: Buf[u8] = buf()
+    var original: []const u8 = []
     if live
         virt.board_named(which) match
             Err(why) -> return Err(why)
             Ok(_) -> ()
         val bytes: []const u8 = if demo then DEMO else read_bytes(file) match
             Ok(bytes) -> bytes
-            Err(why) -> return Err(s"$file: $why")
-        image = virt.image_of(bytes)?
+            Err(why) -> if develop.program.is_empty() then return Err(s"$file: $why") else []
+        if bytes.len == 0 && develop.program.is_empty() then return Err("firmware is empty")
+        if bytes.len > 0
+            val parsed = if host.enabled(develop) then host.checked_image(bytes) else virt.image_of(bytes)
+            parsed match
+                Ok(i) ->
+                    image = i
+                    original = bytes
+                Err(why) -> if develop.program.is_empty() then return Err(why)
     var st = state(live)
     val cpu = virt.core0()
-    if live then restart(cpu, image.view(), &st)
+    if live && image.len() > 0 then restart(cpu, image.view(), &st)
+    elif live
+        st.stopped = true
+        st.paused = true
+        st.status = "WAITING FOR BUILD"
     val d = desktop(s, st)
+    val active = toolkit.signal(image)
+    if host.enabled(develop)
+        d.workflow = Some(host.open(develop, file, original)?)
+        if !develop.program.is_empty() then d.console_tab.set(1)
+    defer close_workflow(d)
     if headless
         val count = if frames == 0 then 1 else frames
+        val count_signal = toolkit.signal(0u64)
         for frame in 0u64..<count
-            if live then advance(s, &st, cpu)
-        d.current.set(st)
+            host_tick(d, cpu, active, true)
+            desktop_tick(d, cpu, active.read().view(), 0, count_signal, "benchtop.png")
+        st = d.current.read()
         if !screenshot.is_empty() then save_desktop(d, screenshot)?
         if live && st.status == "GUEST FAULT" then return Err(st.notice)
+        if st.status == "WAITING FOR BUILD" then return Err("no firmware loaded before --frames ended")
+        d.workflow match
+            Some(w) ->
+                if w.building || w.build_requested then return Err("build did not finish before --frames ended")
+                if w.failed then return Err(w.status)
+            None -> ()
         return Ok(0)
     val path = if screenshot.is_empty() then "benchtop.png" else screenshot
     val count = toolkit.signal(0u64)
@@ -87,16 +114,38 @@ launch(which: string, file: string, demo: bool = false, frames: u64 = 0, screens
     driver.run(driver.app(s"Benchtop - ${s.name}", () -> Workbench(d), () -> GROUND,
         width = WIDTH, height = HEIGHT, size = 14,
         on_event = e -> desktop_event(d, e),
-        on_frame = dt -> desktop_tick(d, cpu, image.view(), frames, count, path)))?
+        on_frame = dt ->
+            host_tick(d, cpu, active)
+            desktop_tick(d, cpu, active.read().view(), frames, count, path)))?
     if !screenshot.is_empty() then save_desktop(d, screenshot)?
     val final = d.current.read()
     if live && final.status == "GUEST FAULT" then return Err(final.notice)
     Ok(0)
 
+private close_workflow(d: &Desktop)
+    d.workflow match
+        Some(w) -> host.close(w)
+        None -> ()
+
+/** Poll host work and apply a completed image only between guest slices. */
+private[ui] host_tick(d: &Desktop, cpu: *Cpu, active: &toolkit.Signal[Buf[u8]], wait: bool = false)
+    d.workflow match
+        Some(w) ->
+            host.poll(w, wait)
+            host.take_image(w) match
+                Some(image) ->
+                    active.set(image)
+                    var st = d.current.read()
+                    restart(cpu, image.view(), &st)
+                    st.notice = "Firmware reloaded"
+                    d.current.set(st)
+                None -> ()
+        None -> ()
+
 private[ui] desktop_tick(d: &Desktop, cpu: *Cpu, image: []const u8, frames: u64, count: &toolkit.Signal[u64], path: string)
     var st = d.current.read()
     if d.resetting.read()
-        restart(cpu, image, &st)
+        if image.len > 0 then restart(cpu, image, &st)
         d.resetting.set(false)
     val step = d.stepping.read()
     d.stepping.set(false)
@@ -142,6 +191,9 @@ private desktop_event(d: &Desktop, e: sdl.Event) -> bool
                 "r" -> if st.live then d.resetting.set(true)
                 "n" -> if st.live && !st.stopped then d.stepping.set(true)
                 "s" -> d.saving.set(true)
+                "b" -> d.workflow match
+                    Some(w) -> host.request_build(w)
+                    None -> ()
                 _ -> return false
             return true
         _ -> ()
