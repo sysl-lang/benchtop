@@ -1,0 +1,543 @@
+module sh.sysl.benchtop.riscv
+@tests
+
+private hstart(cpu: *Cpu, ram: []u8)
+    reset(cpu, model_named("hazard3").unwrap(), ram, 0, 0)
+    for i in 0..<ram.len do ram[i] = 0
+
+private hop(cpu: *Cpu, code: u32, compressed: bool = false)
+    instruction_put_word(cpu.ram, 0, code, if compressed then 2 else 4)
+    cpu.pc = 0
+    cpu.stop = Stop.Budget
+    run(cpu, 1)
+
+private get(cpu: *Cpu, address: u32, raw: u32 = 0) -> u32 = csr_access(cpu, address, 2, raw, true, raw != 0).unwrap()
+private set(cpu: *Cpu, address: u32, value: u32)
+    assert(csr_access(cpu, address, 1, value, false, true).is_some(), s"CSR $address")
+
+private check_csr_instruction(op: u32)
+    var ram: [256]u8
+    var cpu: Cpu
+    for source in [0u32, 1, 31, 0x80000000, 0xFFFFFFFF]
+        for rd in [0u32, 1, 2, 31]
+            for rs1 in 0u32..<32
+                hstart(&cpu, ram)
+                cpu.cs.mscratch = 0xA5A55A5A
+                if rs1 != 0 then cpu.r[rs1] = source
+                val operand = if op >= 5 then rs1 elif rs1 == 0 then 0 else source
+                val kind = op & 3
+                val writing = kind == 1 || rs1 != 0
+                val wanted = if !writing then 0xA5A55A5A elif kind == 1 then operand elif kind == 2 then 0xA5A55A5A | operand else 0xA5A55A5A & ~operand
+                hop(&cpu, (0x340 << 20) | (rs1 << 15) | (op << 12) | (rd << 7) | 0x73)
+                assert(cpu.stop == Stop.Budget && cpu.pc == 4 && cpu.retired == 1)
+                assert(cpu.cs.mscratch == wanted && cpu.r[0] == 0, s"CSR op $op")
+                if rd != 0 then assert(cpu.r[rd] == 0xA5A55A5A)
+
+@test("Hazard3 instruction CSRRW: aliases, x0 read suppression and CSR write effects")
+h3_csrrw() = check_csr_instruction(1)
+@test("Hazard3 instruction CSRRS: aliases, x0 write suppression and CSR set effects")
+h3_csrrs() = check_csr_instruction(2)
+@test("Hazard3 instruction CSRRC: aliases, x0 write suppression and CSR clear effects")
+h3_csrrc() = check_csr_instruction(3)
+@test("Hazard3 instruction CSRRWI: all immediate indices, x0 destination and write effects")
+h3_csrrwi() = check_csr_instruction(5)
+@test("Hazard3 instruction CSRRSI: immediate set, zero suppression and aliases")
+h3_csrrsi() = check_csr_instruction(6)
+@test("Hazard3 instruction CSRRCI: immediate clear, zero suppression and aliases")
+h3_csrrci() = check_csr_instruction(7)
+
+@test("Hazard3 CSRs enforce existence, privilege, read-only writes and RP2350 identities")
+h3_csr_rules()
+    var ram: [256]u8
+    var cpu: Cpu
+    hstart(&cpu, ram)
+    assert(get(&cpu, 0x301) == 0x40901105)
+    assert(get(&cpu, 0xF11) == 0x493 && get(&cpu, 0xF12) == 27 && get(&cpu, 0xF13) == 0x86FC4E3F)
+    for address in [0xF11u32, 0xF12, 0xF13, 0xF14]
+        assert(csr_access(&cpu, address, 1, 0, true, true).is_none())
+        assert(csr_access(&cpu, address, 2, 0, true, false).is_some())
+    for address in [0x999u32, 0x302, 0x303, 0x7B0, 0xBFF, 0xC01]
+        assert(csr_access(&cpu, address, 2, 0, true, false).is_none())
+    set(&cpu, 0x300, 0xFFFFFFFF)
+    assert(get(&cpu, 0x300) == 0x221888)
+    set(&cpu, 0x300, 0x800)
+    assert((get(&cpu, 0x300) & 0x1800) == 0)
+    set(&cpu, 0x343, 0xFFFFFFFF)
+    assert(get(&cpu, 0x343) == 0)
+    set(&cpu, 0x344, 0xFFFFFFFF)
+    assert(get(&cpu, 0x344) == 0)
+    cpu.cs.privilege = 0
+    assert(csr_access(&cpu, 0x340, 2, 0, true, false).is_none())
+    assert(csr_access(&cpu, 0xC00, 2, 0, true, false).is_none())
+    cpu.cs.mcounteren = 5
+    assert(csr_access(&cpu, 0xC00, 2, 0, true, false).is_some())
+    assert(csr_access(&cpu, 0xC02, 2, 0, true, false).is_some())
+    assert(csr_access(&cpu, 0xC00, 1, 0, true, true).is_none())
+
+@test("Hazard3 traps: illegal instruction, ECALL, EBREAK, memory faults and bounded trap loops")
+h3_traps()
+    var ram: [256]u8
+    var cpu: Cpu
+    for test in [[0xFFFFFFFFu32, 2u32], [0x00000073, 11], [0x00100073, 3], [0x0000A183, 5], [0x0020A023, 7]]
+        hstart(&cpu, ram)
+        cpu.cs.mtvec = 128
+        cpu.cs.mstatus |= 8
+        cpu.r[1] = 512
+        cpu.r[3] = 0x12345678
+        hop(&cpu, test[0])
+        assert(cpu.pc == 128 && cpu.cs.mepc == 0 && cpu.cs.mcause == test[1] && cpu.retired == 0)
+        assert(cpu.cs.privilege == 3 && (cpu.cs.mstatus & 0x1888) == 0x1880 && cpu.r[3] == 0x12345678)
+        assert(get(&cpu, 0x343) == 0)
+    hstart(&cpu, ram)
+    cpu.r[1] = 65
+    hop(&cpu, 0x0000A183)
+    assert(cpu.cs.mcause == 4)
+    hop(&cpu, 0x0020A023)
+    assert(cpu.cs.mcause == 6)
+    run(&cpu, 5)
+    assert(cpu.stop == Stop.Budget && cpu.retired == 0)
+    hstart(&cpu, ram)
+    cpu.halt_faults = true
+    hop(&cpu, 0xFFFFFFFF)
+    assert(cpu.stop == Stop.Undefined)
+
+@test("Hazard3 instruction MRET: machine/user return, MIE stack, MPRV and illegal U-mode return")
+h3_mret()
+    var ram: [256]u8
+    var cpu: Cpu
+    for privilege in [0u32, 3]
+        hstart(&cpu, ram)
+        cpu.cs.mepc = 130
+        cpu.cs.mstatus = (privilege << 11) | 0x20080
+        hop(&cpu, 0x30200073)
+        assert(cpu.pc == 130 && cpu.cs.privilege == privilege && cpu.retired == 1)
+        assert((cpu.cs.mstatus & 0x1888) == 0x88)
+        assert(((cpu.cs.mstatus & 0x20000) != 0) == (privilege == 3))
+    hstart(&cpu, ram)
+    cpu.cs.privilege = 0
+    cpu.cs.mtvec = 128
+    hop(&cpu, 0x30200073)
+    assert(cpu.cs.mcause == 2 && cpu.pc == 128 && cpu.retired == 0)
+
+@test("Hazard3 counters: inhibited reset, enable, 64-bit rollover and CSR write precedence")
+h3_counters()
+    var ram: [256]u8
+    var cpu: Cpu
+    hstart(&cpu, ram)
+    hop(&cpu, 0x00000013)
+    assert(cpu.cs.cycle == 0 && cpu.cs.instret == 0)
+    set(&cpu, 0x320, 0)
+    set(&cpu, 0xB00, 0xFFFFFFFF)
+    set(&cpu, 0xB02, 0xFFFFFFFF)
+    hop(&cpu, 0x00000013)
+    assert(get(&cpu, 0xB80) == 1 && get(&cpu, 0xB00) == 0)
+    assert(get(&cpu, 0xB82) == 1 && get(&cpu, 0xB02) == 0)
+    cpu.r[1] = 17
+    hop(&cpu, 0xB0209073) // CSRRW x0,minstret,x1
+    assert(cpu.cs.instret == 0x100000011)
+    set(&cpu, 0x320, 5)
+    val cycle = cpu.cs.cycle
+    hop(&cpu, 0x00000013)
+    assert(cpu.cs.cycle == cycle && cpu.cs.instret == 0x100000011)
+
+@test("Hazard3 Xh3irq: window indexing, padding, priority ties, forced acknowledge and read suppression")
+h3_irq_windows()
+    var ram: [256]u8
+    var cpu: Cpu
+    hstart(&cpu, ram)
+    set(&cpu, 0xBE0, 0xFFFF0003)
+    assert(get(&cpu, 0xBE0, 3) == 0x000F0000)
+    assert(get(&cpu, 0xBE0, 4) == 0)
+    assert(get(&cpu, 0xBE0) == 0) // windows do not retain an index.
+    set(&cpu, 0xBE3, 0xF321000C) // priorities for IRQ 48..51
+    assert(get(&cpu, 0xBE3, 12) == 0xF3210000)
+    set(&cpu, 0xBE2, 0x000F0003)
+    assert(get(&cpu, 0xBE1, 3) == 0x000F0000)
+    assert(get(&cpu, 0xBE4) == 51 * 4)
+    assert(get(&cpu, 0xBE1, 3) == 0x00070000)
+    set(&cpu, 0xBE3, 0xFFFF000C)
+    assert(get(&cpu, 0xBE4) == 48 * 4) // equal priority: lowest number wins.
+    set(&cpu, 0xBE2, 0x00010003)
+    // CSRRW rd=x0 has no read side effect: writing MENEXT must not acknowledge.
+    set(&cpu, 0xBE4, 0)
+    assert(get(&cpu, 0xBE2, 3) == 0x00010000)
+    assert(!irq(&cpu, 52, true))
+
+@test("Hazard3 Xh3irq: nested priorities, vectored entry, context push/pop and CLEARTS")
+h3_irq_nesting()
+    var ram: [256]u8
+    var cpu: Cpu
+    hstart(&cpu, ram)
+    cpu.cs.mtvec = 129
+    cpu.cs.mie = 0x888
+    cpu.cs.mstatus |= 8
+    set(&cpu, 0xBE0, 0x00030000)
+    set(&cpu, 0xBE3, 0x00210000) // IRQ 0 priority 1; IRQ 1 priority 2.
+    assert(irq(&cpu, 0, true))
+    run(&cpu, 1)
+    assert(cpu.cs.mcause == 0x8000000B && cpu.pc == 172 && cpu.retired == 0)
+    assert(((cpu.cs.context >> 16) & 31) == 2 && (cpu.cs.context & 1) != 0)
+    assert(csr_access(&cpu, 0xBE4, 2, 1, true, true).unwrap() == 0)
+    val outer = cpu.cs.context
+    val outer_status = cpu.cs.mstatus
+    val outer_epc = cpu.cs.mepc
+    assert(irq(&cpu, 1, true))
+    cpu.cs.mstatus |= 8
+    run(&cpu, 1)
+    assert(((cpu.cs.context >> 24) & 15) == 2 && ((cpu.cs.context >> 16) & 31) == 3)
+    assert(csr_access(&cpu, 0xBE4, 2, 1, true, true).unwrap() == 4)
+    assert(irq(&cpu, 1, false))
+    hop(&cpu, 0x30200073)
+    assert(((cpu.cs.context >> 16) & 31) == 2)
+    set(&cpu, 0xBE5, outer)
+    cpu.cs.mstatus = outer_status & ~8u32
+    cpu.cs.mepc = outer_epc
+    hop(&cpu, 0x30200073)
+    assert(((cpu.cs.context >> 16) & 31) == 0)
+    cpu.cs.mie = 0x888
+    val old = csr_access(&cpu, 0xBE5, 2, 2, true, true).unwrap()
+    assert((old & 12) == 12 && cpu.cs.mie == 0x800)
+    set(&cpu, 0xBE5, 12)
+    assert(cpu.cs.mie == 0x888)
+
+@test("Hazard3 Xh3pmpm: RP2350 reset map, NAPOT granularity, locks and unlocked M-mode enforcement")
+h3_pmp_configuration()
+    var ram: [256]u8
+    var cpu: Cpu
+    hstart(&cpu, ram)
+    assert(get(&cpu, 0x3A2) == 0x001F1F1F && get(&cpu, 0x3A3) == 0)
+    assert(get(&cpu, 0x3B8) == 0x01FFFFFF && get(&cpu, 0x3B9) == 0x13FFFFFF)
+    set(&cpu, 0x3A2, 0)
+    assert(get(&cpu, 0x3A2) == 0x001F1F1F)
+    set(&cpu, 0x3B0, 16) // address 64, minimum 32-byte NAPOT region
+    set(&cpu, 0x3A0, 0x1D) // read/execute, no write (RP2350-E6)
+    set(&cpu, 0xBD0, 1)
+    assert(get(&cpu, 0xBD0) == 1)
+    assert(pmp_allows(&cpu, 64, 4, 1) && pmp_allows(&cpu, 64, 4, 0) && !pmp_allows(&cpu, 64, 4, 2))
+    set(&cpu, 0xBD0, 0)
+    assert(pmp_allows(&cpu, 64, 4, 2))
+    set(&cpu, 0x3A0, 0x9D)
+    set(&cpu, 0x3B0, 128)
+    set(&cpu, 0x3A0, 0x1F)
+    assert(get(&cpu, 0x3A0) == 0x9D && !pmp_allows(&cpu, 64, 4, 2))
+    hstart(&cpu, ram)
+    set(&cpu, 0x3A0, 0x10) // NA4 is not supported at the RP2350 granularity.
+    assert(get(&cpu, 0x3A0) == 0)
+    set(&cpu, 0x3A0, 8) // TOR is not supported.
+    assert(get(&cpu, 0x3A0) == 0)
+
+@test("Hazard3 PMP checks R/X swap, MPRV, first-match precedence and split instruction fetch")
+h3_pmp_faults()
+    var ram: [256]u8
+    var cpu: Cpu
+    hstart(&cpu, ram)
+    set(&cpu, 0x3B0, 16)
+    set(&cpu, 0x3A0, 0x19) // execute-only region at64..95, R=0
+    set(&cpu, 0xBD0, 1)
+    cpu.r[1] = 64
+    cpu.cs.mtvec = 128
+    hop(&cpu, 0x0000A183)
+    assert(cpu.cs.mcause == 5 && cpu.pc == 128)
+    hop(&cpu, 0x0020A023)
+    assert(cpu.cs.mcause == 7)
+    // Fetch crossing 62..65 partially matches the higher-priority region at64.
+    cpu.pc = 62
+    cpu.stop = Stop.Budget
+    instruction_put_word(ram, 62, 0x00000013, 4)
+    run(&cpu, 1)
+    assert(cpu.cs.mcause == 1 && cpu.cs.mepc == 62)
+    // MPRV routes data permissions through MPP, while fetching still uses M-mode.
+    hstart(&cpu, ram)
+    cpu.cs.mstatus = 0x20000
+    assert(!pmp_allows(&cpu, 0x20000000, 4, 1) && pmp_allows(&cpu, 0x20000000, 4, 0))
+    set(&cpu, 0x3B0, 0x08000003)
+    set(&cpu, 0x3A0, 0x1C) // read-only U-mode SRAM window
+    assert(pmp_allows(&cpu, 0x20000000, 4, 1) && !pmp_allows(&cpu, 0x20000000, 4, 2))
+
+private check_power()
+    var ram: [256]u8
+    var a: Cpu
+    var b: Cpu
+    hstart(&a, ram)
+    hstart(&b, ram)
+    assert(pair(&a, &b))
+    set(&a, 0xBF0, 0xFFFFFFFF)
+    assert(get(&a, 0xBF0) == 7)
+    hop(&a, 0x00002033) // H3.BLOCK
+    assert(a.stop == Stop.Sleep && a.pc == 4 && a.retired == 1 && a.sleep_kind == 2 && sleep_depth(&a) == 3)
+    run(&a, 100)
+    assert(a.stop == Stop.Sleep && a.retired == 1)
+    hop(&b, 0x00102033) // H3.UNBLOCK: RP2350 feedback also reaches the sender.
+    assert(a.stop == Stop.Budget && !a.event && b.event)
+    hop(&a, 0x00002033)
+    assert(a.stop == Stop.Sleep) // the unblock is consumed by the blocked instruction.
+    hop(&b, 0x00002033)
+    assert(b.stop == Stop.Budget && !b.event) // pre-arriving event falls through.
+    hop(&b, 0x00002033)
+    assert(b.stop == Stop.Sleep)
+    notify_unblock(&b)
+    b.cs.privilege = 0
+    b.cs.mstatus |= 0x200000
+    b.cs.mtvec = 128
+    hop(&b, 0x00102033)
+    assert(b.cs.mcause == 2 && b.pc == 128)
+    unpair(&a)
+    assert(a.peer == null && b.peer == null)
+
+@test("Hazard3 instruction WFI: pending enabled interrupts wake with global MIE clear; TW traps U-mode")
+h3_wfi()
+    var ram: [256]u8
+    var cpu: Cpu
+    hstart(&cpu, ram)
+    hop(&cpu, 0x10500073)
+    assert(cpu.stop == Stop.Sleep && cpu.pc == 4 && cpu.retired == 1)
+    cpu.cs.mie = 8
+    interrupt_inputs(&cpu, true, false)
+    instruction_put_word(ram, 4, 0x02A00193, 4)
+    run(&cpu, 1)
+    assert(cpu.stop == Stop.Budget && cpu.pc == 8 && cpu.r[3] == 42 && cpu.retired == 2)
+    hstart(&cpu, ram)
+    cpu.cs.privilege = 0
+    cpu.cs.mstatus = 0x200000
+    cpu.cs.mtvec = 128
+    hop(&cpu, 0x10500073)
+    assert(cpu.cs.mcause == 2 && cpu.retired == 0)
+
+@test("Hazard3 atomics LR.W/SC.W: success, repeated failure, overlapping byte/halfword stores and peer interference")
+h3_reservations()
+    var ram: [256]u8
+    var a: Cpu
+    var b: Cpu
+    hstart(&a, ram)
+    hstart(&b, ram)
+    assert(pair(&a, &b))
+    a.r[1] = 64
+    a.r[2] = 0xAABBCCDD
+    write(&a, 64, 4, 0x11223344)
+    hop(&a, 0x1000A1AF) // LR.W x3,(x1)
+    assert(a.reserved && a.r[3] == 0x11223344)
+    hop(&a, 0x1820A1AF) // SC.W x3,x2,(x1)
+    assert(!a.reserved && a.r[3] == 0 && read(&a, 64, 4) == 0xAABBCCDD)
+    hop(&a, 0x1820A1AF)
+    assert(a.r[3] == 1)
+    for width in [1u32, 2, 4]
+        hop(&a, 0x1000A1AF)
+        assert(a.reserved)
+        write(&b, 64, width, 0)
+        assert(!a.reserved)
+        hop(&a, 0x1820A1AF)
+        assert(a.r[3] == 1)
+    hop(&a, 0x1000A1AF)
+    write(&b, 80, 4, 0)
+    assert(a.reserved)
+    hop(&a, 0x1820A1AF)
+    assert(a.r[3] == 0)
+    hop(&a, 0x1000A1AF)
+    hop(&a, 0xFFFFFFFF)
+    assert(!a.reserved && a.cs.mcause == 2)
+    unpair(&a)
+
+@test("Hazard3 atomics reject misalignment, unmapped/PMP-denied addresses and reserved encodings without writes")
+h3_atomic_faults()
+    var ram: [256]u8
+    var cpu: Cpu
+    for op in [0u32, 1, 2, 3, 4, 8, 12, 16, 20, 24, 28]
+        for address in [65u32, 66, 67, 256]
+            hstart(&cpu, ram)
+            cpu.r[1] = address
+            cpu.r[2] = 0xFFFFFFFF
+            cpu.r[3] = 0x12345678
+            cpu.cs.mtvec = 128
+            val code = (op << 27) | (if op == 2 then 0u32 else 2 << 20) | 0x0000A1AF
+            hop(&cpu, code)
+            val cause: u32 = if op == 2 then (if address < 256 then 4 else 5) else (if address < 256 then 6 else 7)
+            assert(cpu.cs.mcause == cause && cpu.pc == 128 && cpu.retired == 0 && cpu.r[3] == 0x12345678)
+    hstart(&cpu, ram)
+    cpu.r[1] = 64
+    cpu.r[2] = 1
+    cpu.r[3] = 123
+    write(&cpu, 64, 4, 7)
+    set(&cpu, 0x3B0, 16)
+    set(&cpu, 0x3A0, 0x1C) // readable, not writable
+    set(&cpu, 0xBD0, 1)
+    hop(&cpu, 0x0020A1AF)
+    assert(cpu.cs.mcause == 7 && cpu.r[3] == 123)
+    cpu.access = 1
+    assert(read(&cpu, 64, 4) == 7)
+    for code in [0x1020A1AFu32, 0x100091AF, 0x2820A1AF]
+        hstart(&cpu, ram)
+        hop(&cpu, code)
+        assert(cpu.cs.mcause == 2)
+
+private check_stack(family: u32)
+    var ram: [512]u8
+    var cpu: Cpu
+    val registers: []u32 = [1, 8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+    for list in 4u32..<16
+        for extra in 0u32..<4
+            hstart(&cpu, ram)
+            val count = if list == 15 then 13u32 else list - 3
+            val adjustment = ((count * 4 + 15) & ~15u32) + extra * 16
+            cpu.r[2] = 256
+            for i in 0u32..<count do cpu.r[registers[i]] = 0x1000 + i * 17
+            hop(&cpu, 0xB802 | (list << 4) | (extra << 2), true)
+            assert(cpu.r[2] == 256 - adjustment && cpu.pc == 2 && cpu.retired == 1)
+            for i in 0u32..<count
+                cpu.access = 1
+                assert(read(&cpu, 256 - count * 4 + i * 4, 4) == 0x1000 + i * 17)
+                cpu.r[registers[i]] = 0
+            cpu.r[10] = 99
+            hop(&cpu, family | (list << 4) | (extra << 2), true)
+            assert(cpu.stop == Stop.Budget && cpu.r[2] == 256 && cpu.retired == 2)
+            for i in 0u32..<count do assert(cpu.r[registers[i]] == 0x1000 + i * 17)
+            assert(cpu.pc == (if family == 0xBA02 then 2u32 else 0x1000))
+            assert(cpu.r[10] == (if family == 0xBC02 then 0u32 else 99))
+
+@test("Hazard3 instruction CM.PUSH: every register-list/stack-adjust encoding and saved layout")
+h3_push() = check_stack(0xBA02)
+@test("Hazard3 instruction CM.POP: every register-list/stack-adjust encoding and restore")
+h3_pop() = check_stack(0xBA02)
+@test("Hazard3 instruction CM.POPRET: atomic stack adjustment and halfword return")
+h3_popret() = check_stack(0xBE02)
+@test("Hazard3 instruction CM.POPRETZ: stack restore, a0 clearing and return")
+h3_popretz() = check_stack(0xBC02)
+
+private check_double_move(to_saved: bool)
+    var ram: [256]u8
+    var cpu: Cpu
+    for first in 0u32..<8
+        for second in 0u32..<8
+            hstart(&cpu, ram)
+            val a = if first < 2 then first + 8 else first + 16
+            val b = if second < 2 then second + 8 else second + 16
+            cpu.r[a] = 100 + a
+            cpu.r[b] = 100 + b
+            cpu.r[10] = 0x12345678
+            cpu.r[11] = 0x87654321
+            val code = (if to_saved then 0xAC22u32 else 0xAC62) | (first << 7) | (second << 2)
+            hop(&cpu, code, true)
+            if to_saved && a == b
+                assert(cpu.cs.mcause == 2 && cpu.retired == 0)
+            elif to_saved
+                assert(cpu.r[a] == 0x12345678 && cpu.r[b] == 0x87654321 && cpu.retired == 1)
+            else
+                assert(cpu.r[10] == 100 + a && cpu.r[11] == 100 + b && cpu.retired == 1)
+
+@test("Hazard3 instruction CM.MVSA01: all register pairs and reserved identical destinations")
+h3_mvsa01() = check_double_move(true)
+@test("Hazard3 instruction CM.MVA01S: all register pairs including identical sources")
+h3_mva01s() = check_double_move(false)
+
+@test("Hazard3 Zcmp faults are restartable: completed transfers survive but SP/a0/return do not commit")
+h3_zcmp_faults()
+    var ram: [256]u8
+    var cpu: Cpu
+    hstart(&cpu, ram)
+    cpu.r[2] = 260
+    cpu.r[1] = 0x11223344
+    cpu.r[8] = 0x55667788
+    cpu.cs.mtvec = 128
+    hop(&cpu, 0xB852, true) // PUSH {ra,s0}: first store252 succeeds, second256 faults.
+    assert(cpu.cs.mcause == 7 && cpu.r[2] == 260 && cpu.retired == 0)
+    cpu.access = 1
+    assert(read(&cpu, 252, 4) == 0x11223344)
+    hstart(&cpu, ram)
+    cpu.r[2] = 244
+    cpu.r[1] = 0x1234
+    cpu.r[10] = 99
+    cpu.cs.mtvec = 128
+    write(&cpu, 252, 4, 0x5678)
+    hop(&cpu, 0xBC52, true) // POPRETZ {ra,s0}: a partial restore is visible, final effects are not.
+    assert(cpu.cs.mcause == 5 && cpu.r[1] == 0x5678 && cpu.r[2] == 244 && cpu.r[10] == 99 && cpu.retired == 0)
+    for list in 0u32..<4
+        for family in [0xB802u32, 0xBA02, 0xBC02, 0xBE02]
+            hstart(&cpu, ram)
+            hop(&cpu, family | (list << 4), true)
+            assert(cpu.cs.mcause == 2)
+
+@test("Hazard3 instruction H3.BLOCK: paired wake, pending events, TW and no double consumption")
+h3_block() = check_power()
+@test("Hazard3 instruction H3.UNBLOCK: peer notification, sender feedback and TW gating")
+h3_unblock() = check_power()
+
+@test("Hazard3 Xh3irq: all 52 input bits and priority windows, unimplemented windows and CSRRC side effects")
+h3_all_irq_windows()
+    var ram: [256]u8
+    var cpu: Cpu
+    for number in 0u32..<52
+        hstart(&cpu, ram)
+        val window = number / 16
+        val mask = (1u32 << (number % 16)) << 16
+        set(&cpu, 0xBE0, mask | window)
+        set(&cpu, 0xBE2, mask | window)
+        set(&cpu, 0xBE3, (15u32 << (16 + 4 * (number % 4))) | (number / 4))
+        assert(get(&cpu, 0xBE1, window) == mask)
+        assert(get(&cpu, 0xBE4) == number * 4)
+        assert(get(&cpu, 0xBE4) == 0x80000000)
+    hstart(&cpu, ram)
+    for window in 4u32..<32
+        set(&cpu, 0xBE0, 0xFFFF0000 | window)
+        set(&cpu, 0xBE2, 0xFFFF0000 | window)
+        assert(get(&cpu, 0xBE0, window) == 0 && get(&cpu, 0xBE1, window) == 0)
+    for window in 13u32..<128
+        set(&cpu, 0xBE3, 0xFFFF0000 | window)
+        assert(get(&cpu, 0xBE3, window) == 0)
+    cpu.cs.mie = 0x888
+    val read = csr_access(&cpu, 0xBE5, 3, 2, true, true).unwrap()
+    assert((read & 12) == 0 && cpu.cs.mie == 0x888) // CSRRC does not assert CLEARTS.
+
+@test("Hazard3 RP2350 reservation granules: same-hart stores, other-word interference and lost-reservation unblock")
+h3_granules()
+    var ram: [256]u8
+    var a: Cpu
+    var b: Cpu
+    hstart(&a, ram)
+    hstart(&b, ram)
+    assert(pair(&a, &b))
+    a.r[1] = 64
+    a.r[2] = 42
+    hop(&a, 0x1000A1AF)
+    write(&a, 68, 4, 99)
+    assert(a.reserved)
+    hop(&a, 0x00002033)
+    assert(a.stop == Stop.Sleep)
+    write(&b, 76, 4, 17)
+    assert(!a.reserved && a.stop == Stop.Budget)
+    hop(&a, 0x1000A1AF)
+    a.r[1] = 68
+    hop(&a, 0x1820A1AF)
+    assert(a.r[3] == 0 && read(&a, 68, 4) == 42)
+    hop(&a, 0x1000A1AF)
+    external_write(&a, 64, 4, 123)
+    assert(!a.reserved && a.event)
+    unpair(&a)
+
+@test("Hazard3 RP2350-E7: global MIE masks U-mode interrupts and MRET restores MPIE")
+h3_e7()
+    var ram: [256]u8
+    var cpu: Cpu
+    hstart(&cpu, ram)
+    cpu.cs.privilege = 0
+    cpu.cs.mie = 8
+    interrupt_inputs(&cpu, true, false)
+    hop(&cpu, 0x02A00193)
+    assert(cpu.cs.privilege == 0 && cpu.r[3] == 42 && cpu.retired == 1)
+    cpu.cs.mstatus |= 8
+    cpu.cs.mtvec = 128
+    run(&cpu, 1)
+    assert(cpu.cs.mcause == 0x80000003 && cpu.cs.privilege == 3 && cpu.retired == 1 && cpu.pc == 128)
+
+@test("Hazard3 MSLEEP: functional clock-gate/power-down requests respect SLEEPONBLOCK")
+h3_sleep_requests()
+    var ram: [256]u8
+    var cpu: Cpu
+    for config in 0u32..<8
+        hstart(&cpu, ram)
+        set(&cpu, 0xBF0, config)
+        hop(&cpu, 0x00002033)
+        val depth: u32 = if (config & 4) == 0 then 1 elif (config & 2) != 0 then 3 elif (config & 1) != 0 then 2 else 1
+        assert(sleep_depth(&cpu) == depth)
+        hstart(&cpu, ram)
+        set(&cpu, 0xBF0, config)
+        hop(&cpu, 0x10500073)
+        assert(sleep_depth(&cpu) == (if (config & 2) != 0 then 3u32 elif (config & 1) != 0 then 2u32 else 1u32))

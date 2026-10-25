@@ -1,7 +1,7 @@
 # benchtop — a microcontroller board emulator written in sysl
 
 **Status: twelve scalar Cortex-M models run in `sh.sysl.benchtop.v6m` on virtual boards (§11).
-The initial RISC-V interpreter also runs RV32I/M/C profiles through `bench --core`.
+The RISC-V interpreter runs RV32I/M/C and the RP2350 Hazard3 profile through `bench --core`.
 Core options and implemented subsets are described in the README and §2.12. No real board is
 emulated yet; the real-chip peripherals and optional CPU extensions below remain design.** The repo is `sysl-lang/benchtop`.
 
@@ -30,9 +30,10 @@ description, not another emulator.
    user owns both.
 5. **RISC-V support started (2026-10-25):** the RP2350's Hazard3 cores are now in scope.
    The shared RISC-V interpreter runs RV32I/M/C profiles; chip descriptions name them as cores
-   through the existing registry and checker. `hazard3` declares the RP2350 ISA but refuses
-   execution until its remaining extensions and privileged state exist. See the README's
-   RISC-V section for the implemented subset and the remaining board work. The bus, devices,
+   through the existing registry and checker. `hazard3` now executes the RP2350 standard ISA,
+   Machine/User traps, PMP, interrupts and Xh3bextm/Xh3power/Xh3irq/Xh3pmpm extensions. Paired
+   harts are scheduled on one host thread. See the README for the functional model's limits
+   and the remaining RP2350 board/boot/device work. The bus, devices,
    virtual time and panel remain shared architecture goals.
 
 **One `Core`, many `CoreKind`s** (§2.1): an M33 (`V8MMain` with `security`), an M0+ (`V6M`), an M7

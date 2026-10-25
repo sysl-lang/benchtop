@@ -1,0 +1,208 @@
+module sh.sysl.benchtop.riscv
+
+// RP2350 Hazard3 v1.0-rc1, not the newer upstream core. Single-threaded harts may
+// share RAM with pair(); all guest stores must pass through write() for LR/SC coherence.
+struct Machine
+    privilege: u32
+    mstatus: u32
+    mie: u32
+    mip: u32
+    mtvec: u32
+    mscratch: u32
+    mepc: u32
+    mcause: u32
+    mcounteren: u32
+    inhibit: u32
+    cycle: u64
+    instret: u64
+    wrote_instret: bool
+    enabled: u64
+    pending: u64
+    forced: u64
+    priority: [52]u8
+    context: u32
+    sleep: u32
+    cfgm: u32
+    pmpcfg: [16]u8
+    pmpaddr: [16]u32
+
+private[riscv] reset_machine(cpu: *Cpu)
+    var state: Machine
+    state.privilege = 3
+    state.mstatus = 0x1800
+    state.context = 0x8000
+    state.inhibit = 5
+    for i in 8..<11 do state.pmpcfg[i] = 0x1F
+    state.pmpaddr[8] = 0x01FFFFFF
+    state.pmpaddr[9] = 0x13FFFFFF
+    state.pmpaddr[10] = 0x35FFFFFF
+    cpu.cs = state
+    cpu.peer = null
+    cpu.hart = 0
+    cpu.reserved = false
+    cpu.reservation = 0
+    cpu.event = false
+    cpu.sleep_kind = 0
+    cpu.pending_sleep = false
+    cpu.halt_breakpoint = false
+    cpu.halt_faults = false
+    cpu.access = 1
+    cpu.instruction = 0
+
+// Pairs are scheduled sequentially by the caller. No hidden global state or host threads.
+pair(a: *Cpu, b: *Cpu) -> bool
+    if a == b || a.ram.len == 0 || a.ram.len != b.ram.len || a.base != b.base then return false
+    if &a.ram[0] != &b.ram[0] || a.peer != null || b.peer != null then return false
+    a.peer = b
+    b.peer = a
+    a.hart = 0
+    b.hart = 1
+    a.reserved = false
+    b.reserved = false
+    true
+
+unpair(cpu: *Cpu)
+    if cpu.peer != null
+        cpu.peer.peer = null
+        cpu.peer.reserved = false
+    cpu.peer = null
+    cpu.reserved = false
+
+private[riscv] reservation_tag(cpu: *Cpu, address: u32) -> u32 = address & (if cpu.model.name == "hazard3" then ~15u32 else ~3u32)
+
+private[riscv] invalidate(cpu: *Cpu, address: u32, width: u32)
+    // The RP2350 global monitor preserves a PE's reservation on its own ordinary stores.
+    // A different PE's store to any byte of its 16-byte granule invalidates and signals it.
+    if cpu.model.name != "hazard3" && cpu.reserved && reservation_tag(cpu, address) == cpu.reservation then cpu.reserved = false
+    if cpu.peer != null
+        val other = cpu.peer
+        if other.reserved && reservation_tag(other, address) == other.reservation
+            other.reserved = false
+            notify_unblock(other)
+
+/** A DMA/debugger store is from a different master, so it also invalidates this hart. */
+external_write(cpu: *Cpu, address: u32, width: u32, value: u32) -> bool
+    if width != 1 && width != 2 && width != 4 then return false
+    if (address & (width - 1)) != 0 || address < cpu.base || u64(address - cpu.base) + u64(width) > u64(cpu.ram.len) then return false
+    val own = cpu.reserved && reservation_tag(cpu, address) == cpu.reservation
+    for i in 0u32..<width do cpu.ram[address - cpu.base + i] = u8(value >> (8 * i))
+    invalidate(cpu, address, width)
+    if own
+        cpu.reserved = false
+        notify_unblock(cpu)
+    true
+
+/** Observable functional power request: 0 running, 1 stalled, 2 clock gated, 3 power down. */
+sleep_depth(cpu: *Cpu) -> u32
+    if cpu.stop != Stop.Sleep then return 0
+    if cpu.sleep_kind == 2 && (cpu.cs.sleep & 4) == 0 then return 1
+    if (cpu.cs.sleep & 2) != 0 then return 3
+    if (cpu.cs.sleep & 1) != 0 then return 2
+    1
+
+notify_unblock(cpu: *Cpu)
+    cpu.event = true
+    if cpu.stop == Stop.Sleep && cpu.sleep_kind == 2
+        cpu.stop = Stop.Budget
+        cpu.event = false
+
+private[riscv] send_unblock(cpu: *Cpu)
+    notify_unblock(cpu)
+    if cpu.peer != null then notify_unblock(cpu.peer)
+
+/** Level-sensitive external IRQ input, 0..51. Returns false for an invalid input. */
+irq(cpu: *Cpu, number: u32, asserted: bool) -> bool
+    if !has(cpu.model, EXT_H3IRQ) || number >= 52 then return false
+    val mask = 1u64 << number
+    if asserted then cpu.cs.pending |= mask else cpu.cs.pending &= ~mask
+    true
+
+/** Machine software/timer input levels; their pending CSR bits are read-only on RP2350. */
+interrupt_inputs(cpu: *Cpu, software: bool, timer: bool)
+    cpu.cs.mip = (if software then 8u32 else 0) | (if timer then 128u32 else 0)
+
+private[riscv] next_irq(cpu: *Cpu, threshold: u32) -> int
+    val active = (cpu.cs.pending | cpu.cs.forced) & cpu.cs.enabled
+    var best = -1
+    var priority: u32 = 0
+    for i in 0..<52
+        val p = u32(cpu.cs.priority[i])
+        if (active & (1u64 << u32(i))) != 0 && p >= threshold && (best < 0 || p > priority)
+            best = i
+            priority = p
+    best
+
+private[riscv] pending_bits(cpu: *Cpu) -> u32
+    cpu.cs.mip | (if next_irq(cpu, (cpu.cs.context >> 16) & 31) >= 0 then 0x800u32 else 0)
+
+private[riscv] trap(cpu: *Cpu, cause: u32)
+    val status = cpu.cs.mstatus
+    cpu.cs.mepc = cpu.pc & ~1u32
+    cpu.cs.mcause = cause & 0x8000000F
+    cpu.cs.mstatus = (status & ~0x1888u32) | ((status & 8) << 4) | (cpu.cs.privilege << 11)
+    cpu.cs.privilege = 3
+    cpu.reserved = false
+    if cause == 0x8000000B
+        val n = next_irq(cpu, (cpu.cs.context >> 24) & 15)
+        val level = if n < 0 then 16u32 else u32(cpu.cs.priority[n]) + 1
+        val context = cpu.cs.context
+        cpu.cs.context = (context & 0x00009FF0) | (((context >> 24) & 15) << 28) | (((context >> 16) & 15) << 24) | (level << 16) | 1
+    else
+        cpu.cs.context &= ~1u32
+    cpu.pc = (cpu.cs.mtvec & ~3u32) + (if (cause & 0x80000000) != 0 && (cpu.cs.mtvec & 1) != 0 then (cause & 15) * 4 else 0)
+    cpu.stop = Stop.Budget
+    cpu.sleep_kind = 0
+
+private[riscv] take_interrupt(cpu: *Cpu) -> bool
+    if !has(cpu.model, EXT_PRIV) then return false
+    val pending = pending_bits(cpu) & cpu.cs.mie
+    // RP2350-E7: unlike later Hazard3 revisions, MIE also masks interrupts in U-mode.
+    if pending == 0 || ((cpu.cs.privilege == 3 || cpu.model.name == "hazard3") && (cpu.cs.mstatus & 8) == 0) then return false
+    val number: u32 = if (pending & 0x800) != 0 then 11 elif (pending & 8) != 0 then 3 else 7
+    trap(cpu, 0x80000000 | number)
+    true
+
+private[riscv] return_from_trap(cpu: *Cpu) -> u32
+    val status = cpu.cs.mstatus
+    cpu.cs.privilege = (status >> 11) & 3
+    cpu.cs.mstatus = (status & ~0x1888u32) | ((status >> 4) & 8) | 128
+    if cpu.cs.privilege != 3 then cpu.cs.mstatus &= ~0x20000u32
+    val context = cpu.cs.context
+    cpu.cs.context &= ~1u32
+    if (context & 1) != 0 then cpu.cs.context = (context & 0x00009FF0) | (((context >> 28) & 15) << 24) | (((context >> 24) & 15) << 16)
+    cpu.reserved = false
+    cpu.cs.mepc
+
+private[riscv] resolve_fault(cpu: *Cpu)
+    if cpu.halt_faults || !has(cpu.model, EXT_PRIV) || cpu.stop == Stop.Budget || cpu.stop == Stop.Sleep then return
+    if cpu.stop == Stop.Breakpoint && cpu.halt_breakpoint then return
+    val cause: u32 = cpu.stop match
+        Breakpoint -> 3
+        Ecall -> if cpu.cs.privilege == 3 then 11 else 8
+        Misaligned -> if cpu.access == 0 then 0 elif cpu.access == 1 then 4 else 6
+        Unmapped | AccessFault -> if cpu.access == 0 then 1 elif cpu.access == 1 then 5 else 7
+        _ -> 2
+    trap(cpu, cause)
+
+private[riscv] pmp_allows(cpu: *Cpu, address: u32, width: u32, access: u32) -> bool
+    if !has(cpu.model, EXT_PRIV) then return true
+    var privilege = cpu.cs.privilege
+    if access != 0 && (cpu.cs.mstatus & 0x20000) != 0 then privilege = (cpu.cs.mstatus >> 11) & 3
+    // Lowest numbered region matching any byte wins; a partial match always faults.
+    for i in 0..<16
+        val cfg = u32(cpu.cs.pmpcfg[i])
+        if (cfg & 24) == 0 then continue
+        var trailing: u32 = 0
+        val encoded = cpu.cs.pmpaddr[i]
+        while trailing < 30 && ((encoded >> trailing) & 1) != 0 do trailing += 1
+        val size = 1u64 << (trailing + 3)
+        val lower = (u64(encoded) << 2) & ~(size - 1)
+        val upper = lower + size
+        val end = u64(address) + u64(width)
+        if u64(address) >= upper || end <= lower then continue
+        if u64(address) < lower || end > upper then return false
+        if privilege == 3 && (cfg & 128) == 0 && (cpu.cs.cfgm & (1u32 << u32(i))) == 0 then return true
+        // RP2350-E6: permission bit zero is X, bit two is R.
+        val permission: u32 = if access == 0 then 1 elif access == 1 then 4 else 2
+        return (cfg & permission) != 0
+    privilege == 3

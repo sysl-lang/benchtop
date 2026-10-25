@@ -23,8 +23,9 @@ sysl test . --filter RV32
 ```
 
 `chip.hocon` demonstrates core names in the shared description format. It is not yet a
-runnable board; neither the bare ISA profiles nor the interpreter implement an interrupt
-controller or RP2350 devices.
+runnable board. Bare ISA profiles have no interrupt controller; `hazard3.hocon` uses the
+executable Hazard3 profile, whose core-local interrupt controller is implemented. Neither
+configuration supplies RP2350 devices or a firmware boot protocol.
 
 Every implemented mnemonic also has a named instruction unit test and a row in
 [the coverage matrix](../../sh/sysl/benchtop/riscv/COVERAGE.md). The independent Python
@@ -40,3 +41,20 @@ sysl test . --filter "RV32 instruction"
 
 These cover targeted architectural boundaries; they do not enumerate every possible
 operand or machine-state combination. No claim is made for unimplemented instructions.
+
+`kernel-hazard3.bin` is compiled with the RP2350 standard ISA string, including Zcb/Zcmp:
+
+```sh
+./benchtop bench --core hazard3 examples/riscv/kernel-hazard3.bin 3132271724
+./benchtop check --chip examples/riscv/hazard3.hocon
+python3 examples/riscv/generate-hazard3-tests.py
+python3 examples/riscv/generate-hazard3-tests.py --check
+sysl test . --filter Hazard3
+```
+
+The [Hazard3 coverage matrix](../../sh/sysl/benchtop/riscv/HAZARD3-COVERAGE.md) lists the
+additional instruction vectors. Named tests cover all six CSR operations, MRET/WFI, the
+custom power instructions, all Zcmp instructions, IRQ window side effects/nesting, PMP
+configuration/faults, reservation interference and the RP2350 E6/E7 behavior. The
+interpreter is functional and uses a sequential scheduler; cycle/power timing, debug
+machinery and physical-board differential validation are not claimed.

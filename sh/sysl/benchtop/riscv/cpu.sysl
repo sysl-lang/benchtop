@@ -12,6 +12,8 @@ enum Stop
     Undefined
     Misaligned
     Unmapped
+    AccessFault
+    Sleep
 
 struct Cpu
     model: Model
@@ -22,8 +24,21 @@ struct Cpu
     stop_at: u32
     ram: []u8
     base: u32
+    cs: Machine
+    peer: *Cpu
+    hart: u32
+    reserved: bool
+    reservation: u32
+    event: bool
+    sleep_kind: u32
+    pending_sleep: bool
+    halt_faults: bool
+    halt_breakpoint: bool
+    access: u32
+    instruction: u32
 
 reset(cpu: *Cpu, model: Model, ram: []u8, base: u32, entry: u32)
+    if cpu.peer != null then unpair(cpu)
     cpu.model = model
     for i in 0..<32 do cpu.r[i] = 0
     cpu.pc = entry
@@ -32,12 +47,13 @@ reset(cpu: *Cpu, model: Model, ram: []u8, base: u32, entry: u32)
     cpu.stop_at = entry
     cpu.ram = ram
     cpu.base = base
+    reset_machine(cpu)
 
-private fail(cpu: *Cpu, why: Stop, at: u32)
+private[riscv] fail(cpu: *Cpu, why: Stop, at: u32)
     cpu.stop = why
     cpu.stop_at = at
 
-private accessible(cpu: *Cpu, address: u32, width: u32) -> bool
+private[riscv] accessible(cpu: *Cpu, address: u32, width: u32) -> bool
     if (address & (width - 1)) != 0
         fail(cpu, Stop.Misaligned, address)
         return false
@@ -51,6 +67,9 @@ read(cpu: *Cpu, address: u32, width: u32) -> u32
         fail(cpu, Stop.Unmapped, address)
         return 0
     if !accessible(cpu, address, width) then return 0
+    if !pmp_allows(cpu, address, width, cpu.access)
+        fail(cpu, Stop.AccessFault, address)
+        return 0
     var value: u32 = 0
     for i in 0u32..<width do value |= u32(cpu.ram[address - cpu.base + i]) << (8 * i)
     value
@@ -60,6 +79,10 @@ write(cpu: *Cpu, address: u32, width: u32, value: u32)
         fail(cpu, Stop.Unmapped, address)
         return
     if !accessible(cpu, address, width) then return
+    if !pmp_allows(cpu, address, width, 2)
+        fail(cpu, Stop.AccessFault, address)
+        return
+    invalidate(cpu, address, width)
     for i in 0u32..<width do cpu.ram[address - cpu.base + i] = u8(value >> (8 * i))
 
 private sext(value: u32, bits: u32) -> u32 = u32(i32(value << (32 - bits)) >> (32 - bits))
@@ -87,6 +110,7 @@ private multiply(op: u32, a: u32, b: u32) -> u32 = op match
 
 // Execute a canonical 32-bit instruction. Compressed encodings expand into this same path.
 private execute(cpu: *Cpu, insn: u32, length: u32)
+    cpu.access = 1
     val rd = (insn >> 7) & 31
     val rs1 = (insn >> 15) & 31
     val rs2 = (insn >> 20) & 31
@@ -99,6 +123,22 @@ private execute(cpu: *Cpu, insn: u32, length: u32)
     var result: u32 = 0
     var put = true
     var valid = true
+
+    if has(cpu.model, EXT_H3POWER) && (insn == 0x00002033 || insn == 0x00102033)
+        if cpu.cs.privilege == 0 && (cpu.cs.mstatus & 0x200000) != 0
+            fail(cpu, Stop.Undefined, cpu.pc)
+            return
+        if insn == 0x00102033 then send_unblock(cpu)
+        elif cpu.event then cpu.event = false
+        elif (pending_bits(cpu) & cpu.cs.mie) == 0
+            cpu.pending_sleep = true
+            cpu.sleep_kind = 2
+        cpu.pc = next
+        cpu.retired += 1
+        if cpu.pending_sleep
+            cpu.pending_sleep = false
+            cpu.stop = Stop.Sleep
+        return
 
     (insn & 127) match
         0x37 -> result = insn & 0xFFFFF000
@@ -122,43 +162,51 @@ private execute(cpu: *Cpu, insn: u32, length: u32)
                 result = read(cpu, a + imm, 1u32 << (op & 3))
                 if op < 2 then result = sext(result, 8u32 << op)
         0x23 ->
+            cpu.access = 2
             put = false
             valid = op <= 2
             val offset = sext(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
             if valid then write(cpu, a + offset, 1u32 << op, b)
+        0x0B ->
+            valid = has(cpu.model, EXT_H3BEXTM) && (insn & 0xE2000000) == 0 && (op == 0 || op == 4)
+            if valid
+                val shift = (if op == 0 then b else rs2) & 31
+                val bits = ((insn >> 26) & 7) + 1
+                result = (a >> shift) & ((1u32 << bits) - 1)
+        0x2F ->
+            atomic_operation(cpu, insn, a, b) match
+                Some(value) -> result = value
+                None -> valid = false
         0x13 | 0x33 ->
-            val immediate = (insn & 127) == 0x13
-            val rhs = if immediate then imm else b
-            val shift = rhs & 31
-            if !immediate && top == 1
-                valid = has(cpu.model, EXT_M)
-                if valid then result = multiply(op, a, b)
+            val bit_result = if has(cpu.model, EXT_B) then bit_operation(insn, a, b) else None
+            if bit_result.is_some()
+                result = bit_result.unwrap()
             else
-                valid = immediate || top == 0 || (top == 32 && (op == 0 || op == 5))
-                op match
-                    0 -> result = if !immediate && top == 32 then a - rhs else a + rhs
-                    1 ->
-                        if immediate then valid = top == 0
-                        result = a << shift
-                    2 -> result = if i32(a) < i32(rhs) then 1 else 0
-                    3 -> result = if a < rhs then 1 else 0
-                    4 -> result = a ^ rhs
-                    5 ->
-                        if immediate then valid = top == 0 || top == 32
-                        result = if top == 32 then u32(i32(a) >> shift) else a >> shift
-                    6 -> result = a | rhs
-                    7 -> result = a & rhs
-                    _ -> ()
+                alu_operation(cpu, insn, a, b) match
+                    Some(value) -> result = value
+                    None -> valid = false
         0x0F ->
             put = false
-            // FENCE is a no-op on this single-core sequential memory model. FENCE.I is
-            // intentionally not enabled until Zifencei is a declared profile capability.
-            valid = op == 0
+            valid = op == 0 || (op == 1 && has(cpu.model, EXT_IFENCE))
         0x73 ->
-            put = false
-            if insn == 0x00100073 then fail(cpu, Stop.Breakpoint, cpu.pc)
-            elif insn == 0x00000073 then fail(cpu, Stop.Ecall, cpu.pc)
-            else valid = false
+            if op == 0
+                put = false
+                if insn == 0x00100073 then fail(cpu, Stop.Breakpoint, cpu.pc)
+                elif insn == 0x00000073 then fail(cpu, Stop.Ecall, cpu.pc)
+                elif insn == 0x30200073 && has(cpu.model, EXT_PRIV) && cpu.cs.privilege == 3 then next = return_from_trap(cpu)
+                elif insn == 0x10500073 && has(cpu.model, EXT_PRIV)
+                    if cpu.cs.privilege == 0 && (cpu.cs.mstatus & 0x200000) != 0 then valid = false
+                    elif (pending_bits(cpu) & cpu.cs.mie) == 0
+                        cpu.pending_sleep = true
+                        cpu.sleep_kind = 1
+                else valid = false
+            else
+                val source = if (op & 4) != 0 then rs1 else a
+                val writing = (op & 3) == 1 || rs1 != 0
+                val reading = (op & 3) != 1 || rd != 0
+                csr_access(cpu, insn >> 20, op & 3, source, reading, writing) match
+                    Some(value) -> result = value
+                    None -> valid = false
         _ -> valid = false
 
     if !valid then fail(cpu, Stop.Undefined, cpu.pc)
@@ -171,28 +219,87 @@ private execute(cpu: *Cpu, insn: u32, length: u32)
     cpu.r[0] = 0
     cpu.pc = next
     cpu.retired += 1
+    if cpu.pending_sleep
+        cpu.pending_sleep = false
+        cpu.stop = Stop.Sleep
+
+// Shared base/M ALU semantics are unchanged; extensions only add validated encodings.
+private alu_operation(cpu: *Cpu, insn: u32, a: u32, b: u32) -> Option[u32]
+    val op = (insn >> 12) & 7
+    val top = insn >> 25
+    val imm = sext(insn >> 20, 12)
+    var valid = true
+    var result: u32 = 0
+    val immediate = (insn & 127) == 0x13
+    val rhs = if immediate then imm else b
+    val shift = rhs & 31
+    if !immediate && top == 1
+        valid = has(cpu.model, EXT_M)
+        if valid then result = multiply(op, a, b)
+    else
+        valid = immediate || top == 0 || (top == 32 && (op == 0 || op == 5))
+        op match
+            0 -> result = if !immediate && top == 32 then a - rhs else a + rhs
+            1 ->
+                if immediate then valid = top == 0
+                result = a << shift
+            2 -> result = if i32(a) < i32(rhs) then 1 else 0
+            3 -> result = if a < rhs then 1 else 0
+            4 -> result = a ^ rhs
+            5 ->
+                if immediate then valid = top == 0 || top == 32
+                result = if top == 32 then u32(i32(a) >> shift) else a >> shift
+            6 -> result = a | rhs
+            7 -> result = a & rhs
+            _ -> ()
+    if valid then Some(result) else None
 
 run(cpu: *Cpu, budget: u64)
+    if budget == 0 then return
+    if cpu.stop == Stop.Sleep
+        if (pending_bits(cpu) & cpu.cs.mie) == 0 && !(cpu.sleep_kind == 2 && cpu.event) then return
+        if cpu.sleep_kind == 2 then cpu.event = false
+        cpu.stop = Stop.Budget
     if cpu.stop != Stop.Budget then return
     var left = budget
     while left != 0 && cpu.stop == Stop.Budget
-        val alignment: u32 = if has(cpu.model, EXT_C) then 2 else 4
-        if (cpu.pc & (alignment - 1)) != 0
-            fail(cpu, Stop.Misaligned, cpu.pc)
-            break
-        val lo = read(cpu, cpu.pc, 2)
-        if cpu.stop != Stop.Budget then break
-        if (lo & 3) != 3
-            if !has(cpu.model, EXT_C)
-                fail(cpu, Stop.Undefined, cpu.pc)
-                break
-            val expanded = decompress(lo)
-            if expanded == 0
-                fail(cpu, Stop.Undefined, cpu.pc)
-                break
-            execute(cpu, expanded, 2)
-        else
-            val hi = read(cpu, cpu.pc + 2, 2)
-            if cpu.stop != Stop.Budget then break
-            execute(cpu, lo | (hi << 16), 4)
         left -= 1
+        if has(cpu.model, EXT_PRIV) && (cpu.cs.inhibit & 1) == 0 then cpu.cs.cycle += 1
+        if take_interrupt(cpu) then continue
+        val before = cpu.retired
+        val inhibited = (cpu.cs.inhibit & 4) != 0
+        cpu.cs.wrote_instret = false
+        cpu.access = 0
+        step(cpu)
+        if cpu.retired != before && !inhibited && !cpu.cs.wrote_instret then cpu.cs.instret += 1
+        resolve_fault(cpu)
+
+private step(cpu: *Cpu)
+    val alignment: u32 = if has(cpu.model, EXT_C) then 2 else 4
+    if (cpu.pc & (alignment - 1)) != 0
+        fail(cpu, Stop.Misaligned, cpu.pc)
+        return
+    val lo = read(cpu, cpu.pc, 2)
+    if cpu.stop != Stop.Budget then return
+    cpu.instruction = lo
+    if (lo & 3) != 3
+        if !has(cpu.model, EXT_C)
+            fail(cpu, Stop.Undefined, cpu.pc)
+            return
+        cpu.access = 1
+        if has(cpu.model, EXT_ZC) && execute_zcmp(cpu, lo) then return
+        var expanded = decompress(lo)
+        if expanded == 0 && has(cpu.model, EXT_ZC) then expanded = decompress_extra(lo)
+        if expanded == 0
+            fail(cpu, Stop.Undefined, cpu.pc)
+            return
+        execute(cpu, expanded, 2)
+    else
+        val hi = read(cpu, cpu.pc + 2, 2)
+        if cpu.stop != Stop.Budget then return
+        // A 32-bit instruction must fit a single winning PMP region, even with C.
+        if !pmp_allows(cpu, cpu.pc, 4, 0)
+            fail(cpu, Stop.AccessFault, cpu.pc)
+            return
+        cpu.instruction = lo | (hi << 16)
+        execute(cpu, cpu.instruction, 4)

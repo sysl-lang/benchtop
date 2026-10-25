@@ -11,7 +11,7 @@ The generator does not import the interpreter or call its decoder. The original 
 LLVM expansion corpus and compiled-C host oracle remain separate cross-checks.
 
 Every vector checks all 32 registers, every byte of the 512-byte RAM, PC, stop reason,
-fault address on stops, and retirement. All four core profiles are exercised, including
+fault address on stops, and retirement. All five core profiles are exercised, including
 rejection of M/C instructions where disabled. Taken halfword-aligned control transfers
 must fault without C, preserving the link and all other state. Faulting/stopped CPUs are
 run again to verify no further effects. Instruction fetch and reserved/hint encodings
@@ -95,7 +95,7 @@ have additional structural tests in `instruction_boundaries_tests.sysl`.
 | C.ADD | 25 | LLVM-assembled execution, not just expansion; register/RAM preservation, PC/retirement, both C profiles; rejected without C; aliases, low/high registers, zero/extrema/alternating bits, x0 hints where legal |
 | C.SWSP | 256 | LLVM-assembled execution, not just expansion; register/RAM preservation, PC/retirement, both C profiles; rejected without C; every offset bit and extrema, base/data aliases, first/last mapped word, misalignment, unmapped, no partial writes |
 
-75 instructions; 27,945 vectors, each checked on four profiles (111,780 executions).
+75 instructions; 27,945 vectors, each checked on five profiles (139,725 executions).
 
 Rebuild the fixtures with Python 3 and LLVM (`CLANG`, `LD_LLD`, `OBJCOPY` overrides supported).
 Run `sysl test . --filter "RV32 instruction"` for the per-mnemonic tests and `sysl test .` for the full suite.

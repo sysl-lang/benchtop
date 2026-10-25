@@ -1,0 +1,135 @@
+module sh.sysl.benchtop.riscv
+
+// CSR accesses validate before any read/write side effects. Indexed arrays use the raw
+// source operand, not the value produced by CSRRS/CSRRC. See Hazard3 v1.0-rc1 RTL.
+private csr_value(cpu: *Cpu, address: u32, raw: u32, writing: bool) -> Option[u32]
+    val s = &cpu.cs
+    if address >= 0x3A0 && address < 0x3A4
+        var value: u32 = 0
+        for i in 0u32..<4 do value |= u32(s.pmpcfg[(address - 0x3A0) * 4 + i]) << (i * 8)
+        return Some(value)
+    if address >= 0x3B0 && address < 0x3C0
+        val index = address - 0x3B0
+        val value = s.pmpaddr[index]
+        return Some(if index < 8 && (s.pmpcfg[index] & 24) == 0 then value & ~7u32 else value)
+    if (address >= 0xB03 && address <= 0xB1F) || (address >= 0xB83 && address <= 0xB9F) || (address >= 0x323 && address <= 0x33F) then return Some(0)
+    address match
+        0x300 -> return Some(s.mstatus)
+        0x301 -> return Some(0x40901105) // RP2350: B bit was reserved at tape-out.
+        0x304 -> return Some(s.mie)
+        0x305 -> return Some(s.mtvec)
+        0x306 -> return Some(s.mcounteren)
+        0x310 | 0x30A | 0x31A -> return Some(0)
+        0x320 -> return Some(s.inhibit)
+        0x340 -> return Some(s.mscratch)
+        0x341 -> return Some(s.mepc)
+        0x342 -> return Some(s.mcause)
+        0x343 -> return Some(0) // MTVAL is hardwired zero on RP2350.
+        0x344 -> return Some(pending_bits(cpu))
+        0xB00 | 0xC00 -> return Some(u32(s.cycle))
+        0xB80 | 0xC80 -> return Some(u32(s.cycle >> 32))
+        0xB02 | 0xC02 -> return Some(u32(s.instret))
+        0xB82 | 0xC82 -> return Some(u32(s.instret >> 32))
+        0xF11 -> return Some(0x493)
+        0xF12 -> return Some(27)
+        0xF13 -> return Some(0x86FC4E3F)
+        0xF14 -> return Some(cpu.hart)
+        0xF15 -> return Some(0)
+        0xBD0 -> return if has(cpu.model, EXT_H3PMPM) then Some(s.cfgm) else None
+        0xBF0 -> return if has(cpu.model, EXT_H3POWER) then Some(s.sleep) else None
+        0xBE0 | 0xBE1 | 0xBE2 ->
+            if !has(cpu.model, EXT_H3IRQ) then return None
+            val index = raw & 31
+            val values = if address == 0xBE0 then s.enabled elif address == 0xBE1 then s.pending | s.forced else s.forced
+            return Some(if index >= 4 then 0 else u32((values >> (16 * index)) & 65535) << 16)
+        0xBE3 ->
+            if !has(cpu.model, EXT_H3IRQ) then return None
+            val first = (raw & 127) * 4
+            var value: u32 = 0
+            for i in 0u32..<4 do if first + i < 52 then value |= u32(s.priority[first + i]) << (16 + 4 * i)
+            return Some(value)
+        0xBE4 ->
+            if !has(cpu.model, EXT_H3IRQ) then return None
+            val next = next_irq(cpu, (s.context >> 24) & 15)
+            return Some(if next < 0 then 0x80000000 else u32(next) << 2)
+        0xBE5 ->
+            if !has(cpu.model, EXT_H3IRQ) then return None
+            val saved = if writing && (raw & 2) != 0 then ((s.mie >> 4) & 8) | ((s.mie >> 1) & 4) else 0
+            return Some(s.context | saved)
+        _ -> return None
+
+private csr_store(cpu: *Cpu, address: u32, raw: u32, value: u32, operation: u32, selected: int)
+    val s = &cpu.cs
+    if address >= 0x3A0 && address < 0x3A4
+        for i in 0u32..<4
+            val index = (address - 0x3A0) * 4 + i
+            if index >= 8 || (s.pmpcfg[index] & 128) != 0 then continue
+            var cfg = (value >> (8 * i)) & 0x9F
+            if (cfg & 24) != 24 then cfg &= ~24u32 // NAPOT only, 32-byte granule.
+            s.pmpcfg[index] = u8(cfg)
+        return
+    if address >= 0x3B0 && address < 0x3B8
+        val index = address - 0x3B0
+        if (s.pmpcfg[index] & 128) == 0 then s.pmpaddr[index] = (value & 0x3FFFFFFF) | 3
+        return
+    address match
+        0x300 -> s.mstatus = (value & 0x220088) | (if (value & 0x1000) != 0 then 0x1800 else 0)
+        0x304 -> s.mie = value & 0x888
+        0x305 -> s.mtvec = value & ~2u32
+        0x306 -> s.mcounteren = value & 7
+        0x320 -> s.inhibit = value & 5
+        0x340 -> s.mscratch = value
+        0x341 -> s.mepc = value & ~1u32
+        0x342 -> s.mcause = value & 0x8000000F
+        0xB00 -> s.cycle = (s.cycle & 0xFFFFFFFF00000000) | u64(value)
+        0xB80 -> s.cycle = (u64(value) << 32) | (s.cycle & 0xFFFFFFFF)
+        0xB02 ->
+            s.instret = (s.instret & 0xFFFFFFFF00000000) | u64(value)
+            s.wrote_instret = true
+        0xB82 ->
+            s.instret = (u64(value) << 32) | (s.instret & 0xFFFFFFFF)
+            s.wrote_instret = true
+        0xBD0 -> s.cfgm = value & 255
+        0xBF0 -> s.sleep = value & 7
+        0xBE0 | 0xBE2 ->
+            val index = raw & 31
+            if index >= 4 then return
+            val mask = 65535u64 << (16 * index)
+            val bits = u64(value >> 16) << (16 * index)
+            val valid = (1u64 << 52) - 1
+            if address == 0xBE0 then s.enabled = ((s.enabled & ~mask) | bits) & valid
+            else s.forced = ((s.forced & ~mask) | bits) & valid
+        0xBE3 ->
+            val first = (raw & 127) * 4
+            for i in 0u32..<4 do if first + i < 52 then s.priority[first + i] = u8((value >> (16 + 4 * i)) & 15)
+        0xBE4 ->
+            if (value & 1) != 0
+                val level = if selected < 0 then 16u32 else u32(s.priority[selected]) + 1
+                s.context = (s.context & 0xFF000001) | (level << 16) | (if selected < 0 then 0x8000 else u32(selected) << 4)
+        0xBE5 ->
+            // Self-clearing CLEARTS triggers only on write/set, never CSRRC.
+            if operation != 3 && (raw & 2) != 0
+                s.mie &= ~0x88u32
+            else
+                if (value & 8) != 0 then s.mie |= 128
+                if (value & 4) != 0 then s.mie |= 8
+            s.context = value & 0xFF1F9FF1
+        _ -> () // Legal hardwired or read-only fields inside writable CSRs.
+
+/** One atomic CSR operation. op is CSRRW=1, CSRRS=2, CSRRC=3. */
+csr_access(cpu: *Cpu, address: u32, operation: u32, source: u32, reading: bool, writing: bool) -> Option[u32]
+    if !has(cpu.model, EXT_CSR) || operation < 1 || operation > 3 then return None
+    if ((address >> 8) & 3) > cpu.cs.privilege || (writing && (address >> 10) == 3) then return None
+    if cpu.cs.privilege == 0
+        val counter: u32 = if address == 0xC00 || address == 0xC80 then 1 elif address == 0xC02 || address == 0xC82 then 4 else 0
+        if counter != 0 && (cpu.cs.mcounteren & counter) == 0 then return None
+    val raw = if writing then source else 0
+    val old = csr_value(cpu, address, raw, writing && operation != 3) match
+        Some(value) -> value
+        None -> return None
+    val selected = next_irq(cpu, (cpu.cs.context >> 24) & 15)
+    if writing
+        val value = if operation == 1 then source elif operation == 2 then old | source else old & ~source
+        csr_store(cpu, address, raw, value, operation, selected)
+    if reading && address == 0xBE4 && selected >= 0 then cpu.cs.forced &= ~(1u64 << u32(selected))
+    Some(if reading then old else 0)

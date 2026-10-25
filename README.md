@@ -82,32 +82,65 @@ sysl build . -o benchtop
 ./benchtop check pico2
 ```
 
-The bare ISA profiles have no interrupt controller. `hazard3` describes the RP2350's 52 external
-interrupts and its ISA from the Pico SDK, but **cannot execute yet**: atomics, CSRs, instruction
-fences, bit manipulation, additional Zc instructions, privileged execution and interrupt delivery
-remain to be implemented. Unsupported profiles and encodings are refused explicitly.
-`run --board` still uses the Cortex-M board runtime. Neither the `pico2` description (the
-non-wireless Pico 2, LED on GP25) nor the existing `pico2w` boots firmware yet. RP2350 devices,
-boot ROM/flash, core selection and multicore startup are subsequent work.
+`hazard3` is now an executable named core, targeting the RP2350's Hazard3 revision
+(v1.0-rc1, `mimpid = 0x86fc4e3f`). It shares the base/M/C interpreter and adds:
 
-The RISC-V API borrows caller-owned RAM, with a configurable base and entry address, and supports
-instruction budgets. Misaligned and unmapped accesses, illegal instructions, `ECALL` and `EBREAK`
-stop before retirement; privileged trap handlers and MMIO are not implemented. RAM access is
-single-threaded. The ISA reference is the [RISC-V specification](https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html);
-the RP2350 profile follows the [Pico SDK toolchain configuration](https://github.com/raspberrypi/pico-sdk/blob/master/cmake/preload/toolchains/pico_riscv_gcc.cmake).
+- Standard A atomics, Zicsr, Zifencei, Zba/Zbb/Zbs/Zbkb, Zcb and Zcmp.
+- Machine/User execution, exceptions, direct/vectored machine interrupts, `MRET`, `WFI`,
+  counters and the RP2350 PMP configuration.
+- `Xh3bextm`: `h3.bextm` and `h3.bextmi`, extracting 1–8 contiguous bits.
+- `Xh3power`: `h3.block`, `h3.unblock` and `msleep`, including latched wake events and
+  functional clock-gate/power-down requests exposed by `sleep_depth`.
+- `Xh3irq`: the 52-input, 16-priority interrupt controller, indexed CSRs, forced interrupts,
+  priority nesting and interrupt-context save/restore.
+- `Xh3pmpm`: unlocked M-mode region enforcement, with the RP2350's eight configurable
+  32-byte-granule NAPOT regions and three hardwired regions.
 
-Every implemented RISC-V mnemonic has its own unit test and a row in the
-[coverage matrix](sh/sysl/benchtop/riscv/COVERAGE.md). Independent expected-state vectors check
-all registers, all RAM bytes, PC, faults and retirement across all four profiles. Targeted
-boundaries include aliases and `x0`, signed/unsigned extrema, every legal shift amount,
-immediate bits, memory edges, disabled extensions, reserved encodings and compressed HINTs.
-This is systematic boundary coverage, not exhaustive testing of every machine state.
+```hocon
+chip {
+  name = hazard3-example
+  cores = [hazard3, { core = hazard3 }]
+  peripherals { ram { peripheral = ram, at = 0x20000000, size = 520K } }
+}
+```
 
-The committed C guests run under all four profiles and match a host-computed hash. An independent
-LLVM assembler corpus checks 118 compressed/canonical instruction pairs; instruction tests cover
-arithmetic edges, division overflow/zero, branch/jump alignment, memory faults and budget resumption.
-The fixture build requires LLVM clang, lld and llvm-objcopy; their paths can be set with `CLANG`,
-`LD_LLD` and `OBJCOPY`.
+```sh
+./benchtop check --chip examples/riscv/hazard3.hocon
+./benchtop bench --core hazard3 examples/riscv/kernel-hazard3.bin 3132271724
+```
+
+RP2350 details include the E6 PMP R/X bit order, E7 global interrupt masking in User mode,
+read-only zero `mtval`, counters inhibited at reset and 16-byte reservation granules. These
+are functional models, not pipeline/power timing or silicon fault-injection models. Debug
+mode/trigger/JTAG machinery is not implemented. This targets RP2350's core, not every extension
+in newer upstream Hazard3 revisions. See the [RP2350 datasheet](https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf)
+and the [Hazard3 manual](https://wren.wtf/hazard3/doc/).
+
+The RISC-V API borrows caller-owned RAM, with a configurable base/entry and instruction budgets.
+Bare ISA profiles stop at illegal instructions, memory faults, `ECALL` and `EBREAK`. Hazard3
+normally enters its machine trap handler; `halt_breakpoint` and `halt_faults` are explicit debugger
+controls, enabled by `bench` so it can stop and check the guest's result. Cycle counts are based on
+interpreter scheduling slots, not real hardware cycles.
+
+`pair` connects two harts sharing the same RAM on one host thread: atomic operations finish before
+switching harts, stores invalidate the other hart's reservations, and `h3.unblock` reaches both the
+peer and the sender as on RP2350. Caller-owned CPU objects and their shared RAM must outlive the
+pair; `unpair` detaches them. Use `external_write` for DMA/debugger writes so both reservations and
+wake events are updated. `irq` and `interrupt_inputs` supply external, software and timer input
+levels. Concurrent host-thread execution is not supported by this RISC-V API.
+
+`run --board` still uses the Cortex-M board runtime. Neither the `pico2` nor `pico2w` description
+boots firmware yet. RP2350 MMIO devices, ROM/flash boot, core selection and multicore startup remain
+subsequent board work; the core's `pair` API does not supply a boot protocol.
+
+Every implemented RISC-V mnemonic has a named test in the [base coverage matrix](sh/sysl/benchtop/riscv/COVERAGE.md)
+or [Hazard3 coverage matrix](sh/sysl/benchtop/riscv/HAZARD3-COVERAGE.md), with stateful instruction
+and CSR tests beside them. Independent Python mathematics and LLVM encodings check register/RAM
+state, PC, faults and retirement across all five profiles, with targeted boundary, aliasing,
+alignment and extension-gating cases. C guests compiled for all five match a host-computed hash.
+This is systematic boundary coverage, not exhaustive testing of every machine state or validation
+against a physical RP2350. Rebuild fixtures with LLVM clang, lld and llvm-objcopy (`CLANG`, `LD_LLD`
+and `OBJCOPY` overrides), and Python 3 for the generated vector corpora.
 
 ## Describing a board
 

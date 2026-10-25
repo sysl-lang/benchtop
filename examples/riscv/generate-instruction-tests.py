@@ -332,7 +332,7 @@ def emit():
         'The generator does not import the interpreter or call its decoder. The original 118-pair\n'
         'LLVM expansion corpus and compiled-C host oracle remain separate cross-checks.\n',
         'Every vector checks all 32 registers, every byte of the 512-byte RAM, PC, stop reason,\n'
-        'fault address on stops, and retirement. All four core profiles are exercised, including\n'
+        'fault address on stops, and retirement. All five core profiles are exercised, including\n'
         'rejection of M/C instructions where disabled. Taken halfword-aligned control transfers\n'
         'must fault without C, preserving the link and all other state. Faulting/stopped CPUs are\n'
         'run again to verify no further effects. Instruction fetch and reserved/hint encodings\n'
@@ -346,7 +346,7 @@ def emit():
         wrappers += [f'\n@test("RV32 instruction {name}: architectural boundaries and state preservation")\ninstruction_{name.lower().replace(".","_")}()\n    check_instruction_vectors("{name}", {first}, {len(records)}, {need})\n']
         matrix.append(f'| {name} | {len(records)} | {notes[name]} |')
         first+=len(records)
-    matrix+=['',f'{len(groups)} instructions; {first:,} vectors, each checked on four profiles ({first*4:,} executions).',
+    matrix+=['',f'{len(groups)} instructions; {first:,} vectors, each checked on five profiles ({first*5:,} executions).',
         '', 'Rebuild the fixtures with Python 3 and LLVM (`CLANG`, `LD_LLD`, `OBJCOPY` overrides supported).',
         'Run `sysl test . --filter "RV32 instruction"` for the per-mnemonic tests and `sysl test .` for the full suite.',
         '', 'References:',

@@ -1,0 +1,72 @@
+module sh.sysl.benchtop.riscv
+
+private[riscv] decompress_extra(c: u32) -> u32
+    val rd = 8 + ((c >> 2) & 7)
+    val rs = 8 + ((c >> 7) & 7)
+    val byte_offset = ((c >> 6) & 1) | (((c >> 5) & 1) << 1)
+    val half_offset = ((c >> 5) & 1) << 1
+    if (c & 0xFC03) == 0x8000 then return ri(0x03, rd, 4, rs, byte_offset)
+    if (c & 0xFC43) == 0x8400 then return ri(0x03, rd, 5, rs, half_offset)
+    if (c & 0xFC43) == 0x8440 then return ri(0x03, rd, 1, rs, half_offset)
+    if (c & 0xFC03) == 0x8800 then return store_code(rd, rs, 0, byte_offset)
+    if (c & 0xFC43) == 0x8C00 then return store_code(rd, rs, 1, half_offset)
+    if (c & 0xFC63) == 0x9C41 then return rr(rs, 0, rs, rd, 1) // C.MUL
+    (c & 0xFC7F) match
+        0x9C61 -> return ri(0x13, rs, 7, rs, 255)
+        0x9C65 -> return ri(0x13, rs, 1, rs, 0x604)
+        0x9C69 -> return rr(rs, 4, rs, 0, 4)
+        0x9C6D -> return ri(0x13, rs, 1, rs, 0x605)
+        0x9C75 -> return ri(0x13, rs, 4, rs, 0xFFF)
+        _ -> return 0
+
+private store_code(data: u32, base: u32, op: u32, imm: u32) -> u32 =
+    ((imm >> 5) << 25) | (data << 20) | (base << 15) | (op << 12) | ((imm & 31) << 7) | 0x23
+
+private saved_register(n: u32) -> u32 = if n < 2 then n + 8 else n + 16
+private stack_register(n: u32) -> u32 = if n == 0 then 1 elif n < 3 then n + 7 else n + 15
+
+// Zcmp is restartable: completed stores/loads before a fault may remain visible, while
+// SP, a0 and the return PC are committed only after all transfers succeed. Interrupts
+// are sampled between complete guest instructions in this scheduler.
+private[riscv] execute_zcmp(cpu: *Cpu, c: u32) -> bool
+    if (c & 0xFC63) == 0xAC22 || (c & 0xFC63) == 0xAC62
+        val a = saved_register((c >> 7) & 7)
+        val b = saved_register((c >> 2) & 7)
+        if (c & 0x40) == 0
+            if a == b
+                fail(cpu, Stop.Undefined, cpu.pc)
+                return true
+            cpu.r[a] = cpu.r[10]
+            cpu.r[b] = cpu.r[11]
+        else
+            val first = cpu.r[a]
+            val second = cpu.r[b]
+            cpu.r[10] = first
+            cpu.r[11] = second
+        cpu.pc += 2
+        cpu.retired += 1
+        return true
+    val family = c & 0xFF03
+    if family != 0xB802 && family != 0xBA02 && family != 0xBC02 && family != 0xBE02 then return false
+    val list = (c >> 4) & 15
+    if list < 4
+        fail(cpu, Stop.Undefined, cpu.pc)
+        return true
+    val count = if list == 15 then 13u32 else list - 3
+    val adjustment = ((count * 4 + 15) & ~15u32) + (((c >> 2) & 3) * 16)
+    val old_sp = cpu.r[2]
+    val push = family == 0xB802
+    val start = if push then old_sp - count * 4 else old_sp + adjustment - count * 4
+    for i in 0u32..<count
+        val reg = stack_register(i)
+        cpu.access = if push then 2 else 1
+        if push then write(cpu, start + i * 4, 4, cpu.r[reg])
+        else
+            val value = read(cpu, start + i * 4, 4)
+            if cpu.stop == Stop.Budget then cpu.r[reg] = value
+        if cpu.stop != Stop.Budget then return true
+    cpu.r[2] = if push then old_sp - adjustment else old_sp + adjustment
+    if family == 0xBC02 then cpu.r[10] = 0
+    cpu.pc = if family == 0xBC02 || family == 0xBE02 then cpu.r[1] & ~1u32 else cpu.pc + 2
+    cpu.retired += 1
+    true
