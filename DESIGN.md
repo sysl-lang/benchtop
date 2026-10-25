@@ -982,9 +982,9 @@ runs 36 instructions (FPv4-SP), 55 (FPv5-SP) and 79 (FPv5-DP) over 24 edge value
 all 16 FPSCR settings (32 with AHP for the half-precision conversions, over 24 halves and singles at
 half precision's edges), hashing each result with all of FPSCR; QEMU's M4 (`mps2-an386`), M33 (`mps2-an505`)
 and M7 (`mps2-an500`) wrote `fpu-m4.qemu`, `fpu-m33.qemu` and `fpu-m7.qemu`, and cortical must match
-every line (`virt/fpu_tests.sysl`). `VMLS`, `VNMLA`, `VNMLS` and `VFMS` at single precision are held
-apart in an ignored test: the compiler's optimizer moves their negation today, so a NaN result can
-take the other sign.
+every line (`virt/fpu_tests.sysl`). The negating multiply-accumulates (`VMLS`, `VNMLA`, `VNMLS`,
+`VFMS`) depend on a negation in a `@strict_fp` body staying where it is written, so a NaN keeps the
+sign the architecture gives it; the compiler guarantees that.
 
 ## 3. Peripherals: the STM32H747I-DISCO
 
