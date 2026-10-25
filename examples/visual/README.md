@@ -29,9 +29,9 @@ Rebuild benchtop to update its embedded demo. Hold 1/2 or the onscreen buttons;
 Space pauses, N steps, R resets, S saves a PNG. Firmware reads GP8/GP9 as active-low
 inputs and drives GP0 (heartbeat), GP1 and GP2. Turn RV1 on the board or use its
 inspector slider: its wiper drives GP26, connected to ADC channel 0. Firmware
-starts conversions, polls their completion, reads the result and prints only when
-it changes. At 0%, 50% and 100%, it prints 0, 2048 and 4095 respectively. No UI
-callback prints an ADC value or manufactures a guest conversion.
+starts conversions, polls their completion, converts the result to decimal digits,
+and multiplexes DS1 using GPIO writes. At 0%, 50% and 100%, DS1 shows `0000`, `2048`
+and `4095` respectively. The firmware produces no console output.
 The firmware console is at 0x40000000. The workbench board is a virtual Cortex-M0+
 platform, not an RP2350 memory map or Pico SDK target.
 
@@ -102,3 +102,29 @@ its position. No analogue circuit solver, noise or source-impedance model is use
 
 The component declaration uses `ref = RV1` and `wiper = controller.GP26` directly.
 Its ideal voltage range and initial position come from its HOCON instance parameters.
+
+## Seven-segment display
+
+The built-in `seven-segment` part has `digits` (1–8, default 1), `common` (`cathode`
+or `anode`, default `cathode`), `color` and `persistence-cycles` (default 50000).
+All `a`–`g` terminals and `digit0` through `digitN` must be connected. `dp` is optional.
+Each terminal uses a named chip connection, for example `a = controller.GP10`.
+
+DS1 uses four common-cathode digits. Segment bits a,b,c,d,e,f,g,dp map to GP10–17;
+left-to-right digit commons map to GP18–21. Firmware makes these pins outputs,
+sets every common high to blank the display, changes segment lines, then selects
+one common low. It repeats this scan while servicing the ADC and buttons.
+The decimal point is wired but unused by this firmware.
+
+The component model accepts no number or text. It observes physical GPIO patterns
+and output enables, supports static and multiplexed drive, and uses guest-cycle
+visual persistence to show scanned digits. A continuously selected digit stays lit
+without further writes; deselected digits fade after the configured persistence.
+Input/high-impedance pins cannot light a segment, and common-anode wiring reverses
+both segment and common polarity. Reset clears the display's retained scan state.
+This models software-visible pin behavior with ideal electrical drive; brightness,
+current limits and ghosting intensity are not circuit-simulated.
+
+The scan algorithm and segment encodings are suitable for equivalent real wiring.
+The current workbench GPIO/ADC register map is virtual; a binary for a real MCU
+still needs that MCU's register interface and startup code.

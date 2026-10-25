@@ -33,8 +33,9 @@ The bundled firmware is written in sysl and compiled for Cortex-M0+. It drives a
 heartbeat LED and reads two active-low
 buttons through MMIO. Hold **1** or **2**, or click and hold either button, to light
 its corresponding LED. Turn **RV1** on the board (drag around the dial), or use
-its inspector slider, to change the ADC input. The sysl firmware prints `ADC0 = N`
-when the reading changes: 0 at minimum, 2048 at halfway, and 4095 at maximum.
+its inspector slider, to change the ADC input. Sysl firmware multiplexes the four-digit
+**DS1** display through GPIO: `0000` at minimum, `2048` halfway and `4095` at maximum.
+The demo produces no console output.
 **Space** pauses, **N** executes one instruction per active
 core, **R** resets, **S** saves a PNG, and **Escape** closes the window. The toolbar
 provides the same controls. Click a part to inspect its wiring. The scrollable inspector shows wiring, signal
@@ -90,6 +91,13 @@ configured guest cycles. Host rendering and Kairos timers do not advance convers
 This is software peripheral emulation with ideal inputs; real-chip ADC register
 compatibility remains a separate model. The [virtual ADC register map](examples/visual/README.md#virtual-adc)
 describes the model used by this demo.
+
+`seven-segment` is a reusable GPIO-driven part with 1–8 digits. It exposes `a` through
+`g`, optional `dp`, and one `digitN` common terminal per digit. `common = cathode`
+uses high segments and low common terminals; `common = anode` reverses both.
+Firmware supplies raw segment patterns and performs digit scanning. The renderer
+uses only resolved pin levels, output-enable state and guest time; it receives no
+numeric ADC value. See the [display wiring and behavior](examples/visual/README.md#seven-segment-display).
 
 ## Build, watch and reload firmware
 
