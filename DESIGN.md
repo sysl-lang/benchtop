@@ -833,7 +833,7 @@ executes without the FP, Security and MPU extensions; integer DSP is optional vi
   unaligned access. An unaligned access whose bytes run past the RAM's last byte stops at
   `Unmapped`, as an access off the RAM does, on every core kind.
   These, with the escalation to HardFault and its registers, are a later item.
-- **Undefined in this kind**: the floating-point and coprocessor space, and, with DSP disabled, the DSP extension (`QADD`,
+- **Undefined in this kind**: the coprocessor space other than the floating-point unit a board gives the core (§2.13), and, with DSP disabled, the DSP extension (`QADD`,
   `SADD16`, `SSAT16`, `SMLABB`, the extend-and-adds `SXTAB` and its kin), the Security Extension's
   `TT`, `SG`, `BXNS` and `BLXNS`, `UDF`, and the encodings ARMv8-M calls UNPREDICTABLE that a
   compiler does not emit (SP or the PC where an encoding may not name them, a load writing back to a
@@ -918,7 +918,8 @@ CINC/CINV/CNEG/CSET/CSETM aliases. A single cached operation and shared handler 
 four variants. R15 source operands are ZR, flags including Q are preserved, and a destination
 may overlap a source. SP sources, SP/PC destinations, IT blocks and AL/NV conditions are refused.
 The latter are a constrained-unpredictable case; the chosen stop agrees with QEMU's M55.
-No low-overhead loops, long shifts, Helium/MVE, floating point or PACBTI are claimed. Integer DSP is optional.
+No low-overhead loops, long shifts, Helium/MVE, half-precision arithmetic or PACBTI are claimed; the
+scalar FPv5 unit of §2.13 is. Integer DSP is optional.
 
 `select.c` runs 68 instruction/condition/zero-register cases over 16 x 16 operand values and 12
 flag states and hashes both the result and APSR. QEMU's `mps3-an547` generates `select.qemu`;
@@ -935,6 +936,46 @@ Primary references: Arm DDI0432 (M0), DDI0413 (M1), DDI0337 (M3),
 [M55 TRM 101051](https://documentation-service.arm.com/static/60e2c2fc677cf7536a55dfef),
 [M85 TRM 101924](https://documentation-service.arm.com/static/626967f57e121f01fd22e302),
 and [QEMU's conditional-select translation](https://github.com/qemu/qemu/blob/master/target/arm/tcg/translate.c).
+
+### 2.13 The floating-point extension as built
+
+`fpu = sp` on a core gives it a single-precision unit: FPv4-SP on the M4, FPv5-SP on the M7, M33 and
+the later Mainline models. `fpu = dp` on the M7 (and the v8.1-M models that offer it) gives FPv5 with
+double precision, D0–D15. Without it the coprocessor space is undefined, as before. The state is
+S0–S31 (D`k` being S`2k`:S`2k+1`), FPSCR, and CPACR, FPCCR, FPCAR, FPDSCR and MVFR0–2 in the system
+control space (`v6m/fpu.sysl`).
+
+- **The arithmetic is the host's, under the guest's FPSCR** (`v6m/fpu_exec.sysl`). The host is an
+  Arm too, so an operation rounded in the guest's mode with its flush-to-zero and default-NaN answers
+  what the guest's unit would, NaNs and flags included. Every function computing with a float is
+  `@strict_fp`, so each operation runs where it is written, under the environment then in force, and
+  raises its flags there. A run puts the core's controls on the host before its first instruction
+  and gathers the host's flags into `cpu.fpscr` after its last (`fp_begin`, `fp_end`), so two cores
+  taking turns on one thread each see their own; `VMSR` and `VMRS` do the same mid-run. The
+  multiply-accumulates round twice, as the architecture's do, and the `VFMA` family once.
+- **Flags the host does not raise for the guest's reason are worked out here**: a conversion's
+  invalid (NaN, or past either end, saturating) and inexact (a fraction dropped), and `VCMPE`'s
+  invalid on a quiet NaN. A conversion from fixed point rounds to nearest whatever the mode.
+- **Access** follows CPACR.CP10: none, or privileged-only from unprivileged code, is the UsageFault
+  NOCP, which stops the core at `Fault` on the instruction. The first instruction allowed with
+  FPCCR.ASPEN set and CONTROL.FPCA clear creates a new context: FPCA is set, and FPSCR takes AHP, DN,
+  FZ and RMode from FPDSCR.
+- **Exceptions**: with FPCA set, entry stacks the extended frame — S0–S15, FPSCR and a reserved word
+  after the eight — and EXC_RETURN's bit 4 is clear; the handler starts with FPCA clear. The state is
+  stacked at once rather than lazily, so FPCCR.LSPACT is always 0 and FPCAR names the frame's S0. The
+  return restores them, and FPCA, from bit 4.
+- **Undefined until the compiler offers what each needs**: `VCVTB`/`VCVTT` (half precision) and
+  `VRINTN`/`VCVTN` (ties to even whatever the mode). FPSCR.IDC is never set.
+
+**The oracles.** Per-instruction tests (`v6m/fp_tests.sysl`) under both executors check results and
+flags at the edges: every rounding mode, NaNs quiet and signalling with and without default-NaN,
+flush-to-zero in and out, saturation, the fixed-point scales, the extended frame. `examples/virt/fpu.c`
+runs 32 instructions (FPv4-SP), 48 (FPv5-SP) and 66 (FPv5-DP) over 24 edge values (16 doubles) under
+all 16 FPSCR settings, hashing each result with FPSCR; QEMU's M4 (`mps2-an386`), M33 (`mps2-an505`)
+and M7 (`mps2-an500`) wrote `fpu-m4.qemu`, `fpu-m33.qemu` and `fpu-m7.qemu`, and cortical must match
+every line (`virt/fpu_tests.sysl`). `VMLS`, `VNMLA`, `VNMLS` and `VFMS` at single precision are held
+apart in an ignored test: the compiler's optimizer moves their negation today, so a NaN result can
+take the other sign.
 
 ## 3. Peripherals: the STM32H747I-DISCO
 
@@ -1797,8 +1838,8 @@ MPU regions, security `none`, caches off, and two priority bits on M0/M0+/M1/M23
 Only explicitly written settings are serialized, so defaults are applied by core model on read.
 
 The checker validates scalar types, the options allowed by the model and their ranges. It can
-describe hardware features not yet emulated; machine assembly refuses enabled FPU, MPU,
-TrustZone or caches by name. NVIC priority width is implemented independently per core (Baseline models have
+describe hardware features not yet emulated; machine assembly refuses enabled MPU,
+TrustZone or caches by name, and gives a core the floating-point unit `fpu` names (§2.13). NVIC priority width is implemented independently per core (Baseline models have
 2, Mainline models 3–8), and reapplied when core 1 leaves its boot ROM. Integer DSP can be enabled independently on each capable core and is also reapplied on launch.
 Existing board descriptions preserve their behavior.
 

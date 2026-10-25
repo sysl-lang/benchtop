@@ -11,8 +11,9 @@ ARMv8-M Mainline). It is an interpreter; a JIT is not planned.
 ## Status
 
 **Twelve Cortex-M models run scalar firmware on virtual boards:** M0, M0+, M1, M3, M4, M7,
-M23, M33, M35P, M52, M55 and M85. Extensions and limitations are listed below; this is not full
-FPU, TrustZone or Helium emulation. Integer DSP is available through board options. No real board is emulated yet.
+M23, M33, M35P, M52, M55 and M85. Extensions and limitations are listed below; this is not
+TrustZone or Helium emulation. Integer DSP and the floating-point unit (single precision, or double
+on the M7) are available through board options. No real board is emulated yet.
 [DESIGN.md](DESIGN.md) is the design note: the architecture, the CPU interpreter, each board's
 devices, how fidelity is tested against real boards, and the milestones with their estimates.
 
@@ -141,7 +142,9 @@ priority grouping, including after core 1 launches. `check` validates and prints
 options, and writing a description back preserves them. **Integer DSP is implemented** when
 `dsp = true`: packed arithmetic, saturation, packing/extension, byte selection and the DSP
 multiply/accumulate families, including APSR.GE and exception stacking. It defaults to off.
-`run` currently rejects enabled FPU, MPU, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
+`fpu = sp` (or `dp` on the M7) gives a core its floating-point unit, whose results and flags
+match QEMU's (DESIGN §2.13); the half-precision conversions and `VRINTN`/`VCVTN` are not emulated yet.
+`run` currently rejects enabled MPU, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
 unsupported selection; it never silently
 ignores them. A chip's integrated core configuration is defined by its chip model; these options
 apply to boards that declare `cores` directly.
@@ -182,7 +185,7 @@ handlers are shared. M23 is a separate Baseline decoder profile, with two priori
 system-register accesses, fixed CCR and no IT, BASEPRI, FAULTMASK or stack limits in its current
 configuration without the Security Extension. M0/M1 have no VTOR; M3 has the v7-M register profile.
 
-**All models currently omit floating point, MPU and Security extensions.**
+**All models currently omit the MPU and Security extensions; the floating-point unit is a board option.**
 M4 and M7 always have integer DSP; M33/M35P/M52/M55/M85 can enable it independently per core. The M52/M55/M85
 models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
 MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. Unsupported instruction
