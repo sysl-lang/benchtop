@@ -1732,7 +1732,9 @@ reported with its line and column, all of them at once, and checking goes on pas
 
 - **A chip** is built into cortical's registry (`registry.sysl`): `rp2040`, `rp2350`. It holds its
   cores, its pins `GP0` up to the last, its ADC pins, and its bus controllers with the pins each
-  signal can be routed to. A description names a chip; it never describes one.
+  signal can be routed to. A description names a chip; it never describes one. §12.11 replaces
+  this: a chip becomes a description of its own, named or written out as a board is, and the only
+  level with `peripherals`.
 - **A board** is a chip — or, for a board with no real chip, `cores = [...]` — with the parts
   soldered to it, the pins and buses it **exposes** to whatever it is plugged into, and its `view`.
 - **A product** is one or more boards, each an instance with a name of its own, the parts outside
@@ -2025,3 +2027,118 @@ Each points at the name or value it is about; `<x>` is the name in the file.
   one such board and nothing outside it, and refuses anything else with the reason (`cortical does not emulate
   the rp2040`, `cortical runs one board, and this product has 2`).
 - `cortical render` — drawing a description's view to an image — comes with the window (§4).
+
+### 12.11 The chip as a description
+
+**Design; the checker still reads §12.1–12.10's form**, where a board names a registry chip or lists
+its own `cores`, and a part on the cores' bus is one of the board's `parts` with an `at`.
+
+**What it changes.** The MCU is a level of its own between the cores and the board, and it is where
+everything on the cores' bus lives. Each level has one kind of content:
+
+| level | holds | named or written out |
+|---|---|---|
+| chip | `cores`, `pins`, `peripherals` — what is inside the package | `chip = <name or path>` or `chip { ... }` |
+| board | a chip, `parts` soldered beside it, `buses`, `exposes`, `view`, `input` | `board = <name or path>` or `board { ... }` |
+| product | boards, `parts` outside them, `buses`, `view`, `input` | `product { ... }` |
+
+**`peripherals` belong to the chip and `parts` to the board and the product, with no overlap.** A
+peripheral is on the cores' bus: it has an address, a window, and the interrupts it raises, and the
+machine builds it into the bus. A part is off it: it is reached through the chip's pins and buses,
+or through another part. So `ram`, `debug-console` and `virt-sio` move from a board's `parts` into
+its chip's `peripherals`, and §12.8's rules (alignment, overlap, the private peripheral bus, one
+IRQ each and below the cores' count) become rules about a chip. A board no longer has `cores`;
+it always has a chip, which for `virt` is a chip that exists only in cortical.
+
+**A chip is named or described, exactly as a board is.** `chip = rp2350` names a chip built into
+cortical; `chip = chips/mine.hocon` names a file, by §12.5's rule (a `/` or `.hocon` makes it a
+file); `chip { ... }` writes one out in place. A file's top level may also be `chip { ... }`, so
+`cortical check` reads a chip on its own. Chips and boards are named apart: `chip = virt` and
+`board = virt` are two descriptions. The bundled chips are `virt` (two M0+), `virt33` (two M33)
+and the other `virt*` models, `rp2040` and `rp2350`, embedded in the binary from `chips/` as the
+boards are from `boards/`.
+
+```hocon
+// chips/virt.hocon
+chip {
+  name  = virt
+  cores = [cortex-m0plus, cortex-m0plus]
+
+  peripherals {
+    ram     { peripheral = ram, at = 0x00000000, size = 1M }
+    console { peripheral = debug-console, at = 0x40000000, irq = 0 }
+    sio     { peripheral = virt-sio, at = 0xD0000000, irq = 1 }
+  }
+}
+
+// boards/virt.hocon
+board {
+  name = virt
+  chip = virt
+}
+```
+
+A real chip, abridged:
+
+```hocon
+chip {
+  name    = rp2350
+  summary = "Raspberry Pi RP2350A: two Cortex-M33 at 150 MHz"
+  cores   = [{ core = cortex-m33, fpu = sp, dsp = true }, { core = cortex-m33, fpu = sp, dsp = true }]
+  pins    { GP = 30 }
+
+  peripherals {
+    sram  { peripheral = ram, at = 0x20000000, size = 520K }
+    uart0 {
+      peripheral = pl011, at = 0x40070000, irq = 33
+      signals { tx = [GP0, GP12, GP16, GP28], rx = [GP1, GP13, GP17, GP29] }
+    }
+    adc   { peripheral = rp-adc, at = 0x400A0000, irq = 35, channels = [GP26, GP27, GP28, GP29] }
+    // ... spi0, spi1, i2c0, i2c1, uart1, sio, timers, the rest
+  }
+}
+```
+
+- **`name`** (required), **`summary`**, and **`cores`** (required, at least one), each a core name
+  or §12.2.1's object. The cores may be of different models — the STM32H747's M7 and M4 — though
+  `cortical run` runs two of one model until §0's asymmetric pair is built.
+- **`pins`** names the package's GPIO by bank: `pins { GP = 30 }` is `GP0` to `GP29`, and the H747's
+  `pins { PA = 16, PB = 16, ..., PK = 8 }` is `PA0` to `PK7`. A chip with no pins, as `virt`, leaves
+  it out, and its boards expose nothing.
+- **A peripheral** is `<instance> { peripheral = <library peripheral>, at, size, irq, <parameter> =
+  <value>, ... }`, held to the library peripheral's own declaration as a part is (§12.8 for `at`,
+  `size` and `irq`; a peripheral raising several interrupts takes a list). One that drives pins says,
+  for each of its `signals`, the pins that signal can be routed to; its instance name is the bus a
+  board routes and exposes (`spi0`), and its kind (`spi`, `i2c`, `uart`) is the library
+  peripheral's. An ADC lists its `channels`, and an ADC pin (§12.9's `takes an ADC pin`) is one some
+  ADC's channels name.
+- **A board's wires are unchanged**: `GP16`, `spi0` and `wifi.gpio0` mean what they did, now resolved
+  against the chip's `pins` and `peripherals` rather than a registry entry.
+- **The registry keeps cores, library peripherals and library parts**, and loses its chips. A
+  library peripheral declares its window, its alignment, how many interrupts it raises, its
+  parameters and their types, and — for one with pins — its signals and its bus kind.
+- **The machine is built from the chip**: each core as §12.2.1 configures it, and each peripheral at
+  its `at` with its `irq`s. `cortical run` refuses a chip with a peripheral cortical does not
+  emulate, by name: `` cortical does not emulate the rp2350's `uart0` (pl011) ``.
+
+**New diagnostics.** `` `ram` is on the cores' bus, so it is a peripheral of the chip, not a part ``
+(at a board's or a product's part that has `at`, or whose library entry is a peripheral); `` `led`
+is not on the cores' bus, so it is a part of the board, not a peripheral `` ; `` `cores` belongs to
+the chip ``; `the board names no chip`; `the chip has no name`; `the chip has no cores`; `` unknown
+chip `rp2530` `` (with the nearest name); `` `x` is a board, and only a chip is named here `` (and
+the converse); `` `pins.GP` must be a whole number from 1 ``; `` `uart0.signals.tx` names `GP40`,
+which the rp2350 does not have ``; `` `p` names no peripheral ``.
+
+**Still to decide.**
+- **Overriding a named chip.** A product overrides a board's part parameters (§12.6); a board may
+  want the same of its chip — a flash or SRAM size, a clock — without writing the chip out. The
+  shape this suggests is `chip { chip = rp2350, peripherals.sram.size = 256K }`, which reads close
+  to a description; the alternative is a separate `overrides { ... }`.
+- **Package variants.** The RP2350A and B differ in pins (30 and 48) and nothing else a description
+  says: two chips, or one with a `package` parameter.
+- **Memory.** RAM, ROM and flash are peripherals here because they are on the bus with an address
+  and a size; a `memory { ... }` section beside `peripherals` would separate what the page table
+  maps from what answers `io_read`, at the cost of a fourth kind of entry.
+- **Off-chip memory on the bus.** The Pico's QSPI flash is soldered on the board but read through
+  the chip's XIP window: a part wired to the chip's `qspi` bus, which the chip's XIP peripheral
+  maps, keeps the rule that every address is the chip's.
