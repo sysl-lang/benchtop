@@ -823,7 +823,11 @@ executes without the FP, Security and MPU extensions; integer DSP is optional vi
 - **Faults are stops**, as on ARMv6-M: an undefined instruction stops at `Undefined`, an access where
   nothing is at `Unmapped`, a division by zero with CCR.DIV_0_TRP at `Fault` (without it the quotient
   is 0); MemManage, BusFault and UsageFault are never taken, and CFSR, HFSR, MMFAR and BFAR read 0.
-  An unaligned `LDRD`, `LDM` or exclusive, which faults on silicon, is made as an unaligned access.
+  An unaligned exclusive or ordered access (`LDREX`, `STREX`, `LDA`, `STL` and their sizes) is the
+  UsageFault UNALIGNED whatever CCR.UNALIGN_TRP says, and stops at `Fault` on the instruction with
+  nothing loaded or stored. An unaligned `LDRD` or `LDM`, which also faults on silicon, is made as an
+  unaligned access. An unaligned access whose bytes run past the RAM's last byte stops at
+  `Unmapped`, as an access off the RAM does, on every core kind.
   These, with the escalation to HardFault and its registers, are a later item.
 - **Undefined in this kind**: the floating-point and coprocessor space, and, with DSP disabled, the DSP extension (`QADD`,
   `SADD16`, `SSAT16`, `SMLABB`, the extend-and-adds `SXTAB` and its kin), the Security Extension's
