@@ -80,6 +80,7 @@ clear_exceptions(cpu: *Cpu)
     cpu.pending = 0
     cpu.active = 0
     cpu.enabled = 0
+    cpu.priority_bits = default_priority_bits(cpu.kind)
     for e in 0..<cpu.prio.len do cpu.prio[e] = 0
     cpu.sleeping = false
     cpu.slept = 0
@@ -275,7 +276,7 @@ xpsr(cpu: *Cpu) -> u32
     val z: u32 = if flag_z(cpu) then 1 else 0
     val it = ((cpu.it & 3) << 25) | ((cpu.it >> 2) << 10)
 
-    (flag_n(cpu) << 31) | (z << 30) | (cpu.c << 29) | (flag_v(cpu) << 28) | (cpu.q << 27) | it | (1 << 24) | cpu.ipsr
+    (flag_n(cpu) << 31) | (z << 30) | (cpu.c << 29) | (flag_v(cpu) << 28) | (cpu.q << 27) | (cpu.ge << 16) | it | (1 << 24) | cpu.ipsr
 
 // The ITSTATE in an xPSR.
 @inline
@@ -290,7 +291,7 @@ set_apsr(cpu: *Cpu, psr: u32)
     cpu.va = 0
     cpu.vb = 0
     cpu.vr = ((psr >> 28) & 1) << 31
-    if cpu.kind != Kind.V6m then cpu.q = (psr >> 27) & 1
+    if !is_baseline(cpu.kind) then cpu.q = (psr >> 27) & 1
 
 // Take exception `e`, to come back to `ret`, at `n` instructions retired: stack eight words on the
 // stack in use, aligned to 8 with bit 9 of the stacked xPSR saying whether a word was skipped, set LR
@@ -303,11 +304,11 @@ set_apsr(cpu: *Cpu, psr: u32)
 // stacked. The handler starts outside any IT block, and with the local exclusive monitor clear.
 enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     val sp = cpu.r[13]
-    val align: u32 = if cpu.kind == Kind.V7em && cpu.ccr & 0x200 == 0 then 0 else 4
+    val align: u32 = if (cpu.kind == Kind.V7em || cpu.kind == Kind.M3) && cpu.ccr & 0x200 == 0 then 0 else 4
     val frame = (sp - 0x20) & ~align
     val words: [8]u32 = [cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[12], cpu.r[14], ret, xpsr(cpu) | ((if align != 0 then (sp >> 2) & 1 else 0) << 9)]
 
-    if cpu.kind != Kind.V6m && frame < sp_limit(cpu)
+    if !is_v6m(cpu.kind) && frame < sp_limit(cpu)
         halt(cpu, Stop.StackLimit, ret)
         return false
 
@@ -370,15 +371,16 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
     // ARMv8-M: FAULTMASK clears on the return from any exception but NMI, the monitor clears, and an
     // IT block the exception interrupted goes on under the ITSTATE its frame holds: what is left of
     // it is decoded under that state, whatever its records held (thumb2.sysl).
-    if cpu.kind != Kind.V6m
+    if !is_v6m(cpu.kind)
         if cpu.ipsr != NMI then cpu.faultmask = 0
         cpu.excl = false
-        cpu.it = it_of_psr(psr)
+        cpu.it = if cpu.kind == Kind.M23 then 0 else it_of_psr(psr)
         if cpu.it != 0 && pc < RAM_BYTES then decode_block(cpu, pc & ~1, cpu.it)
 
     cpu.active &= ~(u64(1) << cpu.ipsr)
     cpu.ipsr = ipsr
     set_apsr(cpu, psr)
+    if cpu.dsp then cpu.ge = (psr >> 16) & 15
 
     if to_process
         cpu.control |= 2
@@ -523,7 +525,7 @@ tick_start(cpu: *Cpu, now: u64)
 // that is not a register here, stops the core at `Unmapped` as an access where nothing is would.
 
 scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
-    if cpu.kind != Kind.V6m && width != 4 && byte_wide(a, width) then return part_of(scs_read(cpu, a & ~3, 4, n), a, width)
+    if !is_baseline(cpu.kind) && width != 4 && byte_wide(a, width) then return part_of(scs_read(cpu, a & ~3, 4, n), a, width)
 
     if width != 4 || a & 3 != 0
         halt(cpu, Stop.Unmapped, a)
@@ -559,7 +561,7 @@ scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
             val irq: u32 = if cpu.pending >> IRQ0 != 0 then 1 << 22 else 0
 
             (bit_of(cpu.pending, NMI) << 31) | (bit_of(cpu.pending, PENDSV) << 28) | (bit_of(cpu.pending, SYSTICK) << 26) | irq | (vectpending << 12) | cpu.ipsr
-        SCB_VTOR -> cpu.vtor
+        SCB_VTOR -> if cpu.kind == Kind.M0 || cpu.kind == Kind.M1 then 0 else cpu.vtor
         // VECTKEYSTAT, little-endian.
         SCB_AIRCR -> 0xFA050000 | (cpu.prigroup << 8)
         SCB_SHPR2 -> u32(cpu.prio[SVCALL]) << 24
@@ -567,7 +569,7 @@ scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
         _ -> scs_read8(cpu, a)
 
 scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
-    if cpu.kind != Kind.V6m && width != 4 && byte_wide(a, width) then return scs_write(cpu, a & ~3, 4, with_part(scs_read(cpu, a & ~3, 4, n), a, width, x), n)
+    if !is_baseline(cpu.kind) && width != 4 && byte_wide(a, width) then return scs_write(cpu, a & ~3, 4, with_part(scs_read(cpu, a & ~3, 4, n), a, width, x), n)
 
     if width != 4 || a & 3 != 0
         halt(cpu, Stop.Unmapped, a)
@@ -609,10 +611,10 @@ scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
             if (x >> 27) & 1 != 0 then cpu.pending &= ~(u64(1) << PENDSV)
             if (x >> 26) & 1 != 0 then cpu.pending |= u64(1) << SYSTICK
             if (x >> 25) & 1 != 0 then cpu.pending &= ~(u64(1) << SYSTICK)
-        SCB_VTOR -> cpu.vtor = x & ~0xFF
+        SCB_VTOR -> if cpu.kind != Kind.M0 && cpu.kind != Kind.M1 then cpu.vtor = x & ~0xFF
         // SYSRESETREQ, under the key: the board decides what a reset is.
         SCB_AIRCR ->
-            if x >> 16 == 0x05FA && cpu.kind != Kind.V6m then cpu.prigroup = (x >> 8) & 7
+            if x >> 16 == 0x05FA && !is_baseline(cpu.kind) then cpu.prigroup = (x >> 8) & 7
             if x >> 16 == 0x05FA && x & 4 != 0 then halt(cpu, Stop.Reset, a)
         SCB_SHPR2 -> cpu.prio[SVCALL] = u8((x >> 24) & prio_mask(cpu))
         SCB_SHPR3 ->

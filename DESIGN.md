@@ -1,7 +1,8 @@
 # cortical — a Cortex-M board emulator written in sysl
 
-**Status: the ARMv6-M core runs, in `sh.sysl.cortical.v6m`, on the virtual board (§11); no real
-board is emulated yet. The rest is design.** The repo is `sysl-lang/cortical`.
+**Status: twelve scalar Cortex-M models run in `sh.sysl.cortical.v6m` on virtual boards (§11).
+Core options and implemented subsets are described in the README and §2.12. No real board is
+emulated yet; the real-chip peripherals and optional CPU extensions below remain design.** The repo is `sysl-lang/cortical`.
 
 cortical emulates Cortex-M boards well enough to run, unmodified, the firmware a developer would
 flash onto them: each core on a host thread, a board's display in a Mac window, its UART on a
@@ -745,7 +746,7 @@ is for v7E-M and v8-M.
 ### 2.9 The ARMv8-M Mainline core as built
 
 The first item of milestone 1: the integer Thumb-2 instruction set and IT blocks, what a Cortex-M33
-executes without the FP, DSP, Security and MPU extensions. It runs on the `virt33` board (§11).
+executes without the FP, Security and MPU extensions; integer DSP is optional via board configuration. It runs on the `virt33` board (§11).
 
 - **One core with a kind, in the one module.** `Cpu.kind` is `V6m` (the zero value, so every core
   nobody gave a kind is an M0+) or `V8mMain`; the board sets it from the description's `cores`. The
@@ -824,7 +825,7 @@ executes without the FP, DSP, Security and MPU extensions. It runs on the `virt3
   is 0); MemManage, BusFault and UsageFault are never taken, and CFSR, HFSR, MMFAR and BFAR read 0.
   An unaligned `LDRD`, `LDM` or exclusive, which faults on silicon, is made as an unaligned access.
   These, with the escalation to HardFault and its registers, are a later item.
-- **Undefined in this kind**: the floating-point and coprocessor space, the DSP extension (`QADD`,
+- **Undefined in this kind**: the floating-point and coprocessor space, and, with DSP disabled, the DSP extension (`QADD`,
   `SADD16`, `SSAT16`, `SMLABB`, the extend-and-adds `SXTAB` and its kin), the Security Extension's
   `TT`, `SG`, `BXNS` and `BLXNS`, `UDF`, and the encodings ARMv8-M calls UNPREDICTABLE that a
   compiler does not emit (SP or the PC where an encoding may not name them, a load writing back to a
@@ -860,7 +861,7 @@ The M0+ decoder and its executor specialization stay separate. The decoder rejec
 acquire/release instructions and MSPLIM/PSPLIM accesses for M4; stack limits never apply to it.
 M4 reports CPUID 0x410FC241 (r0p1), resets CCR to 0x200 and permits STKALIGN to be cleared.
 The virtual implementation exposes 32 IRQs and four priority bits. Configurable faults stop
-execution, as on M33. DSP, FP, MPU and bit-band aliases are not implemented. Guests compiled
+execution, as on M33. Integer DSP is optional; FP, MPU and bit-band aliases are not implemented. Guests compiled
 for Cortex-M3 with soft float stay in the shared ARMv7-M subset; the example build emits
 `*-m4.elf` using these flags. This does not yet implement a real M4 chip or the full ARMv7E-M ISA.
 
@@ -872,7 +873,7 @@ introduced. It reports CPUID 0x410FC270 (r0p0). M7's CCR.BP and STKALIGN always 
 exception frames are always eight-byte aligned, with xPSR recording a padding word only where
 needed. NONBASETHRDENA is writable, unlike the M33's fixed bit 0. The model has no optional
 caches and CCR.IC/DC read zero. Cache identification/maintenance and TCM control registers,
-DSP, FP and MPU are not implemented. The intended H7's cache and TCM model in §2.1 remains
+Integer DSP is optional; FP and MPU are not implemented. The intended H7's cache and TCM model in §2.1 remains
 future work; this virtual M7 has the same 32 implemented IRQs and four priority bits as M4.
 
 Tests cover every width of ARMv8-M-only ordered access, MSPLIM/PSPLIM, CCR fixed/writable/reserved
@@ -885,6 +886,47 @@ Sources: Arm Cortex-M7 Devices Generic User Guide, DUI0646C, CCR and exception e
 [ST PM0253](https://www.st.com/resource/en/programming_manual/pm0253-stm32f7-series-and-stm32h7-series-cortexm7-processor-programming-manual-stmicroelectronics.pdf),
 CPUID and CCR bit assignments. The fixed BP bit is included in the value the emulator reads even
 though the register-summary table lists CCR's reset value as 0x200.
+
+### 2.12 Additional scalar Cortex-M models
+
+The shared catalog (`v6m/models.sysl`) now covers M0/M0+/M1, M3/M4/M7, M23, M33/M35P and
+M52/M55/M85. Each has its own CPUID, architectural configuration limits and a bundled virtual
+board. The M0+/M4/M7/M33 discriminants and default identities are unchanged. Models choose a
+shared architecture at decoding/run boundaries; arithmetic handlers do not test model names.
+The registry, option checker and machine assembler use the same catalog. Runtime still requires
+two cores of the same model, each with independently selected supported options.
+
+M0/M1 share the v6-M decoder and are included in the existing v6-M instruction edge-case harness;
+they read VTOR as zero and ignore its writes. M3 shares v7-M Thumb-2 with M4/M7 but has no DSP/FPU
+configuration. M23's wide encodings are restricted to the Baseline instruction summary in
+Arm DDI0550C table 3-1: MOVW/MOVT, B.W/BL, divide, barriers, exclusives and ordered accesses.
+Narrow instructions share v6-M plus CBZ/CBNZ; IT and FAULTMASK CPS forms are refused. In the
+current no-Security configuration it has no MSPLIM/PSPLIM, BASEPRI, FAULTMASK or Q, uses two
+priority bits and word-only system accesses, and CCR is read-only 0x208. M35P uses the shared
+M33 scalar ISA; physical anti-tamper properties are outside software emulation.
+
+M52/M55/M85 share v8-M scalar semantics and add CSEL, CSINC, CSINV and CSNEG, including their
+CINC/CINV/CNEG/CSET/CSETM aliases. A single cached operation and shared handler implements the
+four variants. R15 source operands are ZR, flags including Q are preserved, and a destination
+may overlap a source. SP sources, SP/PC destinations, IT blocks and AL/NV conditions are refused.
+The latter are a constrained-unpredictable case; the chosen stop agrees with QEMU's M55.
+No low-overhead loops, long shifts, Helium/MVE, floating point or PACBTI are claimed. Integer DSP is optional.
+
+`select.c` runs 68 instruction/condition/zero-register cases over 16 x 16 operand values and 12
+flag states and hashes both the result and APSR. QEMU's `mps3-an547` generates `select.qemu`;
+each v8.1-M model must reproduce every line. Both executors also run independent per-instruction
+condition and arithmetic-boundary assertions. Compiled arithmetic and multicore guests run on
+all models, under both schedulers. The existing 96-instruction QEMU reference runs on every new
+Mainline model. All run-time external IRQs are limited to the implemented 32-entry NVIC even
+where the hardware-description catalog allows the architectural maximum.
+
+Primary references: Arm DDI0432 (M0), DDI0413 (M1), DDI0337 (M3),
+[DDI0550C / M23](https://documentation-service.arm.com/static/5e908fc2c8052b1608761baf?token=),
+[DUI1095B / M23](https://documentation-service.arm.com/static/63dbc61253e02459952db9cb),
+[M52 TRM 102776](https://documentation-service.arm.com/static/675b510227eda361ad4dede9),
+[M55 TRM 101051](https://documentation-service.arm.com/static/60e2c2fc677cf7536a55dfef),
+[M85 TRM 101924](https://documentation-service.arm.com/static/626967f57e121f01fd22e302),
+and [QEMU's conditional-select translation](https://github.com/qemu/qemu/blob/master/target/arm/tcg/translate.c).
 
 ## 3. Peripherals: the STM32H747I-DISCO
 
@@ -1604,7 +1646,7 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
   as `virt` and `virt33` (§12.5), and `sh.sysl.cortical.virt` builds the machine from it: each
   device answers at the `at` and raises the `irq` its part gives, so a description that moves the
   console (`examples/virt/moved.hocon`) moves it for the guest. `cortical run` runs a description of
-  two `cortex-m0plus` or two `cortex-m33` cores, a 1 MB `ram` at 0 and at most one `debug-console`
+  two cores of one supported Cortex-M model, a 1 MB `ram` at 0 and at most one `debug-console`
   and one `virt-sio`, or a product of one such board and nothing outside it; anything else is
   refused with the reason.
 - **The board** is `sh.sysl.cortical.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
@@ -1736,6 +1778,42 @@ its buses (`spi0`), whose signals `buses { spi0 { sck = GP2, tx = GP3 } }` route
 another part offers (`wifi.gpio0`, the CYW43439's GPIO driving the Pico 2 W's LED). A parameter is
 held to its part's type: a whole number in a range, a number, text, `true`/`false`, or one of a list;
 `0x5d` is the whole number 93, as an address is written on a datasheet.
+
+### 12.2.1 Per-core configuration and defaults
+
+Each entry of `cores` is either a core name or an object with `core = <name>` and optional
+`dsp`, `fpu`, `mpu_regions`, `security`, `icache`, `dcache`, `nvic_priority_bits`. Names remain
+shorthand for the current emulated integer configuration. Defaults are DSP off, FPU `none`, zero
+MPU regions, security `none`, caches off, and two priority bits on M0/M0+/M1/M23 or four on Mainline models.
+Only explicitly written settings are serialized, so defaults are applied by core model on read.
+
+The checker validates scalar types, the options allowed by the model and their ranges. It can
+describe hardware features not yet emulated; machine assembly refuses enabled FPU, MPU,
+TrustZone or caches by name. NVIC priority width is implemented independently per core (Baseline models have
+2, Mainline models 3–8), and reapplied when core 1 leaves its boot ROM. Integer DSP can be enabled independently on each capable core and is also reapplied on launch.
+Existing board descriptions preserve their behavior.
+
+An object's options are independent of every other core. Duplicate fields are errors at the
+second key's source span, including objects inside the cores array. Summaries show explicit
+settings rather than collapsing two differently configured cores into one description.
+The README's core-options table gives the accepted model-specific values. Chip-integrated
+cores remain defined by the chip model; a board cannot override its chip by also naming `cores`.
+
+Integer DSP uses the shared Thumb-2 decoder and 16-byte records. `dsp.sysl` implements the
+36 parallel add/subtract forms, QADD/QSUB/QDADD/QDSUB, SSAT16/USAT16, SEL, PKHBT/PKHTB,
+rotated signed/unsigned extensions with optional addition, and the halfword, dual, word-halfword,
+most-significant-word, long and unsigned absolute-difference multiply/accumulate families.
+APSR.GE is independent of NZCVQ, accessible through MRS and the MSR GE mask, and stacked/restored
+in xPSR on exceptions. Packed saturation preserves Q; scalar saturation and overflowing short
+signed accumulations set it sticky. Long accumulations wrap without changing flags.
+
+Extension gating occurs in both execution engines, after IT predication, because homogeneous
+models can share decoded records while selecting DSP differently per core. Disabled DSP stops
+at `Undefined` without retiring or changing guest registers. The tests include this shared-cache
+case, invalid operands, flag masks, exception restoration and core 1 launch. `examples/virt/dsp.c`
+compares 152 instruction variants against QEMU 11.1.2's Cortex-M33 over operand and accumulator
+edges and every GE combination; every DSP-capable model runs it through both execution engines.
+`examples/qemu/build-dsp.sh` refreshes that oracle.
 
 ### 12.3 A product
 
@@ -1934,7 +2012,7 @@ Each points at the name or value it is about; `<x>` is the name in the file.
   or prints what it is: the board's chip or cores, each part with its place, wires and parameters,
   what it exposes, and its view; for a product, each board instance and then the same.
 - `cortical run [--board <name | file.hocon>] <image>` runs on `virt` where no board is named. It runs
-  a board of two M0+ cores or two M33s and the parts cortical emulates on their bus, or a product of
+  a board of two cores of one supported Cortex-M model and the parts cortical emulates on their bus, or a product of
   one such board and nothing outside it, and refuses anything else with the reason (`cortical does not emulate
   the rp2040`, `cortical runs one board, and this product has 2`).
 - `cortical render` — drawing a description's view to an image — comes with the window (§4).

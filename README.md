@@ -10,8 +10,9 @@ ARMv8-M Mainline). It is an interpreter; a JIT is not planned.
 
 ## Status
 
-**The ARMv6-M (Cortex-M0+) and ARMv8-M Mainline (Cortex-M33, its integer instruction set) cores
-run, on the virtual boards.** No real board is emulated yet.
+**Twelve Cortex-M models run scalar firmware on virtual boards:** M0, M0+, M1, M3, M4, M7,
+M23, M33, M35P, M52, M55 and M85. Extensions and limitations are listed below; this is not full
+FPU, TrustZone or Helium emulation. Integer DSP is available through board options. No real board is emulated yet.
 [DESIGN.md](DESIGN.md) is the design note: the architecture, the CPU interpreter, each board's
 devices, how fidelity is tested against real boards, and the milestones with their estimates.
 
@@ -21,7 +22,7 @@ devices, how fidelity is tested against real boards, and the milestones with the
 sysl build . -o cortical
 ./cortical run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>
 ./cortical check <name | file.hocon>
-./cortical bench [--core <cortex-m0plus | cortex-m4 | cortex-m7 | cortex-m33>] <image.bin> [expected r0] [match | threaded]
+./cortical bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./cortical bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
 ```
 
@@ -58,8 +59,8 @@ A description is a HOCON file, and the shortest names a board built into cortica
 board = pico2w
 ```
 
-`virt`, `virt4`, `virt7`, `virt33`, `pico`, `pico2w` and `pico-breadboard-kit` are built in ([boards](boards) has their
-sources). **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**,
+The virtual boards in the core table below, plus `pico`, `pico2w` and `pico-breadboard-kit`,
+are built in ([boards](boards) has their sources). **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**,
 on the command line and in a file alike, so `--board virt` is the virtual board and `--board
 ./virt` a file. A path in a file is read from that file's directory.
 
@@ -107,52 +108,108 @@ red } }`) and never otherwise. Each exposed pin is wired once across the product
 cores' bus has `at`, `size` and `irq`. [DESIGN.md](DESIGN.md) §12 has the whole format and every
 mistake `check` reports.
 
+## Core options in a board description
+
+A plain core name uses defaults. An object selects options for that core; omitted options keep
+their defaults, independently of the other core:
+
+```hocon
+cores = [
+  { core = cortex-m7, nvic_priority_bits = 3 }
+  { core = cortex-m7, nvic_priority_bits = 8 }
+]
+```
+
+Both forms can appear in the same list. Existing `cores = [cortex-m7, cortex-m7]` descriptions keep
+their behavior. The defaults describe cortical's current integer implementations:
+
+| option | default | accepted selections |
+|---|---|---|
+| `dsp` | `false` | boolean; available on M4/M7/M33/M35P/M52/M55/M85 |
+| `fpu` | `none` | `sp` on M4/M33/M35P; `sp`/`dp` on M7/M52/M55/M85; `none` on every model |
+| `mpu_regions` | `0` | 0 on M0/M1; 0/8 on M0+/M3/M4; 0/8/16 on M7; 0/4/8/12/16 on Armv8-M models |
+| `security` | `none` | `trustzone` on M23/M33/M35P/M52/M55/M85; `none` on every model |
+| `icache` | `false` | boolean; enabling is valid on M7/M35P/M52/M55/M85 |
+| `dcache` | `false` | boolean; enabling is valid on M7/M52/M55/M85 |
+| `nvic_priority_bits` | 2 on M0/M0+/M1/M23, 4 otherwise | 2 on Baseline models; 3–8 on Mainline models |
+| `mve` | `none` | `none`/`integer`/`float` on M52/M55/M85 |
+| `low_overhead_loops` | `false` | boolean on M52/M55/M85 |
+| `pacbti` | `false` | boolean on M52/M85 |
+
+**Priority width is implemented.** It controls NVIC and system-handler priorities, BASEPRI and
+priority grouping, including after core 1 launches. `check` validates and prints all explicit
+options, and writing a description back preserves them. **Integer DSP is implemented** when
+`dsp = true`: packed arithmetic, saturation, packing/extension, byte selection and the DSP
+multiply/accumulate families, including APSR.GE and exception stacking. It defaults to off.
+`run` currently rejects enabled FPU, MPU, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
+unsupported selection; it never silently
+ignores them. A chip's integrated core configuration is defined by its chip model; these options
+apply to boards that declare `cores` directly.
+
+[examples/virt/core-options.hocon](examples/virt/core-options.hocon) is a runnable M7 example.
+[examples/virt/dsp.hocon](examples/virt/dsp.hocon) enables DSP on two M4 cores:
+
+```sh
+./cortical run --board examples/virt/dsp.hocon examples/virt/dsp.elf
+```
+
+The DSP test guest checks 152 instruction variants against QEMU, with integer limits,
+accumulator overflow, saturation, NZCVQ and all GE combinations, on both execution engines.
+Regenerate the oracle with `zsh examples/qemu/build-dsp.sh` and the guest with
+`zsh examples/virt/build.sh`.
+
 ## The cores
 
-| kind | core | what it runs |
-|---|---|---|
-| ARMv6-M | `cortex-m0plus` | the whole ARMv6-M instruction set, its exceptions, SysTick, the NVIC and SCB |
-| ARMv7E-M (integer subset) | `cortex-m4` | shared ARMv7-M integer Thumb-2, IT blocks, exclusives, divide, BASEPRI, FAULTMASK and PRIGROUP; no DSP, FP or MPU |
-| ARMv7E-M (integer subset) | `cortex-m7` | the same shared integer ISA as M4; M7 CPUID and fixed exception-stack alignment; no DSP, FP, MPU or optional caches |
-| ARMv8-M Mainline | `cortex-m33` | the integer Thumb-2 instruction set: every 16- and 32-bit integer encoding, IT blocks, the exclusives, `LDA`/`STL`, hardware divide; BASEPRI, FAULTMASK, PRIGROUP, the stack limits (MSPLIM, PSPLIM) |
+| architecture | core name | bundled board | implemented scalar ISA |
+|---|---|---|---|
+| Armv6-M | `cortex-m0` | `virt0` | shared v6-M; fixed vector table at 0 |
+| Armv6-M | `cortex-m0plus` | `virt` | existing v6-M implementation, with VTOR |
+| Armv6-M | `cortex-m1` | `virt1` | shared v6-M; fixed vector table at 0 |
+| Armv7-M | `cortex-m3` | `virt3` | shared integer Thumb-2, IT, exclusives, divide and priority masks |
+| Armv7E-M subset | `cortex-m4` | `virt4` | shared v7-M integer ISA; optional DSP |
+| Armv7E-M subset | `cortex-m7` | `virt7` | same integer ISA, M7 identity and fixed eight-byte exception alignment |
+| Armv8-M Baseline | `cortex-m23` | `virt23` | v6-M plus MOVW/MOVT, CBZ/CBNZ, B.W, divide, exclusives and ordered accesses; no IT |
+| Armv8-M Mainline subset | `cortex-m33` | `virt33` | shared integer Thumb-2, ordered accesses, stack limits and priority masks |
+| Armv8-M Mainline subset | `cortex-m35p` | `virt35p` | same shared scalar ISA as M33; physical tamper resistance is not modelled |
+| Armv8.1-M scalar subset | `cortex-m52` | `virt52` | shared v8-M scalar ISA plus CSEL/CSINC/CSINV/CSNEG and their aliases |
+| Armv8.1-M scalar subset | `cortex-m55` | `virt55` | same shared scalar subset |
+| Armv8.1-M scalar subset | `cortex-m85` | `virt85` | same shared scalar subset |
 
-One interpreter serves all four, configured by the core's kind when it decodes; the M0+ runs no slower
-for the M33 being there. The M33 has no FP, DSP, Security or MPU extension — their encodings are
-undefined, so a program for it is built `-mcpu=cortex-m33+nodsp -mfloat-abi=soft` — and takes no
-configurable fault: where a UsageFault, BusFault or MemManage would be taken, the core stops and
-cortical says why. Each is checked against the ARMv8-M or ARMv6-M ARM instruction by instruction, and
-the M33 against QEMU's too ([DESIGN.md](DESIGN.md) §2.8–§2.9).
+One interpreter serves all models. The catalog in `v6m/models.sysl` selects identity, architecture
+and available configuration options; decoders gate encodings by architecture, and instruction
+handlers are shared. M23 is a separate Baseline decoder profile, with two priority bits, word-only
+system-register accesses, fixed CCR and no IT, BASEPRI, FAULTMASK or stack limits in its current
+configuration without the Security Extension. M0/M1 have no VTOR; M3 has the v7-M register profile.
 
-`virt4` runs two Cortex-M4 cores using the same decoder, instruction handlers and exception
-machinery as the M33. ARMv8-M-only acquire/release encodings and stack-limit registers are
-undefined on the M4. Its CPUID and CCR behavior are selected separately. This is an integer
-subset of the M4: DSP, floating point and MPU support are not implemented, and configurable faults
-stop execution as on the M33. The virtual boards currently implement 32 external interrupts,
-with four priority bits on M4 and M33.
+**All models currently omit floating point, MPU and Security extensions.**
+M4/M7/M33/M35P/M52/M55/M85 can enable integer DSP independently per core. The M52/M55/M85
+models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
+MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. Unsupported instruction
+encodings stop at `Undefined`; `run` refuses descriptions enabling unimplemented extensions.
+The conditional-select family treats R15 sources as ZR, preserves NZCV/Q, rejects SP and PC
+destination operands, and stops on AL/NV constrained-unpredictable conditions.
 
-Build guests for this subset with `-mcpu=cortex-m3 -mthumb -mfloat-abi=soft` to keep the compiler
-within the shared ARMv7-M instruction set. `examples/virt/build.sh` produces `*-m4.elf` guests:
+Every virtual board still implements 32 external interrupts. Architectural maxima are available
+to the description checker, but `run` refuses a device selecting IRQ 32 or above. Configurable
+faults remain emulator stops rather than implemented fault handlers, as before. Pipeline timing,
+physical side-channel resistance, debug/trace and real-chip peripherals are not modelled.
+
+The example build uses matching scalar compiler targets: M0 for M0/M1, M3 for M3/M4, M23 for M23,
+and `armv8-m.main+nodsp` for M35P/M52/M55/M85 (with tuning for the v8.1-M cores). M7 uses the M3
+ISA with M7 tuning. The existing M0+ and M33 guest builds keep their flags. `select.c` adds explicit
+v8.1-M conditional-select instructions to scalar compiler output and is checked against QEMU's
+M55 by `examples/qemu/build-select.sh`; the 96-instruction shared corpus is also checked on
+M3/M35P/M52/M55/M85. The existing v6-M instruction unit cases run on M0/M1/M0+ under both executors.
 
 ```
-./cortical run --board virt4 examples/virt/crunch-m4.elf
-./cortical run --board virt4 --threads examples/virt/exclusive-m4.elf
+zsh examples/virt/build.sh
+./cortical run --board virt23 examples/virt/crunch-m23.elf
+./cortical run --board virt35p --threads examples/virt/exclusive-m35p.elf
+./cortical run --board virt55 examples/virt/select-v81.elf
 ```
 
-`virt7` runs two Cortex-M7s using that same ARMv7-M instruction implementation, with CPUID
-0x410FC270 (r0p0). Unlike M4, M7 always aligns exception frames to eight bytes: CCR.STKALIGN
-and CCR.BP read as one. The virtual M7 has no optional caches; CCR.IC/DC read as zero. Cache
-identification, cache maintenance and TCM control registers are not implemented. This is the same
-integer subset as M4, with no DSP, FP or MPU, and the same 32 implemented interrupts and four
-priority bits. It is not yet the STM32H7 board model or a cycle-accurate model of the M7 pipeline.
-
-The example build also emits `*-m7.elf`, using `-mcpu=cortex-m3 -mtune=cortex-m7 -mthumb
--mfloat-abi=soft`: the shared ISA, with M7 instruction scheduling. The M7 instruction-hash guest
-checks 96 instructions over edge operands and flag states against the existing QEMU reference.
-
-```
-./cortical run --board virt7 examples/virt/crunch-m7.elf
-./cortical run --board virt7 --threads examples/virt/exclusive-m7.elf
-```
+The M52 model identifies as Arm China's r0p3 (CPUID 0x630FD243), M55 as r1p0 (0x411FD220),
+and M85 as r0p0 (0x410FD230). Existing M0+/M4/M7/M33 identities remain unchanged.
 
 The bench kernel (`bench/guest/kernel.c`) built for each, on an M5 Pro:
 
@@ -167,8 +224,8 @@ fewer, in half the time ([bench/README.md](bench/README.md)).
 ## The virtual boards
 
 Machines that exist only in cortical, for running a program and talking to it with nothing but the
-core — deliberately not a real chip. `virt` has two Cortex-M0+ cores, `virt4` two Cortex-M4s,
-`virt7` two Cortex-M7s and `virt33` two Cortex-M33s, with the same devices:
+core — deliberately not a real chip. Each board in the core table has two cores of that model,
+with the same devices:
 
 | address | what |
 |---|---|

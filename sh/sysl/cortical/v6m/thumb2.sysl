@@ -7,7 +7,7 @@ module sh.sysl.cortical.v6m
 // decoded, a PC-relative address computed — so an executor only reads fields.
 //
 // **Undefined here**, each stopping the core at `Undefined` as any undefined instruction does: the
-// floating-point, DSP and coprocessor encodings (this kind has none of those extensions), `TT`, `SG`,
+// floating-point and coprocessor encodings, `TT`, `SG`,
 // `BXNS` and `BLXNS` (the Security Extension's, which this kind has not), `UDF`, and the encodings the
 // architecture calls UNPREDICTABLE that a compiler never emits: the PC or SP where an instruction may
 // not name it, an empty or self-overlapping register list, writeback to a register also loaded, and
@@ -70,7 +70,7 @@ decode_v8(cpu: *Cpu, pc: u32, into: *Insn, it: u32)
         into.op = decode_wide(cpu, pc, hw, load16(cpu, pc + 2), into, it)
 
     // ARMv7-M shares the decoder, but has neither v8-M ordered accesses nor stack limits.
-    if is_v7em(cpu.kind)
+    if is_v7m(cpu.kind)
         if into.op == Op.Lda || into.op == Op.Stl then into.op = Op.Undefined
         if into.op == Op.Ldrex && u32(into.c) & 4 != 0 then into.op = Op.Undefined
         if into.op == Op.Strex && into.imm & (1 << 18) != 0 then into.op = Op.Undefined
@@ -78,6 +78,8 @@ decode_v8(cpu: *Cpu, pc: u32, into: *Insn, it: u32)
             val sysm = into.imm & 0xFF
 
             if sysm == 10 || sysm == 11 then into.op = Op.Undefined
+
+    if cpu.kind == Kind.M23 then baseline_instruction(hw, is_wide, into)
 
     into.h = handler_for(into)
 
@@ -88,6 +90,39 @@ decode_v8(cpu: *Cpu, pc: u32, into: *Insn, it: u32)
     if into.op == Op.CmpImm || into.op == Op.CmpReg then fuse(cpu, pc, into)
     if into.op == Op.DpImm && u32(into.c) == IMM_CMP then fuse_wide(cpu, pc, into)
     if into.op == Op.It then decode_block(cpu, pc + 2, into.imm)
+
+// ARMv8-M Baseline is not Mainline with IT disabled: restrict wide encodings to the
+// M23 instruction summary (Arm DDI0550C, table 3-1). Security Extension encodings remain undefined.
+private baseline_instruction(hw: u32, is_wide: bool, into: *Insn)
+    if !is_wide
+        if into.op == Op.It then into.op = Op.Undefined
+        if into.op == Op.Cps8
+            if into.imm & 4 != 0 || into.imm & 2 == 0
+                into.op = Op.Undefined
+            else
+                into.op = Op.Cps
+                into.imm &= 1
+        return
+
+    val allowed = into.op match
+        B | Bl | Leave | Barrier | Clrex | Udiv | Sdiv | Ldrex | Strex | Lda | Stl | Movt | Mrs8 | Msr8 -> true
+        // MOVW has the DpImm operation, but the other wide immediate forms are Mainline.
+        DpImm -> hw & 0xFBF0 == 0xF240
+        _ -> false
+
+    if !allowed then into.op = Op.Undefined
+
+    if into.op == Op.Mrs8 || into.op == Op.Msr8
+        val sysm = into.imm & 0xFF
+        val known = sysm <= 3 || (sysm >= 5 && sysm <= 9) || sysm == 16 || sysm == 20
+
+        if !known
+            into.op = Op.Undefined
+        else
+            // Baseline APSR has no Q, BASEPRI or FAULTMASK; use the existing v6-M register handlers.
+            into.op = if into.op == Op.Mrs8 then Op.Mrs else Op.Msr
+            into.imm = sysm
+end baseline_instruction
 
 // A 32-bit `CMP` with an immediate and a 16-bit conditional branch after it, fused as decode.sysl's
 // `fuse` fuses the 16-bit compare: the branch decoded into its own record, two after the compare's,
@@ -263,7 +298,23 @@ private in_block(hw: u32, into: *Insn) -> Op
 // 32-bit encodings.
 
 private decode_wide(cpu: *Cpu, pc: u32, hw1: u32, hw2: u32, into: *Insn, it: u32) -> Op
+    val dsp = decode_dsp(cpu, hw1, hw2, into)
+
+    if dsp != Op.Undecoded then return dsp
+
     val op1 = bits(hw1, 11, 2)
+
+    // These occupy a formerly reserved shifted-register encoding. Never let an older core
+    // decode them as a data-processing operation, or allow them inside an IT block.
+    if hw1 & 0xFFF0 == 0xEA50 && hw2 & 0xC000 == 0x8000
+        val rd = bits(hw2, 8, 4)
+        val rn = hw1 & 0xF
+        val rm = hw2 & 0xF
+        val condition = bits(hw2, 4, 4)
+
+        if !is_v81m(cpu.kind) || it != 0 || bad(rd) || rn == 13 || rm == 13 || condition >= 14 then return Op.Undefined
+        set(into, rd, rn, rm, condition | (bits(hw2, 12, 2) << 4))
+        return Op.Csel
 
     if op1 == 0b01
         return bits(hw1, 9, 2) match
@@ -273,7 +324,7 @@ private decode_wide(cpu: *Cpu, pc: u32, hw1: u32, hw2: u32, into: *Insn, it: u32
             _ -> Op.Undefined
 
     if op1 == 0b10
-        if hw2 >> 15 == 1 then return branch_or_control(pc, hw1, hw2, into, it)
+        if hw2 >> 15 == 1 then return branch_or_control(cpu, pc, hw1, hw2, into, it)
 
         return if bits(hw1, 9, 1) == 0 then modified_immediate(hw1, hw2, into) else plain_immediate(pc, hw1, hw2, into)
 
@@ -595,7 +646,7 @@ private plain_immediate(pc: u32, hw1: u32, hw2: u32, into: *Insn) -> Op
         _ -> Op.Undefined
 
 // Branches and miscellaneous control.
-private branch_or_control(pc: u32, hw1: u32, hw2: u32, into: *Insn, it: u32) -> Op
+private branch_or_control(cpu: *Cpu, pc: u32, hw1: u32, hw2: u32, into: *Insn, it: u32) -> Op
     val op1 = bits(hw2, 12, 3)
     val kind = bits(hw1, 4, 7)
     val s = bits(hw1, 10, 1)
@@ -632,13 +683,13 @@ private branch_or_control(pc: u32, hw1: u32, hw2: u32, into: *Insn, it: u32) -> 
     if op1 != 0 then return Op.Undefined
 
     if kind >> 1 == 0b011100
-        // MSR: the special register, and for an APSR view the mask, which without the DSP extension
-        // must be `nzcvq` alone.
+        // MSR: special register and independent NZCVQ/GE masks. GE writes are ignored
+        // at execution time when this core has DSP disabled.
         val rn = hw1 & 0xF
         val mask = bits(hw2, 10, 2)
         val sysm = hw2 & 0xFF
 
-        if bad(rn) || !special8(sysm) || mask != 2 then return Op.Undefined
+        if bad(rn) || !special8(sysm) || (mask == 0 || (mask != 2 && (!model_of(cpu.kind).dsp || sysm > 3))) then return Op.Undefined
 
         set(into, 0, rn, 0, sysm | (mask << 8))
         return Op.Msr8
