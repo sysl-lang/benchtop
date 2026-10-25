@@ -1,0 +1,438 @@
+module sh.sysl.cortical.v6m
+@tests
+
+// The floating-point extension's instructions one at a time, against the ARMv7-M and ARMv8-M ARMs'
+// pseudocode: the result's bits, FPSCR's flags and NZCV, memory, and the core registers, at the
+// edges where each changes: the rounding modes, NaNs signalling and quiet with and without
+// default-NaN, flush-to-zero, saturation and the conversions' flags. Every case runs under both
+// executors, which must agree on everything, the unit's registers included. The encodings are the
+// GNU assembler's, written beside each case.
+
+const ONE: u32 = 0x3F800000
+const TWO: u32 = 0x40000000
+const THREE: u32 = 0x40400000
+const QNAN: u32 = 0x7FC00000
+const RU: u32 = 0x00400000
+const RM: u32 = 0x00800000
+const DN: u32 = 0x02000000
+const FZ: u32 = 0x01000000
+const IOC: u32 = 1
+const DZC: u32 = 2
+const UFC: u32 = 8
+const IXC: u32 = 16
+
+// `code` on a core of `kind` with a unit (1 single precision, 2 double), CP10 and CP11 open to all,
+// S0 upward from `s`, FPSCR `fpscr` in a context already active (CONTROL.FPCA), and r0 upward from
+// `regs`.
+fp_prepare(cpu: *Cpu, kind: Kind, unit: u32, code: []const u16, regs: []const u32, s: []const u32, fpscr: u32, mem: [][2]u32)
+    cpu.kind = kind
+    prepare(cpu, code, regs, 0, mem)
+    cpu.fpu = unit
+    cpu.cpacr = 0x00F00000
+    cpu.control = 4
+    cpu.fpscr = fpscr
+    for k in 0..<s.len do cpu.s[k] = s[k]
+
+// The case under both executors, which must agree; answers the threaded run.
+fp_case(kind: Kind, unit: u32, code: []const u16, regs: []const u32, s: []const u32, fpscr: u32, mem: [][2]u32) -> Cpu
+    var a: Cpu
+    var b: Cpu
+    var words: [(HIGH - LOW) / 4]u32
+
+    fp_prepare(&a, kind, unit, code, regs, s, fpscr, mem)
+    finish(&a, &run_match)
+    for i in 0..<words.len do words[i] = load32(&a, LOW + u32(i) * 4)
+
+    fp_prepare(&b, kind, unit, code, regs, s, fpscr, mem)
+    finish(&b, &run_threaded)
+
+    for i in 0..<16 do assert(a.r[i] == b.r[i], s"the executors agree on r$i")
+    for i in 0..<32 do assert(a.s[i] == b.s[i], s"the executors agree on s$i")
+    assert(a.fpscr == b.fpscr && flags(&a) == flags(&b) && a.control == b.control, "and on FPSCR, the flags and CONTROL")
+    assert(a.stop == b.stop && a.stop_at == b.stop_at && a.retired == b.retired, "and on the stop")
+    for i in 0..<words.len do assert(words[i] == load32(&b, LOW + u32(i) * 4), "and on memory")
+
+    b
+
+// One instruction on an M33's single-precision unit: S0 upward from `s`, FPSCR `fpscr`.
+single(code: []const u16, s: []const u32, fpscr: u32) -> Cpu = fp_case(Kind.V8mMain, 1, code, [], s, fpscr, [])
+
+// One instruction on an M7's double-precision unit.
+double(code: []const u16, s: []const u32, fpscr: u32) -> Cpu = fp_case(Kind.V7emM7, 2, code, [], s, fpscr, [])
+
+// The instruction ran to the breakpoint, leaving `want` in S1 and FPSCR's low byte (the flags) `raised`.
+gave(c: *Cpu, want: u32, raised: u32) -> bool
+    if c.stop == Stop.Breakpoint && c.retired == 1 && c.s[1] == want && c.fpscr & 0x9F == raised then return true
+
+    print(f"stop ${c.stop} after ${c.retired}: s1 0x${c.s[1]}%08x, flags 0x${c.fpscr & 0x9F}%02x; wanted 0x$want%08x, 0x$raised%02x")
+    false
+
+@inline
+undefined(c: *Cpu) -> bool = c.stop == Stop.Undefined && c.retired == 0
+
+// ---------------------------------------------------------------------------------------------------
+// Arithmetic.
+
+@test("VADD, VSUB, VMUL and VDIV round in FPSCR's mode and raise inexact, divide-by-zero and invalid")
+fp_arithmetic()
+    // vadd.f32 s1, s2, s3; 1 + 2^-30
+    var c = single([0xEE71, 0x0A21], [0, 0, ONE, 0x30800000], 0)
+    assert(gave(&c, ONE, IXC), "to nearest")
+    c = single([0xEE71, 0x0A21], [0, 0, ONE, 0x30800000], RU)
+    assert(gave(&c, 0x3F800001, IXC), "upward")
+    c = single([0xEE71, 0x0A21], [0, 0, ONE, TWO], RU)
+    assert(gave(&c, THREE, 0), "exact")
+    // vsub.f32 s1, s2, s3: 1 - 2^-30 downward
+    c = single([0xEE71, 0x0A61], [0, 0, ONE, 0x30800000], RM)
+    assert(gave(&c, 0x3F7FFFFF, IXC), "VSUB")
+    // vmul.f32 s1, s2, s3
+    c = single([0xEE61, 0x0A21], [0, 0, TWO, THREE], 0)
+    assert(gave(&c, 0x40C00000, 0), "VMUL")
+    // vnmul.f32 s1, s2, s3
+    c = single([0xEE61, 0x0A61], [0, 0, TWO, THREE], 0)
+    assert(gave(&c, 0xC0C00000, 0), "VNMUL")
+    // vdiv.f32 s1, s2, s3: 1/0, 0/0, 1/3
+    c = single([0xEEC1, 0x0A21], [0, 0, ONE, 0], 0)
+    assert(gave(&c, 0x7F800000, DZC), "1/0")
+    c = single([0xEEC1, 0x0A21], [0, 0, 0, 0], 0)
+    assert(gave(&c, QNAN, IOC), "0/0")
+    c = single([0xEEC1, 0x0A21], [0, 0, ONE, THREE], 0)
+    assert(gave(&c, 0x3EAAAAAB, IXC), "1/3")
+
+@test("NaN operands propagate quieted, signalling ones raise invalid, and default-NaN replaces them")
+fp_nans()
+    // vadd.f32 s1, s2, s3
+    var c = single([0xEE71, 0x0A21], [0, 0, 0x7FC00123, ONE], 0)
+    assert(gave(&c, 0x7FC00123, 0), "a quiet NaN propagates")
+    c = single([0xEE71, 0x0A21], [0, 0, 0x7F800123, ONE], 0)
+    assert(gave(&c, 0x7FC00123, IOC), "a signalling NaN is quieted, raising invalid")
+    c = single([0xEE71, 0x0A21], [0, 0, 0x7FC00123, ONE], DN)
+    assert(gave(&c, QNAN, 0), "default NaN")
+    c = single([0xEE71, 0x0A21], [0, 0, 0x7F800123, ONE], DN)
+    assert(gave(&c, QNAN, IOC), "default NaN, signalling")
+
+@test("flush-to-zero reads a subnormal operand as zero and flushes a subnormal result, raising underflow")
+fp_flush_to_zero()
+    // vadd.f32 s1, s2, s3: the least subnormal plus 0
+    var c = single([0xEE71, 0x0A21], [0, 0, 1, 0], 0)
+    assert(gave(&c, 1, 0), "kept")
+    c = single([0xEE71, 0x0A21], [0, 0, 1, 0], FZ)
+    assert(c.stop == Stop.Breakpoint && c.s[1] == 0, "flushed operand")
+    // vmul.f32 s1, s2, s3: the least normal halved, exactly a subnormal
+    c = single([0xEE61, 0x0A21], [0, 0, 0x00800000, 0x3F000000], 0)
+    assert(gave(&c, 0x00400000, 0), "an exact subnormal")
+    c = single([0xEE61, 0x0A21], [0, 0, 0x00800000, 0x3F000000], FZ)
+    assert(c.stop == Stop.Breakpoint && c.s[1] == 0 && c.fpscr & UFC != 0, "flushed result")
+
+@test("VMLA and VMLS round the product and the sum; VFMA and VFMS round once")
+fp_multiply_accumulate()
+    // (1 + 2^-12)^2 - (1 + 2^-11) is 2^-24 exactly; rounded first, the product is 1 + 2^-11.
+    val n = 0x3F800800
+    val d = 0xBF801000
+    // vmla.f32 s1, s2, s3
+    var c = single([0xEE41, 0x0A21], [0, d, n, n], 0)
+    assert(gave(&c, 0, IXC), "VMLA")
+    // vfma.f32 s1, s2, s3
+    c = single([0xEEE1, 0x0A21], [0, d, n, n], 0)
+    assert(gave(&c, 0x33800000, 0), "VFMA")
+    // vmls.f32 s1, s2, s3: d - n*m, with d = 1 + 2^-11
+    c = single([0xEE41, 0x0A61], [0, 0x3F801000, n, n], 0)
+    assert(gave(&c, 0, IXC), "VMLS")
+    // vfms.f32 s1, s2, s3
+    c = single([0xEEE1, 0x0A61], [0, 0x3F801000, n, n], 0)
+    assert(gave(&c, 0xB3800000, 0), "VFMS")
+    // vnmla.f32 s1, s2, s3: -d - n*m; vnmls: -d + n*m; with d = 1, n = 2, m = 3
+    c = single([0xEE51, 0x0A61], [0, ONE, TWO, THREE], 0)
+    assert(gave(&c, 0xC0E00000, 0), "VNMLA")
+    c = single([0xEE51, 0x0A21], [0, ONE, TWO, THREE], 0)
+    assert(gave(&c, 0x40A00000, 0), "VNMLS")
+    // vfnma.f32 s1, s2, s3: -d - n*m; vfnms: -d + n*m
+    c = single([0xEED1, 0x0A61], [0, ONE, TWO, THREE], 0)
+    assert(gave(&c, 0xC0E00000, 0), "VFNMA")
+    c = single([0xEED1, 0x0A21], [0, ONE, TWO, THREE], 0)
+    assert(gave(&c, 0x40A00000, 0), "VFNMS")
+
+@test("VMOV, VABS and VNEG move bits without raising anything, and VSQRT rounds")
+fp_one_operand()
+    // vmov.f32 s1, #1.0; vmov.f32 s1, s3; vabs.f32 s1, s3; vneg.f32 s1, s3
+    var c = single([0xEEF7, 0x0A00], [], 0)
+    assert(gave(&c, ONE, 0), "VMOV immediate")
+    c = single([0xEEF0, 0x0A61], [0, 0, 0, 0x7F800001], 0)
+    assert(gave(&c, 0x7F800001, 0), "VMOV keeps a signalling NaN")
+    c = single([0xEEF0, 0x0AE1], [0, 0, 0, 0xFFC00000], 0)
+    assert(gave(&c, QNAN, 0), "VABS")
+    c = single([0xEEF1, 0x0A61], [0, 0, 0, 0x7F800001], 0)
+    assert(gave(&c, 0xFF800001, 0), "VNEG")
+    // vsqrt.f32 s1, s3
+    c = single([0xEEF1, 0x0AE1], [0, 0, 0, 0x40800000], 0)
+    assert(gave(&c, TWO, 0), "VSQRT")
+    c = single([0xEEF1, 0x0AE1], [0, 0, 0, TWO], 0)
+    assert(gave(&c, 0x3FB504F3, IXC), "VSQRT inexact")
+    c = single([0xEEF1, 0x0AE1], [0, 0, 0, 0xBF800000], 0)
+    assert(gave(&c, QNAN, IOC), "VSQRT of a negative")
+
+@test("VCMP sets FPSCR's NZCV, VCMPE raises invalid for a quiet NaN, and VMRS APSR_nzcv copies them")
+fp_compare()
+    // vcmp.f32 s1, s3
+    var c = single([0xEEF4, 0x0A61], [0, ONE, 0, TWO], 0)
+    assert(c.fpscr == 0x80000000, "less")
+    c = single([0xEEF4, 0x0A61], [0, TWO, 0, TWO], 0)
+    assert(c.fpscr == 0x60000000, "equal")
+    c = single([0xEEF4, 0x0A61], [0, THREE, 0, TWO], 0)
+    assert(c.fpscr == 0x20000000, "greater")
+    c = single([0xEEF4, 0x0A61], [0, QNAN, 0, TWO], 0)
+    assert(c.fpscr == 0x30000000, "unordered, quiet")
+    c = single([0xEEF4, 0x0A61], [0, 0x7F800001, 0, TWO], 0)
+    assert(c.fpscr == 0x30000001, "unordered, signalling")
+    // vcmpe.f32 s1, s3
+    c = single([0xEEF4, 0x0AE1], [0, QNAN, 0, TWO], 0)
+    assert(c.fpscr == 0x30000001, "VCMPE")
+    // vcmp.f32 s1, #0: -0 equals +0
+    c = single([0xEEF5, 0x0A40], [0, 0x80000000], 0)
+    assert(c.fpscr == 0x60000000, "against zero")
+    // vcmp.f32 s1, s3; vmrs APSR_nzcv, fpscr
+    c = single([0xEEF4, 0x0A61, 0xEEF1, 0xFA10], [0, ONE, 0, TWO], 0)
+    assert(c.stop == Stop.Breakpoint && flags(&c) == 8, "VMRS APSR_nzcv")
+
+@test("conversions to an integer round as asked, saturate with invalid, and raise inexact for a dropped fraction")
+fp_to_integer()
+    // vcvt.s32.f32 s1, s3: toward zero
+    var c = single([0xEEFD, 0x0AE1], [0, 0, 0, 0x40200000], 0)
+    assert(gave(&c, 2, IXC), "2.5")
+    c = single([0xEEFD, 0x0AE1], [0, 0, 0, 0xC0200000], 0)
+    assert(gave(&c, 0xFFFFFFFE, IXC), "-2.5")
+    c = single([0xEEFD, 0x0AE1], [0, 0, 0, 0x4F32D05E], 0)
+    assert(gave(&c, 0x7FFFFFFF, IOC), "3e9 saturates")
+    c = single([0xEEFD, 0x0AE1], [0, 0, 0, 0xCF000000], 0)
+    assert(gave(&c, 0x80000000, 0), "-2^31 exactly")
+    c = single([0xEEFD, 0x0AE1], [0, 0, 0, QNAN], 0)
+    assert(gave(&c, 0, IOC), "NaN")
+    // vcvtr.s32.f32 s1, s3: in FPSCR's mode
+    c = single([0xEEFD, 0x0A61], [0, 0, 0, 0x40200000], 0)
+    assert(gave(&c, 2, IXC), "2.5 to even")
+    c = single([0xEEFD, 0x0A61], [0, 0, 0, 0x40600000], 0)
+    assert(gave(&c, 4, IXC), "3.5 to even")
+    c = single([0xEEFD, 0x0A61], [0, 0, 0, 0x40200000], RU)
+    assert(gave(&c, 3, IXC), "2.5 upward")
+    // vcvt.u32.f32 s1, s3
+    c = single([0xEEFC, 0x0AE1], [0, 0, 0, 0xBF800000], 0)
+    assert(gave(&c, 0, IOC), "-1 unsigned")
+    c = single([0xEEFC, 0x0AE1], [0, 0, 0, 0xBF000000], 0)
+    assert(gave(&c, 0, IXC), "-0.5 unsigned")
+    c = single([0xEEFC, 0x0AE1], [0, 0, 0, 0x4F800000], 0)
+    assert(gave(&c, 0xFFFFFFFF, IOC), "2^32 unsigned")
+
+@test("conversions from an integer round in FPSCR's mode; fixed-point conversions scale exactly")
+fp_from_integer_and_fixed()
+    // vcvt.f32.s32 s1, s3: 2^24 + 1
+    var c = single([0xEEF8, 0x0AE1], [0, 0, 0, 0x01000001], 0)
+    assert(gave(&c, 0x4B800000, IXC), "to nearest")
+    c = single([0xEEF8, 0x0AE1], [0, 0, 0, 0x01000001], RU)
+    assert(gave(&c, 0x4B800001, IXC), "upward")
+    c = single([0xEEF8, 0x0AE1], [0, 0, 0, 0xFFFFFFFF], 0)
+    assert(gave(&c, 0xBF800000, 0), "-1 signed")
+    // vcvt.f32.u32 s1, s3
+    c = single([0xEEF8, 0x0A61], [0, 0, 0, 0xFFFFFFFF], 0)
+    assert(gave(&c, 0x4F800000, IXC), "2^32 - 1 unsigned")
+    // vcvt.s16.f32 s1, s1, #3
+    c = single([0xEEFE, 0x0A66], [0, 0x3FC00000], 0)
+    assert(gave(&c, 12, 0), "1.5 as s16.3")
+    c = single([0xEEFE, 0x0A66], [0, 0xBFC00000], 0)
+    assert(gave(&c, 0xFFFFFFF4, 0), "-1.5 sign-extended")
+    c = single([0xEEFE, 0x0A66], [0, 0x459C4000], 0)
+    assert(gave(&c, 0x00007FFF, IOC), "5000 saturates")
+    c = single([0xEEFE, 0x0A66], [0, 0x3E000000], 0)
+    assert(gave(&c, 1, 0), "0.125 is the least step")
+    c = single([0xEEFE, 0x0A66], [0, 0x3D800000], 0)
+    assert(gave(&c, 0, IXC), "0.0625 is lost")
+    // vcvt.f32.u32 s1, s1, #3
+    c = single([0xEEFB, 0x0AEE], [0, 12], 0)
+    assert(gave(&c, 0x3FC00000, 0), "12 as u32.3")
+    // vcvt.u32.f32 s1, s1, #3
+    c = single([0xEEFF, 0x0AEE], [0, 0x3FC00000], 0)
+    assert(gave(&c, 12, 0), "1.5 to u32.3")
+
+// ---------------------------------------------------------------------------------------------------
+// FPv5.
+
+@test("FPv5's VSEL, VMAXNM, VMINNM, VRINT and VCVTA/P/M, which FPv4 does not have")
+fp_v5_instructions()
+    // vseleq.f32 s1, s2, s3 on Z, then not
+    var c = fp_case(Kind.V8mMain, 1, [0xFE41, 0x0A21], [], [0, 0, ONE, TWO], 0, [])
+    assert(c.s[1] == TWO, "VSEL not equal")
+    c = fp_case(Kind.V8mMain, 1, [0x2000, 0xFE41, 0x0A21], [], [0, 0, ONE, TWO], 0, [])
+    assert(c.s[1] == ONE, "VSEL equal, after movs r0, #0")
+    // vmaxnm.f32 s1, s2, s3: a quiet NaN gives way to a number; vminnm
+    c = single([0xFEC1, 0x0A21], [0, 0, QNAN, ONE], 0)
+    assert(gave(&c, ONE, 0), "VMAXNM")
+    c = single([0xFEC1, 0x0A61], [0, 0, TWO, ONE], 0)
+    assert(gave(&c, ONE, 0), "VMINNM")
+    c = single([0xFEC1, 0x0A21], [0, 0, 0x80000000, 0], 0)
+    assert(gave(&c, 0, 0), "+0 is the greater zero")
+    // vrinta, vrintp, vrintm, vrintz, vrintr, vrintx (all .f32 s1, s3) of 2.5 and -2.5
+    c = single([0xFEF8, 0x0A61], [0, 0, 0, 0x40200000], 0)
+    assert(gave(&c, THREE, 0), "VRINTA")
+    c = single([0xFEFA, 0x0A61], [0, 0, 0, 0x40200000], 0)
+    assert(gave(&c, THREE, 0), "VRINTP")
+    c = single([0xFEFB, 0x0A61], [0, 0, 0, 0xC0200000], 0)
+    assert(gave(&c, 0xC0400000, 0), "VRINTM")
+    c = single([0xEEF6, 0x0AE1], [0, 0, 0, 0xC0200000], 0)
+    assert(gave(&c, 0xC0000000, 0), "VRINTZ")
+    c = single([0xEEF6, 0x0A61], [0, 0, 0, 0x40200000], 0)
+    assert(gave(&c, TWO, 0), "VRINTR")
+    c = single([0xEEF7, 0x0A61], [0, 0, 0, 0x40200000], 0)
+    assert(gave(&c, TWO, IXC), "VRINTX")
+    // vcvta.s32.f32, vcvta.u32.f32, vcvtp.s32.f32, vcvtm.s32.f32 (s1, s3)
+    c = single([0xFEFC, 0x0AE1], [0, 0, 0, 0xC0200000], 0)
+    assert(gave(&c, 0xFFFFFFFD, IXC), "VCVTA")
+    c = single([0xFEFC, 0x0A61], [0, 0, 0, 0x40200000], 0)
+    assert(gave(&c, 3, IXC), "VCVTA unsigned")
+    c = single([0xFEFE, 0x0AE1], [0, 0, 0, 0x40100000], 0)
+    assert(gave(&c, 3, IXC), "VCVTP")
+    c = single([0xFEFF, 0x0AE1], [0, 0, 0, 0xC0100000], 0)
+    assert(gave(&c, 0xFFFFFFFD, IXC), "VCVTM")
+    // On the M4's FPv4 each is undefined.
+    val codes: [4][2]u16 = [[0xFE41, 0x0A21], [0xFEC1, 0x0A21], [0xFEF8, 0x0A61], [0xEEF6, 0x0AE1]]
+    for code in codes
+        c = fp_case(Kind.V7em, 1, code, [], [], 0, [])
+        assert(undefined(&c), "FPv4")
+
+@test("instructions not yet emulated are undefined: VCVTB/VCVTT and VRINTN/VCVTN")
+fp_not_yet()
+    val codes: [4][2]u16 = [[0xEEF2, 0x0A61], [0xEEF3, 0x0A61], [0xFEF9, 0x0A61], [0xFEFD, 0x0AE1]]
+
+    for code in codes
+        var c = single(code, [], 0)
+        assert(undefined(&c), f"0x${code[0]}%04x")
+
+// ---------------------------------------------------------------------------------------------------
+// Double precision.
+
+@test("a double-precision unit does double arithmetic and converts between the precisions; a single one cannot")
+fp_double_precision()
+    // vadd.f64 d1, d2, d3: 1 + 2
+    var c = double([0xEE32, 0x1B03], [0, 0, 0, 0, 0, 0x3FF00000, 0, 0x40000000], 0)
+    assert(c.stop == Stop.Breakpoint && c.s[2] == 0 && c.s[3] == 0x40080000, "VADD.F64")
+    c = single([0xEE32, 0x1B03], [], 0)
+    assert(undefined(&c), "no double unit")
+    // vcvt.f64.f32 d1, s3: 1.5
+    c = double([0xEEB7, 0x1AE1], [0, 0, 0, 0x3FC00000], 0)
+    assert(c.s[2] == 0 && c.s[3] == 0x3FF80000 && c.fpscr == 0, "widened")
+    // vcvt.f32.f64 s1, d3: a third
+    c = double([0xEEF7, 0x0BC3], [0, 0, 0, 0, 0, 0, 0x55555555, 0x3FD55555], 0)
+    assert(gave(&c, 0x3EAAAAAB, IXC), "narrowed")
+    // vmov.f64 d1, #1.0... as vmov.f64 d1, d3 and vneg.f64 d1, d3
+    c = double([0xEEB0, 0x1B43], [0, 0, 0, 0, 0, 0, 7, 0x3FF00000], 0)
+    assert(c.s[2] == 7 && c.s[3] == 0x3FF00000, "VMOV.F64")
+    c = double([0xEEB1, 0x1B43], [0, 0, 0, 0, 0, 0, 7, 0x3FF00000], 0)
+    assert(c.s[2] == 7 && c.s[3] == 0xBFF00000, "VNEG.F64")
+
+// ---------------------------------------------------------------------------------------------------
+// Transfers and memory.
+
+@test("VMOV moves between core and S registers, pairs and D halves; VMSR keeps FPSCR's bits and VMRS reads them")
+fp_transfers()
+    // vmov s1, r2; vmov r3, s1
+    var c = fp_case(Kind.V8mMain, 1, [0xEE00, 0x2A90, 0xEE10, 0x3A90], [0, 0, 0x12345678], [], 0, [])
+    assert(c.s[1] == 0x12345678 && c.r[3] == 0x12345678, "S")
+    // vmov s1, s2, r2, r3; vmov r4, r5, s1, s2
+    c = fp_case(Kind.V8mMain, 1, [0xEC43, 0x2A30, 0xEC55, 0x4A30], [0, 0, 7, 8], [], 0, [])
+    assert(c.s[1] == 7 && c.s[2] == 8 && c.r[4] == 7 && c.r[5] == 8, "pair")
+    // vmov d1, r2, r3; vmov.32 r4, d1[1]
+    c = fp_case(Kind.V8mMain, 1, [0xEC43, 0x2B11, 0xEE31, 0x4B10], [0, 0, 7, 8], [], 0, [])
+    assert(c.s[2] == 7 && c.s[3] == 8 && c.r[4] == 8, "D and its half")
+    // vmsr fpscr, r2; vmrs r3, fpscr
+    c = fp_case(Kind.V8mMain, 1, [0xEEE1, 0x2A10, 0xEEF1, 0x3A10], [0, 0, 0xFFFFFFFF], [], 0, [])
+    assert(c.r[3] == 0xF7C0009F, "FPSCR's bits")
+    // vmrs r3, fpscr after a raising vdiv.f32 s1, s2, s3 reads the flag
+    c = fp_case(Kind.V8mMain, 1, [0xEEC1, 0x0A21, 0xEEF1, 0x3A10], [], [0, 0, ONE, 0], 0, [])
+    assert(c.r[3] == DZC, "the flags as raised")
+    // vmrs sp, fpscr is undefined
+    c = fp_case(Kind.V8mMain, 1, [0xEEF1, 0xDA10], [], [], 0, [])
+    assert(undefined(&c), "SP")
+
+@test("VLDR, VSTR, VLDM, VSTM, VPUSH and VPOP move words, write back, and fault on an unaligned address")
+fp_memory()
+    // vldr s1, [r2, #8]; vstr s1, [r2, #-8]... as vldr then vstr s1, [r2, #8] to another base
+    var c = fp_case(Kind.V8mMain, 1, [0xEDD2, 0x0A02], [0, 0, 0x1000], [], 0, [[0x1008, 0xCAFE]])
+    assert(c.s[1] == 0xCAFE, "VLDR")
+    c = fp_case(Kind.V8mMain, 1, [0xEDC2, 0x0A02], [0, 0, 0x1000], [0, 0xBEEF], 0, [])
+    assert(load32(&c, 0x1008) == 0xBEEF, "VSTR")
+    // vldr s1, [r2, #-8]
+    c = fp_case(Kind.V8mMain, 1, [0xED52, 0x0A02], [0, 0, 0x1010], [], 0, [[0x1008, 5]])
+    assert(c.s[1] == 5, "a negative offset")
+    // vldr d1, [r2, #8]
+    c = fp_case(Kind.V8mMain, 1, [0xED92, 0x1B02], [0, 0, 0x1000], [], 0, [[0x1008, 1], [0x100C, 2]])
+    assert(c.s[2] == 1 && c.s[3] == 2, "VLDR.64")
+    // vldr s1, [pc, #8] at 0: from (0 + 4) & ~3, plus 8
+    c = fp_case(Kind.V8mMain, 1, [0xEDDF, 0x0A02], [], [], 0, [[12, 0x1234]])
+    assert(c.s[1] == 0x1234, "VLDR literal")
+    // vldmia r2!, {s1-s3}
+    c = fp_case(Kind.V8mMain, 1, [0xECF2, 0x0A03], [0, 0, 0x1000], [], 0, [[0x1000, 1], [0x1004, 2], [0x1008, 3]])
+    assert(c.s[1] == 1 && c.s[2] == 2 && c.s[3] == 3 && c.r[2] == 0x100C, "VLDMIA!")
+    // vstmdb r2!, {s1-s3}
+    c = fp_case(Kind.V8mMain, 1, [0xED62, 0x0A03], [0, 0, 0x1010], [0, 4, 5, 6], 0, [])
+    assert(load32(&c, 0x1004) == 4 && load32(&c, 0x100C) == 6 && c.r[2] == 0x1004, "VSTMDB!")
+    // vpush {s16-s17}; vpop {s16-s17} after clearing them with vmov s16, s17, r0, r0
+    c = fp_case(Kind.V8mMain, 1, [0xED2D, 0x8A02, 0xEC40, 0x0A18, 0xECBD, 0x8A02], [0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 10], 0, [])
+    assert(c.s[16] == 9 && c.s[17] == 10 && c.r[13] == 0x2000, "VPUSH and VPOP")
+    // vpush {d8-d9}
+    c = fp_case(Kind.V8mMain, 1, [0xED2D, 0x8B04], [], [], 0, [])
+    assert(c.r[13] == 0x2000 - 16, "VPUSH of doubles")
+    // vldr s1, [r2] unaligned
+    c = fp_case(Kind.V8mMain, 1, [0xEDD2, 0x0A00], [0, 0, 0x1001], [], 0, [])
+    assert(c.stop == Stop.Fault && c.retired == 0, "unaligned")
+
+// ---------------------------------------------------------------------------------------------------
+// Access and context.
+
+@test("with no access in CPACR the unit's instructions stop at Fault; a privileged-only grant shuts thread mode out once unprivileged")
+fp_access()
+    var c: Cpu
+
+    fp_prepare(&c, Kind.V8mMain, 1, [0xEE71, 0x0A21], [], [], 0, [])
+    c.cpacr = 0
+    finish(&c, &run_threaded)
+    assert(c.stop == Stop.Fault && c.retired == 0 && c.stop_at == 0, "no access")
+
+    fp_prepare(&c, Kind.V8mMain, 1, [0xEE71, 0x0A21], [], [], 0, [])
+    c.cpacr = 0x00500000
+    finish(&c, &run_match)
+    assert(c.stop == Stop.Breakpoint, "privileged")
+
+    fp_prepare(&c, Kind.V8mMain, 1, [0xEE71, 0x0A21], [], [], 0, [])
+    c.cpacr = 0x00500000
+    c.control = 1
+    finish(&c, &run_match)
+    assert(c.stop == Stop.Fault, "unprivileged")
+
+    // A core with no unit has no such instructions at all.
+    fp_prepare(&c, Kind.V8mMain, 0, [0xEE71, 0x0A21], [], [], 0, [])
+    finish(&c, &run_threaded)
+    assert(c.stop == Stop.Undefined, "no unit")
+
+@test("the first instruction of a new context sets CONTROL.FPCA and takes FPSCR's controls from FPDSCR")
+fp_new_context()
+    // vadd.f32 s1, s2, s3 of 1 + 2^-30, with FPDSCR rounding upward
+    var c: Cpu
+
+    fp_prepare(&c, Kind.V8mMain, 1, [0xEE71, 0x0A21], [], [0, 0, ONE, 0x30800000], 0, [])
+    c.control = 0
+    c.fpdscr = RU
+    finish(&c, &run_threaded)
+    assert(c.s[1] == 0x3F800001 && c.control & 4 != 0 && c.fpscr & 0x07C00000 == RU, "a new context")
+
+    // With FPCA already set, FPSCR is the context's own.
+    fp_prepare(&c, Kind.V8mMain, 1, [0xEE71, 0x0A21], [], [0, 0, ONE, 0x30800000], 0, [])
+    c.fpdscr = RU
+    c.control = 4
+    finish(&c, &run_match)
+    assert(c.s[1] == ONE, "the context's own")
+
+    // Without ASPEN nothing is set.
+    fp_prepare(&c, Kind.V8mMain, 1, [0xEE71, 0x0A21], [], [0, 0, ONE, 0x30800000], 0, [])
+    c.control = 0
+    c.fpccr = 0
+    c.fpdscr = RU
+    finish(&c, &run_threaded)
+    assert(c.s[1] == ONE && c.control & 4 == 0, "no automatic preservation")
