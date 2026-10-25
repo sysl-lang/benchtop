@@ -1,0 +1,200 @@
+module sh.sysl.benchtop.riscv
+@tests
+
+// Whole-state assertions for decoding boundaries, reserved encodings and architectural HINTs.
+private expect_inert(cpu: *Cpu, ram: []u8, reason: Stop, at: u32)
+    var before_r: [32]u32
+    var before_ram: [512]u8
+    for i in 0..<32 do before_r[i] = cpu.r[i]
+    for i in 0..<ram.len do before_ram[i] = ram[i]
+    val pc = cpu.pc
+    val retired = cpu.retired
+    run(cpu, 1)
+    assert(cpu.stop == reason && cpu.stop_at == at && cpu.pc == pc && cpu.retired == retired,
+        s"$reason at $at: ${cpu.stop} at ${cpu.stop_at}, pc ${cpu.pc}, retired ${cpu.retired}")
+    run(cpu, 10)
+    assert(cpu.stop == reason && cpu.pc == pc && cpu.retired == retired && cpu.stop_at == at)
+    for i in 0..<32 do assert(cpu.r[i] == before_r[i], s"x$i changed on a stop")
+    for i in 0..<ram.len do assert(ram[i] == before_ram[i], s"byte $i changed on a stop")
+
+private encoding_unchanged(code: u32, length: usize, model: Model, reason: Stop)
+    var ram: [64]u8
+    var before_ram: [64]u8
+    var cpu: Cpu
+    reset(&cpu, model, ram, 0, 16)
+    for i in 1..<32 do cpu.r[i] = 0x12340000 + u32(i) * 31
+    for i in 0..<ram.len do ram[i] = u8(i * 37 + 11)
+    instruction_put_word(ram, 16, code, length)
+    if reason != Stop.Budget
+        expect_inert(&cpu, ram, reason, 16)
+        return
+    for i in 0..<ram.len do before_ram[i] = ram[i]
+    run(&cpu, 1)
+    assert(cpu.stop == Stop.Budget && cpu.pc == 16 + u32(length) && cpu.retired == 1,
+        s"HINT $code: ${cpu.stop}, pc ${cpu.pc}")
+    assert(cpu.r[0] == 0)
+    for i in 1..<32 do assert(cpu.r[i] == 0x12340000 + u32(i) * 31, s"HINT $code changed x$i")
+    for i in 0..<ram.len do assert(ram[i] == before_ram[i], s"HINT $code changed RAM")
+
+@test("RV32 instruction boundaries: every ALU funct7 and immediate-shift upper field is gated")
+reserved_alu_fields()
+    var ram: [32]u8
+    var cpu: Cpu
+    for profile in 0..<4
+        val model = MODELS[profile]
+        for top in 0u32..<128
+            for op in 0u32..<8
+                val code = (top << 25) | (2 << 20) | (1 << 15) | (op << 12) | (3 << 7) | 0x33
+                val valid = top == 0 || (top == 32 && (op == 0 || op == 5)) || (top == 1 && has(model, EXT_M))
+                reset(&cpu, model, ram, 0, 0)
+                cpu.r[1] = 0x80000000
+                cpu.r[2] = 0xFFFFFFFF
+                instruction_put_word(ram, 0, code, 4)
+                if valid
+                    run(&cpu, 1)
+                    assert(cpu.stop == Stop.Budget && cpu.retired == 1 && cpu.pc == 4)
+                else
+                    expect_inert(&cpu, ram, Stop.Undefined, 0)
+            for op in [1u32, 5]
+                val code = (top << 25) | (31 << 20) | (1 << 15) | (op << 12) | (3 << 7) | 0x13
+                val valid = top == 0 || (top == 32 && op == 5)
+                if !valid then encoding_unchanged(code, 4, model, Stop.Undefined)
+
+@test("RV32 instruction boundaries: reserved memory, branch, JALR, fence and SYSTEM fields are rejected")
+reserved_function_fields()
+    for profile in 0..<4
+        val model = MODELS[profile]
+        for op in 0u32..<8
+            if op == 3 || op == 6 || op == 7 then encoding_unchanged(0x00000183 | (op << 12), 4, model, Stop.Undefined)
+            if op >= 3 then encoding_unchanged(0x00208023 | (op << 12), 4, model, Stop.Undefined)
+            if op == 2 || op == 3 then encoding_unchanged(0x00208063 | (op << 12), 4, model, Stop.Undefined)
+            if op != 0
+                encoding_unchanged(0x000080E7 | (op << 12), 4, model, Stop.Undefined)
+                encoding_unchanged(0x0000000F | (op << 12), 4, model, Stop.Undefined)
+        for code in [0x00200073u32, 0x10500073, 0x30200073, 0x30001073, 0xFFFFFFFF, 0x0000007F]
+            encoding_unchanged(code, 4, model, Stop.Undefined)
+        // A SYSTEM encoding is ECALL/EBREAK only when its reserved operand fields are zero.
+        for bit in 7u32..<32
+            if bit == 20 then continue
+            for system in [0x73u32, 0x100073]
+                encoding_unchanged(system ^ (1u32 << bit), 4, model, Stop.Undefined)
+
+@test("RV32 instruction boundaries: RV32C reserved operands, RV64 shifts and floating-point quadrants stop without effects")
+reserved_compressed_fields()
+    for profile in [2, 3]
+        val model = MODELS[profile]
+        for reg in 0u32..<32
+            // C.LUI/C.ADDI16SP with a zero immediate, and RV32 C.SLLI with shamt[5]=1.
+            encoding_unchanged(0x6001 | (reg << 7), 2, model, Stop.Undefined)
+            for shift in 0u32..<32
+                encoding_unchanged(0x1002 | (reg << 7) | (shift << 2), 2, model, Stop.Undefined)
+        for a in 0u32..<8
+            encoding_unchanged(a << 2, 2, model, Stop.Undefined) // C.ADDI4SPN nzuimm=0
+            for b in 0u32..<8
+                for op in 0u32..<4
+                    encoding_unchanged(0x9C01 | (a << 7) | (b << 2) | (op << 5), 2, model, Stop.Undefined)
+            for shift in 0u32..<32
+                for sub in [0u32, 1]
+                    encoding_unchanged(0x9001 | (sub << 10) | (a << 7) | (shift << 2), 2, model, Stop.Undefined)
+        // C.LWSP rd=x0 is reserved for every possible offset.
+        for offset in 0u32..<64
+            val n = offset * 4
+            val code = 0x4002 | (((n >> 5) & 1) << 12) | (((n >> 2) & 7) << 4) | (((n >> 6) & 3) << 2)
+            encoding_unchanged(code, 2, model, Stop.Undefined)
+        encoding_unchanged(0x8002, 2, model, Stop.Undefined) // C.JR x0
+        // No floating-point memory instructions or RV64-only doubleword accesses are implemented.
+        for quadrant in [0u32, 2]
+            for op in [1u32, 3, 5, 7]
+                for operands in [0u32, 0x1FFC]
+                    encoding_unchanged((op << 13) | operands | quadrant, 2, model, Stop.Undefined)
+
+private ci_bits(imm: u32) -> u32 = (((imm >> 5) & 1) << 12) | ((imm & 31) << 2)
+
+@test("RV32 instruction boundaries: compressed architectural HINTs preserve every register and RAM byte")
+compressed_hints()
+    for profile in [2, 3]
+        val model = MODELS[profile]
+        for imm in 0u32..<64
+            encoding_unchanged(0x0001 | ci_bits(imm), 2, model, Stop.Budget) // C.NOP/HINT
+            encoding_unchanged(0x4001 | ci_bits(imm), 2, model, Stop.Budget) // C.LI x0
+            if imm != 0 then encoding_unchanged(0x6001 | ci_bits(imm), 2, model, Stop.Budget) // C.LUI x0
+        for reg in 1u32..<32
+            encoding_unchanged(0x0001 | (reg << 7), 2, model, Stop.Budget) // C.ADDI n=0
+            encoding_unchanged(0x0002 | (reg << 7), 2, model, Stop.Budget) // C.SLLI n=0
+            encoding_unchanged(0x8002 | (reg << 2), 2, model, Stop.Budget) // C.MV x0,rs2
+            encoding_unchanged(0x9002 | (reg << 2), 2, model, Stop.Budget) // C.ADD x0,rs2
+        for shift in 0u32..<32 do encoding_unchanged(0x0002 | (shift << 2), 2, model, Stop.Budget) // C.SLLI x0
+        for reg in 0u32..<8
+            encoding_unchanged(0x8001 | (reg << 7), 2, model, Stop.Budget) // C.SRLI n=0
+            encoding_unchanged(0x8401 | (reg << 7), 2, model, Stop.Budget) // C.SRAI n=0
+
+@test("RV32 instruction boundaries: truncated fetches, invalid PCs and address-space wrap preserve state")
+fetch_boundaries()
+    var ram: [8]u8
+    var cpu: Cpu
+    for profile in 0..<4
+        val model = MODELS[profile]
+        for pc in [1u32, 3, 0xFFFFFFFF]
+            reset(&cpu, model, ram, 0, pc)
+            expect_inert(&cpu, ram, Stop.Misaligned, pc)
+        for length in 0usize..<4
+            instruction_put_word(ram, 0, 0x02A00093, 4) // ADDI x1,x0,42
+            reset(&cpu, model, ram[0..<length], 0, 0)
+            expect_inert(&cpu, ram, Stop.Unmapped, if length < 2 then 0 else 2)
+        reset(&cpu, model, ram, 0x20000000, 0x1FFFFFFC)
+        expect_inert(&cpu, ram, Stop.Unmapped, 0x1FFFFFFC)
+        reset(&cpu, model, ram, 0, 0x1000)
+        expect_inert(&cpu, ram, Stop.Unmapped, 0x1000)
+        instruction_put_word(ram, 4, 0x02A00093, 4)
+        reset(&cpu, model, ram, 0xFFFFFFF8, 0xFFFFFFFC)
+        run(&cpu, 1)
+        assert(cpu.stop == Stop.Budget && cpu.r[1] == 42 && cpu.pc == 0 && cpu.retired == 1)
+        expect_inert(&cpu, ram, Stop.Unmapped, 0)
+        if has(model, EXT_C)
+            // A complete compressed instruction at the end of memory needs no trailing bytes.
+            instruction_put_word(ram, 6, 0x0001, 2)
+            reset(&cpu, model, ram, 0xFFFFFFF8, 0xFFFFFFFE)
+            run(&cpu, 1)
+            assert(cpu.stop == Stop.Budget && cpu.pc == 0 && cpu.retired == 1)
+            // A 32-bit instruction at the same address faults fetching its second halfword.
+            instruction_put_word(ram, 6, 0x0093, 2)
+            reset(&cpu, model, ram, 0xFFFFFFF8, 0xFFFFFFFE)
+            expect_inert(&cpu, ram, Stop.Unmapped, 0)
+        else
+            reset(&cpu, model, ram, 0, 2)
+            expect_inert(&cpu, ram, Stop.Misaligned, 2)
+
+@test("RV32 instruction boundaries: aligned data accesses crossing a RAM edge never partially write")
+partial_data_boundaries()
+    var ram: [8]u8
+    var cpu: Cpu
+    for profile in 0..<4
+        val model = MODELS[profile]
+        for op in [0u32, 1, 2, 4, 5]
+            val width = 1u32 << (op & 3)
+            for available in 0u32..<width
+                for i in 0..<ram.len do ram[i] = 0xA5
+                instruction_put_word(ram, 0, 0x00008183 | (op << 12), 4) // load x3,0(x1)
+                reset(&cpu, model, ram[0..<usize(4 + available)], 0, 0)
+                cpu.r[1] = 4
+                cpu.r[3] = 0x12345678
+                expect_inert(&cpu, ram, Stop.Unmapped, 4)
+        for op in 0u32..<3
+            val width = 1u32 << op
+            for available in 0u32..<width
+                for i in 0..<ram.len do ram[i] = 0xA5
+                instruction_put_word(ram, 0, 0x00208023 | (op << 12), 4) // store x2,0(x1)
+                reset(&cpu, model, ram[0..<usize(4 + available)], 0, 0)
+                cpu.r[1] = 4
+                cpu.r[2] = 0x12345678
+                expect_inert(&cpu, ram, Stop.Unmapped, 4)
+        if has(model, EXT_C)
+            for code in [0x4000u32, 0xC000, 0x4082, 0xC006] // C.LW, C.SW, C.LWSP, C.SWSP
+                for available in 0usize..<4
+                    for i in 0..<ram.len do ram[i] = 0xA5
+                    instruction_put_word(ram, 0, code, 2)
+                    reset(&cpu, model, ram[0..<(4 + available)], 0, 0)
+                    cpu.r[8] = 4
+                    cpu.r[2] = 4
+                    cpu.r[1] = 0x12345678
+                    expect_inert(&cpu, ram, Stop.Unmapped, 4)

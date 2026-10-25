@@ -1,0 +1,86 @@
+module sh.sysl.benchtop.riscv
+@tests
+
+// Expected state is generated from mathematical results, independently of execute/decompress.
+// See examples/riscv/generate-instruction-tests.py and COVERAGE.md for record layout and scope.
+private val INSTRUCTION_VECTORS = embed("../../../../examples/riscv/instructions.bin")
+private const VECTOR_WORDS: usize = 17
+private const VECTOR_BYTES: usize = VECTOR_WORDS * 4
+
+private vector_word(record: usize, field: usize) -> u32
+    val at = record * VECTOR_BYTES + field * 4
+    var value: u32 = 0
+    for i in 0..<4 do value |= u32(INSTRUCTION_VECTORS[at + usize(i)]) << (8 * u32(i))
+    value
+
+instruction_put_word(ram: []u8, at: usize, value: u32, width: usize)
+    for i in 0..<width do ram[at + i] = u8(value >> (8 * u32(i)))
+
+check_instruction_vectors(name: string, first: usize, count: usize, needed: u32)
+    assert(INSTRUCTION_VECTORS.len % VECTOR_BYTES == 0)
+    assert(count != 0 && first + count <= INSTRUCTION_VECTORS.len / VECTOR_BYTES)
+    var ram: [512]u8
+    var expected_ram: [512]u8
+    var expected_r: [32]u32
+    var cpu: Cpu
+    val profiles: []string = ["rv32i", "rv32im", "rv32ic", "rv32imc"]
+    val extensions: []u32 = [0, 1, 4, 5]
+    for index in first..<(first + count)
+        val length = vector_word(index, 0)
+        val code = vector_word(index, 1)
+        val pc = vector_word(index, 2)
+        val base = vector_word(index, 3)
+        val rd = vector_word(index, 8)
+        val target = vector_word(index, 10)
+        val mem_at = vector_word(index, 13)
+        for profile in 0..<4
+            val model = model_named(profiles[profile]).unwrap()
+            assert(model.extensions == extensions[profile], s"${model.name}: unexpected extension set")
+            reset(&cpu, model, ram, base, pc)
+            for i in 0..<ram.len do ram[i] = u8(i * 37 + 11)
+            if mem_at < 512 then instruction_put_word(ram, usize(mem_at), vector_word(index, 14), 4)
+            instruction_put_word(ram, usize(pc - base), code, usize(length))
+            for i in 0..<ram.len do expected_ram[i] = ram[i]
+            for i in 1..<32 do cpu.r[i] = 0x11220000 + u32(i) * 0x010101
+            val r1 = vector_word(index, 4)
+            val r2 = vector_word(index, 6)
+            if r1 != 0 then cpu.r[r1] = vector_word(index, 5)
+            if r2 != 0 then cpu.r[r2] = vector_word(index, 7)
+            for i in 0..<32 do expected_r[i] = cpu.r[i]
+            var stop = vector_word(index, 11)
+            var at = vector_word(index, 12)
+            var next = target
+            var retired = vector_word(index, 16)
+            if (extensions[profile] & needed) != needed
+                stop = 3 // Undefined: the instruction's extension is not enabled.
+                at = pc
+                next = pc
+                retired = 0
+            elif stop == 0 && (extensions[profile] & 4) == 0 && (target & 3) != 0
+                stop = 4 // Misaligned: taken halfword target on an IALIGN=32 core.
+                at = target
+                next = pc
+                retired = 0
+            if stop == 0
+                if rd != 0 && rd < 32 then expected_r[rd] = vector_word(index, 9)
+                if mem_at < 512 then instruction_put_word(expected_ram, usize(mem_at), vector_word(index, 15), 4)
+            val context = s"$name vector ${index - first}, ${model.name}"
+            run(&cpu, 1)
+            val expected_stop = stop match
+                0 -> Stop.Budget
+                1 -> Stop.Breakpoint
+                2 -> Stop.Ecall
+                3 -> Stop.Undefined
+                4 -> Stop.Misaligned
+                _ -> Stop.Unmapped
+            assert(cpu.stop == expected_stop, s"$context: ${cpu.stop}, expected $expected_stop")
+            assert(cpu.pc == next && cpu.retired == u64(retired), s"$context: pc ${cpu.pc}, expected $next; retired ${cpu.retired}, expected $retired")
+            if stop != 0
+                assert(cpu.stop_at == at, s"$context: address ${cpu.stop_at}, expected $at")
+                // A stopped CPU must be inert, including after a caller supplies another budget.
+                run(&cpu, 2)
+                assert(cpu.stop == expected_stop && cpu.pc == next && cpu.retired == u64(retired) && cpu.stop_at == at, context)
+            for i in 0..<32
+                assert(cpu.r[i] == expected_r[i], s"$context: x$i = ${cpu.r[i]}, expected ${expected_r[i]}")
+            for i in 0..<ram.len
+                assert(ram[i] == expected_ram[i], s"$context: byte $i = ${ram[i]}, expected ${expected_ram[i]}")

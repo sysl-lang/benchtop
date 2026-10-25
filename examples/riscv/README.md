@@ -25,3 +25,18 @@ sysl test . --filter RV32
 `chip.hocon` demonstrates core names in the shared description format. It is not yet a
 runnable board; neither the bare ISA profiles nor the interpreter implement an interrupt
 controller or RP2350 devices.
+
+Every implemented mnemonic also has a named instruction unit test and a row in
+[the coverage matrix](../../sh/sysl/benchtop/riscv/COVERAGE.md). The independent Python
+reference generator checks expected arithmetic and whole-machine state, using LLVM for
+compressed instruction encodings. Boundary tests additionally check reserved encodings,
+architectural HINTs, alignment, partial accesses and fetches at the ends of memory.
+
+```sh
+python3 examples/riscv/generate-instruction-tests.py         # regenerate from the repo root
+python3 examples/riscv/generate-instruction-tests.py --check # verify fixtures without writing
+sysl test . --filter "RV32 instruction"
+```
+
+These cover targeted architectural boundaries; they do not enumerate every possible
+operand or machine-state combination. No claim is made for unimplemented instructions.

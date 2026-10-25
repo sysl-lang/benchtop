@@ -96,6 +96,13 @@ stop before retirement; privileged trap handlers and MMIO are not implemented. R
 single-threaded. The ISA reference is the [RISC-V specification](https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html);
 the RP2350 profile follows the [Pico SDK toolchain configuration](https://github.com/raspberrypi/pico-sdk/blob/master/cmake/preload/toolchains/pico_riscv_gcc.cmake).
 
+Every implemented RISC-V mnemonic has its own unit test and a row in the
+[coverage matrix](sh/sysl/benchtop/riscv/COVERAGE.md). Independent expected-state vectors check
+all registers, all RAM bytes, PC, faults and retirement across all four profiles. Targeted
+boundaries include aliases and `x0`, signed/unsigned extrema, every legal shift amount,
+immediate bits, memory edges, disabled extensions, reserved encodings and compressed HINTs.
+This is systematic boundary coverage, not exhaustive testing of every machine state.
+
 The committed C guests run under all four profiles and match a host-computed hash. An independent
 LLVM assembler corpus checks 118 compressed/canonical instruction pairs; instruction tests cover
 arithmetic edges, division overflow/zero, branch/jump alignment, memory faults and budget resumption.
