@@ -125,7 +125,7 @@ their behavior. The defaults describe cortical's current integer implementations
 
 | option | default | accepted selections |
 |---|---|---|
-| `dsp` | `false` | boolean; available on M4/M7/M33/M35P/M52/M55/M85 |
+| `dsp` | `true` on M4/M7, `false` elsewhere | boolean; always `true` on M4/M7 (ARMv7E-M has it), a choice on M33/M35P/M52/M55/M85 |
 | `fpu` | `none` | `sp` on M4/M33/M35P; `sp`/`dp` on M7/M52/M55/M85; `none` on every model |
 | `mpu_regions` | `0` | 0 on M0/M1; 0/8 on M0+/M3/M4; 0/8/16 on M7; 0/4/8/12/16 on Armv8-M models |
 | `security` | `none` | `trustzone` on M23/M33/M35P/M52/M55/M85; `none` on every model |
@@ -147,7 +147,8 @@ ignores them. A chip's integrated core configuration is defined by its chip mode
 apply to boards that declare `cores` directly.
 
 [examples/virt/core-options.hocon](examples/virt/core-options.hocon) is a runnable M7 example.
-[examples/virt/dsp.hocon](examples/virt/dsp.hocon) enables DSP on two M4 cores:
+[examples/virt/dsp.hocon](examples/virt/dsp.hocon) runs the DSP guest on two M4 cores, which
+always have the extension (`dsp = true` there only says so):
 
 ```sh
 ./cortical run --board examples/virt/dsp.hocon examples/virt/dsp.elf
@@ -166,8 +167,8 @@ Regenerate the oracle with `zsh examples/qemu/build-dsp.sh` and the guest with
 | Armv6-M | `cortex-m0plus` | `virt` | existing v6-M implementation, with VTOR |
 | Armv6-M | `cortex-m1` | `virt1` | shared v6-M; fixed vector table at 0 |
 | Armv7-M | `cortex-m3` | `virt3` | shared integer Thumb-2, IT, exclusives, divide and priority masks |
-| Armv7E-M subset | `cortex-m4` | `virt4` | shared v7-M integer ISA; optional DSP |
-| Armv7E-M subset | `cortex-m7` | `virt7` | same integer ISA, M7 identity and fixed eight-byte exception alignment |
+| Armv7E-M integer | `cortex-m4` | `virt4` | shared v7-M integer ISA plus the DSP extension |
+| Armv7E-M integer | `cortex-m7` | `virt7` | same, with the M7's identity and fixed eight-byte exception alignment |
 | Armv8-M Baseline | `cortex-m23` | `virt23` | v6-M plus MOVW/MOVT, CBZ/CBNZ, B.W, divide, exclusives and ordered accesses; no IT |
 | Armv8-M Mainline subset | `cortex-m33` | `virt33` | shared integer Thumb-2, ordered accesses, stack limits and priority masks |
 | Armv8-M Mainline subset | `cortex-m35p` | `virt35p` | same shared scalar ISA as M33; physical tamper resistance is not modelled |
@@ -182,7 +183,7 @@ system-register accesses, fixed CCR and no IT, BASEPRI, FAULTMASK or stack limit
 configuration without the Security Extension. M0/M1 have no VTOR; M3 has the v7-M register profile.
 
 **All models currently omit floating point, MPU and Security extensions.**
-M4/M7/M33/M35P/M52/M55/M85 can enable integer DSP independently per core. The M52/M55/M85
+M4 and M7 always have integer DSP; M33/M35P/M52/M55/M85 can enable it independently per core. The M52/M55/M85
 models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
 MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. Unsupported instruction
 encodings stop at `Undefined`; `run` refuses descriptions enabling unimplemented extensions.
@@ -194,9 +195,9 @@ to the description checker, but `run` refuses a device selecting IRQ 32 or above
 faults remain emulator stops rather than implemented fault handlers, as before. Pipeline timing,
 physical side-channel resistance, debug/trace and real-chip peripherals are not modelled.
 
-The example build uses matching scalar compiler targets: M0 for M0/M1, M3 for M3/M4, M23 for M23,
-and `armv8-m.main+nodsp` for M35P/M52/M55/M85 (with tuning for the v8.1-M cores). M7 uses the M3
-ISA with M7 tuning. The existing M0+ and M33 guest builds keep their flags. `select.c` adds explicit
+The example build uses matching compiler targets: M0 for M0/M1, M3, M4 and M7 (soft float, so
+their DSP instructions are used), M23 for M23, and `armv8-m.main+nodsp` for M35P/M52/M55/M85
+(with tuning for the v8.1-M cores). The existing M0+ and M33 guest builds keep their flags. `select.c` adds explicit
 v8.1-M conditional-select instructions to scalar compiler output and is checked against QEMU's
 M55 by `examples/qemu/build-select.sh`; the 96-instruction shared corpus is also checked on
 M3/M35P/M52/M55/M85. The existing v6-M instruction unit cases run on M0/M1/M0+ under both executors.

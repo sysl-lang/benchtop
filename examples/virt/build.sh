@@ -1,15 +1,14 @@
 #!/bin/zsh
 # Builds the virtual board's example programs: `zsh build.sh`, then `cortical run echo.elf`.
 # Each is built for the M0+ board virt, the M4/M7 boards virt4/virt7, and the M33 board virt33.
-# The Thumb-2 builds stay within cortical's integer subsets, without DSP or floating point.
+# The Thumb-2 builds stay within cortical's integer instruction sets, without floating point; the
+# M4 and M7 builds use the DSP extension those cores always have.
 set -e
 cd ${0:A:h}
 
 m0=(-mcpu=cortex-m0plus -mthumb)
-# The implemented M4 subset omits DSP; Cortex-M3 code uses the shared ARMv7-M ISA.
-m4=(-mcpu=cortex-m3 -mthumb -mfloat-abi=soft)
-# Keep the shared ISA while tuning instruction scheduling for M7.
-m7=(-mcpu=cortex-m3 -mtune=cortex-m7 -mthumb -mfloat-abi=soft)
+m4=(-mcpu=cortex-m4 -mthumb -mfloat-abi=soft)
+m7=(-mcpu=cortex-m7 -mthumb -mfloat-abi=soft)
 m33=(-mcpu=cortex-m33+nodsp -mthumb -mfloat-abi=soft)
 flags=(-O2 -ffreestanding -nostdlib -Wl,--no-warn-rwx-segments -T virt.ld)
 
@@ -61,5 +60,6 @@ cc -DHOST -O2 crunch.c -o crunch-host
 ./crunch-host > crunch.out
 rm crunch-host
 
-# Optional integer DSP guest, enabled by dsp.hocon.
+# The integer DSP guest: it runs on virt4 and virt7 as they are, and on the boards whose cores
+# offer the extension as a choice with `dsp = true`, as dsp.hocon does.
 arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfloat-abi=soft $flags start.c dsp.c -lgcc -o dsp.elf

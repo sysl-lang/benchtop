@@ -861,9 +861,9 @@ The M0+ decoder and its executor specialization stay separate. The decoder rejec
 acquire/release instructions and MSPLIM/PSPLIM accesses for M4; stack limits never apply to it.
 M4 reports CPUID 0x410FC241 (r0p1), resets CCR to 0x200 and permits STKALIGN to be cleared.
 The virtual implementation exposes 32 IRQs and four priority bits. Configurable faults stop
-execution, as on M33. Integer DSP is optional; FP, MPU and bit-band aliases are not implemented. Guests compiled
-for Cortex-M3 with soft float stay in the shared ARMv7-M subset; the example build emits
-`*-m4.elf` using these flags. This does not yet implement a real M4 chip or the full ARMv7E-M ISA.
+execution, as on M33. Integer DSP is always present, as ARMv7E-M defines it, and a description
+cannot turn it off; FP, MPU and bit-band aliases are not implemented. The example build emits
+`*-m4.elf` with `-mcpu=cortex-m4 -mfloat-abi=soft`, so its guests use DSP instructions.
 
 ### 2.11 Cortex-M7: another model of the shared ARMv7-M core
 
@@ -873,14 +873,14 @@ introduced. It reports CPUID 0x410FC270 (r0p0). M7's CCR.BP and STKALIGN always 
 exception frames are always eight-byte aligned, with xPSR recording a padding word only where
 needed. NONBASETHRDENA is writable, unlike the M33's fixed bit 0. The model has no optional
 caches and CCR.IC/DC read zero. Cache identification/maintenance and TCM control registers,
-Integer DSP is optional; FP and MPU are not implemented. The intended H7's cache and TCM model in §2.1 remains
+Integer DSP is always present, as on the M4; FP and MPU are not implemented. The intended H7's cache and TCM model in §2.1 remains
 future work; this virtual M7 has the same 32 implemented IRQs and four priority bits as M4.
 
 Tests cover every width of ARMv8-M-only ordered access, MSPLIM/PSPLIM, CCR fixed/writable/reserved
 bits, divide boundaries and traps, exception alignment/return, interrupt masks, exclusive-monitor
 clearing, and guests under both scheduling modes. `isa-m7.elf` hashes the same 96 shared integer
 instructions over edge operands and initial flag states as the existing QEMU reference. Its build
-uses the ARMv7-M ISA with M7 tuning, avoiding unimplemented DSP instructions.
+is `-mcpu=cortex-m7 -mfloat-abi=soft`.
 
 Sources: Arm Cortex-M7 Devices Generic User Guide, DUI0646C, CCR and exception entry/return;
 [ST PM0253](https://www.st.com/resource/en/programming_manual/pm0253-stm32f7-series-and-stm32h7-series-cortexm7-processor-programming-manual-stmicroelectronics.pdf),
@@ -1783,7 +1783,8 @@ held to its part's type: a whole number in a range, a number, text, `true`/`fals
 
 Each entry of `cores` is either a core name or an object with `core = <name>` and optional
 `dsp`, `fpu`, `mpu_regions`, `security`, `icache`, `dcache`, `nvic_priority_bits`. Names remain
-shorthand for the current emulated integer configuration. Defaults are DSP off, FPU `none`, zero
+shorthand for the current emulated integer configuration. Defaults are DSP on for the M4 and M7,
+which always have it (`dsp = false` is refused for them), and off elsewhere, FPU `none`, zero
 MPU regions, security `none`, caches off, and two priority bits on M0/M0+/M1/M23 or four on Mainline models.
 Only explicitly written settings are serialized, so defaults are applied by core model on read.
 
