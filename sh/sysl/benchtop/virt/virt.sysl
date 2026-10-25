@@ -68,10 +68,10 @@ module sh.sysl.benchtop.virt
 // for input (so a prompt shows before the guest waits), when it exits, and at `flush_console` —
 // unless `capture` asked to keep it, which is what a test reads.
 
-import sh.sysl.benchtop.v6m.{default_priority_bits, has_fixed_dsp, Cpu, Kind, Stop, IRQ0, NEVER, RAM_BYTES, clear, clock, could_wake, halt, load32, next_wake, raise, reset, run_threaded, set_limit, wake_by}
+import sh.sysl.benchtop.v6m.{default_priority_bits, has_fixed_dsp, Cpu, Kind, Stop, IRQ0, NEVER, RAM_BYTES, clear, clock, could_wake, halt, load32, next_wake, raise, reset, run_single, run_threaded, set_limit, wake_by}
 import sh.sysl.elf as elf
 import sysl.buf.{Buf, buf}
-import sysl.math.min
+import sysl.math.{min, max}
 import sysl.sync.*
 import sysl.threads.{Channel, SleepLock, channel, spawn}
 import sysl.io.stdin
@@ -121,6 +121,7 @@ enum Device
     Resets
     Timer
     Watchdog
+    PanelGpio
 end Device
 
 val NO_IRQS: [4]int = [-1, -1, -1, -1]
@@ -128,8 +129,8 @@ val NO_IRQS: [4]int = [-1, -1, -1, -1]
 // The devices on the bus, at most one of each kind, which `attach` sets; and the IRQs the console
 // and the SIO raise, -1 where the board has no such device or gave it no IRQ.
 // They are a plain array, which both cores' threads read at once without touching it.
-var devices: [5]Mapped = [Mapped(Console, 0, 0, NO_IRQS), Mapped(Sio, 0, 0, NO_IRQS),
-    Mapped(Resets, 0, 0, NO_IRQS), Mapped(Timer, 0, 0, NO_IRQS), Mapped(Watchdog, 0, 0, NO_IRQS)]
+var devices: [6]Mapped = [Mapped(Console, 0, 0, NO_IRQS), Mapped(Sio, 0, 0, NO_IRQS),
+    Mapped(Resets, 0, 0, NO_IRQS), Mapped(Timer, 0, 0, NO_IRQS), Mapped(Watchdog, 0, 0, NO_IRQS), Mapped(PanelGpio, 0, 0, NO_IRQS)]
 var attached: usize = 0
 var console_irq: int = -1
 var fifo_irq: int = -1
@@ -144,6 +145,7 @@ var typed = channel(typed_slots[..])
 var held: int = -1
 var out: Buf[u8] = buf()
 var capturing = false
+var capture_limit: usize = 0
 // CTRL, read by both cores' threads without the console's lock to decide whether to take it.
 var ctrl: u32 = 0
 // Whether each core runs on a thread of its own (`set_threads`). The console's state is then under
@@ -181,6 +183,8 @@ var fifo_errors: [2]u32
 // Bit k set while spinlock k is claimed; claimed and released with atomic operations.
 var locks: u32 = 0
 var quantum: u64 = QUANTUM
+var alone_slice: u64 = ALONE
+var pumping = false
 // The board's clock: the end of the last round, which every running core has reached.
 var now: u64 = 0
 
@@ -190,11 +194,17 @@ open_console()
     held = -1
     out = buf()
     capturing = false
+    capture_limit = 0
     ctrl = 0
 
 // Keep the guest's output for `output` rather than writing it to the host.
 capture()
     capturing = true
+
+/** Console tail for a long-running visual session. */
+capture_bounded(limit: usize)
+    capturing = true
+    capture_limit = if limit < 128 then 128 else limit
 
 // Everything the guest has written since `capture`.
 output() -> []const u8 = out.view()
@@ -290,6 +300,10 @@ private console_write(cpu: *Cpu, a: u32, o: u32, x: u32)
 
     o match
         DATA ->
+            if capturing && capture_limit != 0 && out.len() >= capture_limit
+                var tail: Buf[u8] = buf()
+                tail.extend(out.view()[(out.len() - capture_limit / 2)..])
+                out = tail
             out.push(u8(x & 0xFF))
             if x & 0xFF == 10 || out.len() >= 4096 then flush_out()
         EXIT ->
@@ -367,9 +381,12 @@ boot(cpu: *Cpu, image: []const u8)
 
     locks = 0
     quantum = QUANTUM
+    alone_slice = ALONE
+    pumping = false
     now = 0
     threads = false
     boot_rp()
+    boot_panel()
 
 // Core 0, which `boot` and `run_board` are given.
 core0() -> *Cpu = &first
@@ -413,10 +430,25 @@ run_board(cpu: *Cpu) -> *Cpu
     flush_console()
     if cpu.stop == Stop.Budget then &second else cpu
 
+/** One bounded, nonblocking slice for a UI event loop. Never starts host CPU threads. */
+pump_board(cpu: *Cpu, budget: u64) -> bool
+    require !threads, "the UI scheduler uses deterministic core turns"
+    if budget == 0 then return cpu.stop == Stop.Budget
+    val old_alone = alone_slice
+    val old_quantum = quantum
+    alone_slice = budget
+    quantum = budget
+    pumping = true
+    val running = round(cpu)
+    pumping = false
+    alone_slice = old_alone
+    quantum = old_quantum
+    running
+
 // One round: core 0's turn and then, once it is launched, core 1's, each to the same clock. Answers
 // whether every core is still running.
 round(cpu: *Cpu) -> bool
-    val until = now + (if launched then quantum else ALONE)
+    val until = now + (if launched then quantum else alone_slice)
 
     turn(cpu, until)
 
@@ -434,7 +466,7 @@ round(cpu: *Cpu) -> bool
 
     if cpu.stop != Stop.Budget || second.stop != Stop.Budget then return false
 
-    now = until
+    now = if pumping then max(until, clock(cpu, cpu.retired)) else until
     if !cpu.sleeping || (launched && !second.sleeping) then return true
 
     settle(cpu)
@@ -450,7 +482,7 @@ private turn(cpu: *Cpu, until: u64)
         if clock(cpu, cpu.retired) >= until then return
 
         set_limit(cpu, min(until, timer_due()) - cpu.slept)
-        run_threaded(cpu)
+        if pumping && quantum == 1 then run_single(cpu) else run_threaded(cpu)
 
 // Every running core ended the round asleep. One the other core interrupted in its last turn wakes
 // now; failing that, the board's clock skips to the first SysTick that wakes one; failing that, the
@@ -469,6 +501,8 @@ private settle(cpu: *Cpu) -> bool
     if due != NEVER
         now = due
         return true
+
+    if pumping then return true
 
     val n = u32(console_irq)
     val console_wakes = console_irq >= 0 && (could_wake(cpu, IRQ0 + n) || (launched && could_wake(&second, IRQ0 + n)))
@@ -531,6 +565,7 @@ private[virt] signal(cpu: *Cpu)
 
     if fifo_irq >= 0 && (waiting_in(k) > 0 || fifo_errors[k] != 0) then raise(cpu, u32(fifo_irq))
     signal_rp(cpu)
+    signal_panel(cpu)
 
 // ---------------------------------------------------------------------------------------------------
 // The SIO.
@@ -546,6 +581,7 @@ board_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
         if a >= m.base && a <= m.last then
             return m.device match
                 Console -> console_read(cpu, a, a - m.base)
+                PanelGpio -> panel_read(cpu, a, a - m.base, width)
                 Sio -> sio_read(cpu, a, a - m.base)
                 d -> rp_read(cpu, d, a, a - m.base, width, n)
 
@@ -557,6 +593,7 @@ board_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
         if a >= m.base && a <= m.last then
             m.device match
                 Console -> console_write(cpu, a, a - m.base, x)
+                PanelGpio -> panel_write(cpu, a, a - m.base, width, x)
                 Sio -> sio_write(cpu, a, a - m.base, x)
                 d -> rp_write(cpu, d, a, a - m.base, width, x, n)
             return
@@ -580,6 +617,8 @@ attach(ds: []const Mapped, kind: Kind)
     console_irq = -1
     fifo_irq = -1
 
+    has_panel = false
+    panel_irq = -1
     var resets = false
     var timer = false
     var alarms = NO_IRQS
@@ -590,6 +629,9 @@ attach(ds: []const Mapped, kind: Kind)
         devices[i] = m
 
         m.device match
+            PanelGpio ->
+                has_panel = true
+                panel_irq = m.irqs[0]
             Console -> console_irq = m.irqs[0]
             Sio -> fifo_irq = m.irqs[0]
             Resets -> resets = true

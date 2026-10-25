@@ -1,0 +1,87 @@
+module sh.sysl.benchtop.virt
+
+// An explicitly virtual 32-pin GPIO block for interactive firmware prototypes. The pin
+// levels are shared by the renderer, input controls and guest bus; no animated fake LEDs.
+import sh.sysl.benchtop.{Board, Part, pin_parts}
+import sh.sysl.benchtop.v6m.{Cpu, Stop, halt, raise}
+import sysl.sync.*
+
+var panel_out: u32 = 0
+var panel_oe: u32 = 0
+var panel_in: u32 = 0xFFFFFFFF
+var panel_edges: u32 = 0
+var panel_mask: u32 = 0
+var panel_irq: int = -1
+var has_panel = false
+
+private[virt] boot_panel()
+    atomic_store(&panel_out, 0, Relaxed)
+    atomic_store(&panel_oe, 0, Relaxed)
+    atomic_store(&panel_in, 0xFFFFFFFF, Relaxed)
+    atomic_store(&panel_edges, 0, Relaxed)
+    atomic_store(&panel_mask, 0, Relaxed)
+
+panel_levels() -> u32
+    val oe = atomic_load(&panel_oe, Relaxed)
+    (atomic_load(&panel_out, Relaxed) & oe) | (atomic_load(&panel_in, Relaxed) & ~oe)
+
+panel_drive_mask() -> u32 = atomic_load(&panel_oe, Relaxed)
+
+panel_outputs() -> u32 = atomic_load(&panel_out, Relaxed) & atomic_load(&panel_oe, Relaxed)
+
+/** Set all external input levels. Changes latch regardless of interrupt mask. */
+panel_inputs(levels: u32)
+    val old = atomic_load(&panel_in, Relaxed)
+    atomic_store(&panel_in, levels, Relaxed)
+    atomic_or(&panel_edges, old ^ levels, Relaxed)
+
+private[virt] signal_panel(cpu: *Cpu)
+    if has_panel && panel_irq >= 0 && (atomic_load(&panel_edges, Relaxed) & atomic_load(&panel_mask, Relaxed)) != 0 then raise(cpu, u32(panel_irq))
+
+private[virt] panel_read(cpu: *Cpu, address: u32, offset: u32, width: u32) -> u32
+    if width != 4 || (offset & 3) != 0
+        halt(cpu, Stop.Fault, address)
+        return 0
+    offset match
+        0 -> atomic_load(&panel_out, Relaxed)
+        4 -> panel_levels()
+        8 -> atomic_load(&panel_oe, Relaxed)
+        12 -> atomic_load(&panel_edges, Relaxed)
+        16 -> atomic_load(&panel_mask, Relaxed)
+        20 -> atomic_load(&panel_edges, Relaxed) & atomic_load(&panel_mask, Relaxed)
+        _ ->
+            halt(cpu, Stop.Unmapped, address)
+            0
+
+private[virt] panel_write(cpu: *Cpu, address: u32, offset: u32, width: u32, value: u32)
+    if width != 4 || (offset & 3) != 0
+        halt(cpu, Stop.Fault, address)
+        return
+    offset match
+        0 -> atomic_store(&panel_out, value, Relaxed)
+        8 -> atomic_store(&panel_oe, value, Relaxed)
+        12 -> atomic_and(&panel_edges, ~value, Relaxed)
+        16 -> atomic_store(&panel_mask, value, Relaxed)
+        4 | 20 -> () // Read-only registers.
+        _ -> halt(cpu, Stop.Unmapped, address)
+
+/** A panel part's directly wired GP pin, or -1 for an unsupported connection. */
+part_pin(p: Part) -> int
+    val port = if p.kind == "led" then "anode" else "pin"
+    for wire in p.wires
+        if wire.port != port then continue
+        wire.to match
+            Pin(name) ->
+                pin_parts(name) match
+                    Some((bank, number)) -> if bank == "GP" && number >= 0 && number < 32 then return number
+                    None -> ()
+            _ -> ()
+    -1
+
+/** Only virtual GPIO-backed LED/button parts are runnable. */
+panel_parts(b: Board) -> bool
+    var gpio = false
+    for p in b.chip.peripherals do if p.kind == "panel-gpio" then gpio = true
+    if !gpio then return false
+    for p in b.parts do if (p.kind != "led" && p.kind != "button") || part_pin(p) < 0 then return false
+    true

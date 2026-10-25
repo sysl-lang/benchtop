@@ -1,10 +1,9 @@
 # benchtop
 
-A microcontroller board emulator written in sysl, with Cortex-M virtual boards and an initial RISC-V core interpreter. It runs the firmware a developer would flash onto a board,
-unmodified: each core on its own host thread, the board's display and controls in a Mac window, its
-UART on a terminal. A board is a description (its chip, parts, wiring, what it exposes and its view),
-not a new emulator, and the cores are one interpreter configured per architecture (ARMv6-M, ARMv7E-M,
-ARMv8-M Mainline). It is an interpreter; a JIT is not planned.
+A microcontroller emulator written in sysl. Run Cortex-M firmware on virtual boards,
+interact with GPIO LEDs and buttons in an SDL3 window, inspect board descriptions,
+and execute named RISC-V cores including Hazard3. Real Pico 2 peripheral emulation
+is still in progress. It is an interpreter; a JIT is not planned.
 
 *An independent sysl project. It is not affiliated with or endorsed by Arm, Raspberry Pi or STMicroelectronics, or their trademark holders; Cortex is a trademark of Arm Limited.*
 
@@ -16,6 +15,40 @@ TrustZone or Helium emulation. Integer DSP and the floating-point unit (single p
 on the M7) are available through board options. No real board is emulated yet.
 [DESIGN.md](DESIGN.md) is the design note: the architecture, the CPU interpreter, each board's
 devices, how fidelity is tested against real boards, and the milestones with their estimates.
+
+![Live firmware workbench](docs/workbench.png)
+
+## Try the visual workbench
+
+Install SDL3 and pkg-config (`brew install sdl3 pkg-config` on macOS), then use sysl 0.6.2:
+
+```sh
+sysl build . -o benchtop
+./benchtop demo
+```
+
+The bundled Cortex-M0+ firmware drives a heartbeat LED and reads two active-low
+buttons through MMIO. Hold **1** or **2**, or click and hold either button, to light
+its corresponding LED. **Space** pauses, **N** executes one instruction per active
+core, **R** resets, **S** saves a PNG, and **Escape** closes the window. The toolbar
+provides the same controls. Click a part to inspect its wiring. The console shows
+actual guest output; LEDs reflect actual GPIO output and direction registers.
+
+```sh
+./benchtop view pico2
+./benchtop view pico-breadboard-kit
+./benchtop render pico2 pico2.png
+./benchtop run --window --board workbench examples/visual/demo.elf
+./benchtop demo --headless --frames 60 --screenshot demo.png
+```
+
+`view` and `render` inspect existing descriptions, including products. Hardware
+without modelled peripherals is labelled **LAYOUT PREVIEW**; display placeholders
+are not emulated displays. Live execution currently uses Cortex-M virtual boards
+and deterministic core turns (`--threads` cannot be combined with `--window`).
+`--frames N` bounds either windowed or headless runs. PNG exports and the window
+use the same framebuffer. See [examples/visual](examples/visual/README.md) to build
+and modify the firmware and for the virtual GPIO register map.
 
 ## The `benchtop` command
 
@@ -29,8 +62,7 @@ sysl build . -o benchtop
 
 **`run`** boots an image on the board `--board` names — the virtual board, `virt`, where none is
 named — its console on this terminal a keystroke at a time. It runs a board on a chip of two cores of
-one supported model (the core table below) whose peripherals benchtop all emulates, with no parts of
-its own yet, and refuses any other board with the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
+one supported model (the core table below) whose peripherals benchtop all emulates, with modelled peripherals and supported GPIO LED/button parts, and refuses other boards with the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
 as raw bytes from address 0. **Ctrl-]** ends benchtop whatever the guest is doing, with exit status
 130. Otherwise the exit status is the one the guest wrote to the console's EXIT register; a guest
 that stops on a breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can
