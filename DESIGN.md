@@ -1738,7 +1738,8 @@ reported with its line and column, all of them at once, and checking goes on pas
 - **A board** is a chip — or, for a board with no real chip, `cores = [...]` — with the parts
   soldered to it, the pins and buses it **exposes** to whatever it is plugged into, and its `view`.
 - **A product** is one or more boards, each an instance with a name of its own, the parts outside
-  them wired to what they expose, and a `view` of the whole, which replaces the boards' views.
+  them wired to what they expose, and a `view` of the whole, which replaces the boards' views
+  (§12.11 lets it show a board's own view where the board is not hidden in a case).
 
 A file's top level is exactly one of `board { ... }`, `board = <name or path>`, or `product { ... }`.
 
@@ -2120,6 +2121,16 @@ chip {
 - **The machine is built from the chip**: each core as §12.2.1 configures it, and each peripheral at
   its `at` with its `irq`s. `cortical run` refuses a chip with a peripheral cortical does not
   emulate, by name: `` cortical does not emulate the rp2350's `uart0` (pl011) ``.
+
+**A product's view takes precedence, and shows a board's view where the board can be seen.** A board
+may sit inside the product's case, or in the open — a Pico in the breadboard kit's socket. So the
+product's view is what is drawn, and its elements may show a board instance as a whole: `pico {
+show = pico, at = [124, 54] }` draws the board's own view there at its own size, with the board's elements in it,
+turned by `look { rotate }` as a display is. A board left out of the product's view is not drawn,
+and its parts appear only as the product shows them one by one (`led { show = pico.led }`), as a
+case's window shows an LED. A product with no `view` shows each board's view, side by side in the
+order the boards are written. A board shown whole and one of its parts shown alone is refused: ``
+`pico.led` is already drawn in `pico`'s view ``.
 
 **New diagnostics.** `` `ram` is on the cores' bus, so it is a peripheral of the chip, not a part ``
 (at a board's or a product's part that has `at`, or whose library entry is a peripheral); `` `led`
