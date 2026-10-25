@@ -142,6 +142,7 @@ CASE(vmov_imm, "vmov.f32 %[d], #-0.1875")
 CASE(vmaxnm, "vmaxnm.f32 %[d], %[a], %[b]")
 CASE(vminnm, "vminnm.f32 %[d], %[a], %[b]")
 CASE(vrinta, "vrinta.f32 %[d], %[a]")
+CASE(vrintn, "vrintn.f32 %[d], %[a]")
 CASE(vrintp, "vrintp.f32 %[d], %[a]")
 CASE(vrintm, "vrintm.f32 %[d], %[a]")
 CASE(vrintz, "vrintz.f32 %[d], %[a]")
@@ -149,6 +150,8 @@ CASE(vrintr, "vrintr.f32 %[d], %[a]")
 CASE(vrintx, "vrintx.f32 %[d], %[a]")
 CASE(vcvta_s32, "vcvta.s32.f32 %[d], %[a]")
 CASE(vcvta_u32, "vcvta.u32.f32 %[d], %[a]")
+CASE(vcvtn_s32, "vcvtn.s32.f32 %[d], %[a]")
+CASE(vcvtn_u32, "vcvtn.u32.f32 %[d], %[a]")
 CASE(vcvtp_s32, "vcvtp.s32.f32 %[d], %[a]")
 CASE(vcvtm_u32, "vcvtm.u32.f32 %[d], %[a]")
 
@@ -247,7 +250,9 @@ DCASE(dneg, "vneg.f64 %P[d], %P[a]")
 DCASE(dcmpe, "vcmpe.f64 %P[a], %P[b]")
 DCASE(dmaxnm, "vmaxnm.f64 %P[d], %P[a], %P[b]")
 DCASE(drintx, "vrintx.f64 %P[d], %P[a]")
+DCASE(drintn, "vrintn.f64 %P[d], %P[a]")
 MCASE(dcvt_s32, "vcvt.s32.f64 s0, d1")
+MCASE(dcvtn_s32, "vcvtn.s32.f64 s0, d1")
 MCASE(dcvtr_u32, "vcvtr.u32.f64 s0, d1")
 MCASE(dcvt_f32, "vcvt.f32.f64 s0, d1")
 MCASE(dcvt_f64, "vcvt.f64.f32 d0, s2")
@@ -296,6 +301,7 @@ int main(void) {
     vmaxnm();
     vminnm();
     vrinta();
+    vrintn();
     vrintp();
     vrintm();
     vrintz();
@@ -303,6 +309,8 @@ int main(void) {
     vrintx();
     vcvta_s32();
     vcvta_u32();
+    vcvtn_s32();
+    vcvtn_u32();
     vcvtp_s32();
     vcvtm_u32();
     vseleq();
@@ -323,7 +331,9 @@ int main(void) {
     dcmpe();
     dmaxnm();
     drintx();
+    drintn();
     dcvt_s32();
+    dcvtn_s32();
     dcvtr_u32();
     dcvt_f32();
     dcvt_f64();

@@ -964,8 +964,10 @@ control space (`v6m/fpu.sysl`).
   after the eight — and EXC_RETURN's bit 4 is clear; the handler starts with FPCA clear. The state is
   stacked at once rather than lazily, so FPCCR.LSPACT is always 0 and FPCAR names the frame's S0. The
   return restores them, and FPCA, from bit 4.
-- **Undefined until the compiler offers what each needs**: `VCVTB`/`VCVTT` (half precision) and
-  `VRINTN`/`VCVTN` (ties to even whatever the mode). FPSCR.IDC is never set.
+- **Ties to even whatever the mode**: `VRINTN` and `VCVTN` use `llvm.roundeven`, which rounds that
+  way under any FPSCR setting and raises no inexact of its own.
+- **Undefined until the compiler offers strict `f16` conversions**: `VCVTB`/`VCVTT` (half
+  precision). FPSCR.IDC is never set.
 
 **The oracles.** Per-instruction tests (`v6m/fp_tests.sysl`) under both executors check results and
 flags at the edges: every rounding mode, NaNs quiet and signalling with and without default-NaN,
