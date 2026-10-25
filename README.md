@@ -11,8 +11,9 @@ ARMv8-M Mainline). It is an interpreter; a JIT is not planned.
 ## Status
 
 **Twelve Cortex-M models run scalar firmware on virtual boards:** M0, M0+, M1, M3, M4, M7,
-M23, M33, M35P, M52, M55 and M85. Extensions and limitations are listed below; this is not full
-FPU, TrustZone or Helium emulation. Integer DSP is available through board options. No real board is emulated yet.
+M23, M33, M35P, M52, M55 and M85. Extensions and limitations are listed below; this is not
+TrustZone or Helium emulation. Integer DSP and the floating-point unit (single precision, or double
+on the M7) are available through board options. No real board is emulated yet.
 [DESIGN.md](DESIGN.md) is the design note: the architecture, the CPU interpreter, each board's
 devices, how fidelity is tested against real boards, and the milestones with their estimates.
 
@@ -21,15 +22,15 @@ devices, how fidelity is tested against real boards, and the milestones with the
 ```
 sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>
-./benchtop check <name | file.hocon>
+./benchtop check [--chip] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
 ```
 
 **`run`** boots an image on the board `--board` names — the virtual board, `virt`, where none is
-named — its console on this terminal a keystroke at a time. It runs a board of two Cortex-M0+ cores,
-two Cortex-M4s, two Cortex-M7s or two Cortex-M33s and the parts benchtop emulates on their bus, and refuses any
-other board with the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
+named — its console on this terminal a keystroke at a time. It runs a board on a chip of two cores of
+one supported model (the core table below) whose peripherals benchtop all emulates, with no parts of
+its own yet, and refuses any other board with the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
 as raw bytes from address 0. **Ctrl-]** ends benchtop whatever the guest is doing, with exit status
 130. Otherwise the exit status is the one the guest wrote to the console's EXIT register; a guest
 that stops on a breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can
@@ -60,12 +61,32 @@ board = pico2w
 ```
 
 The virtual boards in the core table below, plus `pico`, `pico2w` and `pico-breadboard-kit`,
-are built in ([boards](boards) has their sources). **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**,
-on the command line and in a file alike, so `--board virt` is the virtual board and `--board
-./virt` a file. A path in a file is read from that file's directory.
+are built in ([boards](boards) has their sources), and so are their chips ([chips](chips)). **A
+name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**, on the
+command line and in a file alike, so `--board virt` is the virtual board and `--board ./virt` a
+file. A path in a file is read from that file's directory. Chips and boards are named apart: the
+chip `virt` is not the board `virt`.
 
-There are three levels. A **chip** (`rp2040`, `rp2350`) is built into benchtop. A **board** names
-a chip, or for a board with no real chip its `cores`, and holds its parts, the pins and buses it
+There are three levels. A **chip** is what is inside the package: its cores, its pins by bank, and
+its peripherals, everything the cores reach by address:
+
+```hocon
+chip {
+  name    = "virt"
+  summary = "two Cortex-M0+ cores, 1 MB of RAM, a console and an SIO"
+  cores   = [cortex-m0plus, cortex-m0plus]
+  peripherals {
+    ram     { peripheral = ram, at = 0x00000000, size = 1M }
+    console { peripheral = debug-console, at = 0x40000000, irq = 0 }
+    sio     { peripheral = virt-sio, at = 0xD0000000, irq = 1 }
+  }
+}
+```
+
+A real chip also has `pins { GP = 30 }`, and a peripheral that drives pins says which each of its
+signals can reach: `uart0 { peripheral = pl011, at = 0x40034000, irq = 20, signals { tx = [GP0,
+GP12, GP16, GP28], rx = [GP1, GP13, GP17, GP29] } }`. A **board** names its chip (`chip = rp2040`)
+or writes it out (`chip { ... }`), and holds the parts soldered beside it, the pins and buses it
 exposes, and its view:
 
 ```hocon
@@ -104,14 +125,14 @@ product {
 ```
 
 A product tweaks a board by its parts' parameters (`boards { pico { board = pico, parts.led.color =
-red } }`) and never otherwise. Each exposed pin is wired once across the product; a part on the
-cores' bus has `at`, `size` and `irq`. [DESIGN.md](DESIGN.md) §12 has the whole format and every
-mistake `check` reports.
+red } }`) and never otherwise. Each exposed pin is wired once across the product. Only a chip's
+peripherals have `at`, `size` and `irq`; a part is off the cores' bus. `benchtop check --chip rp2350`
+prints a chip; [DESIGN.md](DESIGN.md) §12 has the whole format and every mistake `check` reports.
 
-## Core options in a board description
+## Core options in a chip description
 
-A plain core name uses defaults. An object selects options for that core; omitted options keep
-their defaults, independently of the other core:
+A plain core name in a chip's `cores` uses defaults. An object selects options for that core;
+omitted options keep their defaults, independently of the other core:
 
 ```hocon
 cores = [
@@ -141,7 +162,9 @@ priority grouping, including after core 1 launches. `check` validates and prints
 options, and writing a description back preserves them. **Integer DSP is implemented** when
 `dsp = true`: packed arithmetic, saturation, packing/extension, byte selection and the DSP
 multiply/accumulate families, including APSR.GE and exception stacking. It defaults to off.
-`run` currently rejects enabled FPU, MPU, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
+`fpu = sp` (or `dp` on the M7) gives a core its floating-point unit, whose results and flags
+match QEMU's (DESIGN §2.13).
+`run` currently rejects enabled MPU, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
 unsupported selection; it never silently
 ignores them. A chip's integrated core configuration is defined by its chip model; these options
 apply to boards that declare `cores` directly.
@@ -182,7 +205,7 @@ handlers are shared. M23 is a separate Baseline decoder profile, with two priori
 system-register accesses, fixed CCR and no IT, BASEPRI, FAULTMASK or stack limits in its current
 configuration without the Security Extension. M0/M1 have no VTOR; M3 has the v7-M register profile.
 
-**All models currently omit floating point, MPU and Security extensions.**
+**All models currently omit the MPU and Security extensions; the floating-point unit is a board option.**
 M4 and M7 always have integer DSP; M33/M35P/M52/M55/M85 can enable it independently per core. The M52/M55/M85
 models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
 MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. Unsupported instruction

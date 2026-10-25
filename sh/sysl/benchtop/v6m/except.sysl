@@ -305,7 +305,11 @@ set_apsr(cpu: *Cpu, psr: u32)
 enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     val sp = cpu.r[13]
     val align: u32 = if (cpu.kind == Kind.V7em || cpu.kind == Kind.M3) && cpu.ccr & 0x200 == 0 then 0 else 4
-    val frame = (sp - 0x20) & ~align
+    // With a floating-point context active (CONTROL.FPCA), the frame is extended by S0–S15, FPSCR
+    // and a reserved word, stacked at once rather than lazily (fpu.sysl).
+    val extended = cpu.control & 4 != 0
+    val size: u32 = if extended then 0x68 else 0x20
+    val frame = (sp - size) & ~align
     val words: [8]u32 = [cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[12], cpu.r[14], ret, xpsr(cpu) | ((if align != 0 then (sp >> 2) & 1 else 0) << 9)]
 
     if !is_v6m(cpu.kind) && frame < sp_limit(cpu)
@@ -314,12 +318,21 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
 
     for k in 0..<8 do write32(cpu, frame + u32(k) * 4, words[k], n)
 
+    if extended
+        for k in 0..<16 do write32(cpu, frame + 0x20 + u32(k) * 4, cpu.s[k], n)
+        write32(cpu, frame + 0x60, fpscr_now(cpu), n)
+        write32(cpu, frame + 0x64, 0, n)
+        cpu.fpcar = frame + 0x20
+
     val at = cpu.vtor + e * 4
     val vector = read32(cpu, at, n)
 
     if cpu.stop != Stop.Budget then return false
 
-    cpu.r[14] = if cpu.ipsr != 0 then 0xFFFFFFF1 else if cpu.control & 2 != 0 then 0xFFFFFFFD else 0xFFFFFFF9
+    // EXC_RETURN's bit 4 is clear for an extended frame.
+    val ftype: u32 = if extended then 0x10 else 0
+
+    cpu.r[14] = (if cpu.ipsr != 0 then 0xFFFFFFF1 else if cpu.control & 2 != 0 then 0xFFFFFFFD else 0xFFFFFFF9) & ~ftype
 
     if on_process_stack(cpu)
         cpu.r[13] = cpu.sp_other
@@ -328,7 +341,9 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
         cpu.r[13] = frame
 
     cpu.ipsr = e
-    cpu.control &= ~2
+    // The handler starts with no floating-point context of its own.
+    cpu.control &= ~6
+    cpu.fp_ready = false
     cpu.active |= u64(1) << e
     cpu.pending &= ~(u64(1) << e)
     cpu.it = 0
@@ -340,17 +355,23 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
 // The record a `BX` or `POP {pc}` at `from` goes to with `v` off the RAM: in handler mode, an
 // EXC_RETURN value returns from the exception; anything else stops the core at `Unmapped`.
 exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
-    if cpu.ipsr == 0 || v >> 4 != 0x0FFFFFFF then return insn_at(cpu, v & ~1)
+    if cpu.ipsr == 0 || v >> 5 != 0x07FFFFFF then return insn_at(cpu, v & ~1)
 
     val kind = v & 0xF
+    // Bit 4 clear: the frame is extended with the floating-point context, which only a core with the
+    // extension stacks.
+    val extended = v & 0x10 == 0
 
     if kind != 0x1 && kind != 0x9 && kind != 0xD then return fault_at(cpu, from)
+    if extended && cpu.fpu == FP_NONE then return fault_at(cpu, from)
 
     val to_process = kind == 0xD
     val frame = if to_process then cpu.sp_other else cpu.r[13]
     var words: [8]u32
+    var fp: [17]u32
 
     for k in 0..<8 do words[k] = read32(cpu, frame + u32(k) * 4, n)
+    if extended then for k in 0..<17 do fp[k] = read32(cpu, frame + 0x20 + u32(k) * 4, n)
 
     // A frame where nothing is: the core stops on the return, with nothing restored.
     if cpu.stop != Stop.Budget then return stopped_on(cpu, from)
@@ -366,7 +387,15 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
     cpu.r[14] = words[5]
 
     val pc = words[6]
-    val sp = (frame + 0x20) | (((psr >> 9) & 1) << 2)
+    val sp = (frame + (if extended then 0x68 else 0x20)) | (((psr >> 9) & 1) << 2)
+
+    if extended
+        for k in 0..<16 do cpu.s[k] = fp[k]
+        fpscr_set(cpu, fp[16])
+
+    // CONTROL.FPCA is whether the frame was extended.
+    if cpu.fpu != FP_NONE then cpu.control = (cpu.control & ~4) | (if extended then 4 else 0)
+    cpu.fp_ready = false
 
     // ARMv8-M: FAULTMASK clears on the return from any exception but NMI, the monitor clears, and an
     // IT block the exception interrupted goes on under the ITSTATE its frame holds: what is left of

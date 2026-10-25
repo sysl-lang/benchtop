@@ -60,6 +60,13 @@ cc -DHOST -O2 crunch.c -o crunch-host
 ./crunch-host > crunch.out
 rm crunch-host
 
+# The floating-point guest, for a board whose cores have the unit (`fpu = sp`, or `dp` on the M7);
+# examples/qemu/build-fpu.sh runs it on QEMU for fpu-m4.qemu, fpu-m33.qemu and fpu-m7.qemu.
+fp=(-mthumb -mfloat-abi=softfp $flags)
+arm-none-eabi-gcc -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 $fp start.c fpu.c -lgcc -o fpu-m4.elf
+arm-none-eabi-gcc -mcpu=cortex-m33 -mfpu=fpv5-sp-d16 -DFPV5 $fp start.c fpu.c -lgcc -o fpu-m33.elf
+arm-none-eabi-gcc -mcpu=cortex-m7 -mfpu=fpv5-d16 -DFPV5 -DDOUBLE $fp start.c fpu.c -lgcc -o fpu-m7.elf
+
 # The integer DSP guest: it runs on virt4 and virt7 as they are, and on the boards whose cores
 # offer the extension as a choice with `dsp = true`, as dsp.hocon does.
 arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfloat-abi=soft $flags start.c dsp.c -lgcc -o dsp.elf
