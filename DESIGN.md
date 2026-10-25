@@ -1,10 +1,10 @@
-# cortical — a Cortex-M board emulator written in sysl
+# benchtop — a microcontroller board emulator written in sysl
 
-**Status: twelve scalar Cortex-M models run in `sh.sysl.cortical.v6m` on virtual boards (§11).
+**Status: twelve scalar Cortex-M models run in `sh.sysl.benchtop.v6m` on virtual boards (§11).
 Core options and implemented subsets are described in the README and §2.12. No real board is
-emulated yet; the real-chip peripherals and optional CPU extensions below remain design.** The repo is `sysl-lang/cortical`.
+emulated yet; the real-chip peripherals and optional CPU extensions below remain design.** The repo is `sysl-lang/benchtop`.
 
-cortical emulates Cortex-M boards well enough to run, unmodified, the firmware a developer would
+benchtop emulates Cortex-M boards well enough to run, unmodified, the firmware a developer would
 flash onto them: each core on a host thread, a board's display in a Mac window, its UART on a
 terminal, and skiff on every core. It is an interpreter. **JIT: not planned.** It is written in sysl, and part of its job is to stress the language. A gap
 found while writing it is reported, not worked around (Rule 9). A board is a **description**: a HOCON
@@ -17,7 +17,7 @@ description, not another emulator.
 1. **Raspberry Pi Pico 2 (RP2350) first** (§9). The user owns one, so the real board is the oracle.
    Its two Cortex-M33s are ARMv8-M Mainline with DSP and FPv5-SP, a near-superset of the H7's M4, so
    the core work transfers. The org already has Pico 2 code (`pico2`, `pico-scratch`, `ogol-pico2`,
-   `solder-pico2`, the SVD-generated `rp2350`, and skiff's milestone 5), which cortical can then run
+   `solder-pico2`, the SVD-generated `rp2350`, and skiff's milestone 5), which benchtop can then run
    in CI.
 2. **Then the Pico + the GeeekPi 3.5" breadboard kit (RP2040, 52Pi EP-0172)** (§10). The user owns it, and `picokit` is the
    org's program for it. It adds ARMv6-M, SPI, I²C, ADC and a 320×480 panel, at little cost once the
@@ -64,16 +64,16 @@ Sources, and how far each was checked:
 1. **The DISCO cannot run the M7 at 480 MHz as shipped.** The board is wired for direct SMPS supply
    (UM2411 §5.2.3), and with SMPS the highest voltage scale is VOS1, so the most is 400 MHz. VOS0 and
    480 MHz need the LDO, which means moving solder bridges. Every ST DISCO example configures
-   **M7 400 MHz / M4 200 MHz** (the HSEM, LCD_DSI and UART readmes all say so). cortical runs the core
+   **M7 400 MHz / M4 200 MHz** (the HSEM, LCD_DSI and UART readmes all say so). benchtop runs the core
    at whatever RCC programs, so the target is "a fraction of 400/200" for ST's code. The board
    description records the supply wiring. A program that selects the LDO on an SMPS-wired board
-   locks the MCU on real hardware (ST forum), and cortical reproduces that as a reported lock, not a
+   locks the MCU on real hardware (ST forum), and benchtop reproduces that as a reported lock, not a
    silent success.
 2. **The panel controller depends on the board revision, and ST's BSP decides it at run time.**
    MB1166 boards up to and including the A08 revision carry the FRD397B25009 glass with an
    **OTM8009A**. MB1166-**A09** carries the FRD400B25025 glass with an **NT35510** (ST forum answer).
    `BSP_LCD_InitEx` probes the NT35510 ID over a DSI read first and falls back to the OTM8009A
-   (`stm32h747i_discovery_lcd.c`). cortical therefore models both controllers, and the board
+   (`stm32h747i_discovery_lcd.c`). benchtop therefore models both controllers, and the board
    description chooses one (`panel = nt35510` by default, since that is what a board bought today
    carries). The DSI read path has to be real, because the BSP's choice runs through it.
 
@@ -112,7 +112,7 @@ Sources, and how far each was checked:
 - **Deterministic mode** (`--deterministic`) runs both cores on **one** host thread, round-robin with
   fixed quanta, so a run is reproducible to the instruction. **Tests use it.** QEMU's MTTCG made
   skiff's AN521 boots flaky (skiff `CLAUDE.md`, milestone 2: a tick delivered up to 5 ticks late), and
-  cortical should not repeat that. `--seed n` jitters the quanta, which explores interleavings
+  benchtop should not repeat that. `--seed n` jitters the quanta, which explores interleavings
   reproducibly: a skiff race found at seed 1234 recurs at seed 1234.
 - **The virtual boards (§11) run their two cores this way by default.** A round gives core
   0 a turn and then core 1, each running until its clock (instructions retired plus the time skipped
@@ -128,7 +128,7 @@ Sources, and how far each was checked:
   interleaving. There is no `--seed` yet; the quantum is the one input to the interleaving, and the
   same image, input and quantum give the same run, counts and all. This single-threaded run is the
   oracle the threaded mode is checked against.
-- **`cortical run --threads` gives each of the virtual board's cores a host thread of its own**
+- **`benchtop run --threads` gives each of the virtual board's cores a host thread of its own**
   (`virt/parallel.sysl`). Core 0 runs alone, exactly as above, until it launches core 1; then core 1
   gets a thread and the two run at once, each a quantum at a time, with the lag bound of §1.3 between
   them. Between its runs a core does what a turn's start does on one thread — takes in what the other
@@ -136,7 +136,7 @@ Sources, and how far each was checked:
   asleep in `WFI` blocks its thread on a condition variable (§1.3), so an idle core costs no host core.
   The board ends when either core stops: its thread cuts the other's run short (§1.4) and both
   threads leave, and `run_board` answers the core that stopped. **Turns stay the default**, because
-  what cortical is for is a run that can be repeated and compared: a failure found on one thread
+  what benchtop is for is a run that can be repeated and compared: a failure found on one thread
   recurs, counts and all, and the threaded mode is not reproducible by nature. `--threads` is the
   speed for a guest that keeps both cores busy — about 1.8 times the turns' aggregate on the
   two-core bench (`bench/README.md`) — and is checked against the turns on every outcome that does
@@ -186,7 +186,7 @@ checked against the SVD):
 - **Interconnect timing is not modelled.** AXI, AHB and the D1/D2/D3 bridges add no wait states.
   Instruction cost is a per-class cycle table (§1.3), with flash wait states taken from FLASH_ACR's
   LATENCY field, so a program that forgets to set LATENCY runs slower, not wrongly. Real silicon
-  would fail outright in that case, and cortical reports it as a warning on the console.
+  would fail outright in that case, and benchtop reports it as a warning on the console.
 
 ### 1.3 Virtual time
 
@@ -286,7 +286,7 @@ checked against the SVD):
   `C1ISR` and `C2ISR`, raising HSEM1 (to the M7) or HSEM2 (to the M4) where `CnIER` enables it. That is
   the ST examples' "core notification", and skiff's natural doorbell on this chip.
 - **Events between cores**: on the H745/747 each core's TXEV is wired to the other's RXEV, so `SEV` on
-  one core wakes a `WFE` on the other (the ST HSEM readme lists SEV as a D2 wake source). cortical sets
+  one core wakes a `WFE` on the other (the ST HSEM readme lists SEV as a D2 wake source). benchtop sets
   the other core's event register and signals its condition variable.
 - **Interrupts**: every IRQ line is wired to **both** NVICs, and each core enables its own. EXTI keeps
   a mask per core (`CPUIMRx` for the M7, `C2IMRx` for the M4 †). A device raises a line through a
@@ -296,7 +296,7 @@ checked against the SVD):
   `RCC_GCR.BOOT_C2` releases a held M4. The ST examples boot both and park the M4 in Stop until the M7
   frees an HSEM. The option bytes are in the board description (defaults as shipped: both boot).
 - **Per-core clock enables**: RCC has a common enable set and per-core sets (`RCC_C1_*ENR`,
-  `RCC_C2_*ENR` †). A peripheral is clocked if either enables it. cortical models the OR, plus a
+  `RCC_C2_*ENR` †). A peripheral is clocked if either enables it. benchtop models the OR, plus a
   per-core "allocated" view for the D2-in-Stop logic (a domain stays awake while any core has
   allocated something in it).
 
@@ -313,7 +313,7 @@ checked against the SVD):
 - **Exclusives (`LDREX`/`STREX`) model each core's *local* monitor only.** On the H747 there is no
   global exclusive monitor between the M7 and the M4 for ordinary SRAM. That is why HSEM exists, and
   why skiff's ROADMAP names HSEM as the H7's lock. A cross-core spin lock built on exclusives
-  therefore does **not** exclude on silicon, and it must not exclude in cortical. The exact silicon
+  therefore does **not** exclude on silicon, and it must not exclude in benchtop. The exact silicon
   behaviour of an exclusive store to shareable memory on this interconnect (succeed without
   excluding, or always fail) still has to be read from RM0399 and the Cortex-M7 TRM. It is listed in
   §8 as a fact to pin down before the HSEM milestone, with an option, `--exclusives
@@ -352,13 +352,13 @@ checked against the SVD):
     says. On AArch64 a relaxed load or store is the plain `ldr`/`str`, so the one-thread machine pays
     nothing for it (the single-core bench is unchanged).
   - **What the host does not reproduce** is the M0+'s own strength: the core performs its accesses in
-    order, so firmware that omits a barrier works on silicon and may not here. That makes cortical
+    order, so firmware that omits a barrier works on silicon and may not here. That makes benchtop
     stricter than the part, which is the side to err on.
   - Every other shared word — `limit`, `incoming`, the posted lines, the published clocks, the sleep
     flags, the FIFO counts — is an atomic with the ordering its pairing needs, and ThreadSanitizer finds
     no race in the suite (`SYSL_EXTRA_CFLAGS="-fsanitize=thread -g" sysl test .`).
-- **Caches are no-ops (the brief).** That makes cortical *more* coherent than silicon: a missing clean
-  or invalidate works in cortical and fails on the board. Since skiff's milestone 9 is exactly "shared
+- **Caches are no-ops (the brief).** That makes benchtop *more* coherent than silicon: a missing clean
+  or invalidate works in benchtop and fails on the board. Since skiff's milestone 9 is exactly "shared
   state uncached on the M7, then the cache trait", a **later** option, `--dcache-model`, keeps a
   shadow D-cache for the M7 (16 KB, 4-way, 32-byte lines, write-back per the MPU attributes). It
   returns stale data where silicon would, which turns a coherence bug into a visible failure. The bus
@@ -434,11 +434,11 @@ checked against the SVD):
   critical path (§2.4).
 - **DWT/ITM**: `DWT_CYCCNT` is provided because HAL and benchmarks read it. It is the core's virtual
   cycle count. ITM stimulus port 0 is a second console (SWO), which is cheap and useful. QEMU has
-  no DWT (skiff-old's notes), so cortical improves on that.
+  no DWT (skiff-old's notes), so benchtop improves on that.
 - **Semihosting** (`BKPT 0xAB`, SYS_WRITE0/WRITEC/WRITE/EXIT_EXTENDED) is on by an option. It is how
-  skiff's boot tests halt, so the same scripts can drive cortical and QEMU.
+  skiff's boot tests halt, so the same scripts can drive benchtop and QEMU.
 
-**What the ARMv6-M core models** (`sh.sysl.cortical.v6m`, `except.sysl`; ARMv6-M ARM B1, the M0+
+**What the ARMv6-M core models** (`sh.sysl.benchtop.v6m`, `except.sysl`; ARMv6-M ARM B1, the M0+
 subset of the above):
 
 - **State**: MSP and PSP with CONTROL.SPSEL (`r13` is the one in use, the other kept beside it),
@@ -548,7 +548,7 @@ loop
     interpreter does (`forth/README.md` § "Direct threading through guaranteed tail calls").
   - The machine, the record pointer and the retired count ride in parameters across the chain.
   - A `match` over `Op` is the reference implementation the chain is checked against.
-  - **Measured** (`cortical bench`, ARMv6-M, M5 Pro, sysl 0.5.4): the chain runs at ~1365 MIPS and the
+  - **Measured** (`benchtop bench`, ARMv6-M, M5 Pro, sysl 0.5.4): the chain runs at ~1365 MIPS and the
     `match` loop at ~1195 MIPS over the same records and semantics, so the chain is the executor.
     The records are 16 bytes; register numbers are `u4`, so indexing the sixteen registers needs no
     bounds check (with `u8` fields the chain ran at ~1180 MIPS).
@@ -636,7 +636,7 @@ interpreters on a current Apple P-core, which reach 100–300 million guest inst
 before any JIT. Against that:
 
 **The first measurement beat this table's estimates by about ten.** The `become` chain, measured
-with `cortical bench` (§2.3), runs an ARMv6-M workload at ~1365 MIPS on one M5 Pro P-core, with the page-table memory path
+with `benchtop bench` (§2.3), runs an ARMv6-M workload at ~1365 MIPS on one M5 Pro P-core, with the page-table memory path
 and lazy N/Z flags but no interrupts, MPU or IT blocks yet; compare-and-branch fusion and lazy V
 have since cut its cycles per guest instruction by a further 12%. The estimates below are kept as the
 floor to defend; the benchmark after milestone 1 replaces them with Thumb-2 figures.
@@ -717,9 +717,9 @@ Architecture Reference Manual (DDI0553), cited by chapter title. Over §2.1's v7
     the DCP implementation (`pico_double/CMakeLists.txt:116–126`), so any `printf("%f")` reaches it;
   - **CP7, the redundancy coprocessor (RCP)**: `crt0.S:409–423` enables it and seeds the stack-canary
     salts, and the boot ROM's hardening uses its checks. A failed RCP check is a fault on silicon, and
-    in cortical it is a stop with the check named.
+    in benchtop it is a stop with the check named.
 
-  In cortical a coprocessor is a **board device on the core's coprocessor port**, as an MMIO device is
+  In benchtop a coprocessor is a **board device on the core's coprocessor port**, as an MMIO device is
   on the bus, so the M33 stays generic and the RP2350 description supplies the three.
 - **Exceptions**: v8-M adds `AIRCR.BFHFNMINS`/`PRIS` and the Secure/Non-secure priority boosting,
   which are inert in Secure-only mode. The RP2350 has 52 IRQ lines (`NUM_IRQS`,
@@ -750,7 +750,7 @@ executes without the FP, Security and MPU extensions; integer DSP is optional vi
 
 - **One core with a kind, in the one module.** `Cpu.kind` is `V6m` (the zero value, so every core
   nobody gave a kind is an M0+) or `V8mMain`; the board sets it from the description's `cores`. The
-  M33 is in `sh.sysl.cortical.v6m`, the module named for its first kind, beside the M0+: `thumb2.sysl`
+  M33 is in `sh.sysl.benchtop.v6m`, the module named for its first kind, beside the M0+: `thumb2.sysl`
   decodes, `t2sem.sysl` is the semantics, `t2threaded.sysl` the handlers, `t2system.sysl` the system
   registers and instructions, and switch.sysl's `match` loop has the cases. A separate module was the
   alternative, and it would have needed a second `Cpu`: the record's `op`, the decode arrays, the
@@ -821,7 +821,7 @@ executes without the FP, Security and MPU extensions; integer DSP is optional vi
 - **The stack limits.** MSPLIM and PSPLIM are checked on every way an instruction moves SP down — a
   16- or 32-bit push, `SUB`/`ADD`/`MOV` into SP, a pre- or post-indexed store or load, `STRD`, an
   `STMDB`/`LDM` with writeback — and on exception entry. A violation is the UsageFault STKOF, which
-  cortical does not take: **the core stops at `Stop.StackLimit`** on the instruction (or, on entry, the
+  benchtop does not take: **the core stops at `Stop.StackLimit`** on the instruction (or, on entry, the
   address the exception would have returned to), with nothing stored. `MSR` to MSP or PSP is not
   checked.
 - **Faults are stops**, as on ARMv6-M: an undefined instruction stops at `Undefined`, an access where
@@ -851,7 +851,7 @@ the same hashes (`examples/qemu/build.sh` makes them); and **the host** builds `
 arithmetic, division, bitfields, switch tables, saturation, IT blocks, an atomic counter), whose
 output both cores must print. The bench kernel built for the M33 gives the host's answer.
 
-**Measured** (`cortical bench --core cortex-m33`, M5 Pro, sysl 0.5.7, `time -l` over three rounds,
+**Measured** (`benchtop bench --core cortex-m33`, M5 Pro, sysl 0.5.7, `time -l` over three rounds,
 on a machine shared with other work): the bench kernel built for the M33 is 587.5 M guest
 instructions a round against the M0+ build's 667.5 M, 12% fewer. The M33 costs 15.3 host instructions
 and 3.6–3.8 cycles per guest instruction, against the M0+'s 15.1 and 3.3–3.5, so a round takes about
@@ -981,7 +981,7 @@ flush-to-zero in and out, saturation, the fixed-point scales, the extended frame
 runs 36 instructions (FPv4-SP), 55 (FPv5-SP) and 79 (FPv5-DP) over 24 edge values (16 doubles) under
 all 16 FPSCR settings (32 with AHP for the half-precision conversions, over 24 halves and singles at
 half precision's edges), hashing each result with all of FPSCR; QEMU's M4 (`mps2-an386`), M33 (`mps2-an505`)
-and M7 (`mps2-an500`) wrote `fpu-m4.qemu`, `fpu-m33.qemu` and `fpu-m7.qemu`, and cortical must match
+and M7 (`mps2-an500`) wrote `fpu-m4.qemu`, `fpu-m33.qemu` and `fpu-m7.qemu`, and benchtop must match
 every line (`virt/fpu_tests.sysl`). The negating multiply-accumulates (`VMLS`, `VNMLA`, `VNMLS`,
 `VFMS`) depend on a negation in a `@strict_fp` body staying where it is written, so a NaN keeps the
 sign the architecture gives it; the compiler guarantees that.
@@ -998,7 +998,7 @@ breadboard kit's §10.
   register block, with offsets checked by `@assert(offsetof(...))`.
 - **They are generated, not typed**: the org's `svd` tool turns ST's `STM32H747_CM7.svd` into sysl.
   Today it emits `const`s only, and it refuses `<dim>` arrays and clusters by name (svd `README`).
-  cortical needs a second output mode, bitfield structs, plus `<dim>` support (GPIO, DMA streams and
+  benchtop needs a second output mode, bitfield structs, plus `<dim>` support (GPIO, DMA streams and
   LTDC layers use them). That is a piece of work in `sysl-lang/svd`, done before the devices.
 - **A device module** implements
 
@@ -1012,7 +1012,7 @@ breadboard kit's §10.
   and keeps its register block as the generated struct. Behaviour is written against named fields:
   `if cr1.ue && cr1.te`. The offset-to-field dispatch is a `match` the generator also writes, unless the
   reflection probe in §8 shows `T::Fields` can derive it.
-- **A board is a description** in the format of §12: a chip from cortical's registry (or, for a board
+- **A board is a description** in the format of §12: a chip from benchtop's registry (or, for a board
   with no real chip, its cores), its parts with their places on the bus, parameters and wires, the
   pins and buses it exposes, and its view. A chip's own memory and devices are the registry's, so a
   board names the chip rather than listing them. What the H7 adds beyond the format as it stands —
@@ -1050,9 +1050,9 @@ the display area becomes one touch, and two fingers on a trackpad become two (`T
 
 The VCP's line goes to one of three back-ends (`--uart`):
 
-- **`stdio`** (default): cortical's own terminal in raw mode through `sysl.tty`. A REPL on the board is
-  a REPL in the terminal cortical runs in. Ctrl-] leaves.
-- **`pty`**: cortical opens a pseudo-terminal and prints its `/dev/ttys…` name, so `screen`, `picocom`
+- **`stdio`** (default): benchtop's own terminal in raw mode through `sysl.tty`. A REPL on the board is
+  a REPL in the terminal benchtop runs in. Ctrl-] leaves.
+- **`pty`**: benchtop opens a pseudo-terminal and prints its `/dev/ttys…` name, so `screen`, `picocom`
   or a host tool that expects a serial device attaches as it would to the real ST-LINK VCP. The
   pty's baud setting is ignored; the guest's BRR governs timing. **`posix_openpt`, `grantpt`,
   `unlockpt` and `ptsname` are missing from `cstd`** (`cstd/POSIX.md` lists them as missing), so this
@@ -1098,13 +1098,13 @@ neither ever waits for the other.
 
 ---
 
-## 5. Fidelity and testing — the oracle is not cortical
+## 5. Fidelity and testing — the oracle is not benchtop
 
 ### 5.1 Instruction semantics: differential against QEMU, with Arm's pseudocode deciding
 
 - **The harness**: a generator writes small test programs (register and memory set-up, a random but
   valid run of N Thumb-2 instructions from one class, then a semihosting dump of R0–R12, SP, LR, the
-  flags, GE, the FP registers and FPSCR, and a memory window). Each program runs on QEMU and on cortical,
+  flags, GE, the FP registers and FPSCR, and a memory window). Each program runs on QEMU and on benchtop,
   and the two dumps are compared. This is QEMU's own `risu` idea, done through semihosting because
   M-profile has no user mode.
   - **M7**: `qemu-system-arm -M mps2-an500 -cpu cortex-m7` (FPv5 with double precision; skiff already
@@ -1113,7 +1113,7 @@ neither ever waits for the other.
   - Classes run separately: data processing with every shift, the flag setters, IT blocks, loads and
     stores in every addressing mode (unaligned included), the multiplies and divides, every DSP
     group, and FP arithmetic with rounding modes, FZ, DN, NaNs and denormals.
-- **When QEMU and cortical disagree, neither wins by default**: the ARMv7-M Architecture Reference
+- **When QEMU and benchtop disagree, neither wins by default**: the ARMv7-M Architecture Reference
   Manual's pseudocode for that encoding decides, and a QEMU bug found that way is recorded. QEMU's M
   profile has had DSP and FP-flag bugs before.
 - **Exceptions** are compared the same way: a fault-provoking program dumps CFSR, the stacked frame and
@@ -1121,7 +1121,7 @@ neither ever waits for the other.
 - **The final oracle is the board.** The user is buying one, and the same generated programs run on it
   through ST-LINK (`probe-rs` or OpenOCD with semihosting) settle anything QEMU and the manual leave
   open.
-- These are `sysl test` tests in cortical. Each generated case that has ever failed is kept as a fixed
+- These are `sysl test` tests in benchtop. Each generated case that has ever failed is kept as a fixed
   regression case. Seeds are fixed per run and logged.
 
 ### 5.2 Peripherals and boards: ST's own examples, unmodified
@@ -1145,15 +1145,15 @@ acceptance set is therefore:
 | | `Applications/FPU/FPU_Fractal` | the fractal renders, on the M7 with the DP FPU and the M4 with SP, and the on-screen timing is the benchmark |
 
 - **Where the binaries come from**: ST ships sources and IDE projects (EWARM, MDK-ARM, STM32CubeIDE),
-  not ELF files. cortical's `tests/st/` holds a build script and a generic Makefile per example that
+  not ELF files. benchtop's `tests/st/` holds a build script and a generic Makefile per example that
   compile **ST's files untouched** with `arm-none-eabi-gcc` (already on this machine). The files are
   the example's `Src/`, the CMSIS `startup_stm32h747xx.s`, the dual-core `system_stm32h7xx_dualcore_*.c`
   and the STM32CubeIDE linker scripts for CM7 and CM4. Each run produces two ELFs, flash bank 1 and
   flash bank 2. The CubeH7 tree is pinned by commit in the test manifest.
 - **How passing is judged**: LED states and UART bytes are compared exactly, against a trace written
   from the example's readme. **Frames are compared against reference PNGs**, which are captured once
-  from cortical, **checked by the user against the real board** (a photo or the user's eye), and then
-  frozen. The user's own check is the oracle, not cortical. Until the board arrives, a frame passes on
+  from benchtop, **checked by the user against the real board** (a photo or the user's eye), and then
+  frozen. The user's own check is the oracle, not benchtop. Until the board arrives, a frame passes on
   a set of hand-written properties (the background colour at known pixels, the image's bounding box),
   which is weaker, and the report says so.
 - The `BSP` example (`Examples/BSP`) that older STM32CubeH7 releases shipped for this board is not in
@@ -1162,7 +1162,7 @@ acceptance set is therefore:
 
 ---
 
-## 6. skiff on cortical
+## 6. skiff on benchtop
 
 ### 6.1 The Pico 2 first
 
@@ -1174,22 +1174,22 @@ neither `chips/rp2350` nor `boards/pico2` exists yet (the tree has `chips/an521`
 skiff's milestone 6 waits on milestone 5 for silicon. skiff's M33 work (PMSAv8 maps, `PSPLIM` stack
 limits, both AN521 cores) is already done under QEMU.
 
-So **skiff on the Pico 2 in cortical (milestone 4, §7) comes before skiff on the H7 (milestone 7)**,
+So **skiff on the Pico 2 in benchtop (milestone 4, §7) comes before skiff on the H7 (milestone 7)**,
 and it is cheaper on both sides: the cores are the AN521's architecture, and what is new is the chip.
-What cortical must provide faithfully for it:
+What benchtop must provide faithfully for it:
 
 - both M33s entering one image, core 1 released through the boot ROM's FIFO launch protocol (§9.6),
   the core number from `SIO_CPUID`;
 - the SIO FIFO and its per-core IRQ as the doorbell, and the doorbell registers (§9.3);
 - **both locks**: the hardware spinlocks (with erratum E2 modelled behind an option, so a lock that
-  E2 would break fails in cortical) and exclusives that exclude across the cores (§1.5);
+  E2 would break fails in benchtop) and exclusives that exclude across the cores (§1.5);
 - PMSAv8 with 8 regions, `PSPLIM`, SysTick per core, PendSV/SVC, semihosting halt, as §6.2 lists for
   the H7.
 
-**The request to the skiff session for milestone 5**, sent when cortical's milestone 2 (Pico 2 dual
+**The request to the skiff session for milestone 5**, sent when benchtop's milestone 2 (Pico 2 dual
 core) runs: `chips/rp2350` and `boards/pico2` as their ROADMAP describes them, and a `boot-test.sh`
-target that runs cortical headless with `--deterministic` beside the QEMU machines. Then skiff's
-milestone 1–4 and 6 scenarios run on the Pico 2's shape in cortical before and alongside the board,
+target that runs benchtop headless with `--deterministic` beside the QEMU machines. Then skiff's
+milestone 1–4 and 6 scenarios run on the Pico 2's shape in benchtop before and alongside the board,
 and the board confirms.
 
 ### 6.2 The H7
@@ -1197,11 +1197,11 @@ and the board confirms.
 Where skiff stands (`origin/dev` 3cec4b3): milestones 0–4 done; **6 (protection) done on every QEMU
 core** (AN500, AN386, both AN521 cores), waiting on milestone 5 (the Pico 2) for silicon and on
 FINDINGS 9 for granting queues/channels/pools; 7 (the rest of the kernel) and 8 (two images) are next;
-9 is "the H747I-DISCO (needs the board)". cortical lets milestone 9 start before the board arrives, and
+9 is "the H747I-DISCO (needs the board)". benchtop lets milestone 9 start before the board arrives, and
 makes its one-image half testable in a deterministic, scriptable way that the board cannot be.
 
 What skiff uses, from `arch/armv7m`, `arch/pmsa`, `chips/an521` and `boards/qemu-an521`, and
-therefore what cortical must provide faithfully:
+therefore what benchtop must provide faithfully:
 
 - **Both cores entering one `_start`**, reading a core number, taking their own stack top, and core 0
   zeroing `.bss`/`.shared` before releasing core 1. On the H747 the core number comes from SCB
@@ -1211,21 +1211,21 @@ therefore what cortical must provide faithfully:
   bit 4** (§2.2).
 - **The doorbell**: on the AN521 it is MHU0 (IRQ 6). On the H747 it is an HSEM channel per direction
   with `CnIER` set, so the HSEM1/HSEM2 interrupts carry the ring, or alternatively `SEV`/EXTI SWIER
-  with a per-core EXTI line. cortical models all three.
+  with a per-core EXTI line. benchtop models all three.
 - **The lock**: skiff's `spin.sysl` uses `Atomic.swap` (LDREX/STREX). **That does not exclude between
   the M7 and the M4** (§1.5), so the H747 chip must supply its lock from HSEM, as skiff's own ROADMAP
-  says. cortical's default exclusive model makes an exclusives-based lock fail the m3a1-style hammer
-  test (`the shared count is … not 200000`) on the H747 as it would on silicon. That is a test cortical
+  says. benchtop's default exclusive model makes an exclusives-based lock fail the m3a1-style hammer
+  test (`the shared count is … not 200000`) on the H747 as it would on silicon. That is a test benchtop
   is in a position to run.
 - **PMSAv7 with 8 regions on the M4 and 16 on the M7**: `Isolation.capacity()` must answer per core,
   and a one-image build must size maps for 8. The 64-byte stack guard, the null guard over the first
   256 bytes (vector fetch ignores the MPU), unprivileged tasks, SVC kernel calls, and MemManage with
   MSTKERR/DACCVIOL deciding "stopped a task" all have to be exact.
-- **Semihosting halt** for the boot tests, which cortical offers so `scripts/boot-test.sh` can drive
-  cortical as it drives QEMU.
+- **Semihosting halt** for the boot tests, which benchtop offers so `scripts/boot-test.sh` can drive
+  benchtop as it drives QEMU.
 
-**The request to the skiff session for the H747** (their work, not cortical's). It is to be sent once
-cortical's milestone 5 (H7 M7 + M4) runs the HSEM examples:
+**The request to the skiff session for the H747** (their work, not benchtop's). It is to be sent once
+benchtop's milestone 5 (H7 M7 + M4) runs the HSEM examples:
 
 1. `chips/stm32h747`: start-up for both cores (CPUID part number as the core id; stack tops; CPACR;
    core 0 zeroes `.bss`/`.shared`; the M4's release through HSEM notification or `RCC_GCR.BOOT_C2`), the
@@ -1239,12 +1239,12 @@ cortical's milestone 5 (H7 M7 + M4) runs the HSEM examples:
    `.shared` in AXI SRAM or SRAM4. The M7 maps it **uncached** through the MPU.
 4. `arch/pmsa`: `capacity()` taken from MPU_TYPE.DREGION at run time, or the minimum over the image's
    cores.
-5. A boot target in `scripts/boot-test.sh` that runs cortical headless with `--deterministic` and
+5. A boot target in `scripts/boot-test.sh` that runs benchtop headless with `--deterministic` and
    `--seed`, beside the QEMU machines. Then the milestone 1–4 and 6 scenarios run unchanged on the
    H747 shape.
 6. Note **FINDINGS 10** (`__aeabi_memmove` missing from `sysl.softint.aeabi`). An H747 board link
    will meet it just as the MPS2 links did, so it should be fixed in sysl first.
-7. For milestone 9's second half (two images, caches on), cortical's `--dcache-model` (§1.5) is what
+7. For milestone 9's second half (two images, caches on), benchtop's `--dcache-model` (§1.5) is what
    makes "clean before giving, invalidate after taking" testable before the board.
 
 ---
@@ -1257,16 +1257,16 @@ hours. They include the tests the rules require, which are about a third of each
 
 | # | the user runs | contents | estimate |
 |---|---|---|---|
-| **0 — skeleton** | `cortical run --board pico2 blink.elf --headless` prints a hand-written sysl program's semihosting output | the repo, the board-description framework (cores, regions, devices, coprocessors, wiring, panel), the ELF and UF2 loaders (§9.2), the bus with regions and the RP atomic aliases (§9.1), the register types generated from `RP2350.svd`, and the `svd` tool's new bitfield output plus `<dim>` and clusters (in `sysl-lang/svd`; the RP2040 and RP2350 SVDs already pass its constants mode, which `sysl-lang/rp2040` and `sysl-lang/rp2350` are generated by), a first decoder | 3–4 |
+| **0 — skeleton** | `benchtop run --board pico2 blink.elf --headless` prints a hand-written sysl program's semihosting output | the repo, the board-description framework (cores, regions, devices, coprocessors, wiring, panel), the ELF and UF2 loaders (§9.2), the bus with regions and the RP atomic aliases (§9.1), the register types generated from `RP2350.svd`, and the `svd` tool's new bitfield output plus `<dim>` and clusters (in `sysl-lang/svd`; the RP2040 and RP2350 SVDs already pass its constants mode, which `sysl-lang/rp2040` and `sysl-lang/rp2350` are generated by), a first decoder | 3–4 |
 | **1 — Pico 2, one core, UART** | pico-examples `hello_serial` prints on a terminal; `blink` (built for `pico2`) blinks GP25's LED in the window; a sysl program built with the SDK prints and blinks; each matches the real board (§9.8) | the complete integer Thumb-2 + IT + DSP, FPv5-SP, the v8-M additions in Secure-only form (§2.7), exceptions/NVIC/SCB/SysTick/PMSAv8, the fast table and decode cache, the three coprocessors, the boot ROM mapped for its function table, RESETS/CLOCKS/XOSC/PLL/TICKS/PSM/WATCHDOG, IO_BANK0/PADS/SIO GPIO, TIMER0/1, UART0 to stdio, a pty and tcp, virtual time, the SDL3 panel with the Pico 2 drawn, the QEMU differential harness (`mps2-an505`'s M33) for the integer, DSP and FP classes, then the benchmark (§2.6) | 8–10 |
 | **2 — Pico 2, both cores** | pico-examples `multicore/hello_multicore` and `multicore_fifo_irqs`, both M33s on separate threads; a two-core spin-lock hammer that counts exactly | core 1 started in the real boot ROM and launched through the FIFO protocol (§9.6), the second core's view, SIO FIFOs and their IRQs, hardware spinlocks (E2 behind an option), doorbells, the global exclusive monitor (§1.5), `WFE`/`SEV` across cores, the time window and deterministic mode | 3–4 |
 | **3 — Pico + breadboard kit** | `picokit` unmodified, with the screen, touch, joystick, buttons, LEDs and buzzer on the panel; 52Pi's own demo (`geeekpi/pico_breakboard_kit`: FreeRTOS SMP and LVGL on both M0+s, the WS2812 over PIO, the GT911, the joystick) unmodified; the oracle is the user's real kit (§10.6) | ARMv6-M (§2.8) 1.5–2; the RP2040 chip over the RP2350's devices (§10.1) 2–3; PL022 SPI 1; the ST7796 command model with ILI9488 as a variant, and the 320×480 glass 2; the DW I²C master and the GT911 1.5–2; ADC and the joystick 0.5; PWM and the buzzer to host audio 1–1.5; **PIO 4–6**, which the RGB LED needs (§10.4) | 13–18 |
-| **4 — skiff on the Pico 2** | skiff's milestone 1–4 and 6 scenarios on the Pico 2's shape, in a window or headless in skiff's gate | cortical's side: semihosting halt, `--expect`, PMSAv8 and `PSPLIM` edge cases skiff reaches, the E2 option exercised, the pty back-end (after the `cstd` additions); **skiff's side is §6.1's request** (its milestone 5), estimated by them | 2–3 (cortical) |
+| **4 — skiff on the Pico 2** | skiff's milestone 1–4 and 6 scenarios on the Pico 2's shape, in a window or headless in skiff's gate | benchtop's side: semihosting halt, `--expect`, PMSAv8 and `PSPLIM` edge cases skiff reaches, the E2 option exercised, the pty back-end (after the `cstd` additions); **skiff's side is §6.1's request** (its milestone 5), estimated by them | 2–3 (benchtop) |
 | **5 — H7: M7 + M4 + UART** | ST's `GPIO_EXTI` and `UART_WakeUpFromStopUsingFIFO` on the M7; the three HSEM examples and `FreeRTOS_HwSemaphoreCoreSync` on both cores; a sysl REPL from `sysl-lang/repl` on USART1 | what the Pico 2 did not already build: the `V7EM` kinds, PMSAv7 (16 and 8 regions), FPv5-DP at `.F64` and the FP64 differential classes, the M7's caches and TCMs as §2.1 says, the H7's RCC/PWR/FLASH/SYSCFG/GPIO/EXTI/USART1/HSEM, CM4 gating and Stop, the local-only exclusive model, the DISCO drawn on the panel | 7–9 |
 | **6 — H7 display** | ST's LCD_DSI video and command-mode examples, the six DMA2D examples and `FPU_Fractal` on the 800×480 area | FMC SDRAM, LTDC, DSI host + wrapper, OTM8009A and NT35510, DMA2D, MDMA if an example needs it, TIM/DMA as the examples need, headless screenshots and the frame tests | 6–8 |
-| **7 — skiff on the H7** | skiff's milestone 1–4 and 6 scenarios on the H747 shape | cortical's side: the H7 exclusives model and its test (§1.5), PMSAv7 edge cases; **skiff's side is §6.2's request**, estimated by them (the AN521 port suggests 3–5 of their agent-days) | 2–3 (cortical) |
+| **7 — skiff on the H7** | skiff's milestone 1–4 and 6 scenarios on the H747 shape | benchtop's side: the H7 exclusives model and its test (§1.5), PMSAv7 edge cases; **skiff's side is §6.2's request**, estimated by them (the AN521 port suggests 3–5 of their agent-days) | 2–3 (benchtop) |
 
-**Total for cortical: about 44–59 agent-days**, plus skiff's share; through milestone 4 (both Pico
+**Total for benchtop: about 44–59 agent-days**, plus skiff's share; through milestone 4 (both Pico
 boards and skiff on the Pico 2) it is 29–39. Milestone 3 is 9–12 without PIO, if the RGB LED is
 deferred. The benchmark after milestone 1 says how far §2.6's target is met on the M33. Before
 milestone 6, the frame-heavy one, the M7's figure decides whether a performance item
@@ -1286,7 +1286,7 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
 | touch (I2C4 + FT6x06) | §3.1 | 1–1.5 |
 | SDRAM/QSPI/SD beyond the display | QUADSPI memory-mapped + indirect (MT25TL01G), SDMMC1 + an image file | 3–4 |
 | audio (SAI1 + WM8994 over I2C4) | SAI's FIFO and frame timing to host audio through `sysl-lang/miniaudio`; the WM8994's register file accepted, volume and routing honoured | 4–5 |
-| **USB (OTG_HS/FS for tinyusb)** | the org's `sysl-lang/tinyusb` already has an `stm32h7` port (Synopsys DWC2), so cortical models only the **DWC2 core in device mode**: GOTGCTL, GAHBCFG, GUSBCFG, GRSTCTL, GINTSTS/GINTMSK, GRXSTSP, GRXFSIZ, the TX FIFO sizes, DCFG/DCTL/DSTS, the DIEPCTLx/DOEPCTLx/…TSIZ/…INT sets, the FIFO windows, and the interrupt. The host side is a **small USB host inside cortical**: it enumerates the emulated device through the DWC2 model and bridges each class to the Mac: CDC-ACM to a pty, MSC to a disk-image file, HID to an on-screen log. macOS has no USB/IP client and no way to accept a virtual device without a driver, so a bridge is the honest shape | DWC2 device model 3–4, host enumerator + CDC bridge 2, MSC 1: **6–7** |
+| **USB (OTG_HS/FS for tinyusb)** | the org's `sysl-lang/tinyusb` already has an `stm32h7` port (Synopsys DWC2), so benchtop models only the **DWC2 core in device mode**: GOTGCTL, GAHBCFG, GUSBCFG, GRSTCTL, GINTSTS/GINTMSK, GRXSTSP, GRXFSIZ, the TX FIFO sizes, DCFG/DCTL/DSTS, the DIEPCTLx/DOEPCTLx/…TSIZ/…INT sets, the FIFO windows, and the interrupt. The host side is a **small USB host inside benchtop**: it enumerates the emulated device through the DWC2 model and bridges each class to the Mac: CDC-ACM to a pty, MSC to a disk-image file, HID to an on-screen log. macOS has no USB/IP client and no way to accept a virtual device without a driver, so a bridge is the honest shape | DWC2 device model 3–4, host enumerator + CDC bridge 2, MSC 1: **6–7** |
 | wifi | module TBD | — |
 | GDB stub (remote serial protocol over TCP, per core) | very useful for firmware debugging | 2 |
 | `--dcache-model` | §1.5 | 2–3 |
@@ -1299,14 +1299,14 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
 ### 8.1 Risks
 
 1. **The M7's speed target.** An interpreter will not reach 400 MHz-class M7 throughput, so a UI that
-   is smooth on the board will be choppy in cortical, and no JIT is planned to close the gap. §2.6
+   is smooth on the board will be choppy in benchtop, and no JIT is planned to close the gap. §2.6
    says what to expect, and the benchmark decides.
 2. **Exclusives across cores.** What the H747's interconnect does with an exclusive store to shared
    SRAM (succeed without excluding, or fail) has to be read from RM0399 and the Cortex-M7 TRM, and
    ideally run on the board. Getting it wrong either way hides a skiff bug or invents one. The option
    in §1.5 runs both readings until it is settled.
 3. **Coherence that is too good.** Caches as no-ops hide every missing cache operation. `--dcache-model`
-   closes that gap and is costed. Until it exists, a "passes in cortical" on M7-cached data says nothing.
+   closes that gap and is costed. Until it exists, a "passes in benchtop" on M7-cached data says nothing.
 4. **The display stack is undocumented below the HAL.** The DSI host is a Synopsys core whose
    registers ST documents only in RM0399's DSI chapter, and the panel vendor command sets
    (OTM8009A, NT35510) are known mostly through ST's component drivers. The model is built to make
@@ -1315,7 +1315,7 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
    ST's BSP, the CubeH7 tree, ST forum answers and memory. Every † offset is generated from the SVD
    rather than trusted, and the chapter numbers still need filling in.
 6. **Build glue for ST's examples.** The examples are IDE projects. A hand-made Makefile is new code
-   between ST and cortical, and an example that fails could be the glue's fault rather than cortical's.
+   between ST and benchtop, and an example that fails could be the glue's fault rather than benchtop's.
    Keep the glue minimal, and cross-check one example's ELF against an STM32CubeIDE headless build once.
 7. **The `svd` tool's gaps.** It refuses `<dim>` and clusters today, and the H7 SVD uses them. Its new
    bitfield mode is a prerequisite for every device.
@@ -1324,10 +1324,10 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
    figures are noise.
 9. **Peripheral breadth creep.** Each new ST example tends to pull in one more device (MDMA, a timer
    channel, DMAMUX request generators). The milestone tables fix the set; anything else is a new item.
-10. **The boot ROM images' licences.** cortical runs Raspberry Pi's real boot ROMs (§9.2, §10.1).
+10. **The boot ROM images' licences.** benchtop runs Raspberry Pi's real boot ROMs (§9.2, §10.1).
     `raspberrypi/pico-bootrom-rp2350` and `raspberrypi/pico-bootrom-rp2040` both report their licence
     to GitHub as "Other". Both are read before anything is vendored. If
-    redistribution is not allowed, cortical fetches the ROM at build time or reads it from a file the
+    redistribution is not allowed, benchtop fetches the ROM at build time or reads it from a file the
     user supplies (`picotool save` from their own board is a source too). The ROM build must also match
     the user's silicon revision (A2 vs A4 RP2350), which `picotool info -a` reports.
 11. **The RP2350's coprocessors and errata are documented only in the datasheet.** The DCP's exact
@@ -1338,7 +1338,7 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
     exists, the oracle programs are the ones that use a GPIO LED and UART0.
 13. **PIO timing.** A PIO state machine is a small CPU that runs at `clk_sys`/divider. The WS2812
     waveform and gSPI are judged by their decoded output (the colour, the bytes), not by edge timing,
-    so cortical runs PIO at instruction granularity in virtual time and does not model pin
+    so benchtop runs PIO at instruction granularity in virtual time and does not model pin
     synchronisers.
 
 ### 8.2 Language and library gaps
@@ -1347,7 +1347,7 @@ Found while designing. This note was written without running the compiler (the b
 builds), so each is either a **known absence** or a **probe to run** before the item that needs it.
 None is designed around. Each goes to the `sysl` session (or `cstd`) as the org's rules say.
 
-| # | what | evidence | what cortical needs | kind |
+| # | what | evidence | what benchtop needs | kind |
 |---|---|---|---|---|
 | G1 | **WITHDRAWN: not a gap.** A guaranteed tail call between functions, for a tail-calling interpreter (each handler ends by jumping to the next one's, the shape wasm3 and CPython 3.14 use). The claim was made from `@tailrec` (`attributes.md`), which is about a function's call to itself. sysl has `become`, a guaranteed tail call between functions (LLVM `musttail`), and `sysl-lang/forth`'s interpreter is built on it | the org's own program | a tail-calling dispatch as the alternative to §2.3's `match` loop, chosen by measurement | withdrawn |
 | G2 | **`posix_openpt`/`grantpt`/`unlockpt`/`ptsname` missing** from `cstd` (`cstd/POSIX.md`: "missing") | read | the pty back-end of §3.2 | **library gap**: add them to `cstd` (its POSIX-complete project) |
@@ -1370,7 +1370,7 @@ the org's programs are grepped for the feature, as G1's withdrawal shows.
 
 The first board. Two M33s (§2.7) at 150 MHz, 520 KB of SRAM, 4 MB of QSPI flash on the Pico 2 and the
 Pico 2 W. Every address below is from the SDK's generated headers, which come from the same SVD that
-cortical's register types are generated from (§3.0), so the note's numbers are a summary, not the
+benchtop's register types are generated from (§3.0), so the note's numbers are a summary, not the
 source. Datasheet chapters are cited by title.
 
 ### 9.1 The memory map
@@ -1378,7 +1378,7 @@ source. Datasheet chapters are cited by title.
 From `src/rp2350/hardware_regs/include/hardware/regs/addressmap.h:23–109` (datasheet, "System bus",
 "Address map"):
 
-| region | base | what cortical does |
+| region | base | what benchtop does |
 |---|---|---|
 | boot ROM, 32 KB | `0x0000_0000` | the real ROM image, read-only (§9.2) |
 | XIP flash | `0x1000_0000` (cached), aliases at `0x1400_0000`, `0x1800_0000` (maintenance), `0x1c00_0000` | one flash image behind every alias; the cache maintenance alias accepts writes; QMI timing is not modelled |
@@ -1437,7 +1437,7 @@ The single-cycle I/O block, one view per core (`regs/sio.h`; datasheet, "Process
   defaults to **software** spin locks on the RP2350 (`hardware_sync_spin_lock/include/hardware/sync/
   spin_lock.h:13`: "default=1 on RP2350 due to errata E2"), built on `LDAEXB`/`STREXB` in SRAM. So
   the cross-core exclusive monitor (§1.5) is what the SDK's locks run on, and the hardware spinlocks
-  are what skiff may choose. cortical models the spinlocks correctly by default and E2 behind
+  are what skiff may choose. benchtop models the spinlocks correctly by default and E2 behind
   `--erratum rp2350-e2`, so a lock E2 would break can be shown to break.
 - **Doorbells**: 8 (`NUM_DOORBELLS`, `platform_defs.h:46`) at `0x180`, raising `SIO_IRQ_BELL`
   (IRQ 26).
@@ -1452,8 +1452,8 @@ The single-cycle I/O block, one view per core (`regs/sio.h`; datasheet, "Process
 ### 9.4 Clocks, resets, power: as far as the SDK's start-up needs
 
 The SDK's `runtime_init` takes the chip out of reset and sets the clocks, and each step polls for a
-condition. cortical makes every condition true at the moment silicon would report it in virtual time,
-so a program that polls the wrong bit hangs in cortical as on the board:
+condition. benchtop makes every condition true at the moment silicon would report it in virtual time,
+so a program that polls the wrong bit hangs in benchtop as on the board:
 
 - **RESETS** (`0x4002_0000`): `RESET` bits hold a block in reset; `RESET_DONE` follows after the
   write. A register access to a block in reset is refused with a named diagnostic, because on silicon
@@ -1487,7 +1487,7 @@ so a program that polls the wrong bit hangs in cortical as on the board:
   with `FUNCSEL` (SIO is 5, `regs/io_bank0.h:146`) and the over-rides, `GPIOn_STATUS`, the per-core
   interrupt registers with edge latching (`IO_IRQ_BANK0`, IRQ 21). **Pads come up isolated on the
   RP2350**: `PADS_BANK0` `ISO` (bit 8, `regs/pads_bank0.h:38`) must be cleared before a pad drives,
-  and the SDK's `gpio_set_function` clears it. A pad with `ISO` set does not drive in cortical either,
+  and the SDK's `gpio_set_function` clears it. A pad with `ISO` set does not drive in benchtop either,
   since that is the one RP2040 habit that leaves an RP2350 LED dark. Pull-ups and pull-downs decide an
   undriven input, which is how the panel's buttons are read.
 
@@ -1497,7 +1497,7 @@ Core 1 sits in the ROM after reset. `multicore_launch_core1_raw` (`pico_multicor
 pushes the sequence `0, 0, 1, vector_table, stack_pointer, entry` into core 1's FIFO one word at a
 time, and core 1's ROM echoes each word back. A wrong echo restarts the sequence from the start, and
 each `0` lets core 1 drain its FIFO and is followed by `SEV` (datasheet, "Bootrom", "Launching code
-on processor core 1"). With core 1 running the real ROM (§9.2), cortical runs this protocol rather
+on processor core 1"). With core 1 running the real ROM (§9.2), benchtop runs this protocol rather
 than imitating it, and milestone 2's test is that `hello_multicore` launches core 1 exactly when
 the board does: after the sixth echo, with `VTOR`, `SP` and `PC` as sent.
 
@@ -1507,7 +1507,7 @@ Three PIO blocks of four state machines (`0x5020_0000`, `0x5030_0000`, `0x5040_0
 "PIO"), each machine a small CPU: nine instructions, a 32-word shared instruction memory, the X/Y
 scratch registers, the shift registers with autopush/autopull, 4-deep TX/RX FIFOs (joinable to 8),
 side-set, the clock divider, `IRQ` flags, `WAIT` on pins and IRQs, and the pin mappings through
-`IO_BANK0`. In cortical a state machine is a fourth kind of thing beside the cores, the devices and
+`IO_BANK0`. In benchtop a state machine is a fourth kind of thing beside the cores, the devices and
 the coprocessors: an interpreter stepped in virtual time at `clk_sys`/divider, run on the device
 thread. **4–6 agent-days**, the same code for the RP2040's two blocks. The Pico 2 does not need it
 for milestones 1–2. The breadboard kit's RGB LED does (§10.4), so it is costed inside milestone 3.
@@ -1529,7 +1529,7 @@ by a test image. Two facts about the user's board decide how. **It is a Pico 2 W
 the CYW43439 rather than GP25 (`pico2_w.h`: "no PICO_DEFAULT_LED_PIN - LED is on Wireless chip"), so
 a `pico2` build's GP25 blink needs an LED on GP25 or a meter to be seen on the board. **UART0 on
 GP0/GP1 needs a 3.3 V USB-serial adapter** (or a Raspberry Pi Debug Probe) to reach the Mac; the board's
-own USB port carries USB stdio, which cortical does not model until the USB item.
+own USB port carries USB stdio, which benchtop does not model until the USB item.
 
 ---
 
@@ -1572,7 +1572,7 @@ the `sysl-lang/rp2040` package is generated from the same SVD). What differs:
   `0x4003_c000`, I2C0 `0x4004_4000`, ADC `0x4004_c000`, PWM `0x4005_0000`, TIMER `0x4005_4000`);
   PIO0/1 at `0x5020_0000`/`0x5030_0000`.
 - **Boot**: the first 256 bytes of flash are `boot2`, which the ROM copies to SRAM and runs to set
-  up the SSI. With §9.2's debugger entry, cortical never runs `boot2`. The SSI's registers are
+  up the SSI. With §9.2's debugger entry, benchtop never runs `boot2`. The SSI's registers are
   stored, flash reads just work, and a program that reprograms the SSI for XIP is accepted.
 - **The ROM is called much more**: the RP2040's ROM holds the soft-float and soft-double routines
   and the fast `memcpy`/`memset` that the SDK's `pico_float`, `pico_double` and `pico_mem_ops` call
@@ -1598,7 +1598,7 @@ the address and IRQ tables from the SVD.
   (row and column order, exchange, BGR), `CASET`/`RASET`, `RAMWR`/`RAMWRC`, `INVON`/`INVOFF`; the
   `CSCON`-gated extension registers and both gamma curves are accepted and recorded. **The glass's
   polarity is a board fact**: this kit's IPS glass shows the inverse of the controller's default, so
-  it wants `INVON` (`picokit/README.md:113–121`), and cortical shows the wrong colours for a program
+  it wants `INVON` (`picokit/README.md:113–121`), and benchtop shows the wrong colours for a program
   that does not send it, as the board does. Delays the datasheet requires after `SWRESET` and
   `SLPOUT` are checked in virtual time and reported if a program writes too early.
 - **The ILI9488 as a variant**: same pinout and resolution, a different command set, and 18-bit
@@ -1635,7 +1635,7 @@ the address and IRQ tables from the SVD.
   read high when released, as picokit expects. **LEDs** are drawn from GP16/GP17's output levels.
 - **The RGB LED is a WS2812, and it needs PIO.** 52Pi's demo drives it with `ws2812.pio`
   (`ws2812_program_init(pio, sm, offset, 12, 800000, true)` in its `main.c`); `picokit` does not drive
-  it yet (`picokit/README.md:153`). cortical decodes the waveform on GP12 into 24-bit GRB values and
+  it yet (`picokit/README.md:153`). benchtop decodes the waveform on GP12 into 24-bit GRB values and
   draws the LED's colour, so it needs §9.7's PIO, at **4–6 agent-days**. Decoding the pin from a
   bit-banged GPIO waveform would cover a program without PIO, but 52Pi's demo is the oracle, and it
   uses PIO.
@@ -1666,7 +1666,7 @@ ring-into-a-data-callback shape `musicbox-miniaudio` uses (§8.2).
 `sh.sysl.pico`'s `init`, which starts the CYW43. So it **wants a Pico W** and fails to link for a plain
 Pico (`picokit/README.md:94–104`). If the Pico in the user's kit is a plain Pico, picokit needs the
 change its README describes (call `stdio_init_all` directly) before it runs on that board or in
-cortical. If it is a Pico W, cortical needs the CYW43 item (§7, later) for `cyw43_arch_init` to
+benchtop. If it is a Pico W, benchtop needs the CYW43 item (§7, later) for `cyw43_arch_init` to
 succeed. Which Pico is under the kit decides it, and that is the user's to say.
 
 ---
@@ -1680,7 +1680,7 @@ the core and the terminal. It is how the ARMv6-M and ARMv8-M cores run real C be
 board's devices exist, and the smallest machine a test can boot. `virt` has two M0+ cores and
 `virt33` two M33s (§2.9), with the same devices at the same addresses.
 
-- **The core** is `sh.sysl.cortical.v6m`: the ARMv6-M interpreter (§2.8), and the ARMv8-M Mainline
+- **The core** is `sh.sysl.benchtop.v6m`: the ARMv6-M interpreter (§2.8), and the ARMv8-M Mainline
   one beside it (§2.9), with their two executors, the `become` chain and the `match` loop (§2.3), 1
   MB of RAM from address 0 behind a page table, a guard record past the end of RAM, and an
   `io_read`/`io_write` pair the board fills for every
@@ -1688,7 +1688,7 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
   itself (§2.2's ARMv6-M paragraph: SysTick, the NVIC, the SCB). A stop names its kind and its
   address (`stop_at`): a breakpoint, an undefined instruction, an access or a jump where nothing is,
   the guest asking to exit, a `WFI` nothing can wake, a fault it cannot take, or a reset request; it
-  leaves `pc` where the guest was (§2.2, "Where a stop leaves the core"), and `cortical run`'s message
+  leaves `pc` where the guest was (§2.2, "Where a stop leaves the core"), and `benchtop run`'s message
   names both.
 - **A store never leaves a stale decoded record.** A byte per 64-byte line of RAM records whether a
   record has been decoded from it (or from the 3 bytes after it); every store on the fast path tests
@@ -1700,14 +1700,14 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
   unit because a C program's data follows its code: on the benchmark, whose hot data shares a page
   with its code, the check costs about 3% more host instructions and no measurable cycles, where a
   page-granular one would send every one of those stores down the slow path.
-- **The board is described by `boards/virt.hocon`** (and `boards/virt33.hocon`), built into cortical
-  as `virt` and `virt33` (§12.5), and `sh.sysl.cortical.virt` builds the machine from it: each
+- **The board is described by `boards/virt.hocon`** (and `boards/virt33.hocon`), built into benchtop
+  as `virt` and `virt33` (§12.5), and `sh.sysl.benchtop.virt` builds the machine from it: each
   device answers at the `at` and raises the `irq` its part gives, so a description that moves the
-  console (`examples/virt/moved.hocon`) moves it for the guest. `cortical run` runs a description of
+  console (`examples/virt/moved.hocon`) moves it for the guest. `benchtop run` runs a description of
   two cores of one supported Cortex-M model, a 1 MB `ram` at 0 and at most one `debug-console`
   and one `virt-sio`, or a product of one such board and nothing outside it; anything else is
   refused with the reason.
-- **The board** is `sh.sysl.cortical.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
+- **The board** is `sh.sysl.benchtop.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
   (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
   the input has ended), EXIT (end with this status) and CTRL (bit 0 enables the console's interrupt).
   Every other address stops the core with `Unmapped`. Core 0 resets as every M-profile core does, SP
@@ -1739,23 +1739,23 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
   with `--threads` each has a thread of its own once core 1 is launched, within the lag bound of
   §1.3, and the rest of this paragraph holds of it except where §1.3 and §1.4 say otherwise.
   Before core 1 is launched core 0 runs alone a million instructions at a time, exactly as a
-  single-core board, so `cortical run` on a one-core program and `cortical bench` are unchanged. A
+  single-core board, so `benchtop run` on a one-core program and `benchtop bench` are unchanged. A
   core asleep in `WFI` skips to the end of the round, or wakes within it on its own SysTick or on an
   interrupt the other core raised in an earlier turn; when every running core ends a round asleep,
   the board wakes one an interrupt was raised for, else skips to the first SysTick that wakes one,
   else waits for the console where its interrupt would wake one, and else stops both at `Asleep`. A
   stop of either core ends the board — core 1's `EXIT`, for one — and `run_board` answers the core
-  that stopped, which `cortical run`'s message names. `WFE` and `SEV` are hints that do nothing, so
+  that stopped, which `benchtop run`'s message names. `WFE` and `SEV` are hints that do nothing, so
   the SDK's FIFO waits spin rather than sleep.
 - **The console's interrupt is IRQ 0**, raised while CTRL bit 0 is set and STATUS is not 0 — a byte
   waiting, or the input ended — so a handler reads until STATUS is 0, or turns CTRL off once the input
   has ended. The board raises it between runs, a million instructions apart at most. When the core
   sleeps in `WFI` with nothing in it to wake it, the board blocks on the console's input if the
   interrupt that input raises would wake the core, and otherwise lets the core stop at `Asleep`.
-- **The console's input is a channel.** `cortical run` fills it from a thread reading the terminal in
+- **The console's input is a channel.** `benchtop run` fills it from a thread reading the terminal in
   raw mode a byte at a time; a test fills it itself and closes it, which the guest sees as STATUS's
   ENDED. Output is buffered and written at a line's end, when the guest reads STATUS or DATA (so a
-  prompt shows before it waits), and when it stops. **Ctrl-]** ends cortical with status 130 whatever
+  prompt shows before it waits), and when it stops. **Ctrl-]** ends benchtop with status 130 whatever
   the guest is doing, as telnet's escape does.
 - **Images** are ELF-32 little-endian ARM files, loaded by `sysl-lang/elf` at their physical
   addresses (the package is built with `elf64` and `big_endian` off, so it refuses the others as
@@ -1774,13 +1774,13 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
 
 ## 12. Board description format
 
-A description is a HOCON file, read by `sh.sysl.cortical` (`board.sysl` reads the shape,
+A description is a HOCON file, read by `sh.sysl.benchtop` (`board.sysl` reads the shape,
 `shelf.sysl` finds the boards it names, `check.sysl` holds it to the registry). Every mistake is
 reported with its line and column, all of them at once, and checking goes on past each one.
 
 ### 12.1 Three levels
 
-- **A chip** is built into cortical's registry (`registry.sysl`): `rp2040`, `rp2350`. It holds its
+- **A chip** is built into benchtop's registry (`registry.sysl`): `rp2040`, `rp2350`. It holds its
   cores, its pins `GP0` up to the last, its ADC pins, and its bus controllers with the pins each
   signal can be routed to. A description names a chip; it never describes one.
 - **A board** is a chip — or, for a board with no real chip, `cores = [...]` — with the parts
@@ -1792,7 +1792,7 @@ A file's top level is exactly one of `board { ... }`, `board = <name or path>`, 
 
 ### 12.2 A board
 
-The one-liner names a board built into cortical, and is that board:
+The one-liner names a board built into benchtop, and is that board:
 
 ```hocon
 board = pico2w
@@ -1960,7 +1960,7 @@ A product's view shows its own parts by name and a board's as `<instance>.<part>
 ### 12.5 Bundled boards, and naming one
 
 `virt`, `virt33`, `pico`, `pico2w` and `pico-breadboard-kit` (a product) are embedded in the
-`cortical` binary. **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is
+`benchtop` binary. **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is
 built in.** The rule is the same for `board = <name>` at the top of a file, a product's `board =
 <name>`, and the command line, so `--board virt` is always the built-in board even with a file called `virt` in the
 current directory, which is `./virt`. A path is read relative to the directory of the file that
@@ -2067,11 +2067,11 @@ Each points at the name or value it is about; `<x>` is the name in the file.
 
 ### 12.10 The command line
 
-- `cortical check <name | file.hocon>` reads a board or a product, prints every mistake and exits 1,
+- `benchtop check <name | file.hocon>` reads a board or a product, prints every mistake and exits 1,
   or prints what it is: the board's chip or cores, each part with its place, wires and parameters,
   what it exposes, and its view; for a product, each board instance and then the same.
-- `cortical run [--board <name | file.hocon>] <image>` runs on `virt` where no board is named. It runs
-  a board of two cores of one supported Cortex-M model and the parts cortical emulates on their bus, or a product of
-  one such board and nothing outside it, and refuses anything else with the reason (`cortical does not emulate
-  the rp2040`, `cortical runs one board, and this product has 2`).
-- `cortical render` — drawing a description's view to an image — comes with the window (§4).
+- `benchtop run [--board <name | file.hocon>] <image>` runs on `virt` where no board is named. It runs
+  a board of two cores of one supported Cortex-M model and the parts benchtop emulates on their bus, or a product of
+  one such board and nothing outside it, and refuses anything else with the reason (`benchtop does not emulate
+  the rp2040`, `benchtop runs one board, and this product has 2`).
+- `benchtop render` — drawing a description's view to an image — comes with the window (§4).

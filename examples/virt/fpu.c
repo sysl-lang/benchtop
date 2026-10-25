@@ -4,7 +4,7 @@
 // four rounding modes, with and without flush-to-zero and default-NaN), its result and FPSCR (NZCV and
 // the flags) folded into one hash a line. The same source built for QEMU's Cortex-M4 (`mps2-an386`),
 // Cortex-M33 (`mps2-an505`) and double-precision Cortex-M7 (`mps2-an500`), through
-// examples/qemu/build-fpu.sh, and for cortical's boards with the matching unit must print the same
+// examples/qemu/build-fpu.sh, and for benchtop's boards with the matching unit must print the same
 // lines; fpu-m4.qemu, fpu-m33.qemu and fpu-m7.qemu hold QEMU's.
 //
 // FPv5's instructions are built with -DFPV5, the double-precision ones with -DDOUBLE. The conversions
@@ -207,7 +207,7 @@ CASE(vcvtn_u32, "vcvtn.u32.f32 %[d], %[a]")
 CASE(vcvtp_s32, "vcvtp.s32.f32 %[d], %[a]")
 CASE(vcvtm_u32, "vcvtm.u32.f32 %[d], %[a]")
 
-// VSEL under each NZCV but N and Z together, which cortical's flags do not hold.
+// VSEL under each NZCV but N and Z together, which benchtop's flags do not hold.
 #define SEL(name, insn)                                                                               \
     static void name(void) {                                                                          \
         uint32_t h = 2166136261u;                                                                     \

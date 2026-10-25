@@ -12,7 +12,7 @@
 int main(void) {
     unsigned lines = 0;
 
-    put_string("hello from " CORE " on cortical's virtual board\n");
+    put_string("hello from " CORE " on benchtop's virtual board\n");
     put_string("type a line; Ctrl-D ends\n> ");
 
     for (;;) {

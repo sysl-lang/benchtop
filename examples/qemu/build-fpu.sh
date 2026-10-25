@@ -2,7 +2,7 @@
 # Runs examples/virt/fpu.c on QEMU's Cortex-M4 (`mps2-an386`, FPv4-SP), Cortex-M33 (`mps2-an505`,
 # FPv5-SP) and Cortex-M7 (`mps2-an500`, FPv5 with double precision), and writes what each prints to
 # examples/virt/fpu-m4.qemu, fpu-m33.qemu and fpu-m7.qemu, the oracles the same program built for
-# cortical's boards is checked against: `zsh examples/qemu/build-fpu.sh`. Needs `qemu-system-arm`.
+# benchtop's boards is checked against: `zsh examples/qemu/build-fpu.sh`. Needs `qemu-system-arm`.
 set -e
 cd ${0:A:h}
 

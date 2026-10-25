@@ -1,0 +1,768 @@
+module sh.sysl.benchtop.v6m
+
+import sysl.raw.ptr_cast
+import sysl.sync.*
+
+// The core: the registers, the flags, guest memory behind a page table, and the decoded-instruction
+// array, which the cores of a machine share while they take turns on one thread, and of which each
+// has its own while each runs on a thread of its own. It is an ARMv6-M core (the Cortex-M0 and M0+)
+// or a Thumb-2 core (the Cortex-M4, Cortex-M7 or Cortex-M33 integer subset, thumb2.sysl), as its `kind`
+// says; the module is named for the first.
+//
+// **Decoding is one record per halfword of guest address.** The instruction at guest address `a` is
+// decoded into `dec[a >> 1]`, so the next instruction is the next record (or the one after, for a
+// 32-bit encoding) and a branch target is an index, not a lookup. A record starts as "not decoded"
+// and is decoded the first time control reaches it. Code runs from RAM, which starts at address 0;
+// one more record past its end stands for everywhere else, and stops the core that reaches it.
+//
+// **An access with no page is the board's**, unless it is to the system control space, which is the
+// core's own (except.sysl). Devices live at addresses the page table leaves empty, and the core hands
+// such an access to the board through `io_read` and `io_write`.
+//
+// **A store never leaves a stale record behind.** A map of the RAM's 64-byte lines marks each line a
+// record has been decoded from, and a store to a marked line puts back to "not decoded" every record
+// whose bytes it touched — the records of the halfwords written and the one before them, which may be
+// a 32-bit instruction or a compare fused with the branch after it. The same map marks the lines a
+// load-exclusive watches, whose stores are counted for the exclusive monitor (`touched`). A store
+// to a line of data alone costs one test of the map. Where the cores share the records, code one core writes is decoded
+// afresh when any core next runs it. Where each core has its own (`pair`), a store forgets the
+// writer's records at once and posts the line to the other core, which forgets its own records there
+// at its next barrier (`DMB`, `DSB`, `ISB`) or between runs (`refresh`): the point at which ARMv6-M
+// requires a core to see code another has written, since it must execute an `ISB` first.
+//
+// **Two threads may reach the RAM, the line map and a core's `limit` at once**, so every access to
+// them is atomic. A relaxed access is the host's plain load or store of the same width, so it costs
+// the one-thread machine nothing, and it is what makes a guest's racing accesses defined behaviour
+// on the host: each is single-copy atomic up to a word, as the architecture asks, and ordered only
+// where a barrier orders it.
+//
+// **The flags are kept lazily.** N and Z are both read from `nz`, the last flag-setting result: N is
+// its top bit and Z is whether it is zero. C is 0 or 1. V is kept as the last addition that set it —
+// its two operands and its result — and worked out only when a condition reads it, which a signed
+// comparison does and almost nothing else. An instruction that sets flags stores words rather than
+// computing bits.
+
+// The guest's RAM, from address 0. Code and data share it, as they do on an M0+ running from SRAM.
+const RAM_BYTES: u32 = 1024 * 1024
+
+// One page-table entry per 4 KB page of the 4 GB address space. An entry is the host address of the
+// page's first byte, or 0 for a page with no fast path.
+const PAGE_SHIFT: u32 = 12
+const PAGES = 1 << 20
+
+// A line of RAM is the unit a store is checked against for code, once it is on a page that holds some.
+const LINE_SHIFT: u32 = 6
+
+// The handler type: every handler takes the machine, the record it is to execute, and the count of
+// instructions retired so far, and replaces its own frame with the next handler's.
+type Handler = *extern(*Cpu, *Insn, u64) -> unit
+
+// The board's half of an access with no page: a read answers the value, `width` bytes (1, 2 or 4)
+// zero-extended; a write takes it. Either may stop the core with `halt`.
+type IoRead = *extern(*Cpu, u32, u32) -> u32
+type IoWrite = *extern(*Cpu, u32, u32, u32) -> unit
+
+// Why `run` came back. Every stop but `Budget` also leaves `pc` where the guest was: on an access
+// that stopped the core, the instruction that made it (not retired); after a jump off the RAM, its
+// target.
+enum Stop
+    Budget = 0
+    Breakpoint
+    Undefined
+    // An access, or a jump, to an address nothing answers; `stop_at` is the address.
+    Unmapped
+    // The guest asked to end, with `exit_code`.
+    Exit
+    // A `WFI` that nothing can ever wake: no exception is pending that could run, the system timer
+    // will not raise one, and the board has nothing that will. `stop_at` is the instruction after it.
+    Asleep
+    // Where an M0+ would take a HardFault it cannot (and lock up), or where benchtop does not model
+    // the fault: an exception whose vector lacks its Thumb bit (an unset one is 0), `stop_at` the
+    // vector's address; an `SVC` or a return that cannot be taken, or an EXC_RETURN that names no
+    // return, `stop_at` the instruction.
+    Fault
+    // The guest asked for a system reset (AIRCR.SYSRESETREQ); what that does is the board's.
+    Reset
+    // ARMv8-M Mainline: an instruction or an exception entry would have moved the stack pointer in use
+    // below its limit (MSPLIM or PSPLIM), which is a UsageFault (STKOF) benchtop does not take. `stop_at`
+    // is the instruction, or for an entry the address it would have returned to; nothing was stored.
+    StackLimit
+
+// The selected core model. Existing discriminants stay unchanged; models select a shared
+// architecture at decode time, never a second implementation of an arithmetic instruction.
+enum Kind: u8
+    V6m = 0
+    V8mMain
+    V7em
+    V7emM7
+    M0
+    M1
+    M3
+    M23
+    M35p
+    M52
+    M55
+    M85
+
+// A decoded instruction. `h` is its handler for the threaded executor and `op` its case for the
+// `match` executor; the rest are its operands, extracted once. A register number is a `u4`, so
+// indexing the sixteen registers with one needs no bounds check, and the record is 16 bytes.
+struct Insn
+    h: Handler
+    imm: u32
+    op: Op
+    a: u4
+    b: u4
+    c: u4
+
+struct Cpu
+    r: [16]u32
+    nz: u32
+    c: u32
+    // V is the signed overflow of `va + vb`, which came to `vr`.
+    va: u32
+    vb: u32
+    vr: u32
+    // Where to resume, as a guest address, after `run` comes back.
+    pc: u32
+    // `run` comes back at the first taken branch at or past this many instructions. Another core's
+    // thread cuts it to 0, so it is read and written with `limit_of`, `set_limit` and `lower_limit`.
+    limit: u64
+    retired: u64
+    stop: Stop
+    stop_at: u32
+    exit_code: u32
+    pages: *usize
+    // The machine's `code_lines`.
+    lines: *u8
+    dec: *Insn
+    io_read: IoRead
+    io_write: IoWrite
+    // The exception model (except.sysl). `r[13]` is the stack pointer in use; `sp_other` is the
+    // other one: the main stack's while thread mode runs on the process stack, the process stack's
+    // otherwise.
+    sp_other: u32
+    // CONTROL's two bits: nPRIV (kept, and restricting nothing) and SPSEL.
+    control: u32
+    // The exception number running, 0 in thread mode, which is exactly when IPSR is 0.
+    ipsr: u32
+    primask: u32
+    // The vector table's address, VTOR.
+    vtor: u32
+    // One bit per exception number.
+    pending: u64
+    active: u64
+    // Bit k: IRQ k is enabled.
+    enabled: u32
+    // The priority byte of each exception number that has one to set; priority_bits are kept.
+    prio: [48]u8
+    // Implemented NVIC priority width, selected per core by the board description.
+    priority_bits: u32
+    // Set by `WFI`: the core runs nothing until something wakes it.
+    sleeping: bool
+    // The clock is the count of instructions retired plus `slept`, the time skipped while asleep.
+    slept: u64
+    // SysTick: CSR's ENABLE and TICKINT bits, COUNTFLAG, the reload value, and the current value
+    // while it is stopped. While it runs, the current value is worked out from `tick_zero`, the clock
+    // at which it next counts down to 0, and `tick_last`, the clock at which it was last 0.
+    tick_ctrl: u32
+    tick_flag: bool
+    tick_reload: u32
+    tick_value: u32
+    tick_zero: u64
+    tick_last: u64
+    // The IRQs another core's thread has raised in this core (`poke`), one bit per exception number,
+    // taken into `pending` by the core's own thread between runs (`take_incoming`).
+    incoming: u64
+    // The other core, where each core has records of its own; null where the cores share them.
+    peer: *Cpu
+    // The lines of RAM the other core has stored to since this core last forgot its records there,
+    // one bit per line, and whether any bit is set.
+    stale: [256]u64
+    stale_any: u32
+    // What the core is. `reset` and `clear` leave it, so whoever makes a core of another kind sets it
+    // before resetting it.
+    kind: Kind
+    // Which of the machine's cores this is, 0 or 1. `reset` and `clear` leave it too.
+    core: u32
+    // ARMv8-M Mainline's state; an ARMv6-M core keeps every one of these 0.
+    //
+    // ITSTATE, the IT block's condition and mask (EPSR.IT), as IT sets it and each instruction of the
+    // block advances it. Only IT and the instructions it governs touch it (thumb2.sysl), so code
+    // outside an IT block pays nothing for it.
+    it: u32
+    // The sticky saturation flag, APSR.Q: 0 or 1.
+    q: u32
+    // Optional integer DSP extension and APSR.GE[3:0].
+    dsp: bool
+    ge: u32
+    // The floating-point extension (fpu.sysl): none (0), single precision (1) or double (2); the
+    // registers S0–S31 as bits, D`k` being S`2k` and S`2k+1`; FPSCR as last gathered from the host;
+    // CPACR, FPCCR, FPCAR and FPDSCR; and whether this core's FP instructions may run without the
+    // check of CPACR and CONTROL.FPCA, which anything that changes either clears.
+    fpu: u32
+    s: [32]u32
+    fpscr: u32
+    cpacr: u32
+    fpccr: u32
+    fpcar: u32
+    fpdscr: u32
+    fp_ready: bool
+    // BASEPRI and FAULTMASK, and the stack limits.
+    basepri: u32
+    faultmask: u32
+    msplim: u32
+    psplim: u32
+    // AIRCR.PRIGROUP, and the SCB's configuration registers, stored: SHCSR's enables, CCR.
+    prigroup: u32
+    shcsr: u32
+    ccr: u32
+    // The local exclusive monitor: whether it is set, and the address, size in bytes and value a
+    // load-exclusive left in it, with the count of stores to its line then (t2sem.sysl).
+    excl: bool
+    excl_addr: u32
+    excl_size: u32
+    excl_value: u32
+    excl_stores: u32
+
+var ram: [1048576]u8
+var page_table: [1048576]usize
+// One byte per 64-byte line of RAM, and what a store to the line must do besides the store itself:
+// `LINE_CODE` once a record has been decoded from it or from the 3 bytes after it, `LINE_WATCHED`
+// once a load-exclusive has read it or the 3 bytes after it.
+var code_lines: [16384]u8
+// Each core's count of the stores it has made to each watched line, which the other core's
+// store-exclusive checks (t2sem.sysl).
+var line_stores: [2][16384]u32
+
+const LINE_CODE: u8 = 1
+const LINE_WATCHED: u8 = 2
+// One record per halfword of RAM, and the record for everywhere else.
+var decoded: [524289]Insn
+// The same, for the second core while it has records of its own.
+var decoded_own: [524289]Insn
+
+// A machine with `image` at address 0, ready to start at `entry`, and no devices.
+reset(cpu: *Cpu, image: []const u8, entry: u32)
+    for i in 0..<ram.len do ram[i] = 0
+    for i in 0..<image.len do ram[i] = image[i]
+    for i in 0..<page_table.len do page_table[i] = 0
+    for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do page_table[p] = usize(&ram[p << PAGE_SHIFT])
+    for i in 0..<code_lines.len do code_lines[i] = 0
+    for i in 0..<code_lines.len
+        line_stores[0][i] = 0
+        line_stores[1][i] = 0
+    for i in 0..<decoded.len do decoded[i] = undecoded()
+
+    clear(cpu, entry)
+    cpu.io_read = &no_device_read
+    cpu.io_write = &no_device_write
+
+// The core's own state as a reset leaves it, to start at `entry`. Memory is the machine's, untouched,
+// and so is the core's kind.
+clear(cpu: *Cpu, entry: u32)
+    for i in 0..<16 do cpu.r[i] = 0
+    cpu.nz = 1
+    cpu.c = 0
+    cpu.va = 0
+    cpu.vb = 0
+    cpu.vr = 0
+    cpu.pc = entry
+    set_limit(cpu, 0)
+    cpu.retired = 0
+    cpu.stop = Stop.Budget
+    cpu.stop_at = 0
+    cpu.exit_code = 0
+    cpu.pages = &page_table[0]
+    cpu.lines = &code_lines[0]
+    cpu.dec = &decoded[0]
+    cpu.peer = null
+    for w in 0..<cpu.stale.len do cpu.stale[w] = 0
+    cpu.stale_any = 0
+    cpu.it = 0
+    cpu.q = 0
+    cpu.ge = 0
+    cpu.dsp = false
+    cpu.fpu = 0
+    for k in 0..<32 do cpu.s[k] = 0
+    cpu.fpscr = 0
+    cpu.cpacr = 0
+    cpu.fpccr = FPCCR_RESET
+    cpu.fpcar = 0
+    cpu.fpdscr = 0
+    cpu.fp_ready = false
+    cpu.excl = false
+    cpu.excl_addr = 0
+    cpu.excl_size = 0
+    cpu.excl_value = 0
+    cpu.excl_stores = 0
+    clear_exceptions(cpu)
+
+/** Give each of two cores records of its own, so each can run on a thread of its own: `first` keeps
+ * the machine's, and `second` starts with its own, all "not decoded". A store from then on forgets
+ * the writer's records and posts its line to the other core (`forget`).
+ */
+pair(first: *Cpu, second: *Cpu)
+    for i in 0..<decoded_own.len do decoded_own[i] = undecoded()
+
+    second.dec = &decoded_own[0]
+    first.peer = second
+    second.peer = first
+
+/** Undo `pair` before `second` has run on its own records: both cores share the machine's again. */
+unpair(first: *Cpu, second: *Cpu)
+    second.dec = &decoded[0]
+    first.peer = null
+    second.peer = null
+
+// `limit`, read and written by the core's own thread while another may cut it. Relaxed: the plain
+// load and store of the host.
+@inline
+limit_of(cpu: *Cpu) -> u64 = atomic_load(&cpu.limit, Relaxed)
+
+@inline
+set_limit(cpu: *Cpu, n: u64) = atomic_store(&cpu.limit, n, Relaxed)
+
+// Lower `limit` to `n` where it is above it, never undoing a cut another thread made meanwhile.
+lower_limit(cpu: *Cpu, n: u64)
+    var seen = limit_of(cpu)
+
+    while n < seen
+        val got = atomic_cas(&cpu.limit, seen, n, Relaxed)
+
+        if got == seen then return
+
+        seen = got
+
+// The record for guest address `a`: past the end of RAM, the one record that stands for everywhere
+// else, and the core stopped at `a`, both its `stop_at` and its `pc`. A branch to it comes back at
+// once, since the stop has spent the budget.
+@inline
+insn_at(cpu: *Cpu, a: u32) -> *Insn
+    if a < RAM_BYTES then return &cpu.dec[a >> 1]
+
+    if cpu.stop == Stop.Budget then cpu.pc = a
+    halt(cpu, Stop.Unmapped, a)
+    &cpu.dec[RAM_BYTES >> 1]
+
+// Stop the core for `why` at `at`, unless it has already stopped. A taken branch then comes back at
+// once, since the budget is gone, and leaves `pc` alone: whatever stops the core says where.
+halt(cpu: *Cpu, why: Stop, at: u32)
+    if cpu.stop != Stop.Budget then return
+
+    cpu.stop = why
+    cpu.stop_at = at
+    set_limit(cpu, 0)
+
+// The instruction at `ip`, `n` retired before it, made an access that stopped the core: it stops
+// there, not retired, with nothing after the access in it done.
+stop_access(cpu: *Cpu, ip: *Insn, n: u64)
+    cpu.pc = addr_of(cpu, ip)
+    cpu.retired = n
+
+// A taken `Leave` at `ip`, `n` retired before it: the branch retires, and the core stops at its target.
+leave(cpu: *Cpu, ip: *Insn, n: u64)
+    if ip.a != 0 then cpu.r[14] = (addr_of(cpu, ip) + 4) | 1
+
+    halt(cpu, Stop.Unmapped, ip.imm)
+    cpu.pc = ip.imm
+    cpu.retired = n + 1
+
+// A machine with no devices: every access off the page table stops the core.
+no_device_read(cpu: *Cpu, a: u32, width: u32) -> u32
+    halt(cpu, Stop.Unmapped, a)
+    0
+
+no_device_write(cpu: *Cpu, a: u32, width: u32, x: u32) = halt(cpu, Stop.Unmapped, a)
+
+// A record that decodes itself the first time control reaches it.
+@inline
+undecoded() -> Insn = Insn(&h_decode, 0, Op.Undecoded, 0, 0, 0)
+
+// The record at RAM address `pc` is being decoded from the bytes `pc` to `pc + 3`. A store whose
+// first byte is within 3 of them may write one of them, so the lines holding `pc - 3` to `pc + 3` are
+// marked as holding code.
+holds_code(pc: u32)
+    val from = if pc >= 4 then pc - 4 else 0
+    val to = if pc + 2 < RAM_BYTES then pc + 2 else RAM_BYTES - 1
+
+    for a in from..to do atomic_or(&code_lines[a >> LINE_SHIFT], LINE_CODE, Relaxed)
+
+// A load-exclusive of the `width` bytes at RAM address `a`: watch the lines a store touching them
+// can start on, as `holds_code` marks code, and answer the other core's count of stores to `a`'s line.
+watch(cpu: *Cpu, a: u32, width: u32) -> u32
+    val from = if a >= 3 then a - 3 else 0
+
+    for b in from..(a + width - 1) do atomic_or(&code_lines[b >> LINE_SHIFT], LINE_WATCHED, SeqCst)
+
+    others_stores(cpu, a)
+
+// The other core's count of stores to the line of RAM address `a`.
+@inline
+others_stores(cpu: *Cpu, a: u32) -> u32 = atomic_load(&line_stores[1 - cpu.core][a >> LINE_SHIFT], SeqCst)
+
+// The store of `width` bytes just made at RAM address `a`: where it is on a line holding code, every
+// record that read any of its bytes is decoded again when control next reaches it, and where it is on
+// a watched line, the store is counted. A store to a line of neither costs this one test.
+@inline
+stored(cpu: *Cpu, a: u32, width: u32)
+    val mark = atomic_load(&cpu.lines[a >> LINE_SHIFT], Relaxed)
+
+    if mark != 0 then touched(cpu, a, width, mark)
+
+@noinline
+@cold
+private touched(cpu: *Cpu, a: u32, width: u32, mark: u8)
+    if mark & LINE_WATCHED != 0
+        val last = a + width - 1
+
+        atomic_add(&line_stores[cpu.core][a >> LINE_SHIFT], 1, SeqCst)
+        if last >> LINE_SHIFT != a >> LINE_SHIFT then atomic_add(&line_stores[cpu.core][last >> LINE_SHIFT], 1, SeqCst)
+
+    if mark & LINE_CODE != 0 then forget(cpu, a, width)
+
+// Put back to "not decoded" the records that read the `width` bytes at `a`: the halfwords' own, and
+// the one before them; and where the other core has records of its own, post it the lines they are on.
+@noinline
+@cold
+forget(cpu: *Cpu, a: u32, width: u32)
+    drop_records(cpu, a, width)
+
+    val other = cpu.peer
+
+    if other == null then return
+
+    val back = reach_back(cpu)
+    val from = (if a >= back then a - back else 0) >> LINE_SHIFT
+
+    for line in from..(last_reached(cpu, a, width) >> LINE_SHIFT)
+        atomic_or(&other.stale[line >> 6], u64(1) << (line & 63), Relaxed)
+
+    atomic_store(&other.stale_any, 1, Release)
+
+// How far before a byte written the records that depend on it may start: the halfword before, for a
+// 32-bit instruction or a compare fused with the branch after it. On ARMv8-M an IT's decode is what
+// gives the instructions of its block their conditions (thumb2.sysl), so a block and its IT are
+// forgotten together: 16 bytes back reaches the IT of a block the store is in, and 18 bytes on
+// reaches the end of the block of an IT the store overwrites.
+@inline
+private reach_back(cpu: *Cpu) -> u32 = if is_baseline(cpu.kind) then 2 else 16
+
+// The last byte whose record may depend on the `width` bytes stored at `a`.
+@inline
+private last_reached(cpu: *Cpu, a: u32, width: u32) -> u32
+    val last = a + width - 1
+
+    if is_baseline(cpu.kind) then return last
+
+    if last + 18 < RAM_BYTES then last + 18 else RAM_BYTES - 1
+
+// The core's own records that depend on any of the `width` bytes at `a`, put back to "not decoded".
+private drop_records(cpu: *Cpu, a: u32, width: u32)
+    val back = reach_back(cpu)
+    val first = (if a >= back then a - back else 0) >> 1
+
+    for i in first..(last_reached(cpu, a, width) >> 1) do if cpu.dec[i].op != Op.Undecoded then cpu.dec[i] = undecoded()
+
+/** Forget the core's own records on every line the other core has posted since the last time, so a
+ * record of code the other core has written is decoded afresh. The core's own thread calls it, at a
+ * barrier and between runs.
+ */
+@inline
+refresh(cpu: *Cpu)
+    if atomic_load(&cpu.stale_any, Relaxed) != 0 then drop_stale(cpu)
+
+/** A `DMB`, `DSB` or `ISB`: a full host fence, so the guest's accesses on each side of it are ordered
+ * as the architecture orders them, and the point at which code the other core has written is seen.
+ * ARMv6-M has the three for different orderings; one sequentially consistent fence gives every one of
+ * them.
+ */
+@inline
+barrier(cpu: *Cpu)
+    atomic_fence(SeqCst)
+    refresh(cpu)
+
+@noinline
+@cold
+private drop_stale(cpu: *Cpu)
+    // Pairs with the release that posted the lines, so the bits it set are seen. A line posted after
+    // this sets the flag again, for the next time.
+    if atomic_swap(&cpu.stale_any, 0, Acquire) == 0 then return
+
+    for w in 0..<cpu.stale.len
+        if atomic_load(&cpu.stale[w], Relaxed) == 0 then continue
+
+        var lines = atomic_swap(&cpu.stale[w], 0, Acquire)
+        var line = u32(w) << 6
+
+        while lines != 0
+            if lines & 1 != 0 then drop_records(cpu, line << LINE_SHIFT, 1 << LINE_SHIFT)
+            lines >>= 1
+            line += 1
+
+// The record a direct branch goes to: its `imm` is a signed count of records from its own.
+@inline
+target_of(ip: *Insn) -> *Insn = &ip[i32(ip.imm)]
+
+// The guest address of a record.
+@inline
+addr_of(cpu: *Cpu, ip: *Insn) -> u32 = u32(ip - cpu.dec) << 1
+
+// ---------------------------------------------------------------------------------------------------
+// Memory. The fast path is one table load, one test and one host access; everything else (a page
+// with no entry) is the slow path: the system control space (except.sysl), or else the board's
+// `io_read` and `io_write`.
+//
+// A guest access is made at `n`, the count of instructions retired before the one making it, since
+// the system timer's registers answer by the time. `load32` and the rest are the same accesses made
+// at the time the core last stopped, for the host's own use and for the core's work between
+// instructions.
+
+// The host address of the first byte of the page holding `a`, or 0 for a page with no fast path. The
+// test is made on this, not on the byte's own address, which nothing stops from being 0.
+@inline
+page_of(cpu: *Cpu, a: u32) -> usize = cpu.pages[a >> PAGE_SHIFT]
+
+// The page of the `width` bytes at `a`, or 0 where they run past the RAM's last byte. The RAM is one
+// host array, so an access across a page boundary inside it is still one host access; only an
+// unaligned access at the RAM's very end would reach the host memory after it, and it takes the
+// slow path, which stops the core on it.
+@inline
+page_for(cpu: *Cpu, a: u32, width: u32) -> usize = if a + width > RAM_BYTES && a < RAM_BYTES then 0 else page_of(cpu, a)
+
+// The slow path of a read, `width` bytes at `a`.
+slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if a >= SCS && a < SCS_END then return scs_read(cpu, a, width, n)
+
+    cpu.io_read(cpu, a, width)
+
+slow_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if a >= SCS && a < SCS_END
+        scs_write(cpu, a, width, x, n)
+        return
+
+    cpu.io_write(cpu, a, width, x)
+
+// The `width` bytes at `a` on the host page `page`, zero-extended; and storing them.
+@inline
+host_read(page: usize, a: u32, width: u32) -> u32
+    val at = page + (a & 0xFFF)
+
+    width match
+        4 ->
+            val p: *u32 = ptr_cast(at)
+            atomic_load(p, Relaxed)
+        2 ->
+            val p: *u16 = ptr_cast(at)
+            atomic_load(p, Relaxed)
+        _ ->
+            val p: *u8 = ptr_cast(at)
+            atomic_load(p, Relaxed)
+
+@inline
+host_write(page: usize, a: u32, width: u32, x: u32)
+    val at = page + (a & 0xFFF)
+
+    width match
+        4 ->
+            val p: *u32 = ptr_cast(at)
+            atomic_store(p, x, Relaxed)
+        2 ->
+            val p: *u16 = ptr_cast(at)
+            atomic_store(p, u16(x), Relaxed)
+        _ ->
+            val p: *u8 = ptr_cast(at)
+            atomic_store(p, u8(x), Relaxed)
+
+// The low `width` bytes of `x`.
+@inline
+low_bytes(x: u32, width: u32) -> u32 = if width == 4 then x else x & ((1 << (width * 8)) - 1)
+
+// An instruction's own access: the `width` bytes at `a` into `into`, or `x`'s low `width` bytes to
+// `a`, answering whether the access was made. One that stops the core is not: a read leaves `into`
+// as it was, and the instruction stops on it (`stop_access`). The test is in the slow path alone; on
+// the fast path the answer is a constant, and the handler's check of it folds away.
+@inline
+load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
+    val page = page_for(cpu, a, width)
+
+    if page == 0
+        val x = slow_read(cpu, a, width, n)
+
+        if cpu.stop != Stop.Budget then return false
+
+        into[0] = x
+        return true
+
+    into[0] = host_read(page, a, width)
+    true
+
+@inline
+store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
+    val page = page_for(cpu, a, width)
+
+    if page == 0
+        slow_write(cpu, a, width, low_bytes(x, width), n)
+        return cpu.stop == Stop.Budget
+
+    host_write(page, a, width, x)
+    stored(cpu, a, width)
+    true
+
+// The same accesses where nothing stops on them: the exception model's stacking and the host's own.
+@inline
+read32(cpu: *Cpu, a: u32, n: u64) -> u32
+    val page = page_for(cpu, a, 4)
+
+    if page == 0 then return slow_read(cpu, a, 4, n)
+
+    host_read(page, a, 4)
+
+@inline
+read16(cpu: *Cpu, a: u32, n: u64) -> u32
+    val page = page_for(cpu, a, 2)
+
+    if page == 0 then return slow_read(cpu, a, 2, n)
+
+    host_read(page, a, 2)
+
+@inline
+read8(cpu: *Cpu, a: u32, n: u64) -> u32
+    val page = page_of(cpu, a)
+
+    if page == 0 then return slow_read(cpu, a, 1, n)
+
+    host_read(page, a, 1)
+
+@inline
+write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    val page = page_for(cpu, a, width)
+
+    if page == 0
+        slow_write(cpu, a, width, low_bytes(x, width), n)
+        return
+
+    host_write(page, a, width, x)
+    stored(cpu, a, width)
+
+@inline
+write32(cpu: *Cpu, a: u32, x: u32, n: u64) = write(cpu, a, 4, x, n)
+
+@inline
+write16(cpu: *Cpu, a: u32, x: u32, n: u64) = write(cpu, a, 2, x, n)
+
+@inline
+write8(cpu: *Cpu, a: u32, x: u32, n: u64) = write(cpu, a, 1, x, n)
+
+load32(cpu: *Cpu, a: u32) -> u32 = read32(cpu, a, cpu.retired)
+
+load16(cpu: *Cpu, a: u32) -> u32 = read16(cpu, a, cpu.retired)
+
+load8(cpu: *Cpu, a: u32) -> u32 = read8(cpu, a, cpu.retired)
+
+store32(cpu: *Cpu, a: u32, x: u32) = write32(cpu, a, x, cpu.retired)
+
+store16(cpu: *Cpu, a: u32, x: u32) = write16(cpu, a, x, cpu.retired)
+
+store8(cpu: *Cpu, a: u32, x: u32) = write8(cpu, a, x, cpu.retired)
+
+// ---------------------------------------------------------------------------------------------------
+// Flags.
+
+@inline
+set_nz(cpu: *Cpu, res: u32)
+    cpu.nz = res
+
+@inline
+add_flags(cpu: *Cpu, a: u32, b: u32, carry: u32) -> u32
+    val wide = u64(a) + u64(b) + u64(carry)
+    val res = u32(wide)
+
+    cpu.nz = res
+    cpu.c = u32(wide >> 32)
+    cpu.va = a
+    cpu.vb = b
+    cpu.vr = res
+    res
+
+// `a - b` is `a + ~b + 1`, and `SBC` is `a + ~b + C`; C is "no borrow".
+@inline
+sub_flags(cpu: *Cpu, a: u32, b: u32, carry: u32) -> u32 = add_flags(cpu, a, ~b, carry)
+
+@inline
+flag_n(cpu: *Cpu) -> u32 = cpu.nz >> 31
+
+@inline
+flag_z(cpu: *Cpu) -> bool = cpu.nz == 0
+
+// Overflow: the operands agreed in sign and the result does not.
+@inline
+flag_v(cpu: *Cpu) -> u32 = ((cpu.va ^ cpu.vr) & (cpu.vb ^ cpu.vr)) >> 31
+
+// Condition `cond` (the four-bit field of a `B<cond>`) against the flags.
+@inline
+holds(cpu: *Cpu, cond: u32) -> bool = cond match
+    0 -> cpu.nz == 0
+    1 -> cpu.nz != 0
+    2 -> cpu.c != 0
+    3 -> cpu.c == 0
+    4 -> flag_n(cpu) != 0
+    5 -> flag_n(cpu) == 0
+    6 -> flag_v(cpu) != 0
+    7 -> flag_v(cpu) == 0
+    8 -> cpu.c != 0 && cpu.nz != 0
+    9 -> cpu.c == 0 || cpu.nz == 0
+    10 -> flag_n(cpu) == flag_v(cpu)
+    11 -> flag_n(cpu) != flag_v(cpu)
+    12 -> cpu.nz != 0 && flag_n(cpu) == flag_v(cpu)
+    13 -> cpu.nz == 0 || flag_n(cpu) != flag_v(cpu)
+    _ -> true
+
+// ---------------------------------------------------------------------------------------------------
+// Shifts by a register, as the data-processing forms define them: the bottom byte of the amount, and
+// the carry out of the last bit shifted (unchanged when the amount is 0).
+
+lsl_reg(cpu: *Cpu, x: u32, by: u32) -> u32
+    val n = by & 0xFF
+
+    if n == 0 then return x
+
+    if n < 32
+        cpu.c = (x >> (32 - n)) & 1
+        return x << n
+
+    cpu.c = if n == 32 then x & 1 else 0
+    0
+
+lsr_reg(cpu: *Cpu, x: u32, by: u32) -> u32
+    val n = by & 0xFF
+
+    if n == 0 then return x
+
+    if n < 32
+        cpu.c = (x >> (n - 1)) & 1
+        return x >> n
+
+    cpu.c = if n == 32 then x >> 31 else 0
+    0
+
+asr_reg(cpu: *Cpu, x: u32, by: u32) -> u32
+    val n = by & 0xFF
+
+    if n == 0 then return x
+
+    if n < 32
+        cpu.c = u32(i32(x) >> (n - 1)) & 1
+        return u32(i32(x) >> n)
+
+    cpu.c = x >> 31
+    u32(i32(x) >> 31)
+
+ror_reg(cpu: *Cpu, x: u32, by: u32) -> u32
+    if by & 0xFF == 0 then return x
+
+    val n = by & 31
+    val res = if n == 0 then x else (x >> n) | (x << (32 - n))
+
+    cpu.c = res >> 31
+    res

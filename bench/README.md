@@ -1,6 +1,6 @@
 # bench — how fast the core can dispatch
 
-`cortical bench` runs the ARMv6-M core (`sh.sysl.cortical.v6m`) two ways over one guest: a `match`
+`benchtop bench` runs the ARMv6-M core (`sh.sysl.benchtop.v6m`) two ways over one guest: a `match`
 loop over decoded records, and a chain of handlers joined by `become` (LLVM `musttail`). Both share
 the decoder, the instruction semantics, the page-table memory path and the lazy N/Z flags; only the
 step from one instruction to the next differs.
@@ -13,8 +13,8 @@ bench/guest/build.sh` rebuilds them all.
 Run it from the repository's root, with the answer the same C computes on the host for 1000 rounds:
 
 ```
-sysl build . -o cortical
-caffeinate -dimsu ./cortical bench bench/guest/kernel.bin 1380735027
+sysl build . -o benchtop
+caffeinate -dimsu ./benchtop bench bench/guest/kernel.bin 1380735027
 ```
 
 On an Apple M5 Pro, sysl 0.5.4, 667.5 M guest instructions, on a quiet machine:
@@ -30,7 +30,7 @@ Wall time moves with whatever else the machine is doing. The per-process counter
 change is judged by them. Name one executor so the counters see it alone:
 
 ```
-/usr/bin/time -l ./cortical bench bench/guest/kernel.bin 1380735027 threaded
+/usr/bin/time -l ./benchtop bench bench/guest/kernel.bin 1380735027 threaded
 ```
 
 and divide `cycles elapsed` and `instructions retired` by three rounds of guest instructions. For
@@ -49,11 +49,11 @@ did not move when they became so (30.18 G host instructions for three rounds bef
 ## The M33
 
 `kernel33.bin` is the same `kernel.c` built for the Cortex-M33 without its DSP extension, and
-`cortical bench --core cortex-m33` runs it on the ARMv8-M Mainline core:
+`benchtop bench --core cortex-m33` runs it on the ARMv8-M Mainline core:
 
 ```
-/usr/bin/time -l ./cortical bench bench/guest/kernel.bin 1380735027 threaded
-/usr/bin/time -l ./cortical bench --core cortex-m33 bench/guest/kernel33.bin 1380735027 threaded
+/usr/bin/time -l ./benchtop bench bench/guest/kernel.bin 1380735027 threaded
+/usr/bin/time -l ./benchtop bench --core cortex-m33 bench/guest/kernel33.bin 1380735027 threaded
 ```
 
 On the M5 Pro, sysl 0.5.7, five runs each, interleaved, on a machine shared with other work (so the
@@ -75,8 +75,8 @@ thousand times, with nothing shared, then core 1 sends its result through the FI
 each, and reports both cores' instructions over the wall time:
 
 ```
-caffeinate -dimsu ./cortical bench-board bench/guest/dual.elf
-/usr/bin/time -l ./cortical bench-board bench/guest/dual.elf threads
+caffeinate -dimsu ./benchtop bench-board bench/guest/dual.elf
+/usr/bin/time -l ./benchtop bench-board bench/guest/dual.elf threads
 ```
 
 On the same M5 Pro, sysl 0.5.7, 573.5 M guest instructions a round, on a quiet machine:

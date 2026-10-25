@@ -1,6 +1,6 @@
-# cortical
+# benchtop
 
-A Cortex-M board emulator written in sysl. It runs the firmware a developer would flash onto a board,
+A microcontroller board emulator written in sysl, whose cores today are Cortex-M. It runs the firmware a developer would flash onto a board,
 unmodified: each core on its own host thread, the board's display and controls in a Mac window, its
 UART on a terminal. A board is a description (its chip, parts, wiring, what it exposes and its view),
 not a new emulator, and the cores are one interpreter configured per architecture (ARMv6-M, ARMv7E-M,
@@ -17,21 +17,21 @@ on the M7) are available through board options. No real board is emulated yet.
 [DESIGN.md](DESIGN.md) is the design note: the architecture, the CPU interpreter, each board's
 devices, how fidelity is tested against real boards, and the milestones with their estimates.
 
-## The `cortical` command
+## The `benchtop` command
 
 ```
-sysl build . -o cortical
-./cortical run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>
-./cortical check <name | file.hocon>
-./cortical bench [--core <core>] <image.bin> [expected r0] [match | threaded]
-./cortical bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
+sysl build . -o benchtop
+./benchtop run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>
+./benchtop check <name | file.hocon>
+./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
+./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
 ```
 
 **`run`** boots an image on the board `--board` names — the virtual board, `virt`, where none is
 named — its console on this terminal a keystroke at a time. It runs a board of two Cortex-M0+ cores,
-two Cortex-M4s, two Cortex-M7s or two Cortex-M33s and the parts cortical emulates on their bus, and refuses any
+two Cortex-M4s, two Cortex-M7s or two Cortex-M33s and the parts benchtop emulates on their bus, and refuses any
 other board with the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
-as raw bytes from address 0. **Ctrl-]** ends cortical whatever the guest is doing, with exit status
+as raw bytes from address 0. **Ctrl-]** ends benchtop whatever the guest is doing, with exit status
 130. Otherwise the exit status is the one the guest wrote to the console's EXIT register; a guest
 that stops on a breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can
 wake, a fault the core cannot take, or (on an M33) a stack-limit violation gets a message saying
@@ -41,7 +41,7 @@ The two cores take turns on one host thread, so a run is the same every time. **
 each core a host thread of its own once core 1 is launched: faster where both cores are busy, and
 not reproducible, as two real cores are not.
 
-**`check`** reads a board or product description and holds it to cortical's part library: it
+**`check`** reads a board or product description and holds it to benchtop's part library: it
 prints every mistake with its line and column and exits 1, or prints what the description is.
 
 **`bench`** runs a raw image from address 0 to its breakpoint on one core (an M0+, or the core
@@ -54,7 +54,7 @@ speed together. [bench/README.md](bench/README.md) has the numbers.
 
 ## Describing a board
 
-A description is a HOCON file, and the shortest names a board built into cortical:
+A description is a HOCON file, and the shortest names a board built into benchtop:
 
 ```hocon
 board = pico2w
@@ -65,7 +65,7 @@ are built in ([boards](boards) has their sources). **A name with a `/` in it, or
 on the command line and in a file alike, so `--board virt` is the virtual board and `--board
 ./virt` a file. A path in a file is read from that file's directory.
 
-There are three levels. A **chip** (`rp2040`, `rp2350`) is built into cortical. A **board** names
+There are three levels. A **chip** (`rp2040`, `rp2350`) is built into benchtop. A **board** names
 a chip, or for a board with no real chip its `cores`, and holds its parts, the pins and buses it
 exposes, and its view:
 
@@ -122,7 +122,7 @@ cores = [
 ```
 
 Both forms can appear in the same list. Existing `cores = [cortex-m7, cortex-m7]` descriptions keep
-their behavior. The defaults describe cortical's current integer implementations:
+their behavior. The defaults describe benchtop's current integer implementations:
 
 | option | default | accepted selections |
 |---|---|---|
@@ -154,7 +154,7 @@ apply to boards that declare `cores` directly.
 always have the extension (`dsp = true` there only says so):
 
 ```sh
-./cortical run --board examples/virt/dsp.hocon examples/virt/dsp.elf
+./benchtop run --board examples/virt/dsp.hocon examples/virt/dsp.elf
 ```
 
 The DSP test guest checks 152 instruction variants against QEMU, with integer limits,
@@ -207,9 +207,9 @@ M3/M35P/M52/M55/M85. The existing v6-M instruction unit cases run on M0/M1/M0+ u
 
 ```
 zsh examples/virt/build.sh
-./cortical run --board virt23 examples/virt/crunch-m23.elf
-./cortical run --board virt35p --threads examples/virt/exclusive-m35p.elf
-./cortical run --board virt55 examples/virt/select-v81.elf
+./benchtop run --board virt23 examples/virt/crunch-m23.elf
+./benchtop run --board virt35p --threads examples/virt/exclusive-m35p.elf
+./benchtop run --board virt55 examples/virt/select-v81.elf
 ```
 
 The M52 model identifies as Arm China's r0p3 (CPUID 0x630FD243), M55 as r1p0 (0x411FD220),
@@ -227,7 +227,7 @@ fewer, in half the time ([bench/README.md](bench/README.md)).
 
 ## The virtual boards
 
-Machines that exist only in cortical, for running a program and talking to it with nothing but the
+Machines that exist only in benchtop, for running a program and talking to it with nothing but the
 core — deliberately not a real chip. Each board in the core table has two cores of that model,
 with the same devices:
 
@@ -236,7 +236,7 @@ with the same devices:
 | `0x0000_0000`–`0x000F_FFFF` | 1 MB of RAM, shared by both cores: the vector table, code, data and stacks |
 | `0x4000_0000` DATA | write: the low byte goes to standard output. read: the next byte typed, or `0xFFFF_FFFF` when none is waiting |
 | `0x4000_0004` STATUS | bit 0: a byte is waiting. bit 1: the input has ended and nothing is waiting |
-| `0x4000_0008` EXIT | write: cortical ends, with the value as its exit status |
+| `0x4000_0008` EXIT | write: benchtop ends, with the value as its exit status |
 | `0x4000_000C` CTRL | bit 0: the console's interrupt, IRQ 0, is enabled; reads back |
 | `0xD000_0000` CPUID | read: 0 on core 0, 1 on core 1 |
 | `0xD000_0050` FIFO_ST | bit 0 VLD: this core's RX FIFO holds a word. bit 1 RDY: its TX FIFO has room. bit 2 WOF: it wrote to a full FIFO. bit 3 ROE: it read an empty one. Writing 1 to WOF or ROE clears it |
@@ -248,7 +248,7 @@ with the same devices:
 
 The console raises IRQ 0 while CTRL bit 0 is set and STATUS is not 0 (a byte is waiting, or the input
 has ended), in each running core's NVIC. The SIO raises IRQ 1 in a core's own NVIC while its VLD, WOF
-or ROE is set. Any other address stops the core, and cortical reports it. Core 0 resets as every
+or ROE is set. Any other address stops the core, and benchtop reports it. Core 0 resets as every
 M-profile core does: SP from the vector table's first word, PC from its second. Core 1 waits in a boot ROM until core
 0 launches it as on the RP2040 (`multicore_launch_core1_raw`): core 0 pushes 0, 0, 1, VTOR, SP and
 ENTRY through the FIFO, each echoed back, and core 1 starts at ENTRY. Each core takes exceptions as its
@@ -287,13 +287,13 @@ with `arm-none-eabi-gcc` on the PATH:
 
 ```
 zsh examples/virt/build.sh
-./cortical run examples/virt/echo.elf
-./cortical run examples/virt/irq.elf
-./cortical run examples/virt/dual.elf
-./cortical run --threads examples/virt/dual.elf
-./cortical run --board virt33 examples/virt/crunch-m33.elf
-./cortical run --board virt33 --threads examples/virt/exclusive-m33.elf
-./cortical run --board examples/virt/moved.hocon examples/virt/irq-moved.elf
+./benchtop run examples/virt/echo.elf
+./benchtop run examples/virt/irq.elf
+./benchtop run examples/virt/dual.elf
+./benchtop run --threads examples/virt/dual.elf
+./benchtop run --board virt33 examples/virt/crunch-m33.elf
+./benchtop run --board virt33 --threads examples/virt/exclusive-m33.elf
+./benchtop run --board examples/virt/moved.hocon examples/virt/irq-moved.elf
 ```
 
 The last runs `irq.c` built for a console at `0x5000_0000` on IRQ 7, on a description of the board
@@ -311,7 +311,7 @@ that puts it there: the devices are wherever the description says.
 After each board, [skiff](https://github.com/sysl-lang/skiff) runs on it. Later: the micro:bit v1 and
 v2, PIO for the Pico 2, the Pico W radio and USB.
 
-The oracle is always the real board running the same image, never cortical's own idea of it.
+The oracle is always the real board running the same image, never benchtop's own idea of it.
 
 ## Licence
 

@@ -1,7 +1,7 @@
 #!/bin/zsh
-# Builds the virtual board's example programs: `zsh build.sh`, then `cortical run echo.elf`.
+# Builds the virtual board's example programs: `zsh build.sh`, then `benchtop run echo.elf`.
 # Each is built for the M0+ board virt, the M4/M7 boards virt4/virt7, and the M33 board virt33.
-# The Thumb-2 builds stay within cortical's integer instruction sets, without floating point; the
+# The Thumb-2 builds stay within benchtop's integer instruction sets, without floating point; the
 # M4 and M7 builds use the DSP extension those cores always have.
 set -e
 cd ${0:A:h}
@@ -52,7 +52,7 @@ done
 arm-none-eabi-gcc -march=armv8-m.main+nodsp -mthumb -mfloat-abi=soft $flags start.c select.c -lgcc -o select-v81.elf
 
 # irq.c for moved.hocon, whose console is at 0x50000000 and raises IRQ 7:
-# `cortical run --board moved.hocon irq-moved.elf`.
+# `benchtop run --board moved.hocon irq-moved.elf`.
 arm-none-eabi-gcc $m0 $flags -DCONSOLE_BASE=0x50000000 -DCONSOLE_IRQ=7 start.c irq.c -lgcc -o irq-moved.elf
 
 # What crunch.c prints built for the host, which both builds must print too.
