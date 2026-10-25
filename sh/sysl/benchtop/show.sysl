@@ -9,18 +9,42 @@ import sysl.text.{StrBuilder, str_builder}
 //
 // **`description_text` writes the model back as HOCON**, which is the model's own idea of sameness:
 // two descriptions are the same when they are written identically. Spans, comments and the order a
-// part's settings were written in are not part of a board; a part's `at`, `size` and `irq` keep the
-// text they were written in (`0x40000000`, `1M`), since a reader of the file chose it. A product is
-// written as its boards are named and overridden, not as the boards they name.
+// part's settings were written in are not part of a board; a peripheral's `at`, `size` and `irq` keep
+// the text they were written in (`0x40000000`, `1M`), since a reader of the file chose it. A board is
+// written with its chip as it was named or written out, and a product as its boards are named and
+// overridden, not as the boards they name.
 
-/** What `benchtop check` prints for a description that checks clean: the board or the product, then
- * each part on a line with what it is, where it sits or what it is wired to, and whether benchtop
- * emulates it.
+/** What `benchtop check` prints for a description that checks clean: the chip, the board or the
+ * product, then each peripheral or part on a line with what it is, where it sits or what it is wired
+ * to, and whether benchtop emulates it.
  */
 summary(d: Description, reg: Registry) -> string
     var out = str_builder()
 
-    if d.form == ProductForm then
+    if d.form == ChipForm then
+        val c = d.chip
+
+        out.push(s"${c.name}: ${if c.summary.is_empty() then "a chip" else c.summary}\n")
+        out.push(s"  ${core_listing(c.cores)}\n")
+
+        if !c.banks.is_empty() then
+            var pins: Buf[string] = buf()
+
+            for b in c.banks do pins.push(s"${b.prefix}0 to ${b.prefix}${b.count - 1}")
+
+            out.push(s"  pins ${joined(pins, ", ")}\n")
+        end if
+
+        var width = 0
+        var kinds = 0
+
+        for p in c.peripherals
+            if p.name.bytes.len > width then width = p.name.bytes.len
+            if p.kind.bytes.len > kinds then kinds = p.kind.bytes.len
+
+        for p in c.peripherals
+            out.push(s"  ${padded(p.name, width)}  ${padded(p.kind, kinds)}  ${peripheral_line(p, reg)}\n")
+    elif d.form == ProductForm then
         val p = d.product
         val name = if p.name.is_empty() then "the product" else p.name
 
@@ -44,10 +68,10 @@ summary(d: Description, reg: Registry) -> string
         part_lines(&out, b.parts, b.buses, reg)
 
         if !b.exposed_pins.is_empty() || !b.exposed_buses.is_empty() then
-            var pins: Buf[int] = buf()
+            var pins: Buf[string] = buf()
             var names: Buf[string] = buf()
 
-            for e in b.exposed_pins do pins.push(e.pin)
+            for e in b.exposed_pins do pins.push(e.name)
             for e in b.exposed_buses do names.push(e.name)
 
             val both = if pins.is_empty() || names.is_empty() then "" else "; "
@@ -60,16 +84,58 @@ summary(d: Description, reg: Registry) -> string
     out.finish()
 end summary
 
-// What a board is built around: `the rp2040 (…)`, or its cores.
+// What a board is built around: `the rp2040 (…)`, with the chip's summary, or its cores where it
+// gives none.
 private board_line(b: Board, reg: Registry) -> string
-    if b.chip.is_empty() then return core_listing(b.cores)
+    val c = b.chip
+    val about = if c.summary.is_empty() then core_listing(c.cores) else c.summary
 
-    val about = reg.chip(b.chip) match
-        Some(c) -> s" (${c.summary})"
-        None -> ""
-
-    s"the ${b.chip}$about"
+    s"the ${c.name} ($about)"
 end board_line
+
+// One peripheral's line: its window, its IRQs, the pins it can be routed to, and a word where it is not
+// emulated.
+private peripheral_line(p: Peripheral, reg: Registry) -> string
+    var bits: Buf[string] = buf()
+
+    p.at match
+        Some(a) ->
+            val size = window_size(p, reg)
+
+            bits.push(if size > 0 then f"0x${a.n}%08x to 0x${a.n + size - 1}%08x" else f"at 0x${a.n}%08x")
+        None -> ()
+
+    if !p.irqs.is_empty() then
+        var qs: Buf[string] = buf()
+
+        for q in p.irqs do qs.push(str(q.n))
+
+        bits.push(s"${if p.irqs.len() == 1 then "IRQ" else "IRQs"} ${joined(qs, ", ")}")
+
+    for route in p.signals
+        var pins: Buf[string] = buf()
+
+        for pin in route.pins do pins.push(pin.name)
+
+        bits.push(s"${route.name} on ${joined(pins, "/")}")
+
+    if !p.channels.is_empty() then
+        var pins: Buf[string] = buf()
+
+        for pin in p.channels do pins.push(pin.name)
+
+        bits.push(s"channels on ${joined(pins, "/")}")
+
+    for q in p.params do bits.push(s"${q.name} = ${setting_text(q.value)}")
+
+    var line = joined(bits, ", ")
+
+    reg.peripheral(p.kind) match
+        Some(spec) -> if !spec.modelled then line = s"$line (not modelled)"
+        None -> ()
+
+    line
+end peripheral_line
 
 private part_lines(out: *StrBuilder, parts: Buf[Part], buses: Buf[Bus], reg: Registry)
     var width = 0
@@ -85,7 +151,7 @@ private part_lines(out: *StrBuilder, parts: Buf[Part], buses: Buf[Bus], reg: Reg
     for bus in buses
         var sigs: Buf[string] = buf()
 
-        for s in bus.signals do sigs.push(s"${s.name} = ${pin_name(s.pin)}")
+        for s in bus.signals do sigs.push(s"${s.name} = ${s.pin}")
 
         val name = if bus.board.is_empty() then bus.name else s"${bus.board}.${bus.name}"
 
@@ -99,27 +165,9 @@ private view_lines(out: *StrBuilder, view: View, keys: usize, pointers: usize)
     if keys > 0 || pointers > 0 then
         out.push(s"  input: ${counted(keys, "key")}, ${counted(pointers, "pointer binding")}\n")
 
-// One part's line: its place on the bus or its wires, its parameters, and a word where it is not
-// emulated.
+// One part's line: its wires, its parameters, and a word where it is not emulated.
 private part_line(parts: Buf[Part], p: Part, reg: Registry) -> string
     var bits: Buf[string] = buf()
-
-    p.at match
-        Some(a) ->
-            val size: long = p.size match
-                Some(s) -> s.n
-                None -> reg.part(p.kind) match
-                    Some(spec) -> spec.window match
-                        Some(w) -> w.size
-                        None -> 0
-                    None -> 0
-
-            bits.push(if size > 0 then f"0x${a.n}%08x to 0x${a.n + size - 1}%08x" else f"at 0x${a.n}%08x")
-        None -> ()
-
-    p.irq match
-        Some(q) -> bits.push(s"IRQ ${q.n}")
-        None -> ()
 
     for w in p.wires do bits.push(s"${w.port} = ${target_text(w.to)}")
     for q in p.params do bits.push(s"${q.name} = ${setting_text(q.value)}")
@@ -216,39 +264,108 @@ private joined(xs: Buf[string], sep: string) -> string
 description_text(d: Description) -> string
     var top: Buf[(string, Value)] = buf()
 
+    val form = if d.form == ChipForm then "chip" elif d.form == ProductForm then "product" else "board"
+
     if d.form == ProductForm then
-        top.push(("product", product_value(d.product)))
+        top.push((form, product_value(d.product)))
     elif !d.named.is_empty() then
-        top.push(("board", reference(d.named)))
+        top.push((form, reference(d.named)))
+    elif d.form == ChipForm then
+        top.push((form, chip_value(d.chip)))
     else
-        top.push(("board", board_value(d.board)))
+        top.push((form, board_value(d.board)))
 
     render(object_of(top))
 end description_text
 
-// A board named by another: a word for one built in, a quoted string for a file's path.
+// A chip or a board named by another: a word for one built in, a quoted string for a file's path.
 private reference(r: string) -> Value = if is_path(r) then str_value(r) else word(r)
+
+private chip_value(c: Chip) -> Value
+    var fs: Buf[(string, Value)] = buf()
+
+    if !c.name.is_empty() then fs.push(("name", str_value(c.name)))
+    if !c.summary.is_empty() then fs.push(("summary", str_value(c.summary)))
+
+    if !c.cores.is_empty() then
+        var cores: Buf[Value] = buf()
+
+        for k in c.cores
+            if k.configured
+                var fields: Buf[(string, Value)] = buf()
+
+                fields.push(("core", word(k.name)))
+                for option in k.options do fields.push((option.name, setting_value(option.value)))
+                cores.push(object_of(fields))
+            else
+                cores.push(word(k.name))
+
+        fs.push(("cores", value(Arr(cores))))
+    end if
+
+    if !c.banks.is_empty() then
+        var banks: Buf[(string, Value)] = buf()
+
+        for b in c.banks do banks.push((b.prefix, value(Int(long(b.count), ""))))
+
+        fs.push(("pins", object_of(banks)))
+
+    if !c.peripherals.is_empty() then
+        var ps: Buf[(string, Value)] = buf()
+
+        for p in c.peripherals
+            var pf: Buf[(string, Value)] = buf()
+
+            pf.push(("peripheral", word(p.kind)))
+            amount_field(&pf, "at", p.at)
+            amount_field(&pf, "size", p.size)
+
+            if p.irqs.len() == 1 then
+                amount_field(&pf, "irq", Some(p.irqs.at(0)))
+            elif p.irqs.len() > 1 then
+                var qs: Buf[Value] = buf()
+
+                for q in p.irqs do qs.push(amount_value(q))
+
+                pf.push(("irq", value(Arr(qs))))
+            end if
+
+            for q in p.params do pf.push((q.name, setting_value(q.value)))
+
+            if !p.signals.is_empty() then
+                var ss: Buf[(string, Value)] = buf()
+
+                for route in p.signals do ss.push((route.name, pins_value(route.pins)))
+
+                pf.push(("signals", object_of(ss)))
+
+            if !p.channels.is_empty() then pf.push(("channels", pins_value(p.channels)))
+
+            ps.push((p.name, object_of(pf)))
+        end for
+
+        fs.push(("peripherals", object_of(ps)))
+    end if
+
+    object_of(fs)
+end chip_value
+
+private pins_value(pins: Buf[PinRef]) -> Value
+    var xs: Buf[Value] = buf()
+
+    for pin in pins do xs.push(word(pin.name))
+
+    value(Arr(xs))
 
 private board_value(b: Board) -> Value
     var fs: Buf[(string, Value)] = buf()
 
     if !b.name.is_empty() then fs.push(("name", str_value(b.name)))
-    if !b.chip.is_empty() then fs.push(("chip", word(b.chip)))
 
-    if !b.cores.is_empty() then
-        var cores: Buf[Value] = buf()
-
-        for c in b.cores
-            if c.configured
-                var fields: Buf[(string, Value)] = buf()
-
-                fields.push(("core", word(c.name)))
-                for option in c.options do fields.push((option.name, setting_value(option.value)))
-                cores.push(object_of(fields))
-            else
-                cores.push(word(c.name))
-
-        fs.push(("cores", value(Arr(cores))))
+    if !b.chip_named.is_empty() then
+        fs.push(("chip", reference(b.chip_named)))
+    elif b.has_chip then
+        fs.push(("chip", chip_value(b.chip)))
 
     if !b.parts.is_empty() then fs.push(("parts", parts_value(b.parts)))
     if !b.buses.is_empty() then fs.push(("buses", buses_value(b.buses)))
@@ -384,7 +501,7 @@ private buses_value(bs: Buf[Bus]) -> Value
     for bus in bs
         var sigs: Buf[(string, Value)] = buf()
 
-        for s in bus.signals do sigs.push((s.name, word(pin_name(s.pin))))
+        for s in bus.signals do sigs.push((s.name, word(s.pin)))
 
         buses.push((bus.name, object_of(sigs)))
 
@@ -453,11 +570,14 @@ end view_value
 
 private amount_field(fs: *Buf[(string, Value)], key: string, a: Option[Amount])
     a match
-        Some(x) ->
-            val text = if x.written.is_empty() then str(x.n) else x.written
-
-            fs.push((key, if text == str(x.n) then value(Int(x.n, text)) else word(text)))
+        Some(x) -> fs.push((key, amount_value(x)))
         None -> ()
+
+// An amount as it was written: a number as a number, `0x40000000` and `1M` as words.
+private amount_value(x: Amount) -> Value
+    val text = if x.written.is_empty() then str(x.n) else x.written
+
+    if text == str(x.n) then value(Int(x.n, text)) else word(text)
 
 private setting_value(s: Setting) -> Value = s match
     Whole(n) -> value(Int(n, ""))
