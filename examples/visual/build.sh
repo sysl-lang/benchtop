@@ -1,5 +1,9 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")"
-CC=${CC:-arm-none-eabi-gcc}
-"$CC" -mcpu=cortex-m0plus -mthumb -Os -ffreestanding -fno-builtin -nostdlib -Wl,--build-id=none,--no-warn-rwx-segments -T demo.ld demo.c -o demo.elf
+build_dir=$(mktemp -d)
+trap 'rm -rf "$build_dir"' EXIT HUP INT TERM
+sysl build-c --target thumbv6m-freestanding -O2 -o "$build_dir/demo.a" .
+ARM_LD=${ARM_LD:-arm-none-eabi-ld}
+"$ARM_LD" --gc-sections --build-id=none --no-warn-rwx-segments -T demo.ld \
+    --whole-archive "$build_dir/demo.a" --no-whole-archive -o demo.elf

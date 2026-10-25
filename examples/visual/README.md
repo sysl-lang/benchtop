@@ -7,8 +7,9 @@ sysl build . -o benchtop
 ./benchtop demo
 ```
 
+The firmware is written in sysl (`main.sysl`) and targets `thumbv6m-freestanding`.
 The committed demo ELF is embedded, so running the demo needs no cross compiler.
-To change the firmware, install `arm-none-eabi-gcc`, then:
+To change the firmware, install GNU Arm binutils (`arm-none-eabi-ld`), then:
 
 ```sh
 cd examples/visual
@@ -16,6 +17,13 @@ cd examples/visual
 cd ../..
 ./benchtop run --window --board workbench examples/visual/demo.elf
 ```
+
+`sysl build-c` emits an archive directly from sysl; despite its name, this does not
+produce or compile C. GNU Arm ld links it with `demo.ld`. The reset vector table is
+a static sysl struct placed in `.rodata.vectors`, containing a linker-symbol
+address and a reset function pointer. Compile-time assertions check its size and
+reset-vector offset. No C or assembly source is needed. Unused compiler runtime helpers are
+discarded by `--gc-sections`; the firmware needs no libc or heap.
 
 Rebuild benchtop to update its embedded demo. Hold 1/2 or the onscreen buttons;
 Space pauses, N steps, R resets, S saves a PNG. Firmware reads GP8/GP9 as active-low

@@ -27,7 +27,7 @@ sysl build . -o benchtop
 ./benchtop demo
 ```
 
-The bundled Cortex-M0+ firmware drives a heartbeat LED and reads two active-low
+The bundled firmware is written in sysl and compiled for Cortex-M0+. It drives a heartbeat LED and reads two active-low
 buttons through MMIO. Hold **1** or **2**, or click and hold either button, to light
 its corresponding LED. **Space** pauses, **N** executes one instruction per active
 core, **R** resets, **S** saves a PNG, and **Escape** closes the window. The toolbar
