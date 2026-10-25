@@ -71,6 +71,7 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.v6m.{default_priority_bits, has_fixed_dsp, Cpu, Kind, Stop, IRQ0, NEVER, RAM_BYTES, clear, clock, could_wake, halt, load32, next_wake, raise, reset, run_threaded, set_limit, wake_by}
 import sh.sysl.elf as elf
 import sysl.buf.{Buf, buf}
+import sysl.math.min
 import sysl.sync.*
 import sysl.threads.{Channel, SleepLock, channel, spawn}
 import sysl.io.stdin
@@ -105,24 +106,30 @@ const ROE: u32 = 8
 
 const FIFO_DEPTH: u32 = 8
 
-/** A device on the cores' bus: what it is, the addresses it answers, `base` to `last`, and the IRQ it
- * raises, or -1 for none.
+/** A device on the cores' bus: what it is, the addresses it answers, `base` to `last`, and the IRQs
+ * it raises, in the order its description gives them, -1 past the last.
  */
 struct Mapped
     device: Device
     base: u32
     last: u32
-    irq: int
+    irqs: [4]int
 
 enum Device
     Console
     Sio
+    Resets
+    Timer
+    Watchdog
 end Device
 
-// The devices on the bus, which `attach` sets; and the IRQs the console and the SIO raise, -1 where
-// the board has no such device or gave it no IRQ.
+val NO_IRQS: [4]int = [-1, -1, -1, -1]
+
+// The devices on the bus, at most one of each kind, which `attach` sets; and the IRQs the console
+// and the SIO raise, -1 where the board has no such device or gave it no IRQ.
 // They are a plain array, which both cores' threads read at once without touching it.
-var devices: [2]Mapped = [Mapped(Console, 0, 0, -1), Mapped(Sio, 0, 0, -1)]
+var devices: [5]Mapped = [Mapped(Console, 0, 0, NO_IRQS), Mapped(Sio, 0, 0, NO_IRQS),
+    Mapped(Resets, 0, 0, NO_IRQS), Mapped(Timer, 0, 0, NO_IRQS), Mapped(Watchdog, 0, 0, NO_IRQS)]
 var attached: usize = 0
 var console_irq: int = -1
 var fifo_irq: int = -1
@@ -362,6 +369,7 @@ boot(cpu: *Cpu, image: []const u8)
     quantum = QUANTUM
     now = 0
     threads = false
+    boot_rp()
 
 // Core 0, which `boot` and `run_board` are given.
 core0() -> *Cpu = &first
@@ -435,10 +443,13 @@ round(cpu: *Cpu) -> bool
 private turn(cpu: *Cpu, until: u64)
     while cpu.stop == Stop.Budget && !starting
         signal(cpu)
-        if !wake_by(cpu, until) then return
+        if !wake_by(cpu, min(until, timer_wake(cpu)))
+            // Asleep until a timer alarm before the round's end: its interrupt is raised from here.
+            if clock(cpu, cpu.retired) >= until then return
+            continue
         if clock(cpu, cpu.retired) >= until then return
 
-        set_limit(cpu, until - cpu.slept)
+        set_limit(cpu, min(until, timer_due()) - cpu.slept)
         run_threaded(cpu)
 
 // Every running core ended the round asleep. One the other core interrupted in its last turn wakes
@@ -448,10 +459,10 @@ private turn(cpu: *Cpu, until: u64)
 private settle(cpu: *Cpu) -> bool
     if roused(cpu) || (launched && roused(&second)) then return true
 
-    var due = next_wake(cpu)
+    var due = min(next_wake(cpu), timer_wake(cpu))
 
     if launched
-        val other = next_wake(&second)
+        val other = min(next_wake(&second), timer_wake(&second))
 
         if other < due then due = other
 
@@ -511,14 +522,15 @@ private stopped(cpu: *Cpu, why: string) -> string
 
     f"the guest stopped at $why (${core}pc 0x${cpu.pc}%08x, ${cpu.retired} instructions)"
 
-// Raise a core's interrupts: the console's while it is enabled and STATUS is not 0, and the FIFO's
-// while the core's VLD, WOF or ROE is set.
+// Raise a core's interrupts: the console's while it is enabled and STATUS is not 0, the FIFO's while
+// the core's VLD, WOF or ROE is set, and the timer's alarms' while they are raised at its clock.
 private[virt] signal(cpu: *Cpu)
     if console_raising() then raise(cpu, u32(console_irq))
 
     val k = core_of(cpu)
 
     if fifo_irq >= 0 && (waiting_in(k) > 0 || fifo_errors[k] != 0) then raise(cpu, u32(fifo_irq))
+    signal_rp(cpu)
 
 // ---------------------------------------------------------------------------------------------------
 // The SIO.
@@ -529,31 +541,33 @@ private core_of(cpu: *Cpu) -> int = if cpu == &second then 1 else 0
 // The board's half of an access off the RAM, which the core makes through its device hook: the device
 // whose window holds the address answers it, with the register's offset from its base. An address
 // in no window stops the core at `Unmapped`. The RAM's own accesses never come here.
-board_read(cpu: *Cpu, a: u32, width: u32) -> u32
+board_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
     for m in devices[0..<attached]
         if a >= m.base && a <= m.last then
             return m.device match
                 Console -> console_read(cpu, a, a - m.base)
                 Sio -> sio_read(cpu, a, a - m.base)
+                d -> rp_read(cpu, d, a, a - m.base, width, n)
 
     halt(cpu, Stop.Unmapped, a)
     0
 
-board_write(cpu: *Cpu, a: u32, width: u32, x: u32)
+board_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
     for m in devices[0..<attached]
         if a >= m.base && a <= m.last then
             m.device match
                 Console -> console_write(cpu, a, a - m.base, x)
                 Sio -> sio_write(cpu, a, a - m.base, x)
+                d -> rp_write(cpu, d, a, a - m.base, width, x, n)
             return
 
     halt(cpu, Stop.Unmapped, a)
 
-/** Put `ds` on the bus of two cores of `kind`, in place of whatever was there, for the boards booted
- * from now on.
+/** Put `ds`, at most one device of each kind, on the bus of two cores of `kind`, in place of whatever
+ * was there, for the boards booted from now on.
  */
 attach(ds: []const Mapped, kind: Kind)
-    require ds.len <= devices.len, "a board has at most one console and one SIO"
+    require ds.len <= devices.len, "a board has at most one device of each kind"
 
     cores_kind = kind
     val bits = default_priority_bits(kind)
@@ -566,14 +580,25 @@ attach(ds: []const Mapped, kind: Kind)
     console_irq = -1
     fifo_irq = -1
 
+    var resets = false
+    var timer = false
+    var alarms = NO_IRQS
+
     for i in 0..<ds.len
         val m = ds[i]
 
         devices[i] = m
 
         m.device match
-            Console -> console_irq = m.irq
-            Sio -> fifo_irq = m.irq
+            Console -> console_irq = m.irqs[0]
+            Sio -> fifo_irq = m.irqs[0]
+            Resets -> resets = true
+            Timer ->
+                timer = true
+                alarms = m.irqs
+            Watchdog -> ()
+
+    attach_rp(resets, timer, alarms)
 
 // Spinlock k's bit, for a register that is one of the spinlocks; 0 for any other.
 private lock_bit(o: u32) -> u32

@@ -1582,6 +1582,8 @@ the `sysl-lang/rp2040` package is generated from the same SVD). What differs:
   mapped, and core 1 starts in it as on the RP2350.
 - **Clocks**: the same XOSC/PLL/CLOCKS shape with no TICKS block; the timer's 1 µs tick comes from
   `WATCHDOG_TICK`. One 64-bit TIMER with four alarms. No POWMAN; `VREG_AND_CHIP_RESET` instead.
+  RESETS, the TIMER and the watchdog's tick generator are built (§11), with clk_ref taken as the
+  cores' clock until CLOCKS is.
 - **Pads** have no `ISO` bit.
 
 **Cost: 2–3 agent-days** on top of the RP2350, most of it the divider, the ROM's float tables, and
@@ -1708,8 +1710,24 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
   `at` and raises the `irq` its peripheral gives, so a chip that moves the console
   (`examples/virt/moved.hocon`) moves it for the guest. `benchtop run` runs a board with no parts of
   its own on a chip of two cores of one supported Cortex-M model, a 1 MB `ram` at 0 and at most one
-  `debug-console` and one `virt-sio`, or a product of one such board and nothing outside it;
-  anything else is refused with the reason.
+  each of `debug-console`, `virt-sio`, `rp-resets`, `rp-timer` and `rp-watchdog`, or a product of
+  one such board and nothing outside it; anything else is refused with the reason.
+- **The RP2040's RESETS, TIMER and watchdog tick** (`virt/rp.sysl`, over the register models in
+  `sh.sysl.benchtop.peripheral.rp2040`) run on such a board wherever its chip places them; the
+  rp2040 chip itself is not runnable until its ROM and SIO are. benchtop models no CLOCKS block, so
+  **clk_ref is the cores' clock**, one cycle per instruction retired or skipped asleep, and the timer
+  counts the ticks the watchdog divides it into (CYCLES 12 gives a tick every 12 clocks). The timer
+  is shared, and keeps the time of the latest core to touch it: an access brings it to the clock of
+  the instruction making it (the bus hooks are handed the instruction's retired count, as the SCS
+  is), and a core's interrupts are raised with it brought to that core's clock. **A run ends where
+  the next armed alarm fires** — a write that arms one lowers the running core's limit — so on one
+  thread an alarm's IRQ is taken at its tick, from a loop or from `WFI`; a board whose cores all
+  sleep skips to the alarm where its interrupt would wake one. On two threads the cores' clocks stay
+  within the lag bound of each other, and so does the timer's time as each sees it. RESETS holds the
+  timer at its reset state until released and reports a released device done at once; an access to
+  the timer while it is held, or a width, alignment or atomic alias a register does not take, stops
+  the core at `Fault`, and an access to no register at `Unmapped`. The watchdog's counter (CTRL,
+  LOAD, REASON) is not modelled; its SCRATCH registers are.
 - **The board** is `sh.sysl.benchtop.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
   (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
   the input has ended), EXIT (end with this status) and CTRL (bit 0 enables the console's interrupt).

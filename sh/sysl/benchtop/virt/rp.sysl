@@ -1,0 +1,183 @@
+module sh.sysl.benchtop.virt
+
+// The RP2040's RESETS, TIMER and the watchdog's tick generator, where a chip puts them on the cores'
+// bus (`rp-resets`, `rp-timer`, `rp-watchdog`). The register models are
+// `sh.sysl.benchtop.peripheral.rp2040`'s; this is the board's half of them: their time, the reset
+// RESETS fans out, the timer's interrupts, and the lock over them all.
+//
+// **The timer counts the watchdog's ticks, and clk_ref is the cores' clock.** benchtop models no
+// CLOCKS block, so one clock, an instruction retired or skipped asleep, is one clk_ref cycle. A guest
+// that sets the watchdog's CYCLES to 12, as the SDK does for its 12 MHz crystal, sees the timer count
+// once every 12. Without a watchdog on the bus the timer never counts, as on a chip whose tick is never
+// started.
+//
+// **The timer keeps the time of the latest core to touch it.** An access brings it to the clock of
+// the instruction making it, so TIMELR reads the time it is read at. A core's interrupts are raised
+// with the timer brought to that core's clock. A core's run ends where the next armed alarm fires, and
+// the alarm's interrupt is taken at the first taken branch from there. A board whose cores all sleep
+// skips to it, where its interrupt would wake one.
+//
+// **RESETS holds the timer in reset until the guest releases it**, as at power-on. While its bit is
+// set the timer is held at its reset state, and an access to it stops the core at `Stop.Fault`, since
+// what the bus does then is not something benchtop will guess at. A device released is reported done
+// in RESET_DONE at once. A chip with no RESETS on its bus has its timer running from the start.
+//
+// An access the models refuse stops the core: one to no register at `Stop.Unmapped`, and one of a
+// width, alignment or atomic alias the register does not take at `Stop.Fault`. While the cores run on
+// threads of their own, the three devices are under `rp_lock`.
+
+import sh.sysl.benchtop.peripheral.rp2040 as rp
+import sh.sysl.benchtop.v6m.{Cpu, Stop, IRQ0, NEVER, clock, could_wake, halt, lower_limit, raise}
+import sh.sysl.rp2040.resets.RESET_TIMER_MASK
+import sysl.threads.SleepLock
+
+var rp_resets = rp.resets()
+var rp_timer = rp.timer()
+var rp_watchdog = rp.watchdog()
+var has_resets = false
+var has_timer = false
+// The IRQ each of the timer's four alarms raises, -1 for none.
+var timer_irqs: [4]int = [-1, -1, -1, -1]
+// The clock the timer and the watchdog have been brought to.
+var timer_at: u64 = 0
+var rp_lock = SleepLock.new()
+
+// Put the devices on the bus or take them off, with the IRQs the chip gives the timer's alarms.
+private[virt] attach_rp(resets: bool, timer: bool, irqs: [4]int)
+    has_resets = resets
+    has_timer = timer
+    timer_irqs = irqs
+
+// The devices as at power-on, at clock 0.
+private[virt] boot_rp()
+    rp_resets.reset()
+    rp_timer.reset()
+    rp_watchdog.reset()
+    timer_at = 0
+
+private hold_rp()
+    if threads then rp_lock.lock()
+
+private free_rp()
+    if threads then rp_lock.unlock()
+
+private timer_held() -> bool = has_resets && rp_resets.held & RESET_TIMER_MASK != 0
+
+// Bring the watchdog and the timer to clock `t`, where they have not reached it already.
+private bring(t: u64)
+    if t <= timer_at then return
+
+    val ticks = rp_watchdog.advance(t - timer_at)
+
+    if !timer_held() then rp_timer.advance(ticks, 0)
+    timer_at = t
+
+// The clock at which the timer's next armed alarm fires; `NEVER` where none will.
+private due() -> u64
+    if !has_timer || timer_held() then return NEVER
+
+    val ticks = rp_timer.next_alarm(0) match
+        Some(n) -> n
+        None -> return NEVER
+
+    rp_watchdog.cycles_to(ticks) match
+        Some(c) -> timer_at + c
+        None -> NEVER
+
+/** The clock at which a run is to end for the timer's next alarm; `NEVER` where none will fire. */
+private[virt] timer_due() -> u64
+    if !has_timer then return NEVER
+
+    hold_rp()
+    val t = due()
+    free_rp()
+    t
+
+/** The clock at which the timer's next alarm fires where an enabled alarm's interrupt would wake a
+ * sleeping `cpu`; `NEVER` where it would not. An alarm that fires and raises nothing has still let
+ * the time pass.
+ */
+private[virt] timer_wake(cpu: *Cpu) -> u64
+    if !has_timer then return NEVER
+
+    hold_rp()
+    val t = due()
+    val enabled = rp_timer.enable | rp_timer.force
+    free_rp()
+
+    if t == NEVER then return NEVER
+
+    for i in 0..<4
+        val n = timer_irqs[i]
+
+        if n >= 0 && enabled & (1 << u32(i)) != 0 && could_wake(cpu, IRQ0 + u32(n)) then return t
+
+    NEVER
+
+/** Raise in `cpu` the timer's interrupts that are raised at its clock. */
+private[virt] signal_rp(cpu: *Cpu)
+    if !has_timer then return
+
+    hold_rp()
+    bring(clock(cpu, cpu.retired))
+    val lines = if timer_held() then 0 else rp_timer.irqs()
+    free_rp()
+
+    for i in 0..<4
+        val n = timer_irqs[i]
+
+        if n >= 0 && lines & (1 << u32(i)) != 0 then raise(cpu, u32(n))
+
+// A device's half of an access the board's bus sent it, `n` instructions retired before the one
+// making it.
+private[virt] rp_read(cpu: *Cpu, d: Device, a: u32, o: u32, width: u32, n: u64) -> u32
+    hold_rp()
+    bring(clock(cpu, n))
+
+    val held = d == Device.Timer && timer_held()
+    val got = if held then Ok(0u32) else d match
+        Resets -> rp_resets.read(o, width)
+        Watchdog -> rp_watchdog.read(o, width)
+        _ -> rp_timer.read(o, width)
+
+    free_rp()
+
+    if held
+        in_reset(cpu, a)
+        return 0
+
+    got match
+        Ok(v) -> v
+        Err(e) ->
+            refused(cpu, a, e)
+            0
+
+private[virt] rp_write(cpu: *Cpu, d: Device, a: u32, o: u32, width: u32, x: u32, n: u64)
+    hold_rp()
+    bring(clock(cpu, n))
+
+    val held = d == Device.Timer && timer_held()
+    val got = if held then Ok(()) else d match
+        Resets ->
+            val r = rp_resets.write(o, width, x)
+
+            if timer_held() then rp_timer.reset()
+            rp_resets.complete(rp.RESET_BITS)
+            r
+        Watchdog -> rp_watchdog.write(o, width, x)
+        _ -> rp_timer.write(o, width, x)
+    val t = due()
+
+    free_rp()
+
+    if held
+        in_reset(cpu, a)
+        return
+
+    got match
+        Ok(_) -> if t != NEVER then lower_limit(cpu, t - cpu.slept)
+        Err(e) -> refused(cpu, a, e)
+
+private refused(cpu: *Cpu, a: u32, e: rp.AccessError) = halt(cpu, if e == rp.AccessError.Unmapped then Stop.Unmapped else Stop.Fault, a)
+
+private in_reset(cpu: *Cpu, a: u32) = halt(cpu, Stop.Fault, a)

@@ -1,0 +1,255 @@
+module sh.sysl.benchtop.virt
+@tests
+
+// The RP2040's RESETS, TIMER and watchdog tick on a board, as a guest sees them: released from reset,
+// counting the watchdog's ticks of the cores' clock, and an alarm's interrupt taken at the tick it
+// falls due, from WFI or from a running loop.
+
+import sh.sysl.benchtop.v6m.{Cpu, Stop, NVIC_ISER, RAM_BYTES, clock}
+import sh.sysl.rp2040.{resets as rs, timer as tm, watchdog as wd}
+
+// RESET's atomic clear alias.
+const CLEAR: u32 = 0x3000
+
+// The three on a chip of two M0+ cores and the RAM; `without` names one to leave off.
+private rp_board(without: string) -> string
+    var ps = "      ram { peripheral = ram, at = 0x00000000, size = 1M }\n"
+
+    if without != "resets" then ps = s"$ps      resets { peripheral = rp-resets, at = 0x4000C000 }\n"
+    if without != "watchdog" then ps = s"$ps      watchdog { peripheral = rp-watchdog, at = 0x40058000 }\n"
+    s"board {\n  name = rp\n  chip {\n    name = rp, cores = [cortex-m0plus, cortex-m0plus]\n    peripherals {\n$ps      timer { peripheral = rp-timer, at = 0x40054000, irq = [0, 1, 2, 3] }\n    }\n  }\n}\n"
+
+// Thumb's STR, LDR and ADDS with an immediate.
+private str(t: u32, n: u32, offset: u32) -> u16 = u16(0x6000 | ((offset / 4) << 6) | (n << 3) | t)
+private ldr(t: u32, n: u32, offset: u32) -> u16 = u16(0x6800 | ((offset / 4) << 6) | (n << 3) | t)
+private adds(d: u32, imm: u32) -> u16 = u16(0x3000 | (d << 8) | imm)
+
+const WFI: u16 = 0xBF30
+const BKPT: u16 = 0xBE00
+const BX_LR: u16 = 0x4770
+
+// An image whose reset code is `code` at 0x100 and whose IRQ 0 handler is `handler` at 0x200, booted
+// on the board `text` describes, with r1 to r7 as `regs` gives them.
+private booted_rp(cpu: *Cpu, text: string, code: []const u16, handler: []const u16, r: [7]u32)
+    on_board("rp.hocon", text.bytes)
+
+    var image: [0x240]u8
+    val at: [3]int = [0, 4, 0x40]
+    val words: [3]u32 = [RAM_BYTES, 0x101, 0x201]
+
+    for i in 0..<image.len do image[i] = 0
+    for k in 0..<3
+        for i in 0..<4 do image[at[k] + i] = u8(words[k] >> (i * 8) & 0xFF)
+    for i in 0..<code.len
+        image[0x100 + 2 * i] = u8(code[i] & 0xFF)
+        image[0x101 + 2 * i] = u8(code[i] >> 8)
+    for i in 0..<handler.len
+        image[0x200 + 2 * i] = u8(handler[i] & 0xFF)
+        image[0x201 + 2 * i] = u8(handler[i] >> 8)
+
+    open_console()
+    capture()
+    boot(cpu, image[..])
+    for i in 0..<7 do cpu.r[i + 1] = r[i]
+// The registers every program here starts with: RESET's clear alias and the timer's bit, the
+// watchdog and TICK enabled at 12 cycles, the timer, 1, and the NVIC's set-enable register.
+private regs() -> [7]u32 = [rs.BASE + CLEAR, rs.RESET_TIMER_MASK, wd.BASE, wd.TICK_ENABLE_MASK | 12, tm.BASE, 1, NVIC_ISER]
+
+// Release the timer, start the tick, enable IRQ 0 and alarm 0's interrupt, and arm alarm 0 100 ticks
+// from now in r0.
+private arm() -> [7]u16 = [str(2, 1, 0), str(4, 3, wd.TICK_OFFSET), str(6, 7, 0), str(6, 5, tm.INTE_OFFSET),
+    ldr(0, 5, tm.TIMERAWL_OFFSET), adds(0, 100), str(0, 5, tm.ALARM0_OFFSET)]
+
+// The handler: acknowledge alarm 0 and read the time into r4.
+private ack() -> [4]u16 = [0x2001, str(0, 5, tm.INTR_OFFSET), ldr(4, 5, tm.TIMERAWL_OFFSET), BX_LR]
+
+@test("a guest that arms an alarm and sleeps wakes in its handler at the tick it set, 12 clocks a tick")
+rp_alarm_wakes_wfi()
+    val cpu = core0()
+    val a = arm()
+    val h = ack()
+    val code: [10]u16 = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], WFI, ldr(1, 5, tm.TIMERAWL_OFFSET), BKPT]
+
+    booted_rp(cpu, rp_board(""), code[..], h[..], regs())
+    run_board(cpu)
+
+    assert(cpu.stop == Stop.Breakpoint && cpu.pc == 0x112, f"${cpu.stop} at 0x${cpu.pc}%08x")
+    assert(cpu.r[0] >= 100 && cpu.r[4] == cpu.r[0], s"alarm ${cpu.r[0]}, handler read ${cpu.r[4]}")
+    assert(cpu.r[1] == cpu.r[0], s"read ${cpu.r[1]} after waking")
+    // The sleep was skipped, not run, and the clock is 12 a tick.
+    assert(cpu.slept > 1000 && clock(cpu, cpu.retired) / 12 == u64(cpu.r[0]), s"clock ${clock(cpu, cpu.retired)}")
+    assert(rp_timer.raw == 0 && rp_timer.armed == 0, "the handler acknowledged the alarm")
+
+@test("an alarm due while the core runs a loop alone is taken at its tick, not at the end of the run")
+rp_alarm_interrupts_a_loop()
+    val cpu = core0()
+    val a = arm()
+    // A branch to the next instruction, so the run the NVIC's write cut ends before the alarm is
+    // armed; then a loop of 65,280 SUBS and BNE, then a breakpoint the handler's comes before.
+    val code: [13]u16 = [a[0], a[1], a[2], a[3], 0xE7FF, a[4], a[5], a[6], 0x27FF, 0x023F, 0x3F01, 0xD1FD, BKPT]
+    val h: [4]u16 = [0x2001, str(0, 5, tm.INTR_OFFSET), ldr(4, 5, tm.TIMERAWL_OFFSET), BKPT]
+
+    booted_rp(cpu, rp_board(""), code[..], h[..], regs())
+    run_board(cpu)
+
+    assert(cpu.stop == Stop.Breakpoint && cpu.pc == 0x206, f"${cpu.stop} at 0x${cpu.pc}%08x")
+    // The tick starts at 0 one instruction before the alarm is set, so the alarm is 100; the handler's
+    // breakpoint leaves its own r0.
+    assert(cpu.r[4] == 100, s"handler read ${cpu.r[4]}")
+    assert(cpu.slept == 0 && clock(cpu, cpu.retired) / 12 == 100, s"clock ${clock(cpu, cpu.retired)}")
+
+// Two cores on the board, core 0's code at 0x100 and core 1's at 0x200, both with IRQ 0's handler at
+// 0x300, and both started with `regs()`; on a thread each where `parallel`.
+private pair_on_rp(cpu: *Cpu, zero: []const u16, one: []const u16, handler: []const u16, parallel: bool)
+    on_board("rp.hocon", rp_board("").bytes)
+
+    var b = image([(0x100, zero), (0x200, one), (0x300, handler)])
+
+    put32(&b, 0x40, 0x301)
+    open_console()
+    capture()
+    boot(cpu, b.view())
+    launch(0, 0x7000, 0x201)
+
+    val r = regs()
+
+    for i in 0..<7
+        cpu.r[i + 1] = r[i]
+        core1().r[i + 1] = r[i]
+
+    if parallel then set_threads()
+
+@test("with core 0 asleep for good, core 1's alarm wakes core 1 at its tick, on one thread and on two")
+rp_alarm_wakes_core1()
+    val cpu = core0()
+    val a = arm()
+    val h = ack()
+    val one: [10]u16 = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], WFI, ldr(1, 5, tm.TIMERAWL_OFFSET), BKPT]
+
+    for parallel in [false, true]
+        pair_on_rp(cpu, SLEEPER[..], one[..], h[..], parallel)
+
+        val stopped = run_board(cpu)
+
+        assert(stopped == core1() && stopped.stop == Stop.Breakpoint && stopped.pc == 0x212, f"${stopped.stop} at 0x${stopped.pc}%08x")
+        assert(stopped.r[0] >= 100 && stopped.r[4] == stopped.r[0] && stopped.r[1] == stopped.r[0], s"alarm ${stopped.r[0]}, handler ${stopped.r[4]}, after ${stopped.r[1]}")
+        assert(cpu.sleeping, "core 0 never woke")
+
+@test("core 0 asleep on its alarm wakes at its tick while core 1 spins, on one thread and on two")
+rp_alarm_wakes_core0()
+    val cpu = core0()
+    val a = arm()
+    val zero: [8]u16 = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], WFI]
+    val h: [4]u16 = [0x2001, str(0, 5, tm.INTR_OFFSET), ldr(4, 5, tm.TIMERAWL_OFFSET), BKPT]
+    val spin: [1]u16 = [0xE7FE]
+
+    for parallel in [false, true]
+        pair_on_rp(cpu, zero[..], spin[..], h[..], parallel)
+
+        val stopped = run_board(cpu)
+
+        assert(stopped == cpu && cpu.stop == Stop.Breakpoint && cpu.pc == 0x306, f"${cpu.stop} at 0x${cpu.pc}%08x")
+        // On one thread the alarm is 100 ticks from 0, and core 0 takes it at that tick exactly. On
+        // two, core 1 may run up to the lag bound (4000 clocks) ahead, bringing the shared timer with
+        // it: the alarm is then 100 ticks from where core 1 had it, core 0 wakes at that tick by its
+        // own clock, and its handler reads the timer within the lag bound of its clock.
+        val woke = clock(cpu, cpu.retired) / 12
+        val read = u64(cpu.r[4])
+        val lag: u64 = 4000 / 12 + 1
+
+        if parallel
+            assert(woke >= 100 && woke <= 100 + lag && read >= woke && read <= woke + lag, s"handler $read at tick $woke")
+        else
+            assert(read == 100 && woke == 100, s"handler $read at tick $woke")
+        assert(core1().stop == Stop.Budget, "core 1 still spinning")
+
+@test("an alarm whose interrupt the core has not enabled cannot wake it, and the board stops asleep")
+rp_alarm_not_enabled()
+    val cpu = core0()
+    val a = arm()
+    val h = ack()
+    // Alarm 0's interrupt on, IRQ 0 left off in the NVIC.
+    val code: [8]u16 = [a[0], a[1], a[3], a[4], a[5], a[6], WFI, BKPT]
+
+    booted_rp(cpu, rp_board(""), code[..], h[..], regs())
+    run_board(cpu)
+
+    assert(cpu.stop == Stop.Asleep && cpu.stop_at == 0x10E, f"${cpu.stop} at 0x${cpu.stop_at}%08x")
+
+@test("the timer is held in reset until released, and an access to it then stops the core")
+rp_timer_held()
+    val cpu = core0()
+    val code: [2]u16 = [ldr(0, 5, tm.TIMERAWL_OFFSET), BKPT]
+
+    booted_rp(cpu, rp_board(""), code[..], [], regs())
+    run_board(cpu)
+    assert(cpu.stop == Stop.Fault && cpu.stop_at == tm.BASE + tm.TIMERAWL_OFFSET, f"${cpu.stop} at 0x${cpu.stop_at}%08x")
+
+    // Read RESET_DONE before and after the release.
+    val done: [5]u16 = [ldr(0, 3, rs.RESET_DONE_OFFSET), str(2, 1, 0), ldr(4, 3, rs.RESET_DONE_OFFSET), ldr(5, 3, rs.RESET_OFFSET), BKPT]
+    var r = regs()
+
+    r[2] = rs.BASE
+    booted_rp(cpu, rp_board(""), done[..], [], r)
+    run_board(cpu)
+    assert(cpu.stop == Stop.Breakpoint, s"${cpu.stop}")
+    assert(cpu.r[0] & rs.RESET_TIMER_MASK == 0 && cpu.r[4] & rs.RESET_TIMER_MASK != 0, f"done 0x${cpu.r[0]}%08x, then 0x${cpu.r[4]}%08x")
+    assert(cpu.r[5] == (0x01FFFFFF & ~rs.RESET_TIMER_MASK), f"RESET 0x${cpu.r[5]}%08x")
+
+@test("setting the timer's bit in RESET again resets the timer's alarms and interrupts")
+rp_timer_reset_again()
+    val cpu = core0()
+    val a = arm()
+    // Arm the alarm, then hold the timer in reset through RESET's set alias, and release it.
+    val code: [10]u16 = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], str(2, 7, 0), str(2, 1, 0), BKPT]
+    var r = regs()
+
+    r[6] = rs.BASE + 0x2000
+    booted_rp(cpu, rp_board(""), code[..], [], r)
+    run_board(cpu)
+    assert(cpu.stop == Stop.Breakpoint, s"${cpu.stop}")
+    assert(rp_timer.armed == 0 && rp_timer.enable == 0 && rp_timer.alarms[0] == 0, "a reset timer")
+
+@test("the timer counts nothing without the watchdog's tick, and runs from the start without RESETS")
+rp_timer_without()
+    val cpu = core0()
+    // Read the time, run 60 instructions, read it again.
+    val code: [7]u16 = [str(4, 3, wd.TICK_OFFSET), ldr(0, 5, tm.TIMERAWL_OFFSET), 0x273C, 0x3F01, 0xD1FD, ldr(1, 5, tm.TIMERAWL_OFFSET), BKPT]
+
+    booted_rp(cpu, rp_board("resets"), code[..], [], regs())
+    run_board(cpu)
+    assert(cpu.stop == Stop.Breakpoint && cpu.r[1] - cpu.r[0] == 10, f"${cpu.stop} at 0x${cpu.stop_at}%08x: ${cpu.r[0]} to ${cpu.r[1]}")
+
+    // No watchdog: TICK is nowhere, so release the timer in its place.
+    var released = code
+
+    released[0] = str(2, 1, 0)
+    booted_rp(cpu, rp_board("watchdog"), released[..], [], regs())
+    run_board(cpu)
+    assert(cpu.stop == Stop.Breakpoint && cpu.r[0] == 0 && cpu.r[1] == 0, s"${cpu.stop}: ${cpu.r[0]} to ${cpu.r[1]}")
+
+@test("the watchdog's TICK reads back ENABLE, CYCLES, RUNNING and the count, and its counter is not there")
+rp_watchdog_registers()
+    val cpu = core0()
+    // Stop the tick, read TICK; start it, read TICK; then touch CTRL.
+    val code: [6]u16 = [str(6, 3, wd.TICK_OFFSET), ldr(0, 3, wd.TICK_OFFSET), str(4, 3, wd.TICK_OFFSET), ldr(1, 3, wd.TICK_OFFSET), ldr(2, 3, wd.CTRL_OFFSET), BKPT]
+
+    booted_rp(cpu, rp_board(""), code[..], [], regs())
+    run_board(cpu)
+    // Written as 1: CYCLES 1, ENABLE clear, so not running.
+    assert(cpu.r[0] & 0x7FF == 1, f"stopped: 0x${cpu.r[0]}%08x")
+    assert((cpu.r[1] & 0x7FF) == (wd.TICK_RUNNING_MASK | wd.TICK_ENABLE_MASK | 12), f"running: 0x${cpu.r[1]}%08x")
+    assert(cpu.r[1] >> wd.TICK_COUNT_SHIFT >= 1 && cpu.r[1] >> wd.TICK_COUNT_SHIFT <= 12, f"count: 0x${cpu.r[1]}%08x")
+    assert(cpu.stop == Stop.Unmapped && cpu.stop_at == wd.BASE + wd.CTRL_OFFSET, f"${cpu.stop} at 0x${cpu.stop_at}%08x")
+
+@test("an atomic alias on a register that takes none stops the core at a fault")
+rp_alias_refused()
+    val cpu = core0()
+    // A SET-alias write to ARMED, after releasing the timer.
+    val code: [3]u16 = [str(2, 1, 0), str(6, 7, tm.ARMED_OFFSET), BKPT]
+    var r = regs()
+
+    r[6] = tm.BASE + 0x2000
+    booted_rp(cpu, rp_board(""), code[..], [], r)
+    run_board(cpu)
+    assert(cpu.stop == Stop.Fault && cpu.stop_at == tm.BASE + 0x2000 + tm.ARMED_OFFSET, f"${cpu.stop} at 0x${cpu.stop_at}%08x")
