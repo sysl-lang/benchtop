@@ -8,8 +8,9 @@ benchtop emulates Cortex-M boards well enough to run, unmodified, the firmware a
 flash onto them: each core on a host thread, a board's display in a Mac window, its UART on a
 terminal, and skiff on every core. It is an interpreter. **JIT: not planned.** It is written in sysl, and part of its job is to stress the language. A gap
 found while writing it is reported, not worked around (Rule 9). A board is a **description**: a HOCON
-file that names its chip or cores, its parts and their wiring, what it exposes, and its view; a
-product is one or more boards and the parts around them (§12). Another board is another
+file that names or writes out its chip (cores, pins and peripherals), its parts and their wiring,
+what it exposes, and its view; a product is one or more boards and the parts around them (§12).
+Another board is another
 description, not another emulator.
 
 **The boards, in order** (decided 2026-10-23):
@@ -833,7 +834,7 @@ executes without the FP, Security and MPU extensions; integer DSP is optional vi
   unaligned access. An unaligned access whose bytes run past the RAM's last byte stops at
   `Unmapped`, as an access off the RAM does, on every core kind.
   These, with the escalation to HardFault and its registers, are a later item.
-- **Undefined in this kind**: the floating-point and coprocessor space, and, with DSP disabled, the DSP extension (`QADD`,
+- **Undefined in this kind**: the coprocessor space other than the floating-point unit a board gives the core (§2.13), and, with DSP disabled, the DSP extension (`QADD`,
   `SADD16`, `SSAT16`, `SMLABB`, the extend-and-adds `SXTAB` and its kin), the Security Extension's
   `TT`, `SG`, `BXNS` and `BLXNS`, `UDF`, and the encodings ARMv8-M calls UNPREDICTABLE that a
   compiler does not emit (SP or the PC where an encoding may not name them, a load writing back to a
@@ -918,7 +919,8 @@ CINC/CINV/CNEG/CSET/CSETM aliases. A single cached operation and shared handler 
 four variants. R15 source operands are ZR, flags including Q are preserved, and a destination
 may overlap a source. SP sources, SP/PC destinations, IT blocks and AL/NV conditions are refused.
 The latter are a constrained-unpredictable case; the chosen stop agrees with QEMU's M55.
-No low-overhead loops, long shifts, Helium/MVE, floating point or PACBTI are claimed. Integer DSP is optional.
+No low-overhead loops, long shifts, Helium/MVE, half-precision arithmetic or PACBTI are claimed; the
+scalar FPv5 unit of §2.13 is. Integer DSP is optional.
 
 `select.c` runs 68 instruction/condition/zero-register cases over 16 x 16 operand values and 12
 flag states and hashes both the result and APSR. QEMU's `mps3-an547` generates `select.qemu`;
@@ -935,6 +937,55 @@ Primary references: Arm DDI0432 (M0), DDI0413 (M1), DDI0337 (M3),
 [M55 TRM 101051](https://documentation-service.arm.com/static/60e2c2fc677cf7536a55dfef),
 [M85 TRM 101924](https://documentation-service.arm.com/static/626967f57e121f01fd22e302),
 and [QEMU's conditional-select translation](https://github.com/qemu/qemu/blob/master/target/arm/tcg/translate.c).
+
+### 2.13 The floating-point extension as built
+
+`fpu = sp` on a core gives it a single-precision unit: FPv4-SP on the M4, FPv5-SP on the M7, M33 and
+the later Mainline models. `fpu = dp` on the M7 (and the v8.1-M models that offer it) gives FPv5 with
+double precision, D0–D15. Without it the coprocessor space is undefined, as before. The state is
+S0–S31 (D`k` being S`2k`:S`2k+1`), FPSCR, and CPACR, FPCCR, FPCAR, FPDSCR and MVFR0–2 in the system
+control space (`v6m/fpu.sysl`).
+
+- **The arithmetic is the host's, under the guest's FPSCR** (`v6m/fpu_exec.sysl`). The host is an
+  Arm too, so an operation rounded in the guest's mode with its flush-to-zero and default-NaN answers
+  what the guest's unit would, NaNs and flags included. Every function computing with a float is
+  `@strict_fp`, so each operation runs where it is written, under the environment then in force, and
+  raises its flags there. A run puts the core's controls on the host before its first instruction
+  and gathers the host's flags into `cpu.fpscr` after its last (`fp_begin`, `fp_end`), so two cores
+  taking turns on one thread each see their own; `VMSR` and `VMRS` do the same mid-run. The
+  multiply-accumulates round twice, as the architecture's do, and the `VFMA` family once.
+- **Flags the host does not raise for the guest's reason are worked out here**: a conversion's
+  invalid (NaN, or past either end, saturating) and inexact (a fraction dropped), and `VCMPE`'s
+  invalid on a quiet NaN. A conversion from fixed point rounds to nearest whatever the mode.
+- **Access** follows CPACR.CP10: none, or privileged-only from unprivileged code, is the UsageFault
+  NOCP, which stops the core at `Fault` on the instruction. The first instruction allowed with
+  FPCCR.ASPEN set and CONTROL.FPCA clear creates a new context: FPCA is set, and FPSCR takes AHP, DN,
+  FZ and RMode from FPDSCR.
+- **Exceptions**: with FPCA set, entry stacks the extended frame — S0–S15, FPSCR and a reserved word
+  after the eight — and EXC_RETURN's bit 4 is clear; the handler starts with FPCA clear. The state is
+  stacked at once rather than lazily, so FPCCR.LSPACT is always 0 and FPCAR names the frame's S0. The
+  return restores them, and FPCA, from bit 4.
+- **Ties to even whatever the mode**: `VRINTN` and `VCVTN` use `llvm.roundeven`, which rounds that
+  way under any FPSCR setting and raises no inexact of its own.
+- **Half precision**: `VCVTB` and `VCVTT` convert between the bottom or top half of an S register
+  and single precision, or double on a `dp` unit, keeping the other half. FPSCR.AHP goes to the
+  host's own control, so the alternative format (no infinities or NaNs; 65536 to 131008 instead)
+  is the host's conversion too. A half operand is never flushed and a half result never is, as on
+  the guest.
+- **Input-denormal**: FPSCR.IDC is the host's flag, raised where flush-to-zero reads a subnormal
+  operand. A compare reads both operands whatever the first is, so a NaN beside a subnormal still
+  raises it.
+
+**The oracles.** Per-instruction tests (`v6m/fp_tests.sysl`) under both executors check results and
+flags at the edges: every rounding mode, NaNs quiet and signalling with and without default-NaN,
+flush-to-zero in and out, saturation, the fixed-point scales, the extended frame. `examples/virt/fpu.c`
+runs 36 instructions (FPv4-SP), 55 (FPv5-SP) and 79 (FPv5-DP) over 24 edge values (16 doubles) under
+all 16 FPSCR settings (32 with AHP for the half-precision conversions, over 24 halves and singles at
+half precision's edges), hashing each result with all of FPSCR; QEMU's M4 (`mps2-an386`), M33 (`mps2-an505`)
+and M7 (`mps2-an500`) wrote `fpu-m4.qemu`, `fpu-m33.qemu` and `fpu-m7.qemu`, and benchtop must match
+every line (`virt/fpu_tests.sysl`). The negating multiply-accumulates (`VMLS`, `VNMLA`, `VNMLS`,
+`VFMS`) depend on a negation in a `@strict_fp` body staying where it is written, so a NaN keeps the
+sign the architecture gives it; the compiler guarantees that.
 
 ## 3. Peripherals: the STM32H747I-DISCO
 
@@ -962,10 +1013,11 @@ breadboard kit's §10.
   and keeps its register block as the generated struct. Behaviour is written against named fields:
   `if cr1.ue && cr1.te`. The offset-to-field dispatch is a `match` the generator also writes, unless the
   reflection probe in §8 shows `T::Fields` can derive it.
-- **A board is a description** in the format of §12: a chip from benchtop's registry (or, for a board
-  with no real chip, its cores), its parts with their places on the bus, parameters and wires, the
-  pins and buses it exposes, and its view. A chip's own memory and devices are the registry's, so a
-  board names the chip rather than listing them. What the H7 adds beyond the format as it stands —
+- **A board is a description** in the format of §12: a chip (`chips/stm32h747.hocon`, its two cores
+  of different models, its banks `PA` to `PK`, and its peripherals at their bases), the board's parts
+  with their parameters and wires, the pins and buses it exposes, and its view. A chip's own memory
+  and devices are the chip's, so a board names the chip rather than listing them. What the H7 adds
+  beyond the format as it stands —
   clocks (HSE 25 MHz, LSE 32.768 kHz), option bytes, supply wiring, the DSI link to a panel — are
   parameters of its chip and board in this design.
 
@@ -1651,12 +1703,13 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
   with its code, the check costs about 3% more host instructions and no measurable cycles, where a
   page-granular one would send every one of those stores down the slow path.
 - **The board is described by `boards/virt.hocon`** (and `boards/virt33.hocon`), built into benchtop
-  as `virt` and `virt33` (§12.5), and `sh.sysl.benchtop.virt` builds the machine from it: each
-  device answers at the `at` and raises the `irq` its part gives, so a description that moves the
-  console (`examples/virt/moved.hocon`) moves it for the guest. `benchtop run` runs a description of
-  two cores of one supported Cortex-M model, a 1 MB `ram` at 0 and at most one `debug-console`
-  and one `virt-sio`, or a product of one such board and nothing outside it; anything else is
-  refused with the reason.
+  as `virt` and `virt33` (§12.5): the chips `chips/virt.hocon` and `chips/virt33.hocon` and nothing
+  beside them. `sh.sysl.benchtop.virt` builds the machine from the chip: each device answers at the
+  `at` and raises the `irq` its peripheral gives, so a chip that moves the console
+  (`examples/virt/moved.hocon`) moves it for the guest. `benchtop run` runs a board with no parts of
+  its own on a chip of two cores of one supported Cortex-M model, a 1 MB `ram` at 0 and at most one
+  `debug-console` and one `virt-sio`, or a product of one such board and nothing outside it;
+  anything else is refused with the reason.
 - **The board** is `sh.sysl.benchtop.virt`: the RAM, and a debug console at `0x4000_0000` — DATA
   (write a byte out; read the next byte typed, or all ones), STATUS (bit 0 a byte is waiting, bit 1
   the input has ended), EXIT (end with this status) and CTRL (bit 0 enables the console's interrupt).
@@ -1725,23 +1778,23 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
 ## 12. Board description format
 
 A description is a HOCON file, read by `sh.sysl.benchtop` (`board.sysl` reads the shape,
-`shelf.sysl` finds the boards it names, `check.sysl` holds it to the registry). Every mistake is
-reported with its line and column, all of them at once, and checking goes on past each one.
+`shelf.sysl` finds the chips and boards it names, `chip.sysl` holds a chip to the library and
+`check.sysl` a board or a product). Every mistake is reported with its line and column, all of them
+at once, and checking goes on past each one.
 
 ### 12.1 Three levels
 
-- **A chip** is built into benchtop's registry (`registry.sysl`): `rp2040`, `rp2350`. It holds its
-  cores, its pins `GP0` up to the last, its ADC pins, and its bus controllers with the pins each
-  signal can be routed to. A description names a chip; it never describes one. §12.11 replaces
-  this: a chip becomes a description of its own, named or written out as a board is, and the only
-  level with `peripherals`.
-- **A board** is a chip — or, for a board with no real chip, `cores = [...]` — with the parts
-  soldered to it, the pins and buses it **exposes** to whatever it is plugged into, and its `view`.
+- **A chip** is what is inside the package: its `cores`, its `pins` by bank, and its `peripherals`,
+  everything on the cores' bus (§12.11). It is named (`chip = rp2350`) or written out (`chip { ...
+  }`); `chips/` holds the ones built in.
+- **A board** is a chip with the `parts` soldered beside it, the pins and buses it **exposes** to
+  whatever it is plugged into, and its `view`.
 - **A product** is one or more boards, each an instance with a name of its own, the parts outside
   them wired to what they expose, and a `view` of the whole, which replaces the boards' views
   (§12.11 lets it show a board's own view where the board is not hidden in a case).
 
-A file's top level is exactly one of `board { ... }`, `board = <name or path>`, or `product { ... }`.
+A file's top level is exactly one of `chip { ... }`, `chip = <name or path>`, `board { ... }`,
+`board = <name or path>`, or `product { ... }`.
 
 ### 12.2 A board
 
@@ -1782,9 +1835,11 @@ board {
 }
 ```
 
-Its settings are `name` (required), exactly one of `chip` and `cores`, and `parts`, `buses`,
-`exposes`, `view` and `input`, each optional. A part is `<name> { part = <library part>, <parameter>
-= <value>, ..., wire { <port> = <target> } }`. A wire's target is a pin of the chip (`GP16`), one of
+Its settings are `name` and `chip` (both required), and `parts`, `buses`, `exposes`, `view` and
+`input`, each optional; `cores`, `pins` and `peripherals` are the chip's, and a board that writes one
+is told so. A part is `<name> { part = <library part>, <parameter> = <value>, ..., wire { <port> =
+<target> } }`. A pin is spelled as capital letters and digits (`GP16`, `PA9`), so a wire's target is
+told apart by its spelling: a pin of the chip (`GP16`), one of
 its buses (`spi0`), whose signals `buses { spi0 { sck = GP2, tx = GP3 } }` routes to pins, or a pin
 another part offers (`wifi.gpio0`, the CYW43439's GPIO driving the Pico 2 W's LED). A parameter is
 held to its part's type: a whole number in a range, a number, text, `true`/`false`, or one of a list;
@@ -1792,7 +1847,7 @@ held to its part's type: a whole number in a range, a number, text, `true`/`fals
 
 ### 12.2.1 Per-core configuration and defaults
 
-Each entry of `cores` is either a core name or an object with `core = <name>` and optional
+Each entry of a chip's `cores` is either a core name or an object with `core = <name>` and optional
 `dsp`, `fpu`, `mpu_regions`, `security`, `icache`, `dcache`, `nvic_priority_bits`. Names remain
 shorthand for the current emulated integer configuration. Defaults are DSP on for the M4 and M7,
 which always have it (`dsp = false` is refused for them), and off elsewhere, FPU `none`, zero
@@ -1800,16 +1855,16 @@ MPU regions, security `none`, caches off, and two priority bits on M0/M0+/M1/M23
 Only explicitly written settings are serialized, so defaults are applied by core model on read.
 
 The checker validates scalar types, the options allowed by the model and their ranges. It can
-describe hardware features not yet emulated; machine assembly refuses enabled FPU, MPU,
-TrustZone or caches by name. NVIC priority width is implemented independently per core (Baseline models have
+describe hardware features not yet emulated; machine assembly refuses enabled MPU,
+TrustZone or caches by name, and gives a core the floating-point unit `fpu` names (§2.13). NVIC priority width is implemented independently per core (Baseline models have
 2, Mainline models 3–8), and reapplied when core 1 leaves its boot ROM. Integer DSP can be enabled independently on each capable core and is also reapplied on launch.
 Existing board descriptions preserve their behavior.
 
 An object's options are independent of every other core. Duplicate fields are errors at the
 second key's source span, including objects inside the cores array. Summaries show explicit
 settings rather than collapsing two differently configured cores into one description.
-The README's core-options table gives the accepted model-specific values. Chip-integrated
-cores remain defined by the chip model; a board cannot override its chip by also naming `cores`.
+The README's core-options table gives the accepted model-specific values. A board's cores are its
+chip's; a board that also names `cores` is told they belong to the chip.
 
 Integer DSP uses the shared Thumb-2 decoder and 16-byte records. `dsp.sysl` implements the
 36 parallel add/subtract forms, QADD/QSUB/QDADD/QDSUB, SSAT16/USAT16, SEL, PKHBT/PKHTB,
@@ -1900,7 +1955,7 @@ A product may hold two boards of one kind under two names, each wired on its own
 ### 12.4 Exposure and qualified wiring
 
 A board says what its header carries: `exposes { pins = [...], buses = [...] }`, by their names on
-the chip. A board with no chip exposes nothing. A product's part reaches a board only through a
+the chip. A board on a chip with no pins, as `virt`, exposes none. A product's part reaches a board only through a
 qualified name, `<instance>.<pin or bus>`: `pico.GP15`, `pico.spi0`. A product's `buses` routes an
 exposed bus's signals to exposed pins of the same board (`pico.spi0 { sck = GP2 }`), and a part's bus
 port uses an exposed bus only once `buses` routes it. Each board's pins are its own: `left.GP15`
@@ -1910,16 +1965,19 @@ use may still be exposed, as an Arduino's D13 is its LED's, but the product cann
 dotted name whose first half is one of the product's parts is a pin that part offers, as on a board.
 A product's view shows its own parts by name and a board's as `<instance>.<part>` (`pico.led`).
 
-### 12.5 Bundled boards, and naming one
+### 12.5 Bundled chips and boards, and naming one
 
-`virt`, `virt33`, `pico`, `pico2w` and `pico-breadboard-kit` (a product) are embedded in the
-`benchtop` binary. **A name with a `/` in it, or ending in `.hocon`, is a file; any other name is
-built in.** The rule is the same for `board = <name>` at the top of a file, a product's `board =
-<name>`, and the command line, so `--board virt` is always the built-in board even with a file called `virt` in the
-current directory, which is `./virt`. A path is read relative to the directory of the file that
-names it (absolute paths as they stand). A board named this way is read and checked on its own; its
-mistakes are reported as one, at the name, with its own report as the note. A one-liner is written
-back as its name.
+The boards `virt`, `virt33` and the other `virt*`, `pico`, `pico2w` and `pico-breadboard-kit` (a
+product), and the chips `virt`, `virt33` and the other `virt*`, `rp2040` and `rp2350`, are embedded
+in the `benchtop` binary from `boards/` and `chips/`. **A name with a `/` in it, or ending in
+`.hocon`, is a file; any other name is built in.** The rule is the same for `board = <name>` and
+`chip = <name>` at the top of a file, a board's `chip = <name>`, a product's `board = <name>`, and
+the command line, so `--board virt` is always the built-in board even with a file called `virt` in
+the current directory, which is `./virt`. Chips and boards are named apart: the chip `virt` is not
+the board `virt`, and naming a board where a chip goes (or the reverse) is a mistake that says which
+it is. A path is read relative to the directory of the file that names it (absolute paths as they
+stand). A chip or board named this way is read and checked on its own; its mistakes are reported as
+one, at the name, with its own report as the note. A one-liner is written back as its name.
 
 ### 12.6 Overrides
 
@@ -1946,34 +2004,46 @@ its glass, turned with `rotate`. `input { keys { <key> = <part>[.<control>] }, p
 <part> } }` binds host keys to a part's controls (a part with one control needs no `.control`) and
 the mouse over an element to a part that takes a point.
 
-### 12.8 Memory-mapped parts
+### 12.8 Peripherals on the cores' bus
 
-A part the cores reach by address — `ram`, `debug-console`, `virt-sio` — has `at` (decimal or
-`0x…`), `size` (decimal, `0x…`, or `64K`/`1M`; fixed for a part whose window is fixed), and, for a
-part that raises one, `irq`. Its address is aligned as the part needs, its window lies in the 32-bit
-space, meets no other part's and stays off the cores' private peripheral bus (`0xE000_0000` to
-`0xE00F_FFFF`), and no two parts share an IRQ, which is below the core's count (32 for an M0+, 480
-for an M33). A part off the bus has none of the three, and neither has a product's own part.
+A chip's peripheral — `ram`, `debug-console`, `virt-sio`, `pl011`, ... — has `at` (decimal or
+`0x…`), `size` (decimal, `0x…`, or `64K`/`1M`; fixed for a peripheral whose window is fixed), and,
+for one that raises interrupts, `irq`: one IRQ, or a list for one that raises several (the RP2040's
+SIO, `irq = [15, 16]`). Its address is aligned as the peripheral needs, its window lies in the
+32-bit space, meets no other's and stays off the cores' private peripheral bus (`0xE000_0000` to
+`0xE00F_FFFF`), and no two share an IRQ, which is below the fewest the chip's cores take (32 for an
+M0+, 480 for an M33). A part has none of the three: a part of the library's peripherals is the
+chip's, and any other is off the bus.
 
 ### 12.9 The diagnostics
 
 Each points at the name or value it is about; `<x>` is the name in the file.
 
-- **The top level.** `the description is neither a board nor a product`; `the description is both
-  a board and a product`; `` `parts` belongs inside `board { ... }` or `product { ... }` `` (for
-  every board or product setting written at the top); `` unknown section `x` ``; `` `board` must be
-  a block, or the name of a board, not a number ``; `` a description is `board { ... }` or `product
-  { ... }`, not an array ``.
-- **Naming a board.** `` unknown board `pico3` `` (with the nearest name); `` cannot read
-  `x.hocon`: <why> ``; `` the board `x` has mistakes ``; `` `pico-breadboard-kit` is a product, and
-  only a board is named here ``; `` `x` is not a board: the boards name each other in a circle ``.
-- **A board.** `the board has no name`; `the board names neither a chip nor its cores`; `the board
-  names both a chip and cores`; `` unknown chip `x` ``; `` unknown core `x` ``; `` `board.cores` must
-  be a list of cores ``, `` names no core ``; `a core is named by a word`.
+- **The top level.** `the description is neither a chip, a board nor a product`; `the description
+  is both a board and a product` (and each other pair); `` `parts` belongs inside `board { ... }` or
+  `product { ... }` `` (for every board or product setting written at the top); `` `peripherals`
+  belongs inside `chip { ... }` `` (and `cores`, `pins`, `summary`); `` unknown section `x` ``; ``
+  `board` must be a block, or the name of a board, not a number `` (and `chip`); `` a description is
+  `chip { ... }`, `board { ... }` or `product { ... }`, not an array ``.
+- **Naming a chip or a board.** `` unknown board `pico3` `` and `` unknown chip `rp2041` `` (with the
+  nearest name); `` cannot read `x.hocon`: <why> ``; `` the board `x` has mistakes `` (and `` the
+  chip ``); `` `pico-breadboard-kit` is a product, and only a board is named here ``; `` `c.hocon` is
+  a chip, and only a board is named here ``; `` `b.hocon` is a board, and only a chip is named here
+  ``; `` `x` is not a board: the boards name each other in a circle `` (and `` not a chip ``).
+- **A board.** `the board has no name`; `the board names no chip`; `` `cores` belongs to the chip ``
+  (and `peripherals`, `pins`).
+- **A chip.** `the chip has no name`; `the chip has no cores`; `` unknown core `x` ``; `` `chip.cores`
+  must be a list of cores ``, `` names no core ``; `a core is named by a word or a block`; `a chip
+  has `peripherals`, not `parts``; `` `gp` is not a bank of pins ``; `` `pins.GP` must be a whole
+  number from 1, the bank's count of pins ``; `` unknown peripheral `x` `` (with a note where it is
+  a part); `` `u` names no peripheral ``; `` `UART0` is spelled as a pin ``; `` `u` (pl011) has no
+  signal `clk` ``; `` `u.signals.tx` names GP4, which the c does not have ``; `` a ram drives no
+  pins, so `r.signals` means nothing ``; `` a ram is not an ADC, so `r.channels` means nothing ``; ``
+  a rp-sio raises 2 interrupts, and `s.irq` gives 1 ``.
 - **Exposure.** `GP30 is not a pin of the rp2040`; `GP0 is exposed twice`; `` `spi0` is exposed
-  twice ``; `` the rp2040 has no bus `spi9` ``; `` `exposes.pins` lists pins such as `GP15`, and `X1`
+  twice ``; `` the rp2040 has no bus `spi9` ``; `` `exposes.pins` lists pins such as `GP15`, and `x1`
   is not one ``; `` `exposes.buses` lists buses such as `spi0` ``; `` `exposes.pins` must be a list
-  ``; `a board with no chip has no pins or buses to expose`.
+  ``. A chip with no pins, as `virt`, makes every exposed pin `GP0 is not a pin of the virt`.
 - **A product.** `the product has no name`; `the product has no boards` (none written, or an empty
   block); `` `p` names no board ``; `` `pico` does not expose GP25 `` (and `` `spi9` ``); ``
   `pico.GP15` is wired twice ``; `` `pcio` is neither a board nor a part of the product ``; ``
@@ -2003,7 +2073,9 @@ Each points at the name or value it is about; `<x>` is the name in the file.
   must be more than 0 ``; `` a ram raises no interrupt, so `ram.irq` means nothing ``; `IRQ 32 is
   beyond the cortex-m0plus's 32 interrupts`; `IRQ 5 is used twice`; `` `c` (...) overlaps `ram`
   (...) ``; `` overlaps the cores' own private peripheral bus ``; `` `ram` runs past the end of the
-  address space ``; `` a led is not on the cores' bus, so `d1.at` means nothing ``.
+  address space ``; `` a led is not on the cores' bus, so `d1.at` means nothing ``; `` `ram` is on
+  the cores' bus, so it is a peripheral of the chip, not a part `` (a board's or a product's part
+  whose library entry is a peripheral).
 - **The view and input.** `the view has no size`; `the view's size must be positive`; `` `view.size`
   must be [width, height], two whole numbers ``; `` the element `e` does not say what it draws ``,
   `` says both `show` and `text` ``, `` has no place in the view ``, `` shows `nope`, which is not a
@@ -2020,22 +2092,27 @@ Each points at the name or value it is about; `<x>` is the name in the file.
 
 ### 12.10 The command line
 
-- `benchtop check <name | file.hocon>` reads a board or a product, prints every mistake and exits 1,
-  or prints what it is: the board's chip or cores, each part with its place, wires and parameters,
-  what it exposes, and its view; for a product, each board instance and then the same.
+- `benchtop check [--chip] <name | file.hocon>` reads a chip, a board or a product, prints every
+  mistake and exits 1, or prints what it is: for a chip, its cores, its pins and each peripheral with
+  its window, IRQs and the pins its signals reach; for a board, its chip, each part with its wires and
+  parameters, what it exposes, and its view; for a product, each board instance and then the same. A
+  name is a board's, or with `--chip` a chip's.
 - `benchtop run [--board <name | file.hocon>] <image>` runs on `virt` where no board is named. It runs
-  a board of two cores of one supported Cortex-M model and the parts benchtop emulates on their bus, or a product of
-  one such board and nothing outside it, and refuses anything else with the reason (`benchtop does not emulate
-  the rp2040`, `benchtop runs one board, and this product has 2`).
+  a board with no parts of its own on a chip of two cores of one supported Cortex-M model whose
+  peripherals benchtop all emulates, or a product of one such board and nothing outside it, and
+  refuses anything else with the reason (`` benchtop does not emulate the rp2040's `rom` (rom) yet
+  ``, `` benchtop does not emulate the parts on a board yet, and `wifi` is a cyw43439 ``, `benchtop
+  runs one board, and this product has 2`, and a chip file: `` this is the chip `virt`, and benchtop
+  runs a board ``).
 - `benchtop render` — drawing a description's view to an image — comes with the window (§4).
 
 ### 12.11 The chip as a description
 
-**Design; the checker still reads §12.1–12.10's form**, where a board names a registry chip or lists
-its own `cores`, and a part on the cores' bus is one of the board's `parts` with an `at`.
+**Built, except where marked**: the product's view showing a board whole is design, and the
+questions at the end are open.
 
-**What it changes.** The MCU is a level of its own between the cores and the board, and it is where
-everything on the cores' bus lives. Each level has one kind of content:
+**The MCU is a level of its own between the cores and the board**, and it is where everything on
+the cores' bus lives. Each level has one kind of content:
 
 | level | holds | named or written out |
 |---|---|---|
@@ -2120,9 +2197,10 @@ chip {
   parameters and their types, and — for one with pins — its signals and its bus kind.
 - **The machine is built from the chip**: each core as §12.2.1 configures it, and each peripheral at
   its `at` with its `irq`s. `benchtop run` refuses a chip with a peripheral benchtop does not
-  emulate, by name: `` benchtop does not emulate the rp2350's `uart0` (pl011) ``.
+  emulate, by name (`` benchtop does not emulate the rp2350's `rom` (rom) yet ``), and a board with
+  parts of its own, which nothing emulates yet.
 
-**A product's view takes precedence, and shows a board's view where the board can be seen.** A board
+**Design: a product's view takes precedence, and shows a board's view where the board can be seen.** A board
 may sit inside the product's case, or in the open — a Pico in the breadboard kit's socket. So the
 product's view is what is drawn, and its elements may show a board instance as a whole: `pico {
 show = pico, at = [124, 54] }` draws the board's own view there at its own size, with the board's elements in it,
@@ -2132,13 +2210,7 @@ case's window shows an LED. A product with no `view` shows each board's view, si
 order the boards are written. A board shown whole and one of its parts shown alone is refused: ``
 `pico.led` is already drawn in `pico`'s view ``.
 
-**New diagnostics.** `` `ram` is on the cores' bus, so it is a peripheral of the chip, not a part ``
-(at a board's or a product's part that has `at`, or whose library entry is a peripheral); `` `led`
-is not on the cores' bus, so it is a part of the board, not a peripheral `` ; `` `cores` belongs to
-the chip ``; `the board names no chip`; `the chip has no name`; `the chip has no cores`; `` unknown
-chip `rp2530` `` (with the nearest name); `` `x` is a board, and only a chip is named here `` (and
-the converse); `` `pins.GP` must be a whole number from 1 ``; `` `uart0.signals.tx` names `GP40`,
-which the rp2350 does not have ``; `` `p` names no peripheral ``.
+The chip's diagnostics are §12.9's **A chip** and **The bus**.
 
 **Still to decide.**
 - **Overriding a named chip.** A product overrides a board's part parameters (§12.6); a board may

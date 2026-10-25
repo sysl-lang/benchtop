@@ -102,9 +102,19 @@ scs_read8(cpu: *Cpu, a: u32) -> u32
         SCB_SHPR1 -> u32(cpu.prio[MEM_MANAGE]) | u32(cpu.prio[BUS_FAULT]) << 8 | u32(cpu.prio[USAGE_FAULT]) << 16
         SCB_SHCSR -> cpu.shcsr | (bit_of(cpu.active, SVCALL) << 7) | (bit_of(cpu.active, PENDSV) << 10) | (bit_of(cpu.active, SYSTICK) << 11) | (bit_of(cpu.pending, SVCALL) << 15)
         SCB_CFSR | SCB_HFSR | SCB_MMFAR | SCB_BFAR -> 0
-        // No coprocessor: every CPACR field reads as "no access".
-        SCB_CPACR -> 0
+        // Without the floating-point extension, every CPACR field reads as "no access".
+        SCB_CPACR -> cpu.cpacr
         _ ->
+            if cpu.fpu != FP_NONE
+                a match
+                    FP_FPCCR -> return cpu.fpccr
+                    FP_FPCAR -> return cpu.fpcar
+                    FP_FPDSCR -> return cpu.fpdscr
+                    FP_MVFR0 -> return fp_feature(cpu, 0)
+                    FP_MVFR1 -> return fp_feature(cpu, 1)
+                    FP_MVFR2 -> if fpv5(cpu) then return fp_feature(cpu, 2)
+                    _ -> ()
+
             halt(cpu, Stop.Unmapped, a)
             0
 
@@ -128,9 +138,20 @@ scs_write8(cpu: *Cpu, a: u32, x: u32)
         SCB_SHCSR -> cpu.shcsr = x & 0x000F0000
         // Write-one-to-clear registers of faults that are never recorded.
         SCB_CFSR | SCB_HFSR | SCB_MMFAR | SCB_BFAR -> ()
-        SCB_CPACR -> ()
+        // CP10 and CP11, where the core has a unit to give access to.
+        SCB_CPACR ->
+            if cpu.fpu != FP_NONE then cpu.cpacr = x & 0x00F00000
+            cpu.fp_ready = false
         // A software trigger: the interrupt becomes pending.
         NVIC_STIR -> if x & 0x1FF < 32 then cpu.pending |= u64(1) << (IRQ0 + (x & 0x1FF))
+        // FPCCR keeps ASPEN and LSPEN: the state is preserved eagerly, so nothing is ever pending
+        // (LSPACT and the rest read 0). FPCAR is a doubleword address, and FPDSCR holds the
+        // defaults a new context's FPSCR takes: AHP, DN, FZ and RMode.
+        FP_FPCCR if cpu.fpu != FP_NONE ->
+            cpu.fpccr = x & 0xC0000000
+            cpu.fp_ready = false
+        FP_FPCAR if cpu.fpu != FP_NONE -> cpu.fpcar = x & ~7
+        FP_FPDSCR if cpu.fpu != FP_NONE -> cpu.fpdscr = x & FPSCR_CONTROLS
         _ -> halt(cpu, Stop.Unmapped, a)
 
 // ---------------------------------------------------------------------------------------------------
@@ -158,8 +179,8 @@ mrs8(cpu: *Cpu, ip: *Insn)
 
 // `MSR`. A stack pointer keeps bits 31–2 and a limit bits 31–3. BASEPRI keeps the implemented bits,
 // and BASEPRI_MAX writes it only to raise the priority (a lower non-zero value). FAULTMASK cannot be
-// set from the NMI handler. CONTROL is nPRIV and SPSEL, SPSEL only in thread mode; FPCA, of the
-// floating-point extension, reads as 0. APSR takes N, Z, C, V and Q (`MSR APSR_nzcvq`), with
+// set from the NMI handler. CONTROL is nPRIV and SPSEL, SPSEL only in thread mode, and FPCA where the
+// core has the floating-point extension. APSR takes N, Z, C, V and Q (`MSR APSR_nzcvq`), with
 // set_apsr's one limit: N and Z both set reads back as Z.
 msr8(cpu: *Cpu, ip: *Insn)
     val x = cpu.r[ip.b]
@@ -181,12 +202,16 @@ msr8(cpu: *Cpu, ip: *Insn)
         19 ->
             if cpu.ipsr != NMI then cpu.faultmask = x & 1
         20 ->
+            val fpca = if cpu.fpu != FP_NONE then x & 4 else 0
+
+            cpu.fp_ready = false
+
             if cpu.ipsr != 0
-                cpu.control = (cpu.control & 2) | (x & 1)
+                cpu.control = (cpu.control & 2) | (x & 1) | fpca
             else
                 val was = on_process_stack(cpu)
 
-                cpu.control = x & 3
+                cpu.control = (x & 3) | fpca
 
                 if on_process_stack(cpu) != was
                     val sp = cpu.r[13]
