@@ -1,4 +1,4 @@
-// The virtual board's debug console (sh.sysl.cortical.virt), and the start-up every program shares.
+// The virtual board's debug console (sh.sysl.benchtop.virt), and the start-up every program shares.
 
 #ifndef VIRT_H
 #define VIRT_H

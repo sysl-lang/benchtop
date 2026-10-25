@@ -1,0 +1,356 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// The M33's exception model and system registers, against the ARMv8-M ARM ("ExceptionEntry",
+// "ExceptionReturn", "ExecutionPriority", the stack-limit checks, the System Control Block): ITSTATE
+// across an exception, BASEPRI, BASEPRI_MAX, FAULTMASK and PRIGROUP, the stack limits, the registers
+// MRS and MSR reach, the encodings this kind leaves undefined, the exclusive monitor across an
+// exception, and code rewritten under an IT. Every guest case runs under both executors, which must
+// agree on the exception state as well (exceptions.sysl's machine, made an M33).
+
+// `run_both` on an M33, also requiring the executors to agree on ITSTATE, Q, the masks and the
+// limits.
+run_both8(code: []const u16, regs: []const u32, nzcv: u32, handlers: [][2]u32, setup: Setup) -> Cpu
+    run_both_thumb2(Kind.V8mMain, code, regs, nzcv, handlers, setup)
+
+// The exception machinery shared by ARMv7-M and ARMv8-M Mainline.
+run_both_thumb2(kind: Kind, code: []const u16, regs: []const u32, nzcv: u32, handlers: [][2]u32, setup: Setup) -> Cpu
+    var a: Cpu
+    var b: Cpu
+    var words: [(HIGH - LOW) / 4]u32
+
+    a.kind = kind
+    b.kind = kind
+
+    machine(&a, code, regs, nzcv, handlers, setup)
+    finish(&a, &run_match)
+    for i in 0..<words.len do words[i] = load32(&a, LOW + u32(i) * 4)
+
+    machine(&b, code, regs, nzcv, handlers, setup)
+    finish(&b, &run_threaded)
+
+    for i in 0..<16 do assert(a.r[i] == b.r[i], s"the executors agree on r$i")
+    assert(flags(&a) == flags(&b) && a.q == b.q, "the executors agree on the flags")
+    assert(a.stop == b.stop && a.stop_at == b.stop_at && a.retired == b.retired && a.pc == b.pc, "and on the stop")
+    assert(a.ipsr == b.ipsr && a.control == b.control && a.primask == b.primask && a.sp_other == b.sp_other, "and on the modes")
+    assert(a.basepri == b.basepri && a.faultmask == b.faultmask && a.msplim == b.msplim && a.psplim == b.psplim, "and on the masks")
+    assert(a.pending == b.pending && a.active == b.active && a.it == b.it, "and on the exceptions")
+    for i in 0..<words.len do assert(words[i] == load32(&b, LOW + u32(i) * 4), "and on memory")
+
+    b
+
+const LDR_R0_SP_28: u16 = 0x9807
+const STR_R0_SP_28: u16 = 0x9007
+const LOG_9: u16 = 0x2009
+
+// A handler that logs the xPSR its exception stacked: ldr r0, [sp, #28]; stmia r4!, {r0}; bx lr.
+val LOG_XPSR: [3]u16 = [LDR_R0_SP_28, LOG_R0, BX_LR]
+
+// IRQ 0 enabled and pending.
+irq0_pending(cpu: *Cpu)
+    store32(cpu, NVIC_ISER, 1)
+    store32(cpu, NVIC_ISPR, 1)
+
+// ---------------------------------------------------------------------------------------------------
+// ITSTATE across an exception.
+
+@test("SVC inside an IT block stacks the ITSTATE of the instruction after it, and the block resumes under it")
+t2e_svc_in_block()
+    // 0: cmp r0, r0; itte eq; svceq #0; addeq r1, #1; addne r2, #1; bkpt; 12: the handler
+    val code: []const u16 = [0x4280, 0xBF06, SVC, 0x3101, 0x3201, BKPT, LOG_XPSR[0], LOG_XPSR[1], LOG_XPSR[2]]
+    var c = run_both8(code, [0, 0, 0, 0, LOG], 0, [[SVCALL, 12]], &nothing)
+
+    // ITTE EQ is 0x06, and after the SVC 0x0C: IT[7:2] = 3 in bits 15–10, with Z, C and T.
+    assert(logged(&c, [0x61000C00]), "the stacked xPSR")
+    assert(c.r[1] == 1 && c.r[2] == 0 && c.retired == 8 && c.it == 0, "the block went on as it was")
+
+@test("an exception return goes on with the ITSTATE its frame holds, even one the handler rewrote")
+t2e_rewritten_itstate()
+    // As above, the handler flipping IT[4] (xPSR bit 12): ldr r0, [sp, #28]; eor.w r0, r0, #0x1000;
+    // str r0, [sp, #28]; bx lr. The ADDEQ after the SVC becomes an ADDNE, and Z is set.
+    val code: []const u16 = [0x4280, 0xBF06, SVC, 0x3101, 0x3201, BKPT, LDR_R0_SP_28, 0xF480, 0x5080, STR_R0_SP_28, BX_LR]
+    var c = run_both8(code, [], 0, [[SVCALL, 12]], &nothing)
+
+    assert(c.r[1] == 0 && c.r[2] == 0 && c.stop == Stop.Breakpoint, "both of the rest skipped")
+
+@test("an interrupt taken inside a block, where an MSR unmasks it, stacks the ITSTATE there and resumes the block")
+t2e_irq_in_block()
+    // PRIMASK set and IRQ 0 pending. 0: cmp r0, r0; itete eq; msreq primask, r5 (r5 = 0);
+    // addne r1, #1; addeq r2, #1; addne r3, #1; bkpt; 16: the handler.
+    val code: []const u16 = [0x4280, 0xBF0B, 0xF385, 0x8810, 0x3101, 0x3201, 0x3301, BKPT, LOG_XPSR[0], LOG_XPSR[1], LOG_XPSR[2]]
+    var c = run_both8(code, [0, 0, 0, 0, LOG], 0, [[IRQ0, 16]], &masked_irq0)
+
+    // ITETE EQ is 0x0B, and after the MSR 0x16: IT[1:0] = 2 in bits 26–25, IT[7:2] = 5 in 15–10.
+    assert(logged(&c, [0x65001400]), "the stacked xPSR")
+    assert(c.r[1] == 0 && c.r[2] == 1 && c.r[3] == 0, "the rest of the block")
+
+masked_irq0(cpu: *Cpu)
+    irq0_pending(cpu)
+    cpu.primask = 1
+
+@test("the exclusive monitor is clear after an exception, so a STREX across one fails")
+t2e_monitor_across()
+    // ldrex r0, [r1]; svc #0; strex r2, r0, [r1]; bkpt; 10: bx lr
+    val code: []const u16 = [0xE851, 0x0F00, SVC, 0xE841, 0x0200, BKPT, BX_LR]
+    var c = run_both8(code, [0, 0x1000, 9], 0, [[SVCALL, 12]], &nothing)
+
+    assert(c.r[2] == 1, "the STREX failed")
+
+// ---------------------------------------------------------------------------------------------------
+// BASEPRI, BASEPRI_MAX, FAULTMASK, PRIGROUP.
+
+// IRQ 0 pending at priority 0x40, set with a byte store as CMSIS does, and BASEPRI 0x40.
+held_by_basepri(cpu: *Cpu)
+    irq0_pending(cpu)
+    store8(cpu, NVIC_IPR, 0x40)
+    cpu.basepri = 0x40
+
+@test("BASEPRI holds off an interrupt of its own priority, and lowering the mask's priority lets it in")
+t2e_basepri()
+    // movs r0, #1; log; msr basepri, r2 (0x80); movs r0, #2; log; bkpt; 14: movs r0, #9; log; bx lr
+    val code: []const u16 = [0x2001, LOG_R0, 0xF382, 0x8811, 0x2002, LOG_R0, BKPT, LOG_9, LOG_R0, BX_LR]
+    var c = run_both8(code, [0, 0, 0x80, 0, LOG], 0, [[IRQ0, 14]], &held_by_basepri)
+
+    assert(logged(&c, [1, 9, 2]), "taken at the MSR")
+    assert(c.basepri == 0x80, "BASEPRI as written")
+
+@test("BASEPRI_MAX only raises the priority, and MRS reads BASEPRI back")
+t2e_basepri_max()
+    // msr basepri_max, r1 (0x80); mrs r0, basepri; log; msr basepri_max, r2 (0x20); mrs r0, basepri; log
+    val code: []const u16 = [0xF381, 0x8812, 0xF3EF, 0x8011, LOG_R0, 0xF382, 0x8812, 0xF3EF, 0x8011, LOG_R0]
+    var c = run_both8(code, [0, 0x80, 0x20, 0, LOG], 0, [], &basepri_40)
+
+    assert(logged(&c, [0x40, 0x20]), "kept, then raised")
+
+basepri_40(cpu: *Cpu)
+    cpu.basepri = 0x40
+
+faultmask_set(cpu: *Cpu)
+    irq0_pending(cpu)
+    cpu.faultmask = 1
+
+@test("FAULTMASK holds off every interrupt until CPSIE F, and the return from the exception clears it")
+t2e_faultmask()
+    // movs r0, #1; log; cpsie f; movs r0, #2; log; mrs r0, faultmask; log; bkpt;
+    // 18: cpsid f; movs r0, #9; log; bx lr
+    val code: []const u16 = [0x2001, LOG_R0, 0xB661, 0x2002, LOG_R0, 0xF3EF, 0x8013, LOG_R0, BKPT, 0xB671, LOG_9, LOG_R0, BX_LR]
+    var c = run_both8(code, [0, 0, 0, 0, LOG], 0, [[IRQ0, 18]], &faultmask_set)
+
+    assert(logged(&c, [1, 9, 2, 0]), "taken at CPSIE F, and FAULTMASK clear after the return")
+
+// IRQ 1 pending at 0x60 and IRQ 0 enabled at 0x40, with AIRCR.PRIGROUP `group`.
+grouped(cpu: *Cpu, group: u32)
+    store32(cpu, NVIC_ISER, 3)
+    store32(cpu, NVIC_ISPR, 2)
+    store32(cpu, NVIC_IPR, 0x6040)
+    store32(cpu, SCB_AIRCR, 0x05FA0000 | (group << 8))
+
+grouped_0(cpu: *Cpu) = grouped(cpu, 0)
+
+grouped_5(cpu: *Cpu) = grouped(cpu, 5)
+
+@test("AIRCR.PRIGROUP: priorities 0x40 and 0x60 preempt in group 0 and are one group under PRIGROUP 5")
+t2e_prigroup()
+    // nop; bkpt; 4: IRQ 1's handler, pending IRQ 0: str r6, [r5]; isb; movs r0, #1; log; bx lr;
+    // 16: IRQ 0's: movs r0, #0; log; bx lr
+    val code: []const u16 = [0xBF00, BKPT, STR_R6_R5, ISB_1, ISB_2, 0x2001, LOG_R0, BX_LR, MOVS_R0, LOG_R0, BX_LR]
+    val regs: []const u32 = [0, 0, 0, 0, LOG, NVIC_ISPR, 1]
+
+    var c = run_both8(code, regs, 0, [[IRQ0 + 1, 4], [IRQ0, 16]], &grouped_0)
+    assert(logged(&c, [0, 1]), "IRQ 0 preempts IRQ 1")
+    c = run_both8(code, regs, 0, [[IRQ0 + 1, 4], [IRQ0, 16]], &grouped_5)
+    assert(logged(&c, [1, 0]), "IRQ 0 waits for IRQ 1's return")
+
+// ---------------------------------------------------------------------------------------------------
+// The stack limits.
+
+// MSPLIM at 0x1F00.
+limited(cpu: *Cpu)
+    cpu.msplim = 0x1F00
+
+// `code` on the main stack at `sp`, MSPLIM at 0x1F00, stopped on its first instruction at `StackLimit`
+// with SP and the memory below it as they were.
+refused(code: []const u16, sp: u32, regs: []const u32) -> bool
+    var all: [16]u32
+
+    for k in 0..<regs.len do all[k] = regs[k]
+    all[13] = sp
+
+    var c = run_both8(code, all[..], 0, [], &limited)
+
+    if c.stop != Stop.StackLimit || c.stop_at != 0 || c.pc != 0 || c.r[13] != sp || c.retired != 0
+        print(f"stopped at ${c.stop} 0x${c.stop_at}%x, SP 0x${c.r[13]}%x, after ${c.retired}")
+        return false
+
+    for a in 0x1E00u32..<0x2000
+        if load8(&c, a) != 0 then return false
+
+    true
+
+@test("every way of moving SP below MSPLIM stops on the instruction, with nothing stored")
+t2e_stack_limit()
+    val x: u32 = 0xAA
+    // push {r0-r7, lr}: 36 bytes from 0x1F10
+    assert(refused([0xB5FF], 0x1F10, [x, x, x, x, x, x, x, x]), "PUSH")
+    // push.w {r4, r8, lr}; stmdb sp!, as PUSH.W is
+    assert(refused([0xE92D, 0x4110], 0x1F08, [x, x, x, x, x]), "PUSH.W")
+    // str r0, [sp, #-4]!; strd r0, r1, [sp, #-8]!
+    assert(refused([0xF84D, 0x0D04], 0x1F00, [x]), "STR pre-indexed")
+    assert(refused([0xE96D, 0x0102], 0x1F04, [x, x]), "STRD pre-indexed")
+    // sub sp, #0x20; sub.w sp, sp, #256; subw sp, sp, #4
+    assert(refused([0xB088], 0x1F10, []), "SUB SP")
+    assert(refused([0xF5AD, 0x7D80], 0x1FF0, []), "SUB.W SP")
+    assert(refused([0xF2AD, 0x0D04], 0x1F00, []), "SUBW SP")
+    // mov sp, r1; mov.w sp, r1; add.w sp, sp, r1 (r1 negative)
+    assert(refused([0x468D], 0x2000, [0, 0x1EFC]), "MOV SP")
+    assert(refused([0xEA4F, 0x0D01], 0x2000, [0, 0x1EFC]), "MOV.W SP")
+    assert(refused([0xEB0D, 0x0D01], 0x1F00, [0, 0xFFFFFFF8]), "ADD.W SP")
+
+@test("SP may come down to MSPLIM exactly, and an SVC whose frame would go below it stops on its return address")
+t2e_stack_limit_edge()
+    var regs: [16]u32
+
+    for k in 0..<9 do regs[k] = 0xAA
+    regs[13] = 0x1F24
+
+    // push {r0-r7, lr} from 0x1F24 ends at 0x1F00
+    var c = run_both8([0xB5FF], regs[..], 0, [], &limited)
+    assert(c.stop == Stop.Breakpoint && c.r[13] == 0x1F00 && load32(&c, 0x1F00) == 0xAA, "down to the limit")
+
+    // svc #0 with SP at 0x1F10: the frame would start at 0x1EF0
+    regs[13] = 0x1F10
+    c = run_both8([SVC], regs[..], 0, [[SVCALL, 4]], &limited)
+    assert(c.stop == Stop.StackLimit && c.stop_at == 2 && c.ipsr == 0 && load32(&c, 0x1EF0) == 0, "an exception entry")
+
+@test("PSPLIM limits the process stack in thread mode, and MSPLIM does not")
+t2e_psplim()
+    // msr psp, r2; msr psplim, r3; msr control, r6 (SPSEL); push {r0}
+    val code: []const u16 = [0xF382, 0x8809, 0xF383, 0x880B, 0xF386, 0x8814, 0xB401]
+    var c = run_both8(code, [0xAA, 0, 0x1800, 0x1800, 0, 0, 2], 0, [], &nothing)
+    assert(c.stop == Stop.StackLimit && c.stop_at == 12 && c.r[13] == 0x1800, "PSPLIM")
+    c = run_both8(code, [0xAA, 0, 0x1800, 0x1000, 0, 0, 2], 0, [], &limited)
+    assert(c.stop == Stop.Breakpoint && c.r[13] == 0x17FC && load32(&c, 0x17FC) == 0xAA, "MSPLIM above PSP is not PSP's")
+
+// ---------------------------------------------------------------------------------------------------
+// MRS and MSR, and the system control space.
+
+@test("MRS and MSR of the limits, BASEPRI, FAULTMASK, and APSR with Q")
+t2e_mrs_msr()
+    // msr msplim, r1; mrs r0, msplim; log; msr psplim, r1; mrs r0, psplim; log;
+    // msr basepri, r2; mrs r0, basepri; log; msr apsr_nzcvq, r3; mrs r0, apsr; log
+    val code: []const u16 = [0xF381, 0x880A, 0xF3EF, 0x800A, LOG_R0, 0xF381, 0x880B, 0xF3EF, 0x800B, LOG_R0,
+        0xF382, 0x8811, 0xF3EF, 0x8011, LOG_R0, 0xF383, 0x8800, 0xF3EF, 0x8000, LOG_R0]
+    var c = run_both8(code, [0, 0x12345677, 0xFF, 0xB8000000, LOG], 0, [], &nothing)
+
+    // The limits keep bits 31–3, BASEPRI the four the M33 implements, and APSR N, C, V and Q.
+    assert(logged(&c, [0x12345670, 0x12345670, 0xF0, 0xB8000000]), "read back")
+    assert(c.q == 1, "Q")
+
+@test("MSR APSR_nzcvq with N and Z both set reads back Z alone, the lazy flags' one limit")
+t2e_msr_n_and_z()
+    // msr apsr_nzcvq, r1; mrs r0, apsr; log
+    var c = run_both8([0xF381, 0x8800, 0xF3EF, 0x8000, LOG_R0], [0, 0xC0000000, 0, 0, LOG], 0, [], &nothing)
+
+    assert(logged(&c, [0x40000000]), "Z alone")
+
+@test("the M33's system control space: CPUID, CCR, four priority bits, byte access, SHPR1, SHCSR, AIRCR and STIR")
+t2e_scs()
+    var c: Cpu
+
+    c.kind = Kind.V8mMain
+    reset(&c, [], 0)
+
+    assert(load32(&c, SCB_CPUID) == M33_CPUID, "CPUID")
+    assert(load32(&c, SCB_CCR) == CCR_RESET, "CCR at reset")
+    store32(&c, NVIC_IPR, 0xFFFFFFFF)
+    assert(load32(&c, NVIC_IPR) == 0xF0F0F0F0, "four bits of priority")
+    store8(&c, NVIC_IPR + 1, 0x35)
+    assert(load32(&c, NVIC_IPR) == 0xF0F030F0 && load8(&c, NVIC_IPR + 1) == 0x30, "a byte")
+    store16(&c, SCB_SHPR3 + 2, 0x8070)
+    assert(load32(&c, SCB_SHPR3) == 0x80700000, "a halfword of SHPR3")
+    store32(&c, SCB_SHPR1, 0x00A0B0C0)
+    assert(load32(&c, SCB_SHPR1) == 0x00A0B0C0, "SHPR1")
+    store32(&c, SCB_SHCSR, 0x00070000)
+    assert(load32(&c, SCB_SHCSR) == 0x00070000, "SHCSR's enables")
+    store32(&c, SCB_AIRCR, 0x05FA0300)
+    assert(load32(&c, SCB_AIRCR) == 0xFA050300, "PRIGROUP")
+    store32(&c, NVIC_STIR, 5)
+    assert(c.pending == u64(1) << (IRQ0 + 5), "STIR")
+    store32(&c, SCB_CCR, 0x10)
+    assert(load32(&c, SCB_CCR) == 0x211 && c.stop == Stop.Budget, "DIV_0_TRP")
+
+@test("an M0+ keeps its own system control space: no CCR, no byte access to a priority")
+t2e_scs_v6m()
+    var c: Cpu
+
+    reset(&c, [], 0)
+    assert(load32(&c, SCB_CPUID) == 0x410CC601, "CPUID")
+    assert(load32(&c, SCB_CCR) == 0 && c.stop == Stop.Unmapped && c.stop_at == SCB_CCR, "CCR")
+
+    reset(&c, [], 0)
+    store8(&c, NVIC_IPR, 0x40)
+    assert(c.stop == Stop.Unmapped, "a byte of a priority")
+
+ccr_traps(cpu: *Cpu) = store32(cpu, SCB_CCR, 0x10)
+
+@test("with CCR.DIV_0_TRP a division by zero stops on the instruction, the UsageFault benchtop does not take")
+t2e_div_trap()
+    // udiv r0, r1, r2
+    var c = run_both8([0xFBB1, 0xF0F2], [9, 7, 0], 0, [], &ccr_traps)
+
+    assert(c.stop == Stop.Fault && c.stop_at == 0 && c.r[0] == 9 && c.retired == 0, "stopped")
+
+// The one instruction stops the core at `Undefined`, there.
+undefined8(code: []const u16) -> bool
+    var c = run_both8(code, [], 0, [], &nothing)
+
+    c.stop == Stop.Undefined && c.stop_at == 0 && c.retired == 0
+
+@test("the encodings this kind leaves undefined: UDF, the Security, FP, DSP and coprocessor extensions'")
+t2e_undefined()
+    assert(undefined8([0xDE00]), "UDF")
+    assert(undefined8([0xF7F0, 0xA000]), "UDF.W")
+    assert(undefined8([0xE841, 0xF000]), "TT")
+    assert(undefined8([0xE97F, 0xE97F]), "SG")
+    assert(undefined8([0x4774]), "BXNS")
+    assert(undefined8([0xEE30, 0x0A81]), "VADD.F32")
+    assert(undefined8([0xEE00, 0x0010]), "MCR")
+    assert(undefined8([0xFA82, 0xF081]), "QADD")
+    assert(undefined8([0xFA91, 0xF002]), "SADD16")
+    assert(undefined8([0xF321, 0x0007]), "SSAT16")
+    assert(undefined8([0xFB11, 0x3002]), "SMLABB")
+
+// ---------------------------------------------------------------------------------------------------
+// The decode cache and IT.
+
+// `first` at 0, then `movs r1, #5` at 2, which `first` = IT NE governs and NOP does not. The first
+// pass runs it from 0, then writes `second` over 0 with r3 (strh r3, [r4]), ISB, and runs it again
+// with Z set: 0: first; 2: movs r1, #5; 4: cbnz r2, 20; 6: strh r3, [r4]; 8: isb; 12: movs r2, #1;
+// 14: movs r1, #0; 16: cmp r2, r2; 18: b 0; 20: bkpt.
+rewritten(first: u16, second: u16) -> Cpu
+    run_both8([first, 0x2105, 0xB932, 0x8023, ISB_1, ISB_2, 0x2201, 0x2100, 0x4292, 0xE7F5, BKPT], [0, 0, 0, u32(second), 0], 0, [], &nothing)
+
+@test("a halfword run outside an IT block and then, the code rewritten, inside one is decoded as each place has it")
+t2e_outside_then_inside()
+    // NOP, then IT NE: the second MOVS is governed, skipped on Z, and sets no flags.
+    var c = rewritten(0xBF00, 0xBF18)
+
+    assert(c.stop == Stop.Breakpoint && c.r[1] == 0 && flags(&c) == 0b0110 && c.retired == 12, "skipped, flags untouched")
+
+@test("a halfword run inside an IT block and then, the code rewritten, outside one is decoded as each place has it")
+t2e_inside_then_outside()
+    // IT NE, then NOP: the second MOVS runs, and sets N and Z.
+    var c = rewritten(0xBF18, 0xBF00)
+
+    assert(c.stop == Stop.Breakpoint && c.r[1] == 5 && flags(&c) == 0b0010 && c.retired == 12, "run, flags set")
+
+@test("an instruction rewritten inside an IT block is decoded again under the block's IT")
+t2e_rewritten_in_block()
+    // 0: itt ne; 2: movne r1, #5; 4: movne r2, #6; 6: cbnz r5, 22; 8: strh r3, [r4], which writes
+    // MOVS r2, #7 over 4; 10: isb; 14: movs r5, #1; 16: movs r2, #0; 18: cmp r5, r5; 20: b 0;
+    // 22: bkpt. The second pass, on Z, skips both, the rewritten one as an instruction of the block,
+    // which sets no flags.
+    val code: []const u16 = [0xBF1C, 0x2105, 0x2206, 0xB935, 0x8023, ISB_1, ISB_2, 0x2501, 0x2200, 0x42AD, 0xE7F4, BKPT]
+    var c = run_both8(code, [0, 0, 0, 0x2207, 4], 0, [], &nothing)
+
+    assert(c.stop == Stop.Breakpoint && c.r[1] == 5 && c.r[2] == 0 && flags(&c) == 0b0110 && c.retired == 14, "skipped, flags untouched")

@@ -1,0 +1,96 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+@test("every Cortex-M model has a unique name and kind, its own read-only CPUID and architecture defaults")
+models_identity()
+    for i in 0..<MODELS.len
+        val model = MODELS[i]
+        assert(model_named(model.name).unwrap().kind == model.kind)
+        for j in 0..<i
+            assert(MODELS[j].name != model.name && MODELS[j].kind != model.kind, "model identities are unique")
+        for exec in [&run_match, &run_threaded]
+            var c: Cpu
+            c.kind = model.kind
+            // Read CPUID through guest code: ldr r0, [r1].
+            prepare(&c, [0x6808], [0, SCB_CPUID], 0, [])
+            finish(&c, exec)
+            assert(c.stop == Stop.Breakpoint && c.r[0] == model.cpuid, model.name)
+            store32(&c, SCB_CPUID, 0)
+            assert(load32(&c, SCB_CPUID) == model.cpuid, "CPUID is read-only")
+            assert(c.priority_bits == default_priority_bits(model.kind), "default priorities")
+end models_identity
+
+@test("M0 and M1 use the v6-M decoder, preserve arithmetic flags and cannot relocate the vector table")
+models_v6m()
+    for kind in [Kind.M0, Kind.M1]
+        var c = execute_thumb2(kind, [0x3001], [0x7FFFFFFF], 0, [])
+        assert(c.stop == Stop.Breakpoint && c.r[0] == 0x80000000 && flags(&c) == 9, "signed add overflow")
+        c = execute_thumb2(kind, [0x3001], [0xFFFFFFFF], 0, [])
+        assert(c.stop == Stop.Breakpoint && c.r[0] == 0 && flags(&c) == 6, "unsigned carry and zero")
+        c = execute_thumb2(kind, [0xFBB1, 0xF0F2], [0, 7, 2], 0, [])
+        assert(c.stop == Stop.Undefined && c.retired == 0, "no Thumb-2 divide")
+        store32(&c, SCB_VTOR, 0x1000)
+        assert(load32(&c, SCB_VTOR) == 0 && c.vtor == 0, "no VTOR")
+end models_v6m
+
+@test("M3 shares integer Thumb-2 and IT but rejects ordered v8 accesses and stack-limit registers")
+models_m3()
+    var c = execute_thumb2(Kind.M3, [0x4280, 0xBF0C, 0x2107, 0x2109], [], 0, [])
+    assert(c.stop == Stop.Breakpoint && c.r[1] == 7, "IT selects one arm")
+    val rejected: [4][2]u16 = [[0xE8D1, 0x0FAF], [0xE8C1, 0x0FE2], [0xF3EF, 0x800A], [0xF380, 0x880B]]
+    for code in rejected
+        c = execute_thumb2(Kind.M3, code, [0, 0x1000, 9], 0, [])
+        assert(c.stop == Stop.Undefined && c.retired == 0)
+end models_m3
+
+@test("M23 Baseline reuses MOVW/MOVT, divides, CBZ and all sizes of ordered exclusives")
+models_m23_integer()
+    var c = execute_thumb2(Kind.M23, [0xF241, 0x2034, 0xF2C5, 0x6078], [], 3, [])
+    assert(c.stop == Stop.Breakpoint && c.r[0] == 0x56781234 && flags(&c) == 3, "MOVW/MOVT preserve flags")
+    c = execute_thumb2(Kind.M23, [0xFB91, 0xF0F2], [0, 0x80000000, 0xFFFFFFFF], 3, [])
+    assert(c.stop == Stop.Breakpoint && c.r[0] == 0x80000000 && flags(&c) == 3, "signed divide overflow wraps")
+    c = execute_thumb2(Kind.M23, [0xFBB1, 0xF0F2], [99, 7, 0], 0, [])
+    assert(c.stop == Stop.Breakpoint && c.r[0] == 0, "division by zero returns zero")
+    c = execute_thumb2(Kind.M23, [0xB100, 0x2101, 0x2102], [], 0, [])
+    assert(c.stop == Stop.Breakpoint && c.r[1] == 2 && c.retired == 2, "CBZ taken")
+    for size in 0u16..2
+        val code: [7]u16 = [0xE8D1, u16(0x0FCF + (size << 4)), 0x3001, 0xE8C1, u16(0x0FC2 + (size << 4)), 0xE8D1, u16(0x0F8F + (size << 4))]
+        c = execute_thumb2(Kind.M23, code, [0, 0x1000, 9], 0, [[0x1000, 41]])
+        assert(c.stop == Stop.Breakpoint && c.r[0] == 42 && c.r[2] == 0 && load32(&c, 0x1000) == 42, "ordered exclusive pair and acquire load")
+end models_m23_integer
+
+@test("M23 rejects Mainline-only instructions and system registers without side effects")
+models_m23_rejected()
+    val wide: [10][2]u16 = [[0xF011, 0x4000], [0xF3C1, 0x1007], [0xFB01, 0xF002], [0xE8D1, 0xF002],
+        [0xF3EF, 0x8011], [0xF380, 0x8811], [0xF3EF, 0x8013], [0xF380, 0x8813],
+        [0xF3EF, 0x800A], [0xF380, 0x880B]]
+    for code in wide
+        var c = execute_thumb2(Kind.M23, code, [0, 0x1000, 9], 0, [[0x1000, 42]])
+        assert(c.stop == Stop.Undefined && c.retired == 0 && c.r[0] == 0 && load32(&c, 0x1000) == 42, "not in Baseline")
+    for instruction in [u16(0xBF08), u16(0xB671), u16(0xB661)]
+        var c = execute_thumb2(Kind.M23, [instruction], [], 0, [])
+        assert(c.stop == Stop.Undefined && c.retired == 0, "no IT or FAULTMASK")
+end models_m23_rejected
+
+@test("M23 has fixed CCR, two priority bits, word-only system accesses and PRIMASK exceptions")
+models_m23_system()
+    var c = run_both_thumb2(Kind.M23, [SVC, BKPT, MOVS_R0, LOG_R0, BX_LR], [0, 0, 0, 0, LOG], 0, [[SVCALL, 4]], &nothing)
+    assert(c.stop == Stop.Breakpoint && logged(&c, [0]) && c.ipsr == 0, "SVC return")
+    assert(load32(&c, SCB_CCR) == 0x208 && c.priority_bits == 2, "M23 CCR and priorities")
+    store32(&c, SCB_CCR, 0xFFFFFFFF)
+    assert(load32(&c, SCB_CCR) == 0x208, "CCR read-only, including DIV_0_TRP")
+    store32(&c, SCB_AIRCR, 0x05FA0700)
+    assert(c.prigroup == 0, "no priority grouping")
+    c.stop = Stop.Budget
+    store8(&c, NVIC_IPR, 0xFF)
+    assert(c.stop == Stop.Unmapped, "byte NVIC accesses are not supported")
+end models_m23_system
+
+@test("new Mainline cores keep M33 stack-limit checks before storing or retiring")
+models_mainline_limits()
+    for kind in [Kind.M35p, Kind.M52, Kind.M55, Kind.M85]
+        // MSR MSPLIM, r0; PUSH {r0}: SP starts at 0x2000, exactly the selected limit.
+        var c = run_both_thumb2(kind, [0xF380, 0x880A, 0xB401, BKPT], [0x2000], 0, [], &nothing)
+        assert(c.stop == Stop.StackLimit && c.stop_at == 4 && c.retired == 1, "push stops before executing")
+        assert(c.r[13] == 0x2000 && c.msplim == 0x2000 && load32(&c, 0x1FFC) == 0, "stack and memory unchanged")
+end models_mainline_limits

@@ -1,0 +1,315 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// DSP instruction cases always run through both decoders/executors, including disabled features.
+private execute_dsp(kind: Kind, enabled: bool, code: []const u16, regs: []const u32, apsr: u32) -> Cpu
+    var first: Cpu
+    var second: Cpu
+    for exec in [&run_match, &run_threaded]
+        second.kind = kind
+        prepare(&second, code, regs, apsr >> 28, [])
+        second.dsp = enabled
+        second.q = (apsr >> 27) & 1
+        second.ge = if enabled then (apsr >> 16) & 15 else 0
+        finish(&second, exec)
+        if exec == &run_match
+            first = second
+        else
+            for r in 0..<16 do assert(first.r[r] == second.r[r], s"DSP executors agree on r$r")
+            assert(first.ge == second.ge && first.q == second.q && flags(&first) == flags(&second), "DSP flags agree")
+            assert(first.stop == second.stop && first.pc == second.pc && first.retired == second.retired, "DSP stop agrees")
+    end for
+    second
+end execute_dsp
+
+@test("DSP packed arithmetic updates GE independently of NZCVQ; saturation and halving preserve GE and Q")
+dsp_parallel_edges()
+    // SADD8: negative, zero, positive, and signed overflow interpreted at the widened precision.
+    var c = execute_dsp(Kind.V7em, true, [0xFA81, 0xF002], [0, 0x7FFF8000, 0x0101FF00], 0xB80F0000)
+    assert(c.r[0] == 0x80007F00 && c.ge == 0xD && c.q == 1 && flags(&c) == 11, "signed GE uses widened sums")
+    // UADD16 carries set both GE bits for their halfword.
+    c = execute_dsp(Kind.V7em, true, [0xFA91, 0xF042], [0, 0xFFFF0001, 0x0001FFFF], 0)
+    assert(c.r[0] == 0 && c.ge == 15 && c.q == 0, "unsigned carries")
+    c = execute_dsp(Kind.V7em, true, [0xFAD1, 0xF042], [0, 0x00000001, 0x00010001], 0)
+    assert(c.r[0] == 0xFFFF0000 && c.ge == 3, "no borrow includes equality")
+    c = execute_dsp(Kind.V7em, true, [0xFA81, 0xF012], [0, 0x7F807F80, 0x01FF01FF], 0x000A0000)
+    assert(c.r[0] == 0x7F807F80 && c.ge == 10 && c.q == 0, "packed saturation does not set Q")
+    c = execute_dsp(Kind.V7em, true, [0xFAC1, 0xF062], [0, 0, 0x01010101], 0x08050000)
+    assert(c.r[0] == 0xFFFFFFFF && c.ge == 5 && c.q == 1, "unsigned halving subtract retains the extended borrow bit")
+end dsp_parallel_edges
+
+@test("Q arithmetic saturates both stages and Q stays sticky; SSAT16/USAT16 cover zero and maximal widths")
+dsp_saturation_edges()
+    // QDADD r0,r1,r2: the doubled second operand saturates before adding -1.
+    var c = execute_dsp(Kind.V7em, true, [0xFA82, 0xF091], [0, 0xFFFFFFFF, 0x40000000], 0x30090000)
+    assert(c.r[0] == 0x7FFFFFFE && c.q == 1 && c.ge == 9 && flags(&c) == 3, "double saturates separately")
+    c = execute_dsp(Kind.V7em, true, [0xFA82, 0xF081], [0, 1, 2], 0x08000000)
+    assert(c.r[0] == 3 && c.q == 1, "Q sticky without overflow")
+    c = execute_dsp(Kind.V7em, true, [0xF321, 0x0000], [0, 0x80007FFF], 0)
+    assert(c.r[0] == 0xFFFF0000 && c.q == 1, "signed one-bit limits")
+    c = execute_dsp(Kind.V7em, true, [0xF321, 0x000F], [0, 0x80007FFF], 0)
+    assert(c.r[0] == 0x80007FFF && c.q == 0, "signed full halfword")
+    c = execute_dsp(Kind.V7em, true, [0xF3A1, 0x0000], [0, 0xFFFF7FFF], 0)
+    assert(c.r[0] == 0 && c.q == 1, "unsigned zero-width saturation")
+    c = execute_dsp(Kind.V7em, true, [0xF3A1, 0x000F], [0, 0xFFFF7FFF], 0)
+    assert(c.r[0] == 0x00007FFF && c.q == 1, "unsigned negative lane clamps to zero")
+end dsp_saturation_edges
+
+@test("GE writes and reads select bytes; APSR masks preserve independent flag groups")
+dsp_apsr_masks()
+    // MSR APSR_g,r3; SEL r0,r1,r2; MRS r4,APSR. NZCVQ unaffected by a GE-only write.
+    var c = execute_dsp(Kind.V7em, true, [0xF383, 0x8400, 0xFAA1, 0xF082, 0xF3EF, 0x8400], [0, 0x11223344, 0xAABBCCDD, 0x00050000], 0xB80A0000)
+    assert(c.r[0] == 0xAA22CC44 && c.r[4] == 0xB8050000, "GE-only write and SEL")
+    c = execute_dsp(Kind.V7em, true, [0xF383, 0x8800], [0, 0, 0, 0], 0xB80A0000)
+    assert(c.ge == 10 && c.q == 0 && flags(&c) == 0, "NZCVQ-only write leaves GE")
+    c = execute_dsp(Kind.V7em, true, [0xF383, 0x8C00], [0, 0, 0, 0x480F0000], 0)
+    assert(c.ge == 15 && c.q == 1 && flags(&c) == 4, "combined write")
+    c = execute_dsp(Kind.V7em, false, [0xF383, 0x8400, 0xF3EF, 0x8400], [0, 0, 0, 0x000F0000], 0)
+    assert(c.ge == 0 && c.r[4] == 0, "GE read as zero and writes ignored without DSP")
+end dsp_apsr_masks
+
+@test("DSP instructions obey IT predicates, overlap operands, preserve Q in long multiplies and wrap 64-bit accumulators")
+dsp_control_edges()
+    var c = execute_dsp(Kind.V7em, true, [0xBF08, 0xFA81, 0xF002], [99, 1, 2], 0)
+    assert(c.r[0] == 99 && c.retired == 2 && c.ge == 0, "failed condition skips DSP")
+    c = execute_dsp(Kind.V7em, false, [0xBF08, 0xFA81, 0xF002], [99, 1, 2], 0)
+    assert(c.r[0] == 99 && c.stop == Stop.Breakpoint && c.retired == 2, "failed condition skips disabled DSP")
+    c = execute_dsp(Kind.V7em, true, [0xBF08, 0xFA81, 0xF102], [0, 1, 2], 0x40000000)
+    assert(c.r[1] == 3 && c.ge == 15 && flags(&c) == 4, "passed condition and destination overlap")
+    // SMLALD r0,r3,r1,r2 with all-one accumulator wraps to zero.
+    c = execute_dsp(Kind.V7em, true, [0xFBC1, 0x03C2], [0xFFFFFFFF, 1, 1, 0xFFFFFFFF], 0x08090000)
+    assert(c.r[0] == 0 && c.r[3] == 0 && c.q == 1 && c.ge == 9, "64-bit wrap leaves flags")
+    // SMUAD has the one non-accumulating dual product overflow: (-32768)^2 twice.
+    c = execute_dsp(Kind.V7em, true, [0xFB21, 0xF002], [0, 0x80008000, 0x80008000], 0)
+    assert(c.r[0] == 0x80000000 && c.q == 1, "dual product Q overflow")
+end dsp_control_edges
+
+@test("exceptions stack and restore GE independently of handler arithmetic")
+dsp_exception_ge()
+    for exec in [&run_match, &run_threaded]
+        var c: Cpu
+        c.kind = Kind.V7em
+        // SVC; MRS r0,APSR. Handler: MSR APSR_g,r3; BX LR.
+        machine(&c, [0xDF00, 0xF3EF, 0x8000], [0, 0, 0, 0x000A0000], 0, [[SVCALL, 0x100]], &nothing)
+        store16(&c, 0x100, 0xF383)
+        store16(&c, 0x102, 0x8400)
+        store16(&c, 0x104, 0x4770)
+        c.dsp = true
+        c.ge = 5
+        finish(&c, exec)
+        assert(c.stop == Stop.Breakpoint && c.ge == 5 && c.r[0] == 0x00050000, "return restores stacked GE")
+        assert(load32(&c, 0x1FFC) & 0x000F0000 == 0x00050000, "GE stored in xPSR frame")
+    end for
+end dsp_exception_ge
+
+val dsp_encodings: [152][2]u16 = [
+    [0xFA81, 0xF002],
+    [0xFA91, 0xF002],
+    [0xFAA1, 0xF002],
+    [0xFAE1, 0xF002],
+    [0xFAC1, 0xF002],
+    [0xFAD1, 0xF002],
+    [0xFA81, 0xF012],
+    [0xFA91, 0xF012],
+    [0xFAA1, 0xF012],
+    [0xFAE1, 0xF012],
+    [0xFAC1, 0xF012],
+    [0xFAD1, 0xF012],
+    [0xFA81, 0xF022],
+    [0xFA91, 0xF022],
+    [0xFAA1, 0xF022],
+    [0xFAE1, 0xF022],
+    [0xFAC1, 0xF022],
+    [0xFAD1, 0xF022],
+    [0xFA81, 0xF042],
+    [0xFA91, 0xF042],
+    [0xFAA1, 0xF042],
+    [0xFAE1, 0xF042],
+    [0xFAC1, 0xF042],
+    [0xFAD1, 0xF042],
+    [0xFA81, 0xF052],
+    [0xFA91, 0xF052],
+    [0xFAA1, 0xF052],
+    [0xFAE1, 0xF052],
+    [0xFAC1, 0xF052],
+    [0xFAD1, 0xF052],
+    [0xFA81, 0xF062],
+    [0xFA91, 0xF062],
+    [0xFAA1, 0xF062],
+    [0xFAE1, 0xF062],
+    [0xFAC1, 0xF062],
+    [0xFAD1, 0xF062],
+    [0xFA82, 0xF081],
+    [0xFA82, 0xF091],
+    [0xFA82, 0xF0A1],
+    [0xFA82, 0xF0B1],
+    [0xFAA1, 0xF082],
+    [0xEAC1, 0x0002],
+    [0xEAC1, 0x0042],
+    [0xEAC1, 0x4002],
+    [0xEAC1, 0x70C2],
+    [0xEAC1, 0x0062],
+    [0xEAC1, 0x4022],
+    [0xEAC1, 0x70E2],
+    [0xEAC1, 0x0022],
+    [0xF321, 0x0000],
+    [0xF321, 0x0001],
+    [0xF321, 0x0002],
+    [0xF321, 0x0003],
+    [0xF321, 0x0004],
+    [0xF321, 0x0005],
+    [0xF321, 0x0006],
+    [0xF321, 0x0007],
+    [0xF321, 0x0008],
+    [0xF321, 0x0009],
+    [0xF321, 0x000A],
+    [0xF321, 0x000B],
+    [0xF321, 0x000C],
+    [0xF321, 0x000D],
+    [0xF321, 0x000E],
+    [0xF321, 0x000F],
+    [0xF3A1, 0x0000],
+    [0xF3A1, 0x0001],
+    [0xF3A1, 0x0002],
+    [0xF3A1, 0x0003],
+    [0xF3A1, 0x0004],
+    [0xF3A1, 0x0005],
+    [0xF3A1, 0x0006],
+    [0xF3A1, 0x0007],
+    [0xF3A1, 0x0008],
+    [0xF3A1, 0x0009],
+    [0xF3A1, 0x000A],
+    [0xF3A1, 0x000B],
+    [0xF3A1, 0x000C],
+    [0xF3A1, 0x000D],
+    [0xF3A1, 0x000E],
+    [0xF3A1, 0x000F],
+    [0xFA41, 0xF082],
+    [0xFA41, 0xF092],
+    [0xFA41, 0xF0A2],
+    [0xFA41, 0xF0B2],
+    [0xFA01, 0xF082],
+    [0xFA01, 0xF092],
+    [0xFA01, 0xF0A2],
+    [0xFA01, 0xF0B2],
+    [0xFA21, 0xF082],
+    [0xFA21, 0xF092],
+    [0xFA21, 0xF0A2],
+    [0xFA21, 0xF0B2],
+    [0xFA51, 0xF082],
+    [0xFA51, 0xF092],
+    [0xFA51, 0xF0A2],
+    [0xFA51, 0xF0B2],
+    [0xFA11, 0xF082],
+    [0xFA11, 0xF092],
+    [0xFA11, 0xF0A2],
+    [0xFA11, 0xF0B2],
+    [0xFA31, 0xF082],
+    [0xFA31, 0xF092],
+    [0xFA31, 0xF0A2],
+    [0xFA31, 0xF0B2],
+    [0xFA2F, 0xF082],
+    [0xFA2F, 0xF092],
+    [0xFA2F, 0xF0A2],
+    [0xFA2F, 0xF0B2],
+    [0xFA3F, 0xF082],
+    [0xFA3F, 0xF092],
+    [0xFA3F, 0xF0A2],
+    [0xFA3F, 0xF0B2],
+    [0xFB11, 0x3002],
+    [0xFB11, 0x3012],
+    [0xFB11, 0x3022],
+    [0xFB11, 0x3032],
+    [0xFB11, 0xF002],
+    [0xFB11, 0xF012],
+    [0xFB11, 0xF022],
+    [0xFB11, 0xF032],
+    [0xFBC1, 0x0382],
+    [0xFBC1, 0x0392],
+    [0xFBC1, 0x03A2],
+    [0xFBC1, 0x03B2],
+    [0xFB31, 0x3002],
+    [0xFB31, 0x3012],
+    [0xFB31, 0xF002],
+    [0xFB31, 0xF012],
+    [0xFB21, 0x3002],
+    [0xFB21, 0x3012],
+    [0xFB41, 0x3002],
+    [0xFB41, 0x3012],
+    [0xFB21, 0xF002],
+    [0xFB21, 0xF012],
+    [0xFB41, 0xF002],
+    [0xFB41, 0xF012],
+    [0xFB51, 0x3002],
+    [0xFB51, 0x3012],
+    [0xFB61, 0x3002],
+    [0xFB61, 0x3012],
+    [0xFB51, 0xF002],
+    [0xFB51, 0xF012],
+    [0xFB71, 0xF002],
+    [0xFB71, 0x3002],
+    [0xFBC1, 0x03C2],
+    [0xFBC1, 0x03D2],
+    [0xFBD1, 0x03C2],
+    [0xFBD1, 0x03D2],
+    [0xFBE1, 0x0362],
+    [0xFB20, 0x3002],
+    [0xFBC0, 0x03C3],
+]
+
+@test("every DSP encoding rejects disabled extensions and incapable models without retiring or changing flags")
+dsp_gating()
+    for model in MODELS
+        for code in dsp_encodings
+            var c = execute_dsp(model.kind, false, code, [99, 1, 2, 3], 0xB8000000)
+            assert(c.stop == Stop.Undefined && c.pc == 0 && c.retired == 0 && c.r[0] == 99 && c.q == 1 && flags(&c) == 11, "disabled DSP")
+            if !model.dsp
+                c = execute_dsp(model.kind, true, code, [99, 1, 2, 3], 0xB80A0000)
+                assert(c.stop == Stop.Undefined && c.retired == 0 && c.r[0] == 99 && c.ge == 10, "model has no DSP")
+    end for
+end dsp_gating
+
+@test("DSP rejects SP/PC destinations and SP sources, reserved saturation widths and overlapping long destinations")
+dsp_invalid_encodings()
+    for code in dsp_encodings
+        for destination in [u16(13), u16(15)]
+            val invalid: [2]u16 = [code[0], (code[1] & 0xF0FF) | (destination << 8)]
+            var c = execute_dsp(Kind.V7em, true, invalid, [99, 1, 2, 3], 0x080A0000)
+            assert(c.stop == Stop.Undefined && c.retired == 0 && c.r[0] == 99 && c.ge == 10 && c.q == 1, "bad destination")
+        // Saturation encodes its immediate where the other families encode Rm.
+        if code[0] & 0xFF00 != 0xF300
+            for source in [u16(13), u16(15)]
+                val invalid: [2]u16 = [code[0], (code[1] & 0xFFF0) | source]
+                var c = execute_dsp(Kind.V7em, true, invalid, [99, 1, 2, 3], 0)
+                assert(c.stop == Stop.Undefined && c.retired == 0 && c.r[0] == 99, "bad Rm source")
+        val invalid: [2]u16 = [(code[0] & 0xFFF0) | 13, code[1]]
+        var c = execute_dsp(Kind.V7em, true, invalid, [99, 1, 2, 3], 0)
+        assert(c.stop == Stop.Undefined && c.retired == 0, "SP source")
+    end for
+    val invalid: [8][2]u16 = [[0xF321, 0x0010], [0xF3A1, 0x001F], [0xFA91, 0xF032], [0xFA91, 0xF072],
+        [0xFBC1, 0x00C2], [0xFBE1, 0x0062], [0xFB61, 0xF002], [0xFB11, 0xD002]]
+    for code in invalid
+        var c = execute_dsp(Kind.V7em, true, code, [99, 1, 2, 3], 0)
+        assert(c.stop == Stop.Undefined && c.retired == 0 && c.r[0] == 99, "reserved encoding")
+end dsp_invalid_encodings
+
+@test("a cached DSP instruction cannot bypass another core's disabled extension in either execution engine")
+dsp_shared_decode()
+    for first_exec in [&run_match, &run_threaded]
+        for second_exec in [&run_match, &run_threaded]
+            var first: Cpu
+            var second: Cpu
+            first.kind = Kind.V7em
+            prepare(&first, [0xFA81, 0xF002], [99, 1, 2], 0, [])
+            first.dsp = true
+            finish(&first, first_exec)
+            assert(first.r[0] == 3 && first.stop == Stop.Breakpoint, "enabled core populates decode cache")
+            second.kind = Kind.V7em
+            clear(&second, 0)
+            second.r[0] = 99
+            second.r[1] = 1
+            second.r[2] = 2
+            finish(&second, second_exec)
+            assert(second.r[0] == 99 && second.ge == 0 && second.stop == Stop.Undefined && second.retired == 0, "disabled core uses same cached record safely")
+    end for
+end dsp_shared_decode

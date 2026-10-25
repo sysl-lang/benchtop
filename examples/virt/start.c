@@ -4,7 +4,7 @@
 // A program handles an exception by defining the function its entry names: `svc_handler`,
 // `pendsv_handler`, `systick_handler`, `console_handler` (IRQ 0), `sio_handler` (IRQ 1) and so on.
 // Core 1, once launched, shares the table. An entry no program
-// defines is 0, and cortical stops at that exception with a fault on the vector's address.
+// defines is 0, and benchtop stops at that exception with a fault on the vector's address.
 
 #include "virt.h"
 

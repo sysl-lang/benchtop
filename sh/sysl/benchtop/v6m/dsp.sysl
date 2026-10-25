@@ -1,0 +1,203 @@
+module sh.sysl.benchtop.v6m
+
+// Integer DSP instructions share the Thumb-2 records and both execution engines. The high byte
+// of imm identifies the family; its low bits contain only that family's decoded controls.
+// Runtime gating is essential: two cores can share records and have different DSP choices.
+decode_dsp(cpu: *Cpu, h: u32, l: u32, into: *Insn) -> Op
+    val rn = h & 15
+    val rm = l & 15
+    val rd = (l >> 8) & 15
+    val op1 = (h >> 4) & 15
+    val op2 = (l >> 4) & 15
+    var family: u32 = 0
+    var control: u32 = 0
+    var recognized = false
+    var valid = true
+
+    if h & 0xFF00 == 0xFA00 && l >> 12 == 15
+        if op1 >= 8 && op2 <= 6 && op2 != 3 && (op1 == 8 || op1 == 9 || op1 == 10 || op1 == 12 || op1 == 13 || op1 == 14)
+            recognized = true
+            control = op1 | (op2 << 4)
+        else if op1 == 8 && op2 >= 8 && op2 <= 11
+            recognized = true
+            family = 1
+            control = op2 & 3
+        else if op1 == 10 && op2 == 8
+            recognized = true
+            family = 5
+        else if op1 <= 5 && op2 >= 8 && op2 <= 11 && (rn != 15 || op1 == 2 || op1 == 3)
+            recognized = true
+            family = 4
+            control = op1 | ((op2 & 3) << 4)
+        valid = !dsp_bad(rd) && !dsp_bad(rm) && (!dsp_bad(rn) || (family == 4 && rn == 15))
+    else if h & 0xFFF0 == 0xEAC0 && l & 0x8010 == 0
+        recognized = true
+        family = 2
+        control = ((l >> 12) & 7) * 4 + ((l >> 6) & 3) + (l & 32)
+        valid = !dsp_bad(rd) && !dsp_bad(rn) && !dsp_bad(rm)
+    else if (h & 0xFFF0 == 0xF320 || h & 0xFFF0 == 0xF3A0) && l & 0xF0E0 == 0
+        recognized = true
+        family = 3
+        control = (l & 31) | (h & 0x80)
+        valid = !dsp_bad(rd) && !dsp_bad(rn) && l & 31 <= 15
+    else if h & 0xFF00 == 0xFB00
+        val ra = l >> 12
+        val short = (op1 == 1 && op2 <= 3) || ((op1 >= 2 && op1 <= 5) && op2 <= 1) || (op1 == 6 && op2 <= 1 && ra != 15) || (op1 == 7 && op2 == 0)
+        val long = (op1 == 12 && op2 >= 8 && op2 <= 13) || (op1 == 13 && (op2 == 12 || op2 == 13)) || (op1 == 14 && op2 == 6)
+        recognized = short || long
+        family = 6
+        control = op1 | (op2 << 4) | (ra << 8)
+        valid = !dsp_bad(rd) && !dsp_bad(rn) && !dsp_bad(rm) && ra != 13 && (!long || (ra != 15 && ra != rd))
+    end if
+
+    if !recognized then return Op.Undecoded
+    if !model_of(cpu.kind).dsp || !valid then return Op.Undefined
+    set(into, rd, rn, rm, (family << 24) | control)
+    Op.Dsp
+end decode_dsp
+
+@inline
+private dsp_bad(r: u32) -> bool = r == 13 || r == 15
+
+// Clamp a widened intermediate. Packed saturation never changes Q; only the scalar forms do.
+private dsp_clamp(x: i64, width: u32, unsigned: bool) -> i64
+    val low = if unsigned then i64(0) else -(i64(1) << (width - 1))
+    val high = if unsigned then (i64(1) << width) - 1 else (i64(1) << (width - 1)) - 1
+    if x < low then low else if x > high then high else x
+
+private dsp_sat(cpu: *Cpu, x: i64, width: u32, unsigned: bool) -> u32
+    val result = dsp_clamp(x, width, unsigned)
+    if result != x then cpu.q = 1
+    u32(result)
+
+private dsp_lane(x: u32, shift: u32, width: u32, unsigned: bool) -> i64
+    val part = (x >> shift) & ((u32(1) << width) - 1)
+    if unsigned then i64(part) else i64(i32(part << (32 - width)) >> (32 - width))
+
+private dsp_parallel(cpu: *Cpu, x: u32, y: u32, control: u32) -> u32
+    val shape = control & 15
+    val mode = (control >> 4) & 7
+    val unsigned = mode >= 4
+    val width: u32 = if shape == 8 || shape == 12 then 8 else 16
+    val mask = (u32(1) << width) - 1
+    var result: u32 = 0
+    var ge: u32 = 0
+
+    for lane in 0..<(32 / width)
+        val shift = lane * width
+        val cross = shape == 10 || shape == 14
+        val other = if cross then shift ^ 16 else shift
+        val sub = shape == 12 || shape == 13 || (shape == 10 && lane == 0) || (shape == 14 && lane == 1)
+        val a = dsp_lane(x, shift, width, unsigned)
+        val b = dsp_lane(y, other, width, unsigned)
+        val raw = if sub then a - b else a + b
+        val value = if mode & 3 == 1 then dsp_clamp(raw, width, unsigned) else if mode & 3 == 2 then raw >> 1 else raw
+        result |= (u32(value) & mask) << shift
+        if (if unsigned then (if sub then raw >= 0 else raw > i64(mask)) else raw >= 0)
+            ge |= (if width == 16 then u32(3) else u32(1)) << (shift / 8)
+    end for
+
+    if mode & 3 == 0 then cpu.ge = ge
+    result
+end dsp_parallel
+
+x_dsp(cpu: *Cpu, ip: *Insn)
+    val x = cpu.r[ip.b]
+    val y = cpu.r[ip.c]
+    val control = ip.imm & 0xFFFFFF
+    val family = ip.imm >> 24
+    var result: u32 = 0
+
+    family match
+        0 -> result = dsp_parallel(cpu, x, y, control)
+        1 ->
+            // QADD's first operand is Rm; QDADD/QDSUB saturate twice, including the doubling.
+            val doubled = if control & 1 != 0 then dsp_sat(cpu, i64(i32(x)) * 2, 32, false) else x
+            val a = i64(i32(y))
+            val b = i64(i32(doubled))
+            result = dsp_sat(cpu, if control & 2 != 0 then a - b else a + b, 32, false)
+        2 ->
+            val amount = control & 31
+            if control & 32 == 0
+                result = (x & 0xFFFF) | ((y << amount) & 0xFFFF0000)
+            else
+                val shifted = u32(i32(y) >> (if amount == 0 then 32 else amount))
+                result = (x & 0xFFFF0000) | (shifted & 0xFFFF)
+        3 ->
+            val unsigned = control & 0x80 != 0
+            val width = (control & 15) + (if unsigned then 0 else 1)
+            for shift in [u32(0), u32(16)]
+                result |= (dsp_sat(cpu, i64(i16(x >> shift)), width, unsigned) & 0xFFFF) << shift
+        4 ->
+            val kind = control & 15
+            val rotation = ((control >> 4) & 3) * 8
+            val rotated = if rotation == 0 then y else (y >> rotation) | (y << (32 - rotation))
+            val base = if ip.b == 15 then u32(0) else x
+            if kind == 2 || kind == 3
+                for shift in [u32(0), u32(16)]
+                    val value = dsp_lane(rotated, shift, 8, kind == 3)
+                    result |= ((u32(value) + (base >> shift)) & 0xFFFF) << shift
+            else
+                val width: u32 = if kind < 2 then 16 else 8
+                result = base + u32(dsp_lane(rotated, 0, width, kind & 1 != 0))
+        5 ->
+            for byte in 0u32..<4
+                val shift = byte * 8
+                result |= ((if cpu.ge & (1 << byte) != 0 then x else y) & (0xFF << shift))
+        6 ->
+            dsp_multiply(cpu, ip, x, y, control)
+            return
+        _ -> ()
+    end match
+
+    cpu.r[ip.a] = result
+end x_dsp
+
+private dsp_multiply(cpu: *Cpu, ip: *Insn, x: u32, y: u32, control: u32)
+    val kind = control & 15
+    val op = (control >> 4) & 15
+    val ra = u4((control >> 8) & 15)
+    val accumulator = if ra == 15 then i64(0) else i64(i32(cpu.r[ra]))
+    var value: i64 = 0
+
+    if kind == 14
+        val product = u64(x) * u64(y) + u64(cpu.r[ip.a]) + u64(cpu.r[ra])
+        cpu.r[ra] = u32(product)
+        cpu.r[ip.a] = u32(product >> 32)
+        return
+
+    if kind == 1 || (kind == 12 && op <= 11)
+        value = i64(i16(x >> (if op & 2 != 0 then 16 else 0))) * i64(i16(y >> (if op & 1 != 0 then 16 else 0)))
+    else if kind == 3
+        value = (i64(i32(x)) * i64(i16(y >> (if op & 1 != 0 then 16 else 0)))) >> 16
+    else if kind == 5 || kind == 6
+        // Unsigned wrapping of the 64-bit intermediate also handles subtract and rounding overflow.
+        val product = u64(i64(i32(x)) * i64(i32(y)))
+        val acc = u64(accumulator) << 32
+        val total = (if kind == 6 then acc - product else acc + product) + (if op == 1 then u64(0x80000000) else u64(0))
+        cpu.r[ip.a] = u32(total >> 32)
+        return
+    else if kind == 7
+        for shift in [u32(0), u32(8), u32(16), u32(24)]
+            val a = i64((x >> shift) & 255)
+            val b = i64((y >> shift) & 255)
+            value += if a >= b then a - b else b - a
+        cpu.r[ip.a] = u32(value) + u32(accumulator)
+        return
+    else
+        val exchange = op & 1 != 0
+        val low = i64(i16(x)) * i64(i16(y >> (if exchange then 16 else 0)))
+        val high = i64(i16(x >> 16)) * i64(i16(y >> (if exchange then 0 else 16)))
+        value = if kind == 4 || kind == 13 then low - high else low + high
+    end if
+
+    if kind >= 12
+        val acc = u64(cpu.r[ra]) | (u64(cpu.r[ip.a]) << 32)
+        val total = acc + u64(value)
+        cpu.r[ra] = u32(total)
+        cpu.r[ip.a] = u32(total >> 32)
+    else
+        val total = value + accumulator
+        if total != i64(i32(total)) then cpu.q = 1
+        cpu.r[ip.a] = u32(total)
+end dsp_multiply

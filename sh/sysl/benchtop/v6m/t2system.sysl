@@ -1,0 +1,211 @@
+module sh.sysl.benchtop.v6m
+
+// ARMv8-M Mainline's system registers and instructions, over the exception model except.sysl has for
+// both kinds (ARMv8-M ARM, DDI0553, "System Address Map" and "The System Control Block"): BASEPRI,
+// BASEPRI_MAX and FAULTMASK, the stack limits, AIRCR.PRIGROUP, four bits of priority, the system
+// handler priorities and the byte access to them, and the configurable-fault registers.
+//
+// **The faults are stops.** MemManage, BusFault and UsageFault are not taken: an undefined
+// instruction stops the core at `Undefined`, an access where nothing is at `Unmapped`, a division by
+// zero CCR traps and a stack-limit violation at `Fault` and `StackLimit`, as ARMv6-M's HardFaults
+// stop it. SHCSR, CCR and SHPR1 are kept as written, so start-up code that configures them runs; CFSR,
+// HFSR, MMFAR and BFAR read 0, since no fault is ever recorded.
+
+// Cortex-M4 r0p1.
+const M4_CPUID: u32 = 0x410FC241
+
+// Cortex-M7 r0p0. No optional caches, FPU or MPU in the virtual configuration.
+const M7_CPUID: u32 = 0x410FC270
+
+// BP and STKALIGN are read-as-one on M7 (Arm DUI0646C, CCR bit assignments).
+const M7_CCR_FIXED: u32 = 0x40200
+
+// The Cortex-M33 r1p0, as the RP2350's report themselves.
+const M33_CPUID: u32 = 0x411FD210
+
+// CCR at reset: STKALIGN and the reserved bit 0, both read-as-one.
+const CCR_RESET: u32 = 0x201
+
+// Identity and CCR selection belong to the model, rather than instruction handlers.
+cpuid_of(kind: Kind) -> u32 = model_of(kind).cpuid
+
+ccr_reset(kind: Kind) -> u32
+    if is_v6m(kind) then return 0
+    if kind == Kind.M23 then return 0x208
+    if is_v7m(kind) then return if kind == Kind.V7emM7 then M7_CCR_FIXED else 0x200
+    CCR_RESET
+
+ccr_written(kind: Kind, x: u32) -> u32
+    if is_v6m(kind) then return 0
+    if kind == Kind.M23 then return 0x208
+    if kind == Kind.V7emM7 then return (x & 0x11B) | M7_CCR_FIXED
+    if is_v7m(kind) then return x & 0x31B
+    (x & 0x0007071A) | CCR_RESET
+
+// The registers ARMv8-M adds to the system control space.
+const ICTR: u32 = 0xE000E004
+const ACTLR: u32 = 0xE000E008
+const SCB_CCR: u32 = 0xE000ED14
+const SCB_SHPR1: u32 = 0xE000ED18
+const SCB_SHCSR: u32 = 0xE000ED24
+const SCB_CFSR: u32 = 0xE000ED28
+const SCB_HFSR: u32 = 0xE000ED2C
+const SCB_MMFAR: u32 = 0xE000ED34
+const SCB_BFAR: u32 = 0xE000ED38
+const SCB_CPACR: u32 = 0xE000ED88
+const NVIC_STIR: u32 = 0xE000EF00
+
+// The configurable faults' exception numbers, whose priorities SHPR1 holds.
+const MEM_MANAGE: u32 = 4
+const BUS_FAULT: u32 = 5
+const USAGE_FAULT: u32 = 6
+
+// The implemented high bits of a priority byte, configured per core. Defaults are 2 on Baseline
+// models and 4 on Mainline models. Board validation holds the value to the model's range.
+@inline
+prio_mask(cpu: *Cpu) -> u32 = (0xFF << (8 - cpu.priority_bits)) & 0xFF
+
+// Whether an access of `width` bytes to `a` is one of the bytes or halfwords of a priority register,
+// which ARMv8-M allows as well as words (CMSIS's `NVIC_SetPriority` writes a byte).
+byte_wide(a: u32, width: u32) -> bool
+    if a & (width - 1) != 0 then return false
+
+    (a >= NVIC_IPR && a < NVIC_IPR + 32) || (a >= SCB_SHPR1 && a < SCB_SHPR3 + 4)
+
+// The `width` bytes at `a` of the word `w` read from its aligned address; and `w` with them replaced.
+@inline
+part_of(w: u32, a: u32, width: u32) -> u32 = low_bytes(w >> ((a & 3) * 8), width)
+
+@inline
+with_part(w: u32, a: u32, width: u32, x: u32) -> u32
+    val shift = (a & 3) * 8
+    val mask = low_bytes(0xFFFFFFFF, width) << shift
+
+    (w & ~mask) | ((x << shift) & mask)
+
+// The registers only ARMv8-M has. On ARMv6-M, as an address that is no register, each stops the core
+// at `Unmapped`.
+scs_read8(cpu: *Cpu, a: u32) -> u32
+    if is_v6m(cpu.kind)
+        halt(cpu, Stop.Unmapped, a)
+        return 0
+
+    if cpu.kind == Kind.M23 && a != SCB_CCR then
+        halt(cpu, Stop.Unmapped, a)
+        return 0
+
+    a match
+        // One block of 32 interrupts.
+        ICTR -> 0
+        ACTLR -> 0
+        SCB_CCR -> cpu.ccr
+        SCB_SHPR1 -> u32(cpu.prio[MEM_MANAGE]) | u32(cpu.prio[BUS_FAULT]) << 8 | u32(cpu.prio[USAGE_FAULT]) << 16
+        SCB_SHCSR -> cpu.shcsr | (bit_of(cpu.active, SVCALL) << 7) | (bit_of(cpu.active, PENDSV) << 10) | (bit_of(cpu.active, SYSTICK) << 11) | (bit_of(cpu.pending, SVCALL) << 15)
+        SCB_CFSR | SCB_HFSR | SCB_MMFAR | SCB_BFAR -> 0
+        // No coprocessor: every CPACR field reads as "no access".
+        SCB_CPACR -> 0
+        _ ->
+            halt(cpu, Stop.Unmapped, a)
+            0
+
+scs_write8(cpu: *Cpu, a: u32, x: u32)
+    if is_v6m(cpu.kind) then return halt(cpu, Stop.Unmapped, a)
+
+    if cpu.kind == Kind.M23 && a != SCB_CCR then return halt(cpu, Stop.Unmapped, a)
+
+    val mask = prio_mask(cpu)
+
+    a match
+        ACTLR -> ()
+        // Each model keeps only its implemented bits and preserves its fixed ones.
+        SCB_CCR -> cpu.ccr = ccr_written(cpu.kind, x)
+        SCB_SHPR1 ->
+            cpu.prio[MEM_MANAGE] = u8(x & mask)
+            cpu.prio[BUS_FAULT] = u8((x >> 8) & mask)
+            cpu.prio[USAGE_FAULT] = u8((x >> 16) & mask)
+        // The enables of the configurable faults, and of the SecureFault the Security Extension would
+        // add: kept, though no fault is taken.
+        SCB_SHCSR -> cpu.shcsr = x & 0x000F0000
+        // Write-one-to-clear registers of faults that are never recorded.
+        SCB_CFSR | SCB_HFSR | SCB_MMFAR | SCB_BFAR -> ()
+        SCB_CPACR -> ()
+        // A software trigger: the interrupt becomes pending.
+        NVIC_STIR -> if x & 0x1FF < 32 then cpu.pending |= u64(1) << (IRQ0 + (x & 0x1FF))
+        _ -> halt(cpu, Stop.Unmapped, a)
+
+// ---------------------------------------------------------------------------------------------------
+// The system instructions.
+
+// `MRS`: as on ARMv6-M, with APSR's Q, the stack limits, BASEPRI and FAULTMASK. BASEPRI_MAX reads as
+// BASEPRI. EPSR reads as 0.
+mrs8(cpu: *Cpu, ip: *Insn)
+    val sysm = ip.imm
+
+    cpu.r[ip.a] = sysm match
+        8 -> main_sp(cpu)
+        9 -> process_sp(cpu)
+        10 -> cpu.msplim
+        11 -> cpu.psplim
+        16 -> cpu.primask
+        17 | 18 -> cpu.basepri
+        19 -> cpu.faultmask
+        20 -> cpu.control
+        _ ->
+            val ipsr = if sysm & 1 != 0 then cpu.ipsr else 0
+            val apsr = if sysm & 4 == 0 then xpsr(cpu) & 0xF80F0000 else 0
+
+            ipsr | apsr
+
+// `MSR`. A stack pointer keeps bits 31–2 and a limit bits 31–3. BASEPRI keeps the implemented bits,
+// and BASEPRI_MAX writes it only to raise the priority (a lower non-zero value). FAULTMASK cannot be
+// set from the NMI handler. CONTROL is nPRIV and SPSEL, SPSEL only in thread mode; FPCA, of the
+// floating-point extension, reads as 0. APSR takes N, Z, C, V and Q (`MSR APSR_nzcvq`), with
+// set_apsr's one limit: N and Z both set reads back as Z.
+msr8(cpu: *Cpu, ip: *Insn)
+    val x = cpu.r[ip.b]
+    val mask = prio_mask(cpu)
+
+    (ip.imm & 0xFF) match
+        8 ->
+            if on_process_stack(cpu) then cpu.sp_other = x & ~3 else cpu.r[13] = x & ~3
+        9 ->
+            if on_process_stack(cpu) then cpu.r[13] = x & ~3 else cpu.sp_other = x & ~3
+        10 -> cpu.msplim = x & ~7
+        11 -> cpu.psplim = x & ~7
+        16 -> cpu.primask = x & 1
+        17 -> cpu.basepri = x & mask
+        18 ->
+            val v = x & mask
+
+            if v != 0 && (cpu.basepri == 0 || v < cpu.basepri) then cpu.basepri = v
+        19 ->
+            if cpu.ipsr != NMI then cpu.faultmask = x & 1
+        20 ->
+            if cpu.ipsr != 0
+                cpu.control = (cpu.control & 2) | (x & 1)
+            else
+                val was = on_process_stack(cpu)
+
+                cpu.control = x & 3
+
+                if on_process_stack(cpu) != was
+                    val sp = cpu.r[13]
+
+                    cpu.r[13] = cpu.sp_other
+                    cpu.sp_other = sp
+        _ ->
+            if ip.imm & 4 == 0
+                if ip.imm & 0x200 != 0 then set_apsr(cpu, x)
+                if cpu.dsp && ip.imm & 0x100 != 0 then cpu.ge = (x >> 16) & 15
+
+    recheck(cpu)
+
+// `CPSID` (imm bit 0 set) or `CPSIE`, of PRIMASK (bit 1) and FAULTMASK (bit 2). FAULTMASK is not
+// set from the NMI handler.
+cps8(cpu: *Cpu, ip: *Insn)
+    val v = ip.imm & 1
+
+    if ip.imm & 2 != 0 then cpu.primask = v
+    if ip.imm & 4 != 0 && !(v == 1 && cpu.ipsr == NMI) then cpu.faultmask = v
+
+    recheck(cpu)
