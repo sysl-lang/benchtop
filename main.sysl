@@ -22,29 +22,31 @@
 //         the cores taking turns on one thread and three with a thread each, and report the
 //         instructions both cores retired and their speed together. Naming one way runs only that one.
 //
-//     benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
+//     benchtop bench [--core <core>] <image.bin> [expected result] [match | threaded]
 //         Run a raw image from address 0 on one core, an M0+ where none is named, under both
 //         executors, three rounds each, and report each one's speed. Naming one executor runs only
 //         that one, so a process-wide counter (`time -l`'s cycles and instructions) measures it alone.
 
-import sh.sysl.benchtop.v6m.{Cpu, Kind, Stop, model_named, model_names, reset, run_match, run_threaded}
+import sh.sysl.benchtop.v6m.{Cpu, Kind, Stop, model_named, reset, run_match, run_threaded}
 import sh.sysl.benchtop.virt.{board_named, boot, capture, core1, described_error, image_of, listen, open_console, output, run_board, set_threads, stop_message, type_in}
-import sh.sysl.benchtop.{built_in_shelf, library, load, open_chip, open_description, summary}
+import sh.sysl.benchtop.{built_in_shelf, library, listing, load, open_chip, open_description, summary}
 import sysl.raw.str_cast
 import sh.sysl.parsing.Span
 import sysl.fs.read_bytes
-import sysl.text.parse_int
+import sysl.text.{parse_int, parse_long}
 import sysl.time.monotonic
 import sysl.tty.raw
+import sh.sysl.benchtop.riscv as rv
 
 const QUANTUM: u64 = 1000000
 
 var cpu: Cpu
+var riscv_ram: [1048576]u8
 
 usage()
     print("usage: benchtop run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>")
     print("       benchtop check [--chip] <name | file.hocon>")
-    print("       benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]")
+    print("       benchtop bench [--core <core>] <image.bin> [expected result] [match | threaded]")
     print("       benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]")
     exit(2)
 
@@ -178,9 +180,14 @@ bench(args: []string)
 
     if args[2] == "--core"
         if args.len < 5 then usage()
+        rv.model_named(args[3]) match
+            Some(model) ->
+                bench_riscv(args, model)
+                return
+            None -> ()
         kind = model_named(args[3]) match
             Some(m) -> m.kind
-            None -> die(s"`${args[3]}` is no core benchtop has: ${model_names()}")
+            None -> die(s"`${args[3]}` is no core benchtop has: ${listing(library().core_names())}")
         at = 4
 
     val image = read_or_die(args[at])
@@ -244,3 +251,35 @@ bench_board(args: []string)
         if only != "turns" then good = board_round("threads", image.view(), true) && good
 
     if !good then exit(1)
+
+// RISC-V profiles share one interpreter. This raw-image bench starts at zero and checks a0
+// at EBREAK. It deliberately does not pretend to boot an RP2350 or use ARM reset vectors.
+bench_riscv(args: []string, model: rv.Model)
+    if !rv.implemented(model) then die(s"not all extensions of `${model.name}` are emulated yet (${model.isa})")
+    if args.len > 6 then die("RISC-V profiles use one shared executor; no executor selector is accepted")
+    val image = read_or_die(args[4])
+    if image.len > riscv_ram.len then die("larger than the bench's 1 MB of RAM")
+    val expected: u32 = if args.len > 5 then expected_u32(args[5]) else 0
+    var core: rv.Cpu
+    var good = true
+    for round in 0..<3
+        for i in 0..<riscv_ram.len do riscv_ram[i] = 0
+        for i in 0..<image.len do riscv_ram[i] = image[i]
+        rv.reset(&core, model, riscv_ram, 0, 0)
+        val start = monotonic()
+        while core.stop == rv.Stop.Budget
+            rv.run(&core, QUANTUM)
+        val us = (monotonic() - start).us
+        val mips = if us == 0 then 0.0 else real(core.retired) / real(us)
+        print(s"${model.name}: ${core.retired} instructions in $us us, $mips MIPS, a0 = ${core.r[10]}, ${core.stop}")
+        if core.stop != rv.Stop.Breakpoint || core.r[10] != expected
+            print(s"  FAILED: expected a0 = $expected at EBREAK; pc = ${core.pc}, address = ${core.stop_at}")
+            good = false
+    if !good then exit(1)
+
+expected_u32(text: string) -> u32
+    val value = parse_long(text) match
+        Ok(n) -> n
+        Err(_) -> die(s"expected register value is not an integer: $text")
+    if value < -2147483648 || value > 4294967295 then die(s"expected register value is outside 32 bits: $text")
+    u32(value)

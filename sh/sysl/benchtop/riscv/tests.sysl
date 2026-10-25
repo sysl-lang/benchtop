@@ -1,0 +1,280 @@
+module sh.sysl.benchtop.riscv
+@tests
+
+private start(cpu: *Cpu, ram: []u8, core: string)
+    for i in 0..<ram.len do ram[i] = 0
+    reset(cpu, model_named(core).unwrap(), ram, 0, 0)
+
+private insn(cpu: *Cpu, code: u32)
+    write(cpu, 0, 4, code)
+    cpu.pc = 0
+    cpu.stop = Stop.Budget
+    run(cpu, 1)
+
+@test("RV32 profiles share capabilities and refuse the unimplemented Hazard3 extensions")
+profiles()
+    for model in MODELS
+        assert(model_named(model.name).unwrap().extensions == model.extensions)
+        assert(implemented(model) == (model.name != "hazard3"))
+    assert(model_named("rv64i").is_none())
+    var ram: [32]u8
+    var cpu: Cpu
+    reset(&cpu, model_named("hazard3").unwrap(), ram, 0, 0)
+    assert(cpu.stop == Stop.Undefined && cpu.retired == 0)
+
+@test("RV32 ALU operations cover signed boundaries, wraparound and masked shifts across profiles")
+alu()
+    // instruction, a, b, answer. x1 and x2 are the inputs; x3 is the output.
+    val cases: [][4]u32 = [
+        [0x002081B3, 0xFFFFFFFF, 1, 0],
+        [0x402081B3, 0, 1, 0xFFFFFFFF],
+        [0x002091B3, 1, 33, 2],
+        [0x0020A1B3, 0x80000000, 0, 1],
+        [0x0020B1B3, 0xFFFFFFFF, 0, 0],
+        [0x0020C1B3, 0xFF00, 0x0FF0, 0xF0F0],
+        [0x0020D1B3, 0x80000000, 33, 0x40000000],
+        [0x4020D1B3, 0x80000000, 33, 0xC0000000],
+        [0x0020E1B3, 0xFF00, 0x0FF0, 0xFFF0],
+        [0x0020F1B3, 0xFF00, 0x0FF0, 0x0F00],
+        [0xFFF08193, 0, 0, 0xFFFFFFFF],
+        [0xFFF0A193, 0x80000000, 0, 1],
+        [0xFFF0B193, 0, 0, 1],
+        [0xFFF0C193, 0x12345678, 0, 0xEDCBA987],
+        [0x01F09193, 1, 0, 0x80000000],
+        [0x41F0D193, 0x80000000, 0, 0xFFFFFFFF],
+        [0x01F0D193, 0x80000000, 0, 1],
+        [0x0800E193, 1, 0, 129],
+        [0x0800F193, 0xFFFFFFFF, 0, 128],
+        [0xABCDE1B7, 0, 0, 0xABCDE000],
+    ]
+    var ram: [64]u8
+    var cpu: Cpu
+    for name in ["rv32i", "rv32im", "rv32ic", "rv32imc"]
+        for c in cases
+            start(&cpu, ram, name)
+            cpu.r[1] = c[1]
+            cpu.r[2] = c[2]
+            insn(&cpu, c[0])
+            assert(cpu.stop == Stop.Budget && cpu.pc == 4 && cpu.retired == 1, s"$name ${c[0]}")
+            assert(cpu.r[3] == c[3], s"$name ${c[0]}: ${cpu.r[3]} != ${c[3]}")
+
+@test("RV32M wide products and division match architectural overflow and divide-by-zero rules")
+multiply_divide()
+    // funct3, a, b, answer
+    val cases: [][4]u32 = [
+        [0, 0xFFFFFFFF, 3, 0xFFFFFFFD],
+        [1, 0x80000000, 2, 0xFFFFFFFF],
+        [1, 0x80000000, 0x80000000, 0x40000000],
+        [2, 0x80000000, 0xFFFFFFFF, 0x80000000],
+        [3, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFE],
+        [4, 0x80000000, 0xFFFFFFFF, 0x80000000],
+        [4, 0xFFFFFFF9, 3, 0xFFFFFFFE],
+        [5, 0xFFFFFFF9, 3, 1431655763],
+        [6, 0xFFFFFFF9, 3, 0xFFFFFFFF],
+        [6, 0x80000000, 0xFFFFFFFF, 0],
+        [7, 7, 3, 1],
+        [4, 7, 0, 0xFFFFFFFF], [5, 7, 0, 0xFFFFFFFF],
+        [6, 7, 0, 7], [7, 7, 0, 7],
+    ]
+    var ram: [64]u8
+    var cpu: Cpu
+    for name in ["rv32im", "rv32imc"]
+        for c in cases
+            start(&cpu, ram, name)
+            cpu.r[1] = c[1]
+            cpu.r[2] = c[2]
+            insn(&cpu, 0x022081B3 | (c[0] << 12))
+            assert(cpu.stop == Stop.Budget && cpu.r[3] == c[3], s"$name op ${c[0]}: ${cpu.r[3]} != ${c[3]}")
+    for name in ["rv32i", "rv32ic"]
+        start(&cpu, ram, name)
+        insn(&cpu, 0x022081B3)
+        assert(cpu.stop == Stop.Undefined && cpu.pc == 0 && cpu.retired == 0)
+
+@test("RV32 branches use signed and unsigned comparisons and fault only on taken misaligned targets")
+branches()
+    var ram: [64]u8
+    var cpu: Cpu
+    for op in [0u32, 1, 4, 5, 6, 7]
+        for pair in [[0u32, 0u32], [0xFFFFFFFF, 0u32], [0x80000000, 1u32], [1u32, 2u32]]
+            start(&cpu, ram, "rv32i")
+            cpu.r[1] = pair[0]
+            cpu.r[2] = pair[1]
+            val taken = op match
+                0 -> pair[0] == pair[1]
+                1 -> pair[0] != pair[1]
+                4 -> i64(i32(pair[0])) - i64(i32(pair[1])) < 0
+                5 -> i64(i32(pair[0])) - i64(i32(pair[1])) >= 0
+                6 -> u64(pair[0]) < u64(pair[1])
+                _ -> u64(pair[0]) >= u64(pair[1])
+            insn(&cpu, 0x00208463 | (op << 12)) // branch +8
+            assert(cpu.pc == (if taken then 8u32 else 4u32) && cpu.retired == 1)
+    start(&cpu, ram, "rv32i")
+    insn(&cpu, 0x00000163) // BEQ x0,x0,+2
+    assert(cpu.stop == Stop.Misaligned && cpu.stop_at == 2 && cpu.pc == 0 && cpu.retired == 0)
+    start(&cpu, ram, "rv32i")
+    insn(&cpu, 0x00001163) // BNE x0,x0,+2, not taken
+    assert(cpu.stop == Stop.Budget && cpu.pc == 4)
+
+@test("RV32 jumps preserve link aliasing, clear JALR bit zero, and use the actual PC")
+jumps()
+    var ram: [64]u8
+    var cpu: Cpu
+    start(&cpu, ram, "rv32i")
+    cpu.r[1] = 13
+    insn(&cpu, 0x000080E7) // JALR x1,0(x1)
+    assert(cpu.pc == 12 && cpu.r[1] == 4)
+    start(&cpu, ram, "rv32i")
+    insn(&cpu, 0x008000EF) // JAL x1,+8
+    assert(cpu.pc == 8 && cpu.r[1] == 4)
+    write(&cpu, 8, 4, 0x00000197) // AUIPC x3,0
+    run(&cpu, 1)
+    assert(cpu.r[3] == 8 && cpu.pc == 12)
+    start(&cpu, ram, "rv32i")
+    cpu.r[1] = 3
+    insn(&cpu, 0x000080E7)
+    assert(cpu.stop == Stop.Misaligned && cpu.r[1] == 3 && cpu.retired == 0)
+
+@test("RV32 memory handles width, sign extension, offsets and x0 load faults without partial stores")
+loads_stores()
+    var ram: [128]u8
+    var cpu: Cpu
+    start(&cpu, ram, "rv32i")
+    cpu.r[1] = 68
+    cpu.r[2] = 0x80FF7F81
+    insn(&cpu, 0xFE20AE23) // SW x2,-4(x1)
+    assert(read(&cpu, 64, 4) == 0x80FF7F81)
+    for c in [[0u32, 0xFFFFFF81u32], [1u32, 0x7F81u32], [2u32, 0x80FF7F81u32], [4u32, 0x81u32], [5u32, 0x7F81u32]]
+        insn(&cpu, 0xFFC08183 | (c[0] << 12))
+        assert(cpu.stop == Stop.Budget && cpu.r[3] == c[1], s"load ${c[0]}")
+    cpu.r[1] = 66
+    insn(&cpu, 0x00009183) // LH x3,0(x1)
+    assert(cpu.r[3] == 0xFFFF80FF)
+    cpu.r[1] = 65
+    val previous = read(&cpu, 64, 4)
+    insn(&cpu, 0x0020A023) // misaligned SW
+    assert(cpu.stop == Stop.Misaligned && cpu.pc == 0)
+    cpu.stop = Stop.Budget
+    assert(read(&cpu, 64, 4) == previous)
+    cpu.r[1] = 128
+    insn(&cpu, 0x0000A003) // LW x0,0(x1) must still fault
+    assert(cpu.stop == Stop.Unmapped && cpu.stop_at == 128 && cpu.pc == 0)
+
+@test("RV32 illegal encodings, ECALL and EBREAK stop before retirement and x0 stays zero")
+invalid_and_stops()
+    var ram: [64]u8
+    var cpu: Cpu
+    for code in [0u32, 0xFFFFFFFF, 0x02009193, 0x40009193, 0x402091B3, 0x00003183, 0x00003023, 0x00002063, 0x00001067, 0x0000100F, 0x30001073]
+        start(&cpu, ram, "rv32i")
+        insn(&cpu, code)
+        assert(cpu.stop == Stop.Undefined && cpu.pc == 0 && cpu.retired == 0, s"$code")
+    start(&cpu, ram, "rv32i")
+    insn(&cpu, 0x00100013) // ADDI x0,x0,1
+    assert(cpu.r[0] == 0)
+    insn(&cpu, 0x00000073)
+    assert(cpu.stop == Stop.Ecall && cpu.retired == 1 && cpu.pc == 0)
+    insn(&cpu, 0x00100073)
+    assert(cpu.stop == Stop.Breakpoint && cpu.retired == 1)
+    insn(&cpu, 0x0FF0000F) // FENCE
+    assert(cpu.stop == Stop.Budget && cpu.retired == 2)
+
+@test("RV32 bounded execution resumes a backwards-branch loop at each instruction boundary")
+budgets()
+    var ram: [64]u8
+    var cpu: Cpu
+    start(&cpu, ram, "rv32i")
+    write(&cpu, 0, 4, 0x00500513) // ADDI a0,x0,5
+    write(&cpu, 4, 4, 0xFFF50513) // ADDI a0,a0,-1
+    write(&cpu, 8, 4, 0xFE051EE3) // BNE a0,x0,-4
+    write(&cpu, 12, 4, 0x00100073)
+    run(&cpu, 0)
+    assert(cpu.pc == 0 && cpu.retired == 0)
+    for i in 0..<11
+        run(&cpu, 1)
+        assert(cpu.stop == Stop.Budget && cpu.retired == u64(i + 1))
+    run(&cpu, 1)
+    assert(cpu.stop == Stop.Breakpoint && cpu.r[10] == 0 && cpu.retired == 11 && cpu.pc == 12)
+
+@test("RV32 RAM may start at RP2350 SRAM and boundary accesses remain checked")
+relocated_ram()
+    var ram: [16]u8
+    var cpu: Cpu
+    reset(&cpu, model_named("rv32i").unwrap(), ram, 0x20000000, 0x20000000)
+    write(&cpu, 0x20000000, 4, 0x00000197)
+    run(&cpu, 1)
+    assert(cpu.r[3] == 0x20000000 && cpu.pc == 0x20000004)
+    read(&cpu, 0x1FFFFFFC, 4)
+    assert(cpu.stop == Stop.Unmapped)
+    cpu.stop = Stop.Budget
+    read(&cpu, 0x20000010, 4)
+    assert(cpu.stop == Stop.Unmapped)
+    cpu.stop = Stop.Budget
+    read(&cpu, 0x20000000, 3)
+    assert(cpu.stop == Stop.Unmapped)
+
+@test("RV32C runs mixed-width code, preserves compressed links and gates compressed encodings by profile")
+compressed_execution()
+    var ram: [64]u8
+    var cpu: Cpu
+    start(&cpu, ram, "rv32imc")
+    write(&cpu, 0, 2, 0x4515) // C.LI a0,5
+    write(&cpu, 2, 2, 0x157D) // C.ADDI a0,-1
+    write(&cpu, 4, 2, 0xA011) // C.J +4
+    write(&cpu, 6, 2, 0x0000) // skipped illegal instruction
+    write(&cpu, 8, 2, 0x0506) // C.SLLI a0,1
+    write(&cpu, 10, 2, 0x9002) // C.EBREAK
+    run(&cpu, 100)
+    assert(cpu.stop == Stop.Breakpoint && cpu.pc == 10 && cpu.r[10] == 8 && cpu.retired == 4)
+    start(&cpu, ram, "rv32ic")
+    write(&cpu, 0, 2, 0x2011) // C.JAL +4
+    run(&cpu, 1)
+    assert(cpu.pc == 4 && cpu.r[1] == 2)
+    start(&cpu, ram, "rv32i")
+    write(&cpu, 0, 2, 0x0001) // C.NOP is not RV32I
+    run(&cpu, 1)
+    assert(cpu.stop == Stop.Undefined && cpu.retired == 0)
+    start(&cpu, ram, "rv32ic")
+    write(&cpu, 0, 2, 0x0001)
+    write(&cpu, 2, 2, 0x0513) // 32-bit ADDI a0,x0,42 at halfword boundary
+    write(&cpu, 4, 2, 0x02A0)
+    run(&cpu, 2)
+    assert(cpu.pc == 6 && cpu.r[10] == 42 && cpu.retired == 2)
+
+@test("RV32C reserved encodings and unsupported floating-point or RV64 operations are rejected")
+compressed_reserved()
+    for c in [0u32, 0x2000, 0x6000, 0xA000, 0xE000, 0x6101, 0x6001, 0x9001, 0x9C01, 0x1002, 0x4002, 0x8002, 0x2002, 0x6002, 0xA002, 0xE002]
+        assert(decompress(c) == 0, s"$c")
+
+// Built with LLVM from examples/riscv/kernel.c; the host build computes the expected hash.
+private val KERNEL_I = embed("../../../../examples/riscv/kernel-rv32i.bin")
+private val KERNEL_IM = embed("../../../../examples/riscv/kernel-rv32im.bin")
+private val KERNEL_IC = embed("../../../../examples/riscv/kernel-rv32ic.bin")
+private val KERNEL_IMC = embed("../../../../examples/riscv/kernel-rv32imc.bin")
+
+@test("compiled C runs under every RV32 profile and matches the host oracle")
+compiled_kernel()
+    val images: [][]const u8 = [KERNEL_I, KERNEL_IM, KERNEL_IC, KERNEL_IMC]
+    var ram: [1048576]u8
+    var cpu: Cpu
+    for i in 0..<4
+        start(&cpu, ram, MODELS[i].name)
+        for j in 0..<images[i].len do ram[j] = images[i][j]
+        run(&cpu, 100000)
+        assert(cpu.stop == Stop.Breakpoint && cpu.r[10] == 3132271724, MODELS[i].name)
+        // Execute the same image one instruction at a time to check budget resumption.
+        val retired = cpu.retired
+        start(&cpu, ram, MODELS[i].name)
+        for j in 0..<images[i].len do ram[j] = images[i][j]
+        while cpu.stop == Stop.Budget && cpu.retired < 100000 do run(&cpu, 1)
+        assert(cpu.stop == Stop.Breakpoint && cpu.r[10] == 3132271724 && cpu.retired == retired)
+
+private val COMPRESSED_PAIRS = embed("../../../../examples/riscv/compressed.bin")
+
+@test("RV32C expansion matches LLVM encodings for every instruction family and immediate bit")
+compressed_assembler_oracle()
+    assert(COMPRESSED_PAIRS.len % 6 == 0)
+    for i in 0..<(COMPRESSED_PAIRS.len / 6)
+        val at = i * 6
+        val c = u32(COMPRESSED_PAIRS[at]) | (u32(COMPRESSED_PAIRS[at + 1]) << 8)
+        var expected: u32 = 0
+        for j in 0..<4 do expected |= u32(COMPRESSED_PAIRS[at + 2 + usize(j)]) << (8 * u32(j))
+        assert(decompress(c) == expected, s"pair $i: $c expanded to ${decompress(c)}, expected $expected")

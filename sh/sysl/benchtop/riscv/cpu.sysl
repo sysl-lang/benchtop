@@ -1,0 +1,198 @@
+module sh.sysl.benchtop.riscv
+
+// Little-endian RV32 interpreter. The caller owns the RAM and chooses its address and entry point;
+// this is not an RP2350 boot model. No decoder cache, so self-modifying code is immediately visible.
+// Unsupported encodings and accesses stop before retirement, with PC and destination preserved.
+// Spec: https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html
+
+enum Stop
+    Budget = 0
+    Breakpoint
+    Ecall
+    Undefined
+    Misaligned
+    Unmapped
+
+struct Cpu
+    model: Model
+    r: [32]u32
+    pc: u32
+    retired: u64
+    stop: Stop
+    stop_at: u32
+    ram: []u8
+    base: u32
+
+reset(cpu: *Cpu, model: Model, ram: []u8, base: u32, entry: u32)
+    cpu.model = model
+    for i in 0..<32 do cpu.r[i] = 0
+    cpu.pc = entry
+    cpu.retired = 0
+    cpu.stop = if implemented(model) then Stop.Budget else Stop.Undefined
+    cpu.stop_at = entry
+    cpu.ram = ram
+    cpu.base = base
+
+private fail(cpu: *Cpu, why: Stop, at: u32)
+    cpu.stop = why
+    cpu.stop_at = at
+
+private accessible(cpu: *Cpu, address: u32, width: u32) -> bool
+    if (address & (width - 1)) != 0
+        fail(cpu, Stop.Misaligned, address)
+        return false
+    if address < cpu.base || u64(address - cpu.base) + u64(width) > u64(cpu.ram.len)
+        fail(cpu, Stop.Unmapped, address)
+        return false
+    true
+
+read(cpu: *Cpu, address: u32, width: u32) -> u32
+    if width != 1 && width != 2 && width != 4
+        fail(cpu, Stop.Unmapped, address)
+        return 0
+    if !accessible(cpu, address, width) then return 0
+    var value: u32 = 0
+    for i in 0u32..<width do value |= u32(cpu.ram[address - cpu.base + i]) << (8 * i)
+    value
+
+write(cpu: *Cpu, address: u32, width: u32, value: u32)
+    if width != 1 && width != 2 && width != 4
+        fail(cpu, Stop.Unmapped, address)
+        return
+    if !accessible(cpu, address, width) then return
+    for i in 0u32..<width do cpu.ram[address - cpu.base + i] = u8(value >> (8 * i))
+
+private sext(value: u32, bits: u32) -> u32 = u32(i32(value << (32 - bits)) >> (32 - bits))
+
+private branch(op: u32, a: u32, b: u32) -> bool = op match
+    0 -> a == b
+    1 -> a != b
+    4 -> i32(a) < i32(b)
+    5 -> i32(a) >= i32(b)
+    6 -> a < b
+    7 -> a >= b
+    _ -> false
+
+// The M extension's eight operations, shared by every profile that enables it. Wide signed
+// division also handles INT_MIN/-1 without invoking the host's overflow behaviour.
+private multiply(op: u32, a: u32, b: u32) -> u32 = op match
+    0 -> a * b
+    1 -> u32(u64(i64(i32(a)) * i64(i32(b))) >> 32)
+    2 -> u32(u64(i64(i32(a)) * i64(b)) >> 32)
+    3 -> u32((u64(a) * u64(b)) >> 32)
+    4 -> if b == 0 then 0xFFFFFFFF else u32(i64(i32(a)) / i64(i32(b)))
+    5 -> if b == 0 then 0xFFFFFFFF else a / b
+    6 -> if b == 0 then a else u32(i64(i32(a)) % i64(i32(b)))
+    _ -> if b == 0 then a else a % b
+
+// Execute a canonical 32-bit instruction. Compressed encodings expand into this same path.
+private execute(cpu: *Cpu, insn: u32, length: u32)
+    val rd = (insn >> 7) & 31
+    val rs1 = (insn >> 15) & 31
+    val rs2 = (insn >> 20) & 31
+    val a = if rs1 == 0 then 0 else cpu.r[rs1]
+    val b = if rs2 == 0 then 0 else cpu.r[rs2]
+    val op = (insn >> 12) & 7
+    val top = insn >> 25
+    val imm = sext(insn >> 20, 12)
+    var next = cpu.pc + length
+    var result: u32 = 0
+    var put = true
+    var valid = true
+
+    (insn & 127) match
+        0x37 -> result = insn & 0xFFFFF000
+        0x17 -> result = cpu.pc + (insn & 0xFFFFF000)
+        0x6F ->
+            val offset = sext(((insn >> 31) << 20) | (((insn >> 12) & 255) << 12) | (((insn >> 20) & 1) << 11) | (((insn >> 21) & 1023) << 1), 21)
+            result = next
+            next = cpu.pc + offset
+        0x67 ->
+            valid = op == 0
+            result = next
+            next = (a + imm) & ~1u32
+        0x63 ->
+            put = false
+            valid = op != 2 && op != 3
+            val offset = sext(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11) | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)
+            if branch(op, a, b) then next = cpu.pc + offset
+        0x03 ->
+            valid = op == 0 || op == 1 || op == 2 || op == 4 || op == 5
+            if valid
+                result = read(cpu, a + imm, 1u32 << (op & 3))
+                if op < 2 then result = sext(result, 8u32 << op)
+        0x23 ->
+            put = false
+            valid = op <= 2
+            val offset = sext(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
+            if valid then write(cpu, a + offset, 1u32 << op, b)
+        0x13 | 0x33 ->
+            val immediate = (insn & 127) == 0x13
+            val rhs = if immediate then imm else b
+            val shift = rhs & 31
+            if !immediate && top == 1
+                valid = has(cpu.model, EXT_M)
+                if valid then result = multiply(op, a, b)
+            else
+                valid = immediate || top == 0 || (top == 32 && (op == 0 || op == 5))
+                op match
+                    0 -> result = if !immediate && top == 32 then a - rhs else a + rhs
+                    1 ->
+                        if immediate then valid = top == 0
+                        result = a << shift
+                    2 -> result = if i32(a) < i32(rhs) then 1 else 0
+                    3 -> result = if a < rhs then 1 else 0
+                    4 -> result = a ^ rhs
+                    5 ->
+                        if immediate then valid = top == 0 || top == 32
+                        result = if top == 32 then u32(i32(a) >> shift) else a >> shift
+                    6 -> result = a | rhs
+                    7 -> result = a & rhs
+                    _ -> ()
+        0x0F ->
+            put = false
+            // FENCE is a no-op on this single-core sequential memory model. FENCE.I is
+            // intentionally not enabled until Zifencei is a declared profile capability.
+            valid = op == 0
+        0x73 ->
+            put = false
+            if insn == 0x00100073 then fail(cpu, Stop.Breakpoint, cpu.pc)
+            elif insn == 0x00000073 then fail(cpu, Stop.Ecall, cpu.pc)
+            else valid = false
+        _ -> valid = false
+
+    if !valid then fail(cpu, Stop.Undefined, cpu.pc)
+    if cpu.stop != Stop.Budget then return
+    val alignment: u32 = if has(cpu.model, EXT_C) then 2 else 4
+    if (next & (alignment - 1)) != 0
+        fail(cpu, Stop.Misaligned, next)
+        return
+    if put && rd != 0 then cpu.r[rd] = result
+    cpu.r[0] = 0
+    cpu.pc = next
+    cpu.retired += 1
+
+run(cpu: *Cpu, budget: u64)
+    if cpu.stop != Stop.Budget then return
+    var left = budget
+    while left != 0 && cpu.stop == Stop.Budget
+        val alignment: u32 = if has(cpu.model, EXT_C) then 2 else 4
+        if (cpu.pc & (alignment - 1)) != 0
+            fail(cpu, Stop.Misaligned, cpu.pc)
+            break
+        val lo = read(cpu, cpu.pc, 2)
+        if cpu.stop != Stop.Budget then break
+        if (lo & 3) != 3
+            if !has(cpu.model, EXT_C)
+                fail(cpu, Stop.Undefined, cpu.pc)
+                break
+            val expanded = decompress(lo)
+            if expanded == 0
+                fail(cpu, Stop.Undefined, cpu.pc)
+                break
+            execute(cpu, expanded, 2)
+        else
+            val hi = read(cpu, cpu.pc + 2, 2)
+            if cpu.stop != Stop.Budget then break
+            execute(cpu, lo | (hi << 16), 4)
+        left -= 1

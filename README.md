@@ -1,6 +1,6 @@
 # benchtop
 
-A microcontroller board emulator written in sysl, whose cores today are Cortex-M. It runs the firmware a developer would flash onto a board,
+A microcontroller board emulator written in sysl, with Cortex-M virtual boards and an initial RISC-V core interpreter. It runs the firmware a developer would flash onto a board,
 unmodified: each core on its own host thread, the board's display and controls in a Mac window, its
 UART on a terminal. A board is a description (its chip, parts, wiring, what it exposes and its view),
 not a new emulator, and the cores are one interpreter configured per architecture (ARMv6-M, ARMv7E-M,
@@ -52,6 +52,56 @@ speed together. [bench/README.md](bench/README.md) has the numbers.
 
 `sysl test .` runs every test.
 
+## RISC-V cores (initial Pico 2 work)
+
+Chip descriptions can name `rv32i`, `rv32im`, `rv32ic`, `rv32imc` and `hazard3` as cores,
+using the same names and option-block syntax as Cortex-M:
+
+```hocon
+chip {
+  name = riscv-example
+  cores = [rv32i, { core = rv32imc }]
+  peripherals { ram { peripheral = ram, at = 0x20000000, size = 520K } }
+}
+```
+
+One RISC-V interpreter serves all four generic ISA profiles. The catalog selects extensions;
+compressed instructions expand into the same RV32I operations, and M adds shared multiply/divide
+operations. The existing reader, checker, registry, diagnostics and description writer are reused.
+Cortex-M options such as `nvic_priority_bits` are rejected on RISC-V cores, and the checker reserves
+the Cortex-M private peripheral bus only where a chip actually has a Cortex-M core.
+
+`bench --core` runs raw RISC-V images from address 0 in 1 MB of RAM, stopping at `EBREAK` and
+checking `a0` against the expected result. There is one executor, with three rounds:
+
+```sh
+sh examples/riscv/build.sh
+sysl build . -o benchtop
+./benchtop bench --core rv32imc examples/riscv/kernel-rv32imc.bin 3132271724
+./benchtop check --chip examples/riscv/chip.hocon
+./benchtop check pico2
+```
+
+The bare ISA profiles have no interrupt controller. `hazard3` describes the RP2350's 52 external
+interrupts and its ISA from the Pico SDK, but **cannot execute yet**: atomics, CSRs, instruction
+fences, bit manipulation, additional Zc instructions, privileged execution and interrupt delivery
+remain to be implemented. Unsupported profiles and encodings are refused explicitly.
+`run --board` still uses the Cortex-M board runtime. Neither the `pico2` description (the
+non-wireless Pico 2, LED on GP25) nor the existing `pico2w` boots firmware yet. RP2350 devices,
+boot ROM/flash, core selection and multicore startup are subsequent work.
+
+The RISC-V API borrows caller-owned RAM, with a configurable base and entry address, and supports
+instruction budgets. Misaligned and unmapped accesses, illegal instructions, `ECALL` and `EBREAK`
+stop before retirement; privileged trap handlers and MMIO are not implemented. RAM access is
+single-threaded. The ISA reference is the [RISC-V specification](https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html);
+the RP2350 profile follows the [Pico SDK toolchain configuration](https://github.com/raspberrypi/pico-sdk/blob/master/cmake/preload/toolchains/pico_riscv_gcc.cmake).
+
+The committed C guests run under all four profiles and match a host-computed hash. An independent
+LLVM assembler corpus checks 118 compressed/canonical instruction pairs; instruction tests cover
+arithmetic edges, division overflow/zero, branch/jump alignment, memory faults and budget resumption.
+The fixture build requires LLVM clang, lld and llvm-objcopy; their paths can be set with `CLANG`,
+`LD_LLD` and `OBJCOPY`.
+
 ## Describing a board
 
 A description is a HOCON file, and the shortest names a board built into benchtop:
@@ -60,7 +110,7 @@ A description is a HOCON file, and the shortest names a board built into benchto
 board = pico2w
 ```
 
-The virtual boards in the core table below, plus `pico`, `pico2w` and `pico-breadboard-kit`,
+The virtual boards in the core table below, plus `pico`, `pico2`, `pico2w` and `pico-breadboard-kit`,
 are built in ([boards](boards) has their sources), and so are their chips ([chips](chips)). **A
 name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**, on the
 command line and in a file alike, so `--board virt` is the virtual board and `--board ./virt` a
