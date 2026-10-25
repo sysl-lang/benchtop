@@ -1,7 +1,7 @@
 # benchtop — a microcontroller board emulator written in sysl
 
 **Status: a syslUI desktop workbench with the shared SDL3 driver and PlutoVG rendering now runs the bundled virtual GPIO demo, inspects board/product
-descriptions, and exports PNGs. LEDs and buttons are connected to guest MMIO; real-board views
+descriptions, and exports PNGs. LEDs, buttons and a potentiometer/ADC are connected to guest MMIO; real-board views
 are labelled previews and displays remain unimplemented. Twelve scalar Cortex-M models run in `sh.sysl.benchtop.v6m` on virtual boards (§11).
 The RISC-V interpreter runs RV32I/M/C and the RP2350 Hazard3 profile through `bench --core`.
 Core options and implemented subsets are described in the README and §2.12. No real board is

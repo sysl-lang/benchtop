@@ -27,7 +27,11 @@ discarded by `--gc-sections`; the firmware needs no libc or heap.
 
 Rebuild benchtop to update its embedded demo. Hold 1/2 or the onscreen buttons;
 Space pauses, N steps, R resets, S saves a PNG. Firmware reads GP8/GP9 as active-low
-inputs and drives GP0 (heartbeat), GP1 and GP2. There is no host-generated LED animation.
+inputs and drives GP0 (heartbeat), GP1 and GP2. Turn RV1 on the board or use its
+inspector slider: its wiper drives GP26, connected to ADC channel 0. Firmware
+starts conversions, polls their completion, reads the result and prints only when
+it changes. At 0%, 50% and 100%, it prints 0, 2048 and 4095 respectively. No UI
+callback prints an ADC value or manufactures a guest conversion.
 The firmware console is at 0x40000000. The workbench board is a virtual Cortex-M0+
 platform, not an RP2350 memory map or Pico SDK target.
 
@@ -68,3 +72,33 @@ Run this from the repository root with libuv installed. Kairos runs the child bu
 reads stdout and stderr asynchronously, and watches for file changes. Use the Build
 button or B to rebuild, and the Build console tab for diagnostics. A successful
 changed image resets the guest; a failed build leaves its previous firmware running.
+
+## Virtual ADC
+
+`virt-adc` is an explicit virtual chip peripheral at 0x50000100, with IRQ3 and
+`channels = [GP26]`. It uses a 3,300,000 μV reference and 32 guest cycles per conversion.
+Both are configurable as `reference-uv` and `conversion-cycles`. Resolution is 12 bits.
+Samples round to the nearest code (half steps up), saturating at 0 and 4095.
+Unconnected channels report an error instead of supplying a fabricated voltage.
+
+| Offset | Register | Behavior |
+|---|---|---|
+| 0x00 | CTRL | Bit 0 enables; writing bit 1 starts a conversion. Disabling aborts a pending conversion. |
+| 0x04 | CHANNEL | Zero-based index into the peripheral's declared channels. |
+| 0x08 | STATUS | Bit 0 busy, bit 1 ready, bit 2 error. Ready/error are write-one-to-clear. |
+| 0x0c | RESULT | Read-only, holds the last completed sample. |
+| 0x10 | IRQ_ENABLE | Bit 0 completion, bit 1 error. |
+| 0x14 | IRQ_STATUS | Sticky completion/error bits, write-one-to-clear. Masked pending bits assert IRQ3. |
+| 0x18 | REFERENCE_UV | Read-only reference voltage. |
+| 0x1c | RESOLUTION | Read-only, 12 bits. |
+| 0x20 | CONVERSION_CYCLES | Read-only configured duration. |
+
+Only aligned 32-bit accesses are supported. Other access widths fault and unknown
+registers are unmapped. Starts while disabled, busy, or on an unconnected channel
+set the error flag; a busy restart preserves the sample already in flight. Inputs
+changed during a conversion affect the next sample. A guest WFI can wake on the
+completion interrupt. Reset clears ADC registers while the external knob retains
+its position. No analogue circuit solver, noise or source-impedance model is used.
+
+The component declaration uses `ref = RV1` and `wiper = controller.GP26` directly.
+Its ideal voltage range and initial position come from its HOCON instance parameters.

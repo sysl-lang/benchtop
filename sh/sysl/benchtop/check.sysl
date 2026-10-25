@@ -23,6 +23,7 @@ check(b: *Board, reg: Registry, src: Source, r: *Report)
     var pins = PinUses(buf())
 
     check_buses(b, chip, src, r, &pins)
+    check_refs(b.parts, r)
     check_parts(b, chip, reg, src, r, &pins)
     check_exposes(b, chip, src, r)
 
@@ -213,11 +214,31 @@ end carries
 
 // -- parts -----------------------------------------------------------------------------------------
 
+// Direct fields are classified against the actual registry passed to the checker,
+// so custom catalogs and built-in parts use the same schema-driven connection syntax.
+private resolve_terminals(p: *Part, spec: PartSpec, r: *Report)
+    var params: Buf[Param] = buf()
+    for q in p.params
+        if spec.port(q.name).is_some()
+            q.value match
+                Text(value) -> p.wires.push(Wire(q.name, q.name_span, target_of(value), q.span))
+                _ -> r.add(error(q.span, s"`${p.name}.${q.name}` must name a connection point"))
+        else params.push(q)
+    p.params = params
+
+private check_refs(parts: Buf[Part], r: *Report)
+    var seen: Buf[string] = buf()
+    for p in parts
+        if p.reference.is_empty() then continue
+        if contains_name(seen, p.reference) then r.add(error(p.reference_span, s"duplicate part reference `${p.reference}`"))
+        seen.push(p.reference)
+
 private check_parts(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Source, r: *Report, pins: *PinUses)
     // The offered pins taken so far, as `part.port`, with who took them.
     var offered: Buf[(string, string, Span)] = buf()
 
-    for p in b.parts
+    for index in 0..<b.parts.len()
+        var p = b.parts.at(index)
         for bus in b.buses
             if bus.name == p.name then
                 r.add(error(p.name_span, s"duplicate name `${p.name}`")
@@ -235,12 +256,17 @@ private check_parts(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Sourc
                         .with_note(s"the parts benchtop knows are ${listing(reg.part_names())}"))
                 continue
 
+        resolve_terminals(&p, spec, r)
+        b.parts.set(index, p)
         unmapped(p, p.at, "at", spec, r)
         unmapped(p, p.size, "size", spec, r)
         unmapped(p, p.irq, "irq", spec, r)
         check_params(p, spec, r)
 
+        var connected: Buf[string] = buf()
         for w in p.wires
+            if contains_name(connected, w.port) then r.add(error(w.port_span, s"terminal `${p.name}.${w.port}` is connected more than once"))
+            connected.push(w.port)
             val port = spec.port(w.port) match
                 Some(x) -> x
                 None ->
@@ -255,7 +281,7 @@ private check_parts(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Sourc
                     w.to match
                         Pin(n) ->
                             if real_pin(chip, r, n, w.span) then
-                                if need == AdcPin && !adc_pin(chip, n) then
+                                if (need == AdcPin || need == AnalogPin) && !adc_pin(chip, n) then
                                     r.add(error(w.span, s"`$who` takes an ADC pin, and $n has no ADC channel")
                                         .with_note(adc_note(chip)))
                                 else
@@ -264,6 +290,12 @@ private check_parts(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Sourc
                             r.add(error(w.span, s"`$who` takes a pin, and `$name` is a bus")
                                 .with_note("a pin is written `GP16`, or another part's port as `wifi.gpio0`"))
                         Port(other, its) ->
+                            if other == b.chip.name
+                                if real_pin(chip, r, its, w.span)
+                                    if (need == AdcPin || need == AnalogPin) && !adc_pin(chip, its)
+                                        r.add(error(w.span, s"`$who` needs an analogue-capable connection point; `$other.$its` has no ADC channel"))
+                                    else claim(pins, src, r, its, s"$other.$its", who, w.span)
+                                continue
                             wire_offered(b.parts, reg, src, r, &offered, need, who, other, its, w.span)
                 BusPort(kind) ->
                     w.to match
@@ -362,6 +394,10 @@ check_params(p: Part, spec: PartSpec, r: *Report)
             Some(ps) -> check_param(s"`${p.name}.${prm.name}`", prm, ps, r)
             None -> r.add(unknown_param(p.name, prm, spec))
 
+    if p.kind == "potentiometer"
+        val low = part_whole(p, "low-uv", 0)
+        val high = part_whole(p, "high-uv", 3300000)
+        if low > high then r.add(error(p.name_span, "potentiometer low-uv must not exceed high-uv"))
     for ps in spec.params
         if ps.required && param_named(p.params, ps.name).is_none() then
             r.add(error(p.name_span, s"`${p.name}` (${spec.name}) needs `${ps.name}`")
@@ -582,6 +618,7 @@ end Socket
  * expose, each exposed pin once across the product.
  */
 check_product(p: *Product, reg: Registry, src: Source, r: *Report)
+    check_refs(p.parts, r)
     var sockets: Buf[Socket] = buf()
 
     for inst in p.boards
@@ -594,6 +631,7 @@ check_product(p: *Product, reg: Registry, src: Source, r: *Report)
             for w in q.wires
                 w.to match
                     Pin(n) -> held_by_board(&uses, n, s"${q.name}.${w.port}", inst.name)
+                    Port(owner, n) -> if owner == inst.board.chip.name then held_by_board(&uses, n, s"${q.name}.${w.port}", inst.name)
                     _ -> ()
 
         val chip: Option[ChipSpec] = if inst.board.chip_found then Some(chip_spec(inst.board.chip, reg)) else None
@@ -632,7 +670,8 @@ check_product(p: *Product, reg: Registry, src: Source, r: *Report)
 
     var offered: Buf[(string, string, Span)] = buf()
 
-    for q in p.parts
+    for index in 0..<p.parts.len()
+        var q = p.parts.at(index)
         instance_named(*p, q.name) match
             Some(i) ->
                 r.add(error(q.name_span, s"duplicate name `${q.name}`")
@@ -651,6 +690,8 @@ check_product(p: *Product, reg: Registry, src: Source, r: *Report)
                         .with_note(s"the parts benchtop knows are ${listing(reg.part_names())}"))
                 continue
 
+        resolve_terminals(&q, spec, r)
+        p.parts.set(index, q)
         outside(q, q.at, "at", r)
         outside(q, q.size, "size", r)
         outside(q, q.irq, "irq", r)
@@ -725,7 +766,7 @@ private wire_board_pin(sock: Socket, need: PinNeed, who: string, name: string, s
         r.add(unexposed(sock.inst, name, span))
         return
 
-    if need == AdcPin && !adc_pin(sock.chip, name) then
+    if (need == AdcPin || need == AnalogPin) && !adc_pin(sock.chip, name) then
         r.add(error(span, s"`$who` takes an ADC pin, and `$board.$name` has no ADC channel")
             .with_note(adc_note(sock.chip)))
         return
@@ -976,3 +1017,10 @@ private example(k: ParamKind) -> string
         PFlag -> "true"
         PChoice(options) -> options.at(0)
 end example
+
+/** An integer instance parameter, after schema checking, with its model's default. */
+part_whole(p: Part, name: string, fallback: long) -> long = param_named(p.params, name) match
+    Some(q) -> q.value match
+        Whole(n) -> n
+        _ -> fallback
+    None -> fallback

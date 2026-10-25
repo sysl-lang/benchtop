@@ -32,7 +32,10 @@ sysl build . -o benchtop
 The bundled firmware is written in sysl and compiled for Cortex-M0+. It drives a
 heartbeat LED and reads two active-low
 buttons through MMIO. Hold **1** or **2**, or click and hold either button, to light
-its corresponding LED. **Space** pauses, **N** executes one instruction per active
+its corresponding LED. Turn **RV1** on the board (drag around the dial), or use
+its inspector slider, to change the ADC input. The sysl firmware prints `ADC0 = N`
+when the reading changes: 0 at minimum, 2048 at halfway, and 4095 at maximum.
+**Space** pauses, **N** executes one instruction per active
 core, **R** resets, **S** saves a PNG, and **Escape** closes the window. The toolbar
 provides the same controls. Click a part to inspect its wiring. The scrollable inspector shows wiring, signal
 states, and actual guest console
@@ -56,6 +59,37 @@ syslUI view tree and PlutoVG renderer at a standard
 1200×760 size. Headless rendering also needs an installed system font (Arial on
 macOS, or DejaVu Sans/Liberation Sans on Linux); it needs no display server. See [examples/visual](examples/visual/README.md) to build
 and modify the firmware and for the virtual GPIO register map.
+
+## Parts, references and analogue input
+
+`potentiometer` is a built-in part; `virt-adc` is a built-in chip peripheral.
+Part terminals can be assigned directly, using named chip connection points:
+
+```hocon
+volume {
+  part = potentiometer
+  ref = RV1
+  position = 50
+  low-uv = 0
+  high-uv = 3300000
+  taper = linear
+  wiper = controller.GP26
+}
+```
+
+`volume` is the instance identifier and `RV1` its schematic/silkscreen reference.
+References are optional and checked for uniqueness within a board or product's
+own parts. `controller` names the owning chip in the workbench description; GP26
+is declared by that chip and connected to ADC channel 0. Unknown endpoints,
+non-ADC input pins and invalid parameter values are rejected. Legacy `wire { … }`
+blocks remain accepted; descriptions are written back with direct terminal fields.
+
+The ideal potentiometer supplies integer microvolts, derived from its endpoints
+and position. The ADC latches the voltage at conversion start and completes after
+configured guest cycles. Host rendering and Kairos timers do not advance conversions.
+This is software peripheral emulation with ideal inputs; real-chip ADC register
+compatibility remains a separate model. The [virtual ADC register map](examples/visual/README.md#virtual-adc)
+describes the model used by this demo.
 
 ## Build, watch and reload firmware
 
@@ -101,7 +135,7 @@ sysl build . -o benchtop
 
 **`run`** boots an image on the board `--board` names — the virtual board, `virt`, where none is
 named — its console on this terminal a keystroke at a time. It runs a board on a chip of two cores of
-one supported model (the core table below) whose peripherals benchtop all emulates, with modelled peripherals and supported GPIO LED/button parts, and refuses other boards with the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
+one supported model (the core table below) whose peripherals benchtop all emulates, with modelled peripherals and supported LED, button and potentiometer parts, and refuses other boards with the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
 as raw bytes from address 0. **Ctrl-]** ends benchtop whatever the guest is doing, with exit status
 130. Otherwise the exit status is the one the guest wrote to the console's EXIT register; a guest
 that stops on a breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can
