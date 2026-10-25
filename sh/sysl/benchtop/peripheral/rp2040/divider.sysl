@@ -1,0 +1,84 @@
+module sh.sysl.benchtop.peripheral.rp2040
+
+import sh.sysl.rp2040.sio as reg
+
+// Instantiate once per core, alongside the shared SIO GPIO/FIFO/spinlock state. Every operand
+// write restarts the eight input-clock calculation, including writes to the dividend alone.
+struct Divider
+    dividend: u32
+    divisor: u32
+    quotient: u32
+    remainder: u32
+    remaining: u32
+    signed: bool
+    dirty: bool
+
+    reset(*self)
+        self.dividend = 0
+        self.divisor = 0
+        self.quotient = 0
+        self.remainder = 0
+        self.remaining = 0
+        self.signed = false
+        self.dirty = false
+    end reset
+
+    advance(*self, cycles: u64)
+        if self.remaining == 0 then return
+        if cycles < u64(self.remaining)
+            self.remaining -= u32(cycles)
+            return
+        self.remaining = 0
+        if self.divisor == 0
+            self.quotient = if !self.signed || i32(self.dividend) > 0 then 0xFFFFFFFF else if self.dividend == 0 then 0 else 1
+            self.remainder = self.dividend
+        else if self.signed
+            // Widen first: INT_MIN / -1 must wrap as a guest word rather than overflow the host.
+            val a = i64(i32(self.dividend))
+            val b = i64(i32(self.divisor))
+            self.quotient = u32(a / b)
+            self.remainder = u32(a % b)
+        else
+            self.quotient = self.dividend / self.divisor
+            self.remainder = self.dividend % self.divisor
+    end advance
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, false)?
+        val value = (offset & ~3) match
+            reg.DIV_UDIVIDEND_OFFSET | reg.DIV_SDIVIDEND_OFFSET -> self.dividend
+            reg.DIV_UDIVISOR_OFFSET | reg.DIV_SDIVISOR_OFFSET -> self.divisor
+            reg.DIV_QUOTIENT_OFFSET ->
+                self.dirty = false
+                self.quotient
+            reg.DIV_REMAINDER_OFFSET -> self.remainder
+            reg.DIV_CSR_OFFSET -> (if self.remaining == 0 then reg.DIV_CSR_READY_MASK else 0) | (if self.dirty then reg.DIV_CSR_DIRTY_MASK else 0)
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+    end read
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, false)?
+        val address = offset & ~3
+        val data = replicated(value, width)
+        address match
+            reg.DIV_UDIVIDEND_OFFSET | reg.DIV_SDIVIDEND_OFFSET -> self.dividend = data
+            reg.DIV_UDIVISOR_OFFSET | reg.DIV_SDIVISOR_OFFSET -> self.divisor = data
+            reg.DIV_QUOTIENT_OFFSET -> self.quotient = data
+            reg.DIV_REMAINDER_OFFSET -> self.remainder = data
+            reg.DIV_CSR_OFFSET -> return Ok(())
+            _ -> return Err(AccessError.Unmapped)
+        self.dirty = true
+        if address <= reg.DIV_SDIVISOR_OFFSET
+            self.signed = address == reg.DIV_SDIVIDEND_OFFSET || address == reg.DIV_SDIVISOR_OFFSET
+            self.remaining = 8
+        else
+            self.remaining = 0
+        Ok(())
+    end write
+end Divider
+
+divider() -> Divider
+    var state: Divider
+    state.reset()
+    state

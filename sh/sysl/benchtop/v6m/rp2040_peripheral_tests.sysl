@@ -1,0 +1,110 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2040 as rp
+import sh.sysl.rp2040.{timer as tm, resets as rs, sio}
+
+// A test-only chip bus: the real chip layer owns dispatch, synchronization and IRQ routing.
+// The models themselves have no dependency on this CPU or its scheduler.
+var peripheral_timer: rp.Timer
+var peripheral_resets: rp.Resets
+var peripheral_dividers: [2]rp.Divider
+var peripheral_core: usize = 0
+
+private peripheral_read(cpu: *Cpu, address: u32, width: u32) -> u32
+    if address >= rs.BASE && address < rs.BASE + 0x4000
+        return peripheral_resets.read(address - rs.BASE, width).unwrap()
+    if address >= tm.BASE && address < tm.BASE + 0x4000
+        assert(peripheral_resets.held & rs.RESET_TIMER_MASK == 0, "timer must be out of reset")
+        return peripheral_timer.read(address - tm.BASE, width).unwrap()
+    if address >= sio.BASE + sio.DIV_UDIVIDEND_OFFSET && address <= sio.BASE + sio.DIV_CSR_OFFSET
+        return peripheral_dividers[peripheral_core].read(address - sio.BASE, width).unwrap()
+    halt(cpu, Stop.Unmapped, address)
+    0
+end peripheral_read
+
+private peripheral_write(cpu: *Cpu, address: u32, width: u32, value: u32)
+    if address >= rs.BASE && address < rs.BASE + 0x4000
+        val before = peripheral_resets.held
+        peripheral_resets.write(address - rs.BASE, width, value).unwrap()
+        if peripheral_resets.held & rs.RESET_TIMER_MASK != 0
+            peripheral_timer.reset()
+        else if before & rs.RESET_TIMER_MASK != 0
+            peripheral_resets.complete(rs.RESET_TIMER_MASK)
+        return
+    if address >= tm.BASE && address < tm.BASE + 0x4000
+        assert(peripheral_resets.held & rs.RESET_TIMER_MASK == 0, "timer must be out of reset")
+        peripheral_timer.write(address - tm.BASE, width, value).unwrap()
+        return
+    if address >= sio.BASE + sio.DIV_UDIVIDEND_OFFSET && address <= sio.BASE + sio.DIV_CSR_OFFSET
+        peripheral_dividers[peripheral_core].write(address - sio.BASE, width, value).unwrap()
+        return
+    halt(cpu, Stop.Unmapped, address)
+end peripheral_write
+
+@test("M0+ guest releases an RP2040 timer through RESET_CLR, arms an alarm and receives/acknowledges its IRQ in both engines")
+rp2040_guest_timer()
+    for exec in [&run_match, &run_threaded]
+        var c: Cpu
+        peripheral_timer.reset()
+        peripheral_resets.reset()
+        // STR r2,[r1]; LDR r3,[r4]; STR r6,[r5]; STR r6,[r7].
+        prepare(&c, [0x600A, 0x6823, 0x602E, 0x603E],
+            [0, rs.BASE + 0x3000, rs.RESET_TIMER_MASK, 0, rs.BASE + rs.RESET_DONE_OFFSET,
+             tm.BASE + tm.INTE_OFFSET, 1, tm.BASE + tm.ALARM0_OFFSET], 0, [])
+        c.io_read = &peripheral_read
+        c.io_write = &peripheral_write
+        finish(&c, exec)
+        assert(c.stop == Stop.Breakpoint && c.r[3] == rs.RESET_TIMER_MASK && peripheral_timer.armed == 1, "guest reset handshake and alarm programming")
+
+        // Resume at WFI. The chip scheduler supplies the watchdog tick and routes TIMER_IRQ_0.
+        store16(&c, 8, 0xBF30)
+        store16(&c, 10, 0xBE00)
+        store32(&c, SCB_VTOR, 0xC00)
+        store32(&c, 0xC00 + (IRQ0 * 4), 0x101)
+        // IRQ handler: MOVS r0,#1; STR r0,[r1]; BX LR. R1 points at timer INTR.
+        store16(&c, 0x100, 0x2001)
+        store16(&c, 0x102, 0x6008)
+        store16(&c, 0x104, 0x4770)
+        c.r[1] = tm.BASE + tm.INTR_OFFSET
+        store32(&c, NVIC_ISER, 1)
+        c.stop = Stop.Budget
+        c.limit = c.retired + 100
+        exec(&c)
+        assert(c.sleeping && c.stop == Stop.Budget, "WFI waits before alarm")
+        assert(peripheral_timer.next_alarm(0).unwrap() == 1)
+        peripheral_timer.advance(1, 0)
+        assert(peripheral_timer.irqs() == 1)
+        raise(&c, 0)
+        finish(&c, exec)
+        assert(c.stop == Stop.Breakpoint && c.pc == 10 && c.ipsr == 0 && !c.sleeping, "IRQ returns to interrupted thread")
+        assert(peripheral_timer.irqs() == 0 && peripheral_timer.raw == 0 && peripheral_timer.armed == 0, "guest handler acknowledges alarm")
+    end for
+end rp2040_guest_timer
+
+@test("M0+ guest uses RP2040 signed divider aliases and each core receives independent results")
+rp2040_guest_divider()
+    for exec in [&run_match, &run_threaded]
+        peripheral_dividers[0].reset()
+        peripheral_dividers[1].reset()
+        for core in 0usize..<2
+            var c: Cpu
+            peripheral_core = core
+            // STR r2,[r1]; STR r4,[r3]. Both operands launch/restart the divider.
+            prepare(&c, [0x600A, 0x601C], [0, sio.BASE + sio.DIV_SDIVIDEND_OFFSET,
+                if core == 0 then 0xFFFFFFE9 else 23, sio.BASE + sio.DIV_SDIVISOR_OFFSET, 5], 0, [])
+            c.io_read = &peripheral_read
+            c.io_write = &peripheral_write
+            finish(&c, exec)
+            assert(c.stop == Stop.Breakpoint && peripheral_dividers[core].remaining == 8)
+            peripheral_dividers[core].advance(8)
+            store16(&c, 4, 0x6808) // LDR r0,[r1]: quotient read clears DIRTY.
+            store16(&c, 6, 0xBE00)
+            c.r[1] = sio.BASE + sio.DIV_QUOTIENT_OFFSET
+            c.stop = Stop.Budget
+            finish(&c, exec)
+            assert(c.stop == Stop.Breakpoint && c.r[0] == (if core == 0 then u32(0xFFFFFFFC) else u32(4)))
+            assert(!peripheral_dividers[core].dirty)
+        assert(peripheral_dividers[0].remainder == 0xFFFFFFFD && peripheral_dividers[1].remainder == 3, "per-core signed remainders")
+    end for
+end rp2040_guest_divider
