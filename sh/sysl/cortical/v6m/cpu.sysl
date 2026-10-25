@@ -21,8 +21,9 @@ import sysl.sync.*
 // **A store never leaves a stale record behind.** A map of the RAM's 64-byte lines marks each line a
 // record has been decoded from, and a store to a marked line puts back to "not decoded" every record
 // whose bytes it touched — the records of the halfwords written and the one before them, which may be
-// a 32-bit instruction or a compare fused with the branch after it. A store to a line of data alone
-// costs one test of the map. Where the cores share the records, code one core writes is decoded
+// a 32-bit instruction or a compare fused with the branch after it. The same map marks the lines a
+// load-exclusive watches, whose stores are counted for the exclusive monitor (`touched`). A store
+// to a line of data alone costs one test of the map. Where the cores share the records, code one core writes is decoded
 // afresh when any core next runs it. Where each core has its own (`pair`), a store forgets the
 // writer's records at once and posts the line to the other core, which forgets its own records there
 // at its next barrier (`DMB`, `DSB`, `ISB`) or between runs (`refresh`): the point at which ARMv6-M
@@ -181,6 +182,8 @@ struct Cpu
     // What the core is. `reset` and `clear` leave it, so whoever makes a core of another kind sets it
     // before resetting it.
     kind: Kind
+    // Which of the machine's cores this is, 0 or 1. `reset` and `clear` leave it too.
+    core: u32
     // ARMv8-M Mainline's state; an ARMv6-M core keeps every one of these 0.
     //
     // ITSTATE, the IT block's condition and mask (EPSR.IT), as IT sets it and each instruction of the
@@ -202,17 +205,25 @@ struct Cpu
     shcsr: u32
     ccr: u32
     // The local exclusive monitor: whether it is set, and the address, size in bytes and value a
-    // load-exclusive left in it (t2sem.sysl).
+    // load-exclusive left in it, with the count of stores to its line then (t2sem.sysl).
     excl: bool
     excl_addr: u32
     excl_size: u32
     excl_value: u32
+    excl_stores: u32
 
 var ram: [1048576]u8
 var page_table: [1048576]usize
-// One byte per 64-byte line of RAM, set once a record has been decoded from it or from the 3 bytes
-// after it.
+// One byte per 64-byte line of RAM, and what a store to the line must do besides the store itself:
+// `LINE_CODE` once a record has been decoded from it or from the 3 bytes after it, `LINE_WATCHED`
+// once a load-exclusive has read it or the 3 bytes after it.
 var code_lines: [16384]u8
+// Each core's count of the stores it has made to each watched line, which the other core's
+// store-exclusive checks (t2sem.sysl).
+var line_stores: [2][16384]u32
+
+const LINE_CODE: u8 = 1
+const LINE_WATCHED: u8 = 2
 // One record per halfword of RAM, and the record for everywhere else.
 var decoded: [524289]Insn
 // The same, for the second core while it has records of its own.
@@ -225,6 +236,9 @@ reset(cpu: *Cpu, image: []const u8, entry: u32)
     for i in 0..<page_table.len do page_table[i] = 0
     for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do page_table[p] = usize(&ram[p << PAGE_SHIFT])
     for i in 0..<code_lines.len do code_lines[i] = 0
+    for i in 0..<code_lines.len
+        line_stores[0][i] = 0
+        line_stores[1][i] = 0
     for i in 0..<decoded.len do decoded[i] = undecoded()
 
     clear(cpu, entry)
@@ -260,6 +274,7 @@ clear(cpu: *Cpu, entry: u32)
     cpu.excl_addr = 0
     cpu.excl_size = 0
     cpu.excl_value = 0
+    cpu.excl_stores = 0
     clear_exceptions(cpu)
 
 /** Give each of two cores records of its own, so each can run on a thread of its own: `first` keeps
@@ -350,13 +365,40 @@ holds_code(pc: u32)
     val from = if pc >= 4 then pc - 4 else 0
     val to = if pc + 2 < RAM_BYTES then pc + 2 else RAM_BYTES - 1
 
-    for a in from..to do atomic_store(&code_lines[a >> LINE_SHIFT], 1, Relaxed)
+    for a in from..to do atomic_or(&code_lines[a >> LINE_SHIFT], LINE_CODE, Relaxed)
+
+// A load-exclusive of the `width` bytes at RAM address `a`: watch the lines a store touching them
+// can start on, as `holds_code` marks code, and answer the other core's count of stores to `a`'s line.
+watch(cpu: *Cpu, a: u32, width: u32) -> u32
+    val from = if a >= 3 then a - 3 else 0
+
+    for b in from..(a + width - 1) do atomic_or(&code_lines[b >> LINE_SHIFT], LINE_WATCHED, SeqCst)
+
+    others_stores(cpu, a)
+
+// The other core's count of stores to the line of RAM address `a`.
+@inline
+others_stores(cpu: *Cpu, a: u32) -> u32 = atomic_load(&line_stores[1 - cpu.core][a >> LINE_SHIFT], SeqCst)
 
 // The store of `width` bytes just made at RAM address `a`: where it is on a line holding code, every
-// record that read any of its bytes is decoded again when control next reaches it.
+// record that read any of its bytes is decoded again when control next reaches it, and where it is on
+// a watched line, the store is counted. A store to a line of neither costs this one test.
 @inline
 stored(cpu: *Cpu, a: u32, width: u32)
-    if atomic_load(&cpu.lines[a >> LINE_SHIFT], Relaxed) != 0 then forget(cpu, a, width)
+    val mark = atomic_load(&cpu.lines[a >> LINE_SHIFT], Relaxed)
+
+    if mark != 0 then touched(cpu, a, width, mark)
+
+@noinline
+@cold
+private touched(cpu: *Cpu, a: u32, width: u32, mark: u8)
+    if mark & LINE_WATCHED != 0
+        val last = a + width - 1
+
+        atomic_add(&line_stores[cpu.core][a >> LINE_SHIFT], 1, SeqCst)
+        if last >> LINE_SHIFT != a >> LINE_SHIFT then atomic_add(&line_stores[cpu.core][last >> LINE_SHIFT], 1, SeqCst)
+
+    if mark & LINE_CODE != 0 then forget(cpu, a, width)
 
 // Put back to "not decoded" the records that read the `width` bytes at `a`: the halfwords' own, and
 // the one before them; and where the other core has records of its own, post it the lines they are on.

@@ -802,11 +802,15 @@ executes without the FP, Security and MPU extensions; integer DSP is optional vi
 - **The exclusive monitor**, per core, holds the address, size and value of the last load-exclusive.
   A store-exclusive succeeds where the monitor is set for the same address and size and the memory
   still holds that value, checked and replaced in one host compare-and-swap; either way the monitor
-  is then clear, as `CLREX`, exception entry and exception return leave it. That rule is the global
-  monitor too, on one thread or two: any store by the other core (or this one, or a device) that
-  changed the value between makes the store-exclusive fail, atomically against the other core's
-  thread. A store of the very value that was there (A, then B, then A) does not, where silicon would;
-  no lock or counter built on the exclusives can tell. An exclusive to a device is an ordinary access.
+  is then clear, as `CLREX`, exception entry and exception return leave it. **The global monitor**
+  is the line map's: a load-exclusive marks its 64-byte line watched, a store to a watched line (on
+  the map's existing cold path, so other stores pay nothing) adds one to its writer's count for the
+  line, and the store-exclusive fails where the other core's count moved — whatever it stored, so A,
+  then B, then A fails as on silicon. The reservation granule is the line, as the architecture
+  allows, and a core's own stores between the two leave its reservation, so a loop that spills to
+  the same line cannot livelock. In turns the check is exact; on two threads it misses only two
+  stores by the other core between the count's check and the compare-and-swap, a few host
+  instructions apart. An exclusive to a device is an ordinary access.
   `LDA`/`STL` and `LDAEX`/`STLEX` are the plain and exclusive forms with a host fence on the acquire
   or release side.
 - **The exception model is §2.2's with the ARMv8-M registers**: BASEPRI and BASEPRI_MAX, FAULTMASK

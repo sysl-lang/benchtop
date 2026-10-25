@@ -186,7 +186,7 @@ t2m_exclusive_fails()
     c = ran8([0xE851, 0x0F00, 0xE841, 0x0201], [0, 0x1000, 9], [[0x1000, 41]])
     assert(holds_reg(&c, 2, 1) && holds_word(&c, 0x1004, 0), "another address")
 
-@test("a store of the very value LDREX read does not break the monitor (the ABA case DESIGN §2.8 documents)")
+@test("a core's own store of the very value LDREX read, between the two, leaves its reservation")
 t2m_exclusive_same_value()
     // str r3, [r1] between, r3 = 41, the value there
     var c = exclusive(0x600B, [0, 0x1000, 9, 41])
@@ -210,6 +210,70 @@ t2m_exclusive_sizes()
     // lda r0, [r1]; stlb r0, [r3]
     c = ran8([0xE8D1, 0x0FAF, 0xE8C3, 0x0F8F], [0, 0x1000, 0, 0x1004], [[0x1000, 0x1234]])
     assert(holds_reg(&c, 0, 0x1234) && holds_word(&c, 0x1004, 0x34), "LDA/STLB")
+
+// Run `cpu` from `pc` to its next stop.
+private run_from(cpu: *Cpu, pc: u32, exec: Exec)
+    cpu.pc = pc
+    cpu.stop = Stop.Budget
+
+    while cpu.stop == Stop.Budget
+        cpu.limit = cpu.retired + 1000
+        exec(cpu)
+
+// Core 0 runs `ldrex r0, [r1]` at 0, with 41 at 0x1000; core 1 then runs `between` at 0x80 with r1 =
+// 0x1000, r3 = 99, r4 = 41 and r5 = 41 << 16; core 0 then runs `strex r2, r0, [r1]` at 0x40. Answers core 0, whose
+// r2 is the store-exclusive's status.
+private across_cores(between: []const u16, exec: Exec) -> Cpu
+    var a: Cpu
+    var b: Cpu
+
+    a.kind = Kind.V8mMain
+    b.kind = Kind.V8mMain
+    b.core = 1
+    prepare(&a, [0xE851, 0x0F00], [0, 0x1000, 9], 0, [[0x1000, 41]])
+    store16(&a, 0x40, 0xE841)
+    store16(&a, 0x42, 0x0200)
+    store16(&a, 0x44, 0xBE00)
+    for i in 0..<between.len do store16(&a, 0x80 + u32(i) * 2, between[i])
+    store16(&a, 0x80 + u32(between.len) * 2, 0xBE00)
+
+    run_from(&a, 0, exec)
+    assert(a.stop == Stop.Breakpoint && a.r[0] == 41 && a.excl, "core 0's LDREX")
+
+    clear(&b, 0x80)
+    b.r[1] = 0x1000
+    b.r[3] = 99
+    b.r[4] = 41
+    b.r[5] = 41 << 16
+    run_from(&b, 0x80, exec)
+    assert(b.stop == Stop.Breakpoint, s"core 1 stopped at ${b.stop}")
+
+    run_from(&a, 0x40, exec)
+    assert(a.stop == Stop.Breakpoint && !a.excl, "core 0's STREX")
+    a
+
+@test("the other core's store to the reserved line fails STREX whatever it stored, A then B then A included")
+t2m_exclusive_across_cores()
+    for exec in [&run_match, &run_threaded]
+        // str r3, [r1]; str r4, [r1]: 99, then 41 back again
+        var c = across_cores([0x600B, 0x600C], exec)
+        assert(holds_reg(&c, 2, 1) && holds_word(&c, 0x1000, 41), "A, B, A")
+        // str r4, [r1]: the very value
+        c = across_cores([0x600C], exec)
+        assert(holds_reg(&c, 2, 1), "the same value")
+        // str r3, [r1, #16]: another word of the same 64-byte line
+        c = across_cores([0x610B], exec)
+        assert(holds_reg(&c, 2, 1) && holds_word(&c, 0x1010, 99), "the same line")
+        // str.w r5, [r1, #-2]: an unaligned word from the line before, writing the reserved word's
+        // low halfword back as it was
+        c = across_cores([0xF841, 0x5C02], exec)
+        assert(holds_reg(&c, 2, 1) && holds_word(&c, 0x1000, 41), "a store starting on the line before")
+        // str r3, [r1, #64]: the next line
+        c = across_cores([0x640B], exec)
+        assert(holds_reg(&c, 2, 0) && holds_word(&c, 0x1000, 41) && holds_word(&c, 0x1040, 99), "another line")
+        // ldrex r5, [r1, #64]; strex r6, r3, [r1, #64]: core 1's own exclusive pair on the next line
+        c = across_cores([0xE851, 0x5F10, 0xE841, 0x3610], exec)
+        assert(holds_reg(&c, 2, 0), "another line's exclusives")
 
 // A stop on the instruction at 0 with nothing retired, `r0` still 99 and the word at 0x1000 still 41.
 private faulted(c: *Cpu, why: Stop) -> bool
