@@ -1,0 +1,257 @@
+module sh.sysl.benchtop.ui
+
+import sh.sysl.ui as ui
+import sh.sysl.ui_sdl as driver
+import sh.sysl.plutovg as vg
+import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.{Part, Element}
+import sysl.buf.{Buf, buf}
+import sysl.raw.str_cast
+import sysl.math.{min, max}
+
+const GROUND: u32 = 0x0D1420
+
+/** UI state stays separate from the guest; syslUI owns layout and input geometry. */
+struct Desktop
+    scene: Scene
+    current: &ui.Signal[State]
+    stepping: &ui.Signal[bool]
+    resetting: &ui.Signal[bool]
+    saving: &ui.Signal[bool]
+    pointer_live: &ui.Signal[bool]
+    scroll: &ui.Signal[int]
+    board_rect: &ui.Signal[ui.Rect]
+    interactive: bool
+
+desktop(s: Scene, st: State, interactive: bool = true) -> &Desktop =
+    Desktop(s, ui.signal(st), ui.signal(false), ui.signal(false), ui.signal(false),
+        ui.signal(false), ui.signal(0), ui.signal(ui.Rect(0, 0, 0, 0)), interactive)
+
+pause(d: &Desktop)
+    var st = d.current.read()
+    if !st.live || st.stopped then return
+    st.paused = !st.paused
+    d.current.set(st)
+
+private section(title: string, child: &ui.View) -> &ui.View =
+    ui.column([ui.text(title).font_size(12).foreground(MUTED), child], 10).padded().panel()
+
+private inspector(d: &Desktop, height: int) -> &ui.View
+    val s = d.scene
+    val st = d.current.read()
+    var rows: Buf[&ui.View] = buf()
+    rows.push(ui.text(if st.live then "Live session" else "Layout preview").font_size(20).foreground(ACCENT))
+    rows.push(ui.text(s.chip))
+    rows.push(ui.text(s.cores).font_size(12).foreground(MUTED))
+    rows.push(ui.divider())
+    if st.live
+        rows.push(ui.text(f"PC  0x${st.pc}%08X"))
+        rows.push(ui.text(s"${st.instructions} instructions retired").font_size(12).foreground(MUTED))
+    else
+        rows.push(ui.text("Firmware is not running").foreground(0xE9BD72))
+        rows.push(ui.text("Real-board peripherals remain unmodelled.").font_size(12))
+    rows.push(ui.divider())
+    s.scope.find(st.selected) match
+        Some(p) ->
+            rows.push(ui.button("All parts", () -> select_part(d, ""), ui.Role.Secondary, ui.Variant.Outline))
+            rows.push(ui.text(st.selected).font_size(18))
+            rows.push(ui.text(p.kind).foreground(MUTED))
+            for wire in p.wires do rows.push(ui.text(s"${wire.port} → ${target(wire.to)}").font_size(13))
+            rows.push(ui.text(if st.live then "Connected to virtual GPIO" else "Description only").font_size(12).foreground(ACCENT))
+        None ->
+            rows.push(ui.text("Parts & signals").font_size(16))
+            for p in s.scope.parts
+                val value = if st.live && p.kind == "led" then (if lit(st, p) then "ON" else "OFF") else p.kind
+                rows.push(ui.row([
+                    ui.button(p.name, () -> select_part(d, p.name), ui.Role.Secondary, ui.Variant.Soft).frame(170, 32),
+                    ui.text(value).font_size(12).foreground(if st.live && lit(st, p) then ACCENT else MUTED)
+                ], 8))
+    val output = if st.live then virt.output() else []
+    var lines: Buf[&ui.View] = buf()
+    if st.live
+        // Bound the displayed tail; the guest's capture is bounded separately.
+        var start: usize = output.len
+        var count = 0
+        while start > 0
+            start -= 1
+            if output[start] == 10
+                count += 1
+                if count == 12
+                    start += 1
+                    break
+        var at = start
+        for i in start..output.len
+            if i == output.len || output[i] == 10
+                lines.push(ui.text(str_cast(output[at..<i])).font_size(12).foreground(0xB6DCC9))
+                at = i + 1
+        if lines.len() == 0 then lines.push(ui.text("Waiting for guest output…").foreground(MUTED))
+    else
+        lines.push(ui.text("Open the live firmware demo with:").font_size(12))
+        lines.push(ui.text("benchtop demo").foreground(ACCENT))
+    rows.push(section(if st.live then "GUEST CONSOLE" else "TRY LIVE FIRMWARE", ui.column(lines.view(), 5)))
+    ui.scroll(ui.column(rows.view(), 12), d.scroll, height).padding(16).background(CARD, 12).border(EDGE, 1, 12)
+
+select_part(d: &Desktop, name: string)
+    var st = d.current.read()
+    st.selected = name
+    d.current.set(st)
+
+struct Workbench
+    d: &Desktop
+
+impl ui.View for Workbench
+    measure(&self, c: *ui.Canvas, avail: ui.Size) -> ui.Size = avail
+
+    paint(&self, c: *ui.Canvas, r: ui.Rect)
+        val d = self.d
+        val st = d.current.read()
+        val title = ui.row([
+            ui.text("B").font_size(23).foreground(0x102C24).padding(10).background(ACCENT, 10),
+            ui.column([ui.text("Benchtop").font_size(27), ui.text(d.scene.name).font_size(13).foreground(MUTED)], 3).flex(),
+            ui.text(st.status).font_size(12).foreground(if st.live then ACCENT else 0xE9BD72).padding(10).background(0x192E30, 8)
+        ], 14)
+        var actions: Buf[&ui.View] = buf()
+        if st.live
+            if !st.stopped
+                actions.push(ui.button(if st.paused then "Resume" else "Pause", () -> pause(d)))
+                actions.push(ui.button("Step", () -> d.stepping.set(true), ui.Role.Secondary, ui.Variant.Soft))
+            actions.push(ui.button("Reset", () -> d.resetting.set(true), ui.Role.Secondary, ui.Variant.Soft))
+        actions.push(ui.button("Save PNG", () -> d.saving.set(true), ui.Role.Secondary, ui.Variant.Outline))
+        val room = if r.h > 260 then r.h - 228 else 80
+        val side = inspector(d, if room > 50 then room - 32 else 18)
+        val board_view: &ui.View = BoardView(d)
+        val board = board_view.padding(18).background(CARD, 12).border(EDGE, 1, 12)
+        // A narrow window stacks panels rather than squeezing the PCB into a sliver.
+        val content = if r.w >= 900 then ui.row([board.flex(), side.frame(320, room)], 18) else ui.column([board.frame(r.w - 48, room / 2), inspector(d, room / 2 - 32)], 12)
+        val footer = if st.notice.is_empty() then (if st.live then "Hold 1 / 2 or a board button · Space pause · N step · R reset · S save" else "Layout preview · Click a part to inspect its wiring · S save PNG") else st.notice
+        val tree = ui.column([title, ui.row(actions.view(), 10), content.flex(), ui.text(footer).font_size(12).foreground(MUTED)], 18).padding(24).restyle(t -> t with { primary = ACCENT, secondary = 0xA7B8CA, on_fill = 0x102C24, panel = 0x192C3B, edge = EDGE })
+        c.clip(r)
+        tree.paint(c, r)
+        c.unclip()
+
+board_transform(s: Scene, r: ui.Rect) -> Transform
+    fit(if s.view.width > 0 then s.view.width else 640, if s.view.height > 0 then s.view.height else 380, r.w, r.h, r.x, r.y)
+
+part_at(s: Scene, r: ui.Rect, x: int, y: int) -> string
+    val t = board_transform(s, r)
+    var i = s.view.elements.len()
+    while i > 0
+        i -= 1
+        val e = s.view.elements.at(i)
+        val (ex, ey, w, h) = coords(t, e)
+        if !ui.Rect(ex, ey, w, h).holds(x, y) then continue
+        e.shows match
+            ShowPart(name) -> return name
+            _ -> return ""
+    ""
+
+private label(c: *ui.Canvas, r: ui.Rect, value: string, color: u32 = INK, size: real = 12.0)
+    c.ink(color)
+    c.push_font_size(size)
+    c.text(r, value)
+    c.pop_font_size()
+    c.unink()
+
+struct BoardView
+    d: &Desktop
+
+impl ui.View for BoardView
+    measure(&self, c: *ui.Canvas, avail: ui.Size) -> ui.Size = avail
+
+    paint(&self, c: *ui.Canvas, r: ui.Rect)
+        val d = self.d
+        val s = d.scene
+        var st = d.current.read()
+        if d.board_rect.read() != r then d.board_rect.set(r)
+        if d.interactive
+            val (mx, my) = c.pointer()
+            val down = d.pointer_live.read() && c.pressed(r)
+            val (bx, by) = c.press_origin()
+            val under = part_at(s, r, mx, my)
+            val name = if down && r.holds(bx, by) && part_at(s, r, bx, by) == under then under else ""
+            val selected = if down then name elif c.tapped(r) then part_at(s, r, c.tap_point().0, c.tap_point().1) else st.selected
+            var mouse = ""
+            s.scope.find(name) match
+                Some(p) -> if st.live && p.kind == "button" then mouse = name
+                None -> ()
+            if mouse != st.mouse_part || (!selected.is_empty() && selected != st.selected)
+                st.mouse_part = mouse
+                if !selected.is_empty() then st.selected = selected
+                d.current.set(st)
+        c.clip(r)
+        val t = board_transform(s, r)
+        if s.view.width > 0
+            val pcb = ui.Rect(int(t.x), int(t.y), int(f32(s.view.width) * t.scale), int(f32(s.view.height) * t.scale))
+            c.fill(pcb, parse_color(s.view.background), 8)
+            c.stroke(pcb, 0x487160, 1, 8)
+            for e in s.view.elements
+                val (x, y, w, h) = coords(t, e)
+                val box = ui.Rect(x, y, w, h)
+                e.shows match
+                    Fill(color) ->
+                        c.fill(box, parse_color(color), if look(e, "shape", "rect") == "round" then min(w, h) / 2 else 2)
+                        if !e.label.is_empty() then label(c, ui.Rect(x + 5, y + h / 2 - 7, w - 10, 20), e.label, INK, 11)
+                    Caption(value) -> label(c, box, value, INK, if h > 20 then 18 else 11)
+                    ShowPart(name) -> s.scope.find(name) match
+                        Some(p) -> draw_part(c, s, st, e, p, name, box)
+                        None -> ()
+        else
+            label(c, ui.Rect(r.x + 24, r.y + r.h / 2 - 30, r.w - 48, 40), s.chip, INK, 25)
+            label(c, ui.Rect(r.x + 24, r.y + r.h / 2 + 15, r.w - 48, 30), "No board layout supplied", MUTED, 14)
+        c.unclip()
+
+private draw_part(c: *ui.Canvas, s: Scene, st: State, e: Element, p: Part, name: string, r: ui.Rect)
+    val radius = min(r.w, r.h) / 2
+    p.kind match
+        "led" | "ws2812" ->
+            val color = parse_color(look(e, "color", param(p, "color", "green")))
+            val on = p.kind == "led" && lit(st, p)
+            val outer = ui.Rect(r.x - 4, r.y - 4, r.w + 8, r.h + 8)
+            c.fill(outer, if on then dim(color) else 0x21353D, radius + 4)
+            c.fill(r, if on then color else dim(color), radius)
+            if on then c.fill(ui.Rect(r.x + r.w / 4, r.y + r.h / 5, max(2, r.w / 4), max(2, r.h / 4)), 0xE8FFF5, radius)
+        "button" ->
+            val down = st.live && pressed(s, st, name)
+            c.fill(r, 0x13232D, 6)
+            c.stroke(r, if down then ACCENT else 0x7B92A3, 2, 6)
+            c.fill(ui.Rect(r.x + 7, r.y + 7, max(0, r.w - 14), max(0, r.h - 14)), if down then ACCENT else 0x536D7E, radius)
+        "st7796" ->
+            c.fill(r, 0x080F17, 5)
+            c.stroke(r, 0x445A6C, 2, 5)
+            label(c, ui.Rect(r.x + 12, r.y + r.h / 2, r.w - 24, 40), "Display not emulated", MUTED, 14)
+        "joystick" | "buzzer" ->
+            c.fill(r, 0x334B5D, radius)
+            c.fill(ui.Rect(r.x + 7, r.y + 7, max(0, r.w - 14), max(0, r.h - 14)), 0x172937, radius)
+        _ ->
+            c.fill(r, 0x34475A, 5)
+            label(c, r, p.kind)
+    if st.selected == name then c.stroke(ui.Rect(r.x - 6, r.y - 6, r.w + 12, r.h + 12), ACCENT, 2, 7)
+    if !e.label.is_empty() then label(c, ui.Rect(r.x, r.bottom() + 5, max(r.w, 100), 22), e.label)
+
+/** Same syslUI tree and vector backend as the desktop driver, without a window server. */
+rasterize(d: &Desktop, width: int = WIDTH, height: int = HEIGHT) -> Result[&vg.Surface, string]
+    if width < 320 || height < 240 || long(width) * long(height) > 16777216 then return Err("unsupported render size")
+    val path = driver.system_font()
+    if path.is_empty() then return Err("no system font found for syslUI")
+    val face = vg.font(path) match
+        Some(f) -> f
+        None -> return Err(s"cannot load font: $path")
+    val surf = vg.surface(width, height) match
+        Some(s) -> s
+        None -> return Err("cannot allocate desktop surface")
+    val canvas = vg.canvas(surf) match
+        Some(c) -> c
+        None -> return Err("cannot create desktop canvas")
+    var c = ui.pluto_canvas(canvas, face, 14)
+    surf.clear(13.0 / 255.0, 20.0 / 255.0, 32.0 / 255.0)
+    val readonly = desktop(d.scene, d.current.read(), false)
+    readonly.scroll.set(d.scroll.read())
+    val tree: &ui.View = Workbench(readonly)
+    ui.render(tree, &c, ui.Rect(0, 0, width, height))
+    d.board_rect.set(readonly.board_rect.read())
+    Ok(surf)
+
+save_desktop(d: &Desktop, path: string) -> Result[unit, string]
+    val surf = rasterize(d)?
+    if !surf.write_png(path) then return Err(s"cannot write PNG: $path")
+    Ok(())

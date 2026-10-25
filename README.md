@@ -1,7 +1,7 @@
 # benchtop
 
 A microcontroller emulator written in sysl. Run Cortex-M firmware on virtual boards,
-interact with GPIO LEDs and buttons in an SDL3 window, inspect board descriptions,
+interact with GPIO LEDs and buttons in a syslUI desktop window, inspect board descriptions,
 and execute named RISC-V cores including Hazard3. Real Pico 2 peripheral emulation
 is still in progress. It is an interpreter; a JIT is not planned.
 
@@ -20,19 +20,24 @@ devices, how fidelity is tested against real boards, and the milestones with the
 
 ## Try the visual workbench
 
-Install SDL3 and pkg-config (`brew install sdl3 pkg-config` on macOS), then use sysl 0.6.2:
+The desktop uses **syslUI**, its shared **SDL3 driver**, and **PlutoVG** for vector
+graphics and font rendering. Install SDL3 and pkg-config (`brew install sdl3 pkg-config`
+on macOS), then use sysl 0.6.2:
 
 ```sh
 sysl build . -o benchtop
 ./benchtop demo
 ```
 
-The bundled firmware is written in sysl and compiled for Cortex-M0+. It drives a heartbeat LED and reads two active-low
+The bundled firmware is written in sysl and compiled for Cortex-M0+. It drives a
+heartbeat LED and reads two active-low
 buttons through MMIO. Hold **1** or **2**, or click and hold either button, to light
 its corresponding LED. **Space** pauses, **N** executes one instruction per active
 core, **R** resets, **S** saves a PNG, and **Escape** closes the window. The toolbar
-provides the same controls. Click a part to inspect its wiring. The console shows
-actual guest output; LEDs reflect actual GPIO output and direction registers.
+provides the same controls. Click a part to inspect its wiring. The scrollable inspector shows wiring, signal
+states, and actual guest console
+output; LEDs reflect actual GPIO output and direction registers. The layout adapts
+to the window, with fonts rasterized at the display density.
 
 ```sh
 ./benchtop view pico2
@@ -46,8 +51,10 @@ actual guest output; LEDs reflect actual GPIO output and direction registers.
 without modelled peripherals is labelled **LAYOUT PREVIEW**; display placeholders
 are not emulated displays. Live execution currently uses Cortex-M virtual boards
 and deterministic core turns (`--threads` cannot be combined with `--window`).
-`--frames N` bounds either windowed or headless runs. PNG exports and the window
-use the same framebuffer. See [examples/visual](examples/visual/README.md) to build
+`--frames N` bounds either windowed or headless runs. PNG exports use the same
+syslUI view tree and PlutoVG renderer at a standard
+1200×760 size. Headless rendering also needs an installed system font (Arial on
+macOS, or DejaVu Sans/Liberation Sans on Linux); it needs no display server. See [examples/visual](examples/visual/README.md) to build
 and modify the firmware and for the virtual GPIO register map.
 
 ## The `benchtop` command

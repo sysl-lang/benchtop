@@ -6,7 +6,8 @@ import sh.sysl.benchtop.v6m.{Cpu, Stop}
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_bytes
 import sysl.raw.str_cast
-import sysl.slices.as_ptr
+import sh.sysl.ui as toolkit
+import sh.sysl.ui_sdl as driver
 import sysl.text.parse_long
 
 private val DEMO = embed("../../../../examples/visual/demo.elf")
@@ -33,7 +34,10 @@ private restart(cpu: *Cpu, image: []const u8, st: *State)
 /** One frame's real guest execution. A paused frame advances no guest instructions. */
 advance(s: Scene, st: *State, cpu: *Cpu, step: bool = false)
     sample_inputs(s, *st)
-    if !st.live || st.stopped || (st.paused && !step) then return
+    if !st.live || st.stopped then return
+    if st.paused && !step
+        st.status = "PAUSED"
+        return
     let_running(virt.pump_board(cpu, if step then 1 else 20000), st, cpu)
     st.pc = cpu.pc
     st.instructions = cpu.retired + virt.core1().retired
@@ -52,7 +56,7 @@ private let_running(running: bool, st: *State, cpu: *Cpu)
         _ -> "GUEST FAULT"
     st.notice = virt.stop_message(stopped)
 
-/** Load/check before SDL initialization, so bad input never opens an empty window. */
+/** Load/check before opening a window. Both modes use the same syslUI tree. */
 launch(which: string, file: string, demo: bool = false, frames: u64 = 0, screenshot: string = "", headless: bool = false) -> Result[int, string]
     val s = open_scene(which)?
     val live = demo || !file.is_empty()
@@ -68,114 +72,80 @@ launch(which: string, file: string, demo: bool = false, frames: u64 = 0, screens
     var st = state(live)
     val cpu = virt.core0()
     if live then restart(cpu, image.view(), &st)
-    val c = canvas(WIDTH, HEIGHT)
+    val d = desktop(s, st)
     if headless
         val count = if frames == 0 then 1 else frames
-        for frame in 0u64..<count do if live then advance(s, &st, cpu)
-        render(c, s, st, if live then virt.output() else [])
-        if !screenshot.is_empty() then save_png(c, screenshot)?
+        for frame in 0u64..<count
+            if live then advance(s, &st, cpu)
+        d.current.set(st)
+        if !screenshot.is_empty() then save_desktop(d, screenshot)?
         if live && st.status == "GUEST FAULT" then return Err(st.notice)
         return Ok(0)
+    val path = if screenshot.is_empty() then "benchtop.png" else screenshot
+    val count = toolkit.signal(0u64)
     sdl.set_main_ready()
-    if !sdl.init(sdl.INIT_VIDEO) then return Err(s"SDL3: ${sdl.error()}")
-    val window = sdl.create_window(s"Benchtop - ${s.name}", WIDTH, HEIGHT, sdl.WINDOW_RESIZABLE | sdl.WINDOW_HIGH_PIXEL_DENSITY) match
-        Some(w) -> w
-        None -> return Err(s"SDL3 window: ${sdl.error()}")
-    val renderer = window.create_renderer() match
-        Some(r) -> r
-        None -> return Err(s"SDL3 renderer: ${sdl.error()}")
-    // ABGR8888 stores RGBA bytes on the supported little-endian desktop hosts.
-    val texture = renderer.create_texture(sdl.PixelFormat.Abgr8888, sdl.TextureAccess.Streaming, WIDTH, HEIGHT) match
-        Some(t) -> t
-        None -> return Err(s"SDL3 texture: ${sdl.error()}")
-    texture.set_scale_mode(sdl.ScaleMode.Nearest)
-    renderer.set_vsync(true)
-    render(c, s, st, if live then virt.output() else [])
-    val capture_path = if screenshot.is_empty() then "benchtop.png" else screenshot
-    var verified = false
-    var running = true
-    var frame: u64 = 0
-    var step = false
-    while running
-        val start = sdl.ticks_ns()
-        loop
-            val event = sdl.poll_event() match
-                Some(e) -> e
-                None -> break
-            event.kind() match
-                Quit | WindowCloseRequested -> running = false
-                WindowFocusLost -> release_inputs(&st)
-                KeyDown | KeyUp ->
-                    val down = event.kind() == sdl.EventKind.KeyDown
-                    if down && event.key_repeat() then continue
-                    val key = canonical_key(event.key_scancode())
-                    if key_input(s, &st, key, down) then continue
-                    if !down then continue
-                    key match
-                        "escape" -> running = false
-                        "space" -> if live && !st.stopped then st.paused = !st.paused
-                        "r" -> if live then restart(cpu, image.view(), &st)
-                        "n" -> if live && !st.stopped then step = true
-                        "s" -> snapshot(c, &st, capture_path)
-                        _ -> ()
-                MouseButtonDown ->
-                    if event.mouse_button() != sdl.MouseButton.Left then continue
-                    val (ww, wh) = window.size()
-                    val v = fit(WIDTH, HEIGHT, int(ww), int(wh))
-                    val x = int((event.mouse_x() - v.x) / v.scale)
-                    val y = int((event.mouse_y() - v.y) / v.scale)
-                    action_at(x, y) match
-                        "pause" -> if live && !st.stopped then st.paused = !st.paused
-                        "step" -> if live && !st.stopped then step = true
-                        "reset" -> if live then restart(cpu, image.view(), &st)
-                        "save" -> snapshot(c, &st, capture_path)
-                        _ ->
-                            val name = hit_part(s, x, y)
-                            st.selected = name
-                            s.scope.find(name) match
-                                Some(p) -> if live && p.kind == "button" then st.mouse_part = name
-                                None -> ()
-                MouseButtonUp -> if event.mouse_button() == sdl.MouseButton.Left then st.mouse_part = ""
-                _ -> ()
-        if !running then break
-        if live then advance(s, &st, cpu, step)
-        step = false
-        render(c, s, st, if live then virt.output() else [])
-        if !texture.update(as_ptr(c.pixels.view()), WIDTH * 4) then return Err(s"SDL3 upload: ${sdl.error()}")
-        val (pw, ph) = renderer.output_size()
-        val viewport = fit(WIDTH, HEIGHT, int(pw), int(ph))
-        if pw <= 0 || ph <= 0
-            sdl.delay(16)
-            continue
-        if !renderer.clear_to(sdl.rgb(7, 12, 19)) || !renderer.copy_to(texture, sdl.FRect(viewport.x, viewport.y, f32(WIDTH) * viewport.scale, f32(HEIGHT) * viewport.scale)) then return Err(s"SDL3 draw: ${sdl.error()}")
-        // Finite-frame runs double as a native display smoke test. Read before present,
-        // as required by SDL, and verify the upload's channel order and geometry.
-        if frames != 0 && !verified
-            val surface = renderer.read_pixels() match
-                Some(s) -> s
-                None -> return Err(s"SDL3 framebuffer readback: ${sdl.error()}")
-            for point in [[1, 1], [WIDTH / 2, HEIGHT / 2], [WIDTH - 2, HEIGHT - 2]]
-                val x = int(viewport.x + (f32(point[0]) + 0.5) * viewport.scale)
-                val y = int(viewport.y + (f32(point[1]) + 0.5) * viewport.scale)
-                val got = surface.read_pixel(x, y) match
-                    Some(color) -> color
-                    None -> return Err("SDL3 framebuffer sample is unavailable")
-                val at = usize(point[1] * WIDTH + point[0]) * 4
-                if got.r != c.pixels.at(at) || got.g != c.pixels.at(at + 1) || got.b != c.pixels.at(at + 2) then return Err("SDL3 framebuffer differs from the rendered image")
-            verified = true
-        if !renderer.present() then return Err(s"SDL3 present: ${sdl.error()}")
-        frame += 1
-        if frames != 0 && frame >= frames then break
-        val elapsed = sdl.ticks_ns() - start
-        if elapsed < 16666667 then sdl.delay_ns(16666667 - elapsed)
-    if !screenshot.is_empty() then save_png(c, screenshot)?
-    if live && st.status == "GUEST FAULT" then return Err(st.notice)
+    driver.run(driver.app(s"Benchtop - ${s.name}", () -> Workbench(d), () -> GROUND,
+        width = WIDTH, height = HEIGHT, size = 14,
+        on_event = e -> desktop_event(d, e),
+        on_frame = dt -> desktop_tick(d, cpu, image.view(), frames, count, path)))?
+    if !screenshot.is_empty() then save_desktop(d, screenshot)?
+    val final = d.current.read()
+    if live && final.status == "GUEST FAULT" then return Err(final.notice)
     Ok(0)
 
-private snapshot(c: Canvas, st: *State, path: string)
-    save_png(c, path) match
-        Ok(_) -> st.notice = s"SAVED $path"
-        Err(why) -> st.notice = s"SAVE FAILED: $why"
+private[ui] desktop_tick(d: &Desktop, cpu: *Cpu, image: []const u8, frames: u64, count: &toolkit.Signal[u64], path: string)
+    var st = d.current.read()
+    if d.resetting.read()
+        restart(cpu, image, &st)
+        d.resetting.set(false)
+    val step = d.stepping.read()
+    d.stepping.set(false)
+    if st.live then advance(d.scene, &st, cpu, step)
+    d.current.set(st)
+    if d.saving.read()
+        d.saving.set(false)
+        save_desktop(d, path) match
+            Ok(_) -> st.notice = s"Saved $path"
+            Err(why) -> st.notice = s"Save failed: $why"
+        d.current.set(st)
+    count.set(count.read() + 1)
+    if frames != 0 && count.read() >= frames then driver.stop()
+
+/** Leave pointer coordinates and widget events to syslUI's density-aware SDL driver. */
+private desktop_event(d: &Desktop, e: sdl.Event) -> bool
+    var st = d.current.read()
+    e.kind() match
+        WindowCloseRequested -> driver.stop()
+        WindowFocusLost ->
+            release_inputs(&st)
+            d.pointer_live.set(false)
+            d.current.set(st)
+        MouseButtonDown ->
+            if e.mouse_button() != sdl.MouseButton.Left then return true
+            d.pointer_live.set(true)
+        MouseButtonUp ->
+            if e.mouse_button() != sdl.MouseButton.Left then return true
+            st.mouse_part = ""
+            d.pointer_live.set(false)
+            d.current.set(st)
+        KeyDown | KeyUp ->
+            val down = e.kind() == sdl.EventKind.KeyDown
+            if down && e.key_repeat() then return true
+            val key = canonical_key(e.key_scancode())
+            if key_input(d.scene, &st, key, down)
+                d.current.set(st)
+                return true
+            if !down then return false
+            key match
+                "escape" -> driver.stop()
+                "space" -> pause(d)
+                "r" -> if st.live then d.resetting.set(true)
+                "n" -> if st.live && !st.stopped then d.stepping.set(true)
+                "s" -> d.saving.set(true)
+                _ -> return false
+            return true
+        _ -> ()
+    false
 
 private canonical_key(scancode: i32) -> string
     var bytes: Buf[u8] = buf()

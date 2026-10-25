@@ -46,6 +46,10 @@ Headless smoke test and image export:
 sysl test . --jobs 1
 ```
 
-The shared framebuffer is encoded as RGBA PNG without initializing SDL in headless
-mode. A finite native `--frames` run also checks renderer readback against framebuffer
-samples. Console capture retains a bounded recent tail for long-running firmware.
+The desktop uses syslUI widgets and its shared SDL3 application driver. The board
+is a custom syslUI view rendered through PlutoVG, including antialiased shapes and
+font rendering. Headless exports render the same view tree to a 1200×760 PlutoVG
+surface without initializing SDL. A system font is required in both modes.
+The window handles display density and resizing through the toolkit driver;
+the inspector scrolls when its contents exceed the available space. Console
+capture retains a bounded recent tail for long-running firmware.
