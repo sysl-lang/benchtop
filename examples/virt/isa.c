@@ -1,10 +1,10 @@
 // The integer instruction set as QEMU's Cortex-M33 runs it: each instruction below, run on every pair
 // of 16 edge values and from each of the 12 flag states, its result and APSR (N, Z, C, V and Q) folded
 // into one hash a line. The same source built for QEMU's `mps2-an505` (`-DSEMIHOSTING`, through
-// examples/qemu/build.sh) and for `virt33` must print the same lines, so the M33 cortical emulates is
+// examples/qemu/build.sh) and for `virt33` must print the same lines, so the M33 benchtop emulates is
 // checked against an emulator nobody here wrote. isa.qemu holds QEMU's lines.
 //
-// The flag states leave out N and Z both set, which no instruction produces and cortical's flags do
+// The flag states leave out N and Z both set, which no instruction produces and benchtop's flags do
 // not hold (DESIGN §2.9).
 
 #include <stdint.h>

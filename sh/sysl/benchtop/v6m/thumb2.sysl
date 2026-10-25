@@ -1,0 +1,916 @@
+module sh.sysl.benchtop.v6m
+
+// The shared ARMv7-M / ARMv8-M Mainline integer decoder (ARMv8-M ARM, DDI0553, "T32 instruction set encoding"): every 16-bit
+// encoding, as decode.sysl reads them for ARMv6-M plus `CBZ`, `CBNZ`, `IT` and the hints, and every
+// 32-bit encoding of the integer instruction set. As for ARMv6-M, every operand is extracted here,
+// once — a modified immediate is expanded, its carry-out worked out, a shift's kind and amount
+// decoded, a PC-relative address computed — so an executor only reads fields.
+//
+// **Undefined here**, each stopping the core at `Undefined` as any undefined instruction does: the
+// floating-point and coprocessor encodings, `TT`, `SG`,
+// `BXNS` and `BLXNS` (the Security Extension's, which this kind has not), `UDF`, and the encodings the
+// architecture calls UNPREDICTABLE that a compiler never emits: the PC or SP where an instruction may
+// not name it, an empty or self-overlapping register list, writeback to a register also loaded, and
+// the like.
+//
+// **The record is the ARMv6-M one, 16 bytes.** Every 32-bit instruction's operands fit its three
+// register fields and its word — a fourth register (`MLA`'s Ra, a long multiply's RdHi) goes in the
+// word, a shift's kind and amount, an addressing mode and a bitfield's position are packed into it —
+// so no instruction needs a second record or a table beside the records. A family of operations (data
+// processing with a shifted register, the loads and stores of one register) is one case with the
+// operation in a field, and the decoder gives it the threaded handler made for that operation alone
+// (t2threaded.sysl). The second halfword's record of a 32-bit instruction is left alone: a branch to
+// it decodes the halfword there as an instruction, as the core would execute it.
+//
+// **IT blocks are decoded with their IT.** Decoding an `IT` decodes the up to four instructions it
+// governs at once, each into its own record with its condition baked into its handler
+// (`pred_handler`): a 16-bit data-processing instruction, which sets no flags inside a block, is
+// decoded as the form that does not. So nothing outside an IT block ever tests for one. The record of
+// a halfword inside a block is therefore the one its IT made, whoever reaches it:
+//
+// - **Falling through from the IT**, which is the only way the architecture allows into a block, it
+//   runs under its condition, and `cpu.it` steps through ITSTATE as it does on the core.
+// - **A branch into the middle of a block** is UNPREDICTABLE. ITSTATE is 0 there, so benchtop runs
+//   the instructions left in the block unconditionally, as the block decoded them.
+// - **An exception taken inside a block** stacks ITSTATE in the frame's EPSR and clears it; the return
+//   restores it and decodes what is left of the block under the restored state, so a block resumes
+//   where it was, under the conditions its frame says (except.sysl).
+// - **A store into a block, or over its IT**, forgets the block and its IT together (cpu.sysl), and
+//   they are decoded afresh, together, the next time the IT runs. So a halfword run outside an IT block
+//   and later inside one — code rewritten in between, as self-modifying code must, with an `ISB` — is
+//   decoded as each place has it.
+
+// SP or the PC, which most 32-bit encodings may not name where they name a general register
+// (`BadReg`); LR they may.
+@inline
+private bad(r: u32) -> bool = r == 13 || r == 15
+
+// Whether `hw` is the first halfword of a 32-bit instruction.
+@inline
+wide(hw: u32) -> bool = hw >> 11 >= 0b11101
+
+// Decode the instruction at RAM address `pc` into `into`, `it` being the ITSTATE it runs under: 0 for
+// one outside an IT block.
+decode_v8(cpu: *Cpu, pc: u32, into: *Insn, it: u32)
+    into.a = 0
+    into.b = 0
+    into.c = 0
+    into.imm = 0
+
+    holds_code(pc)
+
+    val hw = load16(cpu, pc)
+    val is_wide = wide(hw)
+
+    if !is_wide
+        into.op = decode_narrow(cpu, pc, hw, into, it)
+    else if pc + 2 >= RAM_BYTES
+        into.op = Op.Undefined
+    else
+        into.op = decode_wide(cpu, pc, hw, load16(cpu, pc + 2), into, it)
+
+    // ARMv7-M shares the decoder, but has neither v8-M ordered accesses nor stack limits.
+    if is_v7m(cpu.kind)
+        if into.op == Op.Lda || into.op == Op.Stl then into.op = Op.Undefined
+        if into.op == Op.Ldrex && u32(into.c) & 4 != 0 then into.op = Op.Undefined
+        if into.op == Op.Strex && into.imm & (1 << 18) != 0 then into.op = Op.Undefined
+        if into.op == Op.Mrs8 || into.op == Op.Msr8
+            val sysm = into.imm & 0xFF
+
+            if sysm == 10 || sysm == 11 then into.op = Op.Undefined
+
+    if cpu.kind == Kind.M23 then baseline_instruction(hw, is_wide, into)
+
+    into.h = handler_for(into)
+
+    if it != 0
+        into.h = pred_handler(it >> 4, if is_wide then 2 else 1)
+        return
+
+    if into.op == Op.CmpImm || into.op == Op.CmpReg then fuse(cpu, pc, into)
+    if into.op == Op.DpImm && u32(into.c) == IMM_CMP then fuse_wide(cpu, pc, into)
+    if into.op == Op.It then decode_block(cpu, pc + 2, into.imm)
+
+// ARMv8-M Baseline is not Mainline with IT disabled: restrict wide encodings to the
+// M23 instruction summary (Arm DDI0550C, table 3-1). Security Extension encodings remain undefined.
+private baseline_instruction(hw: u32, is_wide: bool, into: *Insn)
+    if !is_wide
+        if into.op == Op.It then into.op = Op.Undefined
+        if into.op == Op.Cps8
+            if into.imm & 4 != 0 || into.imm & 2 == 0
+                into.op = Op.Undefined
+            else
+                into.op = Op.Cps
+                into.imm &= 1
+        return
+
+    val allowed = into.op match
+        B | Bl | Leave | Barrier | Clrex | Udiv | Sdiv | Ldrex | Strex | Lda | Stl | Movt | Mrs8 | Msr8 -> true
+        // MOVW has the DpImm operation, but the other wide immediate forms are Mainline.
+        DpImm -> hw & 0xFBF0 == 0xF240
+        _ -> false
+
+    if !allowed then into.op = Op.Undefined
+
+    if into.op == Op.Mrs8 || into.op == Op.Msr8
+        val sysm = into.imm & 0xFF
+        val known = sysm <= 3 || (sysm >= 5 && sysm <= 9) || sysm == 16 || sysm == 20
+
+        if !known
+            into.op = Op.Undefined
+        else
+            // Baseline APSR has no Q, BASEPRI or FAULTMASK; use the existing v6-M register handlers.
+            into.op = if into.op == Op.Mrs8 then Op.Mrs else Op.Msr
+            into.imm = sysm
+end baseline_instruction
+
+// A 32-bit `CMP` with an immediate and a 16-bit conditional branch after it, fused as decode.sysl's
+// `fuse` fuses the 16-bit compare: the branch decoded into its own record, two after the compare's,
+// and the compare's handler doing both. A record past the RAM's end, or an access off it, leaves the
+// two apart.
+private fuse_wide(cpu: *Cpu, pc: u32, into: *Insn)
+    if pc + 4 >= RAM_BYTES || page_of(cpu, pc + 4) == 0 then return
+
+    val next = load16(cpu, pc + 4)
+    val cond = bits(next, 8, 4)
+
+    if next >> 12 != 0b1101 || cond >= 14 then return
+
+    decode(cpu, pc + 4, &into[2])
+
+    if into[2].op == Op.Leave then return
+
+    into.h = cmp_w_bcond_handler(cond)
+
+// The instructions of an IT block from `at`, each under the ITSTATE it runs with, starting at `st`.
+decode_block(cpu: *Cpu, at: u32, st: u32)
+    var pc = at
+    var s = st
+
+    while s != 0 && pc < RAM_BYTES
+        decode_v8(cpu, pc, &cpu.dec[pc >> 1], s)
+        pc += if wide(load16(cpu, pc)) then 4 else 2
+        s = it_advance(s)
+
+// ---------------------------------------------------------------------------------------------------
+// 16-bit encodings.
+
+private decode_narrow(cpu: *Cpu, pc: u32, hw: u32, into: *Insn, it: u32) -> Op
+    // IT and the hints.
+    if hw >> 8 == 0xBF
+        val mask = hw & 0xF
+        val first = bits(hw, 4, 4)
+
+        if mask == 0
+            return if first == 3 then Op.Wfi else Op.Nop
+
+        // An IT inside a block, one on "never", and one on "always" with an else, are UNPREDICTABLE.
+        if it != 0 || first == 15 || (first == 14 && mask != 8 && mask != 4 && mask != 2 && mask != 1) then return Op.Undefined
+
+        set(into, 0, 0, 0, hw & 0xFF)
+        return Op.It
+
+    // CBZ and CBNZ, which may not be in a block; their targets are forward and near.
+    if hw & 0xF500 == 0xB100
+        val target = pc + 4 + ((bits(hw, 9, 1) << 6) | (bits(hw, 3, 5) << 1))
+
+        if it != 0 || target >= RAM_BYTES then return Op.Undefined
+
+        set(into, bits(hw, 0, 3), 0, 0, (target - pc) >> 1)
+        return if bits(hw, 11, 1) == 1 then Op.Cbnz else Op.Cbz
+
+    // CPSIE and CPSID, for PRIMASK (I) and FAULTMASK (F).
+    if hw >> 5 == 0b10110110011
+        if it != 0 then return Op.Undefined
+
+        set(into, 0, 0, 0, bits(hw, 4, 1) | (bits(hw, 1, 1) << 1) | (bits(hw, 0, 1) << 2))
+        return Op.Cps8
+
+    // The ways a 16-bit instruction moves SP, each checking the limit.
+    if hw >> 9 == 0b1011010
+        set(into, 0, 0, 0, (hw & 0xFF) | (bits(hw, 8, 1) << 14))
+        return Op.PushL
+
+    if hw >> 8 == 0b10110000
+        val imm = (hw & 0x7F) << 2
+
+        set(into, 13, 13, 0, if bits(hw, 7, 1) == 0 then imm else 0 - imm)
+        return Op.SpImm
+
+    // BX and BLX name a register in bits 3–6, and bits 0–2 are 0: otherwise they are BXNS and BLXNS.
+    if hw >> 7 == 0b010001110 || hw >> 7 == 0b010001111
+        if hw & 7 != 0 then return Op.Undefined
+
+    if it != 0
+        val op = in_block(hw, into)
+
+        if op != Op.Undecoded then return op
+
+    val op = decode16(cpu, pc, hw, into)
+
+    // ADD SP, Rm and MOV SP, Rm.
+    if (op == Op.AddHi || op == Op.MovHi) && into.a == 13
+        into.c = if op == Op.AddHi then 1 else 0
+        return Op.SpReg
+
+    op
+
+// A 16-bit data-processing encoding inside an IT block, where it sets no flags: the form that does
+// not. `Undecoded` for every encoding that means the same inside a block as outside one.
+private in_block(hw: u32, into: *Insn) -> Op
+    val rd = bits(hw, 0, 3)
+    val rm = bits(hw, 3, 3)
+
+    if hw >> 13 == 0
+        val imm5 = bits(hw, 6, 5)
+
+        return bits(hw, 11, 2) match
+            0 ->
+                if imm5 == 0
+                    set(into, rd, rm, 0, 0)
+                    return Op.MovHi
+                set(into, rd, rm, 0, ALU16_LSL | (imm5 << 8))
+                Op.ItAlu
+            1 ->
+                set(into, rd, rm, 0, ALU16_LSR | ((if imm5 == 0 then 32 else imm5) << 8))
+                Op.ItAlu
+            2 ->
+                set(into, rd, rm, 0, ALU16_ASR | ((if imm5 == 0 then 32 else imm5) << 8))
+                Op.ItAlu
+            _ ->
+                val rn = rm
+                val third = bits(hw, 6, 3)
+
+                bits(hw, 9, 2) match
+                    0 ->
+                        set(into, rd, rn, third, ALU16_ADD)
+                        Op.ItAlu
+                    1 ->
+                        set(into, rd, rn, third, ALU16_SUB)
+                        Op.ItAlu
+                    2 ->
+                        set(into, rd, rn, 0, third)
+                        Op.AddImm
+                    _ ->
+                        set(into, rd, rn, 0, 0 - third)
+                        Op.AddImm
+
+    if hw >> 13 == 1
+        val rdn = bits(hw, 8, 3)
+        val imm8 = hw & 0xFF
+
+        return bits(hw, 11, 2) match
+            0 ->
+                set(into, rdn, 0, 0, imm8)
+                Op.LoadConst
+            1 -> Op.Undecoded
+            2 ->
+                set(into, rdn, rdn, 0, imm8)
+                Op.AddImm
+            _ ->
+                set(into, rdn, rdn, 0, 0 - imm8)
+                Op.AddImm
+
+    if hw >> 10 == 0b010000
+        val code: u32 = bits(hw, 6, 4) match
+            0 -> ALU16_AND
+            1 -> ALU16_EOR
+            2 -> ALU16_LSLR
+            3 -> ALU16_LSRR
+            4 -> ALU16_ASRR
+            5 -> ALU16_ADC
+            6 -> ALU16_SBC
+            7 -> ALU16_RORR
+            9 -> ALU16_NEG
+            12 -> ALU16_ORR
+            13 -> ALU16_MUL
+            14 -> ALU16_BIC
+            15 -> ALU16_MVN
+            // TST, CMP and CMN set the flags inside a block too.
+            _ -> return Op.Undecoded
+
+        set(into, rd, rm, 0, code)
+        return Op.ItAlu
+
+    Op.Undecoded
+
+// ---------------------------------------------------------------------------------------------------
+// 32-bit encodings.
+
+private decode_wide(cpu: *Cpu, pc: u32, hw1: u32, hw2: u32, into: *Insn, it: u32) -> Op
+    val dsp = decode_dsp(cpu, hw1, hw2, into)
+
+    if dsp != Op.Undecoded then return dsp
+
+    val op1 = bits(hw1, 11, 2)
+
+    // These occupy a formerly reserved shifted-register encoding. Never let an older core
+    // decode them as a data-processing operation, or allow them inside an IT block.
+    if hw1 & 0xFFF0 == 0xEA50 && hw2 & 0xC000 == 0x8000
+        val rd = bits(hw2, 8, 4)
+        val rn = hw1 & 0xF
+        val rm = hw2 & 0xF
+        val condition = bits(hw2, 4, 4)
+
+        if !is_v81m(cpu.kind) || it != 0 || bad(rd) || rn == 13 || rm == 13 || condition >= 14 then return Op.Undefined
+        set(into, rd, rn, rm, condition | (bits(hw2, 12, 2) << 4))
+        return Op.Csel
+
+    if op1 == 0b01
+        return bits(hw1, 9, 2) match
+            0 -> if bits(hw1, 6, 1) == 0 then multiple(hw1, hw2, into) else dual(pc, hw1, hw2, into)
+            1 -> shifted_register(hw1, hw2, into)
+            // Coprocessor and floating point.
+            _ -> Op.Undefined
+
+    if op1 == 0b10
+        if hw2 >> 15 == 1 then return branch_or_control(cpu, pc, hw1, hw2, into, it)
+
+        return if bits(hw1, 9, 1) == 0 then modified_immediate(hw1, hw2, into) else plain_immediate(pc, hw1, hw2, into)
+
+    val top = hw1 >> 8
+
+    if top == 0xF8 || top == 0xF9 then return single(pc, hw1, hw2, into)
+    if top == 0xFA && hw2 >> 12 == 0xF then return data_register(hw1, hw2, into)
+    if hw1 >> 7 == 0b111110110 then return multiply(hw1, hw2, into)
+    if hw1 >> 7 == 0b111110111 then return long_multiply(hw1, hw2, into)
+
+    Op.Undefined
+
+// LDM, STM, PUSH.W and POP.W: increment-after or decrement-before, with or without writeback.
+private multiple(hw1: u32, hw2: u32, into: *Insn) -> Op
+    val kind = bits(hw1, 7, 2)
+    val rn = hw1 & 0xF
+    val list = hw2 & 0xFFFF
+    val c = bits(hw1, 5, 1) | (if kind == 2 then 2 else 0)
+
+    if kind == 0 || kind == 3 || rn == 15 || list == 0 then return Op.Undefined
+
+    set(into, rn, 0, c, list)
+
+    if bits(hw1, 4, 1) == 0
+        return if list & 0xA000 != 0 then Op.Undefined else Op.StmW
+
+    if list & 0x2000 != 0 || list & 0xC000 == 0xC000 then return Op.Undefined
+    if c & 1 != 0 && (list >> rn) & 1 != 0 then return Op.Undefined
+
+    if list & 0x8000 != 0 then Op.LdmPc else Op.LdmW
+
+// LDRD and STRD; the exclusives, the load-acquires and store-releases; TBB and TBH.
+private dual(pc: u32, hw1: u32, hw2: u32, into: *Insn) -> Op
+    val upper = bits(hw1, 7, 2)
+    val lower = bits(hw1, 4, 2)
+    val rn = hw1 & 0xF
+    val rt = hw2 >> 12
+    val rt2 = bits(hw2, 8, 4)
+    val imm8 = hw2 & 0xFF
+
+    if upper == 0 && lower == 0
+        // STREX; with Rt = PC it is TT, of the Security Extension.
+        if bad(rt) || bad(rt2) || rn == 15 || rt2 == rt || rt2 == rn then return Op.Undefined
+
+        set(into, rt2, rn, rt, (imm8 << 2) | (EX_WORD << 16))
+        return Op.Strex
+
+    if upper == 0 && lower == 1
+        if bad(rt) || rn == 15 then return Op.Undefined
+
+        set(into, rt, rn, EX_WORD, imm8 << 2)
+        return Op.Ldrex
+
+    if upper == 1 && lower == 0 then return store_ordered(hw2, rn, rt, into)
+    if upper == 1 && lower == 1 then return load_ordered(pc, hw2, rn, rt, into)
+
+    // LDRD and STRD: P, U, W and L.
+    val pre = bits(hw1, 8, 1)
+    val back = bits(hw1, 5, 1)
+    val offset = if bits(hw1, 7, 1) == 1 then imm8 << 2 else 0 - (imm8 << 2)
+    val loads = bits(hw1, 4, 1) == 1
+
+    if bad(rt) || bad(rt2) then return Op.Undefined
+
+    if loads && rn == 15
+        // From a literal, which may not write back; SG is one with writeback.
+        if back == 1 then return Op.Undefined
+
+        set(into, rt, 0, rt2, ((pc + 4) & ~3) + offset)
+        return Op.LdrdLit
+
+    if rn == 15 || (back == 1 && (rn == rt || rn == rt2)) || (loads && rt == rt2) then return Op.Undefined
+
+    val mode: u32 = if back == 0 then 0 else if pre == 1 then 1 else 2
+
+    set(into, rt, rn, rt2, (offset & 0xFFFF) | (mode << 16))
+    if loads then Op.Ldrd else Op.Strd
+
+// STREXB, STREXH, and ARMv8-M's STL, STLB, STLH, STLEX, STLEXB, STLEXH.
+private store_ordered(hw2: u32, rn: u32, rt: u32, into: *Insn) -> Op
+    val kind = bits(hw2, 4, 4)
+    val rd = hw2 & 0xF
+    val size: u32 = kind & 3 match
+        0 -> EX_BYTE
+        1 -> EX_HALF
+        2 -> EX_WORD
+        _ -> return Op.Undefined
+
+    if bad(rt) || rn == 15 then return Op.Undefined
+
+    if kind == 0b1000 || kind == 0b1001 || kind == 0b1010
+        set(into, rt, rn, size, 0)
+        return Op.Stl
+
+    if kind != 0b0100 && kind != 0b0101 && kind != 0b1100 && kind != 0b1101 && kind != 0b1110 then return Op.Undefined
+    if bad(rd) || rd == rt || rd == rn then return Op.Undefined
+
+    set(into, rd, rn, rt, (size << 16) | ((if kind >= 0b1100 then 1 else 0) << 18))
+    Op.Strex
+
+// TBB, TBH, LDREXB, LDREXH, and ARMv8-M's LDA, LDAB, LDAH, LDAEX, LDAEXB, LDAEXH.
+private load_ordered(pc: u32, hw2: u32, rn: u32, rt: u32, into: *Insn) -> Op
+    val kind = bits(hw2, 4, 4)
+    val rm = hw2 & 0xF
+
+    if kind == 0 || kind == 1
+        if bad(rm) then return Op.Undefined
+
+        val from_pc: u32 = if rn == 15 then 1 else 0
+
+        set(into, from_pc, rn, rm, if rn == 15 then pc + 4 else 0)
+        return if kind == 0 then Op.Tbb else Op.Tbh
+
+    val size: u32 = kind & 3 match
+        0 -> EX_BYTE
+        1 -> EX_HALF
+        2 -> EX_WORD
+        _ -> return Op.Undefined
+
+    if bad(rt) || rn == 15 then return Op.Undefined
+
+    if kind == 0b1000 || kind == 0b1001 || kind == 0b1010
+        set(into, rt, rn, size, 0)
+        return Op.Lda
+
+    if kind != 0b0100 && kind != 0b0101 && kind != 0b1100 && kind != 0b1101 && kind != 0b1110 then return Op.Undefined
+
+    set(into, rt, rn, size | (if kind >= 0b1100 then 4 else 0), 0)
+    Op.Ldrex
+
+// `DecodeImmShift`: the kind and amount, packed as `DpReg` keeps them.
+private imm_shift(kind: u32, imm5: u32) -> u32
+    if kind == 0 then return imm5
+    if kind == 3 then return if imm5 == 0 then (SH_RRX << 6) | 1 else (SH_ROR << 6) | imm5
+
+    (kind << 6) | (if imm5 == 0 then 32 else imm5)
+
+// Data processing with a shifted register.
+private shifted_register(hw1: u32, hw2: u32, into: *Insn) -> Op
+    val kind = bits(hw1, 5, 4)
+    val s = bits(hw1, 4, 1)
+    val rn = hw1 & 0xF
+    val rd = bits(hw2, 8, 4)
+    val rm = hw2 & 0xF
+    val shift = imm_shift(bits(hw2, 4, 2), (bits(hw2, 12, 3) << 2) | bits(hw2, 6, 2))
+    // Rd = PC with S set is the comparing form, which writes nothing.
+    val compare = rd == 15 && s == 1
+
+    val op: u32 = kind match
+        0 -> if compare then DP_TST else DP_AND + s
+        1 -> DP_BIC + s
+        2 -> if rn == 15 then DP_MOV + s else DP_ORR + s
+        3 -> if rn == 15 then DP_MVN + s else DP_ORN + s
+        4 -> if compare then DP_TEQ else DP_EOR + s
+        8 -> if compare then DP_CMN else DP_ADD + s
+        10 -> DP_ADC + s
+        11 -> DP_SBC + s
+        13 -> if compare then DP_CMP else DP_SUB + s
+        14 -> DP_RSB + s
+        _ -> return Op.Undefined
+
+    if rm == 15 || (rd == 15 && !compare) then return Op.Undefined
+
+    set(into, rd, rn, rm, (op << 12) | shift)
+
+    if rd == 13
+        // Only ADD, SUB and MOV may write SP, and they check its limit.
+        return if op == DP_ADD || op == DP_SUB || op == DP_MOV then Op.SpRegW else Op.Undefined
+
+    Op.DpReg
+
+// `ThumbExpandImm`: the value of a 12-bit modified immediate, and whether it was rotated, which is
+// when its carry-out is its bit 31 rather than C. None where the encoding is UNPREDICTABLE.
+private expand(imm12: u32) -> Option[u32]
+    val imm8 = imm12 & 0xFF
+
+    if imm12 >> 10 == 0
+        return bits(imm12, 8, 2) match
+            0 -> Some(imm8)
+            1 -> if imm8 == 0 then None else Some((imm8 << 16) | imm8)
+            2 -> if imm8 == 0 then None else Some((imm8 << 24) | (imm8 << 8))
+            _ -> if imm8 == 0 then None else Some((imm8 << 24) | (imm8 << 16) | (imm8 << 8) | imm8)
+
+    val unrotated = 0x80 | (imm12 & 0x7F)
+    val n = imm12 >> 7
+
+    Some((unrotated >> n) | (unrotated << (32 - n)))
+
+// Data processing with a modified immediate.
+private modified_immediate(hw1: u32, hw2: u32, into: *Insn) -> Op
+    val kind = bits(hw1, 5, 4)
+    val s = bits(hw1, 4, 1) == 1
+    val rn = hw1 & 0xF
+    val rd = bits(hw2, 8, 4)
+    val imm12 = (bits(hw1, 10, 1) << 11) | (bits(hw2, 12, 3) << 8) | (hw2 & 0xFF)
+    val rotated = imm12 >> 10 != 0
+    val compare = rd == 15 && s
+
+    val value = expand(imm12) match
+        Some(v) -> v
+        None -> return Op.Undefined
+
+    if rd == 15 && !compare then return Op.Undefined
+
+    // A flag-setting logical operation: C becomes the immediate's carry-out where it was rotated. The
+    // complemented forms (BIC, ORN, MVN) take the carry of the immediate before the complement.
+    if s && (kind <= 4)
+        val logic: u32 = kind match
+            0 -> if compare then LOGIC_TST else LOGIC_AND
+            1 -> LOGIC_AND
+            2 -> if rn == 15 then LOGIC_MOV else LOGIC_ORR
+            3 -> if rn == 15 then LOGIC_MOV else LOGIC_ORR
+            _ -> if compare then LOGIC_TEQ else LOGIC_EOR
+        val operand = if kind == 1 || kind == 3 then ~value else value
+
+        if !compare && rd == 13 then return Op.Undefined
+
+        if !rotated
+            set(into, rd, rn, logic, operand)
+            return Op.LogicImm
+
+        set(into, rd, rn, logic | ((value >> 31) << 3), operand)
+        return Op.LogicImmC
+
+    val code: u32 = kind match
+        0 | 1 -> IMM_AND
+        2 | 3 -> if rn == 15 then IMM_MOV else IMM_ORR
+        4 -> IMM_EOR
+        8 -> if compare then IMM_CMN else if s then IMM_ADDS else IMM_ADD
+        10 | 11 -> if s then IMM_ADCS else IMM_ADC
+        13 -> if compare then IMM_CMP else if s then IMM_SUBS else IMM_ADD
+        14 -> if s then IMM_RSBS else IMM_RSB
+        _ -> return Op.Undefined
+    // BIC, ORN, MVN and SBC take the complement, and SUB (not SUBS) the negation.
+    val operand = if kind == 1 || kind == 3 || kind == 11 then ~value else if kind == 13 && code == IMM_ADD then 0 - value else value
+
+    if rd == 13
+        // ADD and SUB into SP check its limit; nothing else may write it.
+        if code != IMM_ADD || kind == 2 || kind == 3 then return Op.Undefined
+
+        set(into, 13, rn, 0, operand)
+        return Op.SpImmW
+
+    set(into, rd, rn, code, operand)
+    Op.DpImm
+
+// Data processing with a plain binary immediate: ADDW, SUBW, ADR, MOVW, MOVT, the saturations and
+// the bitfields.
+private plain_immediate(pc: u32, hw1: u32, hw2: u32, into: *Insn) -> Op
+    val kind = bits(hw1, 4, 5)
+    val rn = hw1 & 0xF
+    val rd = bits(hw2, 8, 4)
+    val imm12 = (bits(hw1, 10, 1) << 11) | (bits(hw2, 12, 3) << 8) | (hw2 & 0xFF)
+    val imm16 = ((hw1 & 0xF) << 12) | imm12
+    // imm3:imm2, a shift amount or a bitfield's lsb.
+    val low = (bits(hw2, 12, 3) << 2) | bits(hw2, 6, 2)
+    val field = hw2 & 0x1F
+
+    if rd == 15 then return Op.Undefined
+
+    if kind == 0b00000 || kind == 0b01010
+        val add = kind == 0b00000
+        val amount = if add then imm12 else 0 - imm12
+
+        if rn == 15
+            // ADR: from the instruction's address plus 4, word-aligned.
+            if rd == 13 then return Op.Undefined
+
+            set(into, rd, 0, IMM_MOV, ((pc + 4) & ~3) + amount)
+            return Op.DpImm
+
+        if rd == 13
+            set(into, 13, rn, 0, amount)
+            return Op.SpImmW
+
+        set(into, rd, rn, IMM_ADD, amount)
+        return Op.DpImm
+
+    if rd == 13 then return Op.Undefined
+
+    if kind == 0b00100
+        set(into, rd, 0, IMM_MOV, imm16)
+        return Op.DpImm
+
+    if kind == 0b01100
+        set(into, rd, 0, 0, imm16)
+        return Op.Movt
+
+    if bad(rn) && !(rn == 15 && kind == 0b10110) then return Op.Undefined
+
+    kind match
+        0b10000 | 0b10010 ->
+            // SSAT; with ASR #0 it is SSAT16, of the DSP extension.
+            val asr = bits(hw1, 5, 1)
+
+            if asr == 1 && low == 0 then return Op.Undefined
+
+            set(into, rd, rn, 0, (field + 1) | ((if asr == 1 then SH_ASR else SH_LSL) << 8) | (low << 16))
+            Op.Ssat
+        0b11000 | 0b11010 ->
+            val asr = bits(hw1, 5, 1)
+
+            if asr == 1 && low == 0 then return Op.Undefined
+
+            set(into, rd, rn, 0, field | ((if asr == 1 then SH_ASR else SH_LSL) << 8) | (low << 16))
+            Op.Usat
+        0b10100 | 0b11100 ->
+            val width = field + 1
+
+            if low + width > 32 then return Op.Undefined
+
+            set(into, rd, rn, 0, low | (width << 8))
+            if kind == 0b10100 then Op.Sbfx else Op.Ubfx
+        0b10110 ->
+            if field < low then return Op.Undefined
+
+            set(into, rd, rn, 0, low | ((field - low + 1) << 8))
+            if rn == 15 then Op.Bfc else Op.Bfi
+        _ -> Op.Undefined
+
+// Branches and miscellaneous control.
+private branch_or_control(cpu: *Cpu, pc: u32, hw1: u32, hw2: u32, into: *Insn, it: u32) -> Op
+    val op1 = bits(hw2, 12, 3)
+    val kind = bits(hw1, 4, 7)
+    val s = bits(hw1, 10, 1)
+    val j1 = bits(hw2, 13, 1)
+    val j2 = bits(hw2, 11, 1)
+
+    if op1 & 0b101 == 0b001 || op1 & 0b101 == 0b101
+        // B (T4) and BL: S:I1:I2:imm10:imm11:0, with I1 = ~(J1 ^ S) and I2 = ~(J2 ^ S).
+        val i1 = ~(j1 ^ s) & 1
+        val i2 = ~(j2 ^ s) & 1
+        val off = (s << 24) | (i1 << 23) | (i2 << 22) | ((hw1 & 0x3FF) << 12) | ((hw2 & 0x7FF) << 1)
+        val target = pc + 4 + sext(off, 25)
+
+        return if op1 & 0b100 != 0 then direct(into, pc, target, Op.Bl, 14, 1) else direct(into, pc, target, Op.B, 14, 0)
+
+    // BLX to an immediate, which would leave Thumb state.
+    if op1 & 0b101 == 0b100 then return Op.Undefined
+
+    if bits(kind, 3, 3) != 0b111
+        // B<cond> (T3): S:J2:J1:imm6:imm11:0. It may not be in an IT block.
+        val cond = bits(hw1, 6, 4)
+        val off = (s << 20) | (j2 << 19) | (j1 << 18) | ((hw1 & 0x3F) << 12) | ((hw2 & 0x7FF) << 1)
+        val target = pc + 4 + sext(off, 21)
+
+        if it != 0 then return Op.Undefined
+
+        if target >= RAM_BYTES
+            set(into, 0, 0, cond, target)
+            return Op.LeaveW
+
+        set(into, 0, 0, cond, u32(i32(target - pc) >> 1))
+        return Op.BcondW
+
+    if op1 != 0 then return Op.Undefined
+
+    if kind >> 1 == 0b011100
+        // MSR: special register and independent NZCVQ/GE masks. GE writes are ignored
+        // at execution time when this core has DSP disabled.
+        val rn = hw1 & 0xF
+        val mask = bits(hw2, 10, 2)
+        val sysm = hw2 & 0xFF
+
+        if bad(rn) || !special8(sysm) || (mask == 0 || (mask != 2 && (!model_of(cpu.kind).dsp || sysm > 3))) then return Op.Undefined
+
+        set(into, 0, rn, 0, sysm | (mask << 8))
+        return Op.Msr8
+
+    if kind == 0b0111010
+        // The hints; there is no 32-bit CPS on an M profile core.
+        if bits(hw2, 8, 3) != 0 then return Op.Undefined
+
+        return if hw2 & 0xFF == 3 then Op.WfiW else Op.NopW
+
+    if kind == 0b0111011
+        return bits(hw2, 4, 4) match
+            0b0010 -> Op.Clrex
+            0b0100 | 0b0101 | 0b0110 -> Op.Barrier
+            _ -> Op.Undefined
+
+    if kind >> 1 == 0b011111
+        val rd = bits(hw2, 8, 4)
+        val sysm = hw2 & 0xFF
+
+        if bad(rd) || !special8(sysm) then return Op.Undefined
+
+        set(into, rd, 0, 0, sysm)
+        return Op.Mrs8
+
+    // UDF, and everything else here.
+    Op.Undefined
+
+// The special registers this kind has: the PSR views (0–3, 5–7), MSP, PSP, MSPLIM, PSPLIM, PRIMASK,
+// BASEPRI, BASEPRI_MAX, FAULTMASK and CONTROL. The Non-secure aliases (0x88 and up) are the Security
+// Extension's.
+private special8(sysm: u32) -> bool = sysm <= 3 || (sysm >= 5 && sysm <= 11) || (sysm >= 16 && sysm <= 20)
+
+// The loads and stores of one register, and the memory hints.
+private single(pc: u32, hw1: u32, hw2: u32, into: *Insn) -> Op
+    val loads = bits(hw1, 4, 1) == 1
+    val signed = bits(hw1, 8, 1) == 1
+    val size = bits(hw1, 5, 2)
+    val up = bits(hw1, 7, 1) == 1
+    val rn = hw1 & 0xF
+    val rt = hw2 >> 12
+
+    if size == 3 || (signed && (!loads || size == 2)) then return Op.Undefined
+
+    val xfer: u32 = if !loads
+        if size == 0 then XFER_STRB else if size == 1 then XFER_STRH else XFER_STR
+    else if signed
+        if size == 0 then XFER_LDRSB else XFER_LDRSH
+    else
+        if size == 0 then XFER_LDRB else if size == 1 then XFER_LDRH else XFER_LDR
+
+    // Into the PC: LDR is a branch, and a byte or halfword load is a preload hint, which does nothing.
+    if rt == 15 && loads
+        return if size == 2 then load_pc(pc, hw1, hw2, into) else Op.NopW
+
+    if rt == 15 || (rt == 13 && xfer != XFER_LDR && xfer != XFER_STR) then return Op.Undefined
+
+    if rn == 15
+        if !loads then return Op.Undefined
+
+        val offset = hw2 & 0xFFF
+
+        set(into, rt, 0, xfer, if up then ((pc + 4) & ~3) + offset else ((pc + 4) & ~3) - offset)
+        return Op.LdLit
+
+    if up
+        set(into, rt, rn, xfer, hw2 & 0xFFF)
+        return Op.LdImm
+
+    if bits(hw2, 11, 1) == 1
+        // imm8 with P, U and W.
+        val pre = bits(hw2, 10, 1)
+        val add = bits(hw2, 9, 1)
+        val back = bits(hw2, 8, 1)
+        val imm8 = hw2 & 0xFF
+        val offset = if add == 1 then imm8 else 0 - imm8
+
+        if pre == 0 && back == 0 then return Op.Undefined
+
+        if back == 0
+            // With P and U and no writeback, the unprivileged form (LDRT, STRT…), which on a core
+            // that does not restrict unprivileged accesses is the same access.
+            set(into, rt, rn, xfer, offset)
+            return Op.LdImm
+
+        if rn == rt then return Op.Undefined
+
+        set(into, rt, rn, xfer | (if pre == 0 then 8 else 0), offset)
+        return Op.LdWb
+
+    if bits(hw2, 6, 6) != 0 then return Op.Undefined
+
+    val rm = hw2 & 0xF
+
+    if bad(rm) then return Op.Undefined
+
+    set(into, rt, rn, rm, (xfer << 8) | bits(hw2, 4, 2))
+    Op.LdReg
+
+// `LDR PC, …` in each of its addressings.
+private load_pc(pc: u32, hw1: u32, hw2: u32, into: *Insn) -> Op
+    val rn = hw1 & 0xF
+
+    if rn == 15
+        val offset = hw2 & 0xFFF
+
+        set(into, 0, 0, PC_LITERAL, if bits(hw1, 7, 1) == 1 then ((pc + 4) & ~3) + offset else ((pc + 4) & ~3) - offset)
+        return Op.LdPc
+
+    if bits(hw1, 7, 1) == 1
+        set(into, 0, rn, PC_OFFSET, hw2 & 0xFFF)
+        return Op.LdPc
+
+    if bits(hw2, 11, 1) == 1
+        val pre = bits(hw2, 10, 1)
+        val back = bits(hw2, 8, 1)
+        val imm8 = hw2 & 0xFF
+        val offset = if bits(hw2, 9, 1) == 1 then imm8 else 0 - imm8
+
+        if pre == 0 && back == 0 then return Op.Undefined
+
+        val mode = if back == 0 then PC_OFFSET else if pre == 1 then PC_PRE else PC_POST
+
+        set(into, 0, rn, mode, offset)
+        return Op.LdPc
+
+    val rm = hw2 & 0xF
+
+    if bits(hw2, 6, 6) != 0 || bad(rm) then return Op.Undefined
+
+    set(into, rm, rn, PC_REG, bits(hw2, 4, 2))
+    Op.LdPc
+
+// Data processing on registers: the shifts by a register, the extends, and the bit and byte
+// operations.
+private data_register(hw1: u32, hw2: u32, into: *Insn) -> Op
+    val op1 = bits(hw1, 4, 4)
+    val op2 = bits(hw2, 4, 4)
+    val rn = hw1 & 0xF
+    val rd = bits(hw2, 8, 4)
+    val rm = hw2 & 0xF
+
+    if bad(rd) || bad(rm) then return Op.Undefined
+
+    if op1 >> 3 == 0 && op2 == 0
+        if bad(rn) then return Op.Undefined
+
+        set(into, rd, rn, rm, bits(hw1, 5, 2) | (bits(hw1, 4, 1) << 4))
+        return Op.ShiftReg
+
+    if op2 >> 3 == 1 && rn == 15
+        val which: u32 = op1 match
+            0 -> 0
+            1 -> 1
+            4 -> 2
+            5 -> 3
+            // SXTB16, UXTB16: the DSP extension's.
+            _ -> return Op.Undefined
+
+        set(into, rd, rm, which, bits(hw2, 4, 2) * 8)
+        return Op.Extend
+
+    if op1 >> 2 == 0b10 && op2 >> 2 == 0b10
+        // Rm is named twice, and the two must agree.
+        if rn != rm then return Op.Undefined
+
+        val which: u32 = ((bits(hw1, 4, 2) << 2) | bits(hw2, 4, 2)) match
+            0b0100 -> 2
+            0b0101 -> 3
+            0b0110 -> 1
+            0b0111 -> 4
+            0b1100 -> 0
+            // QADD and the rest, and SEL: the DSP extension's.
+            _ -> return Op.Undefined
+
+        set(into, rd, rm, which, 0)
+        return Op.BitOp
+
+    // The extends that add, and the parallel additions: the DSP extension's.
+    Op.Undefined
+
+// MUL, MLA and MLS; the rest of the space is the DSP extension's.
+private multiply(hw1: u32, hw2: u32, into: *Insn) -> Op
+    val rn = hw1 & 0xF
+    val ra = hw2 >> 12
+    val rd = bits(hw2, 8, 4)
+    val rm = hw2 & 0xF
+
+    if bits(hw1, 4, 3) != 0 || bad(rd) || bad(rn) || bad(rm) || ra == 13 then return Op.Undefined
+
+    set(into, rd, rn, rm, ra)
+
+    bits(hw2, 4, 4) match
+        0 -> if ra == 15 then Op.MulW else Op.Mla
+        1 -> if ra == 15 then Op.Undefined else Op.Mls
+        _ -> Op.Undefined
+
+// The long multiplies and the divides.
+private long_multiply(hw1: u32, hw2: u32, into: *Insn) -> Op
+    val op1 = bits(hw1, 4, 3)
+    val op2 = bits(hw2, 4, 4)
+    val rn = hw1 & 0xF
+    val lo = hw2 >> 12
+    val hi = bits(hw2, 8, 4)
+    val rm = hw2 & 0xF
+
+    if bad(rn) || bad(rm) || bad(hi) then return Op.Undefined
+
+    if op2 == 0b1111 && (op1 == 0b001 || op1 == 0b011)
+        if lo != 15 then return Op.Undefined
+
+        set(into, hi, rn, rm, 0)
+        return if op1 == 0b001 then Op.Sdiv else Op.Udiv
+
+    if op2 != 0 || bad(lo) || lo == hi then return Op.Undefined
+
+    set(into, lo, rn, rm, hi)
+
+    op1 match
+        0b000 -> Op.Smull
+        0b010 -> Op.Umull
+        0b100 -> Op.Smlal
+        0b110 -> Op.Umlal
+        _ -> Op.Undefined

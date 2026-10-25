@@ -1,10 +1,10 @@
 #!/bin/zsh
 # Builds the benchmark's guests: `zsh bench/guest/build.sh`.
-#   kernel.bin    the one-core workload `cortical bench` runs from address 0, for the M0+
-#   kernel33.bin  the same C for the M33 (`cortical bench --core cortex-m33`), without the DSP
-#                 extension, which cortical's M33 leaves out
-#   dual.elf      the two-core workload `cortical bench-board` runs on the virtual board, and
-#   dual33.elf    the same for `virt33` (`cortical bench-board --board virt33`)
+#   kernel.bin    the one-core workload `benchtop bench` runs from address 0, for the M0+
+#   kernel33.bin  the same C for the M33 (`benchtop bench --core cortex-m33`), without the DSP
+#                 extension, which benchtop's M33 leaves out
+#   dual.elf      the two-core workload `benchtop bench-board` runs on the virtual board, and
+#   dual33.elf    the same for `virt33` (`benchtop bench-board --board virt33`)
 set -e
 cd ${0:A:h}
 

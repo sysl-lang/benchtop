@@ -1,0 +1,252 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// Both executors over the same code must agree with each other and with the architecture. The guest
+// kernel's answer comes from the same C built for the host, so it is an oracle neither executor
+// wrote; the single-instruction cases are the ARMv6-M ARM's results for the edges of each operation.
+
+val kernel = embed("../../../../bench/guest/kernel.bin")
+
+// The kernel's `run(20)`, as the host computes it from `kernel.c`.
+const KERNEL_20: u32 = 1743194623
+
+type Exec = *extern(*Cpu) -> unit
+
+// Run from 0 until the guest stops, in quanta as the benchmark does.
+run_to_stop(cpu: *Cpu, exec: Exec)
+    while cpu.stop == Stop.Budget
+        cpu.limit = cpu.retired + 1000
+        exec(cpu)
+
+// The kernel with its round count patched to 20, run to its breakpoint.
+kernel_run(cpu: *Cpu, exec: Exec)
+    reset(cpu, kernel, 0)
+    store32(cpu, 0xC, 20)
+    run_to_stop(cpu, exec)
+
+// `code` at 0 followed by a `BKPT`, with r0, r1 and C set first.
+one(cpu: *Cpu, exec: Exec, code: u16, r0: u32, r1: u32, carry: u32)
+    reset(cpu, [], 0)
+    store16(cpu, 0, code)
+    store16(cpu, 2, 0xBE00)
+    cpu.r[0] = r0
+    cpu.r[1] = r1
+    cpu.c = carry
+    run_to_stop(cpu, exec)
+
+struct Want
+    reg: u4
+    value: u32
+    n: u32
+    z: bool
+    c: u32
+    v: u32
+
+// Both executors give `want` for `code`.
+agrees(code: u16, r0: u32, r1: u32, carry: u32, want: Want) -> bool
+    var cpu: Cpu
+
+    for exec in [&run_match, &run_threaded]
+        one(&cpu, exec, code, r0, r1, carry)
+
+        if cpu.stop != Stop.Breakpoint || cpu.retired != 1 then return false
+        if cpu.r[want.reg] != want.value || flag_n(&cpu) != want.n || flag_z(&cpu) != want.z then return false
+        if cpu.c != want.c || flag_v(&cpu) != want.v then return false
+
+    true
+
+// `code` at 0, with r0 and r1 set first, run under `exec` in quanta of `quantum` until it stops — or
+// gives up after a million instructions, still at `Stop.Budget`, so a guest sent into a loop by a
+// wrong branch fails its test rather than hanging it.
+program(cpu: *Cpu, exec: Exec, code: []const u16, r0: u32, r1: u32, quantum: u64)
+    reset(cpu, [], 0)
+    for i in 0..<code.len do store16(cpu, u32(i) * 2, code[i])
+    cpu.r[0] = r0
+    cpu.r[1] = r1
+
+    while cpu.stop == Stop.Budget && cpu.retired < 1000000
+        cpu.limit = cpu.retired + quantum
+        exec(cpu)
+
+// Whether condition `cond` holds after `CMP a, b`, from the comparison it stands for rather than from
+// flags.
+compare_holds(cond: u32, a: u32, b: u32) -> bool
+    val overflow = i64(i32(a)) - i64(i32(b)) != i64(i32(a - b))
+
+    cond match
+        0 -> a == b
+        1 -> a != b
+        2 -> a >= b
+        3 -> a < b
+        4 -> i32(a - b) < 0
+        5 -> i32(a - b) >= 0
+        6 -> overflow
+        7 -> !overflow
+        8 -> a > b
+        9 -> a <= b
+        10 -> i32(a) >= i32(b)
+        11 -> i32(a) < i32(b)
+        12 -> i32(a) > i32(b)
+        _ -> i32(a) <= i32(b)
+
+// `cmp` (comparing r0 with r1 or an immediate), then `B<cond>` over a `MOVS r2, #1` to a `MOVS r2, #2`:
+// both executors take the branch exactly when the comparison holds, and retire the same three.
+branches_as_compared(cmp: u16, cond: u32, a: u32, b: u32) -> bool
+    val code: []const u16 = [cmp, u16(0xD001 | (cond << 8)), 0x2201, 0xBE00, 0x2202, 0xBE00]
+    val want: u32 = if compare_holds(cond, a, b) then 2 else 1
+    var cpu: Cpu
+
+    for exec in [&run_match, &run_threaded]
+        program(&cpu, exec, code, a, b, 1000)
+
+        if cpu.stop != Stop.Breakpoint || cpu.r[2] != want || cpu.retired != 3 then return false
+
+    true
+
+@test("a compare fused with the branch after it takes the branch exactly when the comparison holds")
+dsp_fused_conditions()
+    val pairs: [][2]u32 = [
+        [5, 5], [4, 5], [5, 4], [0x80000000, 1], [0x7FFFFFFF, 0xFFFFFFFF], [0, 0x80000000],
+        [0xFFFFFFFF, 1], [1, 0xFFFFFFFF]
+    ]
+    val imms: []u32 = [0, 1, 5, 0x7F, 0xFF]
+    val values: []u32 = [0, 1, 5, 0x7F, 0xFF, 0x100, 0x80000000, 0xFFFFFFFF]
+
+    for cond in 0u32..<14
+        for p in pairs
+            assert(branches_as_compared(0x4288, cond, p[0], p[1]), s"CMP r0, r1; condition $cond, ${p[0]} ${p[1]}")
+
+        for b in imms
+            for a in values
+                assert(branches_as_compared(u16(0x2800 | b), cond, a, b), s"CMP r0, #$b; condition $cond, $a")
+
+// A loop that branches back into the branch half of a fused pair, with the flags then set by a
+// `SUBS`: counts r0 down from 3, so r2 ends at 3.
+//
+//     0: movs r2, #0      6: adds r2, #1
+//     2: cmp r0, #0       8: subs r0, #1
+//     4: beq 12          10: b 4
+//                        12: bkpt
+val into_fused: []const u16 = [0x2200, 0x2800, 0xD002, 0x3201, 0x3801, 0xE7FB, 0xBE00]
+
+@test("a branch into the second half of a fused pair runs that branch alone, on the flags it finds")
+dsp_into_fused()
+    var a: Cpu
+    var b: Cpu
+
+    program(&a, &run_match, into_fused, 3, 0, 1000)
+    program(&b, &run_threaded, into_fused, 3, 0, 1000)
+    assert(b.stop == Stop.Breakpoint && b.r[2] == 3 && b.r[0] == 0, "counted down three times")
+    assert(a.r[2] == 3 && a.retired == 15 && b.retired == 15, "both retired fifteen")
+
+@test("every budget stops both executors at the same branch, fused or not, and resuming finishes")
+dsp_fused_budget()
+    for quantum in 1..<20
+        var a: Cpu
+        var b: Cpu
+
+        // One after the other: the two machines share guest memory and its decoded records.
+        reset(&a, [], 0)
+        for i in 0..<into_fused.len do store16(&a, u32(i) * 2, into_fused[i])
+        a.r[0] = 3
+        a.limit = u64(quantum)
+        run_match(&a)
+
+        reset(&b, [], 0)
+        for i in 0..<into_fused.len do store16(&b, u32(i) * 2, into_fused[i])
+        b.r[0] = 3
+        b.limit = u64(quantum)
+        run_threaded(&b)
+        assert(a.stop == b.stop && a.retired == b.retired && a.pc == b.pc, s"one stop at budget $quantum")
+
+        program(&a, &run_threaded, into_fused, 3, 0, u64(quantum))
+        assert(a.r[2] == 3 && a.retired == 15, s"resumed to the end in quanta of $quantum")
+
+@test("V outlives a logical instruction that rewrites N and Z")
+dsp_v_kept()
+    // adds r2, r0, r1 (overflows); ands r0, r0; bkpt
+    val code: []const u16 = [0x1842, 0x4000, 0xBE00]
+
+    for exec in [&run_match, &run_threaded]
+        var cpu: Cpu
+
+        program(&cpu, exec, code, 0x7FFFFFFF, 1, 1000)
+        assert(flag_v(&cpu) == 1 && flag_n(&cpu) == 0 && !flag_z(&cpu), "V from ADDS, N and Z from ANDS")
+
+@test("the kernel's answer under the match executor is the host's")
+dsp_kernel_match()
+    var cpu: Cpu
+
+    kernel_run(&cpu, &run_match)
+    assert(cpu.stop == Stop.Breakpoint, "stopped at a breakpoint")
+    assert(cpu.r[0] == KERNEL_20, "r0 is run(20)")
+
+@test("the kernel's answer under the threaded executor is the host's, in as many instructions")
+dsp_kernel_threaded()
+    var a: Cpu
+    var b: Cpu
+
+    kernel_run(&a, &run_match)
+    kernel_run(&b, &run_threaded)
+    assert(b.stop == Stop.Breakpoint, "stopped at a breakpoint")
+    assert(b.r[0] == KERNEL_20, "r0 is run(20)")
+    assert(a.retired == b.retired, "both retired the same count")
+
+@test("the threaded executor stops at the first taken branch past its budget, and resumes there")
+dsp_budget()
+    var a: Cpu
+    var b: Cpu
+
+    // One after the other: the two machines share guest memory, which the kernel writes.
+    reset(&a, kernel, 0)
+    a.limit = 5000
+    run_match(&a)
+    reset(&b, kernel, 0)
+    b.limit = 5000
+    run_threaded(&b)
+    assert(a.stop == Stop.Budget && b.stop == Stop.Budget, "neither finished")
+    assert(a.retired >= 5000 && a.retired == b.retired && a.pc == b.pc, "both stopped at one branch")
+
+@test("ADDS: unsigned carry, signed overflow, and a zero result")
+dsp_adds()
+    assert(agrees(0x1842, 0xFFFFFFFF, 1, 0, Want(2, 0, 0, true, 1, 0)), "carry, zero")
+    assert(agrees(0x1842, 0x7FFFFFFF, 1, 0, Want(2, 0x80000000, 1, false, 0, 1)), "overflow")
+    assert(agrees(0x1842, 0x80000000, 0x80000000, 0, Want(2, 0, 0, true, 1, 1)), "both")
+
+@test("SUBS: C is 'no borrow', and overflow from the negative edge")
+dsp_subs()
+    assert(agrees(0x1A42, 5, 5, 0, Want(2, 0, 0, true, 1, 0)), "equal: no borrow")
+    assert(agrees(0x1A42, 4, 5, 1, Want(2, 0xFFFFFFFF, 1, false, 0, 0)), "borrow")
+    assert(agrees(0x1A42, 0x80000000, 1, 0, Want(2, 0x7FFFFFFF, 0, false, 1, 1)), "overflow")
+
+@test("ADCS and SBCS take the carry in")
+dsp_adcs_sbcs()
+    assert(agrees(0x4148, 0xFFFFFFFF, 0, 1, Want(0, 0, 0, true, 1, 0)), "ADCS carries through")
+    assert(agrees(0x4148, 1, 2, 0, Want(0, 3, 0, false, 0, 0)), "ADCS without carry")
+    assert(agrees(0x4188, 5, 5, 0, Want(0, 0xFFFFFFFF, 1, false, 0, 0)), "SBCS borrows one more")
+    assert(agrees(0x4188, 5, 5, 1, Want(0, 0, 0, true, 1, 0)), "SBCS with carry is SUBS")
+
+@test("shifts by a register: amounts 0, 32 and over 32, and the carry out")
+dsp_shift_reg()
+    assert(agrees(0x4088, 0x80000001, 0, 1, Want(0, 0x80000001, 1, false, 1, 0)), "LSLS by 0 keeps C")
+    assert(agrees(0x4088, 0x80000001, 1, 0, Want(0, 2, 0, false, 1, 0)), "LSLS by 1")
+    assert(agrees(0x4088, 1, 32, 0, Want(0, 0, 0, true, 1, 0)), "LSLS by 32: C is bit 0")
+    assert(agrees(0x4088, 1, 33, 1, Want(0, 0, 0, true, 0, 0)), "LSLS by 33")
+    assert(agrees(0x4088, 1, 0x100, 1, Want(0, 1, 0, false, 1, 0)), "only the bottom byte counts")
+    assert(agrees(0x40C8, 0x80000000, 32, 0, Want(0, 0, 0, true, 1, 0)), "LSRS by 32: C is bit 31")
+    assert(agrees(0x4108, 0x80000000, 40, 0, Want(0, 0xFFFFFFFF, 1, false, 1, 0)), "ASRS past 32")
+    assert(agrees(0x41C8, 0x00000001, 1, 0, Want(0, 0x80000000, 1, false, 1, 0)), "RORS by 1")
+    assert(agrees(0x41C8, 0x80000000, 32, 0, Want(0, 0x80000000, 1, false, 1, 0)), "RORS by 32")
+
+@test("shifts by an immediate: LSL #0 is MOVS, and LSR/ASR #0 mean 32")
+dsp_shift_imm()
+    assert(agrees(0x0008, 0, 0x80000000, 1, Want(0, 0x80000000, 1, false, 1, 0)), "MOVS keeps C")
+    assert(agrees(0x0808, 0, 0x80000000, 0, Want(0, 0, 0, true, 1, 0)), "LSRS #32")
+    assert(agrees(0x1008, 0, 0x80000000, 0, Want(0, 0xFFFFFFFF, 1, false, 1, 0)), "ASRS #32")
+
+@test("byte reversals and sign extension")
+dsp_rev()
+    assert(agrees(0xBA08, 0, 0x11223344, 0, Want(0, 0x44332211, 0, false, 0, 0)), "REV")
+    assert(agrees(0xBA48, 0, 0x11223344, 0, Want(0, 0x22114433, 0, false, 0, 0)), "REV16")
+    assert(agrees(0xBAC8, 0, 0x000080FF, 0, Want(0, 0xFFFFFF80, 0, false, 0, 0)), "REVSH")
+    assert(agrees(0xB248, 0, 0x00000080, 0, Want(0, 0xFFFFFF80, 0, false, 0, 0)), "SXTB")
