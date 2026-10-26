@@ -16,6 +16,7 @@ struct CoreObservation
     registers: [16]u32
     sleeping: bool
     stop: Stop
+    late_us: u64
 
 struct WorkerObservation
     cores: [2]CoreObservation
@@ -45,10 +46,11 @@ private const WORKER_BATCH: u64 = 250000
 // Stable for the session. Manual/deterministic jobs keep their existing path.
 private var worker_individual_pacing = false
 private var worker_interrupt: u32 = 0
+private var worker_epoch_ready = false
 private var worker_pacers: [2]timing.CorePacer
 
 
-private capture_core(c: *Cpu) -> CoreObservation = CoreObservation(c.pc,c.retired,board_time(c,c.retired),c.r,c.sleeping,c.stop)
+private capture_core(c: *Cpu) -> CoreObservation = CoreObservation(c.pc,c.retired,board_time(c,c.retired),c.r,c.sleeping,c.stop,0)
 
 private capture_workers() -> WorkerObservation = WorkerObservation(
     [capture_core(core0()),capture_core(core1())],launched,
@@ -59,7 +61,7 @@ observe_core(k: int) -> CoreObservation
     require k == 0 || k == 1, "core is 0 or 1"
     if !workers_active then return capture_core(if k == 0 then core0() else core1())
     worker_gate.lock_raw()
-    val snapshot = worker_snap.cores[k]
+    val snapshot = observed_workers().cores[k]
     worker_gate.unlock_raw()
     snapshot
 
@@ -73,7 +75,7 @@ observation_time() -> u64
 workers_observe() -> WorkerObservation
     require workers_active, "CPU workers are started"
     worker_gate.lock_raw()
-    val snapshot = worker_snap
+    val snapshot = observed_workers()
     worker_gate.unlock_raw()
     snapshot
 
@@ -91,6 +93,7 @@ start_workers(cpu: *Cpu, parallel: bool = true, hz: u64 = 0) -> Result[unit,stri
     worker_step_pending = false
     worker_hz = hz
     worker_individual_pacing = hz != 0 && parallel
+    worker_epoch_ready = false
     for k in 0..<2
         if hz != 0 && (hz < core_clock_divisors[k] || hz % core_clock_divisors[k] != 0) then
             return Err("worker clock must divide into each configured core clock domain")
@@ -133,6 +136,7 @@ resume_workers()
                 val c = if k == 0 then core0() else core1()
                 val origin = if k == 1 && !launched then local_time(c,now) else core_ticks(c,c.retired)
                 worker_pacers[k] = timing.pacer(worker_hz / core_clock_divisors[k],at,origin)
+            worker_epoch_ready = true
         atomic_store(&worker_interrupt,0,Release)
         worker_paused = false
         worker_changed.notify_all()
@@ -241,9 +245,9 @@ private cpu_worker0(ignored: *Cpu)
         if !stepping && !worker_individual_pacing && target <= now
             worker_changed.wait(&worker_gate)
             continue
-        // Normal paced workers run independently inside a long control window.
-        // The window is an infrequent quiescence point, not a pacing barrier.
-        val horizon = if worker_individual_pacing && !stepping then now + max(1u64,worker_hz / 20) else now + min(WORKER_BATCH,if stepping then 1u64 else target - now)
+        // Each normal worker runs until an explicit control request or stop.
+        // No periodic job barrier lets a slow peer stall a faster CPU.
+        val horizon = if worker_individual_pacing && !stepping then NEVER else now + min(WORKER_BATCH,if stepping then 1u64 else target - now)
         worker_busy = true
         worker_gate.unlock_raw()
         execute_worker_batch(cpu,horizon,stepping)
@@ -373,3 +377,16 @@ private[virt] wake_worker_checkpoints()
     worker_gate.lock_raw()
     worker_changed.notify_all()
     worker_gate.unlock_raw()
+
+/** True for the normal real-time worker session, independent of CPU models. */
+private[virt] worker_independent() -> bool = workers_active && worker_individual_pacing
+
+// Called with worker_gate held. Compute lateness from the last published clock
+// and the common host timestamp, even if a worker is currently stuck in a device.
+private observed_workers() -> WorkerObservation
+    var snapshot = worker_snap
+    if !worker_individual_pacing || !worker_epoch_ready || worker_paused || worker_step_pending then return snapshot
+    val at = host_now_ns() / 1000
+    for k in 0..<(if snapshot.launched then 2 else 1)
+        snapshot.cores[k].late_us = timing.late_us(worker_pacers[k],snapshot.cores[k].time / core_clock_divisors[k],at)
+    snapshot
