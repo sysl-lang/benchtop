@@ -8,6 +8,8 @@ Speaker input connects to `amplifier.out`, rather than directly to an MCU pin.
 Hold keyboard **1** or click/hold SW1 for a 480 Hz triangular PCM tone. Speak
 into the Mac's microphone to drive the five-LED level meter. The firmware reads
 microphone samples and drives the GPIO LEDs; the UI does not calculate the meter.
+The meter uses thresholds spanning roughly -54 to -6 dBFS, leaving headroom above
+background noise. The button caption is also a mouse hold target.
 Microphone input is not played back. Mute affects playback; pause freezes the
 guest and discards stale host audio. No recording is written to disk.
 
@@ -57,3 +59,6 @@ parameter (0..100, default 12), not an electrical amplifier-gain register.
 References:
 - https://www.analog.com/en/products/max98357a.html
 - https://invensense.tdk.com/wp-content/uploads/2015/02/INMP441.pdf
+
+Set `BENCHTOP_AUDIO_TRACE=1` to log the selected backend, PCM peaks, captured
+sample counts, microphone peaks and GPIO state while diagnosing host audio.
