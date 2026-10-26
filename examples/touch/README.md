@@ -48,12 +48,19 @@ input, regardless of how many bands are redrawn.
 Guest tick measurements show unchanged input dropping from about 3.4 million
 ticks to 12 thousand, button release from 4.6 million to 2.2 million, and steady
 slider dragging from about 3.9 million to 1.1 million. These are emulator
-instruction ticks, not hardware cycle timings. A focus change can still dirty a
-larger region because recorded commands are compared by position. The firmware
+instruction ticks, not hardware cycle timings. Matching command prefixes and suffixes remain clean when focus adds an outline.
+The changed middle is still compared by position. The firmware
 exports `touch_profile` with rendering, flush and SPI ticks plus transmitted byte
 and pixel counts. The performance test writes `target/touch-performance.txt`,
 checks idle/drag budgets, and compares eight complete image hashes against the
 preceding full-screen renderer.
+
+The MCU now declares `clock-hz = 150000000`, and the desktop paces guest
+execution at that target. Peripheral timebases inherit it. This is one tick per
+emulated instruction, not a cycle-accurate Cortex-M33 model; no flash wait states
+or bus contention are included. If the host cannot keep up, emulation runs slower
+than the target. Stalls are capped at 50 ms of catch-up work per frame.
+Headless runs and tests pump deterministic guest ticks without wall-time pacing.
  GPIO
 bit-banging and real guest rendering cost execution time. This is not a direct
 host-rendered mockup; a virtual SPI controller and firmware DMA are future
@@ -90,7 +97,10 @@ and `imui` code are hardware-style, but this image is not a physical Pico binary
 `imui` 0.2.0 adds the optional PlutoVG painter and fixes toggles/checkboxes to
 paint their updated state in the activation frame. PlutoVG 0.2.6 makes its memory
 rendering path usable without POSIX and checks caller-owned-surface allocation
-failure. Both are developed in sibling worktrees. Validation runs inside
+failure. `imui` 0.2.1 improves damage matching and conservatively repaints when a changed
+clip affects otherwise identical commands. The button-press rasterization/scan
+cost drops from about 2.66 million to 724 thousand guest ticks. Both libraries
+are developed in sibling worktrees. Validation runs inside
 Benchtop: touch-driven UI behavior, actual display pixels, antialiased text,
 repeated bounded-heap redraws, and flash-resident Thumb-2 execution.
 

@@ -302,6 +302,14 @@ and `OBJCOPY` overrides), and Python 3 for the generated vector corpora.
 
 ## Describing a board
 
+The MCU may declare `clock-hz = 150000000`. The desktop uses this target for
+wall-time execution pacing, and virtual I2C/RTC, PWM and digital-audio timebases
+inherit it. Existing boards that omit it retain their previous defaults. Legacy
+peripheral `clock-hz` values must match an explicitly configured MCU timebase.
+The emulator currently uses one tick per instruction, so a clock setting is an
+instruction-rate approximation, not cycle-exact hardware performance. Host
+capacity can limit the achieved rate; headless execution remains unthrottled.
+
 A description is a HOCON file, and the shortest names a board built into benchtop:
 
 ```hocon
