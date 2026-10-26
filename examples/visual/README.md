@@ -141,7 +141,7 @@ working while the LCD starts.
 | --- | --- |
 | RS | GP3 |
 | E | GP4 |
-| RW (driven low) | GP5 |
+| RW | Tied low (`write-only = true`) |
 | D4–D7 | GP22–GP25 |
 
 The model latches writes on falling E edges and decodes command/data nibbles.
@@ -277,3 +277,18 @@ arguments are consumed without being interpreted as pixels. The firmware include
 cooperative startup waits and sends small pixel batches so the other components
 continue running; a real MCU port should calibrate SPI and startup timing.
 The implementation follows the [Sitronix ST7789V datasheet](https://dl.espressif.com/dl/schematics/LCD_ST7789.pdf).
+
+## Audio and RTC
+
+The workbench now includes the real catalog identities `PS1240P02BT` (TDK passive
+piezo, BZ1) and `DS3231SN` (Analog Devices/Maxim RTC, U2). Hold button **1** to hear
+a tone; the knob controls PWM period. **Mute** affects host playback only. Press
+button **2** to demonstrate setting the RTC to 2026-01-01 12:34:56 through firmware
+I²C transactions. The LCD's second line reads back and displays the RTC time.
+
+RTC instances live only in RAM. They start from the Mac's current local time,
+then advance from their stored state, accepting normal register writes without
+host-clock resynchronization. MCU reset preserves the external RTC; starting a
+new board instance seeds a fresh clock. Use `initial-time = fixed` for a repeatable
+calendar epoch. See [audio and RTC details](../../docs/audio-and-rtc.md) for the
+virtual PWM/I²C maps, catalog identity rules and model boundaries.

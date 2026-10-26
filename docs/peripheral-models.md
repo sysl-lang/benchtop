@@ -24,6 +24,11 @@ PIO also needs the chip's clock domains, interrupts and DMA requests. The RP2350
 PIO connects to GPIO, bus fabric and interrupts and has clock dividers; timer
 registers remain separate peripherals. See the [RP2350 datasheet](https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf).
 
+The workbench now has a minimal static PWM pad override and timestamped audio
+integration. Its PWM and byte-level I²C register adapters are explicitly virtual
+and reusable; the DS3231 is a separate slave model behind I²C device callbacks.
+See [audio and RTC](audio-and-rtc.md) for the implemented boundaries.
+
 These are model boundaries for extending real-chip support, not a claim that PIO,
 a complete pin mux, clock tree or DMA is already emulated. Host Kairos/libuv timers
 serve build/watch/I/O workflows and do not stand in for guest hardware clocks.

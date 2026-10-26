@@ -1,0 +1,143 @@
+module sh.sysl.benchtop.virt
+
+import sh.sysl.benchtop.{Board, part_model, part_text, part_whole, pin_parts}
+import sh.sysl.benchtop.peripheral.pwm as pwm
+import sh.sysl.benchtop.audio as audio
+import sh.sysl.benchtop.v6m.{Cpu, Stop, clock, halt}
+import sysl.buf.{Buf, buf}
+import sysl.threads.SleepLock
+import sysl.math.{min, max}
+
+struct BuzzerBinding
+    name: string
+    pin: int
+    active: bool
+    tone: u64
+    synth: &audio.Synth
+    level: bool
+    driven: bool
+
+var pwm_channel = pwm.pwm()
+var has_pwm = false
+var buzzers: Buf[BuzzerBinding] = buf()
+var sound_time: u64 = 0
+var sound_epoch: u64 = 0
+var sound_lock = SleepLock.new()
+
+private[virt] configure_sound(b: Board) -> Result[unit, string]
+    buzzers = buf()
+    var hz: u64 = 12000000
+    var pin = 5
+    for p in b.chip.peripherals
+        if p.kind != "virt-pwm" then continue
+        for q in p.params do q.value match
+            Whole(n) -> if q.name == "clock-hz" then hz = u64(n)
+            _ -> ()
+        var found = false
+        for route in p.signals
+            if route.name != "out" then continue
+            if route.pins.len() != 1 then return Err("virt-pwm needs exactly one output pin")
+            pin_parts(route.pins.at(0).name) match
+                Some((bank, number)) ->
+                    if bank != "GP" || number < 0 || number >= 32 then return Err("virt-pwm output is GP0..GP31")
+                    pin = number
+                    found = true
+                None -> ()
+        if !found then return Err("virt-pwm needs signals { out = [GPn] }")
+    pwm_channel = pwm.pwm(hz, pin)
+    for p in b.parts
+        if part_model(p) != "buzzer" then continue
+        buzzers.push(BuzzerBinding(p.name, terminal_pin(p, "pin", b.chip.name), part_text(p, "kind", "passive") == "active",
+            u64(part_whole(p, "tone", 4000)), audio.synth(hz, 48000, real(part_whole(p, "gain", 12)) / 100.0), false, false))
+    Ok(())
+
+private[virt] boot_sound()
+    pwm.reset(&pwm_channel)
+    sound_time = 0
+    sound_epoch += 1
+    for i in 0..<buzzers.len()
+        var b = buzzers.at(i)
+        audio.clear(b.synth)
+        b.driven = false
+        b.level = false
+        buzzers.set(i, b)
+
+private waveform(b: BuzzerBinding) -> audio.Wave
+    if has_pwm && pwm_channel.enabled && b.pin == pwm_channel.pin
+        return audio.Wave(true, u64(pwm_channel.period), u64(pwm_channel.high), pwm_channel.origin, false)
+    if b.active
+        val period = pwm_channel.hz / b.tone
+        return audio.Wave(b.driven && b.level, period, period / 2, 0, false)
+    audio.Wave(b.driven, 0, 0, 0, b.level)
+
+private render_sound(time: u64)
+    val now = max(time, sound_time)
+    for b in buzzers do audio.advance(b.synth, now, waveform(b))
+    sound_time = now
+
+/** Called only when a buzzer's own GPIO level/direction changed; display traffic is ignored. */
+private[virt] sound_gpio(levels: u32, driven: u32, changed: u32, time: u64)
+    if buzzers.is_empty() then return
+    var relevant = false
+    for b in buzzers do if (changed & (1u32 << u32(b.pin))) != 0 then relevant = true
+    if !relevant then return
+    sound_lock.lock()
+    defer sound_lock.unlock()
+    render_sound(time)
+    for i in 0..<buzzers.len()
+        var b = buzzers.at(i)
+        val bit = 1u32 << u32(b.pin)
+        b.level = (levels & bit) != 0
+        b.driven = (driven & bit) != 0
+        buzzers.set(i, b)
+
+/** PWM supplies the selected pad independently of the GPIO output latch and OE register. */
+pwm_pad(time: u64) -> (u32, u32)
+    if !has_pwm then return (0, 0)
+    sound_lock.lock()
+    defer sound_lock.unlock()
+    if !pwm_channel.enabled then return (0, 0)
+    val mask = 1u32 << u32(pwm_channel.pin)
+    (mask, if pwm.level(pwm_channel, time) then mask else 0)
+
+private[virt] pwm_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
+    if width != 4 || (offset & 3) != 0
+        halt(cpu, Stop.Fault, address)
+        return 0
+    sound_lock.lock()
+    defer sound_lock.unlock()
+    pwm.read(pwm_channel, offset, max(sound_time, clock(cpu, n))) match
+        Some(value) -> value
+        None ->
+            halt(cpu, Stop.Unmapped, address)
+            0
+
+private[virt] pwm_write(cpu: *Cpu, address: u32, offset: u32, width: u32, value: u32, n: u64)
+    if width != 4 || (offset & 3) != 0
+        halt(cpu, Stop.Fault, address)
+        return
+    sound_lock.lock()
+    defer sound_lock.unlock()
+    val time = max(sound_time, clock(cpu, n))
+    render_sound(time)
+    if !pwm.write(&pwm_channel, offset, value, time) then halt(cpu, Stop.Unmapped, address)
+
+sound_available() -> bool = !buzzers.is_empty()
+sound_clock_hz() -> u64 = pwm_channel.hz
+
+sound_active(name: string) -> bool
+    sound_lock.lock()
+    defer sound_lock.unlock()
+    for b in buzzers do if b.name == name then return waveform(b).enabled && (if b.active then true else (pwm_channel.enabled && pwm_channel.high > 0 && pwm_channel.high < pwm_channel.period))
+    false
+
+take_sound(time: u64) -> Buf[f32]
+    sound_lock.lock()
+    defer sound_lock.unlock()
+    render_sound(time)
+    var mixed: Buf[f32] = buf()
+    for b in buzzers
+        val samples = audio.take(b.synth)
+        while mixed.len() < samples.len() do mixed.push(0.0)
+        for i in 0..<samples.len() do mixed.set(i, max(-1.0f32, min(1.0f32, mixed.at(i) + samples.at(i))))
+    mixed

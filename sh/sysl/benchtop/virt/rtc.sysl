@@ -1,0 +1,77 @@
+module sh.sysl.benchtop.virt
+
+import sh.sysl.benchtop.{Board, part_model, part_whole, part_text}
+import sh.sysl.benchtop.parts.ds3231 as rtc
+import sh.sysl.benchtop.peripheral.i2c as i2c
+import sh.sysl.benchtop.v6m.{Cpu, Stop, clock, halt}
+import sysl.buf.{Buf, buf}
+import sysl.threads.SleepLock
+import sysl.math.max
+
+struct RtcBinding
+    name: string
+    model: &rtc.Rtc
+
+var rtc_bindings: Buf[RtcBinding] = buf()
+var i2c_controller = i2c.controller(buf())
+var rtc_lock = SleepLock.new()
+
+private[virt] configure_rtcs(b: Board) -> Result[unit, string]
+    rtc_bindings = buf()
+    var devices: Buf[i2c.Device] = buf()
+    var hz: u64 = 12000000
+    for p in b.chip.peripherals
+        if p.kind != "virt-i2c" then continue
+        for q in p.params do q.value match
+            Whole(n) -> if q.name == "clock-hz" then hz = u64(n)
+            _ -> ()
+    for p in b.parts
+        if part_model(p) != "ds3231" then continue
+        if !devices.is_empty() then return Err("two DS3231 parts share the fixed I2C address 0x68")
+        val model = rtc.rtc(hz, int(part_whole(p, "initial-year", 2026)), int(part_whole(p, "initial-month", 1)), int(part_whole(p, "initial-day", 1)), int(part_whole(p, "temperature-quarter-c", 100)))
+        if part_text(p,"initial-time","host") == "host" then seed_rtc_from_host(model)?
+        rtc_bindings.push(RtcBinding(p.name, model))
+        devices.push(i2c.Device(0x68, (reading, time) -> rtc.start(model, reading, max(model.time, time)),
+            (byte, time) -> rtc.write(model, byte, max(model.time, time)), time -> rtc.read(model, max(model.time, time))))
+    i2c_controller = i2c.controller(devices)
+    Ok(())
+
+private[virt] boot_i2c()
+    i2c.reset(&i2c_controller)
+    for b in rtc_bindings do rtc.rebase(b.model, 0)
+
+private[virt] signal_rtcs(cpu: *Cpu)
+    if rtc_bindings.is_empty() then return
+    rtc_lock.lock()
+    defer rtc_lock.unlock()
+    for b in rtc_bindings do rtc.advance(b.model, max(b.model.time, clock(cpu, cpu.retired)))
+
+private[virt] i2c_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
+    if width != 4 || (offset & 3) != 0
+        halt(cpu, Stop.Fault, address)
+        return 0
+    rtc_lock.lock()
+    defer rtc_lock.unlock()
+    i2c.read(i2c_controller, offset) match
+        Some(value) -> value
+        None ->
+            halt(cpu, Stop.Unmapped, address)
+            0
+
+private[virt] i2c_write(cpu: *Cpu, address: u32, offset: u32, width: u32, value: u32, n: u64)
+    if width != 4 || (offset & 3) != 0
+        halt(cpu, Stop.Fault, address)
+        return
+    rtc_lock.lock()
+    defer rtc_lock.unlock()
+    if !i2c.write(&i2c_controller, offset, value, clock(cpu, n)) then halt(cpu, Stop.Unmapped, address)
+
+rtc_snapshot(name: string) -> Option[[7]u8]
+    rtc_lock.lock()
+    defer rtc_lock.unlock()
+    for b in rtc_bindings
+        if b.name != name then continue
+        var result: [7]u8 = [0; 7]
+        for i in 0..<7 do result[i] = b.model.registers[i]
+        return Some(result)
+    None

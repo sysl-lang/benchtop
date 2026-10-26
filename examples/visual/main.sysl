@@ -30,6 +30,56 @@ struct Adc
     status: volatile u32
     result: volatile u32
 
+struct Pwm
+    ctrl: volatile u32
+    period: volatile u32
+    high: volatile u32
+
+// This is the virtual MCU's I2C adapter. Device transactions use the ordinary DS3231 protocol.
+struct I2c
+    address: volatile u32
+    data: volatile u32
+    command: volatile u32
+    status: volatile u32
+
+rtc_begin(bus: *I2c, pointer: u32) -> bool
+    bus.address = 0x68
+    bus.command = 1
+    if (bus.status & 2) != 0 then return false
+    bus.data = pointer
+    bus.command = 4
+    (bus.status & 2) == 0
+
+rtc_clock(bus: *I2c) -> Option[[3]u8]
+    if !rtc_begin(bus, 0)
+        bus.command = 8
+        return None
+    bus.command = 3 // Repeated START with read address: the RTC snapshots time here.
+    var time: [3]u8 = [0; 3]
+    for i in 0..<3
+        bus.command = 2
+        if (bus.status & 2) != 0
+            bus.command = 8
+            return None
+        time[i] = u8(bus.data)
+    bus.command = 8
+    Some(time)
+
+// A demonstration setting, sent by firmware just as a hardware driver would send it.
+rtc_set_example(bus: *I2c)
+    if !rtc_begin(bus, 0)
+        bus.command = 8
+        return
+    val date: [7]u8 = [0x56,0x34,0x12,4,1,1,0x26] // 2026-01-01 12:34:56, weekday numbering chosen by firmware.
+    for byte in date
+        bus.data = u32(byte)
+        bus.command = 4
+    bus.command = 8
+    if rtc_begin(bus, 15)
+        bus.data = 8 // Clear OSF/alarm flags; retain the 32kHz enable setting.
+        bus.command = 4
+    bus.command = 8
+
 // Conventional a,b,c,d,e,f,g segment bits, compatible with a common-cathode display.
 segments(digit: u32) -> u32 = digit match
     0 -> 0x3F
@@ -44,13 +94,15 @@ segments(digit: u32) -> u32 = digit match
     9 -> 0x6F
     _ -> 0
 
-// HD44780 write bus: RS=GP3, E=GP4, RW=GP5 (kept low), D4..D7=GP22..GP25.
-const LCD_MASK: u32 = (7 << 3) | (15 << 22)
+// HD44780 write bus: RS=GP3, E=GP4, RW tied low, D4..D7=GP22..GP25.
+const LCD_MASK: u32 = (3 << 3) | (15 << 22)
 
 struct LcdTask
     stage: u32
     wait: u32
     character: usize
+    clock: [12]u8
+    last_time: u32
 
 lcd_nibble(gpio: *Gpio, value: u32, data: bool)
     val pins = (gpio.out & ~LCD_MASK) | ((value & 15) << 22) | (if data then 1 << 3 else 0)
@@ -67,8 +119,7 @@ lcd_byte(gpio: *Gpio, value: u32, data: bool)
 
 // Cooperative delays leave ADC sampling, digit scanning and buttons running.
 // On a hardware port, calibrate these loop delays for that MCU's clock or use its timer.
-lcd_tick(gpio: *Gpio, task: *LcdTask)
-    if task.stage >= 11 then return
+lcd_tick(gpio: *Gpio, task: *LcdTask, bus: *I2c)
     if task.wait > 0
         task.wait -= 1
         return
@@ -94,6 +145,32 @@ lcd_tick(gpio: *Gpio, task: *LcdTask)
             lcd_byte(gpio, u32(message[task.character]), true)
             task.character += 1
             if task.character < message.len then task.stage = 10
+        11 ->
+            task.stage = 11
+            task.wait = 1000
+            val time = rtc_clock(bus) match
+                Some(value) -> value
+                None -> return
+            val packed = u32(time[0]) | (u32(time[1]) << 8) | (u32(time[2]) << 16)
+            if packed == task.last_time then return
+            task.last_time = packed
+            var hour = u32(time[2] & 63)
+            if (time[2] & 64) != 0
+                var n = u32((time[2] & 16) >> 4) * 10 + u32(time[2] & 15)
+                if n == 12 then n = 0
+                if (time[2] & 32) != 0 then n += 12
+                hour = if n >= 20 then 0x20 + n - 20 elif n >= 10 then 0x10 + n - 10 else n
+            task.clock = [82,84,67,32,u8(48 + (hour >> 4)),u8(48 + (hour & 15)),58,
+                u8(48 + (u32(time[1]) >> 4)),u8(48 + (u32(time[1]) & 15)),58,
+                u8(48 + (u32(time[0]) >> 4)),u8(48 + (u32(time[0]) & 15))]
+            task.character = 0
+            task.wait = 0
+            task.stage = 12
+        12 -> lcd_byte(gpio, 0xC0, false)
+        13 ->
+            lcd_byte(gpio, u32(task.clock[task.character]), true)
+            task.character += 1
+            task.stage = if task.character == task.clock.len then 11 else 13
         _ -> ()
 
 // SSD1306 four-wire SPI: SCK=GP6, MOSI=GP7, CS=GP27, DC=GP28, RESET=GP29.
@@ -257,11 +334,16 @@ tft_tick(gpio: *Gpio, task: *TftTask, reading: u32)
 start() -> never
     val gpio: *Gpio = ptr_cast(usize(0x50000000))
     val adc: *Adc = ptr_cast(usize(0x50000100))
+    val pwm: *Pwm = ptr_cast(usize(0x50000200))
+    val i2c: *I2c = ptr_cast(usize(0x50000300))
+    var set_time_held = false
+    var sound_period: u32 = 0
+    var sound_enabled = false
     // Cathode commons are active low. Set them inactive before enabling output drivers.
     val commons_off: u32 = 0xF << 18
     gpio.out = commons_off | (1u32 << 27) | (1u32 << 30)
     gpio.oe = 7 | (0xFFF << 10) | LCD_MASK | OLED_MASK | TFT_MASK
-    var lcd_task = LcdTask(0, 2000, 0)
+    var lcd_task = LcdTask(0, 2000, 0, [32; 12], 0xFFFFFFFF)
     var oled_task = OledTask(0, 16, 0, 0)
     var tft_task = TftTask(0, 32, 0, 0, 0, 0, false)
     var count: u32 = 0
@@ -282,6 +364,18 @@ start() -> never
         adc.ctrl = 3 // Enable and start. Input is latched here by the peripheral.
         while (adc.status & 1) != 0 do ()
         val reading = adc.result
+        val period = 3000 + ((4095 - reading) << 2)
+        if period != sound_period
+            pwm.period = period
+            pwm.high = period >> 1
+            sound_period = period
+        val enabled = (gpio.input & (1 << 8)) == 0
+        if enabled != sound_enabled
+            pwm.ctrl = if enabled then 1 else 0
+            sound_enabled = enabled
+        val set_time = (gpio.input & (1 << 9)) == 0
+        if set_time && !set_time_held then rtc_set_example(i2c)
+        set_time_held = set_time
         if reading != previous
             var remaining = reading
             thousands = 0
@@ -300,7 +394,7 @@ start() -> never
             previous = reading
         val numeral = if scan == 0 then thousands elif scan == 1 then hundreds elif scan == 2 then tens else units
         val pattern = segments(numeral) << 10
-        lcd_tick(gpio, &lcd_task)
+        lcd_tick(gpio, &lcd_task, i2c)
         oled_tick(gpio, &oled_task, reading)
         tft_tick(gpio, &tft_task, reading)
         val display_lines = gpio.out & (LCD_MASK | OLED_MASK | TFT_MASK)

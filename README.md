@@ -39,7 +39,13 @@ The GPIO-connected **DS2** character LCD shows **“Hello from Benchtop!”** af
 firmware initialization. The **DS3** 128×64 SSD1306 OLED shows a graphical knob
 gauge, sent by the sysl firmware over GPIO SPI. The **DS4** 240×240 ST7789 color TFT
 shows the pixel wordmark, color bars and a second knob gauge on that same SPI bus.
+Hold **1** to hear the **BZ1** piezo; RV1 controls its pitch. The toolbar's
+**Mute / Unmute** controls host playback. On macOS SDL uses Core Audio. The board
+also includes **U2**, a DS3231SN RTC whose time firmware reads over I²C and writes
+to LCD line two. It starts from the Mac’s local time. Press **2** to demonstrate
+setting it to **12:34:56** through firmware; it then continues from that value.
 The demo produces no console output.
+See [audio, RTC and real-part catalog entries](docs/audio-and-rtc.md).
 Click **RV1**’s small plot icon, right-click RV1, or use **RV1 · ADC result**
 in the toolbar to open a movable,
 resizable instrument window. **Hold / Resume** freezes only the instrument;
