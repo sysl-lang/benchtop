@@ -1,0 +1,165 @@
+module sh.sysl.benchtop.peripheral.spi
+
+/** PL022 master in Motorola SPI modes 0..3, 4..16 bits, with eight-entry
+ * transmit/receive FIFOs. Time is in input-clock ticks. Each callback observes
+ * an actual SCK/MOSI transition and returns MISO. No framebuffer shortcuts.
+ */
+struct Controller
+    cr0: u32
+    cr1: u32
+    cpsr: u32
+    mask: u32
+    dma: u32
+    tx: [8]u16
+    tx_head: usize
+    tx_count: usize
+    rx: [8]u16
+    rx_head: usize
+    rx_count: usize
+    shifting: bool
+    word: u16
+    received: u16
+    edges: u32
+    next: u64
+    time: u64
+    timeout: u64
+    overrun: bool
+    sck: bool
+    mosi: bool
+
+controller() -> Controller = Controller(0,0,0,0,0,[0;8],0,0,[0;8],0,0,false,0,0,0,0,0,0,false,false,false)
+
+reset(c: *Controller) = *c = controller()
+
+enabled(c: Controller) -> bool = (c.cr1 & 2) != 0
+private bits(c: Controller) -> u32 = (c.cr0 & 15) + 1
+private half(c: Controller) -> u64 = u64(c.cpsr) * u64(((c.cr0 >> 8) & 255) + 1) / 2
+private polarity(c: Controller) -> bool = (c.cr0 & 64) != 0
+private phase(c: Controller) -> bool = (c.cr0 & 128) != 0
+
+private start(c: *Controller, time: u64)
+    if c.shifting || !enabled(*c) || c.tx_count == 0 then return
+    c.word = c.tx[c.tx_head]
+    c.tx_head = (c.tx_head + 1) % 8
+    c.tx_count -= 1
+    c.received = 0
+    c.edges = 0
+    c.shifting = true
+    c.sck = polarity(*c)
+    if !phase(*c) then c.mosi = (u32(c.word) & (1u32 << (bits(*c) - 1))) != 0
+    c.next = time + half(*c)
+
+/** Internal edges are advanced lazily at MMIO/pin accesses or word completion.
+ * A delayed call emits the same timestamped edges as many small calls.
+ */
+advance(c: *Controller, time: u64, pins: &Fn(bool,bool,u64) -> bool)
+    if time < c.time then return
+    while c.shifting && c.next <= time
+        val at = c.next
+        val leading = (c.edges & 1) == 0
+        val bit = c.edges / 2
+        c.sck = if leading then !polarity(*c) else polarity(*c)
+        if phase(*c) && leading
+            c.mosi = (u32(c.word) & (1u32 << (bits(*c) - 1 - bit))) != 0
+        val input = (pins)(c.sck, c.mosi, at)
+        if leading != phase(*c)
+            c.received = (c.received << 1) | (if (c.cr1 & 1) != 0 then (if c.mosi then 1u16 else 0u16) else if input then 1u16 else 0u16)
+        c.edges += 1
+        c.next = at + half(*c)
+        if c.edges == 2 * bits(*c)
+            if c.rx_count == 8 then c.overrun = true
+            else
+                c.rx[(c.rx_head + c.rx_count) % 8] = c.received
+                c.rx_count += 1
+            c.timeout = at + 64 * half(*c)
+            c.shifting = false
+            start(c, at)
+            if c.shifting then (pins)(c.sck, c.mosi, at)
+        elif !phase(*c) && !leading
+            c.mosi = (u32(c.word) & (1u32 << (bits(*c) - 1 - c.edges / 2))) != 0
+            (pins)(c.sck, c.mosi, at)
+    c.time = time
+
+status(c: Controller) -> u32 =
+    (if c.tx_count == 0 then 1u32 else 0u32) |
+    (if c.tx_count < 8 then 2u32 else 0u32) |
+    (if c.rx_count > 0 then 4u32 else 0u32) |
+    (if c.rx_count == 8 then 8u32 else 0u32) |
+    (if c.shifting || c.tx_count != 0 then 16u32 else 0u32)
+
+raw_irq(c: Controller) -> u32 =
+    (if c.overrun then 1u32 else 0u32) |
+    (if c.rx_count > 0 && c.timeout <= c.time then 2u32 else 0u32) |
+    (if c.rx_count >= 4 then 4u32 else 0u32) |
+    (if c.tx_count <= 4 then 8u32 else 0u32)
+
+irq(c: Controller) -> bool = (raw_irq(c) & c.mask) != 0
+
+/** The next externally visible FIFO/interrupt change, not every internal edge. */
+due(c: Controller) -> Option[u64]
+    val word = if c.shifting then c.next + u64(2 * bits(c) - c.edges - 1) * half(c) else 0xFFFFFFFFFFFFFFFFu64
+    val timeout = if c.rx_count > 0 && (c.mask & 2) != 0 && c.timeout > c.time then c.timeout else 0xFFFFFFFFFFFFFFFFu64
+    val next = if word < timeout then word else timeout
+    if next == 0xFFFFFFFFFFFFFFFFu64 then None else Some(next)
+
+read(c: *Controller, offset: u32) -> Option[u32] = offset match
+    0 -> Some(c.cr0)
+    4 -> Some(c.cr1)
+    8 ->
+        var value: u32 = 0
+        if c.rx_count > 0
+            value = u32(c.rx[c.rx_head])
+            c.rx_head = (c.rx_head + 1) % 8
+            c.rx_count -= 1
+            c.timeout = c.time + 64 * half(*c)
+        Some(value)
+    12 -> Some(status(*c))
+    16 -> Some(c.cpsr)
+    20 -> Some(c.mask)
+    24 -> Some(raw_irq(*c))
+    28 -> Some(raw_irq(*c) & c.mask)
+    32 -> Some(0)
+    36 -> Some(c.dma)
+    0xFE0 -> Some(0x22)
+    0xFE4 -> Some(0x10)
+    0xFE8 -> Some(0x04)
+    0xFEC -> Some(0)
+    0xFF0 -> Some(0x0D)
+    0xFF4 -> Some(0xF0)
+    0xFF8 -> Some(0x05)
+    0xFFC -> Some(0xB1)
+    _ -> None
+
+/** Advance before accessing registers. Unsupported frame formats/slave mode are
+ * refused; filling a full TX FIFO drops the write, as hardware does.
+ */
+write(c: *Controller, offset: u32, value: u32) -> bool
+    offset match
+        0 ->
+            if enabled(*c) || (value & ~65535u32) != 0 then return false
+            c.cr0 = value
+            c.sck = polarity(*c)
+        4 ->
+            if (value & ~11u32) != 0 then return false
+            if (value & 2) != 0 && (bits(*c) < 4 || (c.cr0 & 48) != 0 || c.cpsr < 2 || c.cpsr > 254 || (c.cpsr & 1) != 0) then return false
+            c.cr1 = value
+            if !enabled(*c)
+                c.shifting = false
+                c.sck = polarity(*c)
+            else start(c, c.time)
+        8 ->
+            if c.tx_count < 8
+                c.tx[(c.tx_head + c.tx_count) % 8] = u16(value & 65535)
+                c.tx_count += 1
+                start(c, c.time)
+        12 | 24 | 28 -> ()
+        16 ->
+            if enabled(*c) || value < 2 || value > 254 || (value & 1) != 0 then return false
+            c.cpsr = value
+        20 -> c.mask = value & 15
+        32 ->
+            if (value & 1) != 0 then c.overrun = false
+            if (value & 2) != 0 then c.timeout = c.time + 64 * half(*c)
+        36 -> c.dma = value & 3
+        _ -> return false
+    true

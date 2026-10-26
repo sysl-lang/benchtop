@@ -1,0 +1,104 @@
+module sh.sysl.benchtop.peripheral.spi
+@tests
+
+import sysl.buf.{Buf,buf}
+
+private setup(mode: u32 = 0, width: u32 = 8) -> Controller
+    var c = controller()
+    assert(write(&c,0,(width - 1) | (if (mode & 2) != 0 then 64u32 else 0u32) | (if (mode & 1) != 0 then 128u32 else 0u32)))
+    assert(write(&c,16,4))
+    assert(write(&c,4,2))
+    c
+
+private val low: &Fn(bool,bool,u64) -> bool = (sck,mosi,time) -> false
+private val wire_loop: &Fn(bool,bool,u64) -> bool = (sck,mosi,time) -> mosi
+
+@test("PL022 SPI: all modes and frame widths shift MSB first and complete at the configured clock")
+clocked_words()
+    for mode in 0u32..<4
+        for width in 4u32..16
+            for value in [0u32,65535u32,0xA55Au32,1u32]
+                var c = setup(mode,width)
+                assert(write(&c,8,value))
+                assert((status(c) & 16) != 0)
+                val finish = u64(width) * 4
+                assert(due(c) == Some(finish))
+                advance(&c,finish - 1,wire_loop)
+                assert(c.rx_count == 0 && c.shifting)
+                advance(&c,finish,wire_loop)
+                assert(!c.shifting && c.sck == ((mode & 2) != 0))
+                assert(read(&c,8) == Some(value & ((1u32 << width) - 1)))
+                assert(status(c) == 3)
+
+@test("PL022 SPI: FIFO capacity, full writes, receive overrun, timeout and IRQ acknowledgement")
+fifos_and_interrupts()
+    var c = setup()
+    for i in 0u32..<10 do assert(write(&c,8,i))
+    assert(c.tx_count == 8 && (status(c) & 2) == 0)
+    write(&c,20,15)
+    assert((read(&c,28).unwrap() & 8) == 0)
+    advance(&c,9 * 32,wire_loop)
+    assert(!c.shifting && c.rx_count == 8 && c.overrun)
+    assert((read(&c,24).unwrap() & 13) == 13)
+    for i in 0u32..<8 do assert(read(&c,8) == Some(i))
+    assert(c.rx_count == 0)
+    write(&c,32,1)
+    assert(!c.overrun)
+    write(&c,8,123)
+    advance(&c,10 * 32,wire_loop)
+    assert((raw_irq(c) & 2) == 0)
+    advance(&c,10 * 32 + 127,wire_loop)
+    assert((raw_irq(c) & 2) == 0)
+    advance(&c,10 * 32 + 128,wire_loop)
+    assert((raw_irq(c) & 2) != 0 && irq(c))
+    write(&c,32,2)
+    assert((raw_irq(c) & 2) == 0)
+
+struct Trace
+    points: Buf[(bool,bool,u64)]
+
+@test("PL022 SPI: time chunking preserves every timestamped wire edge and FIFO result")
+chunking()
+    var a = setup()
+    var b = setup()
+    for value in [0x81u32,0x5Au32,0u32]
+        write(&a,8,value)
+        write(&b,8,value)
+    val one: &Trace = Trace(buf())
+    val many: &Trace = Trace(buf())
+    val p: &Fn(bool,bool,u64) -> bool = (s,m,t) ->
+        one.points.push((s,m,t))
+        m
+    val q: &Fn(bool,bool,u64) -> bool = (s,m,t) ->
+        many.points.push((s,m,t))
+        m
+    advance(&a,96,p)
+    for t in 0u64..96 do advance(&b,t,q)
+    assert(one.points.view() == many.points.view())
+    for i in 0..<3 do assert(read(&a,8) == read(&b,8))
+    assert(status(a) == status(b))
+
+@test("PL022 SPI: reset, loopback, disable, prescaler bounds and unsupported modes are explicit")
+configuration()
+    var c = controller()
+    assert(status(c) == 3 && !write(&c,4,2))
+    for divisor in [0u32,1u32,3u32,255u32,256u32] do assert(!write(&c,16,divisor))
+    for divisor in [2u32,4u32,254u32] do assert(write(&c,16,divisor))
+    write(&c,0,7 | 0xFF00)
+    assert(write(&c,4,3))
+    assert(!write(&c,0,7) && !write(&c,16,2) && !write(&c,4,6))
+    write(&c,8,0xA5)
+    assert(due(c) == Some(8u64 * 254 * 256))
+    advance(&c,8u64 * 254 * 256,low)
+    assert(read(&c,8) == Some(0xA5u32), "internal loopback ignores external MISO")
+    write(&c,8,42)
+    write(&c,4,0)
+    assert(!c.shifting && !enabled(c))
+    reset(&c)
+    assert(c.cr0 == 0 && c.tx_count == 0 && c.rx_count == 0 && !c.overrun)
+    assert(read(&c,0xFE0) == Some(0x22u32) && read(&c,0xFFC) == Some(0xB1u32))
+    assert(read(&c,0x40).is_none() && !write(&c,0x40,0))
+    for format in [16u32,32u32]
+        write(&c,0,7 | format)
+        write(&c,16,2)
+        assert(!write(&c,4,2))

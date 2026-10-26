@@ -1,0 +1,113 @@
+module sh.sysl.benchtop.virt
+
+import sh.sysl.benchtop.{Board, Target}
+import sh.sysl.benchtop.peripheral.spi as spi
+import sh.sysl.benchtop.v6m.{Cpu, Stop, IRQ0, NEVER, clock, halt, raise, could_wake, lower_limit}
+import sysl.sync.*
+
+var serial = spi.controller()
+var serial_present = false
+var serial_irq: int = -1
+var serial_sck: int = -1
+var serial_tx: int = -1
+var serial_rx: int = -1
+var serial_mask: u32 = 0
+var serial_output: u32 = 0
+
+/** Select a board-routed signal, or the sole permitted pin in a simple MCU. */
+private spi_pin(b: Board, name: string, signal: string) -> int
+    for bus in b.buses
+        if bus.name != name then continue
+        for route in bus.signals
+            if route.name == signal then return connection_pin(Target.Pin(route.pin), b.chip.name)
+    for p in b.chip.peripherals
+        if p.name != name then continue
+        for route in p.signals
+            if route.name == signal && route.pins.len() == 1
+                return connection_pin(Target.Pin(route.pins.at(0).name), b.chip.name)
+    -1
+
+private[virt] configure_spi(b: Board) -> Result[unit,string]
+    serial_present = false
+    serial_irq = -1
+    for p in b.chip.peripherals
+        if p.kind != "pl022" then continue
+        if serial_present then return Err("one hardware SPI controller is currently supported")
+        serial_present = true
+        serial_sck = spi_pin(b, p.name, "sck")
+        serial_tx = spi_pin(b, p.name, "tx")
+        serial_rx = spi_pin(b, p.name, "rx")
+        if serial_sck < 0 || serial_tx < 0 || serial_sck == serial_tx
+            return Err("pl022 needs distinct routed sck and tx GPIOs")
+        if !p.irqs.is_empty() then serial_irq = int(p.irqs.at(0).n)
+    boot_spi()
+    Ok(())
+
+private[virt] boot_spi()
+    spi.reset(&serial)
+    atomic_store(&serial_mask,0,Relaxed)
+    atomic_store(&serial_output,0,Relaxed)
+
+private[virt] spi_pad() -> (u32,u32) = (atomic_load(&serial_mask,Relaxed), atomic_load(&serial_output,Relaxed))
+
+private spi_drive(sck: bool, mosi: bool, time: u64) -> bool
+    val mask = if spi.enabled(serial) then (1u32 << u32(serial_sck)) | (1u32 << u32(serial_tx)) else 0u32
+    val output = (if sck then 1u32 << u32(serial_sck) else 0u32) | (if mosi then 1u32 << u32(serial_tx) else 0u32)
+    atomic_store(&serial_mask,mask,Relaxed)
+    atomic_store(&serial_output,output & mask,Relaxed)
+    observe_displays(panel_levels_at(time), panel_drive_mask_at(time), time)
+    serial_rx >= 0 && (atomic_load(&panel_in,Relaxed) & (1u32 << u32(serial_rx))) != 0
+
+val serial_pins: &Fn(bool,bool,u64) -> bool = (sck,mosi,time) -> spi_drive(sck,mosi,time)
+
+/** Caller owns panel_lock, preserving ordering with guest CS/DC/OE changes. */
+private[virt] bring_spi(time: u64)
+    if serial_present then spi.advance(&serial,time,serial_pins)
+
+private[virt] spi_due() -> u64
+    if !serial_present then return NEVER
+    panel_lock.lock()
+    defer panel_lock.unlock()
+    spi.due(serial).unwrap_or(NEVER)
+
+private[virt] spi_wake(cpu: *Cpu) -> u64
+    if !serial_present || serial_irq < 0 || !could_wake(cpu,IRQ0 + u32(serial_irq)) then return NEVER
+    panel_lock.lock()
+    defer panel_lock.unlock()
+    if serial.mask != 0 then spi.due(serial).unwrap_or(NEVER) else NEVER
+
+private[virt] signal_spi(cpu: *Cpu)
+    if !serial_present then return
+    panel_lock.lock()
+    defer panel_lock.unlock()
+    bring_spi(clock(cpu,cpu.retired))
+    if serial_irq >= 0 && spi.irq(serial) then raise(cpu,u32(serial_irq))
+
+private[virt] spi_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
+    if (width != 2 && width != 4) || (offset & (width - 1)) != 0 || (offset & 3) != 0
+        halt(cpu,Stop.Fault,address)
+        return 0
+    panel_lock.lock()
+    defer panel_lock.unlock()
+    bring_spi(clock(cpu,n))
+    spi.read(&serial,offset) match
+        Some(value) -> value
+        None ->
+            halt(cpu,Stop.Unmapped,address)
+            0
+
+private[virt] spi_write(cpu: *Cpu, address: u32, offset: u32, width: u32, value: u32, n: u64)
+    if (width != 2 && width != 4) || (offset & (width - 1)) != 0 || (offset & 3) != 0
+        halt(cpu,Stop.Fault,address)
+        return
+    panel_lock.lock()
+    defer panel_lock.unlock()
+    val time = clock(cpu,n)
+    bring_spi(time)
+    if !spi.write(&serial,offset,value)
+        halt(cpu,Stop.Fault,address)
+        return
+    spi_drive(serial.sck,serial.mosi,time)
+    spi.due(serial) match
+        Some(due) -> lower_limit(cpu,due - cpu.slept)
+        None -> ()
