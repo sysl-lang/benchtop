@@ -1,0 +1,107 @@
+module sh.sysl.benchtop.parts.gt911
+
+import sysl.math.{min, max}
+
+struct Contact
+    down: bool
+    x: int
+    y: int
+
+/** GT911 polling profile: big-endian register addresses, little-endian coordinates,
+ * ready/ack report buffer, product ID and checksummed configuration memory.
+ */
+struct Touch
+    width: int
+    height: int
+    pointer: u16
+    address_bytes: int
+    config: [186]u8
+    reports: [8]Contact
+    first: int
+    count: int
+    physical: Contact
+    command: u8
+
+touch(width: int = 240, height: int = 240) -> &Touch
+    require width > 0 && width <= 4096 && height > 0 && height <= 4096, "valid touch dimensions"
+    var config: [186]u8 = [0;186]
+    config[0] = 0x41
+    config[1] = u8(width)
+    config[2] = u8(width >> 8)
+    config[3] = u8(height)
+    config[4] = u8(height >> 8)
+    config[5] = 1 // The first model supports one pointer/contact.
+    var sum: u32 = 0
+    for i in 0..<184 do sum += u32(config[i])
+    config[184] = u8(0u32 - sum)
+    Touch(width, height, 0, 0, config, [Contact(false, 0, 0);8], 0, 0, Contact(false, 0, 0), 0)
+
+/** Preserve press/release transitions while coalescing pending drag positions.
+ * Reports stay stable until the host clears 0x814e. The bounded queue prevents
+ * quick desktop clicks from disappearing during an SPI redraw.
+ */
+point(t: &Touch, x: int, y: int, down: bool)
+    val next = Contact(down, max(0, min(t.width - 1, x)), max(0, min(t.height - 1, y)))
+    if next.down == t.physical.down && (!down || (next.x == t.physical.x && next.y == t.physical.y)) then return
+    t.physical = next
+    if t.count > 1
+        val last = (t.first + t.count - 1) % 8
+        if t.reports[last].down == down
+            t.reports[last] = next
+            return
+    if t.count == 8
+        t.first = (t.first + 1) % 8
+        t.count -= 1
+    t.reports[(t.first + t.count) % 8] = next
+    t.count += 1
+
+start(t: &Touch, reading: bool)
+    if !reading then t.address_bytes = 0
+
+write(t: &Touch, byte: u8) -> bool
+    if t.address_bytes < 2
+        t.pointer = if t.address_bytes == 0 then u16(byte) << 8 else t.pointer | u16(byte)
+        t.address_bytes += 1
+        return true
+    val address = t.pointer
+    t.pointer += 1
+    if address == 0x814E && byte == 0
+        if t.count > 0
+            t.first = (t.first + 1) % 8
+            t.count -= 1
+    elif address == 0x8040 then t.command = byte
+    elif address >= 0x8047 && address <= 0x8100
+        t.config[int(address - 0x8047)] = byte
+        if address == 0x8100 && byte == 1
+            var sum: u32 = 0
+            for i in 0..<185 do sum += u32(t.config[i])
+            val w = int(t.config[1]) | (int(t.config[2]) << 8)
+            val h = int(t.config[3]) | (int(t.config[4]) << 8)
+            if (sum & 255) == 0 && w > 0 && w <= 4096 && h > 0 && h <= 4096
+                t.width = w
+                t.height = h
+                t.config[185] = 0
+    true
+
+read(t: &Touch) -> u8
+    val address = t.pointer
+    t.pointer += 1
+    if address >= 0x8047 && address <= 0x8100 then return t.config[int(address - 0x8047)]
+    if address >= 0x8140 && address <= 0x8143
+        val id: [4]u8 = [u8('9'), u8('1'), u8('1'), 0]
+        return id[int(address - 0x8140)]
+    if address == 0x8144 then return 0x60
+    if address == 0x8145 then return 0x10
+    if address == 0x8040 then return t.command
+    if t.count == 0 || t.command == 5 then return 0
+    val report = t.reports[t.first]
+    if address == 0x814E then return if report.down then 0x81 else 0x80
+    if !report.down then return 0
+    address match
+        0x814F -> 0 // Track ID.
+        0x8150 -> u8(report.x)
+        0x8151 -> u8(report.x >> 8)
+        0x8152 -> u8(report.y)
+        0x8153 -> u8(report.y >> 8)
+        0x8154 -> 8 // Contact size, low byte.
+        _ -> 0

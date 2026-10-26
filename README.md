@@ -52,6 +52,14 @@ RAM at `0x20000000` and sysl startup that copies `.data` and clears `.bss`.
 The workbench describes an external W25Q32JV part; the matrix uses on-chip flash.
 See [flash configuration and current hardware limits](docs/flash.md).
 
+The [touchscreen example](examples/touch/README.md) runs `imui` inside flash-linked
+sysl firmware, with an ST7789 display and a GT911 I²C touch controller. Click its
+counter button, toggle a GPIO LED, and drag the brightness slider:
+
+```sh
+./benchtop run --window --board boards/touch.hocon examples/touch/demo.elf
+```
+
 A separate [digital audio demo](examples/audio/README.md) adds a MAX98357A-style
 PCM amplifier/speaker and an INMP441 MEMS microphone backed by the Mac's input.
 Hold **1** to play a tone; the firmware displays microphone level on GPIO LEDs:

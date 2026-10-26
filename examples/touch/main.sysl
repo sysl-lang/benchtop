@@ -1,0 +1,175 @@
+import sysl.raw.ptr_cast
+import sh.sysl.imui.*
+
+extern __stack_top: u8
+
+// Linker-provided load and runtime addresses; startup runs before using any globals.
+extern __data_start: u8
+extern __data_end: u8
+extern __data_load: u8
+extern __bss_start: u8
+extern __bss_end: u8
+
+struct StartupByte
+    value: volatile u8
+
+initialize_memory()
+    val source: *StartupByte = ptr_cast(usize(&__data_load))
+    val data: *StartupByte = ptr_cast(usize(&__data_start))
+    val zero: *StartupByte = ptr_cast(usize(&__bss_start))
+    for i in 0..<(usize(&__data_end) - usize(&__data_start)) do data[i].value = source[i].value
+    for i in 0..<(usize(&__bss_end) - usize(&__bss_start)) do zero[i].value = 0
+
+
+struct Vectors
+    stack: *u8
+    reset: *extern() -> never
+    reserved: [46]u32
+
+@export("vectors")
+@section(".rodata.vectors")
+val vectors: Vectors = Vectors(&__stack_top, &start, [0; 46])
+
+struct Gpio
+    out: volatile u32
+    input: volatile u32
+    oe: volatile u32
+
+struct I2c
+    address: volatile u32
+    data: volatile u32
+    command: volatile u32
+    status: volatile u32
+
+struct AppState
+    count: int
+    enabled: bool
+    level: int
+
+@export("touch_app")
+var app = AppState(0, true, 50)
+var pixels: [57600]u16
+var previous: [57600]u16
+
+// Ordinary mode-0 SPI: SCK GP0, MOSI GP1, CS GP2, DC GP3, RESET GP4.
+spi(gpio: *Gpio, byte: u32, data: bool)
+    val base = (gpio.out & 32) | 16 | (if data then 8 else 0)
+    gpio.out = base
+    for bit in 0..<8
+        val value = base | (if (byte & (128u32 >> u32(bit))) != 0 then 2 else 0)
+        gpio.out = value
+        gpio.out = value | 1
+        gpio.out = value
+    gpio.out = base | 4
+
+window(gpio: *Gpio, x: int, y: int, last: int)
+    spi(gpio, 0x2A, false)
+    spi(gpio, 0, true)
+    spi(gpio, u32(x), true)
+    spi(gpio, 0, true)
+    spi(gpio, u32(last), true)
+    spi(gpio, 0x2B, false)
+    spi(gpio, 0, true)
+    spi(gpio, u32(y), true)
+    spi(gpio, 0, true)
+    spi(gpio, u32(y), true)
+    spi(gpio, 0x2C, false)
+
+// Only changed pixel runs go over SPI; idle UI frames transmit nothing.
+flush(gpio: *Gpio, first_frame: bool)
+    for y in 0..<240
+        var x = 0
+        while x < 240
+            val index = y * 240 + x
+            if !first_frame && pixels[index] == previous[index]
+                x += 1
+                continue
+            val first = x
+            while x < 240 && (first_frame || pixels[y * 240 + x] != previous[y * 240 + x]) do x += 1
+            window(gpio, first, y, x - 1)
+            for col in first..<x
+                val at = y * 240 + col
+                val color = u32(pixels[at])
+                spi(gpio, color >> 8, true)
+                spi(gpio, color & 255, true)
+                previous[at] = u16(color)
+
+begin(bus: *I2c, register: u32)
+    bus.address = 0x5D
+    bus.command = 1
+    bus.data = register >> 8
+    bus.command = 4
+    bus.data = register & 255
+    bus.command = 4
+
+// Real GT911 protocol: 16-bit register pointer, status plus 8-byte contact,
+// then acknowledge the report by writing zero to status 0x814e.
+poll_touch(bus: *I2c, last: Input) -> Option[Input]
+    begin(bus, 0x814E)
+    if (bus.status & 2) != 0
+        bus.command = 8
+        return None
+    bus.command = 3
+    bus.command = 2
+    val status = bus.data
+    if (status & 128) == 0
+        bus.command = 8
+        return None
+    var bytes: [8]u32 = [0;8]
+    if (status & 15) != 0
+        for i in 0..<8
+            bus.command = 2
+            bytes[i] = bus.data
+    bus.command = 8
+    begin(bus, 0x814E)
+    bus.data = 0
+    bus.command = 4
+    bus.command = 8
+    if (status & 15) == 0 then return Some(pointer(last.x, last.y, false))
+    Some(pointer(int(bytes[1] | (bytes[2] << 8)), int(bytes[3] | (bytes[4] << 8)), true))
+
+frame(ui: *Ui, painter: *FrameBuffer)
+    val th = dark()
+    painter.fill_rect(Rect(0, 0, 240, 240), th.bg)
+    label(painter, th, Rect(12, 4, 216, 28), "TOUCH SETTINGS", 0)
+    if accent_button(ui, painter, th, Rect(12, 40, 216, 44), "ADD ONE")
+        app.count += 1
+        if app.count == 10 then app.count = 0
+    val counts: [10]string = ["COUNT 0","COUNT 1","COUNT 2","COUNT 3","COUNT 4","COUNT 5","COUNT 6","COUNT 7","COUNT 8","COUNT 9"]
+    label(painter, th, Rect(12, 88, 216, 16), counts[app.count], 0)
+    toggle(ui, painter, th, Rect(12, 108, 216, 36), "POWER", &app.enabled)
+    label(painter, th, Rect(12, 146, 216, 16), "BRIGHTNESS", -1)
+    slider(ui, painter, th, Rect(12, 164, 216, 36), &app.level, 0, 100)
+    progress(painter, th, Rect(12, 208, 216, 16), app.level, 100)
+
+@export("start")
+start() -> never
+    initialize_memory()
+    val gpio: *Gpio = ptr_cast(usize(0x50000000))
+    val bus: *I2c = ptr_cast(usize(0x50000300))
+    gpio.out = 4
+    gpio.oe = 63
+    gpio.out = 4 | 16
+    spi(gpio, 0x11, false) // Sleep out.
+    spi(gpio, 0x3A, false)
+    spi(gpio, 0x55, true) // RGB565.
+    spi(gpio, 0x29, false) // Display on.
+    val font = Font(font_bits[..], 32, 59, 6, 10, 8)
+    var painter = frame_buffer(pixels[..], 240, 240, font)
+    var ui = sh.sysl.imui.ui()
+    var input = no_input()
+    ui.begin(input)
+    frame(&ui, &painter)
+    ui.finish()
+    gpio.out |= 32
+    flush(gpio, true)
+    loop
+        poll_touch(bus, input) match
+            Some(next) ->
+                input = next
+                ui.begin(input)
+                frame(&ui, &painter)
+                ui.finish()
+                gpio.out = (gpio.out & ~32u32) | (if app.enabled then 32 else 0)
+                flush(gpio, false)
+            None -> ()
