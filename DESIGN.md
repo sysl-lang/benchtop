@@ -1021,7 +1021,7 @@ breadboard kit's §10.
   and keeps its register block as the generated struct. Behaviour is written against named fields:
   `if cr1.ue && cr1.te`. The offset-to-field dispatch is a `match` the generator also writes, unless the
   reflection probe in §8 shows `T::Fields` can derive it.
-- **A board is a description** in the format of §12: a chip (`chips/stm32h747.hocon`, its two cores
+- **A board is a description** in the format of §12: a chip (`mcus/stm32h747.hocon`, its two cores
   of different models, its banks `PA` to `PK`, and its peripherals at their bases), the board's parts
   with their parameters and wires, the pins and buses it exposes, and its view. A chip's own memory
   and devices are the chip's, so a board names the chip rather than listing them. What the H7 adds
@@ -1177,10 +1177,10 @@ acceptance set is therefore:
 ### 6.1 The Pico 2 first
 
 skiff already names the RP2350 as its first real silicon: its ROADMAP milestone 5 is "Pico 2:
-`chips/rp2350`, `boards/pico2` (one image, both M33s), the SIO FIFO doorbell, the lock (spinlocks or
+`mcus/rp2350`, `boards/pico2` (one image, both M33s), the SIO FIFO doorbell, the lock (spinlocks or
 exclusives, per erratum E2), UF2" (`skiff/ROADMAP.md:126`), and its Machines table lists the Pico 2
 for "the SIO FIFO doorbell, the spinlocks (erratum E2)" (`ROADMAP.md:111`). At `origin/dev` 3cec4b3
-neither `chips/rp2350` nor `boards/pico2` exists yet (the tree has `chips/an521`, `chips/mps2`), and
+neither `mcus/rp2350` nor `boards/pico2` exists yet (the tree has `mcus/an521`, `mcus/mps2`), and
 skiff's milestone 6 waits on milestone 5 for silicon. skiff's M33 work (PMSAv8 maps, `PSPLIM` stack
 limits, both AN521 cores) is already done under QEMU.
 
@@ -1197,7 +1197,7 @@ What benchtop must provide faithfully for it:
   the H7.
 
 **The request to the skiff session for milestone 5**, sent when benchtop's milestone 2 (Pico 2 dual
-core) runs: `chips/rp2350` and `boards/pico2` as their ROADMAP describes them, and a `boot-test.sh`
+core) runs: `mcus/rp2350` and `boards/pico2` as their ROADMAP describes them, and a `boot-test.sh`
 target that runs benchtop headless with `--deterministic` beside the QEMU machines. Then skiff's
 milestone 1–4 and 6 scenarios run on the Pico 2's shape in benchtop before and alongside the board,
 and the board confirms.
@@ -1210,7 +1210,7 @@ FINDINGS 9 for granting queues/channels/pools; 7 (the rest of the kernel) and 8 
 9 is "the H747I-DISCO (needs the board)". benchtop lets milestone 9 start before the board arrives, and
 makes its one-image half testable in a deterministic, scriptable way that the board cannot be.
 
-What skiff uses, from `arch/armv7m`, `arch/pmsa`, `chips/an521` and `boards/qemu-an521`, and
+What skiff uses, from `arch/armv7m`, `arch/pmsa`, `mcus/an521` and `boards/qemu-an521`, and
 therefore what benchtop must provide faithfully:
 
 - **Both cores entering one `_start`**, reading a core number, taking their own stack top, and core 0
@@ -1237,7 +1237,7 @@ therefore what benchtop must provide faithfully:
 **The request to the skiff session for the H747** (their work, not benchtop's). It is to be sent once
 benchtop's milestone 5 (H7 M7 + M4) runs the HSEM examples:
 
-1. `chips/stm32h747`: start-up for both cores (CPUID part number as the core id; stack tops; CPACR;
+1. `mcus/stm32h747`: start-up for both cores (CPUID part number as the core id; stack tops; CPACR;
    core 0 zeroes `.bss`/`.shared`; the M4's release through HSEM notification or `RCC_GCR.BOOT_C2`), the
    IRQ table to at least HSEM2 (≈126) and USART1, an HSEM doorbell, an **HSEM lock** behind the
    lock trait, `irq.sysl`, and `uart.sysl` on USART1.
@@ -1713,7 +1713,7 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
   with its code, the check costs about 3% more host instructions and no measurable cycles, where a
   page-granular one would send every one of those stores down the slow path.
 - **The board is described by `boards/virt.hocon`** (and `boards/virt33.hocon`), built into benchtop
-  as `virt` and `virt33` (§12.5): the chips `chips/virt.hocon` and `chips/virt33.hocon` and nothing
+  as `virt` and `virt33` (§12.5): the chips `mcus/virt.hocon` and `mcus/virt33.hocon` and nothing
   beside them. `sh.sysl.benchtop.virt` builds the machine from the chip: each device answers at the
   `at` and raises the `irq` its peripheral gives, so a chip that moves the console
   (`examples/virt/moved.hocon`) moves it for the guest. `benchtop run` runs a board with no parts of
@@ -1804,22 +1804,22 @@ board's devices exist, and the smallest machine a test can boot. `virt` has two 
 ## 12. Board description format
 
 A description is a HOCON file, read by `sh.sysl.benchtop` (`board.sysl` reads the shape,
-`shelf.sysl` finds the chips and boards it names, `chip.sysl` holds a chip to the library and
+`shelf.sysl` finds the chips and boards it names, `mcu.sysl` holds a chip to the library and
 `check.sysl` a board or a product). Every mistake is reported with its line and column, all of them
 at once, and checking goes on past each one.
 
 ### 12.1 Three levels
 
 - **A chip** is what is inside the package: its `cores`, its `pins` by bank, and its `peripherals`,
-  everything on the cores' bus (§12.11). It is named (`chip = rp2350`) or written out (`chip { ...
-  }`); `chips/` holds the ones built in.
+  everything on the cores' bus (§12.11). It is named (`mcu = rp2350`) or written out (`mcu { ...
+  }`); `mcus/` holds the ones built in.
 - **A board** is a chip with the `parts` soldered beside it, the pins and buses it **exposes** to
   whatever it is plugged into, and its `view`.
 - **A product** is one or more boards, each an instance with a name of its own, the parts outside
   them wired to what they expose, and a `view` of the whole, which replaces the boards' views
   (§12.11 lets it show a board's own view where the board is not hidden in a case).
 
-A file's top level is exactly one of `chip { ... }`, `chip = <name or path>`, `board { ... }`,
+A file's top level is exactly one of `mcu { ... }`, `mcu = <name or path>`, `board { ... }`,
 `board = <name or path>`, or `product { ... }`.
 
 ### 12.2 A board
@@ -1835,7 +1835,7 @@ A board written out (`boards/pico.hocon`):
 ```hocon
 board {
   name = "Raspberry Pi Pico"
-  chip = rp2040
+  mcu = rp2040
 
   parts {
     led { part = led, color = green, wire { anode = GP25 } }
@@ -1855,13 +1855,13 @@ board {
       usb     { box = "#c0c0c0", at = [52, 0], size = [64, 40] }
       led     { show = led, at = [28, 16], size = [16, 10] }
       bootsel { box = "#f0f0f0", at = [32, 88], size = [24, 24], label = "BOOTSEL" }
-      chip    { box = "#202020", at = [56, 168], size = [56, 56], label = "RP2040" }
+      mcu    { box = "#202020", at = [56, 168], size = [56, 56], label = "RP2040" }
     }
   }
 }
 ```
 
-Its settings are `name` and `chip` (both required), and `parts`, `buses`, `exposes`, `view` and
+Its settings are `name` and `mcu` (both required), and `parts`, `buses`, `exposes`, `view` and
 `input`, each optional; `cores`, `pins` and `peripherals` are the chip's, and a board that writes one
 is told so. A part is `<name> { part = <library part>, <parameter> = <value>, ..., wire { <port> =
 <target> } }`. A pin is spelled as capital letters and digits (`GP16`, `PA9`), so a wire's target is
@@ -1995,9 +1995,9 @@ A product's view shows its own parts by name and a board's as `<instance>.<part>
 
 The boards `virt`, `virt33` and the other `virt*`, `pico`, `pico2w` and `pico-breadboard-kit` (a
 product), and the chips `virt`, `virt33` and the other `virt*`, `rp2040` and `rp2350`, are embedded
-in the `benchtop` binary from `boards/` and `chips/`. **A name with a `/` in it, or ending in
+in the `benchtop` binary from `boards/` and `mcus/`. **A name with a `/` in it, or ending in
 `.hocon`, is a file; any other name is built in.** The rule is the same for `board = <name>` and
-`chip = <name>` at the top of a file, a board's `chip = <name>`, a product's `board = <name>`, and
+`mcu = <name>` at the top of a file, a board's `mcu = <name>`, a product's `board = <name>`, and
 the command line, so `--board virt` is always the built-in board even with a file called `virt` in
 the current directory, which is `./virt`. Chips and boards are named apart: the chip `virt` is not
 the board `virt`, and naming a board where a chip goes (or the reverse) is a mistake that says which
@@ -2048,9 +2048,9 @@ Each points at the name or value it is about; `<x>` is the name in the file.
 - **The top level.** `the description is neither a chip, a board nor a product`; `the description
   is both a board and a product` (and each other pair); `` `parts` belongs inside `board { ... }` or
   `product { ... }` `` (for every board or product setting written at the top); `` `peripherals`
-  belongs inside `chip { ... }` `` (and `cores`, `pins`, `summary`); `` unknown section `x` ``; ``
-  `board` must be a block, or the name of a board, not a number `` (and `chip`); `` a description is
-  `chip { ... }`, `board { ... }` or `product { ... }`, not an array ``.
+  belongs inside `mcu { ... }` `` (and `cores`, `pins`, `summary`); `` unknown section `x` ``; ``
+  `board` must be a block, or the name of a board, not a number `` (and `mcu`); `` a description is
+  `mcu { ... }`, `board { ... }` or `product { ... }`, not an array ``.
 - **Naming a chip or a board.** `` unknown board `pico3` `` and `` unknown chip `rp2041` `` (with the
   nearest name); `` cannot read `x.hocon`: <why> ``; `` the board `x` has mistakes `` (and `` the
   chip ``); `` `pico-breadboard-kit` is a product, and only a board is named here ``; `` `c.hocon` is
@@ -2118,11 +2118,11 @@ Each points at the name or value it is about; `<x>` is the name in the file.
 
 ### 12.10 The command line
 
-- `benchtop check [--chip] <name | file.hocon>` reads a chip, a board or a product, prints every
+- `benchtop check [--mcu] <name | file.hocon>` reads a chip, a board or a product, prints every
   mistake and exits 1, or prints what it is: for a chip, its cores, its pins and each peripheral with
   its window, IRQs and the pins its signals reach; for a board, its chip, each part with its wires and
   parameters, what it exposes, and its view; for a product, each board instance and then the same. A
-  name is a board's, or with `--chip` a chip's.
+  name is a board's, or with `--mcu` a chip's.
 - `benchtop run [--board <name | file.hocon>] <image>` runs on `virt` where no board is named. It runs
   a board with no parts of its own on a chip of two cores of one supported Cortex-M model whose
   peripherals benchtop all emulates, or a product of one such board and nothing outside it, and
@@ -2142,7 +2142,7 @@ the cores' bus lives. Each level has one kind of content:
 
 | level | holds | named or written out |
 |---|---|---|
-| chip | `cores`, `pins`, `peripherals` — what is inside the package | `chip = <name or path>` or `chip { ... }` |
+| chip | `cores`, `pins`, `peripherals` — what is inside the package | `mcu = <name or path>` or `mcu { ... }` |
 | board | a chip, `parts` soldered beside it, `buses`, `exposes`, `view`, `input` | `board = <name or path>` or `board { ... }` |
 | product | boards, `parts` outside them, `buses`, `view`, `input` | `product { ... }` |
 
@@ -2154,17 +2154,17 @@ its chip's `peripherals`, and §12.8's rules (alignment, overlap, the private pe
 IRQ each and below the cores' count) become rules about a chip. A board no longer has `cores`;
 it always has a chip, which for `virt` is a chip that exists only in benchtop.
 
-**A chip is named or described, exactly as a board is.** `chip = rp2350` names a chip built into
-benchtop; `chip = chips/mine.hocon` names a file, by §12.5's rule (a `/` or `.hocon` makes it a
-file); `chip { ... }` writes one out in place. A file's top level may also be `chip { ... }`, so
-`benchtop check` reads a chip on its own. Chips and boards are named apart: `chip = virt` and
+**A chip is named or described, exactly as a board is.** `mcu = rp2350` names a chip built into
+benchtop; `mcu = mcus/mine.hocon` names a file, by §12.5's rule (a `/` or `.hocon` makes it a
+file); `mcu { ... }` writes one out in place. A file's top level may also be `mcu { ... }`, so
+`benchtop check` reads a chip on its own. Chips and boards are named apart: `mcu = virt` and
 `board = virt` are two descriptions. The bundled chips are `virt` (two M0+), `virt33` (two M33)
-and the other `virt*` models, `rp2040` and `rp2350`, embedded in the binary from `chips/` as the
+and the other `virt*` models, `rp2040` and `rp2350`, embedded in the binary from `mcus/` as the
 boards are from `boards/`.
 
 ```hocon
-// chips/virt.hocon
-chip {
+// mcus/virt.hocon
+mcu {
   name  = virt
   cores = [cortex-m0plus, cortex-m0plus]
 
@@ -2178,14 +2178,14 @@ chip {
 // boards/virt.hocon
 board {
   name = virt
-  chip = virt
+  mcu = virt
 }
 ```
 
 A real chip, abridged:
 
 ```hocon
-chip {
+mcu {
   name    = rp2350
   summary = "Raspberry Pi RP2350A: two Cortex-M33 at 150 MHz"
   cores   = [{ core = cortex-m33, fpu = sp, dsp = true }, { core = cortex-m33, fpu = sp, dsp = true }]
@@ -2241,7 +2241,7 @@ The chip's diagnostics are §12.9's **A chip** and **The bus**.
 **Still to decide.**
 - **Overriding a named chip.** A product overrides a board's part parameters (§12.6); a board may
   want the same of its chip — a flash or SRAM size, a clock — without writing the chip out. The
-  shape this suggests is `chip { chip = rp2350, peripherals.sram.size = 256K }`, which reads close
+  shape this suggests is `mcu { mcu = rp2350, peripherals.sram.size = 256K }`, which reads close
   to a description; the alternative is a separate `overrides { ... }`.
 - **Package variants.** The RP2350A and B differ in pins (30 and 48) and nothing else a description
   says: two chips, or one with a `package` parameter.

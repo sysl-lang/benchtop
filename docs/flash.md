@@ -18,7 +18,7 @@ For external flash, the chip describes its mapped interface and the board
 supplies a storage part, as in `boards/workbench.hocon`:
 
 ```hocon
-// In chip.peripherals:
+// In mcu.peripherals:
 flash0 { peripheral = flash-interface, at = 0x10000000, size = 4M }
 // In board.parts:
 firmware { part = W25Q32JV, ref = U3, interface = flash0 }

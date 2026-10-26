@@ -18,7 +18,7 @@ Run from the repository root:
 ```sh
 sysl build . -o benchtop
 ./benchtop bench --core rv32imc examples/riscv/kernel-rv32imc.bin 3132271724
-./benchtop check --chip examples/riscv/chip.hocon
+./benchtop check --mcu examples/riscv/chip.hocon
 sysl test . --filter RV32
 ```
 
@@ -46,7 +46,7 @@ operand or machine-state combination. No claim is made for unimplemented instruc
 
 ```sh
 ./benchtop bench --core hazard3 examples/riscv/kernel-hazard3.bin 3132271724
-./benchtop check --chip examples/riscv/hazard3.hocon
+./benchtop check --mcu examples/riscv/hazard3.hocon
 python3 examples/riscv/generate-hazard3-tests.py
 python3 examples/riscv/generate-hazard3-tests.py --check
 sysl test . --filter Hazard3

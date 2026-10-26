@@ -5,7 +5,7 @@ integer divider. They import the SVD-generated `github.com/sysl-lang/rp2040` reg
 model imports a CPU module, uses global device state, starts a host thread, or reads the host clock.
 
 RESETS, TIMER and the watchdog are library peripherals (`rp-resets`, `rp-timer`, `rp-watchdog`),
-placed by `chips/rp2040.hocon` and run by `sh.sysl.benchtop.virt` (`virt/rp.sysl`) on any runnable
+placed by `mcus/rp2040.hocon` and run by `sh.sysl.benchtop.virt` (`virt/rp.sysl`) on any runnable
 board whose chip places them. The rp2040 chip itself does not run yet: its ROM and SIO are not
 modelled, and the divider waits for the SIO. GPIO/pads, UART, clock generators, the watchdog
 counter, DMA, SPI, I2C, PWM, PIO, USB, interpolators, flash and boot ROM are separate work.

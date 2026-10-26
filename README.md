@@ -172,7 +172,7 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 ```
 sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>
-./benchtop check [--chip] <name | file.hocon>
+./benchtop check [--mcu] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
 ```
@@ -207,7 +207,7 @@ Chip descriptions can name `rv32i`, `rv32im`, `rv32ic`, `rv32imc` and `hazard3` 
 using the same names and option-block syntax as Cortex-M:
 
 ```hocon
-chip {
+mcu {
   name = riscv-example
   cores = [rv32i, { core = rv32imc }]
   peripherals { ram { peripheral = ram, at = 0x20000000, size = 520K } }
@@ -227,7 +227,7 @@ checking `a0` against the expected result. There is one executor, with three rou
 sh examples/riscv/build.sh
 sysl build . -o benchtop
 ./benchtop bench --core rv32imc examples/riscv/kernel-rv32imc.bin 3132271724
-./benchtop check --chip examples/riscv/chip.hocon
+./benchtop check --mcu examples/riscv/chip.hocon
 ./benchtop check pico2
 ```
 
@@ -246,7 +246,7 @@ sysl build . -o benchtop
   32-byte-granule NAPOT regions and three hardwired regions.
 
 ```hocon
-chip {
+mcu {
   name = hazard3-example
   cores = [hazard3, { core = hazard3 }]
   peripherals { ram { peripheral = ram, at = 0x20000000, size = 520K } }
@@ -254,7 +254,7 @@ chip {
 ```
 
 ```sh
-./benchtop check --chip examples/riscv/hazard3.hocon
+./benchtop check --mcu examples/riscv/hazard3.hocon
 ./benchtop bench --core hazard3 examples/riscv/kernel-hazard3.bin 3132271724
 ```
 
@@ -300,7 +300,7 @@ board = pico2w
 ```
 
 The virtual boards in the core table below, plus `pico`, `pico2`, `pico2w` and `pico-breadboard-kit`,
-are built in ([boards](boards) has their sources), and so are their chips ([chips](chips)). **A
+are built in ([boards](boards) has their sources), and so are their MCUs ([mcus](mcus)). **A
 name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**, on the
 command line and in a file alike, so `--board virt` is the virtual board and `--board ./virt` a
 file. A path in a file is read from that file's directory. Chips and boards are named apart: the
@@ -310,7 +310,7 @@ There are three levels. A **chip** is what is inside the package: its cores, its
 its peripherals, everything the cores reach by address:
 
 ```hocon
-chip {
+mcu {
   name    = "virt"
   summary = "two Cortex-M0+ cores, 1 MB of RAM, a console and an SIO"
   cores   = [cortex-m0plus, cortex-m0plus]
@@ -324,14 +324,14 @@ chip {
 
 A real chip also has `pins { GP = 30 }`, and a peripheral that drives pins says which each of its
 signals can reach: `uart0 { peripheral = pl011, at = 0x40034000, irq = 20, signals { tx = [GP0,
-GP12, GP16, GP28], rx = [GP1, GP13, GP17, GP29] } }`. A **board** names its chip (`chip = rp2040`)
-or writes it out (`chip { ... }`), and holds the parts soldered beside it, the pins and buses it
+GP12, GP16, GP28], rx = [GP1, GP13, GP17, GP29] } }`. A **board** names its chip (`mcu = rp2040`)
+or writes it out (`mcu { ... }`), and holds the parts soldered beside it, the pins and buses it
 exposes, and its view:
 
 ```hocon
 board {
   name = "Raspberry Pi Pico"
-  chip = rp2040
+  mcu = rp2040
   parts {
     led { part = led, color = green, wire { anode = GP25 } }
   }
@@ -365,7 +365,7 @@ product {
 
 A product tweaks a board by its parts' parameters (`boards { pico { board = pico, parts.led.color =
 red } }`) and never otherwise. Each exposed pin is wired once across the product. Only a chip's
-peripherals have `at`, `size` and `irq`; a part is off the cores' bus. `benchtop check --chip rp2350`
+peripherals have `at`, `size` and `irq`; a part is off the cores' bus. `benchtop check --mcu rp2350`
 prints a chip; [DESIGN.md](DESIGN.md) §12 has the whole format and every mistake `check` reports.
 
 ## Core options in a chip description
