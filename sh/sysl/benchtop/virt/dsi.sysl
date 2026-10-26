@@ -6,9 +6,11 @@ import sh.sysl.benchtop.parts.mipi_dcs as dcs
 import sh.sysl.benchtop.v6m.{Cpu,Stop,NEVER,halt,lower_limit}
 import sysl.buf.{Buf,buf}
 import sysl.sync.*
+import sysl.threads.SleepLock
 
 var dsi_host = dsi.host(480000000)
-private var has_dsi = false
+private[virt] var has_dsi = false
+private[virt] var dsi_reg_lock = SleepLock.new()
 private var dsi_next: u64 = NEVER
 private val dsi_sink: dsi.Endpoint = (vc,kind,bytes) -> dsi_endpoint(vc,kind,bytes)
 
@@ -37,10 +39,20 @@ private[virt] configure_dsi(b: Board) -> Result[unit,string]
 
 private[virt] boot_dsi()
     dsi_host = dsi.host(dsi_host.hz,dsi_host.reference_hz)
+    dsi_host.defer_reads = dsi_async
     atomic_store(&dsi_next,NEVER,Release)
 
-// Invoked under display_lock at packet completion, never from host painting.
+// CPU-side completion enqueues only; display interpretation runs on its worker.
 private dsi_endpoint(vc: u32, kind: u32, payload: []const u8) -> Buf[u8]
+    if dsi_async
+        enqueue_dsi_packet(vc,kind,payload,dsi_host.request_id)
+        return buf()
+    display_lock.lock()
+    defer display_lock.unlock()
+    apply_dsi_packet(vc,kind,payload)
+
+// Invoked under display_lock by the device worker (or deterministic fallback).
+private[virt] apply_dsi_packet(vc: u32, kind: u32, payload: []const u8) -> Buf[u8]
     var response: Buf[u8] = buf()
     for b in tft_bindings
         if b.dsi_channel != int(vc) then continue
@@ -63,9 +75,9 @@ private[virt] signal_dsi(c: *Cpu)
     val time = board_time(c,c.retired)
     val due = atomic_load(&dsi_next,Acquire)
     if due == NEVER || time < due then return
-    display_lock.lock()
-    defer display_lock.unlock()
-    dsi.advance(dsi_host,time,dsi_sink)
+    dsi_reg_lock.lock()
+    defer dsi_reg_lock.unlock()
+    advance_dsi(time)
     publish_dsi_deadline()
 
 private[virt] dsi_due() -> u64
@@ -74,15 +86,21 @@ private[virt] dsi_due() -> u64
 
 // The display lock is held by the caller. Publish after every state change,
 // including MMIO-driven completion and reset/cancellation of a queued packet.
-private publish_dsi_deadline() = atomic_store(&dsi_next,if dsi_host.busy then dsi_host.due else NEVER,Release)
+private[virt] publish_dsi_deadline()
+    val blocked = dsi_async && !dsi_queue_has_room()
+    atomic_store(&dsi_next,if dsi_host.busy && !blocked then dsi_host.due else NEVER,Release)
+
+private advance_dsi(time: u64)
+    if dsi_async && dsi_host.busy && !dsi_host.response_pending && !dsi_queue_has_room() then return
+    dsi.advance(dsi_host,time,dsi_sink)
 
 private[virt] dsi_read(c: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || offset & 3 != 0
         halt(c,Stop.Fault,address)
         return 0
-    display_lock.lock()
-    defer display_lock.unlock()
-    dsi.advance(dsi_host,board_time(c,n),dsi_sink)
+    dsi_reg_lock.lock()
+    defer dsi_reg_lock.unlock()
+    advance_dsi(board_time(c,n))
     publish_dsi_deadline()
     dsi.read(dsi_host,offset) match
         Some(v) -> v
@@ -94,9 +112,9 @@ private[virt] dsi_write(c: *Cpu, address: u32, offset: u32, width: u32, value: u
     if width != 4 || offset & 3 != 0
         halt(c,Stop.Fault,address)
         return
-    display_lock.lock()
-    defer display_lock.unlock()
-    dsi.advance(dsi_host,board_time(c,n),dsi_sink)
+    dsi_reg_lock.lock()
+    defer dsi_reg_lock.unlock()
+    advance_dsi(board_time(c,n))
     if !dsi.write(dsi_host,offset,value) then halt(c,Stop.Fault,address)
     publish_dsi_deadline()
     if dsi_host.busy then lower_limit(c,retirement_limit(c,dsi_host.due))

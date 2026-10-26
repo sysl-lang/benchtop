@@ -1,0 +1,105 @@
+module sh.sysl.benchtop.virt
+
+import sh.sysl.benchtop.peripheral.dsi as dsi
+import sysl.threads.{Thread,Mutex,Condvar,channel,spawn,current}
+import sysl.sync.*
+
+// Fixed packet values cross the channel; no views, display references or CPU
+// pointers cross domains. The existing bounded channel supplies the semaphore-
+// style queue wakeups. CPU producers use try_send, never a blocking send.
+private const DSI_QUEUE_CAPACITY: usize = 64
+private struct DsiPacket
+    channel: u32
+    kind: u32
+    request: u64
+    count: usize
+    bytes: [1024]u8
+
+private var dsi_slots: [64]DsiPacket = [DsiPacket(0,0,0,0,[0;1024]);64]
+private var dsi_queue = channel(dsi_slots[..])
+private var dsi_handle: Option[Thread] = None
+private var dsi_done_gate = Mutex.new(0)
+private var dsi_done = Condvar.new()
+private var dsi_outstanding: u64 = 0
+private var dsi_thread_id: u64 = 0
+private[virt] var dsi_async = false
+
+struct DsiWorkerStatus
+    worker_id: u64
+    queued: usize
+    outstanding: u64
+
+dsi_worker_status() -> DsiWorkerStatus = DsiWorkerStatus(atomic_load(&dsi_thread_id,Acquire),
+    if dsi_async then dsi_queue.len() else 0,atomic_load(&dsi_outstanding,Acquire))
+
+private[virt] start_dsi_worker() -> Result[unit,string]
+    if !has_dsi then return Ok(())
+    dsi_queue = channel(dsi_slots[..])
+    atomic_store(&dsi_outstanding,0,Release)
+    atomic_store(&dsi_thread_id,0,Release)
+    dsi_async = true
+    dsi_host.defer_reads = true
+    dsi_handle = spawn(&dsi_device_body,&dsi_queue,1 << 20)
+    if dsi_handle.is_none()
+        dsi_async = false
+        dsi_host.defer_reads = false
+        return Err("cannot create the DSI device worker")
+    dsi_done_gate.lock_raw()
+    while atomic_load(&dsi_thread_id,Acquire) == 0 do dsi_done.wait(&dsi_done_gate)
+    dsi_done_gate.unlock_raw()
+    Ok(())
+
+// Only call with CPU producers parked. This is a control/debug barrier, never
+// part of normal instruction execution or status polling.
+private[virt] flush_dsi_worker()
+    if !dsi_async then return
+    dsi_done_gate.lock_raw()
+    while atomic_load(&dsi_outstanding,Acquire) != 0 do dsi_done.wait(&dsi_done_gate)
+    dsi_done_gate.unlock_raw()
+
+private[virt] stop_dsi_worker()
+    if !dsi_async then return
+    flush_dsi_worker()
+    dsi_queue.close()
+    dsi_handle.unwrap().join()
+    dsi_handle = None
+    dsi_async = false
+    dsi_host.defer_reads = false
+    atomic_store(&dsi_thread_id,0,Release)
+
+private[virt] dsi_queue_has_room() -> bool = !dsi_async || dsi_queue.len() < DSI_QUEUE_CAPACITY
+
+// Register lock held: there is only one producer at a time, and advance_dsi
+// already checked capacity. A full host queue leaves the command FIFO busy.
+private[virt] enqueue_dsi_packet(vc: u32, kind: u32, bytes: []const u8, request: u64)
+    var packet = DsiPacket(vc,kind,request,bytes.len,[0;1024])
+    for i in 0..<bytes.len do packet.bytes[i] = bytes[i]
+    atomic_add(&dsi_outstanding,1,AcqRel)
+    assert(dsi_queue.try_send(packet),"DSI queue capacity checked under register lock")
+
+private dsi_device_body(queue: *sysl.threads.Channel[DsiPacket])
+    dsi_done_gate.lock_raw()
+    atomic_store(&dsi_thread_id,current().id,Release)
+    dsi_done.notify_all()
+    dsi_done_gate.unlock_raw()
+    loop
+        val packet = queue.receive() match
+            Some(p) -> p
+            None -> break
+        // Freeing a queue slot lets a due hardware command complete. Never
+        // hold the queue lock while processing pixels or waiting for the UI.
+        dsi_reg_lock.lock()
+        publish_dsi_deadline()
+        dsi_reg_lock.unlock()
+        display_lock.lock()
+        val response = apply_dsi_packet(packet.channel,packet.kind,packet.bytes[..<packet.count])
+        display_lock.unlock()
+        if packet.kind == 6 || packet.kind == 4 || packet.kind == 0x14 || packet.kind == 0x24
+            dsi_reg_lock.lock()
+            dsi.complete_read(dsi_host,packet.request,response.view())
+            publish_dsi_deadline()
+            dsi_reg_lock.unlock()
+        dsi_done_gate.lock_raw()
+        atomic_sub(&dsi_outstanding,1,AcqRel)
+        dsi_done.notify_all()
+        dsi_done_gate.unlock_raw()

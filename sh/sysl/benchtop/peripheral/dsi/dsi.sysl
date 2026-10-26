@@ -23,10 +23,13 @@ struct Host
     rx_count: usize
     rx_at: usize
     max_return: usize
+    defer_reads: bool
+    response_pending: bool
+    request_id: u64
 
 host(hz: u64, reference_hz: u64 = 25000000) -> &Host
     require hz > 0 && hz <= 1000000000 && reference_hz > 0 && reference_hz <= 1000000000, "bounded DSI clock rates"
-    val h: &Host = Host(hz,reference_hz,0,[0;269],[0;1024],0,[0;1024],0,0,false,0,0,[0;1024],0,0,1)
+    val h: &Host = Host(hz,reference_hz,0,[0;269],[0;1024],0,[0;1024],0,0,false,0,0,[0;1024],0,0,1,false,false,0)
     h.regs[0x34 / 4] = 1 // Command mode.
     h
 
@@ -38,13 +41,18 @@ type Endpoint = &Fn(u32,u32,[]const u8) -> Buf[u8]
 advance(h: &Host, time: u64, endpoint: Endpoint)
     if time <= h.time then return
     h.time = time
-    if !h.busy || time < h.due then return
+    if !h.busy || h.response_pending || time < h.due then return
     val kind = h.header & 63
     if kind == 0x37
         h.max_return = usize((h.header >> 8) & 0xffff)
     else
+        val reading = kind == 0x06 || kind == 0x04 || kind == 0x14 || kind == 0x24
+        if reading && h.defer_reads
+            h.response_pending = true
+            h.due = 0xffffffffffffffff
         val response = endpoint((h.header >> 6) & 3,kind,h.packet[..<h.packet_count])
-        if kind == 0x06 || kind == 0x04 || kind == 0x14 || kind == 0x24
+        if reading && h.defer_reads then return
+        if reading
             h.rx_count = if response.len() < h.max_return then response.len() else h.max_return
             h.rx_at = 0
             for i in 0..<h.rx_count do h.rx[i] = response.at(i)
@@ -100,12 +108,16 @@ write(h: &Host, offset: u32, value: u32) -> bool
         if offset == 0xa4 && value & 3 > 1 then return false // One or two lanes.
         if offset == 0x04 && value & 1 == 0
             h.busy = false
+            h.response_pending = false
+            h.request_id += 1
             h.tx_count = 0
             h.rx_at = 0
             h.rx_count = 0
         h.regs[offset / 4] = value
         if h.busy && !ready(h)
             h.busy = false
+            h.response_pending = false
+            h.request_id += 1
             h.tx_count = 0
         return true
     if offset == 0x70
@@ -132,10 +144,24 @@ write(h: &Host, offset: u32, value: u32) -> bool
         if h.tx_count != 0 then return false
         if size > 0 then h.packet[0] = u8(value >> 8)
         if size > 1 then h.packet[1] = u8(value >> 16)
+    h.request_id += 1
+    h.response_pending = false
     h.header = value & 0xffffff
     h.packet_count = size
     h.busy = true
     val bytes = if kind == 0x29 || kind == 0x39 then u64(size) + 6 else 4u64
     val rate = h.lane_rate * u64((h.regs[0xa4 / 4] & 3) + 1)
     h.due = h.time + (bytes * 8 * h.hz + rate - 1) / rate
+    true
+
+/** Complete a deferred read on the device worker. A cancelled/reset request
+ * cannot populate a newer transaction's receive FIFO.
+ */
+complete_read(h: &Host, request_id: u64, response: []const u8) -> bool
+    if !h.busy || !h.response_pending || h.request_id != request_id then return false
+    h.rx_count = if response.len < h.max_return then response.len else h.max_return
+    h.rx_at = 0
+    for i in 0..<h.rx_count do h.rx[i] = response[i]
+    h.response_pending = false
+    h.busy = false
     true
