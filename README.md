@@ -107,6 +107,11 @@ worker waits until firmware launches it. CPU workers pace themselves from the
 MCU clock and host monotonic time, independently of UI redraws. The UI reads
 published CPU snapshots and locked device observations; only pause, step, reset,
 reload and shutdown wait for a safe boundary. No worker is recreated per frame.
+Normal paced workers each use their own configured clock domain and monotonic
+host-time checkpoints. The coordinator no longer distributes short lockstep
+pacing batches. Live per-core snapshots are published independently; pause,
+reset and debugger steps still obtain a coherent stopped pair. The separate
+guest-time ordering bound remains in force for shared-state correctness.
 The board view uses a fixed 1:1 layout scale; resizing changes its viewport,
 not the size of its components. TFT images use one guest pixel per framebuffer
 pixel, including on Retina displays, so firmware antialiasing is not enlarged

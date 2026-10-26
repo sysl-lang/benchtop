@@ -103,3 +103,26 @@ a controlled maximum-throughput result. The native profiles and concurrency
 regression establish that the idle DSI/UI wait is removed independently of that
 speed comparison. A quieter-host measurement is still needed for sustained
 480/240 target-rate claims.
+
+
+## Independent per-core wall pacing
+
+Normal paced execution now uses `timing.CorePacer`, an ISA-independent clock
+policy. Each instance receives its own frequency, host epoch and guest-clock
+origin. It checks host time after a bounded batch (up to one million ticks,
+limited to about one millisecond at clocks of at least 1 kHz). A faster core
+waits against its own timestamp; pause/resume rebases both domains without
+charging paused host time to guest execution.
+
+The old short coordinator jobs remain for unpaced manual budgets and explicit
+deterministic execution. Normal paced jobs use a longer control window while
+each worker paces and publishes itself independently. Pause interrupts both
+host-time waits and guest-ordering waits; reset and exact instruction stepping
+still operate on a stopped pair. Sleeping cores also reach pacing checkpoints,
+so WFI cannot jump an entire future control window into a UI snapshot.
+
+The guest-time ordering limit is distinct and remains conservative. Independent
+wall pacing is not a claim that all cross-core synchronization has been removed.
+The pacing policy contains no M4/M7 names or ISA branches. Regression tests cover
+matching M0+ cores, M33/M0+, M4/M7 and M7/M4, including unequal rates; the clock
+math also covers arbitrary frequencies, rounding, long epochs and pause rebasing.
