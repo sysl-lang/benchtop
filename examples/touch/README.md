@@ -61,7 +61,7 @@ emulated instruction, not a cycle-accurate Cortex-M33 model; no flash wait state
 or bus contention are included. If the host cannot keep up, emulation runs slower
 than the target. Stalls are capped at 50 ms of catch-up work per frame.
 Headless runs and tests pump deterministic guest ticks without wall-time pacing.
- The display now uses the catalog's `pl022` hardware SPI peripheral at
+The display now uses the catalog's `pl022` hardware SPI peripheral at
 `0x50001000`, mode 0, 8-bit frames, divider 4: 37.5 MHz with the 150 MHz guest
 clock. Firmware fills the eight-entry TX FIFO, polls TNF/BSY, and drains RX.
 The controller emits timestamped SCK/MOSI transitions into the existing display
@@ -97,7 +97,7 @@ input { pointer { display = touch } }
 ```
 
 Pointer coordinates map only to the active glass, excluding the bezel, and
-follow window scaling. A drag captures the display and clamps at its edges;
+remain aligned with the native raster at different display densities. A drag captures the display and clamps at its edges;
 release outside the display or focus loss releases the touch. Bounded report
 buffering preserves quick taps across slow redraws.
 
@@ -127,3 +127,18 @@ repeated bounded-heap redraws, and flash-resident Thumb-2 execution.
 Protocol references:
 - [Goodix-authored GT911 programming guide](https://www.lcd-module.de/fileadmin/eng/pdf/zubehoer/GT911_Programming_Guide_Rev.10.pdf)
 - [Linux Goodix driver](https://github.com/torvalds/linux/blob/master/drivers/input/touchscreen/goodix.c)
+
+## Native display presentation
+
+The glass is shown at 240×240 device pixels, including on Retina displays.
+Guest RGB565 colors are copied to a native-pixel raster, without host rescaling
+or smoothing. Window resizing changes the available viewport and leaves board
+geometry at a fixed 1:1 layout scale. The bezel and other desktop controls remain
+DPI-aware. The small syslUI 0.1.9 native-image operation makes this independent of
+the desktop's display-density transform; mouse/touch mapping uses the same glass
+rectangle.
+
+Normal desktop execution runs launched guest cores on separate host threads.
+Workers finish each bounded batch before the UI snapshots state or reloads the
+firmware. `--deterministic` selects reproducible serial interleaving; headless
+runs and firmware tests retain deterministic pumping.

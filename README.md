@@ -103,6 +103,10 @@ and parallel execution of launched guest cores on distinct host threads.
 Use `--deterministic` for reproducible serial interleaving. Headless UI runs
 remain deterministic. Workers finish each bounded desktop batch before the UI
 reads guest state, pauses, steps, resets, or reloads firmware.
+The board view uses a fixed 1:1 layout scale; resizing changes its viewport,
+not the size of its components. TFT images use one guest pixel per framebuffer
+pixel, including on Retina displays, so firmware antialiasing is not enlarged
+or smoothed by the host.
 `--frames N` bounds either windowed or headless runs. PNG exports use the same
 syslUI view tree and PlutoVG renderer at a standard
 1200×760 size. Headless rendering also needs an installed system font (Arial on
@@ -536,12 +540,12 @@ kind does — SVC, PendSV, SysTick, IRQs, with priorities, PRIMASK and both stac
 BASEPRI, FAULTMASK and the stack limits; SysTick counts one per instruction. [DESIGN.md](DESIGN.md)
 §2.2 and §2.9 say what is modelled and what is not.
 
-**Both cores run on one host thread, taking turns** of 1000 instructions each, so a run is the same
+**With `--deterministic`, both cores run on one host thread, taking turns** of 1000 instructions each, so a run is the same
 every time, to the instruction. A core asleep in `WFI` costs nothing while the other runs, and the
 board stops at `Asleep` only when both sleep with nothing that can wake them. A program that never
 launches core 1 runs exactly as on a single core. [DESIGN.md](DESIGN.md) §1.1 and §11 have the rest.
 
-**With `--threads` each core runs on a host thread of its own**, and neither gets more than 4000
+**By default, each launched Cortex-M core runs on a host thread of its own**, and neither gets more than 4000
 instructions ahead of the other; a core asleep in `WFI` blocks its thread until the other core or its
 own SysTick wakes it. On the two-core bench that is about 1.8 times the speed of taking turns
 ([bench/README.md](bench/README.md)). Guest RAM accesses are the host's relaxed atomic accesses and
