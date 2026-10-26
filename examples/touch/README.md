@@ -140,9 +140,11 @@ DPI-aware. The small syslUI 0.1.9 native-image operation makes this independent 
 the desktop's display-density transform; mouse/touch mapping uses the same glass
 rectangle.
 
-Normal desktop execution runs launched guest cores on separate host threads.
-Workers finish each bounded batch before the UI snapshots state or reloads the
-firmware. `--deterministic` selects reproducible serial interleaving; headless
+Normal desktop execution uses persistent CPU workers, including a dedicated
+core 0 worker. They pace themselves from the MCU clock, independently of UI
+frames; the UI reads published CPU snapshots and locked display observations.
+Pause, step, reset and reload wait for safe execution boundaries. Reset/reload
+reuse the same host threads. `--deterministic` selects reproducible serial interleaving; headless
 runs and firmware tests retain deterministic pumping.
 
 ## Rounded imui styling

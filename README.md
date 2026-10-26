@@ -101,8 +101,12 @@ without modelled peripherals is labelled **LAYOUT PREVIEW**; display placeholder
 are not emulated displays. Live execution currently uses Cortex-M virtual boards
 and parallel execution of launched guest cores on distinct host threads.
 Use `--deterministic` for reproducible serial interleaving. Headless UI runs
-remain deterministic. Workers finish each bounded desktop batch before the UI
-reads guest state, pauses, steps, resets, or reloads firmware.
+remain deterministic. Normal desktop execution uses two persistent host CPU
+workers. Core 0 never executes guest instructions on the UI thread, and core 1's
+worker waits until firmware launches it. CPU workers pace themselves from the
+MCU clock and host monotonic time, independently of UI redraws. The UI reads
+published CPU snapshots and locked device observations; only pause, step, reset,
+reload and shutdown wait for a safe boundary. No worker is recreated per frame.
 The board view uses a fixed 1:1 layout scale; resizing changes its viewport,
 not the size of its components. TFT images use one guest pixel per framebuffer
 pixel, including on Retina displays, so firmware antialiasing is not enlarged
@@ -600,3 +604,13 @@ The oracle is always the real board running the same image, never benchtop's own
 ## Licence
 
 ISC.
+
+CPU worker snapshots are published between short execution batches (at most
+250,000 guest ticks). Register/counter presentation adds no new per-instruction
+synchronization. Console output is copied under its lock; instrument CPU sources
+use snapshots, and RAM observations use atomic reads. CPU threads use direct
+`sysl.threads` synchronization; Kairos/libuv continues to serve host build and
+file-watching I/O. Tests exercise stable thread identities, progress without UI
+ticks, clock pacing, pause/step/reset, WFI, live display access and dual Cortex-M7
+firmware. These scheduling changes do not add STM32H7 peripherals or its
+heterogeneous M7/M4 configuration.
