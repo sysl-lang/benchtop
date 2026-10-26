@@ -316,7 +316,13 @@ and `OBJCOPY` overrides), and Python 3 for the generated vector corpora.
 
 The MCU may declare `clock-hz = 150000000`. The desktop uses this target for
 wall-time execution pacing, and virtual I2C/RTC, PWM and digital-audio timebases
-inherit it. Existing boards that omit it retain their previous defaults. Legacy
+inherit it. Each Cortex-M core can override `clock-hz`; its rate must divide the
+MCU timebase exactly. For example, an M7 at 480 MHz and an M4 at 240 MHz use
+`mcu.clock-hz = 480000000`, with `clock-hz = 240000000` on the M4.
+Core-local SysTick keeps that core's rate while shared peripherals use the MCU
+timebase. Different supported Cortex-M models may share a board, with independent
+instruction records and FPU settings. Existing boards that omit clocks retain
+their previous defaults. Legacy
 peripheral `clock-hz` values must match an explicitly configured MCU timebase.
 The emulator currently uses one tick per instruction, so a clock setting is an
 instruction-rate approximation, not cycle-exact hardware performance. Host

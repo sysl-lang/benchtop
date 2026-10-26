@@ -96,3 +96,28 @@ one the host has descheduled blocks until it runs again.
 368.7 M guest instructions a round against the M0+ build's 573.5 M, in about 0.20 s taking turns
 and 0.12 s on a thread each (single runs, the same loaded machine), against the M0+'s 0.42 s and
 0.24 s.
+
+
+## Persistent desktop CPU workers
+
+`sysl test . --filter 'CPU worker throughput:' --timeout 30` measures the two
+persistent host workers using the committed `dual33.elf` workload. It writes
+`target/worker-throughput.txt`, with per-core retired counts, elapsed wall time,
+and per-core and aggregate MIPS. Creation of the workers is outside the measured
+interval. Guest startup and decoding are included. This test runs unthrottled.
+
+On an Apple M5 Pro (18 CPUs), sysl 0.6.2, October 26, 2026, median of three runs:
+
+| Model pair | Core 0 MIPS | Core 1 MIPS | Aggregate MIPS |
+|---|---:|---:|---:|
+| M33 / M33 | 1237 | 1237 | 2474 |
+| M7 / M7 | 1259 | 1259 | 2518 |
+
+Both use the same Thumb-2 integer CRC workload; this does not measure an M7-tuned
+build, audio, framebuffer rendering, bus contention, or hardware cycle accuracy.
+
+Set `BENCHTOP_CPU_TRACE=1` when launching a windowed session for approximately
+one-second samples of per-core MIPS, launched status and UI FPS. The existing
+150 MHz touchscreen demo measured approximately 150 MIPS on core 0 and zero on
+its unlaunched core 1, while the UI ran at approximately 120 FPS. This is a live
+paced polling workload, distinct from the unthrottled benchmark above.
