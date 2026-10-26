@@ -40,7 +40,7 @@ The main UI thread spent approximately 34% of its samples in `tft_frame`.
 DSI now publishes its next completion deadline atomically. An idle or not-yet-due
 signal check needs no display lock. Completion, MMIO and display state still use
 the existing lock, with the deadline published after every mutation and reset.
-Guest instruction counts, clock ratios, transfer deadlines and the allowed
+Guest instruction counts, clock ratios, packet duration calculations and the allowed
 inter-core clock skew are unchanged.
 
 A concurrency regression holds the UI display lock while both guest workers run
@@ -69,7 +69,7 @@ spent asleep.
 
 Outside the native sampling interval, median rates were approximately
 289/144 million instructions per second before, and 307/153 million after the
-idle-DSI fix: about a 6% increase. The host UI stayed around 120 FPS. This does
+idle-DSI fix: about a 6% increase in that pair of runs. The host UI stayed around 120 FPS. This does
 not establish full 480/240 target throughput, exact physical H747 timing or
 real-time audio performance.
 
@@ -91,3 +91,15 @@ Diagnostic artifacts from this session are under `target/`: the before and after
 stack samples, the bounded live-rate logs, and the full regression-suite log.
 They are intentionally not committed because they contain local process data
 and are specific to this host load and build.
+
+
+## Host-load limitation
+
+At 18:57 local time, `uptime` reported load averages of 51.69 / 45.96 / 31.28
+on this 18-CPU host. The final 693-test suite passed, but took 197 seconds,
+compared with 75--103 seconds in earlier runs. Absolute speed measurements and
+small before/after differences are therefore noisy; the 6% observation is not
+a controlled maximum-throughput result. The native profiles and concurrency
+regression establish that the idle DSI/UI wait is removed independently of that
+speed comparison. A quieter-host measurement is still needed for sustained
+480/240 target-rate claims.
