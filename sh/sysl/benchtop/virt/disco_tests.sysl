@@ -4,6 +4,7 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.v6m as cpu
 import sh.sysl.elf as elf
 import sysl.time.{monotonic,millis}
+import sysl.threads.current
 
 private val DISCO_GUEST = embed("../../../../examples/touch/disco.elf")
 
@@ -103,3 +104,70 @@ disco_independent_pacing()
     boot(core0(),image_of(DISCO_GUEST).unwrap().view())
     assert(workers_observe().worker_ids == ids && !workers_observe().launched)
     assert(workers_observe().cores[0].retired == 0 && workers_observe().cores[1].retired == 0)
+
+private enable_dsi_for_test()
+    val c = core0()
+    for pair in [(0x430u32,0x01000001u32 | (100 << 2) | (5 << 11)),(0xa0,3),(0xa4,1),(0x404,8),(4,1)]
+        board_write(c,0x50000000 + pair.0,4,pair.1,0)
+
+@test("DSI worker: active display processing cannot block CPU workers behind a UI snapshot")
+dsi_worker_display_isolation()
+    assert(board_named("stm32h747-disco").is_ok())
+    boot(core0(),image_of(DISCO_GUEST).unwrap().view())
+    cpu.store16(core0(),0x24000100,0xe7fe)
+    cpu.store16(core0(),0x24000200,0xe7fe)
+    core0().pc = 0x24000100
+    launch(0x08100000,0x24070000,0x24000201)
+    enable_dsi_for_test()
+    board_write(core0(),0x5000006c,4,(0x29 << 8) | 5,0)
+    start_workers(core0(),true,2000000).unwrap()
+    defer stop_workers()
+    val ids = workers_observe().worker_ids
+    val device = dsi_worker_status().worker_id
+    assert(device != 0 && device != ids[0] && device != ids[1] && device != current().id)
+    display_lock.lock()
+    resume_workers()
+    val until = monotonic() + millis(500)
+    while monotonic() < until && workers_observe().cores[0].retired < 20000 do ()
+    val progress = workers_observe()
+    val pending = dsi_worker_status().outstanding
+    val enabled = tft_bindings.at(0).model.enabled
+    display_lock.unlock()
+    pause_workers()
+    assert(progress.cores[0].retired >= 20000 && progress.cores[1].retired > 1000)
+    assert(pending > 0 && !enabled,"the device worker is delayed by the UI reader while CPUs keep executing")
+    assert(tft_bindings.at(0).model.enabled && dsi_worker_status().outstanding == 0)
+
+@test("DSI worker: bounded FIFO applies backpressure without losing packets and readback follows writes")
+dsi_worker_fifo_readback()
+    assert(board_named("stm32h747-disco").is_ok())
+    boot(core0(),image_of(DISCO_GUEST).unwrap().view())
+    enable_dsi_for_test()
+    start_workers(core0()).unwrap()
+    defer stop_workers()
+    val c = core0()
+    var time: u64 = 1000
+    var sent: u64 = 0
+    display_lock.lock()
+    for i in 0..<80
+        if board_read(c,0x50000074,4,time) & 1 == 0 then break
+        board_write(c,0x5000006c,4,(0x29 << 8) | 5,time)
+        sent += 1
+        time += 1000
+    val blocked = board_read(c,0x50000074,4,time)
+    val queue = dsi_worker_status()
+    display_lock.unlock()
+    assert(c.stop == cpu.Stop.Budget && blocked & 3 == 2)
+    assert(queue.queued <= 64 && queue.outstanding <= 65)
+    flush_dsi_worker()
+    board_read(c,0x50000074,4,time + 1000)
+    flush_dsi_worker()
+    assert(dsi_worker_status().completed == sent,"every accepted packet must be consumed once")
+    board_write(c,0x5000006c,4,(0x3a << 8) | (0x55 << 16) | 0x15,time + 2000)
+    board_read(c,0x50000074,4,time + 3000)
+    flush_dsi_worker()
+    board_write(c,0x5000006c,4,(0x0c << 8) | 6,time + 4000)
+    board_read(c,0x50000074,4,time + 5000)
+    flush_dsi_worker()
+    assert(board_read(c,0x50000070,4,time + 6000) == 0x55)
+    assert(c.stop == cpu.Stop.Budget)

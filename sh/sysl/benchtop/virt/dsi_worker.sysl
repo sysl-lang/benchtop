@@ -21,6 +21,7 @@ private var dsi_handle: Option[Thread] = None
 private var dsi_done_gate = Mutex.new(0)
 private var dsi_done = Condvar.new()
 private var dsi_outstanding: u64 = 0
+private var dsi_completed: u64 = 0
 private var dsi_thread_id: u64 = 0
 private[virt] var dsi_async = false
 
@@ -28,14 +29,16 @@ struct DsiWorkerStatus
     worker_id: u64
     queued: usize
     outstanding: u64
+    completed: u64
 
 dsi_worker_status() -> DsiWorkerStatus = DsiWorkerStatus(atomic_load(&dsi_thread_id,Acquire),
-    if dsi_async then dsi_queue.len() else 0,atomic_load(&dsi_outstanding,Acquire))
+    if dsi_async then dsi_queue.len() else 0,atomic_load(&dsi_outstanding,Acquire),atomic_load(&dsi_completed,Acquire))
 
 private[virt] start_dsi_worker() -> Result[unit,string]
     if !has_dsi then return Ok(())
     dsi_queue = channel(dsi_slots[..])
     atomic_store(&dsi_outstanding,0,Release)
+    atomic_store(&dsi_completed,0,Release)
     atomic_store(&dsi_thread_id,0,Release)
     dsi_async = true
     dsi_host.defer_reads = true
@@ -53,9 +56,18 @@ private[virt] start_dsi_worker() -> Result[unit,string]
 // part of normal instruction execution or status polling.
 private[virt] flush_dsi_worker()
     if !dsi_async then return
-    dsi_done_gate.lock_raw()
-    while atomic_load(&dsi_outstanding,Acquire) != 0 do dsi_done.wait(&dsi_done_gate)
-    dsi_done_gate.unlock_raw()
+    loop
+        dsi_done_gate.lock_raw()
+        while atomic_load(&dsi_outstanding,Acquire) != 0 do dsi_done.wait(&dsi_done_gate)
+        dsi_done_gate.unlock_raw()
+        // A previously full queue may have held a due hardware command busy.
+        // Catch it up to the parked board clock before declaring the barrier.
+        dsi_reg_lock.lock()
+        advance_dsi(now)
+        publish_dsi_deadline()
+        val drained = atomic_load(&dsi_outstanding,Acquire) == 0
+        dsi_reg_lock.unlock()
+        if drained then return
 
 private[virt] stop_dsi_worker()
     if !dsi_async then return
@@ -100,6 +112,7 @@ private dsi_device_body(queue: *sysl.threads.Channel[DsiPacket])
             publish_dsi_deadline()
             dsi_reg_lock.unlock()
         dsi_done_gate.lock_raw()
+        atomic_add(&dsi_completed,1,AcqRel)
         atomic_sub(&dsi_outstanding,1,AcqRel)
         dsi_done.notify_all()
         dsi_done_gate.unlock_raw()
