@@ -44,6 +44,29 @@ import sysl.sync.*
 
 // The guest's RAM, from address 0. Code and data share it, as they do on an M0+ running from SRAM.
 const RAM_BYTES: u32 = 1024 * 1024
+const FLASH_BYTES: u32 = 4 * 1024 * 1024
+const FLASH_OFFSET: u32 = RAM_BYTES + 2 // Guard record prevents RAM fall-through into flash.
+const MEMORY_BYTES: u32 = FLASH_OFFSET + FLASH_BYTES
+var ram_base: u32 = 0
+var ram_size: u32 = RAM_BYTES
+var flash_base: u32 = 0x10000000
+var flash_size: u32 = 0
+var flash: [4194304]u8
+
+@inline
+ram_range(a: u32, width: u32) -> bool = a >= ram_base && u64(a) + u64(width) <= u64(ram_base) + u64(ram_size)
+
+@inline
+flash_range(a: u32, width: u32) -> bool = flash_size != 0 && a >= flash_base && u64(a) + u64(width) <= u64(flash_base) + u64(flash_size)
+
+@inline
+code_offset(a: u32) -> u32
+    if ram_range(a, 2) then return a - ram_base
+    if flash_range(a, 2) then return FLASH_OFFSET + a - flash_base
+    MEMORY_BYTES
+
+@inline
+code_address(offset: u32) -> u32 = if offset < FLASH_OFFSET then ram_base + offset else flash_base + offset - FLASH_OFFSET
 
 // One page-table entry per 4 KB page of the 4 GB address space. An entry is the host address of the
 // page's first byte, or 0 for a page with no fast path.
@@ -240,12 +263,15 @@ var line_stores: [2][16384]u32
 const LINE_CODE: u8 = 1
 const LINE_WATCHED: u8 = 2
 // One record per halfword of RAM, and the record for everywhere else.
-var decoded: [524289]Insn
+var decoded: [2621442]Insn
 // The same, for the second core while it has records of its own.
-var decoded_own: [524289]Insn
+var decoded_own: [2621442]Insn
 
 // A machine with `image` at address 0, ready to start at `entry`, and no devices.
 reset(cpu: *Cpu, image: []const u8, entry: u32)
+    ram_base = 0
+    ram_size = RAM_BYTES
+    flash_size = 0
     for i in 0..<ram.len do ram[i] = 0
     for i in 0..<image.len do ram[i] = image[i]
     for i in 0..<page_table.len do page_table[i] = 0
@@ -254,7 +280,8 @@ reset(cpu: *Cpu, image: []const u8, entry: u32)
     for i in 0..<code_lines.len
         line_stores[0][i] = 0
         line_stores[1][i] = 0
-    for i in 0..<decoded.len do decoded[i] = undecoded()
+    for i in 0..(RAM_BYTES >> 1) do decoded[i] = undecoded()
+    decoded[MEMORY_BYTES >> 1] = undecoded()
 
     clear(cpu, entry)
     cpu.io_read = &no_device_read
@@ -305,7 +332,9 @@ clear(cpu: *Cpu, entry: u32)
  * the writer's records and posts its line to the other core (`forget`).
  */
 pair(first: *Cpu, second: *Cpu)
-    for i in 0..<decoded_own.len do decoded_own[i] = undecoded()
+    for i in 0..(RAM_BYTES >> 1) do decoded_own[i] = undecoded()
+    for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + flash_size) >> 1) do decoded_own[i] = undecoded()
+    decoded_own[MEMORY_BYTES >> 1] = undecoded()
 
     second.dec = &decoded_own[0]
     first.peer = second
@@ -341,11 +370,12 @@ lower_limit(cpu: *Cpu, n: u64)
 // once, since the stop has spent the budget.
 @inline
 insn_at(cpu: *Cpu, a: u32) -> *Insn
-    if a < RAM_BYTES then return &cpu.dec[a >> 1]
+    val offset = code_offset(a)
+    if offset < MEMORY_BYTES then return &cpu.dec[offset >> 1]
 
     if cpu.stop == Stop.Budget then cpu.pc = a
     halt(cpu, Stop.Unmapped, a)
-    &cpu.dec[RAM_BYTES >> 1]
+    &cpu.dec[MEMORY_BYTES >> 1]
 
 // Stop the core for `why` at `at`, unless it has already stopped. A taken branch then comes back at
 // once, since the budget is gone, and leaves `pc` alone: whatever stops the core says where.
@@ -384,7 +414,9 @@ undecoded() -> Insn = Insn(&h_decode, 0, Op.Undecoded, 0, 0, 0)
 // The record at RAM address `pc` is being decoded from the bytes `pc` to `pc + 3`. A store whose
 // first byte is within 3 of them may write one of them, so the lines holding `pc - 3` to `pc + 3` are
 // marked as holding code.
-holds_code(pc: u32)
+holds_code(address: u32)
+    if !ram_range(address, 2) then return
+    val pc = address - ram_base
     val from = if pc >= 4 then pc - 4 else 0
     val to = if pc + 2 < RAM_BYTES then pc + 2 else RAM_BYTES - 1
 
@@ -392,22 +424,24 @@ holds_code(pc: u32)
 
 // A load-exclusive of the `width` bytes at RAM address `a`: watch the lines a store touching them
 // can start on, as `holds_code` marks code, and answer the other core's count of stores to `a`'s line.
-watch(cpu: *Cpu, a: u32, width: u32) -> u32
+watch(cpu: *Cpu, address: u32, width: u32) -> u32
+    val a = address - ram_base
     val from = if a >= 3 then a - 3 else 0
 
     for b in from..(a + width - 1) do atomic_or(&code_lines[b >> LINE_SHIFT], LINE_WATCHED, SeqCst)
 
-    others_stores(cpu, a)
+    others_stores(cpu, address)
 
 // The other core's count of stores to the line of RAM address `a`.
 @inline
-others_stores(cpu: *Cpu, a: u32) -> u32 = atomic_load(&line_stores[1 - cpu.core][a >> LINE_SHIFT], SeqCst)
+others_stores(cpu: *Cpu, a: u32) -> u32 = atomic_load(&line_stores[1 - cpu.core][(a - ram_base) >> LINE_SHIFT], SeqCst)
 
 // The store of `width` bytes just made at RAM address `a`: where it is on a line holding code, every
 // record that read any of its bytes is decoded again when control next reaches it, and where it is on
 // a watched line, the store is counted. A store to a line of neither costs this one test.
 @inline
-stored(cpu: *Cpu, a: u32, width: u32)
+stored(cpu: *Cpu, address: u32, width: u32)
+    val a = address - ram_base
     val mark = atomic_load(&cpu.lines[a >> LINE_SHIFT], Relaxed)
 
     if mark != 0 then touched(cpu, a, width, mark)
@@ -508,7 +542,7 @@ target_of(ip: *Insn) -> *Insn = &ip[i32(ip.imm)]
 
 // The guest address of a record.
 @inline
-addr_of(cpu: *Cpu, ip: *Insn) -> u32 = u32(ip - cpu.dec) << 1
+addr_of(cpu: *Cpu, ip: *Insn) -> u32 = code_address(u32(ip - cpu.dec) << 1)
 
 // ---------------------------------------------------------------------------------------------------
 // Memory. The fast path is one table load, one test and one host access; everything else (a page
@@ -530,7 +564,7 @@ page_of(cpu: *Cpu, a: u32) -> usize = cpu.pages[a >> PAGE_SHIFT]
 // unaligned access at the RAM's very end would reach the host memory after it, and it takes the
 // slow path, which stops the core on it.
 @inline
-page_for(cpu: *Cpu, a: u32, width: u32) -> usize = if a + width > RAM_BYTES && a < RAM_BYTES then 0 else page_of(cpu, a)
+page_for(cpu: *Cpu, a: u32, width: u32) -> usize = if ram_range(a, width) || flash_range(a, width) then page_of(cpu, a) else 0
 
 // The slow path of a read, `width` bytes at `a`.
 slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
@@ -601,6 +635,9 @@ load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
 
 @inline
 store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
+    if flash_range(a, 1)
+        halt(cpu, Stop.Fault, a)
+        return false
     val page = page_for(cpu, a, width)
 
     if page == 0
@@ -638,6 +675,9 @@ read8(cpu: *Cpu, a: u32, n: u64) -> u32
 
 @inline
 write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if flash_range(a, 1)
+        halt(cpu, Stop.Fault, a)
+        return
     val page = page_for(cpu, a, width)
 
     if page == 0
@@ -768,3 +808,18 @@ ror_reg(cpu: *Cpu, x: u32, by: u32) -> u32
 
     cpu.c = res >> 31
     res
+
+/** Reset memory from a packed image: RAM backing first, then flash contents.
+ * Mappings are page aligned and validated by the board assembler.
+ */
+reset_mapped(cpu: *Cpu, image: []const u8, ram_at: u32, ram_length: u32, flash_at: u32, flash_length: u32)
+    reset(cpu, if image.len > usize(RAM_BYTES) then image[..<usize(RAM_BYTES)] else image, 0)
+    ram_base = ram_at
+    ram_size = ram_length
+    flash_base = flash_at
+    flash_size = flash_length
+    for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do page_table[p] = 0
+    for p in 0..<(ram_size >> PAGE_SHIFT) do page_table[(ram_base >> PAGE_SHIFT) + p] = usize(&ram[p << PAGE_SHIFT])
+    for i in 0..<flash_size do flash[i] = image[usize(RAM_BYTES + i)]
+    for p in 0..<(flash_size >> PAGE_SHIFT) do page_table[(flash_base >> PAGE_SHIFT) + p] = usize(&flash[p << PAGE_SHIFT])
+    for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + flash_size) >> 1) do decoded[i] = undecoded()
