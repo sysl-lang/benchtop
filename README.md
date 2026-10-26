@@ -110,8 +110,11 @@ reload and shutdown wait for a safe boundary. No worker is recreated per frame.
 Normal paced workers each use their own configured clock domain and monotonic
 host-time checkpoints. The coordinator no longer distributes short lockstep
 pacing batches. Live per-core snapshots are published independently; pause,
-reset and debugger steps still obtain a coherent stopped pair. The separate
-guest-time ordering bound remains in force for shared-state correctness.
+reset and debugger steps still obtain a coherent stopped pair. Real-time cores have no global time-lead limit: a slower core reports lateness
+rather than holding its peer back. Shared RAM atomics, explicit firmware barriers,
+FIFO ordering and device locks remain. Cycle-accurate cross-core instruction
+ordering is not promised; explicit deterministic/manual execution retains the
+older coordinated scheduler.
 The board view uses a fixed 1:1 layout scale; resizing changes its viewport,
 not the size of its components. TFT images use one guest pixel per framebuffer
 pixel, including on Retina displays, so firmware antialiasing is not enlarged
@@ -657,3 +660,15 @@ DMA2D, SAI/DMA audio, the remaining RAM banks, external memory, full RCC/PWR and
 panel-specific vendor initialization are still missing. I2C4 is a functional
 polling adapter, without SCL timing or interrupts. See
 [the hardware target and supported subset](docs/stm32h747i-disco.md).
+
+
+Normal DSI sessions also have a dedicated device worker. CPU workers enqueue
+completed packets through a bounded 64-packet host channel; pixel decoding runs
+outside the CPU workers and outside the channel lock. The register lock is
+separate from the UI/display lock. A full queue exposes command-busy backpressure
+rather than dropping packets or making a CPU wait for painting. This is a host
+work queue, not an extra hardware FIFO; the emulated payload FIFO remains 1024
+bytes. Read replies are ordered after earlier packets, and cancelled replies
+cannot populate newer requests. Pause, step, reset and shutdown drain completed
+work before inspection. Deterministic/headless execution can use the synchronous
+endpoint path.

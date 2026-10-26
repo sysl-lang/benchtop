@@ -135,3 +135,39 @@ load changed, and the conservative guest-time ordering limit still couples
 shared execution. The change separates per-core wall-clock pacing and
 publication from that ordering policy; further ordering/peripheral optimization
 is required before claiming sustained full-clock emulation for this workload.
+
+
+## Real-time cores and DSI now execute independently
+
+Normal paced execution no longer applies the global peer-clock lead limit or
+periodic shared job horizons. Each CPU runs until a control request or guest
+stop and paces against its own host-time epoch. Sleeping CPUs use their own
+pacing/event deadline. A delayed CPU reports `late_us` in observations and the
+optional live trace; the desktop warns above 5 ms without masking an existing
+diagnostic. The ISA-independent policy applies to matching and heterogeneous
+core models. Explicit deterministic and unpaced manual jobs retain coordinated
+virtual-time behavior for repeatable tests.
+
+This intentionally trades cycle-level cross-core timing fidelity for real-time
+functional emulation. Host atomic shared-memory accesses, firmware barriers,
+FIFO ordering and shared peripheral locks still apply; firmware must synchronize
+shared data as it would on hardware. One core's instruction count no longer
+limits its peer. A regression blocks a core in a host device callback and
+requires its peer to continue retiring instructions while the blocked core
+reports lateness.
+
+DSI display interpretation now has its own persistent host worker, with an
+existing `Channel[DsiPacket]` providing bounded semaphore-style handoff. CPU
+producers use nonblocking queue submission under the small register lock. The
+device worker releases the channel lock before taking the display lock or
+processing pixels. A full host queue applies command-busy backpressure; it does
+not block unrelated CPU instruction execution or discard accepted packets.
+Readback is deferred and ordered, with request IDs rejecting stale replies after
+cancellation. Pause/reset/step/shutdown barriers drain completed packets and
+catch up any command whose queue backpressure has cleared at the parked time.
+
+A second regression deliberately holds the UI display lock while DSI work is
+pending, and requires both CPU workers to progress on threads distinct from the
+DSI worker. Further tests cover bounded queue saturation, consume-once behavior,
+write/read ordering and worker persistence across reset. The previous throughput
+numbers describe earlier scheduler versions and must be remeasured for this one.
