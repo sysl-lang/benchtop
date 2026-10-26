@@ -36,6 +36,18 @@ its corresponding LED. Turn **RV1** on the board (drag around the dial), or use
 its inspector slider, to change the ADC input. Sysl firmware multiplexes the four-digit
 **DS1** display through GPIO: `0000` at minimum, `2048` halfway and `4095` at maximum.
 The demo produces no console output.
+Hover over **RV1** or its small plot icon for a live ADC preview. Click the icon,
+right-click RV1, or use **RV1 · ADC result** in the toolbar to open a movable,
+resizable instrument window. **Hold / Resume** freezes only the instrument;
+**Clear** clears its history. In that window, **Space** toggles Hold and **C** clears.
+Closing it leaves the firmware running. The **Guest / Build** output tabs remain
+available even when the firmware is quiet.
+
+Instruments are configured separately from hardware descriptions. The demo loads
+[instruments/workbench.hocon](instruments/workbench.hocon); other windowed sessions
+can load an instrument set with `--instruments file.hocon`.
+See [instrument configuration and numeric sources](docs/instruments.md).
+
 **Space** pauses, **N** executes one instruction per active
 core, **R** resets, **S** saves a PNG, and **Escape** closes the window. The toolbar
 provides the same controls. Click a part to inspect its wiring. The scrollable inspector shows wiring, signal
