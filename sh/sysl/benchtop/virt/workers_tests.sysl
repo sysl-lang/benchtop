@@ -2,7 +2,8 @@ module sh.sysl.benchtop.virt
 @tests
 
 import sh.sysl.benchtop.v6m as cpu
-import sysl.threads.current
+import sysl.threads.{current,Mutex,Condvar}
+import sysl.sync.*
 import sysl.time.{monotonic,millis}
 import sysl.raw.str_cast
 import sh.sysl.elf as elf
@@ -289,3 +290,42 @@ worker_rejected_clock()
     assert(worker_clock_limit(core0()) == cpu.NEVER && worker_checkpoint(core0()))
     assert(pump_board(core0(),1000) && core0().retired > 0)
     core_clock_divisors = [1,1]
+
+private var stalled_gate = Mutex.new(0)
+private var stalled_changed = Condvar.new()
+private var stalled_entered: u32 = 0
+private var stalled_release: u32 = 0
+
+private stalled_read(c: *cpu.Cpu, address: u32, width: u32, retired: u64) -> u32
+    stalled_gate.lock_raw()
+    atomic_store(&stalled_entered,1,Release)
+    while atomic_load(&stalled_release,Acquire) == 0 do stalled_changed.wait(&stalled_gate)
+    stalled_gate.unlock_raw()
+    0
+
+@test("CPU workers: a delayed device on one core cannot stop another core's independently paced execution")
+worker_peer_isolation()
+    val reader: [6]u16 = [0x4801,0x6801,0xe7fe,0xbf00,0,0x6000]
+    started(core0(),image([(0x100,SPINNER[..]),(0x200,reader[..])]).view())
+    launch(0,0x7000,0x201)
+    core1().io_read = &stalled_read
+    atomic_store(&stalled_entered,0,Release)
+    atomic_store(&stalled_release,0,Release)
+    start_workers(core0(),true,2000000).unwrap()
+    defer stop_workers()
+    resume_workers()
+    val deadline = monotonic() + millis(1000)
+    while monotonic() < deadline && atomic_load(&stalled_entered,Acquire) == 0 do ()
+    val entered = atomic_load(&stalled_entered,Acquire) != 0
+    val before = workers_observe().cores[0].retired
+    val end = monotonic() + millis(40)
+    while monotonic() < end do ()
+    val during = workers_observe()
+    stalled_gate.lock_raw()
+    atomic_store(&stalled_release,1,Release)
+    stalled_changed.notify_all()
+    stalled_gate.unlock_raw()
+    pause_workers()
+    assert(entered,"the second guest must have entered the delayed device")
+    assert(during.cores[0].retired > before + 10000,"the runnable core cannot be held at its peer's clock or a shared job boundary")
+    assert(during.cores[1].late_us > 5000,"a delayed core reports lateness without holding back its peer")
