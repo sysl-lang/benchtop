@@ -96,15 +96,85 @@ lcd_tick(gpio: *Gpio, task: *LcdTask)
             if task.character < message.len then task.stage = 10
         _ -> ()
 
+// SSD1306 four-wire SPI: SCK=GP6, MOSI=GP7, CS=GP27, DC=GP28, RESET=GP29.
+const OLED_MASK: u32 = (3 << 6) | (7 << 27)
+
+struct OledTask
+    stage: u32
+    wait: u32
+    index: usize
+    reading: u32
+
+// Mode 0, MSB first. Each byte yields back to the ordinary firmware loop.
+oled_byte(gpio: *Gpio, byte: u32, data: bool)
+    val base = (gpio.out & ~(OLED_MASK & ~(1u32 << 29))) | (if data then 1 << 28 else 0)
+    gpio.out = base
+    for bit in 0..<8
+        val pins = base | (if (byte & (128u32 >> u32(bit))) != 0 then 1 << 7 else 0)
+        gpio.out = pins
+        gpio.out = pins | (1 << 6)
+        gpio.out = pins
+    gpio.out = base | (1 << 27)
+
+// A framebuffer byte in SSD1306 page layout, generated entirely by guest software.
+oled_pixels(index: usize, reading: u32) -> u32
+    val page = u32(index >> 7)
+    val x = u32(index & 127)
+    if page == 1 && x >= 52 && x < 76
+        val title: [24]u8 = [127,8,20,34,65,0,127,4,8,16,127,0,62,65,65,65,62,0,127,73,73,73,54,0]
+        return u32(title[usize(x - 52)]) // KNOB
+    val length = (reading * 112 + 2048) >> 12
+    var byte: u32 = 0
+    for bit in 0..<8
+        val y = page * 8 + u32(bit)
+        val outline = ((x == 4 || x == 123) && y >= 25 && y <= 50) || ((y == 25 || y == 50) && x >= 4 && x <= 123)
+        val fill = y >= 29 && y <= 46 && x >= 8 && x < 8 + length
+        val ticks = y >= 54 && y <= 57 && (x == 8 || x == 36 || x == 64 || x == 92 || x == 119)
+        if outline || fill || ticks then byte |= 1u32 << u32(bit)
+    byte
+
+oled_tick(gpio: *Gpio, task: *OledTask, reading: u32)
+    if task.wait > 0
+        task.wait -= 1
+        return
+    task.stage match
+        0 ->
+            gpio.out = gpio.out | (1 << 29) | (1 << 27)
+            task.stage = 1
+            task.wait = 16
+        1 ->
+            val setup: [25]u8 = [0xAE,0xD5,0x80,0xA8,0x3F,0xD3,0,0x40,0x8D,0x14,0x20,0,0xA0,0xC0,0xDA,0x12,0x81,0xCF,0xD9,0xF1,0xDB,0x40,0xA4,0xA6,0xAF]
+            oled_byte(gpio, u32(setup[task.index]), false)
+            task.index += 1
+            if task.index == setup.len
+                task.index = 0
+                task.stage = 2
+        2 ->
+            val window: [6]u8 = [0x21,0,127,0x22,0,7]
+            oled_byte(gpio, u32(window[task.index]), false)
+            task.index += 1
+            if task.index == window.len
+                task.index = 0
+                task.reading = reading
+                task.stage = 3
+        3 ->
+            oled_byte(gpio, oled_pixels(task.index, task.reading), true)
+            task.index += 1
+            if task.index == 1024 then task.stage = 4
+        _ -> if reading != task.reading
+            task.index = 0
+            task.stage = 2
+
 @export("start")
 start() -> never
     val gpio: *Gpio = ptr_cast(usize(0x50000000))
     val adc: *Adc = ptr_cast(usize(0x50000100))
     // Cathode commons are active low. Set them inactive before enabling output drivers.
     val commons_off: u32 = 0xF << 18
-    gpio.out = commons_off
-    gpio.oe = 7 | (0xFFF << 10) | LCD_MASK
+    gpio.out = commons_off | (1 << 27)
+    gpio.oe = 7 | (0xFFF << 10) | LCD_MASK | OLED_MASK
     var lcd_task = LcdTask(0, 2000, 0)
+    var oled_task = OledTask(0, 16, 0, 0)
     var count: u32 = 0
     var heartbeat: u32 = 0
     var previous: u32 = 0xFFFFFFFF
@@ -142,10 +212,11 @@ start() -> never
         val numeral = if scan == 0 then thousands elif scan == 1 then hundreds elif scan == 2 then tens else units
         val pattern = segments(numeral) << 10
         lcd_tick(gpio, &lcd_task)
-        val lcd_lines = gpio.out & LCD_MASK
+        oled_tick(gpio, &oled_task, reading)
+        val display_lines = gpio.out & (LCD_MASK | OLED_MASK)
         // Blank every common before changing shared segment lines, then select one digit.
-        gpio.out = lcd_lines | leds | commons_off
-        gpio.out = lcd_lines | leds | commons_off | pattern
-        gpio.out = lcd_lines | leds | (commons_off & ~(1u32 << (18 + scan))) | pattern
+        gpio.out = display_lines | leds | commons_off
+        gpio.out = display_lines | leds | commons_off | pattern
+        gpio.out = display_lines | leds | (commons_off & ~(1u32 << (18 + scan))) | pattern
         scan += 1
         if scan == 4 then scan = 0

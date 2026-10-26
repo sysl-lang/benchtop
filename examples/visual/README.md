@@ -163,3 +163,57 @@ The controller protocol follows the [Hitachi HD44780U datasheet](https://cdn-sho
 As with DS1, the visible message comes entirely from guest GPIO writes; the UI does
 not inject a greeting. Reset clears LCD memory and bus state, and the firmware
 initializes it again.
+
+## Graphical OLED
+
+DS3 is a built-in `ssd1306` part with 128×64 monochrome pixels and a four-wire SPI
+interface. The firmware initializes the controller and draws a KNOB gauge that
+follows RV1. Firmware generates all framebuffer bytes; the UI reads controller
+GDDRAM and never translates an ADC value directly into display pixels.
+
+| Terminal | MCU pin |
+| --- | --- |
+| SCK | GP6 |
+| MOSI | GP7 |
+| CS (active low) | GP27 |
+| DC (command low, data high) | GP28 |
+| RESET (active low) | GP29 |
+
+```hocon
+oled {
+  part = ssd1306
+  ref = DS3
+  sck = controller.GP6
+  mosi = controller.GP7
+  cs = controller.GP27
+  dc = controller.GP28
+  reset = controller.GP29
+}
+```
+
+All five terminals are required. Use an explicit size for the part's view element;
+its controller memory is fixed at 128×64 pixels. The current transport is GPIO
+bit-banging, with a reusable SPI receiver that samples mode-0 rising edges,
+most-significant bit first. Deselection, undriven bus terminals and reset abort
+partial bytes. DC must remain stable for the whole byte. No dedicated MCU SPI
+peripheral is required for this firmware.
+
+The controller implements horizontal, vertical and page addressing, column/page
+windows and wrap, display enable, normal/inverse and all-on modes, segment/COM
+remapping, display start line/offset, multiplex ratio and stored contrast.
+Electrical setup command arguments are accepted so normal initialization sequences
+work. Hardware reset restores configuration and retains GDDRAM; a new emulated
+board boot starts with deterministic blank memory.
+
+The firmware sends one SPI byte per normal loop iteration and captures the ADC
+value at the start of each framebuffer. This keeps digit scanning, buttons, ADC
+sampling and LCD initialization running during refresh. A changed knob reading
+starts another complete frame after the current one finishes. Pins belonging to
+other components are preserved by both display drivers.
+
+This first model implements four-wire SPI only. I2C, three-wire SPI, controller
+scroll animation and electrical brightness behavior remain unimplemented. Scroll
+setup commands consume their arguments but do not animate. The protocol and
+memory layout follow the [Solomon Systech SSD1306 datasheet](https://docs.sparkfun.com/SparkFun_Qwiic_OLED_1.3in/assets/board_files/SSD1306.pdf).
+The GPIO and ADC MMIO addresses are still the workbench's virtual registers; real
+hardware needs the corresponding MCU register interface and SPI timing calibration.

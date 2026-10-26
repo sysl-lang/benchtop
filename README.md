@@ -36,7 +36,8 @@ its corresponding LED. Turn **RV1** on the board (drag around the dial), or use
 its inspector slider, to change the ADC input. Sysl firmware multiplexes the four-digit
 **DS1** display through GPIO: `0000` at minimum, `2048` halfway and `4095` at maximum.
 The GPIO-connected **DS2** character LCD shows **“Hello from Benchtop!”** after
-firmware initialization. The demo produces no console output.
+firmware initialization. The **DS3** 128×64 SSD1306 OLED shows a graphical knob
+gauge, sent by the sysl firmware over GPIO SPI. The demo produces no console output.
 Click **RV1**’s small plot icon, right-click RV1, or use **RV1 · ADC result**
 in the toolbar to open a movable,
 resizable instrument window. **Hold / Resume** freezes only the instrument;
