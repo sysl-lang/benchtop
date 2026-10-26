@@ -45,15 +45,17 @@ through PlutoVG and compared with the previous RGB565 image. Unchanged frames
 skip rasterization, pixel scanning and SPI entirely. Interaction runs once per
 input, regardless of how many bands are redrawn.
 
-Guest tick measurements show unchanged input dropping from about 3.4 million
-ticks to 12 thousand, button release from 4.6 million to 2.2 million, and steady
-slider dragging from about 3.9 million to 1.1 million. These are emulator
-instruction ticks, not hardware cycle timings. Matching command prefixes and suffixes remain clean when focus adds an outline.
-The changed middle is still compared by position. The firmware
+With rounded widgets and hardware SPI, unchanged input drops from about 3.69
+million guest ticks for full replay to 12 thousand with damage tracking. Button
+press/release take about 1.43/1.75 million ticks (9.5/11.7 ms at the 150 MHz target),
+and steady slider dragging takes about 939 thousand. These are emulator
+instruction ticks, not hardware cycle timings. Matching command prefixes and
+suffixes remain clean when focus adds an outline. The changed middle is still
+compared by position. The firmware
 exports `touch_profile` with rendering, flush and SPI ticks plus transmitted byte
 and pixel counts. The performance test writes `target/touch-performance.txt`,
-checks idle/drag budgets, and compares eight complete image hashes against the
-preceding full-screen renderer.
+checks idle/drag budgets, and compares eight complete image hashes against a separately built
+full-replay firmware image (`./examples/touch/build.sh full`).
 
 The MCU now declares `clock-hz = 150000000`, and the desktop paces guest
 execution at that target. Peripheral timebases inherit it. This is one tick per
@@ -142,3 +144,18 @@ Normal desktop execution runs launched guest cores on separate host threads.
 Workers finish each bounded batch before the UI snapshots state or reloads the
 firmware. `--deterministic` selects reproducible serial interleaving; headless
 runs and firmware tests retain deterministic pumping.
+
+## Rounded imui styling
+
+The firmware enables `imui` 0.3.0 rounded widgets with `theme.radius = 8`.
+PlutoVG performs the antialiased rasterization inside the MCU. The native-pixel
+host view displays those RGB565 pixels directly. Changing the theme radius
+changes the command record and therefore damages the appropriate display bands;
+unchanged rounded shapes do not repaint. Square styling remains available by
+setting radius to zero. Buttons, toggle track/knob and slider track/thumb are
+rounded; the progress bar keeps its existing square design.
+
+The full-reference firmware and GPIO-SPI firmware are built from the same source
+using `full_redraw` and `gpio_spi` features. Tests compare full replay with damage
+replay through eight interaction states, check antialiased corner pixels and
+corner hit targets, and keep button redraws within a 60 Hz guest-frame budget.
