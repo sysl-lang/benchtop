@@ -5,9 +5,10 @@ transport=${1:-spi}
 case "$transport" in
     spi) feature_args=""; output=demo.elf ;;
     gpio) feature_args="--features gpio_spi"; output=gpio.elf ;;
+    dsi) feature_args="--features h7_cores,dsi"; output=disco.elf ;;
     h7) feature_args="--features h7_cores"; output=h7.elf ;;
     full) feature_args="--features full_redraw"; output=full.elf ;;
-    *) echo "usage: $0 [spi|gpio|full|h7]" >&2; exit 2 ;;
+    *) echo "usage: $0 [spi|gpio|full|h7|dsi]" >&2; exit 2 ;;
 esac
 build_dir=$(mktemp -d)
 trap 'rm -rf "$build_dir"' EXIT HUP INT TERM
@@ -17,7 +18,7 @@ target=thumb-freestanding
 cpu=cortex-m33
 fpu=fpv5-sp-d16
 script=demo.ld
-if [ "$transport" = h7 ]; then
+if [ "$transport" = h7 ] || [ "$transport" = dsi ]; then
     target=thumbv7em-freestanding
     cpu=cortex-m4
     fpu=fpv4-sp-d16

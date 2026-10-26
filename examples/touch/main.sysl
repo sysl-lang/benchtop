@@ -123,6 +123,83 @@ struct Spi
 
 spi_bus() -> *Spi = ptr_cast(usize(0x50001000))
 
+#if feature_dsi
+// STM32 DSI host command-mode registers, with 500 Mbit/s on each of two lanes.
+word(at: u32) -> *Word = ptr_cast(usize(at))
+
+dsi_wait()
+    while word(0x50000074).value & 1 == 0 do ()
+
+dsi_short(command: u32, parameter: u32 = 0, has_parameter: bool = false)
+    dsi_wait()
+    word(0x5000006c).value = (if has_parameter then 0x15u32 else 5u32) | (command << 8) | (parameter << 16)
+    dsi_wait()
+
+dsi_window(left: int, top: int, right: int, bottom: int)
+    dsi_wait()
+    word(0x50000070).value = 0x2a | (u32(left >> 8) << 8) | (u32(left & 255) << 16) | (u32(right >> 8) << 24)
+    word(0x50000070).value = u32(right & 255)
+    word(0x5000006c).value = 0x39 | (5 << 8)
+    dsi_wait()
+    word(0x50000070).value = 0x2b | (u32(top >> 8) << 8) | (u32(top & 255) << 16) | (u32(bottom >> 8) << 24)
+    word(0x50000070).value = u32(bottom & 255)
+    word(0x5000006c).value = 0x39 | (5 << 8)
+    dsi_wait()
+
+dsi_pixels(command: u32, first: int, count: int, blank: bool = false)
+    dsi_wait()
+    var packed = command
+    var shift: u32 = 8
+    for i in 0..<count
+        val color = if blank then 0u32 else u32(pixel565(first + i))
+        for byte in [color >> 8,color & 255]
+            packed |= byte << shift
+            shift += 8
+            if shift == 32
+                word(0x50000070).value = packed
+                packed = 0
+                shift = 0
+    if shift != 0 then word(0x50000070).value = packed
+    word(0x5000006c).value = 0x39 | (u32(1 + count * 2) << 8)
+    dsi_wait()
+
+dsi_initialize()
+    word(0x50000430).value = 0x01000001
+    while word(0x5000040c).value & 0x1100 != 0x1100 do ()
+    word(0x500000a0).value = 3
+    word(0x500000a4).value = 1
+    word(0x50000034).value = 1
+    word(0x50000404).value = 8
+    word(0x50000004).value = 1
+    dsi_short(0x11)
+    dsi_short(0x3a,0x55,true)
+    // Initialize the complete physical glass, not just the UI's 240x240 region.
+    dsi_window(0,0,799,479)
+    for i in 0..<1500 do dsi_pixels(if i == 0 then 0x2c else 0x3c,0,256,true)
+    dsi_short(0x29)
+
+// I2C4 polling using STM32 v2 flags and one-byte FT6206 register addresses.
+ft_read(register: u32, bytes: []u32)
+    word(0x58001c1c).value = (1 << 4) | (1 << 5)
+    word(0x58001c04).value = 0x54 | (1 << 16) | (1 << 13)
+    while word(0x58001c18).value & 2 == 0 do ()
+    word(0x58001c28).value = register
+    while word(0x58001c18).value & (1 << 6) == 0 do ()
+    word(0x58001c04).value = 0x54 | (u32(bytes.len) << 16) | (1 << 10) | (1 << 13) | (1 << 25)
+    for i in 0..<bytes.len
+        while word(0x58001c18).value & 4 == 0 do ()
+        bytes[i] = word(0x58001c24).value
+
+poll_focal(last: Input) -> Option[Input]
+    var report: [7]u32 = [0;7]
+    ft_read(2,report[..])
+    val down = report[0] & 15 != 0
+    val x = int(((report[1] & 15) << 8) | report[2]) - 280
+    val y = int(((report[3] & 15) << 8) | report[4]) - 120
+    if down == last.down && (!down || (x == last.x && y == last.y)) then return None
+    Some(pointer(if down then x else last.x,if down then y else last.y,down))
+#endif
+
 // Keep the original transport as a buildable firmware feature.
 // Ordinary mode-0 SPI: SCK GP0, MOSI GP1, CS GP2, DC GP3, RESET GP4.
 gpio_spi(gpio: *Gpio, byte: u32, data: bool)
@@ -179,6 +256,19 @@ pixel565(at: int) -> u16
 
 // Only changed pixel runs go over SPI; idle UI frames transmit nothing.
 flush(gpio: *Gpio, first_frame: bool, only: Rect)
+#if feature_dsi
+    for y in only.y..<only.bottom()
+        var x = only.x
+        while x < only.right()
+            if !first_frame && pixel565(y * 240 + x) == previous[y * 240 + x]
+                x += 1
+                continue
+            val first = x
+            while x < only.right() && (first_frame || pixel565(y * 240 + x) != previous[y * 240 + x]) do x += 1
+            dsi_window(first + 280,y + 120,x - 1 + 280,y + 120)
+            dsi_pixels(0x2c,y * 240 + first,x - first)
+            for i in first..<x do previous[y * 240 + i] = pixel565(y * 240 + i)
+#else
     for y in only.y..<only.bottom()
         var x = only.x
         while x < only.right()
@@ -210,6 +300,8 @@ flush(gpio: *Gpio, first_frame: bool, only: Rect)
             spi_finish(gpio)
 #endif
             profile.spi += elapsed(started)
+
+#endif
 
 begin(bus: *I2c, register: u32)
     bus.address = 0x5D
@@ -278,7 +370,9 @@ draw_frame(ui: *Ui, painter: *PlutoPainter, gpio: *Gpio, input: Input,
     val mask = if first then all_bands(30) else damage(old, rec.recorded(), screen, 30)
 #endif
     profile.render = elapsed(started)
+#if !feature_dsi
     gpio.out = (gpio.out & ~32u32) | (if app.enabled then 32 else 0)
+#endif
     var next = next_band(mask, 30, screen, 0)
     while next.is_some()
         val band = next.unwrap()
@@ -305,6 +399,13 @@ start() -> never
             "isb"
             clobbers "memory"
         [aarch64, x86_64, riscv64, riscv32, wasm32, craft] unavailable "Cortex-M firmware"
+#if feature_dsi
+    val gpio: *Gpio = ptr_cast(usize(0)) // Unused by the DSI transport.
+    val bus: *I2c = ptr_cast(usize(0)) // FT6206 uses real I2C4 registers below.
+    dsi_initialize()
+    word(0x58001c10).value = 0x10c0ecff
+    word(0x58001c00).value = 1
+#else
     val gpio: *Gpio = ptr_cast(usize(0x50000000))
     val bus: *I2c = ptr_cast(usize(0x50000300))
     gpio.out = 4
@@ -326,6 +427,7 @@ start() -> never
     spi(gpio, 0x3A, false)
     spi(gpio, 0x55, true) // RGB565.
     spi(gpio, 0x29, false) // Display on.
+#endif
     val systick: *Gpio = ptr_cast(usize(0xE000E010))
     systick.input = 0xFFFFFF
     systick.oe = 0
@@ -339,7 +441,11 @@ start() -> never
     var count = draw_frame(&ui, &painter, gpio, input, commands_a[..], [], true)
     var previous_a = true
     loop
+#if feature_dsi
+        poll_focal(input) match
+#else
         poll_touch(bus, input) match
+#endif
             Some(next) ->
                 input = next
                 if previous_a
