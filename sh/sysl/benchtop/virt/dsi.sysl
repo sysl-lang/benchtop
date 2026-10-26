@@ -1,0 +1,87 @@
+module sh.sysl.benchtop.virt
+
+import sh.sysl.benchtop.{Board,param_named,part_model,part_whole}
+import sh.sysl.benchtop.peripheral.dsi as dsi
+import sh.sysl.benchtop.parts.mipi_dcs as dcs
+import sh.sysl.benchtop.v6m.{Cpu,Stop,NEVER,halt,lower_limit}
+import sysl.buf.{Buf,buf}
+
+var dsi_host = dsi.host(480000000)
+private var has_dsi = false
+
+private[virt] configure_dsi(b: Board) -> Result[unit,string]
+    has_dsi = false
+    var rate: u64 = 500000000
+    for p in b.chip.peripherals
+        if p.kind != "stm32-dsi" then continue
+        has_dsi = true
+        param_named(p.params,"lane-bit-rate") match
+            Some(q) -> q.value match
+                Whole(n) -> rate = u64(n)
+                _ -> ()
+            None -> ()
+    if has_dsi && board_clock_hz == 0 then return Err("stm32-dsi requires mcu.clock-hz for its transfer timebase")
+    dsi_host = dsi.host(if has_dsi then board_clock_hz else 480000000,rate)
+    var channels: u32 = 0
+    for p in b.parts
+        if part_model(p) != "mipi-dcs-display" then continue
+        if !has_dsi then return Err("DSI display requires a stm32-dsi peripheral")
+        val vc = u32(part_whole(p,"channel",0))
+        if channels & (1u32 << vc) != 0 then return Err("two DSI displays share a virtual channel")
+        channels |= 1u32 << vc
+    Ok(())
+
+private[virt] boot_dsi()
+    dsi_host = dsi.host(dsi_host.hz,dsi_host.lane_rate)
+
+// Invoked under display_lock at packet completion, never from host painting.
+private dsi_endpoint(vc: u32, kind: u32, payload: []const u8) -> Buf[u8]
+    var response: Buf[u8] = buf()
+    for b in tft_bindings
+        if b.dsi_channel != int(vc) then continue
+        if kind == 0x05 || kind == 0x15 || kind == 0x39
+            if payload.len == 0 then return response
+            dcs.write(b.model,false,payload[0])
+            for i in 1..<payload.len do dcs.write(b.model,true,payload[i])
+        elif kind == 0x06 && payload.len == 1
+            payload[0] match
+                0x0a -> response.push(0x88 | (if b.model.sleeping then 0 else 16) | (if b.model.enabled then 4 else 0))
+                0x0b -> response.push(b.model.madctl)
+                0x0c -> response.push(b.model.format)
+                _ -> ()
+    response
+
+private[virt] signal_dsi(c: *Cpu)
+    if !has_dsi then return
+    display_lock.lock()
+    defer display_lock.unlock()
+    dsi.advance(dsi_host,board_time(c,c.retired),&dsi_endpoint)
+
+private[virt] dsi_due() -> u64
+    if !has_dsi then return NEVER
+    display_lock.lock()
+    defer display_lock.unlock()
+    if dsi_host.busy then dsi_host.due else NEVER
+
+private[virt] dsi_read(c: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
+    if width != 4 || offset & 3 != 0
+        halt(c,Stop.Fault,address)
+        return 0
+    display_lock.lock()
+    defer display_lock.unlock()
+    dsi.advance(dsi_host,board_time(c,n),&dsi_endpoint)
+    dsi.read(dsi_host,offset) match
+        Some(v) -> v
+        None ->
+            halt(c,Stop.Unmapped,address)
+            0
+
+private[virt] dsi_write(c: *Cpu, address: u32, offset: u32, width: u32, value: u32, n: u64)
+    if width != 4 || offset & 3 != 0
+        halt(c,Stop.Fault,address)
+        return
+    display_lock.lock()
+    defer display_lock.unlock()
+    dsi.advance(dsi_host,board_time(c,n),&dsi_endpoint)
+    if !dsi.write(dsi_host,offset,value) then halt(c,Stop.Fault,address)
+    if dsi_host.busy then lower_limit(c,retirement_limit(c,dsi_host.due))
