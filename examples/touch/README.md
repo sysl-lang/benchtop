@@ -31,14 +31,30 @@ embeds the OFL-licensed ABeeZee TrueType font in flash, and rasterizes into a
 The host does not draw guest text or substitute native widgets for the firmware.
 
 The example uses Cortex-M33 cores with the single-precision FPU enabled, 520 KB
-of MCU RAM, and a bounded 128 KB newlib heap. Globals occupy about 468 KB including
+of MCU RAM, and a bounded 128 KB newlib heap. Globals occupy about 472 KB including
 the heap, leaving the rest for the stack. `runtime.sysl` supplies the allocator's
 `_sbrk` hook and explicitly rejects file/process operations. Building requires an
 Arm GNU toolchain with newlib; `build.sh` locates its target headers and libraries.
 The original small bitmap font remains in `font.sysl` for framebuffer examples,
 but is not used by this renderer.
 
-A full screen is initially transmitted, then only changed pixel runs. GPIO
+A full screen is initially transmitted, then only changed pixel runs. Each input
+frame is recorded through imui's existing command recorder. Two fixed command
+buffers identify damage in 30 horizontal bands; only damaged bands are replayed
+through PlutoVG and compared with the previous RGB565 image. Unchanged frames
+skip rasterization, pixel scanning and SPI entirely. Interaction runs once per
+input, regardless of how many bands are redrawn.
+
+Guest tick measurements show unchanged input dropping from about 3.4 million
+ticks to 12 thousand, button release from 4.6 million to 2.2 million, and steady
+slider dragging from about 3.9 million to 1.1 million. These are emulator
+instruction ticks, not hardware cycle timings. A focus change can still dirty a
+larger region because recorded commands are compared by position. The firmware
+exports `touch_profile` with rendering, flush and SPI ticks plus transmitted byte
+and pixel counts. The performance test writes `target/touch-performance.txt`,
+checks idle/drag budgets, and compares eight complete image hashes against the
+preceding full-screen renderer.
+ GPIO
 bit-banging and real guest rendering cost execution time. This is not a direct
 host-rendered mockup; a virtual SPI controller and firmware DMA are future
 performance improvements.
