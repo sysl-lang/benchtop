@@ -99,7 +99,10 @@ to the window, with fonts rasterized at the display density.
 `view` and `render` inspect existing descriptions, including products. Hardware
 without modelled peripherals is labelled **LAYOUT PREVIEW**; display placeholders
 are not emulated displays. Live execution currently uses Cortex-M virtual boards
-and deterministic core turns (`--threads` cannot be combined with `--window`).
+and parallel execution of launched guest cores on distinct host threads.
+Use `--deterministic` for reproducible serial interleaving. Headless UI runs
+remain deterministic. Workers finish each bounded desktop batch before the UI
+reads guest state, pauses, steps, resets, or reloads firmware.
 `--frames N` bounds either windowed or headless runs. PNG exports use the same
 syslUI view tree and PlutoVG renderer at a standard
 1200×760 size. Headless rendering also needs an installed system font (Arial on
@@ -180,7 +183,7 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 
 ```
 sysl build . -o benchtop
-./benchtop run [--board <name | file.hocon>] [--threads] <image.elf | image.bin>
+./benchtop run [--board <name | file.hocon>] [--deterministic] <image.elf | image.bin>
 ./benchtop check [--mcu] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
@@ -195,7 +198,8 @@ that stops on a breakpoint, an undefined instruction, an access where nothing is
 wake, a fault the core cannot take, or (on an M33) a stack-limit violation gets a message saying
 where, and status 3 for all but the breakpoint. A system reset request (AIRCR) ends it with status 0.
 
-The two cores take turns on one host thread, so a run is the same every time. **`--threads`** gives
+By default, launched guest cores run on separate host threads. **`--deterministic`**
+selects reproducible turns on one thread. The explicit **`--threads`** spelling also gives
 each core a host thread of its own once core 1 is launched: faster where both cores are busy, and
 not reproducible, as two real cores are not.
 
