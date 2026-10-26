@@ -126,3 +126,12 @@ wall pacing is not a claim that all cross-core synchronization has been removed.
 The pacing policy contains no M4/M7 names or ISA branches. Regression tests cover
 matching M0+ cores, M33/M0+, M4/M7 and M7/M4, including unequal rates; the clock
 math also covers arbitrary frequencies, rounding, long epochs and pause rebasing.
+
+
+A subsequent 19-interval live run with independent pacing measured a median of
+approximately 293/146 million instructions per second (M7/M4), with a 120 FPS
+host UI. This does not establish an improvement over the earlier runs: host
+load changed, and the conservative guest-time ordering limit still couples
+shared execution. The change separates per-core wall-clock pacing and
+publication from that ordering policy; further ordering/peripheral optimization
+is required before claiming sustained full-clock emulation for this workload.
