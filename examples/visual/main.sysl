@@ -105,16 +105,18 @@ struct OledTask
     index: usize
     reading: u32
 
-// Mode 0, MSB first. Each byte yields back to the ordinary firmware loop.
-oled_byte(gpio: *Gpio, byte: u32, data: bool)
-    val base = (gpio.out & ~(OLED_MASK & ~(1u32 << 29))) | (if data then 1 << 28 else 0)
+// Both serial displays share mode-0 clock/data; each byte selects exactly one device.
+spi_byte(gpio: *Gpio, byte: u32, data: bool, cs: u32, dc: u32)
+    val base = (gpio.out & ~((3u32 << 6) | cs | dc)) | (if data then dc else 0)
     gpio.out = base
     for bit in 0..<8
         val pins = base | (if (byte & (128u32 >> u32(bit))) != 0 then 1 << 7 else 0)
         gpio.out = pins
         gpio.out = pins | (1 << 6)
         gpio.out = pins
-    gpio.out = base | (1 << 27)
+    gpio.out = base | cs
+
+oled_byte(gpio: *Gpio, byte: u32, data: bool) = spi_byte(gpio, byte, data, 1u32 << 27, 1u32 << 28)
 
 // A framebuffer byte in SSD1306 page layout, generated entirely by guest software.
 oled_pixels(index: usize, reading: u32) -> u32
@@ -165,16 +167,103 @@ oled_tick(gpio: *Gpio, task: *OledTask, reading: u32)
             task.index = 0
             task.stage = 2
 
+// ST7789 shares SCK/MOSI/RESET with the OLED, with CS=GP30 and DC=GP31.
+const TFT_MASK: u32 = (1u32 << 30) | (1u32 << 31)
+
+struct TftTask
+    stage: u32
+    wait: u32
+    index: usize
+    x: u32
+    y: u32
+    reading: u32
+    partial: bool
+
+tft_byte(gpio: *Gpio, byte: u32, data: bool) = spi_byte(gpio, byte, data, 1u32 << 30, 1u32 << 31)
+
+// RGB565: the host only sees these bytes through the controller's RAM-write command.
+tft_color(x: u32, y: u32, reading: u32) -> u32
+    if x == 7 || x == 232 || y == 7 || y == 232 then return 0x39E7
+    if x >= 24 && x < 216 && y >= 26 && y < 54
+        val logo: [48]u8 = [127,73,73,73,54,0,127,73,73,73,65,0,127,4,8,16,127,0,62,65,65,65,34,0,
+            127,8,8,8,127,0,1,1,127,1,1,0,62,65,65,65,62,0,127,9,9,9,6,0]
+        if (u32(logo[usize((x - 24) >> 2)]) & (1u32 << ((y - 26) >> 2))) != 0 then return 0x7FF6
+    if y >= 78 && y <= 109 && x >= 16 && x <= 223
+        return if x < 51 then 0xF800 elif x < 86 then 0xFFE0 elif x < 121 then 0x07E0 elif x < 156 then 0x07FF elif x < 191 then 0x001F else 0xF81F
+    val length = (reading * 200 + 2048) >> 12
+    if ((x == 16 || x == 223) && y >= 145 && y <= 177) || ((y == 145 || y == 177) && x >= 16 && x <= 223) then return 0xFFFF
+    if y >= 149 && y <= 173 && x >= 20 && x < 20 + length
+        return if x < 86 then 0xF800 elif x < 154 then 0xFFE0 else 0x07E0
+    if y >= 198 && y <= 215 && x >= 16 + length && x < 24 + length then return 0x07FF
+    if y >= 206 && y <= 208 && x >= 20 && x <= 219 then return 0x39E7
+    0x0843
+
+tft_tick(gpio: *Gpio, task: *TftTask, reading: u32)
+    if task.wait > 0
+        task.wait -= 1
+        return
+    task.stage match
+        0 ->
+            tft_byte(gpio, 0x01, false)
+            task.wait = 1600
+            task.stage = 1
+        1 ->
+            tft_byte(gpio, 0x11, false) // Sleep out, with cooperative delay before display setup.
+            task.wait = 16000
+            task.stage = 2
+        2 ->
+            val setup: [6]u16 = [0x3A,0x155,0x36,0x100,0x20,0x29]
+            val item = u32(setup[task.index])
+            tft_byte(gpio, item & 255, (item & 256) != 0)
+            task.index += 1
+            if task.index == setup.len
+                task.index = 0
+                task.stage = 3
+        3 ->
+            // Refresh only the gauge region after the first complete frame.
+            val left: u32 = if task.partial then 16 else 0
+            val right: u32 = if task.partial then 223 else 239
+            val top: u32 = if task.partial then 145 else 0
+            val bottom: u32 = if task.partial then 215 else 239
+            val window: [11]u32 = [0x2A,0x100,0x100 | left,0x100,0x100 | right,0x2B,0x100,0x100 | top,0x100,0x100 | bottom,0x2C]
+            val item = window[task.index]
+            tft_byte(gpio, item & 255, (item & 256) != 0)
+            task.index += 1
+            if task.index == window.len
+                task.index = 0
+                task.x = left
+                task.y = top
+                task.reading = reading
+                task.stage = 4
+        4 ->
+            // Small batches keep the other parts serviced throughout a full-screen update.
+            for pixel in 0..<4
+                val color = tft_color(task.x, task.y, task.reading)
+                tft_byte(gpio, color >> 8, true)
+                tft_byte(gpio, color & 255, true)
+                task.x += 1
+                if task.x > (if task.partial then 223 else 239)
+                    task.x = if task.partial then 16 else 0
+                    task.y += 1
+                    if task.y > (if task.partial then 215 else 239)
+                        task.stage = 5
+                        return
+        _ -> if reading != task.reading
+            task.partial = true
+            task.index = 0
+            task.stage = 3
+
 @export("start")
 start() -> never
     val gpio: *Gpio = ptr_cast(usize(0x50000000))
     val adc: *Adc = ptr_cast(usize(0x50000100))
     // Cathode commons are active low. Set them inactive before enabling output drivers.
     val commons_off: u32 = 0xF << 18
-    gpio.out = commons_off | (1 << 27)
-    gpio.oe = 7 | (0xFFF << 10) | LCD_MASK | OLED_MASK
+    gpio.out = commons_off | (1u32 << 27) | (1u32 << 30)
+    gpio.oe = 7 | (0xFFF << 10) | LCD_MASK | OLED_MASK | TFT_MASK
     var lcd_task = LcdTask(0, 2000, 0)
     var oled_task = OledTask(0, 16, 0, 0)
+    var tft_task = TftTask(0, 32, 0, 0, 0, 0, false)
     var count: u32 = 0
     var heartbeat: u32 = 0
     var previous: u32 = 0xFFFFFFFF
@@ -213,7 +302,8 @@ start() -> never
         val pattern = segments(numeral) << 10
         lcd_tick(gpio, &lcd_task)
         oled_tick(gpio, &oled_task, reading)
-        val display_lines = gpio.out & (LCD_MASK | OLED_MASK)
+        tft_tick(gpio, &tft_task, reading)
+        val display_lines = gpio.out & (LCD_MASK | OLED_MASK | TFT_MASK)
         // Blank every common before changing shared segment lines, then select one digit.
         gpio.out = display_lines | leds | commons_off
         gpio.out = display_lines | leds | commons_off | pattern

@@ -1,0 +1,139 @@
+module sh.sysl.benchtop.parts.mipi_dcs
+
+import sysl.buf.{Buf, buf}
+
+/** Common write-side DCS TFT controller: memory windows, RGB pixels and orientation. */
+struct Display
+    width: int
+    height: int
+    ram: Buf[u32] // RGB888, reference-owned so GPIO edges never copy the framebuffer.
+    sleeping: bool
+    enabled: bool
+    inverse: bool
+    madctl: u8
+    format: u8
+    left: int
+    right: int
+    top: int
+    bottom: int
+    column: int
+    row: int
+    command: u8
+    needed: int
+    count: int
+    arguments: [16]u8
+    writing: bool
+    bytes: int
+    components: [3]u8
+
+display(width: int, height: int) -> &Display
+    require width >= 1 && width <= 480 && height >= 1 && height <= 480, "bounded TFT controller memory"
+    var ram: Buf[u32] = buf()
+    for i in 0..<(width * height) do ram.push(0)
+    Display(width, height, ram, true, false, false, 0, 6, 0, width - 1, 0, height - 1,
+        0, 0, 0, 0, 0, [0; 16], false, 0, [0; 3])
+
+/** Controller reset retains display memory; a new board gets a fresh controller. */
+reset(d: &Display)
+    d.sleeping = true
+    d.enabled = false
+    d.inverse = false
+    d.madctl = 0
+    d.format = 6
+    d.left = 0
+    d.right = d.width - 1
+    d.top = 0
+    d.bottom = d.height - 1
+    d.column = 0
+    d.row = 0
+    d.command = 0
+    d.needed = 0
+    d.count = 0
+    d.writing = false
+    d.bytes = 0
+
+write(d: &Display, data: bool, byte: u8)
+    if data
+        if d.needed > 0
+            d.arguments[d.count] = byte
+            d.count += 1
+            if d.count == d.needed
+                d.needed = 0
+                arguments(d)
+        elif d.writing
+            d.components[d.bytes] = byte
+            d.bytes += 1
+            if d.bytes == (if d.format == 5 then 2 else 3)
+                store_pixel(d)
+                d.bytes = 0
+        return
+    d.command = byte
+    d.count = 0
+    d.bytes = 0
+    d.writing = false
+    d.needed = byte match
+        0x2A | 0x2B -> 4
+        0x36 | 0x3A | 0xB7 | 0xBB | 0xC0 | 0xC3 | 0xC4 | 0xC5 | 0xC6 -> 1
+        0xB0 | 0xC2 | 0xD0 -> 2
+        0xB2 -> 5
+        0xE0 | 0xE1 -> 14
+        _ -> 0
+    byte match
+        0x01 -> reset(d)
+        0x10 -> d.sleeping = true
+        0x11 -> d.sleeping = false
+        0x20 -> d.inverse = false
+        0x21 -> d.inverse = true
+        0x28 -> d.enabled = false
+        0x29 -> d.enabled = true
+        0x2C ->
+            d.column = d.left
+            d.row = d.top
+            d.writing = true
+        0x3C -> d.writing = true
+        _ -> ()
+
+private arguments(d: &Display)
+    val a = (int(d.arguments[0]) << 8) | int(d.arguments[1])
+    val b = (int(d.arguments[2]) << 8) | int(d.arguments[3])
+    val swapped = (d.madctl & 32) != 0
+    d.command match
+        0x2A -> if a <= b && b < (if swapped then d.height else d.width)
+            d.left = a
+            d.right = b
+        0x2B -> if a <= b && b < (if swapped then d.width else d.height)
+            d.top = a
+            d.bottom = b
+        0x36 -> d.madctl = d.arguments[0]
+        0x3A ->
+            val format = d.arguments[0] & 7
+            if format == 5 || format == 6 then d.format = format
+        _ -> ()
+
+private expand5(n: u32) -> u32 = (n << 3) | (n >> 2)
+private expand6(n: u32) -> u32 = (n << 2) | (n >> 4)
+
+private store_pixel(d: &Display)
+    val a = u32(d.components[0])
+    val b = u32(d.components[1])
+    val color = if d.format == 5
+        val value = (a << 8) | b
+        (expand5(value >> 11) << 16) | (expand6((value >> 5) & 63) << 8) | expand5(value & 31)
+    else
+        (expand6(a >> 2) << 16) | (expand6(b >> 2) << 8) | expand6(u32(d.components[2]) >> 2)
+    var x = if (d.madctl & 32) != 0 then d.row else d.column
+    var y = if (d.madctl & 32) != 0 then d.column else d.row
+    if (d.madctl & 64) != 0 then x = d.width - 1 - x
+    if (d.madctl & 128) != 0 then y = d.height - 1 - y
+    if x >= 0 && x < d.width && y >= 0 && y < d.height then d.ram.set(usize(y * d.width + x), color)
+    if d.column < d.right then d.column += 1
+    else
+        d.column = d.left
+        d.row = if d.row < d.bottom then d.row + 1 else d.top
+
+pixel(d: &Display, x: int, y: int) -> u32
+    if d.sleeping || !d.enabled || x < 0 || x >= d.width || y < 0 || y >= d.height then return 0
+    var color = d.ram.at(usize(y * d.width + x))
+    if (d.madctl & 8) != 0 then color = ((color & 255) << 16) | (color & 0xFF00) | (color >> 16)
+    if d.inverse then color ^= 0xFFFFFF
+    color

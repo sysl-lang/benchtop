@@ -4,7 +4,7 @@ import sh.sysl.parsing.{Report, Source, Span, error, nearest_name}
 import sysl.buf.{Buf, buf}
 
 // A board or a product held to the library: every part is one the registry has, every wire goes to
-// something its port can take, no pin is wired twice, every element is in the view, every key drives
+// something its port can take, pin sharing is limited to component inputs, every element is in the view, every key drives
 // a control. A board is checked against its chip (chip.sysl), and a product's parts are wired only to
 // what its boards expose.
 //
@@ -126,31 +126,33 @@ private unmapped(p: Part, a: Option[Amount], key: string, spec: PartSpec, r: *Re
         None -> ()
 end unmapped
 
-// Who holds each pin, by name. An owner is its name and the place it was wired, or, for a pin a
-// product's board wires itself, the board's name instead of a place.
+// Pin owners retain a shared-input flag, including pins already used inside product boards.
 struct PinUses
-    owner: Buf[(string, string, Span, string)]
+    owner: Buf[(string, string, Span, string, bool)]
 end PinUses
 
 // A pin wired to `who`, unless something has it already. `label` is how a message names the pin.
-claim(uses: *PinUses, src: Source, r: *Report, pin: string, label: string, who: string, span: Span)
-    for (held, first, at, board) in uses.owner
+claim(uses: *PinUses, src: Source, r: *Report, pin: string, label: string, who: string, span: Span, shared: bool = false)
+    for (held, first, at, board, input) in uses.owner
         if held == pin then
+            if shared && input then return
             val where = if board.is_empty() then s"at ${src.locate(at.start)}" else s"on the board `$board` itself"
 
             r.add(error(span, s"$label is wired twice")
                 .with_note(s"it is already `$first`'s, $where"))
             return
 
-    uses.owner.push((pin, who, span, ""))
+    uses.owner.push((pin, who, span, "", shared))
 end claim
 
-// A pin a board wires itself, which a product that has the board may not wire again.
-held_by_board(uses: *PinUses, pin: string, who: string, board: string)
-    for (held, _, _, _) in uses.owner
-        if held == pin then return
-
-    uses.owner.push((pin, who, Span(0, 0), board))
+// Carry the board's ownership into a product, preserving explicitly shareable inputs.
+held_by_board(uses: *PinUses, pin: string, who: string, board: string, shared: bool = false)
+    for i in 0..<uses.owner.len()
+        val held = uses.owner.at(i)
+        if held.0 != pin then continue
+        if !shared && held.4 then uses.owner.set(i, (held.0, held.1, held.2, held.3, false))
+        return
+    uses.owner.push((pin, who, Span(0, 0), board, shared))
 end held_by_board
 
 // Whether a pin exists on the chip, saying so where it does not.
@@ -285,7 +287,7 @@ private check_parts(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Sourc
                                     r.add(error(w.span, s"`$who` takes an ADC pin, and $n has no ADC channel")
                                         .with_note(adc_note(chip)))
                                 else
-                                    claim(pins, src, r, n, n, who, w.span)
+                                    claim(pins, src, r, n, n, who, w.span, need == InputPin)
                         Bus(name) ->
                             r.add(error(w.span, s"`$who` takes a pin, and `$name` is a bus")
                                 .with_note("a pin is written `GP16`, or another part's port as `wifi.gpio0`"))
@@ -294,7 +296,7 @@ private check_parts(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Sourc
                                 if real_pin(chip, r, its, w.span)
                                     if (need == AdcPin || need == AnalogPin) && !adc_pin(chip, its)
                                         r.add(error(w.span, s"`$who` needs an analogue-capable connection point; `$other.$its` has no ADC channel"))
-                                    else claim(pins, src, r, its, s"$other.$its", who, w.span)
+                                    else claim(pins, src, r, its, s"$other.$its", who, w.span, need == InputPin)
                                 continue
                             wire_offered(b.parts, reg, src, r, &offered, need, who, other, its, w.span)
                 BusPort(kind) ->
@@ -400,6 +402,9 @@ check_params(p: Part, spec: PartSpec, r: *Report)
             val terminal = s"digit$i"
             if long(i) < count && !wired(p, terminal) then r.add(error(p.name_span, s"`${p.name}.$terminal` is not connected"))
             if long(i) >= count && wired(p, terminal) then r.add(error(p.name_span, s"`${p.name}.$terminal` exceeds its configured digit count"))
+    if p.kind == "st7789"
+        if part_whole(p, "width", 240) + part_whole(p, "column-offset", 0) > 240 || part_whole(p, "height", 240) + part_whole(p, "row-offset", 0) > 320
+            r.add(error(p.name_span, "ST7789 glass and offsets must fit its 240x320 controller memory"))
     if p.kind == "potentiometer"
         val low = part_whole(p, "low-uv", 0)
         val high = part_whole(p, "high-uv", 3300000)
@@ -635,9 +640,16 @@ check_product(p: *Product, reg: Registry, src: Source, r: *Report)
 
         for q in inst.board.parts
             for w in q.wires
+                val shared = reg.part(q.kind) match
+                    Some(spec) -> spec.port(w.port) match
+                        Some(port) -> port.kind match
+                            PinPort(need) -> need == InputPin
+                            _ -> false
+                        None -> false
+                    None -> false
                 w.to match
-                    Pin(n) -> held_by_board(&uses, n, s"${q.name}.${w.port}", inst.name)
-                    Port(owner, n) -> if owner == inst.board.chip.name then held_by_board(&uses, n, s"${q.name}.${w.port}", inst.name)
+                    Pin(n) -> held_by_board(&uses, n, s"${q.name}.${w.port}", inst.name, shared)
+                    Port(owner, n) -> if owner == inst.board.chip.name then held_by_board(&uses, n, s"${q.name}.${w.port}", inst.name, shared)
                     _ -> ()
 
         val chip: Option[ChipSpec] = if inst.board.chip_found then Some(chip_spec(inst.board.chip, reg)) else None
@@ -779,7 +791,7 @@ private wire_board_pin(sock: Socket, need: PinNeed, who: string, name: string, s
 
     var uses = sock.pins
 
-    claim(&uses, src, r, name, s"`$board.$name`", who, span)
+    claim(&uses, src, r, name, s"`$board.$name`", who, span, need == InputPin)
 end wire_board_pin
 
 // A bus port wired to `board.name`: a bus the board exposes, of the port's kind, that the product's

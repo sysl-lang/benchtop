@@ -217,3 +217,63 @@ setup commands consume their arguments but do not animate. The protocol and
 memory layout follow the [Solomon Systech SSD1306 datasheet](https://docs.sparkfun.com/SparkFun_Qwiic_OLED_1.3in/assets/board_files/SSD1306.pdf).
 The GPIO and ADC MMIO addresses are still the workbench's virtual registers; real
 hardware needs the corresponding MCU register interface and SPI timing calibration.
+
+## Color TFT
+
+DS4 is the `st7789` catalog part: a 240×240 glass area backed by the ST7789's
+240×320 controller memory. The sysl firmware sends standard DCS commands and
+RGB565 pixels for the BENCHTOP wordmark, color bars, a knob gauge and a slider.
+After the first complete frame it updates only the gauge region with a new
+CASET/RASET window. The renderer reads RGB pixels from controller memory; it does
+not draw the demo graphic independently of firmware.
+
+| Terminal | MCU pin |
+| --- | --- |
+| SCK | GP6 (shared with OLED) |
+| MOSI | GP7 (shared with OLED) |
+| CS (active low) | GP30 |
+| DC (command low, data high) | GP31 |
+| RESET (active low) | GP29 (shared with OLED) |
+
+Both displays reuse the same mode-0 SPI receiver and four-wire command/data/reset
+adapter. The firmware also uses one SPI sender with per-device CS and DC masks.
+Every byte deselects its device before yielding, so another display can use the
+bus between bytes. Display terminals are declared component inputs in the catalog,
+allowing MCU output fan-out. Exclusive connections retain their conflict checks.
+This also applies when a product connects another input to an exposed board pin.
+
+```hocon
+tft {
+  part = st7789
+  ref = DS4
+  width = 240
+  height = 240
+  sck = controller.GP6
+  mosi = controller.GP7
+  cs = controller.GP30
+  dc = controller.GP31
+  reset = controller.GP29
+}
+```
+
+`width` (1–240, default 240), `height` (1–320, default 240), `column-offset`
+and `row-offset` describe the visible glass within controller memory. Offsets
+must keep the glass inside 240×320; for example, a 240×240 module can use
+`row-offset = 80`. An explicit view size controls how large the module is drawn.
+
+The shared DCS controller core supports CASET, RASET, RAMWR/RAMWRC, RGB565 and
+RGB666 pixel transfers, MADCTL mirrors/row-column exchange and RGB/BGR order,
+display enable, sleep, inversion, and software/hardware reset. Invalid address
+windows are ignored and incomplete pixels are discarded when a new command
+arrives. Chip-select transitions between bytes preserve incomplete pixels and
+controller command arguments. Reset retains RAM, while a new board boot starts
+with deterministic blank memory. Frame snapshots own their pixels and remain
+stable while firmware continues or resets.
+
+This first TFT model is write-only, four-wire SPI. Readback, RGB444 packing,
+scrolling, partial-display scan modes, gamma/electrical behavior, backlight control
+and timed reset/sleep readiness are not emulated. Common electrical setup command
+arguments are consumed without being interpreted as pixels. The firmware includes
+cooperative startup waits and sends small pixel batches so the other components
+continue running; a real MCU port should calibrate SPI and startup timing.
+The implementation follows the [Sitronix ST7789V datasheet](https://dl.espressif.com/dl/schematics/LCD_ST7789.pdf).
