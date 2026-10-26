@@ -71,6 +71,7 @@ set_threads()
     threads = true
 
 private[virt] run_threads(cpu: *Cpu) -> *Cpu
+    slice_horizon = NEVER
     cores[0] = cpu
     cores[1] = &second
 
@@ -112,6 +113,11 @@ private run_core(cpu: *Cpu, k: int)
     val o = 1 - k
 
     while atomic_load(&ended, SeqCst) == 0
+        if clock(cpu,cpu.retired) >= slice_horizon
+            publish(k,cpu)
+            after_run(o,clock(cpu,cpu.retired))
+            nudge()
+            return
         take_incoming(cpu)
         refresh(cpu)
         signal(cpu)
@@ -127,7 +133,7 @@ private run_core(cpu: *Cpu, k: int)
             hold_back(k, o, mine)
             continue
 
-        set_limit(cpu, min(min(mine + quantum, bound), device_due()) - cpu.slept)
+        set_limit(cpu, min(min(min(mine + quantum, bound), device_due()), slice_horizon) - cpu.slept)
         run_threaded(cpu)
         publish(k, cpu)
         after_run(o, clock(cpu, cpu.retired))
@@ -202,7 +208,8 @@ private doze(cpu: *Cpu, k: int)
         // The time has come as far as the other core's clock, or the board's where it sleeps too.
         val t = if atomic_load(&dozing[o], SeqCst) == 0 then atomic_load(&clocks[o], SeqCst) else floor
 
-        if wake_by(cpu, min(t, device_wake(cpu))) then break
+        if wake_by(cpu, min(min(t, device_wake(cpu)), slice_horizon)) then break
+        if clock(cpu,cpu.retired) >= slice_horizon then break
 
         take_incoming(cpu)
         signal(cpu)
@@ -262,6 +269,11 @@ private both_asleep(cpu: *Cpu, k: int) -> bool
     // is asked again.
     val theirs = min(atomic_load(&wake_at[o], SeqCst), device_wake(other))
 
+    if slice_horizon != NEVER && mine > slice_horizon && theirs > slice_horizon
+        floor = slice_horizon
+        wakeup.notify_all()
+        return true
+
     if mine != NEVER || theirs != NEVER
         val due = if mine < theirs then mine else theirs
 
@@ -294,3 +306,50 @@ private both_asleep(cpu: *Cpu, k: int) -> bool
     wakeup.notify_all()
     false
 end both_asleep
+
+// Desktop batches end at a shared guest-clock horizon. Workers join before any
+// UI snapshot, firmware reload or reset, so those operations never race a core.
+var slice_horizon: u64 = NEVER
+var slice_paired = false
+
+/** A bounded batch on distinct host threads once core 1 has been launched.
+ * No host thread is needed for an inactive guest core. Headless deterministic
+ * tests continue to use pump_board explicitly.
+ */
+pump_parallel(cpu: *Cpu, budget: u64) -> Result[bool,string]
+    require !threads, "a desktop batch starts with both guest workers stopped"
+    if budget == 0 then return Ok(cpu.stop == Stop.Budget && second.stop == Stop.Budget)
+    val horizon = now + budget
+    if !launched
+        val running = pump_board(cpu,budget)
+        if !running || !launched || now >= horizon then return Ok(running)
+
+    cores[0] = cpu
+    cores[1] = &second
+    for k in 0..<2
+        atomic_store(&dozing[k],0,SeqCst)
+        atomic_store(&wake_at[k],NEVER,SeqCst)
+        atomic_store(&holding[k],0,SeqCst)
+        atomic_store(&clocks[k],clock(cores[k],cores[k].retired),SeqCst)
+    atomic_store(&ended,0,SeqCst)
+    floor = now
+    slice_horizon = horizon
+    if !slice_paired
+        pair(cpu,&second)
+        slice_paired = true
+    threads = true
+    val worker = spawn(&core1_body,&second,CORE1_STACK) match
+        Some(t) -> t
+        None ->
+            threads = false
+            slice_horizon = NEVER
+            return Err("cannot create a host thread for guest core 1")
+    run_core(cpu,0)
+    worker.join()
+    threads = false
+    slice_horizon = NEVER
+    take_incoming(cpu)
+    take_incoming(&second)
+    now = if clock(cpu,cpu.retired) > clock(&second,second.retired) then clock(cpu,cpu.retired) else clock(&second,second.retired)
+    flush_console()
+    Ok(cpu.stop == Stop.Budget && second.stop == Stop.Budget)
