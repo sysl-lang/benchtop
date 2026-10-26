@@ -128,3 +128,38 @@ current limits and ghosting intensity are not circuit-simulated.
 The scan algorithm and segment encodings are suitable for equivalent real wiring.
 The current workbench GPIO/ADC register map is virtual; a binary for a real MCU
 still needs that MCU's register interface and startup code.
+
+## Character LCD
+
+DS2 is the built-in `hd44780` part, configured as 20 columns × 2 rows.
+The sysl firmware initializes its four-bit parallel bus and writes exactly
+`Hello from Benchtop!` on the first line. Initialization and writes are scheduled
+cooperatively, so the ADC, multiplexed seven-segment display and buttons continue
+working while the LCD starts.
+
+| LCD terminal | MCU pin |
+| --- | --- |
+| RS | GP3 |
+| E | GP4 |
+| RW (driven low) | GP5 |
+| D4–D7 | GP22–GP25 |
+
+The model latches writes on falling E edges and decodes command/data nibbles.
+It provides DDRAM, CGRAM custom characters, address increment/decrement and wrap,
+clear/home, display enable and display shifts. ASCII and custom 5×8 glyphs are
+rendered from controller memory. The current model supports a **write-only,
+four-bit interface**, with the standard power-up nibble sequence; busy-flag and
+data reads, eight-bit wiring, the complete regional character ROMs, 5×10 fonts,
+and cursor/blink rendering are not implemented.
+
+`columns` (1–40, default 20) and `rows` (1–2, default 2) parameterize the module.
+`instruction-cycles` (default 444) and `clear-cycles` (default 18240) model command
+latency in guest cycles, corresponding to 37 µs and 1.52 ms at 12 MHz. Writes while
+busy are ignored. Firmware uses conservative cooperative delays; a real MCU port
+should calibrate those delays or use its timer. Supply, backlight and contrast
+are idealized rather than circuit-simulated.
+
+The controller protocol follows the [Hitachi HD44780U datasheet](https://cdn-shop.adafruit.com/datasheets/HD44780.pdf).
+As with DS1, the visible message comes entirely from guest GPIO writes; the UI does
+not inject a greeting. Reset clears LCD memory and bus state, and the firmware
+initializes it again.

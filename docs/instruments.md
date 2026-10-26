@@ -2,9 +2,9 @@
 
 An instrument observes the emulation without becoming part of the board or product.
 The first instrument is a scrolling plot. A part association adds a small plot icon
-and hover preview; the same instrument can also be opened from the toolbar in a
-movable, resizable native window. Both views share one history. Closing a window
-does not stop recording or affect firmware.
+for opening the instrument; it can also be opened from the toolbar in a
+movable, resizable native window. Closing the window does not stop recording
+or affect firmware.
 
 The demo automatically loads `instruments/workbench.hocon`. Use an explicit set for
 another session:

@@ -35,9 +35,10 @@ buttons through MMIO. Hold **1** or **2**, or click and hold either button, to l
 its corresponding LED. Turn **RV1** on the board (drag around the dial), or use
 its inspector slider, to change the ADC input. Sysl firmware multiplexes the four-digit
 **DS1** display through GPIO: `0000` at minimum, `2048` halfway and `4095` at maximum.
-The demo produces no console output.
-Hover over **RV1** or its small plot icon for a live ADC preview. Click the icon,
-right-click RV1, or use **RV1 · ADC result** in the toolbar to open a movable,
+The GPIO-connected **DS2** character LCD shows **“Hello from Benchtop!”** after
+firmware initialization. The demo produces no console output.
+Click **RV1**’s small plot icon, right-click RV1, or use **RV1 · ADC result**
+in the toolbar to open a movable,
 resizable instrument window. **Hold / Resume** freezes only the instrument;
 **Clear** clears its history. In that window, **Space** toggles Hold and **C** clears.
 Closing it leaves the firmware running. The **Guest / Build** output tabs remain
