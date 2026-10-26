@@ -75,11 +75,43 @@ ST7789/GT911 test harness using virtual peripherals. This is **not** the complet
 Discovery board, and the window labels it as core bring-up. The original M33
 board and all original SPI/GPIO firmware modes remain available.
 
+## Runnable Discovery DSI subset
+
+```
+./examples/touch/build.sh dsi
+./benchtop run --window --board stm32h747-disco examples/touch/disco.elf
+```
+
+The built-in description lives in `boards/stm32h747-disco.hocon`. It uses the real
+internal flash and AXI SRAM addresses, RCC CM4 release, STM32 DSI at 0x50000000,
+and I2C4 at 0x58001c00 routed to PD12/PD13. An FT6206 at address 0x2a supplies touch
+reports. The display part currently implements common MIPI DCS behavior rather
+than a complete NT35510/OTM8009A vendor-specific controller.
+
+M4 sends real DCS short/long packets through GHCR/GPDR. The host emulates their
+completion and updates the separate display model. Host painting does not write
+pixels into the device. Packet timing uses PLL-derived lane rate, lane count and
+packet length; PHY transitions, LP/HS timing overhead, TE and ECC/CRC faults are
+not modeled. The hardware's complete 16-bit long-packet length range is not yet
+supported: the implemented packet payload limit is 1024 bytes, rejected above
+that bound.
+
+The example keeps its 240x240 imui surface centered on the 800x480 native glass.
+The full glass is initialized over DSI. Interactions arrive through FT6206
+registers and the STM32 I2C v2 polling adapter; no virtual SPI or I2C peripherals
+are used. Two FT6206 contacts are modeled; desktop pointer input supplies one.
+I2C DMA, IRQ, slave operation and SCL timing remain unsupported.
+
+The demonstration ELF has real flash load addresses and ARMv7E-M instructions,
+but complete physical-board startup is not ready: RCC clock/gating/pin-mux setup
+and the panel-specific vendor initialization sequence remain to be implemented
+before this example can boot unchanged on a physical Discovery board.
+
 ## Remaining board bring-up
 
 Real memory banks and external SDRAM; remaining STM32 RCC/PWR behavior;
-STM32 interrupt routing beyond the existing 32 external lines; GPIO and I2C;
-LTDC/DSI and Discovery display/touch controller models; SAI/DMA/codec and microphone
+STM32 interrupt routing beyond the existing 32 external lines; GPIO and full I2C timing/interrupt behavior;
+LTDC video streaming and complete Discovery panel-specific initialization; SAI/DMA/codec and microphone
 adapters; board description and flashable dual-core demo firmware.
 
 Clock pacing currently counts one local tick per retired instruction. It does

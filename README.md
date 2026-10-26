@@ -620,3 +620,35 @@ file-watching I/O. Tests exercise stable thread identities, progress without UI
 ticks, clock pacing, pause/step/reset, WFI, live display access and dual Cortex-M7
 firmware. These scheduling changes do not add STM32H7 peripherals or its
 heterogeneous M7/M4 configuration.
+
+
+## STM32H747 Discovery DSI bring-up
+
+The initial `stm32h747-disco` board description runs an M7 at a configured
+480 MHz and an M4 at 240 MHz, each on its own host worker. M4 runs the touchscreen
+UI; M7 is reserved for audio and currently idles in a loop.
+
+```sh
+./examples/touch/build.sh dsi
+./benchtop run --window --board stm32h747-disco examples/touch/disco.elf
+```
+
+The display uses `stm32-dsi` at the real H747 DSI address, through timed DCS
+command packets and an 800x480 display model. The existing 240x240 imui example
+is centered without scaling. Touch uses an FT6206 part through the real I2C4
+register layout. Both transports are guest firmware; host drawing only reads
+display snapshots. SPI/GPIO examples remain available.
+
+The DSI peripheral is reusable: `reference-clock-hz` supplies its PHY reference,
+guest WRPCR PLL divisors determine the lane rate, and its endpoint API carries
+virtual-channel-tagged DCS/generic packets. Supported features include short and
+long writes (up to the bounded 1024-byte payload FIFO), DCS/generic reads, maximum
+return size, one/two lanes, packet completion timing and polling status. Invalid
+or unsupported operations fail explicitly. The common DCS display is a separate
+part connected by `dsi = <controller>` and optional `channel = 0..3`.
+
+This is a runnable subset, not complete Discovery emulation: LTDC/video mode,
+DMA2D, SAI/DMA audio, the remaining RAM banks, external memory, full RCC/PWR and
+panel-specific vendor initialization are still missing. I2C4 is a functional
+polling adapter, without SCL timing or interrupts. See
+[the hardware target and supported subset](docs/stm32h747i-disco.md).
