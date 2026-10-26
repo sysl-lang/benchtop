@@ -1,5 +1,7 @@
 import sysl.raw.ptr_cast
 import sh.sysl.imui.*
+import sh.sysl.imui.plutovg.{PlutoPainter, painter}
+import sh.sysl.plutovg as vg
 
 extern __stack_top: u8
 
@@ -35,6 +37,9 @@ struct Gpio
     input: volatile u32
     oe: volatile u32
 
+struct Word
+    value: volatile u32
+
 struct I2c
     address: volatile u32
     data: volatile u32
@@ -48,8 +53,10 @@ struct AppState
 
 @export("touch_app")
 var app = AppState(0, true, 50)
-var pixels: [57600]u16
+var pixels: [230400]u8
 var previous: [57600]u16
+@export("touch_frames")
+var frames: u32 = 0
 
 // Ordinary mode-0 SPI: SCK GP0, MOSI GP1, CS GP2, DC GP3, RESET GP4.
 spi(gpio: *Gpio, byte: u32, data: bool)
@@ -75,21 +82,28 @@ window(gpio: *Gpio, x: int, y: int, last: int)
     spi(gpio, u32(y), true)
     spi(gpio, 0x2C, false)
 
+@inline
+pixel565(at: int) -> u16
+    val blue = u32(pixels[at * 4])
+    val green = u32(pixels[at * 4 + 1])
+    val red = u32(pixels[at * 4 + 2])
+    u16(((red & 248) << 8) | ((green & 252) << 3) | (blue >> 3))
+
 // Only changed pixel runs go over SPI; idle UI frames transmit nothing.
 flush(gpio: *Gpio, first_frame: bool)
     for y in 0..<240
         var x = 0
         while x < 240
             val index = y * 240 + x
-            if !first_frame && pixels[index] == previous[index]
+            if !first_frame && pixel565(index) == previous[index]
                 x += 1
                 continue
             val first = x
-            while x < 240 && (first_frame || pixels[y * 240 + x] != previous[y * 240 + x]) do x += 1
+            while x < 240 && (first_frame || pixel565(y * 240 + x) != previous[y * 240 + x]) do x += 1
             window(gpio, first, y, x - 1)
             for col in first..<x
                 val at = y * 240 + col
-                val color = u32(pixels[at])
+                val color = u32(pixel565(at))
                 spi(gpio, color >> 8, true)
                 spi(gpio, color & 255, true)
                 previous[at] = u16(color)
@@ -128,7 +142,7 @@ poll_touch(bus: *I2c, last: Input) -> Option[Input]
     if (status & 15) == 0 then return Some(pointer(last.x, last.y, false))
     Some(pointer(int(bytes[1] | (bytes[2] << 8)), int(bytes[3] | (bytes[4] << 8)), true))
 
-frame(ui: *Ui, painter: *FrameBuffer)
+frame(ui: *Ui, painter: *PlutoPainter)
     val th = dark()
     painter.fill_rect(Rect(0, 0, 240, 240), th.bg)
     label(painter, th, Rect(12, 4, 216, 28), "TOUCH SETTINGS", 0)
@@ -145,6 +159,14 @@ frame(ui: *Ui, painter: *FrameBuffer)
 @export("start")
 start() -> never
     initialize_memory()
+    val cpacr: *Word = ptr_cast(usize(0xE000ED88))
+    cpacr.value = 0x00F00000 // Enable CP10/CP11 before using the Cortex-M33 FPU.
+    asm
+        [thumb]
+            "dsb"
+            "isb"
+            clobbers "memory"
+        [aarch64, x86_64, riscv64, riscv32, wasm32, craft] unavailable "Cortex-M firmware"
     val gpio: *Gpio = ptr_cast(usize(0x50000000))
     val bus: *I2c = ptr_cast(usize(0x50000300))
     gpio.out = 4
@@ -154,8 +176,10 @@ start() -> never
     spi(gpio, 0x3A, false)
     spi(gpio, 0x55, true) // RGB565.
     spi(gpio, 0x29, false) // Display on.
-    val font = Font(font_bits[..], 32, 59, 6, 10, 8)
-    var painter = frame_buffer(pixels[..], 240, 240, font)
+    val surface = vg.for_data(pixels[..], 240, 240, 240 * 4).unwrap()
+    val canvas = vg.canvas(surface).unwrap()
+    val font = vg.font_from_data(embed("assets/ABeeZee-Regular.ttf")).unwrap()
+    var painter = sh.sysl.imui.plutovg.painter(canvas, font, 14.0)
     var ui = sh.sysl.imui.ui()
     var input = no_input()
     ui.begin(input)
@@ -163,6 +187,7 @@ start() -> never
     ui.finish()
     gpio.out |= 32
     flush(gpio, true)
+    frames += 1
     loop
         poll_touch(bus, input) match
             Some(next) ->
@@ -172,4 +197,5 @@ start() -> never
                 ui.finish()
                 gpio.out = (gpio.out & ~32u32) | (if app.enabled then 32 else 0)
                 flush(gpio, false)
+                frames += 1
             None -> ()

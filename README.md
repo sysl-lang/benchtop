@@ -53,7 +53,8 @@ The workbench describes an external W25Q32JV part; the matrix uses on-chip flash
 See [flash configuration and current hardware limits](docs/flash.md).
 
 The [touchscreen example](examples/touch/README.md) runs `imui` inside flash-linked
-sysl firmware, with an ST7789 display and a GT911 I²C touch controller. Click its
+sysl firmware, using its optional PlutoVG painter for antialiased TrueType text,
+an ST7789 display and a GT911 I²C touch controller. Click its
 counter button, toggle a GPIO LED, and drag the brightness slider:
 
 ```sh

@@ -1,8 +1,8 @@
 # Touch UI with imui
 
 This example runs an actual embedded UI inside the emulated MCU. The sysl
-firmware is linked for flash, uses `imui`, draws RGB565 pixels into RAM, and
-sends changed pixel runs to an ST7789 over GPIO SPI. Mouse input enters a
+firmware is linked for flash, uses `imui`, renders antialiased vector graphics and TrueType text
+through PlutoVG into ARGB32 RAM, converts to RGB565, and sends changed pixel runs to an ST7789 over GPIO SPI. Mouse input enters a
 separate GT911 touch controller; firmware reads its ordinary I2C registers.
 No host-side button callbacks change the guest application's state.
 
@@ -11,7 +11,7 @@ No host-side button callbacks change the guest application's state.
 sysl build .
 ./benchtop run --window --board boards/touch.hocon --watch \
   --build ./examples/touch/build.sh \
-  --watch-source examples/touch/main.sysl --watch-source examples/touch/font.sysl \
+  --watch-source examples/touch/main.sysl --watch-source examples/touch/runtime.sysl \
   examples/touch/demo.elf
 ```
 
@@ -23,13 +23,20 @@ The original workbench, audio and matrix examples remain separate boards.
 
 ## Graphics
 
-PlutoVG renders Benchtop's host window, not the MCU's framebuffer. `imui`
-provides layout, widget interaction and drawing commands through its `Painter`
-trait. This example chooses its allocation-free `FrameBuffer` painter, which
-uses RGB565 rectangle fills and one-bit bitmap text. The original 3x5 font in
-`font.sysl` is doubled to 6x10 pixels. It deliberately has a pixel appearance;
-better fonts or another embedded painter can improve the visual quality.
-The emulated ST7789 displays whatever pixels firmware sends.
+PlutoVG now runs in the emulated MCU as well as rendering Benchtop's host window.
+`imui` keeps its abstract `Painter` interface and supplies an optional
+`sh.sysl.imui.plutovg.PlutoPainter` backend. This firmware enables that feature,
+embeds the OFL-licensed ABeeZee TrueType font in flash, and rasterizes into a
+240x240 ARGB32 buffer. Changed pixels are converted to RGB565 and sent over SPI.
+The host does not draw guest text or substitute native widgets for the firmware.
+
+The example uses Cortex-M33 cores with the single-precision FPU enabled, 520 KB
+of MCU RAM, and a bounded 128 KB newlib heap. Globals occupy about 468 KB including
+the heap, leaving the rest for the stack. `runtime.sysl` supplies the allocator's
+`_sbrk` hook and explicitly rejects file/process operations. Building requires an
+Arm GNU toolchain with newlib; `build.sh` locates its target headers and libraries.
+The original small bitmap font remains in `font.sysl` for framebuffer examples,
+but is not used by this renderer.
 
 A full screen is initially transmitted, then only changed pixel runs. GPIO
 bit-banging and real guest rendering cost execution time. This is not a direct
@@ -62,13 +69,14 @@ implemented; omit INT and RESET in runnable descriptions.
 The MCU's GPIO and I2C register adapters are virtual. The display/touch protocols
 and `imui` code are hardware-style, but this image is not a physical Pico binary.
 
-## imui fix
+## Graphics dependencies
 
-The dependency pins commit `6ee7c464ce50ad7d3f155a32b3071a01a0823b70` from the
-`benchtop-touch` branch. It makes toggles and checkboxes paint their new state
-in the activation frame instead of requiring an extra frame. The change was
-made in the sibling `imui-benchtop-touch` worktree; the original imui checkout
-was not modified.
+`imui` 0.2.0 adds the optional PlutoVG painter and fixes toggles/checkboxes to
+paint their updated state in the activation frame. PlutoVG 0.2.6 makes its memory
+rendering path usable without POSIX and checks caller-owned-surface allocation
+failure. Both are developed in sibling worktrees. Validation runs inside
+Benchtop: touch-driven UI behavior, actual display pixels, antialiased text,
+repeated bounded-heap redraws, and flash-resident Thumb-2 execution.
 
 Protocol references:
 - [Goodix-authored GT911 programming guide](https://www.lcd-module.de/fileadmin/eng/pdf/zubehoer/GT911_Programming_Guide_Rev.10.pdf)
