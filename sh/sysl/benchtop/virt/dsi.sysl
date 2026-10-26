@@ -5,9 +5,11 @@ import sh.sysl.benchtop.peripheral.dsi as dsi
 import sh.sysl.benchtop.parts.mipi_dcs as dcs
 import sh.sysl.benchtop.v6m.{Cpu,Stop,NEVER,halt,lower_limit}
 import sysl.buf.{Buf,buf}
+import sysl.sync.*
 
 var dsi_host = dsi.host(480000000)
 private var has_dsi = false
+private var dsi_next: u64 = NEVER
 private val dsi_sink: dsi.Endpoint = (vc,kind,bytes) -> dsi_endpoint(vc,kind,bytes)
 
 private[virt] configure_dsi(b: Board) -> Result[unit,string]
@@ -23,6 +25,7 @@ private[virt] configure_dsi(b: Board) -> Result[unit,string]
             None -> ()
     if has_dsi && board_clock_hz == 0 then return Err("stm32-dsi requires mcu.clock-hz for its transfer timebase")
     dsi_host = dsi.host(if has_dsi then board_clock_hz else 480000000,reference)
+    atomic_store(&dsi_next,NEVER,Release)
     var channels: u32 = 0
     for p in b.parts
         if part_model(p) != "mipi-dcs-display" then continue
@@ -34,6 +37,7 @@ private[virt] configure_dsi(b: Board) -> Result[unit,string]
 
 private[virt] boot_dsi()
     dsi_host = dsi.host(dsi_host.hz,dsi_host.reference_hz)
+    atomic_store(&dsi_next,NEVER,Release)
 
 // Invoked under display_lock at packet completion, never from host painting.
 private dsi_endpoint(vc: u32, kind: u32, payload: []const u8) -> Buf[u8]
@@ -52,17 +56,25 @@ private dsi_endpoint(vc: u32, kind: u32, payload: []const u8) -> Buf[u8]
                 _ -> ()
     response
 
+// Only the CPU owning an actual due event enters the display's critical
+// section. An idle peripheral must not couple guest execution to UI painting.
 private[virt] signal_dsi(c: *Cpu)
     if !has_dsi then return
+    val time = board_time(c,c.retired)
+    val due = atomic_load(&dsi_next,Acquire)
+    if due == NEVER || time < due then return
     display_lock.lock()
     defer display_lock.unlock()
-    dsi.advance(dsi_host,board_time(c,c.retired),dsi_sink)
+    dsi.advance(dsi_host,time,dsi_sink)
+    publish_dsi_deadline()
 
 private[virt] dsi_due() -> u64
     if !has_dsi then return NEVER
-    display_lock.lock()
-    defer display_lock.unlock()
-    if dsi_host.busy then dsi_host.due else NEVER
+    atomic_load(&dsi_next,Acquire)
+
+// The display lock is held by the caller. Publish after every state change,
+// including MMIO-driven completion and reset/cancellation of a queued packet.
+private publish_dsi_deadline() = atomic_store(&dsi_next,if dsi_host.busy then dsi_host.due else NEVER,Release)
 
 private[virt] dsi_read(c: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || offset & 3 != 0
@@ -71,6 +83,7 @@ private[virt] dsi_read(c: *Cpu, address: u32, offset: u32, width: u32, n: u64) -
     display_lock.lock()
     defer display_lock.unlock()
     dsi.advance(dsi_host,board_time(c,n),dsi_sink)
+    publish_dsi_deadline()
     dsi.read(dsi_host,offset) match
         Some(v) -> v
         None ->
@@ -85,4 +98,5 @@ private[virt] dsi_write(c: *Cpu, address: u32, offset: u32, width: u32, value: u
     defer display_lock.unlock()
     dsi.advance(dsi_host,board_time(c,n),dsi_sink)
     if !dsi.write(dsi_host,offset,value) then halt(c,Stop.Fault,address)
+    publish_dsi_deadline()
     if dsi_host.busy then lower_limit(c,retirement_limit(c,dsi_host.due))
