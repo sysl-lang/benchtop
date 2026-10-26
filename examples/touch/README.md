@@ -2,7 +2,7 @@
 
 This example runs an actual embedded UI inside the emulated MCU. The sysl
 firmware is linked for flash, uses `imui`, renders antialiased vector graphics and TrueType text
-through PlutoVG into ARGB32 RAM, converts to RGB565, and sends changed pixel runs to an ST7789 over GPIO SPI. Mouse input enters a
+through PlutoVG into ARGB32 RAM, converts to RGB565, and sends changed pixel runs to an ST7789VW over hardware SPI. Mouse input enters a
 separate GT911 touch controller; firmware reads its ordinary I2C registers.
 No host-side button callbacks change the guest application's state.
 
@@ -61,10 +61,30 @@ emulated instruction, not a cycle-accurate Cortex-M33 model; no flash wait state
 or bus contention are included. If the host cannot keep up, emulation runs slower
 than the target. Stalls are capped at 50 ms of catch-up work per frame.
 Headless runs and tests pump deterministic guest ticks without wall-time pacing.
- GPIO
-bit-banging and real guest rendering cost execution time. This is not a direct
-host-rendered mockup; a virtual SPI controller and firmware DMA are future
-performance improvements.
+ The display now uses the catalog's `pl022` hardware SPI peripheral at
+`0x50001000`, mode 0, 8-bit frames, divider 4: 37.5 MHz with the 150 MHz guest
+clock. Firmware fills the eight-entry TX FIFO, polls TNF/BSY, and drains RX.
+The controller emits timestamped SCK/MOSI transitions into the existing display
+wire receiver, including CS/DC/reset handling. Peripheral time advances at MMIO
+and GPIO accesses or word completion, rather than scheduling a host task per bit.
+No host framebuffer shortcut or separate per-byte host thread is involved.
+
+The demo selects ST7789VW, whose four-wire write timing allows this rate;
+the older ST7789V catalog entry remains available. Both share the existing DCS
+behavior model. See the [Sitronix ST7789VW datasheet](https://www.hestore.eu/en/prod_getfile.php?id=12938).
+Button-press SPI work drops from about 1.26 million to 656 thousand guest ticks.
+DMA request-control registers are present, but a DMA engine, SPI slave mode,
+TI/Microwire framing and automatic hardware CS are not implemented yet.
+
+The original GPIO implementation is preserved as a buildable feature:
+
+```sh
+./examples/touch/build.sh gpio
+./benchtop run --window --board boards/touch.hocon examples/touch/gpio.elf
+```
+
+`./examples/touch/build.sh` builds the default hardware-SPI `demo.elf`. Both
+transports have firmware regression coverage and identical reference pixels.
 
 ## Hardware description
 
