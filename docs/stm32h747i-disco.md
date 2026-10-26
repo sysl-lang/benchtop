@@ -52,11 +52,34 @@ chosen revision must be explicit when the board description is introduced.
 - Regression coverage for 2:1 busy-loop progress in both schedulers, local
   SysTick wakeup conversion, invalid clocks, reset and differing architectures.
 
+## Runnable dual-core bring-up harness
+
+```
+./examples/touch/build.sh h7
+./benchtop run --window --board boards/h747-cores.hocon examples/touch/h7.elf
+```
+
+This runs actual M7 and M4 guest cores. M7 initializes the shared runtime and
+uses `RCC_GCR.BOOT_C2` to release M4 from its vector table at 0x08100000.
+The image targets the common ARMv7E-M single-precision subset, with M4-compatible
+newlib and PlutoVG; both vectors and code reside in the real internal-flash
+address range. Runtime data uses 512 KB AXI SRAM, with separate stacks.
+
+The boot configuration corresponds to BCM4 disabled in option bytes. The current
+`stm32h7-rcc` adapter implements GCR boot control only; oscillator, PLL and other
+RCC accesses fail explicitly. Clock rates are supplied by the description.
+
+The UI executes on M4. M7 currently spins and is reserved for subsequent audio
+firmware; it does not yet process audio. The screen/touch are still the existing
+ST7789/GT911 test harness using virtual peripherals. This is **not** the complete
+Discovery board, and the window labels it as core bring-up. The original M33
+board and all original SPI/GPIO firmware modes remain available.
+
 ## Remaining board bring-up
 
-Real memory banks and external SDRAM; STM32 RCC/PWR and dual-core boot;
+Real memory banks and external SDRAM; remaining STM32 RCC/PWR behavior;
 STM32 interrupt routing beyond the existing 32 external lines; GPIO and I2C;
-LTDC/DSI and display/touch controller models; SAI/DMA/codec and microphone
+LTDC/DSI and Discovery display/touch controller models; SAI/DMA/codec and microphone
 adapters; board description and flashable dual-core demo firmware.
 
 Clock pacing currently counts one local tick per retired instruction. It does
