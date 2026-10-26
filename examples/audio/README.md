@@ -5,7 +5,7 @@ amplifier, a separate speaker (LS1), and an INMP441 MEMS microphone (MK1).
 The component descriptions reserve four MCU pins for BCLK, WS, TX and RX.
 Speaker input connects to `amplifier.out`, rather than directly to an MCU pin.
 
-Hold keyboard **1** or click/hold SW1 for a 480 Hz triangular PCM tone. Speak
+Hold keyboard **1** or click/hold SW1 for a 480 Hz sine-wave PCM tone. Speak
 into the Mac's microphone to drive the five-LED level meter. The firmware reads
 microphone samples and drives the GPIO LEDs; the UI does not calculate the meter.
 The meter uses thresholds spanning roughly -54 to -6 dBFS, leaving headroom above
