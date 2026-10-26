@@ -1,0 +1,133 @@
+module sh.sysl.benchtop.peripheral.i2s
+
+import sysl.buf.{Buf, buf}
+import sysl.math.{min, max}
+
+const RATE: u64 = 48000
+const FIFO: int = 64
+const HISTORY: int = 4096
+
+/** Mono left-channel I2S frame engine. Signed 24-bit samples occupy bits 31..8.
+ * Right slots are silent. The virtual MCU adapter exposes completed frames, not pin edges.
+ */
+struct Controller
+    hz: u64
+    ctrl: u32
+    flags: u32
+    time: u64
+    phase: u64
+    tx: [64]u32
+    tx_at: int
+    tx_count: int
+    rx: [64]u32
+    rx_at: int
+    rx_count: int
+    input: [4096]u32
+    input_at: int
+    input_count: int
+    output: [4096]f32
+    output_at: int
+    output_count: int
+    peak: u32
+
+controller(hz: u64 = 12000000) -> Controller
+    require hz >= RATE && hz <= 1000000000, "valid digital audio clock"
+    Controller(hz, 0, 0, 0, 0, [0;64], 0, 0, [0;64], 0, 0, [0;4096], 0, 0, [0.0;4096], 0, 0, 0)
+
+reset(c: *Controller) = *c = controller(c.hz)
+
+/** Host input is bounded and quantized exactly once into the microphone's 24-bit format. */
+feed(c: *Controller, samples: []const f32)
+    for sample in samples
+        if c.input_count == HISTORY
+            c.input_at = (c.input_at + 1) % HISTORY
+            c.input_count -= 1
+        val clipped = if sample != sample then 0.0f32 else max(-1.0f32, min(1.0f32, sample))
+        val signed = int(min(8388607.0, real(clipped) * 8388608.0))
+        c.input[(c.input_at + c.input_count) % HISTORY] = u32(signed) << 8
+        c.input_count += 1
+
+/** One rational guest clock drives playback and capture, independent of UI frame size. */
+advance(c: *Controller, time: u64)
+    if time <= c.time then return
+    val elapsed = time - c.time
+    val ticks = elapsed * RATE + c.phase
+    val count = min(ticks / c.hz, u64(HISTORY))
+    c.phase = ticks % c.hz
+    c.time = time
+    for i in 0..<count
+        var value: u32 = 0
+        if (c.ctrl & 1) != 0
+            if c.tx_count == 0 then c.flags |= 4
+            else
+                value = c.tx[c.tx_at]
+                c.tx_at = (c.tx_at + 1) % FIFO
+                c.tx_count -= 1
+        if c.output_count == HISTORY
+            c.output_at = (c.output_at + 1) % HISTORY
+            c.output_count -= 1
+        c.output[(c.output_at + c.output_count) % HISTORY] = f32(real(int(value & 0xFFFFFF00)) / 2147483648.0)
+        c.output_count += 1
+        var input: u32 = 0
+        if c.input_count > 0
+            input = c.input[c.input_at]
+            c.input_at = (c.input_at + 1) % HISTORY
+            c.input_count -= 1
+        if (c.ctrl & 2) == 0 then continue
+        val signed = int(input)
+        c.peak = u32(if signed < 0 then -long(signed) else long(signed))
+        if c.rx_count == FIFO then c.flags |= 8
+        else
+            c.rx[(c.rx_at + c.rx_count) % FIFO] = input
+            c.rx_count += 1
+
+read(c: *Controller, offset: u32) -> Option[u32] = offset match
+    0 -> Some(c.ctrl)
+    4 -> Some((if c.tx_count < FIFO then 1u32 else 0) | (if c.rx_count > 0 then 2u32 else 0) | c.flags)
+    8 -> Some(0)
+    12 ->
+        if c.rx_count == 0
+            c.flags |= 16
+            Some(0)
+        else
+            val sample = c.rx[c.rx_at]
+            c.rx_at = (c.rx_at + 1) % FIFO
+            c.rx_count -= 1
+            Some(sample)
+    16 -> Some(u32(RATE))
+    20 -> Some(u32(FIFO - c.tx_count))
+    24 -> Some(u32(c.rx_count))
+    28 -> Some(c.peak)
+    _ -> None
+
+write(c: *Controller, offset: u32, value: u32) -> bool
+    offset match
+        0 ->
+            if (value & 0x80000000) != 0
+                val time = c.time
+                reset(c)
+                c.time = time
+            c.ctrl = value & 3
+        4 -> c.flags &= ~(value & 60)
+        8 ->
+            if c.tx_count == FIFO then c.flags |= 32
+            else
+                c.tx[(c.tx_at + c.tx_count) % FIFO] = value & 0xFFFFFF00
+                c.tx_count += 1
+        12 | 16 | 20 | 24 | 28 -> ()
+        _ -> return false
+    true
+
+take(c: *Controller) -> Buf[f32]
+    var samples: Buf[f32] = buf()
+    for i in 0..<c.output_count do samples.push(c.output[(c.output_at + i) % HISTORY])
+    c.output_at = 0
+    c.output_count = 0
+    samples
+
+/** Dropping stale host sound at pause/reset never changes guest TX/RX FIFO contents. */
+clear_host(c: *Controller)
+    c.input_count = 0
+    c.input_at = 0
+    c.output_count = 0
+    c.output_at = 0

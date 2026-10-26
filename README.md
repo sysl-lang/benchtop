@@ -46,6 +46,20 @@ to LCD line two. It starts from the Mac’s local time. Press **2** to demonstra
 setting it to **12:34:56** through firmware; it then continues from that value.
 The demo produces no console output.
 See [audio, RTC and real-part catalog entries](docs/audio-and-rtc.md).
+
+The workbench and matrix firmware now execute from flash at `0x10000000`, with
+RAM at `0x20000000` and sysl startup that copies `.data` and clears `.bss`.
+The workbench describes an external W25Q32JV part; the matrix uses on-chip flash.
+See [flash configuration and current hardware limits](docs/flash.md).
+
+A separate [digital audio demo](examples/audio/README.md) adds a MAX98357A-style
+PCM amplifier/speaker and an INMP441 MEMS microphone backed by the Mac's input.
+Hold **1** to play a tone; the firmware displays microphone level on GPIO LEDs:
+
+```sh
+./benchtop run --window --board boards/audio.hocon examples/audio/demo.elf
+```
+
 Click **RV1**’s small plot icon, right-click RV1, or use **RV1 · ADC result**
 in the toolbar to open a movable,
 resizable instrument window. **Hold / Resume** freezes only the instrument;

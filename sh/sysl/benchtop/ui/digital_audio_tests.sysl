@@ -1,0 +1,92 @@
+module sh.sysl.benchtop.ui
+@tests
+
+import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.v6m as cpu
+import sh.sysl.sdl3 as sdl
+import sh.sysl.ui as ui
+import sysl.env.vars
+import sysl.math.Float
+
+private val DIGITAL_GUEST = embed("../../../../examples/audio/demo.elf")
+
+private digital_desktop() -> &Desktop
+    assert(virt.board_named("boards/audio.hocon").is_ok())
+    virt.open_console()
+    virt.capture_bounded(256)
+    virt.boot(virt.core0(), virt.image_of(DIGITAL_GUEST).unwrap().view())
+    desktop(open_scene("boards/audio.hocon").unwrap(), state(true))
+
+@test("digital audio firmware: button plays PCM, synthetic microphone drives GPIO meter, and reset clears audio")
+digital_firmware()
+    val d = digital_desktop()
+    val count = ui.signal(0u64)
+    var st = d.current.read()
+    key_input(d.scene, &st, "1", true)
+    d.current.set(st)
+    var loud = false
+    var meter = false
+    val input: [800]f32 = [0.25;800]
+    for frame in 0..<30
+        virt.feed_microphone(input[..])
+        desktop_tick(d, virt.core0(), [], 0, count, "", 120000)
+        for sample in virt.take_sound(cpu.clock(virt.core0(), virt.core0().retired))
+            if sample.abs() > 0.01 then loud = true
+        if (virt.panel_output_latch() & 61) == 61 then meter = true
+    assert(!d.current.read().stopped, d.current.read().notice)
+    assert(loud && meter, s"speaker=$loud meter=$meter")
+    st = d.current.read()
+    key_input(d.scene, &st, "1", false)
+    d.current.set(st)
+    for frame in 0..<5 do desktop_tick(d, virt.core0(), [], 0, count, "", 120000)
+    val image = virt.image_of(DIGITAL_GUEST).unwrap()
+    virt.boot(virt.core0(), image.view())
+    assert(virt.digital_audio.tx_count == 0 && virt.digital_audio.rx_count == 0 && virt.digital_audio.input_count == 0)
+
+@test("digital audio MMIO: word alignment, unknown registers and frame FIFO state")
+digital_registers()
+    digital_desktop()
+    cpu.store32(virt.core0(), 0x50000400, 3)
+    virt.feed_microphone([0.5f32])
+    virt.core0().retired = 250
+    assert(cpu.load32(virt.core0(), 0x50000418) == 1)
+    assert(cpu.load32(virt.core0(), 0x5000040C) == 0x40000000)
+    cpu.store8(virt.core0(), 0x50000408, 1)
+    assert(virt.core0().stop == cpu.Stop.Fault)
+    digital_desktop()
+    cpu.load32(virt.core0(), 0x50000420)
+    assert(virt.core0().stop == cpu.Stop.Unmapped)
+
+@test("native microphone: SDL recording reaches firmware input and clears stale capture on pause")
+native_capture()
+    var live = false
+    for entry in vars() do if entry.0 == "BENCHTOP_MIC_LIVE" && entry.1 == "1" then live = true
+    sdl.set_main_ready()
+    assert(sdl.set_hint("SDL_AUDIO_DRIVER", if live then "coreaudio" else "dummy"))
+    val d = digital_desktop()
+    val player = audio_player()
+    defer close_audio(player)
+    assert(player.recording.is_some(), player.error)
+    if live then assert(player.driver == "coreaudio")
+    sdl.delay(80)
+    assert(player.recording.unwrap().available() > 0, "recording stream supplies PCM frames")
+    audio_frame(player, d)
+    assert(virt.digital_audio.input_count > 0)
+    var st = d.current.read()
+    st.paused = true
+    d.current.set(st)
+    audio_frame(player, d)
+    assert(virt.digital_audio.input_count == 0)
+
+@test("native PCM speaker: SDL plays guest samples and clears its queue on mute, pause and reset")
+native_pcm()
+    var live = false
+    for entry in vars() do if entry.0 == "BENCHTOP_AUDIO_LIVE" && entry.1 == "1" then live = true
+    sdl.set_main_ready()
+    assert(sdl.set_hint("SDL_AUDIO_DRIVER", if live then "coreaudio" else "dummy"))
+    val d = digital_desktop()
+    val player = audio_player()
+    defer close_audio(player)
+    assert(player.stream.is_some(), player.error)
+    if live then assert(player.driver == "coreaudio")
+    exercise_playback(d, player, live)

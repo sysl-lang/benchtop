@@ -1,0 +1,107 @@
+module sh.sysl.benchtop.virt
+
+import sh.sysl.benchtop.{Board, part_model, part_whole, param_named}
+import sh.sysl.benchtop.peripheral.i2s as i2s
+import sh.sysl.benchtop.v6m.{Cpu, Stop, clock, halt}
+import sysl.buf.{Buf, buf}
+import sysl.threads.SleepLock
+
+var digital_audio = i2s.controller()
+var digital_present = false
+var digital_speaker = false
+var digital_mic = false
+var digital_gain: f32 = 0.12
+var digital_lock = SleepLock.new()
+
+private[virt] configure_digital_audio(b: Board) -> Result[unit, string]
+    digital_present = false
+    digital_speaker = false
+    digital_mic = false
+    var hz: u64 = 12000000
+    var bus = ""
+    for p in b.chip.peripherals
+        if p.kind != "virt-i2s" then continue
+        digital_present = true
+        bus = p.name
+        param_named(p.params, "clock-hz") match
+            Some(q) -> q.value match
+                Whole(n) -> hz = u64(n)
+                _ -> ()
+            None -> ()
+    if digital_present && !buzzers.is_empty() && hz != pwm_channel.hz then return Err("PWM and I2S audio must share the same guest clock")
+    digital_audio = i2s.controller(hz)
+    var amplifier = ""
+    for p in b.parts
+        if part_model(p) != "i2s-amplifier" && part_model(p) != "i2s-microphone" then continue
+        if !digital_present then return Err("digital audio parts require a virt-i2s peripheral")
+        for wire in p.wires
+            if wire.port != "i2s" then continue
+            wire.to match
+                Bus(name) -> if name != bus then return Err("digital audio part uses an unsupported controller")
+                _ -> ()
+        if part_model(p) == "i2s-amplifier"
+            if !amplifier.is_empty() then return Err("one I2S amplifier is supported per controller")
+            amplifier = p.name
+        else
+            if digital_mic then return Err("one left-channel I2S microphone is supported per controller")
+            digital_mic = true
+    for p in b.parts
+        if part_model(p) != "speaker" then continue
+        if digital_speaker then return Err("one speaker is supported per amplifier")
+        for wire in p.wires
+            wire.to match
+                Port(owner, terminal) -> if owner == amplifier && terminal == "out"
+                    if digital_speaker then return Err("one speaker is supported per amplifier")
+                    digital_speaker = true
+                    digital_gain = f32(real(part_whole(p, "gain", 12)) / 100.0)
+                _ -> ()
+        if !digital_speaker then return Err("speaker input must connect to the I2S amplifier's out terminal")
+    Ok(())
+
+private[virt] boot_digital_audio()
+    i2s.reset(&digital_audio)
+
+private[virt] digital_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
+    if width != 4 || (offset & 3) != 0
+        halt(cpu, Stop.Fault, address)
+        return 0
+    digital_lock.lock()
+    defer digital_lock.unlock()
+    i2s.advance(&digital_audio, clock(cpu, n))
+    i2s.read(&digital_audio, offset) match
+        Some(value) -> value
+        None ->
+            halt(cpu, Stop.Unmapped, address)
+            0
+
+private[virt] digital_write(cpu: *Cpu, address: u32, offset: u32, width: u32, value: u32, n: u64)
+    if width != 4 || (offset & 3) != 0
+        halt(cpu, Stop.Fault, address)
+        return
+    digital_lock.lock()
+    defer digital_lock.unlock()
+    i2s.advance(&digital_audio, clock(cpu, n))
+    if !i2s.write(&digital_audio, offset, value) then halt(cpu, Stop.Unmapped, address)
+
+microphone_available() -> bool = digital_mic
+
+feed_microphone(samples: []const f32)
+    if !digital_mic then return
+    digital_lock.lock()
+    defer digital_lock.unlock()
+    i2s.feed(&digital_audio, samples)
+
+clear_audio_host()
+    digital_lock.lock()
+    defer digital_lock.unlock()
+    i2s.clear_host(&digital_audio)
+
+private[virt] take_digital_sound(time: u64) -> Buf[f32]
+    digital_lock.lock()
+    defer digital_lock.unlock()
+    i2s.advance(&digital_audio, time)
+    val samples = i2s.take(&digital_audio)
+    if !digital_speaker then return buf()
+    var out: Buf[f32] = buf()
+    for sample in samples do out.push(sample * digital_gain)
+    out
