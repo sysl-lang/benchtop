@@ -182,3 +182,35 @@ averages before the run were 19.05 / 15.87 / 22.78. This measures this demo
 (M7 integer idle loop, M4 UI), not audio DSP or cycle-accurate H747 timing.
 All 704 tests passed, including stalled-peer and blocked-display isolation,
 FIFO backpressure, ordered readback, reset and pacing notices.
+
+## Fixed instruction cycle costs (2026-10-26)
+
+Cortex-M cores now support `instruction-timing = estimated`, with `unit` as the
+backward-compatible default. The Discovery demo explicitly enables estimates on
+both cores. All 711 tests passed, including fused/reference equivalence over a
+complete Thumb-2 workload, fault accounting, stepping, IT, FP division, SysTick,
+per-core configuration, DSI rendering/input and worker isolation.
+
+The preserved pre-change binary and the final build were compared in three
+interleaved runs per mode, each executing the three-round Cortex-M7 raw kernel
+benchmark. This workload retires 587,512,667 instructions per round and accounts
+for 802,542,718 estimated cycles (1.366 cycles/instruction).
+
+| Mode | Median native instructions, three rounds | Median native cycles, three rounds |
+| --- | ---: | ---: |
+| Original binary | 33,082,882,760 | 7,308,782,525 |
+| New unit mode | 33,065,619,001 | 7,237,320,189 |
+| Estimated mode | 37,708,187,636 | 8,342,832,321 |
+
+Unit mode is effectively unchanged in these counters. Estimated mode adds about
+14% native work while representing 36.6% more guest cycles; normalized by native
+cycles, guest-cycle throughput improves about 20% for this workload. Wall rates
+were noisy (host load averages 26.97 / 24.57 / 28.13); these counters do not imply
+a guaranteed elapsed-time improvement on a loaded host or another workload.
+
+The final 2,400-frame Discovery run averaged 479.996 / 240.000 MHz of simulated
+core time, 319.995 / 146.596 MIPS and 119.849 UI FPS across nineteen trace samples.
+The two instruction rates differ from clock rates because each instruction now
+advances its estimated number of cycles. These results remain specific to the
+M7 idle-loop/M4 UI demonstration, not audio DSP validation or pipeline-accurate
+H747 execution timing. See [the timing model](../docs/instruction-timing.md).
