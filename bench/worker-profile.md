@@ -171,3 +171,14 @@ pending, and requires both CPU workers to progress on threads distinct from the
 DSI worker. Further tests cover bounded queue saturation, consume-once behavior,
 write/read ordering and worker persistence across reset. The previous throughput
 numbers describe earlier scheduler versions and must be remeasured for this one.
+
+## Independent CPUs and asynchronous DSI measurement
+
+2026-10-26: the Discovery DSI demo ran for 2,400 UI frames with independent
+CPU pacing and the dedicated bounded-channel DSI worker. Unsampled CPU trace
+reported approximately 480 MIPS on M7 and 240 MIPS on M4, sustaining both
+configured instruction-rate targets while the UI ran near 120 FPS. Host load
+averages before the run were 19.05 / 15.87 / 22.78. This measures this demo
+(M7 integer idle loop, M4 UI), not audio DSP or cycle-accurate H747 timing.
+All 704 tests passed, including stalled-peer and blocked-display isolation,
+FIFO backpressure, ordered readback, reset and pacing notices.
