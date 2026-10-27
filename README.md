@@ -638,7 +638,8 @@ heterogeneous M7/M4 configuration.
 
 The initial `stm32h747-disco` board description runs an M7 at a configured
 480 MHz and an M4 at 240 MHz, each on its own host worker. M4 runs the touchscreen
-UI; M7 is reserved for audio and currently idles in a loop.
+UI. The display-only image leaves M7 idle; the audio variant runs M7 sine DSP
+and interrupt-driven SAI/DMA playback through a WM8994 codec.
 
 ```sh
 ./examples/touch/build.sh dsi
@@ -660,7 +661,7 @@ or unsupported operations fail explicitly. The common DCS display is a separate
 part connected by `dsi = <controller>` and optional `channel = 0..3`.
 
 This is a runnable subset, not complete Discovery emulation: LTDC/video mode,
-DMA2D, the audio codec, the remaining RAM banks, external memory, full RCC/PWR and
+DMA2D, audio capture, the remaining RAM banks, external memory, full RCC/PWR and
 panel-specific vendor initialization are still missing. I2C4 is a functional
 polling adapter, without SCL timing or interrupts. See
 [the hardware target and supported subset](docs/stm32h747i-disco.md).
@@ -669,7 +670,9 @@ Reusable STM32H7 SAI, DMA and DMAMUX models now provide the
 [audio peripheral foundation](docs/stm32-audio-peripherals.md). They are tested
 together with circular RAM-to-SAI transfers and mapped on Discovery with real
 SAI/DMA IRQs. A flash-linked Sysl regression wakes from WFI on DMA completion.
-Codec and audible audio integration are the next step.
+For audible playback with M4 touch controls, build with
+`./examples/touch/build.sh audio` and run `examples/touch/audio-disco.elf` on
+`stm32h747-disco`. Enable TONE in the display UI; startup is silent.
 
 
 Normal DSI sessions also have a dedicated device worker. CPU workers enqueue

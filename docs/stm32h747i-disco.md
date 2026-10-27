@@ -111,8 +111,10 @@ before this example can boot unchanged on a physical Discovery board.
 
 Real memory banks and external SDRAM; remaining STM32 RCC/PWR behavior;
 GPIO and full I2C timing/interrupt behavior;
-LTDC video streaming and complete Discovery panel-specific initialization; WM8994 codec and microphone
-adapters, the audio DSP firmware and complete physical-board startup.
+LTDC video streaming and complete Discovery panel-specific initialization; WM8994
+capture, microphone adapters and complete physical-board startup. The optional
+`audio-disco.elf` image runs sine DSP on M7 with WM8994 speaker playback and M4
+touch controls; see the audio peripheral documentation for the supported subset.
 SAI, DMA and DMAMUX register mappings and their real interrupt numbers are
 implemented; see [audio peripherals](stm32-audio-peripherals.md).
 
