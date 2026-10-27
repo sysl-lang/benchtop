@@ -203,11 +203,11 @@ input/output meters and estimated DSP peak load. Monitoring starts off. The
 headphone part uses the Mac's default playback device; the speaker, sine and
 microphone-filter demos remain available.
 
-## SPI SD-card settings
+## SD-card settings
 
-The `storage` variant keeps the stereo delay and adds **SAVE**. It writes
+The `storage` variant uses the Discovery board’s native SDMMC1 slot, keeps the stereo delay and adds **SAVE**. It writes
 `SETTINGS.TXT` (feedback and wet/dry percentages) and restores it at startup through the standalone
-[`spi`](https://github.com/sysl-lang/spi), [`sd`](https://github.com/sysl-lang/sd)
+[`sd`](https://github.com/sysl-lang/sd)
 and [`fat`](https://github.com/sysl-lang/fat) firmware dependencies.
 
 ```sh
@@ -223,20 +223,35 @@ card's storage. Restarting Benchtop reloads the disk image. An omitted/empty
 `image` gives volatile zero-filled media instead. Firmware never formats media
 on initialization failure: the UI reports SD ERROR.
 
-This is an **external SPI slot**, with PA5 SCK, PA6 MISO, PA7 MOSI and PA4 active-low
-CS, using SPI1 AF5. It does not emulate the Discovery board's onboard SDMMC slot.
-M4 uses actual GPIO MODER/AFR/BSRR and STM32H7 SPI CR1/CFG1/CFG2/TXDR/RXDR
-registers. The SD model receives clock edges and commands, not filesystem calls.
-The driver runs at a ceiling of 400 kHz during initialization and 25 MHz afterwards
-(actual configured rates are 234.375 kHz and 15 MHz for a 60 MHz SPI kernel clock).
-Physical-board startup still needs the full RCC/PLL and board initialization.
+The default connection is the Discovery microSD slot CN12: SDMMC1 at
+`0x52007000`, IRQ49, PC8..PC11 D0..D3, PC12 CK and PD2 CMD (AF12), plus
+active-low card detect on PI8. M4 drives actual GPIO and SDMMC registers and
+uses SDMMC's single-buffer internal DMA through a word-aligned AXI SRAM buffer.
+The native driver in `sd` performs CMD0/8, ACMD41, CID/RCA/CSD, selection, SCR and
+four-bit negotiation. The controller has a configured 60 MHz kernel clock;
+firmware selects 400 kHz initialization and 15 MHz four-bit transfers under its
+25 MHz transfer ceiling. Full physical-board RCC/PLL startup remains separate.
 
-The initial SD model implements single-sector SDHC SPI commands, CSD/OCR,
-command/data CRC, programming busy and write protection. Its reduced 16 MiB
-SDHC-addressed capacity is convenient for development, rather than a real SDHC
-card's capacity class. The register adapter currently supports eight-bit polling,
-software chip select and continuous TSIZE=0 transfers; DMA, interrupts, hardware
-CRC/NSS and finite TSIZE are rejected. Existing SPI and audio demos remain.
+The register model supports native SD v2 memory cards, one 512-byte sector per
+transfer, the eight-byte SCR transfer, single-buffer IDMA, completion/error IRQs
+and programming-busy polling. PIO FIFO, multiblock, double-buffer IDMA, SDIO,
+MMC/eMMC, UHS and busy-end IRQ are not implemented. Unsupported register modes
+are rejected. Command/data timing follows configured bus clocks; RAM block
+visibility occurs at transfer completion, without detailed AHB arbitration.
+The reduced 16 MiB SDHC-addressed image is for development, rather than a real
+SDHC card's capacity class.
+
+The complete SPI variant remains available:
+
+```sh
+./examples/touch/build.sh storage-spi
+./benchtop run --window --board boards/stm32h747-spi-sd.hocon examples/touch/storage-spi-disco.elf
+```
+
+It uses the external slot on PA5 SCK, PA6 MISO, PA7 MOSI and PA4 CS (SPI1 AF5),
+eight-bit polling, software chip select and continuous TSIZE=0 transfers, at
+234.375 kHz initialization and 15 MHz transfers. The same FAT, settings, WAV,
+recording/playback, media cache and disk writer are shared between transports.
 
 A separate host worker writes accepted sectors to disk; the guest core does no
 host filesystem I/O. Card busy stays asserted until that write has been flushed
@@ -274,7 +289,7 @@ counters are available to debugger instruments. The existing firmware startup
 keeps caches disabled; a physical application enabling the M7 data cache must
 configure shared SRAM appropriately or perform cache maintenance.
 
-Recording uses FIFO-pipelined bulk SPI reads/writes rather than waiting for each
+The SPI variant uses FIFO-pipelined bulk SPI reads/writes rather than waiting for each
 byte separately. At most 32 bytes are outstanding, and writes drain RX too.
 The transfer-clock ceiling is 25 MHz (15 MHz with this board's 60 MHz kernel
 clock and available dividers), within standard-speed SD operation. Initialization

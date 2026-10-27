@@ -20,3 +20,10 @@ M33, RV32 and AArch64.
   mistake, not a WAV or firmware recording failure.
 
 These are API/ergonomics observations, not claims of a confirmed compiler defect.
+
+
+While implementing SDMMC under installed Sysl 0.7.2, mutable scalar captures in
+callbacks were another small friction point: assigning to the captured copy did
+not update the enclosing test's flag. Explicit reference-backed observation
+state made ownership clear. Native SD and both firmware variants otherwise
+compiled without language/compiler changes.
