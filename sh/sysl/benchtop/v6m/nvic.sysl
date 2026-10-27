@@ -1,0 +1,134 @@
+module sh.sysl.benchtop.v6m
+
+import sysl.sync.*
+
+// ARM NVIC banked register model, up to the selected model's implemented IRQs.
+// Low words remain in their original fields. Cold extra banks are visited only
+// when their summary bits say that something is pending, active or incoming.
+const NVIC_IABR: u32 = 0xe000e300
+
+irq_enabled(c: *Cpu, irq: u32) -> bool
+    if irq >= c.nvic_irqs then return false
+    val word = if irq < 32 then c.enabled else c.enabled_extra[usize(irq / 32 - 1)]
+    word & (1u32 << (irq & 31)) != 0
+
+exception_pending(c: *Cpu, e: u32) -> bool
+    if e >= c.nvic_irqs + IRQ0 then return false
+    val word = if e < 64 then c.pending else c.pending_extra[usize(e / 64 - 1)]
+    word & (1u64 << (e & 63)) != 0
+
+exception_active(c: *Cpu, e: u32) -> bool
+    if e >= c.nvic_irqs + IRQ0 then return false
+    val word = if e < 64 then c.active else c.active_extra[usize(e / 64 - 1)]
+    word & (1u64 << (e & 63)) != 0
+
+set_pending(c: *Cpu, e: u32, on: bool)
+    if e >= c.nvic_irqs + IRQ0 then return
+    val bit = 1u64 << (e & 63)
+    if e < 64
+        if on then c.pending |= bit else c.pending &= ~bit
+    else
+        val bank = usize(e / 64 - 1)
+        if on then c.pending_extra[bank] |= bit else c.pending_extra[bank] &= ~bit
+        if c.pending_extra[bank] != 0 then c.pending_banks |= 1u32 << u32(bank)
+        else c.pending_banks &= ~(1u32 << u32(bank))
+
+set_active(c: *Cpu, e: u32, on: bool)
+    if e >= c.nvic_irqs + IRQ0 then return
+    val bit = 1u64 << (e & 63)
+    if e < 64
+        if on then c.active |= bit else c.active &= ~bit
+    else
+        val bank = usize(e / 64 - 1)
+        if on then c.active_extra[bank] |= bit else c.active_extra[bank] &= ~bit
+        if c.active_extra[bank] != 0 then c.active_banks |= 1u32 << u32(bank)
+        else c.active_banks &= ~(1u32 << u32(bank))
+
+take_extra_incoming(c: *Cpu)
+    val banks = atomic_swap(&c.incoming_banks,0,Acquire)
+    for bank in 0usize..<7
+        if banks & (1u32 << u32(bank)) == 0 then continue
+        val bits = atomic_swap(&c.incoming_extra[bank],0,Acquire)
+        c.pending_extra[bank] |= bits
+        if c.pending_extra[bank] != 0 then c.pending_banks |= 1u32 << u32(bank)
+
+extra_running_priority(c: *Cpu, current: int) -> int
+    var result = current
+    for bank in 0usize..<7
+        if c.active_banks & (1u32 << u32(bank)) == 0 then continue
+        var bits = c.active_extra[bank]
+        var e = u32(bank + 1) * 64
+        while bits != 0
+            if bits & 1 != 0 then result = if group(c,priority(c,e)) < result then group(c,priority(c,e)) else result
+            bits >>= 1
+            e += 1
+    result
+
+extra_best_pending(c: *Cpu, current: int) -> int
+    var best = current
+    for bank in 0usize..<7
+        if c.pending_banks & (1u32 << u32(bank)) == 0 then continue
+        var bits = c.pending_extra[bank]
+        var e = u32(bank + 1) * 64
+        while bits != 0
+            if bits & 1 != 0 && eligible(c,e) && (best < 0 || priority(c,e) < priority(c,u32(best))) then best = int(e)
+            bits >>= 1
+            e += 1
+    best
+
+private bank_mask(c: *Cpu, bank: u32) -> u32
+    val first = bank * 32
+    if first >= c.nvic_irqs then return 0
+    val count = c.nvic_irqs - first
+    if count >= 32 then 0xffffffff else (1u32 << count) - 1
+
+private bank_bits(c: *Cpu, bank: u32, active: bool) -> u32
+    var bits: u32 = 0
+    for k in 0u32..<32
+        val e = IRQ0 + bank * 32 + k
+        if (if active then exception_active(c,e) else exception_pending(c,e)) then bits |= 1u32 << k
+    bits
+
+private nvic_bank(c: *Cpu, address: u32) -> int
+    if address < NVIC_ISER || address >= NVIC_IABR + 64 || address & 3 != 0 then return -1
+    val group = (address - NVIC_ISER) / 128
+    val offset = (address - NVIC_ISER) % 128
+    if group > 4 || offset >= 64 then return -1
+    if is_v6m(c.kind) && offset != 0 then return -1
+    if group == 4 && is_baseline(c.kind) then return -1
+    int(group * 16 + offset / 4)
+
+nvic_read(c: *Cpu, address: u32) -> Option[u32]
+    if address >= NVIC_IPR && address < NVIC_IPR + 512 && (!is_v6m(c.kind) || address < NVIC_IPR + 32)
+        var value: u32 = 0
+        for k in 0u32..<4
+            val irq = address - NVIC_IPR + k
+            if irq < c.nvic_irqs then value |= u32(c.prio[IRQ0 + irq]) << (k * 8)
+        return Some(value)
+    val encoded = nvic_bank(c,address)
+    if encoded < 0 then return None
+    val group = u32(encoded) / 16
+    val bank = u32(encoded) % 16
+    var value = bank_bits(c,bank,group == 4)
+    if group < 2 then value = if bank == 0 then c.enabled else c.enabled_extra[usize(bank - 1)]
+    Some(value & bank_mask(c,bank))
+
+nvic_write(c: *Cpu, address: u32, value: u32) -> bool
+    if address >= NVIC_IPR && address < NVIC_IPR + 512 && (!is_v6m(c.kind) || address < NVIC_IPR + 32)
+        for k in 0u32..<4
+            val irq = address - NVIC_IPR + k
+            if irq < c.nvic_irqs then c.prio[IRQ0 + irq] = u8((value >> (k * 8)) & prio_mask(c))
+        return true
+    val encoded = nvic_bank(c,address)
+    if encoded < 0 then return false
+    val group = u32(encoded) / 16
+    val bank = u32(encoded) % 16
+    val bits = value & bank_mask(c,bank)
+    if group < 2
+        val word = if bank == 0 then &c.enabled else &c.enabled_extra[usize(bank - 1)]
+        if group == 0 then word[0] |= bits else word[0] &= ~bits
+    elif group < 4
+        for k in 0u32..<32
+            if bits & (1u32 << k) != 0 then set_pending(c,IRQ0 + bank * 32 + k,group == 2)
+    // IABR is read-only.
+    true

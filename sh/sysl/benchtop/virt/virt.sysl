@@ -114,7 +114,7 @@ struct Mapped
     device: Device
     base: u32
     last: u32
-    irqs: [4]int
+    irqs: [8]int
 
 enum Device
     Console
@@ -130,15 +130,19 @@ enum Device
     Spi
     H7Rcc
     Dsi
+    Sai
+    Dma1
+    Dma2
+    Dmamux
 end Device
 
-val NO_IRQS: [4]int = [-1, -1, -1, -1]
+val NO_IRQS: [8]int = [-1;8]
 
 // The devices on the bus, at most one of each kind, which `attach` sets; and the IRQs the console
 // and the SIO raise, -1 where the board has no such device or gave it no IRQ.
 // They are a plain array, which both cores' threads read at once without touching it.
-var devices: [13]Mapped = [Mapped(Console, 0, 0, NO_IRQS), Mapped(Sio, 0, 0, NO_IRQS),
-    Mapped(Resets, 0, 0, NO_IRQS), Mapped(Timer, 0, 0, NO_IRQS), Mapped(Watchdog, 0, 0, NO_IRQS), Mapped(PanelGpio, 0, 0, NO_IRQS), Mapped(Adc, 0, 0, NO_IRQS), Mapped(I2c, 0, 0, NO_IRQS), Mapped(Pwm, 0, 0, NO_IRQS), Mapped(DigitalAudio, 0, 0, NO_IRQS), Mapped(Spi, 0, 0, NO_IRQS), Mapped(H7Rcc, 0, 0, NO_IRQS), Mapped(Dsi, 0, 0, NO_IRQS)]
+var devices: [17]Mapped = [Mapped(Console, 0, 0, NO_IRQS), Mapped(Sio, 0, 0, NO_IRQS),
+    Mapped(Resets, 0, 0, NO_IRQS), Mapped(Timer, 0, 0, NO_IRQS), Mapped(Watchdog, 0, 0, NO_IRQS), Mapped(PanelGpio, 0, 0, NO_IRQS), Mapped(Adc, 0, 0, NO_IRQS), Mapped(I2c, 0, 0, NO_IRQS), Mapped(Pwm, 0, 0, NO_IRQS), Mapped(DigitalAudio, 0, 0, NO_IRQS), Mapped(Spi, 0, 0, NO_IRQS), Mapped(H7Rcc, 0, 0, NO_IRQS), Mapped(Dsi, 0, 0, NO_IRQS), Mapped(Sai, 0, 0, NO_IRQS), Mapped(Dma1, 0, 0, NO_IRQS), Mapped(Dma2, 0, 0, NO_IRQS), Mapped(Dmamux, 0, 0, NO_IRQS)]
 var attached: usize = 0
 var console_irq: int = -1
 var fifo_irq: int = -1
@@ -424,6 +428,7 @@ boot(cpu: *Cpu, image: []const u8)
     threads = false
     slice_paired = false
     slice_horizon = NEVER
+    boot_sai_dma()
     boot_dsi()
     boot_h7()
     boot_rp()
@@ -522,8 +527,8 @@ round(cpu: *Cpu) -> bool
 
     settle(cpu)
 
-private[virt] device_due() -> u64 = min(min(min(timer_due(), adc_due()), spi_due()),dsi_due())
-private[virt] device_wake(cpu: *Cpu) -> u64 = min(min(min(timer_wake(cpu), adc_wake(cpu)), spi_wake(cpu)),dsi_due())
+private[virt] device_due() -> u64 = min(min(min(min(timer_due(), adc_due()), spi_due()),dsi_due()),sai_dma_due())
+private[virt] device_wake(cpu: *Cpu) -> u64 = min(min(min(min(timer_wake(cpu), adc_wake(cpu)), spi_wake(cpu)),dsi_due()),sai_dma_wake(cpu))
 
 // A core's turn: run it until its clock reaches `until`, or it sleeps past it, or it stops.
 private[virt] turn(cpu: *Cpu, until: u64)
@@ -622,6 +627,7 @@ private[virt] signal(cpu: *Cpu)
 
     if fifo_irq >= 0 && (waiting_in(k) > 0 || fifo_errors[k] != 0) then raise(cpu, u32(fifo_irq))
     signal_rp(cpu)
+    signal_sai_dma(cpu)
     signal_dsi(cpu)
     signal_spi(cpu)
     signal_panel(cpu)
@@ -641,6 +647,7 @@ board_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
     for m in devices[0..<attached]
         if a >= m.base && a <= m.last then
             return m.device match
+                Sai | Dma1 | Dma2 | Dmamux -> sai_dma_read(cpu,m.device,a,a - m.base,width,n)
                 Dsi -> dsi_read(cpu,a,a - m.base,width,n)
                 H7Rcc -> h7_rcc_read(cpu,a,a - m.base,width)
                 Console -> console_read(cpu, a, a - m.base)
@@ -660,6 +667,7 @@ board_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
     for m in devices[0..<attached]
         if a >= m.base && a <= m.last then
             m.device match
+                Sai | Dma1 | Dma2 | Dmamux -> sai_dma_write(cpu,m.device,a,a - m.base,width,x,n)
                 Dsi -> dsi_write(cpu,a,a - m.base,width,x,n)
                 H7Rcc -> h7_rcc_write(cpu,a,a - m.base,width,x)
                 Console -> console_write(cpu, a, a - m.base, x)
@@ -701,7 +709,7 @@ attach(ds: []const Mapped, kind: Kind)
     adc_irq = -1
     var resets = false
     var timer = false
-    var alarms = NO_IRQS
+    var alarms: [4]int = [-1;4]
 
     for i in 0..<ds.len
         val m = ds[i]
@@ -720,9 +728,9 @@ attach(ds: []const Mapped, kind: Kind)
             Resets -> resets = true
             Timer ->
                 timer = true
-                alarms = m.irqs
+                for k in 0..<4 do alarms[k] = m.irqs[k]
             Pwm -> has_pwm = true
-            Watchdog | I2c | DigitalAudio | Spi | H7Rcc | Dsi -> ()
+            Watchdog | I2c | DigitalAudio | Spi | H7Rcc | Dsi | Sai | Dma1 | Dma2 | Dmamux -> ()
 
     attach_rp(resets, timer, alarms)
 
