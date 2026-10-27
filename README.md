@@ -22,7 +22,7 @@ devices, how fidelity is tested against real boards, and the milestones with the
 
 The desktop uses **syslUI**, its shared **SDL3 driver**, and **PlutoVG** for vector
 graphics and font rendering. Install SDL3, libuv and pkg-config (`brew install sdl3 libuv pkg-config`
-on macOS), then use sysl 0.6.2:
+on macOS), then use sysl 0.7.0 or newer:
 
 ```sh
 sysl build . -o benchtop
