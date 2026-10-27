@@ -666,6 +666,11 @@ panel-specific vendor initialization are still missing. I2C4 is a functional
 polling adapter, without SCL timing or interrupts. See
 [the hardware target and supported subset](docs/stm32h747i-disco.md).
 
+Reusable STM32H7 SAI, DMA and DMAMUX models now provide the
+[audio peripheral foundation](docs/stm32-audio-peripherals.md). They are tested
+together with circular RAM-to-SAI transfers; board bus and codec integration
+are the next step.
+
 
 Normal DSI sessions also have a dedicated device worker. CPU workers enqueue
 completed packets through a bounded 64-packet host channel; pixel decoding runs

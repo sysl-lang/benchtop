@@ -38,3 +38,7 @@ Primary references:
 - [ST SAI HAL clock-divider formulas](https://github.com/STMicroelectronics/stm32h7xx-hal-driver/blob/master/Src/stm32h7xx_hal_sai.c)
 - [ST DMA request identifiers](https://github.com/STMicroelectronics/stm32h7xx-hal-driver/blob/master/Inc/stm32h7xx_hal_dma.h)
 - [Discovery audio wiring and DMA selections](https://github.com/STMicroelectronics/stm32h747i-disco-bsp/blob/main/stm32h747i_discovery_audio.h)
+
+Validation: all 722 repository tests passed, including eleven new peripheral
+and audio-pipeline regressions. The host build also passed. No audio firmware
+or Discovery bus mapping was changed in this checkpoint.
