@@ -226,18 +226,22 @@ on initialization failure: the UI reports SD ERROR.
 The default connection is the Discovery microSD slot CN12: SDMMC1 at
 `0x52007000`, IRQ49, PC8..PC11 D0..D3, PC12 CK and PD2 CMD (AF12), plus
 active-low card detect on PI8. M4 drives actual GPIO and SDMMC registers and
-uses SDMMC's single-buffer internal DMA through a word-aligned AXI SRAM buffer.
+uses word-aligned AXI SRAM buffers: single-buffer IDMA for individual sectors
+and double-buffer IDMA for bounded multiblock transfers (up to eight sectors).
 The native driver in `sd` performs CMD0/8, ACMD41, CID/RCA/CSD, selection, SCR and
 four-bit negotiation. The controller has a configured 60 MHz kernel clock;
 firmware selects 400 kHz initialization and 15 MHz four-bit transfers under its
 25 MHz transfer ceiling. Full physical-board RCC/PLL startup remains separate.
 
-The register model supports native SD v2 memory cards, one 512-byte sector per
-transfer, the eight-byte SCR transfer, single-buffer IDMA, completion/error IRQs
-and programming-busy polling. PIO FIFO, multiblock, double-buffer IDMA, SDIO,
-MMC/eMMC, UHS and busy-end IRQ are not implemented. Unsupported register modes
-are rejected. Command/data timing follows configured bus clocks; RAM block
-visibility occurs at transfer completion, without detailed AHB arbitration.
+The register model supports native SD v2 memory cards, CMD17/24 single-block and
+CMD18/25 multiblock transfers, CMD12 stop, the eight-byte SCR transfer,
+single/double-buffer IDMA, inactive-buffer address updates, buffer-complete,
+data/error and busy-end IRQs, and per-block programming-busy polling. DMA moves
+RAM data in timed bursts; buffer completion toggles the active buffer. FAT
+coalesces aligned sectors within a cluster, and the native driver splits larger
+requests into bounded transfers. Both DMA halves are prepared before a firmware
+transfer. PIO FIFO, SDIO, MMC/eMMC and UHS remain unsupported. Command/data timing
+follows configured bus clocks without detailed AHB arbitration.
 The reduced 16 MiB SDHC-addressed image is for development, rather than a real
 SDHC card's capacity class.
 
