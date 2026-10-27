@@ -33,6 +33,20 @@ private record_tap()
     touch_point("touch",456,332,false)
     record_chunks(8)
 
+private recorded_file() -> Buf[u8]
+    var disk = fat.ram_device(32768)
+    for sector in 0u64..<32768 do disk.write(sector,sd_image()[usize(sector)*512..<usize(sector+1)*512]).unwrap()
+    var scratch: [512]u8 = [0;512]
+    var volume = fat.mount(&disk,scratch[..]).unwrap()
+    var file = volume.open("RECORD.WAV").unwrap()
+    var bytes: Buf[u8] = buf()
+    var payload: [512]u8 = [0;512]
+    loop
+        val got = volume.read(&file,payload[..]).unwrap()
+        if got == 0 then break
+        for i in 0..<got do bytes.push(payload[i])
+    bytes
+
 @test("Discovery WAV: real microphone DMA records stereo PCM16 through FAT/SD while DSP continues, then finalizes a readable file")
 recording_firmware()
     val description = replace_all(str_cast(embed("../../../../boards/stm32h747-sd.hocon")),"target/disco-sd.img","")
@@ -62,16 +76,7 @@ recording_firmware()
     assert(cpu.load32(core0(),state) == 3,s"finish state=${cpu.load32(core0(),state)} overruns=${cpu.load32(core0(),overruns)}")
     assert(cpu.load32(core0(),overruns) == 0)
     assert(cpu.load32(core0(),errors) == 0 && cpu.load32(core0(),misses) == 0)
-    for sector in 0u64..<32768 do disk.write(sector,sd_image()[usize(sector)*512..<usize(sector+1)*512]).unwrap()
-    var scratch: [512]u8 = [0;512]
-    var volume = fat.mount(&disk,scratch[..]).unwrap()
-    var file = volume.open("RECORD.WAV").unwrap()
-    var bytes: Buf[u8] = buf()
-    var payload: [512]u8 = [0;512]
-    loop
-        val got = volume.read(&file,payload[..]).unwrap()
-        if got == 0 then break
-        for i in 0..<got do bytes.push(payload[i])
+    val bytes = recorded_file()
     var source = WaveBytes(bytes.view())
     val info = wav.inspect(&source).unwrap()
     assert(info.format == wav.format(48000,2,wav.Encoding.Pcm16))
@@ -84,3 +89,48 @@ recording_firmware()
         if bytes.at(at) != 0 || bytes.at(at + 1) != 0 then nonzero = true
     assert(nonzero,"recording must contain captured audio even with MONITOR off")
     fs.write_bytes("target/disco-recording-test.wav",bytes.view()).unwrap()
+
+    // Losing write permission during recording must report failure and let M7
+    // continue. Never present an unfinalized/failed file as REC SAVED.
+    record_tap()
+    pause_workers()
+    storage_card.unwrap().protected = true
+    record_chunks(100)
+    pause_workers()
+    assert(cpu.load32(core0(),state) == 4,"SD write failure must reach the UI")
+    assert(cpu.load32(core0(),errors) == 0 && cpu.load32(core0(),misses) == 0)
+
+@test("Discovery WAV: a slow card overruns a bounded buffer without blocking M7 and finalizes the captured prefix")
+recording_overrun()
+    val description = replace_all(str_cast(embed("../../../../boards/stm32h747-sd.hocon")),"target/disco-sd.img","")
+    board_from("slow-recording-test.hocon",description.bytes).unwrap()
+    var disk = fat.ram_device(32768)
+    fat.format(&disk,Some(fat.FatType.Fat16)).unwrap()
+    sd_seed_image(disk.image())
+    boot(core0(),image_of(RECORD_GUEST).unwrap().view())
+    val executable = elf.read(RECORD_GUEST).unwrap()
+    val state = u32(executable.symbol_named("record_status").unwrap().unwrap().value)
+    val overruns = u32(executable.symbol_named("record_overruns").unwrap().unwrap().value)
+    val frames = u32(executable.symbol_named("record_frames").unwrap().unwrap().value)
+    val errors = u32(executable.symbol_named("audio_errors").unwrap().unwrap().value)
+    val misses = u32(executable.symbol_named("audio_deadline_misses").unwrap().unwrap().value)
+    start_workers(core0()).unwrap()
+    defer stop_workers()
+    submit_workers(240000000)
+    wait_workers()
+    record_tap()
+    pause_workers()
+    storage_card.unwrap().program_ticks = 96000000 // 200ms programming, below SD's 500ms timeout
+    record_chunks(256)
+    pause_workers()
+    assert(cpu.load32(core0(),overruns) > 0,"card latency must exceed the 341ms ring budget")
+    storage_card.unwrap().program_ticks = 0
+    record_chunks(300)
+    pause_workers()
+    assert(workers_observe().running,stop_message(core1()))
+    assert(cpu.load32(core0(),state) == 5,s"slow-card state=${cpu.load32(core0(),state)}")
+    assert(cpu.load32(core0(),errors) == 0 && cpu.load32(core0(),misses) == 0)
+    val bytes = recorded_file()
+    var source = WaveBytes(bytes.view())
+    val info = wav.inspect(&source).unwrap()
+    assert(info.frames == u64(cpu.load32(core0(),frames)) && info.frames > 0)
