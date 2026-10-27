@@ -498,10 +498,9 @@ encodings stop at `Undefined`; `run` refuses descriptions enabling unimplemented
 The conditional-select family treats R15 sources as ZR, preserves NZCV/Q, rejects SP and PC
 destination operands, and stops on AL/NV constrained-unpredictable conditions.
 
-Every virtual board still implements 32 external interrupts. Architectural maxima are available
-to the description checker, but `run` refuses a device selecting IRQ 32 or above. Configurable
-faults remain emulator stops rather than implemented fault handlers, as before. Pipeline timing,
-physical side-channel resistance, debug/trace and real-chip peripherals are not modelled.
+The NVIC supports each catalog model's interrupt range, up to 480 external
+lines, including banked enable/pending/active registers, priorities, WFI wake and
+nested nine-bit IPSR state. See [Cortex-M interrupts](docs/cortex-m-interrupts.md).
 
 The example build uses matching compiler targets: M0 for M0/M1, M3, M4 and M7 (soft float, so
 their DSP instructions are used), M23 for M23, and `armv8-m.main+nodsp` for M35P/M52/M55/M85
@@ -661,15 +660,16 @@ or unsupported operations fail explicitly. The common DCS display is a separate
 part connected by `dsi = <controller>` and optional `channel = 0..3`.
 
 This is a runnable subset, not complete Discovery emulation: LTDC/video mode,
-DMA2D, SAI/DMA audio, the remaining RAM banks, external memory, full RCC/PWR and
+DMA2D, the audio codec, the remaining RAM banks, external memory, full RCC/PWR and
 panel-specific vendor initialization are still missing. I2C4 is a functional
 polling adapter, without SCL timing or interrupts. See
 [the hardware target and supported subset](docs/stm32h747i-disco.md).
 
 Reusable STM32H7 SAI, DMA and DMAMUX models now provide the
 [audio peripheral foundation](docs/stm32-audio-peripherals.md). They are tested
-together with circular RAM-to-SAI transfers; board bus and codec integration
-are the next step.
+together with circular RAM-to-SAI transfers and mapped on Discovery with real
+SAI/DMA IRQs. A flash-linked Sysl regression wakes from WFI on DMA completion.
+Codec and audible audio integration are the next step.
 
 
 Normal DSI sessions also have a dedicated device worker. CPU workers enqueue

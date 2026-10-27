@@ -3,15 +3,17 @@
 This checkpoint provides reusable SAI, DMA and DMAMUX models under
 `sh/sysl/benchtop/peripheral`. They operate on register offsets and bus callbacks,
 with no UI, host audio, hard-coded RAM mapping or Cortex-M dependencies.
-They are not yet mapped into a runnable board's bus or exposed as HOCON catalog
-entries. The existing Discovery demo remains unchanged.
+They are exposed as `stm32-sai`, `stm32-dma` and `stm32-dmamux` catalog entries
+and mapped on `stm32h747-disco`. The display firmware still leaves audio idle;
+`examples/sai-dma` is a separate flash-linked Sysl interrupt regression.
 
 SAI models one audio sub-block (A or B), with CR1/CR2/FRCR/SLOTR/IMR/SR/CLRFR/DR,
 an eight-word FIFO, data-width masking, active TDM slots, mute, FIFO-level flags,
 DMA request thresholds, underrun/overrun and interrupt masking. Master mode uses
 a rational kernel-clock divider to emit timestamped slot words independently of
 advance chunk size. Slave/internal-synchronous blocks accept explicit slot
-clocks; the board adapter will wire their synchronization. The caller must
+clocks; the board adapter connects a block configured for internal sync to its
+peer. Both blocks must have matching frame configuration. The caller must
 serialize accesses and advance the peripheral before MMIO.
 
 DMA models all eight streams of either DMA1 or DMA2. One request moves one bus
@@ -21,7 +23,7 @@ target switching. Bus/alignment errors stop a stream and preserve its failing
 count. DMAMUX1 models sixteen request selectors. FIFO/burst/width conversion,
 peripheral flow control, memory-to-memory DMA, DMAMUX synchronization and request
 generators are rejected rather than silently accepted. Bus arbitration and
-transfer latency await the board adapter. No codec, PDM, SPDIF/AC97, companding,
+transfer latency are not simulated; supported transfers complete on request. No codec, PDM, SPDIF/AC97, companding,
 mono duplication, bit-edge serialization or host playback/capture is included.
 
 The integration regression configures DMA2 stream 1 through DMAMUX channel 9,
@@ -39,6 +41,34 @@ Primary references:
 - [ST DMA request identifiers](https://github.com/STMicroelectronics/stm32h7xx-hal-driver/blob/master/Inc/stm32h7xx_hal_dma.h)
 - [Discovery audio wiring and DMA selections](https://github.com/STMicroelectronics/stm32h747i-disco-bsp/blob/main/stm32h747i_discovery_audio.h)
 
-Validation: all 722 repository tests passed, including eleven new peripheral
-and audio-pipeline regressions. The host build also passed. No audio firmware
-or Discovery bus mapping was changed in this checkpoint.
+## Board bus and firmware
+
+The Discovery mapping is SAI1 at `0x40015800`, DMA2 at `0x40020400` and DMAMUX1 at
+`0x40020800`. DMA controller identities, all base addresses, kernel clock and
+SAI request identifiers come from the description. Both DMA1 and DMA2 can be
+mapped simultaneously. Default SAI request identifiers are 87 and 88; kernel
+clock is 12.288 MHz. SAI A/B DR supports byte, halfword and word accesses at the
+DR address; control registers require aligned word accesses.
+
+The adapter interleaves DMA and SAI slot events, even when advancing a large
+interval. Internal synchronous capture follows the peer's slots. RX thresholds
+have their real buffering consequences: a full threshold retains seven words
+between requests, whereas an empty threshold requests every received word.
+DMA uses the emulated atomic RAM/flash bus for reads and RAM writes, with
+instruction-cache and exclusive-monitor bookkeeping. Transfers do not call UI
+rendering or acquire the display lock. Idle SAI uses an atomic next-deadline
+check. Raw input/output queues are bounded; no host audio conversion is done
+on a CPU worker.
+
+The [extended NVIC](cortex-m-interrupts.md) delivers SAI and all eight DMA stream
+interrupts using board-specified IRQs. Tests cover normal and deterministic CPU
+workers, WFI wake on actual DMA2 stream1 IRQ57, IABR active status, single
+completion delivery, internal synchronous capture, error IRQs, reset and DMA
+memory coherence. Rebuild the Sysl firmware with `./examples/sai-dma/build.sh`.
+It initializes its own RAM state and uses a vector table defined in Sysl.
+RCC/kernel-clock/pin setup still needs physical-board startup support; this is
+a flash-linked emulator regression, not complete Discovery hardware startup.
+
+WM8994 codec control, audible playback/capture and the M7 DSP workload are the
+next integration steps. The SAI/DMA models are usable through firmware registers
+now; this work does not claim complete audio hardware emulation.

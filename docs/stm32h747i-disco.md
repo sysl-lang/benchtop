@@ -110,9 +110,11 @@ before this example can boot unchanged on a physical Discovery board.
 ## Remaining board bring-up
 
 Real memory banks and external SDRAM; remaining STM32 RCC/PWR behavior;
-STM32 interrupt routing beyond the existing 32 external lines; GPIO and full I2C timing/interrupt behavior;
-LTDC video streaming and complete Discovery panel-specific initialization; SAI/DMA/codec and microphone
-adapters; board description and flashable dual-core demo firmware.
+GPIO and full I2C timing/interrupt behavior;
+LTDC video streaming and complete Discovery panel-specific initialization; WM8994 codec and microphone
+adapters, the audio DSP firmware and complete physical-board startup.
+SAI, DMA and DMAMUX register mappings and their real interrupt numbers are
+implemented; see [audio peripherals](stm32-audio-peripherals.md).
 
 The demo selects fixed per-instruction cycle estimates for both cores.
 Unit timing remains available through `instruction-timing = unit`. See
