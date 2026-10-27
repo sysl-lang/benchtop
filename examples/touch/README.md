@@ -258,7 +258,7 @@ input at 48 kHz, PCM16, into `RECORD.WAV` on the SD image, using the standalone
 recording works with MONITOR off. Each RECORD replaces the previous RECORD.WAV;
 STOP drains pending audio, patches WAV lengths and flushes the FAT/SD storage.
 Wait for REC SAVED before closing/resetting. An interrupted recording may have an
-unfinished header. Playback is a later step.
+unfinished header. PLAY can replay the finalized recording.
 
 M7 remains the audio producer. Its DMA IRQ publishes blocks into a 64 KiB SPSC
 ring in D2 SRAM (about 341 ms at 192,000 bytes/second). M4 copies at most 4 KiB
@@ -279,3 +279,27 @@ byte separately. At most 32 bytes are outstanding, and writes drain RX too.
 The transfer-clock ceiling is 25 MHz (15 MHz with this board's 60 MHz kernel
 clock and available dividers), within standard-speed SD operation. Initialization
 still stays below 400 kHz. The ring capacity remains 64 KiB.
+
+## WAV playback
+
+PLAY reads `RECORD.WAV` through FAT and the shared `wav` reader. The initial
+player accepts 48 kHz, stereo PCM16, matching recordings made by this demo;
+other rates/encodings report WAV FORMAT without starting playback. MONITOR can
+stay off. During playback the file replaces the live delay output; live DSP
+continues running and resumes at Stop or EOF.
+
+M4 prefills the existing 64 KiB audio ring and continues reading 4 KiB chunks;
+M7 consumes it into the normal SAI/DMA output. Recording and playback take turns
+using that ring and the FAT cache. SAVE/REC are ignored during playback, and
+PLAY is ignored while recording or finalizing. No extra audio buffer is added.
+The bottom controls are SAVE, REC/STOP and PLAY/STOP.
+
+PLAY DONE means EOF or manual Stop. NO WAV, WAV FORMAT, PLAY ERROR and UNDERRUN
+report missing files, unsupported/malformed input, I/O failure and starvation.
+On an underrun the missing frames are silenced and playback stops without
+blocking M7. An immutable total frame count distinguishes EOF from starvation,
+including files smaller than one DMA half or exactly one ring buffer long.
+`play_tail`, `play_total` and `play_underruns` are exported for instruments.
+EOF and Stop use a generation acknowledgment before the shared ring is reused.
+EOF/Stop does not alter the WAV or card contents. Rate conversion, compressed
+formats and simultaneous record/playback are future extensions.
