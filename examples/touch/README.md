@@ -161,3 +161,18 @@ The full-reference firmware and GPIO-SPI firmware are built from the same source
 using `full_redraw` and `gpio_spi` features. Tests compare full replay with damage
 replay through eight interaction states, check antialiased corner pixels and
 corner hit targets, and keep button redraws within a 60 Hz guest-frame budget.
+
+## Discovery audio and touchscreen
+
+Build with `./examples/touch/build.sh audio`, then run:
+
+```sh
+./benchtop run --window --board stm32h747-disco examples/touch/audio-disco.elf
+```
+
+M4 runs the native-pixel DSI UI. Enable TONE to hear M7's 440 Hz sine through
+SAI/DMA and the WM8994 speaker path; CHANGE TONE selects higher pitches and
+VOLUME controls amplitude. Startup is silent. The guest uses its FPU to
+interpolate samples and DMA half/full IRQs to refill a circular buffer. Exported
+`audio_errors`, `audio_irqs` and `audio_deadline_misses` help inspect the workload.
+See [supported audio hardware](../../docs/stm32-audio-peripherals.md) for limitations.
