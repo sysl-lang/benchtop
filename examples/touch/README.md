@@ -227,8 +227,8 @@ This is an **external SPI slot**, with PA5 SCK, PA6 MISO, PA7 MOSI and PA4 activ
 CS, using SPI1 AF5. It does not emulate the Discovery board's onboard SDMMC slot.
 M4 uses actual GPIO MODER/AFR/BSRR and STM32H7 SPI CR1/CFG1/CFG2/TXDR/RXDR
 registers. The SD model receives clock edges and commands, not filesystem calls.
-The driver runs at a ceiling of 400 kHz during initialization and 8 MHz afterwards
-(actual configured rates are 234.375 kHz and 7.5 MHz for a 60 MHz SPI kernel clock).
+The driver runs at a ceiling of 400 kHz during initialization and 25 MHz afterwards
+(actual configured rates are 234.375 kHz and 15 MHz for a 60 MHz SPI kernel clock).
 Physical-board startup still needs the full RCC/PLL and board initialization.
 
 The initial SD model implements single-sector SDHC SPI commands, CSD/OCR,
@@ -273,3 +273,9 @@ that the failed file is playable. The exported record_frames and record_overruns
 counters are available to debugger instruments. The existing firmware startup
 keeps caches disabled; a physical application enabling the M7 data cache must
 configure shared SRAM appropriately or perform cache maintenance.
+
+Recording uses FIFO-pipelined bulk SPI reads/writes rather than waiting for each
+byte separately. At most 32 bytes are outstanding, and writes drain RX too.
+The transfer-clock ceiling is 25 MHz (15 MHz with this board's 60 MHz kernel
+clock and available dividers), within standard-speed SD operation. Initialization
+still stays below 400 kHz. The ring capacity remains 64 KiB.
