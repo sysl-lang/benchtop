@@ -1,0 +1,142 @@
+module sh.sysl.benchtop.parts.wm8994
+
+// WM8994 control-port and AIF1 DAC2 speaker-path subset. Register addresses and
+// bit definitions follow ST's WM8994 component driver. Analog stages are ideal;
+// no pop delays, charge-pump/DC-servo physics, microphone, EQ or DRC simulation.
+struct Codec
+    regs: [4096]u16
+    pointer: u16
+    stage: u32
+    high: u8
+    read_low: bool
+    speaker: [2]u16
+    dac: [2]u16
+    aif: [2]u16
+
+codec() -> &Codec
+    val c: &Codec = Codec([0;4096],0,0,0,false,[0;2],[0x2c0;2],[0xc0;2])
+    reset(c)
+    c
+
+reset(c: &Codec)
+    for i in 0..<c.regs.len do c.regs[i] = 0
+    c.regs[0] = 0x8994
+    c.regs[0x100] = 0
+    c.regs[0x210] = 0x83
+    c.regs[0x300] = 0x10
+    c.regs[0x406] = 0xc0
+    c.regs[0x407] = 0xc0
+    c.regs[0x422] = 0x200
+    c.regs[0x612] = 0x2c0
+    c.regs[0x613] = 0x2c0
+    c.pointer = 0
+    c.stage = 0
+    c.high = 0
+    c.read_low = false
+    c.speaker = [0;2]
+    c.dac = [0x2c0;2]
+    c.aif = [0xc0;2]
+
+private known(reg: u16) -> bool = reg match
+    0 | 1 | 2 | 3 | 4 | 5 | 6 | 0x1c | 0x1d | 0x22 | 0x23 | 0x26 | 0x27 | 0x2d | 0x2e | 0x36 | 0x39 | 0x4c | 0x51 | 0x54 | 0x60 | 0x100 | 0x102 | 0x110 | 0x111 | 0x200 | 0x201 | 0x208 | 0x209 | 0x210 | 0x300 | 0x301 | 0x302 | 0x303 | 0x304 | 0x305 | 0x406 | 0x407 | 0x420 | 0x422 | 0x601 | 0x602 | 0x604 | 0x605 | 0x610 | 0x611 | 0x612 | 0x613 | 0x700 | 0x817 -> true
+    _ -> false
+
+write_register(c: &Codec, reg: u16, value: u16) -> bool
+    if !known(reg) then return false
+    if reg == 0
+        reset(c)
+        return true
+    if reg == 0x100 then return true // Chip revision is read-only.
+    if reg == 0x210 && (value >> 4) & 15 != 8 then return false // First playback subset: 48kHz.
+    if reg == 0x302 && value != 0 then return false // Codec is an audio slave.
+    if reg == 0x300 && ((value >> 3) & 3 < 2 || value & 0x100 != 0) then return false
+    c.regs[reg] = value
+    if (reg == 0x26 || reg == 0x27) && value & 0x100 != 0 then c.speaker = [c.regs[0x26],c.regs[0x27]]
+    if (reg == 0x612 || reg == 0x613) && value & 0x100 != 0 then c.dac = [c.regs[0x612],c.regs[0x613]]
+    if (reg == 0x406 || reg == 0x407) && value & 0x100 != 0 then c.aif = [c.regs[0x406],c.regs[0x407]]
+    true
+
+start(c: &Codec, reading: bool)
+    c.read_low = false
+    if !reading then c.stage = 0
+
+// 16-bit register address and 16-bit data, most-significant byte first. A
+// repeated START for reading preserves the pointer; bursts increment by words.
+write(c: &Codec, byte: u8) -> bool
+    c.stage match
+        0 ->
+            c.pointer = u16(byte) << 8
+            c.stage = 1
+        1 ->
+            c.pointer |= u16(byte)
+            if !known(c.pointer) then return false
+            c.stage = 2
+        2 ->
+            c.high = byte
+            c.stage = 3
+        _ ->
+            val reg = c.pointer
+            if !write_register(c,reg,(u16(c.high) << 8) | u16(byte)) then return false
+            c.pointer = reg + 1
+            c.stage = 2
+    true
+
+read(c: &Codec) -> u8
+    val value: u16 = if known(c.pointer) then c.regs[c.pointer] else 0
+    val result = if c.read_low then u8(value & 255) else u8(value >> 8)
+    if c.read_low then c.pointer += 1
+    c.read_low = !c.read_low
+    result
+
+word_bits(c: &Codec) -> u32 = [16u32,20,24,32][usize((c.regs[0x300] >> 5) & 3)]
+
+// Q16 volume tables avoid host floating-point work (and FPSCR pollution) in
+// CPU-side I2C callbacks. The host audio consumer performs float conversion.
+private val SPEAKER_GAIN: [64]u32 = [
+    93,104,117,131,147,165,185,207,233,261,293,328,
+    369,414,464,521,584,655,735,825,926,1039,1165,1308,
+    1467,1646,1847,2072,2325,2609,2927,3285,3685,4135,4640,5206,
+    5841,6554,7353,8250,9257,10387,11654,13076,14672,16462,18471,20724,
+    23253,26090,29274,32846,36854,41350,46396,52057,58409,65536,73533,82505,
+    92572,103868,116541,130762,
+]
+
+private val DIGITAL_GAIN: [256]u32 = [
+    0,17,18,19,20,20,21,22,23,24,25,26,
+    28,29,30,31,33,34,36,37,39,41,43,44,
+    46,48,51,53,55,58,60,63,66,68,71,75,
+    78,81,85,89,93,97,101,105,110,115,120,125,
+    131,137,143,149,155,162,169,177,185,193,201,210,
+    220,229,239,250,261,272,284,297,310,324,338,353,
+    369,385,402,419,438,457,478,499,521,544,568,593,
+    619,646,674,704,735,768,802,837,874,912,953,995,
+    1039,1085,1132,1182,1234,1289,1346,1405,1467,1532,1599,1670,
+    1744,1821,1901,1985,2072,2164,2259,2359,2463,2572,2685,2804,
+    2927,3057,3191,3332,3479,3633,3793,3960,4135,4317,4508,4707,
+    4915,5131,5358,5594,5841,6099,6368,6649,6942,7248,7568,7902,
+    8250,8614,8995,9391,9806,10238,10690,11162,11654,12168,12705,13266,
+    13851,14462,15100,15766,16462,17188,17947,18738,19565,20428,21329,22270,
+    23253,24279,25350,26469,27636,28856,30129,31458,32846,34295,35808,37388,
+    39037,40760,42558,44435,46396,48443,50580,52812,55142,57574,60115,62767,
+    65536,68427,71446,74598,77890,81326,84914,88660,92572,96656,100921,105373,
+    110022,114876,119944,125236,130762,136531,142554,148844,155410,162267,169426,176901,
+    184706,192855,201363,210247,219523,229208,239321,249879,260904,272414,284433,296982,
+    310084,323765,338049,352964,368536,384795,401772,419498,438006,457330,477507,498574,
+    520571,543538,567518,592557,618700,645996,674497,704255,735326,767768,801641,837009,
+    873937,912494,952752,994787,
+]
+
+speaker_gains(c: &Codec) -> [2]u32
+    var gains: [2]u32 = [0,0]
+    if c.regs[1] & 3 != 3 || c.regs[0x200] & 1 == 0 || c.regs[0x208] & 10 != 10 || c.regs[0x422] & 0x200 != 0 then return gains
+    for channel in 0usize..<2
+        val power = if channel == 0 then 0x404u16 else 0x808u16
+        val mixer = if channel == 0 then 0x200u16 else 0x100u16
+        if c.regs[1] & (1u16 << u32(12 + channel)) == 0 || c.regs[3] & (1u16 << u32(8 + channel)) == 0 then continue
+        if c.regs[5] & power != power || c.regs[0x36] & mixer == 0 || c.regs[0x604 + channel] & 2 == 0 then continue
+        if c.speaker[channel] & 0x40 == 0 || c.dac[channel] & 0x200 != 0 then continue
+        var gain = (u64(SPEAKER_GAIN[usize(c.speaker[channel] & 63)]) * u64(DIGITAL_GAIN[usize(c.dac[channel] & 255)])) >> 16
+        gain = (gain * u64(DIGITAL_GAIN[usize(c.aif[channel] & 255)])) >> 16
+        if c.regs[0x22 + channel] & 0x40 != 0 then gain >>= 1
+        gains[channel] = u32(gain)
+    gains

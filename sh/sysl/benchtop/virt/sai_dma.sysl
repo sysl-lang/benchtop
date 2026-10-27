@@ -25,7 +25,14 @@ private var audio_irq_routes: [17]int = [-1;17]
 // Store the core ID rather than retaining a borrowed MMIO callback pointer.
 private var audio_core: u32 = 0
 private audio_cpu() -> *Cpu = if audio_core == 0 then core0() else core1()
-private var audio_output: [2][4096]u32
+struct SaiPacket
+    word: u32
+    slot: u32
+    slots: u32
+    bits: u32
+    gain: u32
+
+private var audio_output: [2][16384]SaiPacket
 private var audio_out_head: [2]usize = [0,0]
 private var audio_out_count: [2]usize = [0,0]
 private var audio_input: [2][4096]u32
@@ -98,14 +105,19 @@ sai_feed_input(block: usize, words: []const u32)
         audio_in_count[block] += 1
 
 sai_take_output(block: usize) -> Buf[u32]
-    require block < 2, "SAI block index"
     var words: Buf[u32] = buf()
+    for packet in sai_take_packets(block) do words.push(packet.word)
+    words
+
+private[virt] sai_take_packets(block: usize) -> Buf[SaiPacket]
+    require block < 2, "SAI block index"
+    var packets: Buf[SaiPacket] = buf()
     audio_lock.lock()
     defer audio_lock.unlock()
-    for i in 0..<audio_out_count[block] do words.push(audio_output[block][(audio_out_head[block] + i) % 4096])
+    for i in 0..<audio_out_count[block] do packets.push(audio_output[block][(audio_out_head[block] + i) % 16384])
     audio_out_head[block] = 0
     audio_out_count[block] = 0
-    words
+    packets
 
 private input_word(block: usize) -> u32
     if audio_in_count[block] == 0 then return 0
@@ -114,11 +126,15 @@ private input_word(block: usize) -> u32
     audio_in_count[block] -= 1
     word
 
-private output_word(block: usize, word: u32)
-    if audio_out_count[block] == 4096
-        audio_out_head[block] = (audio_out_head[block] + 1) % 4096
+private output_word(block: usize, slot: u32, word: u32)
+    val b = sai_blocks[block]
+    val bits = sh.sysl.benchtop.peripheral.sai.sample_bits(b)
+    val count = sai.slots(b)
+    val gain = codec_slot_gain(block,slot,count,bits)
+    if audio_out_count[block] == 16384
+        audio_out_head[block] = (audio_out_head[block] + 1) % 16384
         audio_out_count[block] -= 1
-    audio_output[block][(audio_out_head[block] + audio_out_count[block]) % 4096] = word
+    audio_output[block][(audio_out_head[block] + audio_out_count[block]) % 16384] = SaiPacket(word,slot,count,bits,gain)
     audio_out_count[block] += 1
 
 private data_block(address: u32) -> int
@@ -157,14 +173,15 @@ private audio_slot(block: usize, slot: u32, word: u32, time: u64) -> u32
     var input: u32 = 0
     if sai.receiving(b)
         if (b.slotr >> 16) & (1u32 << slot) != 0 then input = input_word(block)
-    else output_word(block,word)
+    else output_word(block,slot,word)
     val peer = 1 - block
     val other = sai_blocks[peer]
     if sai.enabled(other) && (other.cr1 >> 10) & 3 == 1
         other.time = time
         val sample = if sai.receiving(other) && (other.slotr >> 16) & (1u32 << other.slot) != 0 then input_word(peer) else 0
+        val peer_slot = other.slot
         val output = sai.clock_slot(other,sample)
-        if !sai.receiving(other) then output_word(peer,output)
+        if !sai.receiving(other) then output_word(peer,peer_slot,output)
     // RX data for the autonomous block is committed by sai.advance after this
     // callback. Its DMA is serviced immediately afterwards by bring_audio.
     input

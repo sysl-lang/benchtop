@@ -1,0 +1,160 @@
+#if feature_audio
+// M7 audio is independent of the M4 UI: a circular SAI DMA buffer, refilled
+// on half/full IRQs, with single-precision interpolation and a click-free ramp.
+struct AudioControl
+    sequence: volatile u32
+    enabled: volatile u32
+    level: volatile u32
+    note: volatile u32
+
+@export("audio_control")
+var audio_control = AudioControl(0,0,50,0)
+@export("audio_errors")
+var audio_errors: Word
+@export("audio_irqs")
+var audio_irqs: Word
+@export("audio_ready")
+var audio_ready: Word
+var audio_buffer: [512]u16
+var audio_phase: u32 = 0
+var audio_envelope: f32 = 0.0
+var audio_target: f32 = 0.0
+var audio_step: u32 = 39370534
+
+// One sine cycle, interpolated by fractional phase rather than rounding to
+// table entries. This is firmware data, not samples synthesized by the host.
+val audio_wave: [256]f32 = [
+    0.0000000000,0.0245412285,0.0490676743,0.0735645636,0.0980171403,0.1224106752,0.1467304745,0.1709618888,
+    0.1950903220,0.2191012402,0.2429801799,0.2667127575,0.2902846773,0.3136817404,0.3368898534,0.3598950365,
+    0.3826834324,0.4052413140,0.4275550934,0.4496113297,0.4713967368,0.4928981922,0.5141027442,0.5349976199,
+    0.5555702330,0.5758081914,0.5956993045,0.6152315906,0.6343932842,0.6531728430,0.6715589548,0.6895405447,
+    0.7071067812,0.7242470830,0.7409511254,0.7572088465,0.7730104534,0.7883464276,0.8032075315,0.8175848132,
+    0.8314696123,0.8448535652,0.8577286100,0.8700869911,0.8819212643,0.8932243012,0.9039892931,0.9142097557,
+    0.9238795325,0.9329927988,0.9415440652,0.9495281806,0.9569403357,0.9637760658,0.9700312532,0.9757021300,
+    0.9807852804,0.9852776424,0.9891765100,0.9924795346,0.9951847267,0.9972904567,0.9987954562,0.9996988187,
+    1.0000000000,0.9996988187,0.9987954562,0.9972904567,0.9951847267,0.9924795346,0.9891765100,0.9852776424,
+    0.9807852804,0.9757021300,0.9700312532,0.9637760658,0.9569403357,0.9495281806,0.9415440652,0.9329927988,
+    0.9238795325,0.9142097557,0.9039892931,0.8932243012,0.8819212643,0.8700869911,0.8577286100,0.8448535652,
+    0.8314696123,0.8175848132,0.8032075315,0.7883464276,0.7730104534,0.7572088465,0.7409511254,0.7242470830,
+    0.7071067812,0.6895405447,0.6715589548,0.6531728430,0.6343932842,0.6152315906,0.5956993045,0.5758081914,
+    0.5555702330,0.5349976199,0.5141027442,0.4928981922,0.4713967368,0.4496113297,0.4275550934,0.4052413140,
+    0.3826834324,0.3598950365,0.3368898534,0.3136817404,0.2902846773,0.2667127575,0.2429801799,0.2191012402,
+    0.1950903220,0.1709618888,0.1467304745,0.1224106752,0.0980171403,0.0735645636,0.0490676743,0.0245412285,
+    0.0000000000,-0.0245412285,-0.0490676743,-0.0735645636,-0.0980171403,-0.1224106752,-0.1467304745,-0.1709618888,
+    -0.1950903220,-0.2191012402,-0.2429801799,-0.2667127575,-0.2902846773,-0.3136817404,-0.3368898534,-0.3598950365,
+    -0.3826834324,-0.4052413140,-0.4275550934,-0.4496113297,-0.4713967368,-0.4928981922,-0.5141027442,-0.5349976199,
+    -0.5555702330,-0.5758081914,-0.5956993045,-0.6152315906,-0.6343932842,-0.6531728430,-0.6715589548,-0.6895405447,
+    -0.7071067812,-0.7242470830,-0.7409511254,-0.7572088465,-0.7730104534,-0.7883464276,-0.8032075315,-0.8175848132,
+    -0.8314696123,-0.8448535652,-0.8577286100,-0.8700869911,-0.8819212643,-0.8932243012,-0.9039892931,-0.9142097557,
+    -0.9238795325,-0.9329927988,-0.9415440652,-0.9495281806,-0.9569403357,-0.9637760658,-0.9700312532,-0.9757021300,
+    -0.9807852804,-0.9852776424,-0.9891765100,-0.9924795346,-0.9951847267,-0.9972904567,-0.9987954562,-0.9996988187,
+    -1.0000000000,-0.9996988187,-0.9987954562,-0.9972904567,-0.9951847267,-0.9924795346,-0.9891765100,-0.9852776424,
+    -0.9807852804,-0.9757021300,-0.9700312532,-0.9637760658,-0.9569403357,-0.9495281806,-0.9415440652,-0.9329927988,
+    -0.9238795325,-0.9142097557,-0.9039892931,-0.8932243012,-0.8819212643,-0.8700869911,-0.8577286100,-0.8448535652,
+    -0.8314696123,-0.8175848132,-0.8032075315,-0.7883464276,-0.7730104534,-0.7572088465,-0.7409511254,-0.7242470830,
+    -0.7071067812,-0.6895405447,-0.6715589548,-0.6531728430,-0.6343932842,-0.6152315906,-0.5956993045,-0.5758081914,
+    -0.5555702330,-0.5349976199,-0.5141027442,-0.4928981922,-0.4713967368,-0.4496113297,-0.4275550934,-0.4052413140,
+    -0.3826834324,-0.3598950365,-0.3368898534,-0.3136817404,-0.2902846773,-0.2667127575,-0.2429801799,-0.2191012402,
+    -0.1950903220,-0.1709618888,-0.1467304745,-0.1224106752,-0.0980171403,-0.0735645636,-0.0490676743,-0.0245412285,
+]
+
+val audio_steps: [10]u32 = [39370534,49213167,59055800,68898434,78741067,88583700,98426334,108268967,118111601,127954234]
+
+audio_barrier()
+    asm
+        [thumb]
+            "dmb"
+            clobbers "memory"
+        [aarch64, x86_64, riscv64, riscv32, wasm32, craft] unavailable "Cortex-M firmware"
+
+audio_publish_controls(enabled: bool, level: int, note: int)
+    audio_control.sequence += 1
+    audio_barrier()
+    audio_control.enabled = if enabled then 1 else 0
+    audio_control.level = u32(level)
+    audio_control.note = u32(note)
+    audio_barrier()
+    audio_control.sequence += 1
+
+audio_controls()
+    val before = audio_control.sequence
+    if before & 1 != 0 then return
+    audio_barrier()
+    val enabled = audio_control.enabled
+    val level = audio_control.level
+    val note = audio_control.note
+    audio_barrier()
+    if before != audio_control.sequence then return
+    audio_target = if enabled != 0 then f32(if level > 100 then 100 else level) * 0.0035 else 0.0
+    audio_step = audio_steps[usize(if note > 9 then 9 else note)]
+
+audio_fill(first: usize, last: usize)
+    audio_controls()
+    var i = first
+    while i < last
+        audio_envelope += (audio_target - audio_envelope) * 0.002
+        if audio_target == 0.0 && audio_envelope < 0.0000001 then audio_envelope = 0.0
+        val index = usize(audio_phase >> 24)
+        val fraction = f32(audio_phase & 0xffffff) / 16777216.0
+        val wave = audio_wave[index] + (audio_wave[(index + 1) & 255] - audio_wave[index]) * fraction
+        val value = u16(int(wave * audio_envelope * 32767.0))
+        audio_buffer[i] = value
+        audio_buffer[i + 1] = value
+        audio_phase += audio_step
+        i += 2
+
+@export("audio_dma_interrupt")
+audio_interrupt()
+    val flags = word(0x40020400).value
+    word(0x40020408).value = flags & (0x3d << 6)
+    audio_irqs.value += 1
+    if flags & (8 << 6) != 0 then audio_errors.value += 1
+    if flags & (16 << 6) != 0 then audio_fill(0,256)
+    if flags & (32 << 6) != 0 then audio_fill(256,512)
+
+audio_i2c_byte(value: u32) -> bool
+    while word(0x58001c18).value & 2 == 0
+        if word(0x58001c18).value & 16 != 0 then return false
+    word(0x58001c28).value = value & 255
+    true
+
+audio_codec_write(register: u32, value: u32) -> bool
+    word(0x58001c04).value = (0x1a << 1) | (4 << 16) | (1 << 13) | (1 << 25)
+    if !audio_i2c_byte(register >> 8) || !audio_i2c_byte(register) || !audio_i2c_byte(value >> 8) || !audio_i2c_byte(value) then return false
+    while word(0x58001c18).value & 32 == 0
+        if word(0x58001c18).value & 16 != 0 then return false
+    word(0x58001c1c).value = 32
+    true
+
+audio_initialize()
+    word(0xe000ed88).value = 0x00f00000
+    asm
+        [thumb]
+            "dsb"
+            "isb"
+            clobbers "memory"
+        [aarch64, x86_64, riscv64, riscv32, wasm32, craft] unavailable "Cortex-M firmware"
+    word(0x58001c10).value = 0x10c0ecff
+    word(0x58001c00).value = 1
+    // DAC2, AIF1 timeslot1, the actual WM8994 speaker path on Discovery.
+    val configuration: [15][2]u32 = [[0,0],[1,0x3003],[3,0x300],[5,0xc0c],[0x200,1],[0x208,0xa],[0x210,0x83],[0x300,0x10],[0x302,0],[0x604,2],[0x605,2],[0x36,0x300],[0x612,0x1c0],[0x613,0x1c0],[0x422,0x10]]
+    for item in configuration
+        if !audio_codec_write(item[0],item[1]) then audio_errors.value += 1
+    if !audio_codec_write(0x26,0x179) || !audio_codec_write(0x27,0x179) then audio_errors.value += 1
+    audio_fill(0,512)
+    // Four 32-bit TDM slots; only speaker slots1 and3 consume FIFO words.
+    word(0x4001580c).value = 127 | (63 << 8) | (1 << 16) | (1 << 18)
+    word(0x40015810).value = (10 << 16) | (3 << 8) | (2 << 6)
+    word(0x40015808).value = 4
+    word(0x40015804).value = (4 << 5) | (1 << 20) | (1 << 27)
+    word(0x40020824).value = 87
+    word(0x4002042c).value = 512
+    word(0x40020430).value = 0x40015820
+    word(0x40020434).value = u32(usize(&audio_buffer[0]))
+    word(0xe000e104).value = 1 << 25
+    word(0x40020428).value = 1 | 28 | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 11) | (1 << 13)
+    audio_ready.value = 1
+
+audio_start()
+    word(0x40015804).value = (4 << 5) | (1 << 20) | (1 << 27) | (1 << 16) | (1 << 17)
+#endif
