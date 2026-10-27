@@ -89,7 +89,7 @@ with 16-bit DAC2 left/right samples in slots 1 and 3. The reusable codec part
 implements 16-bit register addressing/data, readback, software reset, power and
 clock gates, DAC2 routing, mute and latched speaker/digital volume. Unknown
 writes and unsupported sample rates/formats are rejected. The current path is
-48 kHz, codec-slave AIF1 DAC2 speaker playback; headphones, DMIC2/analog inputs,
+48 kHz, codec-slave AIF1 DAC2 speaker playback; DMIC2/analog inputs,
 codec HPF/EQ/DRC, analog settling and complete vendor driver initialization remain future work.
 
 The host snapshots integer codec gains with each slot, then converts and mixes
@@ -174,3 +174,57 @@ monitoring remained disabled for the live check; audible effects were verified
 numerically through the synthetic-input guest firmware regression. Host load
 and startup compilation can temporarily delay emulation; these figures describe
 this small DSP workload rather than arbitrary H747 audio processing capacity.
+
+## Stereo headphone delay
+
+```sh
+./examples/touch/build.sh delay
+./benchtop run --window --board stm32h747-disco examples/touch/delay-disco.elf
+```
+
+The catalog includes `headphones`, wired with `input = codec.headphones` and
+an optional host listening `gain` percentage. Speaker and headphone parts can
+coexist. Firmware selects the active paths using codec registers. The delay
+example powers down the speaker stages and configures DAC1/HPOUT1; the earlier
+speaker examples are retained. DAC1 uses output slots 0/2, independently of
+capture on the opposite serial-data direction.
+
+Headphone emulation checks bias/VMID, AIF/core clocks, DAC1 power and routing,
+DAC filter mute, paired digital/AIF/analog volume, charge pump, DC-servo enables,
+output stages and clamps. DAC1 can route directly to HPOUT1 or through powered
+MIXOUT. Analog settling, servo calibration, impedance/load detection, Class-W
+physics and automatic write-sequencer startup are not modeled. Firmware uses an
+explicit register startup sequence. This does not claim the entire vendor BSP
+initialization is supported.
+
+M7 processes separate stereo delay lines at 48 kHz: 4800 float samples (100 ms)
+left, 7200 (150 ms) right. Feedback is adjustable from 0–85%, wet/dry from 0–100%.
+Parameters and monitor gain ramp smoothly; delay storage and output saturate at
+95% full scale. Mono host input feeds both DMIC channels, while distinct echo
+times create a stereo output. All delay computation uses guest instructions.
+The 48,000 bytes of delay data reside in D2 SRAM1 at 0x30000000; the board now
+includes that 128 KiB RAM bank. The separate delay linker script and explicit
+startup clearing keep it outside the existing AXI framebuffer/heap allocation.
+Other SRAM aliases, cache/MPU behavior and bus arbitration remain unmodeled.
+
+M4 provides MONITOR, FEEDBACK, WET/DRY, input/output meters and DSP PEAK. The
+latter uses M7's local SysTick to measure refill cycles against the 1,280,000-cycle
+128-frame deadline at its configured 480 MHz. The high-water mark is rounded up
+for display. Instruction-cycle estimates are approximate, so this is a guest
+workload budget indicator, not a cycle-exact physical CPU benchmark. It excludes
+part of interrupt-entry/exit overhead; DMA deadline checks still cover completed
+refills and catch overruns.
+
+SDL receives interleaved left/right float samples at 48 kHz, preserving stereo
+through CoreAudio. Mono PWM/I2S sources are duplicated when mixing into a stereo
+stream. Existing callers can still request the mono mix. The headphone part uses
+the Mac's current default playback device; it does not force a physical jack or
+change macOS output settings. MONITOR starts off.
+
+The impulse regression checks dry output, distinct 100/150 ms echoes, feedback
+decay, M4 touch controls, mute and DMA deadlines. Headphone model tests cover
+routing, power/analog gates, per-channel mute, volume latching and speaker
+independence. A dummy SDL test checks the two-channel queue and mute path.
+
+Primary references: [ST WM8994 register driver](https://github.com/STMicroelectronics/stm32-wm8994),
+[STM32H747 memory map](https://github.com/STMicroelectronics/cmsis-device-h7/blob/master/Include/stm32h747xx.h).

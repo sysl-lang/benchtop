@@ -189,3 +189,16 @@ MONITOR starts off; enable it for playback, CHANGE EFFECT for dry/low-pass/high-
 and VOLUME for gain. M7 processes the completed receive half into the free transmit
 half on DMA IRQ60, while M4 draws the meter and handles touch. The generated sine
 example is retained as `audio-disco.elf` (`build.sh audio`).
+
+## Stereo headphone delay
+
+```sh
+./examples/touch/build.sh delay
+./benchtop run --window --board stm32h747-disco examples/touch/delay-disco.elf
+```
+
+M7 runs separate 100/150 ms delay lines in D2 SRAM1 and sends DAC1 stereo PCM to
+the headphone part through SAI/DMA. M4 provides MONITOR, FEEDBACK, WET/DRY,
+input/output meters and estimated DSP peak load. Monitoring starts off. The
+headphone part uses the Mac's default playback device; the speaker, sine and
+microphone-filter demos remain available.

@@ -680,6 +680,11 @@ applies dry/low-pass/high-pass processing; M4 shows an input meter and controls
 MONITOR, effect and volume. MONITOR starts off. The `pdm-microphone` part connects
 to the WM8994 DMIC1 input, with ideal PDM-to-PCM conversion and CoreAudio capture.
 
+`./examples/touch/build.sh delay` builds `delay-disco.elf` for the same board:
+M7 runs stereo 100/150 ms delays in D2 SRAM1, with feedback and wet/dry controls
+on M4, input/output meters and a refill-budget indicator. The new `headphones`
+part preserves stereo through SDL/CoreAudio; speaker output remains available.
+
 
 Normal DSI sessions also have a dedicated device worker. CPU workers enqueue
 completed packets through a bounded 64-packet host channel; pixel decoding runs
