@@ -249,3 +249,27 @@ Startup accepts the exact settings format written by SAVE SD, with feedback
 keeps the 35/35 defaults and shows SD READY. Invalid contents keep both defaults
 and show BAD FILE; SAVE SD can replace that file. Storage read/mount failures
 show SD ERROR. Monitor always starts off, including after settings restoration.
+
+## WAV recording
+
+The `storage` demo also has RECORD / STOP. It records the stereo microphone DMA
+input at 48 kHz, PCM16, into `RECORD.WAV` on the SD image, using the standalone
+[`wav`](https://github.com/sysl-lang/wav) dependency. Monitoring is independent:
+recording works with MONITOR off. Each RECORD replaces the previous RECORD.WAV;
+STOP drains pending audio, patches WAV lengths and flushes the FAT/SD storage.
+Wait for REC SAVED before closing/resetting. An interrupted recording may have an
+unfinished header. Playback is a later step.
+
+M7 remains the audio producer. Its DMA IRQ publishes blocks into a 64 KiB SPSC
+ring in D2 SRAM (about 341 ms at 192,000 bytes/second). M4 copies at most 4 KiB
+per loop into its own buffer, releases ring slots, and performs the filesystem
+and SPI work. A generation acknowledgment stops capture before finalization, so
+no final DMA half is silently lost. SAVE SD is ignored while recording/finishing
+because the filesystem cache has one owner.
+
+A full ring stops capture without blocking M7; the buffered prefix is finalized
+and the UI shows OVERRUN. A storage failure shows REC ERROR and makes no promise
+that the failed file is playable. The exported record_frames and record_overruns
+counters are available to debugger instruments. The existing firmware startup
+keeps caches disabled; a physical application enabling the M7 data cache must
+configure shared SRAM appropriately or perform cache maintenance.
