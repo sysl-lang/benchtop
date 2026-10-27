@@ -1,0 +1,160 @@
+module sh.sysl.benchtop.peripheral.sdmmc
+@tests
+import sh.sysl.benchtop.parts.sd_card as card
+
+private struct Trace
+    memory: [16384]u8
+    output: [4096]u8
+    count: usize
+    writes: u32
+    last_write: u64
+private trace() -> &Trace = Trace([0;16384],[0;4096],0,0,0)
+private native_ready(media: card.Media) -> &card.Native
+    val c = card.native(card.card(media,32768))
+    c.state = 4
+    c.width = 4
+    c
+private configure_double(h: &Host, size: u32, length: u32, writing: bool, active1: bool = false)
+    assert(write(h,0,3,0) && write(h,4,0x4002,0))
+    assert(write(h,36,1000000,0) && write(h,40,length,0))
+    assert(write(h,44,0x90 | (if writing then 0u32 else 2),0))
+    assert(write(h,84,size,0))
+    assert(write(h,88,0x24000000,0) && write(h,92,0x24001000,0))
+    assert(write(h,80,if active1 then 7 else 3,0))
+    assert(write(h,8,3,0))
+    assert(write(h,12,(if writing then 25u32 else 18) | 64 | 256 | 4096,0))
+private val reject_read: &Fn(u32,[]u8) -> bool = (address,out) -> false
+private val reject_write: &Fn(u32,[]const u8) -> bool = (address,bytes) -> false
+
+@test("SDMMC double buffer: sub-sector switches, live inactive-base replacement, active-base protection and IRQ acknowledgment")
+double_receive()
+    val t = trace()
+    val c = native_ready(card.Media((sector,out) ->
+        for i in 0..<out.len do out[i] = u8((usize(sector) * 512 + i) % 251)
+        true,(sector,bytes) -> false,() -> true,() -> true))
+    val h = host()
+    configure_double(h,256,1536,false)
+    assert(write(h,60,IDMABTC,0))
+    val ram: &Fn(u32,[]const u8) -> bool = (address,bytes) ->
+        val at = usize(address - 0x24000000)
+        assert(at + bytes.len <= t.memory.len)
+        for i in 0..<bytes.len do t.memory[at + i] = bytes[i]
+        true
+    advance(h,due(h),Some(c),true,reject_read,ram)
+    assert(!write(h,88,0x24002000,h.at),"active buffer 0 must be protected")
+    assert(!write(h,84,512,h.at) && !write(h,80,0,h.at))
+    while h.data_due != NEVER
+        advance(h,h.data_due,Some(c),true,reject_read,ram)
+        if h.flags & IDMABTC == 0 then continue
+        assert(irq(h))
+        val completed: u32 = if h.idma & 4 != 0 then 88 else 92
+        val base = read(h,completed,Some(c),h.at).unwrap()
+        for i in 0usize..<256
+            t.output[t.count] = t.memory[usize(base - 0x24000000) + i]
+            t.count += 1
+        if h.data_due != NEVER
+            val replacement = if base < 0x24002000 then base + 0x2000 else base - 0x2000
+            assert(write(h,completed,replacement,h.at),"the inactive base can be replaced while DPSM is running")
+            val active = if completed == 88 then 92u32 else 88
+            assert(!write(h,active,0,h.at))
+        assert(write(h,56,IDMABTC,h.at))
+        assert(!irq(h))
+    assert(t.count == 1536 && h.buffer_completions == 6 && h.blocks == 3)
+    for i in 0usize..<1536 do assert(t.output[i] == u8((3 * 512 + i) % 251))
+    assert(h.remaining == 0 && h.flags & 256 != 0 && h.idma & 4 == 0)
+    assert(c.pending == 18 && c.state == 5,"a finite host length does not silently stop the card's multiblock command")
+    assert(write(h,8,0,h.at) && write(h,12,12 | 128 | 256 | 4096,h.at))
+    advance(h,due(h),Some(c),true,reject_read,ram)
+    assert(c.pending == 0 && c.state == 4)
+
+@test("SDMMC double buffer: transmit refill while the other buffer is active, sector order and per-block programming busy")
+double_transmit()
+    val t = trace()
+    val c = native_ready(card.Media((sector,out) -> false,(sector,bytes) ->
+        assert(sector == 3 + t.writes)
+        for i in 0..<bytes.len do assert(bytes[i] == u8(t.writes + 11))
+        t.writes += 1
+        true,() -> true,() -> true))
+    val h = host()
+    configure_double(h,512,2048,true)
+    for i in 0usize..<512
+        t.memory[i] = 11
+        t.memory[4096 + i] = 12
+    val ram: &Fn(u32,[]u8) -> bool = (address,out) ->
+        val at = usize(address - 0x24000000)
+        for i in 0..<out.len do out[i] = t.memory[at + i]
+        true
+    advance(h,due(h),Some(c),true,ram,reject_write)
+    var next: u8 = 13
+    while h.data_due != NEVER
+        val before = t.writes
+        advance(h,h.data_due,Some(c),true,ram,reject_write)
+        if t.writes != before
+            if before > 0 then assert(h.at >= t.last_write + c.card.program_ticks)
+            t.last_write = h.at
+        if h.flags & IDMABTC != 0
+            val base = if h.idma & 4 != 0 then h.base else h.base1
+            for i in 0usize..<512 do t.memory[usize(base - 0x24000000) + i] = next
+            next += 1
+            assert(write(h,56,IDMABTC,h.at))
+    assert(t.writes == 4 && h.buffer_completions == 4 && h.flags & 256 != 0)
+    assert(c.pending == 25 && card.native_busy(c,h.at))
+    assert(write(h,56,BUSYEND,h.at) && write(h,60,BUSYEND,h.at))
+    assert(write(h,8,0,h.at) && write(h,12,12 | 128 | 256 | 4096,h.at))
+    advance(h,h.command_due,Some(c),true,ram,reject_write)
+    while h.busy_due != NEVER do advance(h,h.busy_due,Some(c),true,ram,reject_write)
+    assert(c.state == 4 && c.pending == 0 && irq(h) && h.flags & BUSYEND != 0)
+
+@test("SDMMC double buffer: initial buffer 1, partial final buffer, CMD12 abort and payload prefixes")
+partial_and_abort()
+    val t = trace()
+    val c = native_ready(card.Media((sector,out) ->
+        for i in 0..<out.len do out[i] = u8(sector)
+        true,(sector,bytes) -> false,() -> true,() -> true))
+    val ram: &Fn(u32,[]const u8) -> bool = (address,bytes) ->
+        val at = usize(address - 0x24000000)
+        for i in 0..<bytes.len do t.memory[at + i] = bytes[i]
+        t.count += bytes.len
+        true
+    val h = host()
+    configure_double(h,1024,1536,false,true)
+    advance(h,due(h),Some(c),true,reject_read,ram)
+    while h.data_due != NEVER do advance(h,h.data_due,Some(c),true,reject_read,ram)
+    assert(h.buffer_completions == 1 && h.idma & 4 == 0 && h.remaining == 0)
+    assert(t.memory[4096] == 3 && t.memory[4608] == 4 && t.memory[0] == 5)
+    card.reset_native(c)
+    c.state = 4
+    c.width = 4
+    reset(h)
+    t.count = 0
+    configure_double(h,512,2048,false)
+    advance(h,due(h),Some(c),true,reject_read,ram)
+    advance(h,h.data_due,Some(c),true,reject_read,ram)
+    assert(t.count == 32)
+    assert(write(h,8,0,h.at) && write(h,12,12 | 128 | 256 | 4096,h.at))
+    while h.command_due != NEVER do advance(h,due(h),Some(c),true,reject_read,ram)
+    assert(h.data_due == NEVER && h.remaining > 0 && h.flags & (1 << 11) != 0 && h.flags & 256 == 0)
+    assert(t.count >= 32 && t.count < 512 && c.pending == 0 && c.state == 4)
+    val stopped = t.count
+    advance(h,h.at + 1000000,Some(c),true,reject_read,ram)
+    assert(t.count == stopped,"stop must not continue DMA into a recycled buffer")
+
+@test("SDMMC multiblock failure: completed prefix survives a later media error; errors never generate DATAEND")
+block_error()
+    val t = trace()
+    val c = native_ready(card.Media((sector,out) ->
+        if sector == 4 then return false
+        for i in 0..<out.len do out[i] = 91
+        true,(sector,bytes) -> false,() -> true,() -> true))
+    val ram: &Fn(u32,[]const u8) -> bool = (address,bytes) ->
+        t.count += bytes.len
+        true
+    val h = host()
+    configure_double(h,512,1024,false)
+    assert(write(h,60,2,0))
+    advance(h,due(h),Some(c),true,reject_read,ram)
+    while h.data_due != NEVER do advance(h,h.data_due,Some(c),true,reject_read,ram)
+    assert(t.count == 512 && h.remaining == 512 && h.flags & 2 != 0 && h.flags & 256 == 0 && irq(h))
+    assert(c.pending == 0)
+    reset(h)
+    assert(!write(h,84,1,0) && !write(h,84,8192,0))
