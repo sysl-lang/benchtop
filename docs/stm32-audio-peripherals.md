@@ -164,3 +164,13 @@ filter attenuation, M4 display changes, monitor mute and refill deadlines.
 
 Register routing follows the [ST WM8994 component driver](https://github.com/STMicroelectronics/stm32-wm8994/blob/main/wm8994.c)
 and [Discovery audio BSP](https://github.com/STMicroelectronics/stm32h747i-disco-bsp/blob/main/stm32h747i_discovery_audio.c).
+
+Microphone validation on October 27, 2026: all 744 repository tests passed and
+the host build succeeded. The rebuilt sine firmware also passed its original
+end-to-end regression. The live microphone window opened CoreAudio, received
+nonzero capture samples without an audio error, and settled near 480/240 MHz
+simulated core clocks and 120 host UI frames/second after startup. Output
+monitoring remained disabled for the live check; audible effects were verified
+numerically through the synthetic-input guest firmware regression. Host load
+and startup compilation can temporarily delay emulation; these figures describe
+this small DSP workload rather than arbitrary H747 audio processing capacity.
