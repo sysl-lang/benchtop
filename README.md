@@ -661,7 +661,7 @@ or unsupported operations fail explicitly. The common DCS display is a separate
 part connected by `dsi = <controller>` and optional `channel = 0..3`.
 
 This is a runnable subset, not complete Discovery emulation: LTDC/video mode,
-DMA2D, audio capture, the remaining RAM banks, external memory, full RCC/PWR and
+DMA2D, remaining codec modes, the remaining RAM banks, external memory, full RCC/PWR and
 panel-specific vendor initialization are still missing. I2C4 is a functional
 polling adapter, without SCL timing or interrupts. See
 [the hardware target and supported subset](docs/stm32h747i-disco.md).

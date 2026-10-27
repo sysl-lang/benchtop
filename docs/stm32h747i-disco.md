@@ -112,7 +112,7 @@ before this example can boot unchanged on a physical Discovery board.
 Real memory banks and external SDRAM; remaining STM32 RCC/PWR behavior;
 GPIO and full I2C timing/interrupt behavior;
 LTDC video streaming and complete Discovery panel-specific initialization; WM8994
-capture, microphone adapters and complete physical-board startup. The optional
+DMIC2/analog capture and complete physical-board startup. The optional
 `audio-disco.elf` image runs sine DSP on M7 with WM8994 speaker playback and M4
 touch controls; see the audio peripheral documentation for the supported subset.
 SAI, DMA and DMAMUX register mappings and their real interrupt numbers are
@@ -133,3 +133,9 @@ audio firmware will match the execution time of a physical H747.
 - [ST LCD driver](https://github.com/STMicroelectronics/stm32h747i-disco-bsp/blob/main/stm32h747i_discovery_lcd.c)
 - [ST touch interface](https://github.com/STMicroelectronics/stm32h747i-disco-bsp/blob/main/stm32h747i_discovery_ts.h)
 - [ST SDRAM interface](https://github.com/STMicroelectronics/stm32h747i-disco-bsp/blob/main/stm32h747i_discovery_sdram.h)
+
+The microphone variant (`./examples/touch/build.sh mic`, `mic-disco.elf`) adds
+host microphone capture through WM8994 DMIC1, SAI1 B and DMA2 stream4. M7 applies
+dry/low-pass/high-pass processing and fills the speaker TX buffer from receive
+interrupts; M4 draws the input meter and handles monitoring controls. PDM
+decimation is idealized and MONITOR starts disabled.
