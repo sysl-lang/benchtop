@@ -238,3 +238,15 @@ RAM plus 4 KiB guards must currently fit the existing 1 MiB RAM backing budget.
 ELF loading covers each mapped region; reset clears all bank contents. Tests
 cover DMA/device writes, exclusive tracking, self-modifying code, adjacent-bank
 Thumb32 execution, disjoint fall-through and independent per-core decode records.
+
+Stereo-delay validation on October 27, 2026 with Sysl 0.7.0: all 750 repository
+tests passed and the desktop build succeeded. The refreshed tone and microphone
+images passed their existing regressions. Peak measured refill work was 33,073
+estimated guest cycles out of 1,280,000 (about 2.58%, displayed as 3%). This covers
+the demonstrated delay workload, not arbitrary DSP code or cycle-exact silicon.
+The live window opened CoreAudio with nonzero microphone capture and no reported
+audio error. With monitoring off, it held approximately 480/240 MHz simulated
+clocks and 120 host UI FPS; M7 retired roughly 9.4 million instructions/second
+and slept between refills. Simulated clocks include sleeping time. Actual effect
+outputs and stereo separation were validated by the guest impulse regression;
+no claim of a listening test is made.
