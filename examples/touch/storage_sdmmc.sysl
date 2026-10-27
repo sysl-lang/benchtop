@@ -1,0 +1,108 @@
+#if feature_storage && feature_sdmmc
+import sysl.raw.ptr_cast
+import sh.sysl.sd as sd
+import sh.sysl.sd.native as card_spi
+
+struct CardTransport
+    base: u32
+    rate: u32
+var storage_card = card_spi.card(CardTransport(0x52007000,400000),storage_config())
+// Word-aligned AXI SRAM bounce buffer. Cache maintenance is unnecessary with
+// this startup's caches disabled; a physical cached build must maintain it.
+var sdmmc_dma: [128]Word
+struct SdByte
+    value: volatile u8
+
+sdmmc_command(base: u32, index: u32, arg: u32, response: card_spi.Response, transfer: bool = false) -> Result[[4]u32,sd.Error]
+    word(base + 0x38).value = 0x1fe00fff
+    word(base + 8).value = arg
+    val mode: u32 = if response == card_spi.Response.None then 0 elif response == card_spi.Response.Long then 3 else 1
+    word(base + 12).value = index | (mode << 8) | 4096 | (if transfer then 64u32 else 0)
+    val start = storage_now()
+    for i in 0..<1000000
+        val flags = word(base + 0x34).value
+        if flags & 4 != 0 then return Err(sd.Error.Timeout(sd.Phase.Response))
+        if flags & 1 != 0 && response != card_spi.Response.NoCrc then return Err(sd.Error.Crc)
+        if flags & (if mode == 0 then 128u32 else 65u32) != 0
+            return Ok([word(base + 0x14).value,word(base + 0x18).value,word(base + 0x1c).value,word(base + 0x20).value])
+        if storage_now() - start >= 100000 then return Err(sd.Error.Timeout(sd.Phase.Response))
+    Err(sd.Error.Timeout(sd.Phase.Response))
+
+sdmmc_cleanup(base: u32)
+    if word(base + 0x34).value & (1 << 12) != 0 then word(base).value = 0
+    word(base + 0x50).value = 0
+    word(base + 0x2c).value = 0
+
+sdmmc_transfer(base: u32, rate: u32, index: u32, arg: u32, count: usize, reading: bool) -> Result[unit,sd.Error]
+    word(base + 0x2c).value = 0
+    word(base + 0x38).value = 0x1fe00fff
+    word(base + 0x24).value = rate / 5
+    word(base + 0x28).value = u32(count)
+    word(base + 0x2c).value = (if count == 8 then 3u32 else 9u32) << 4 | (if reading then 2u32 else 0)
+    word(base + 0x58).value = u32(usize(&sdmmc_dma[0]))
+    word(base + 0x50).value = 1
+    audio_barrier()
+    val result = sdmmc_command(base,index,arg,card_spi.Response.Short,true)
+    if result.is_err()
+        sdmmc_cleanup(base)
+        return Err(result.unwrap_err())
+    val status = card_spi.check_status(result.unwrap()[0])
+    if status.is_err()
+        sdmmc_cleanup(base)
+        return status
+    val start = storage_now()
+    for i in 0..<1000000
+        val flags = word(base + 0x34).value
+        if flags & 0x0800003a != 0
+            sdmmc_cleanup(base)
+            return Err(if flags & 8 != 0 then sd.Error.Timeout(sd.Phase.ReadToken) elif flags & 2 != 0 then sd.Error.Crc else sd.Error.Bus(sh.sysl.spi.Error.Io))
+        if flags & 256 != 0
+            audio_barrier()
+            sdmmc_cleanup(base)
+            return Ok(())
+        if storage_now() - start >= 250000 then break
+    sdmmc_cleanup(base)
+    Err(sd.Error.Timeout(sd.Phase.ReadToken))
+
+impl card_spi.Host for CardTransport
+    configure(*self, hz: u32, width: u32) -> Result[unit,sd.Error]
+        if hz == 0 || (width != 1 && width != 4) then return Err(sd.Error.InvalidSettings)
+        val divider = (60000000u32 + hz * 2 - 1) / (hz * 2)
+        if divider == 0 || divider > 1023 then return Err(sd.Error.InvalidSettings)
+        word(self.base + 4).value = divider | (if width == 4 then 0x4000u32 else 0)
+        word(self.base).value = 3
+        self.rate = 60000000 / (divider * 2)
+        Ok(())
+    command(*self, index: u32, arg: u32, response: card_spi.Response) -> Result[[4]u32,sd.Error] = sdmmc_command(self.base,index,arg,response)
+    read_data(*self, index: u32, arg: u32, out: []u8) -> Result[unit,sd.Error]
+        if out.len != 8 && out.len != 512 then return Err(sd.Error.BadLength)
+        sdmmc_transfer(self.base,self.rate,index,arg,out.len,true)?
+        val bytes: *SdByte = ptr_cast(usize(&sdmmc_dma[0]))
+        for i in 0..<out.len do out[i] = bytes[i].value
+        Ok(())
+    write_data(*self, index: u32, arg: u32, input: []const u8) -> Result[unit,sd.Error]
+        if input.len != 512 then return Err(sd.Error.BadLength)
+        val bytes: *SdByte = ptr_cast(usize(&sdmmc_dma[0]))
+        for i in 0..<input.len do bytes[i].value = input[i]
+        audio_barrier()
+        sdmmc_transfer(self.base,self.rate,index,arg,input.len,false)
+impl sd.Clock for CardTransport
+    now_us(self) -> u64 = storage_now()
+    delay_us(*self, micros: u32)
+        val start = storage_now()
+        while storage_now() - start < u64(micros) do ()
+
+storage_pin_setup() -> bool
+    // SDMMC1 AF12: PC8..12 data/clock and PD2 CMD. PI8 active-low detect.
+    word(0x58020800).value = (word(0x58020800).value & ~0x03ff0000u32) | 0x02aa0000
+    word(0x58020824).value = (word(0x58020824).value & ~0x000fffffu32) | 0x000ccccc
+    word(0x58020808).value = word(0x58020808).value | 0x03ff0000
+    word(0x5802080c).value = (word(0x5802080c).value & ~0x03ff0000u32) | 0x00550000
+    word(0x58020c00).value = (word(0x58020c00).value & ~(3u32 << 4)) | (2 << 4)
+    word(0x58020c20).value = (word(0x58020c20).value & ~(15u32 << 8)) | (12 << 8)
+    word(0x58020c08).value = word(0x58020c08).value | (3 << 4)
+    word(0x58020c0c).value = (word(0x58020c0c).value & ~(3u32 << 4)) | (1 << 4)
+    word(0x58022000).value = word(0x58022000).value & ~(3u32 << 16)
+    word(0x5802200c).value = (word(0x5802200c).value & ~(3u32 << 16)) | (1 << 16)
+    word(0x58022010).value & (1 << 8) == 0
+#endif

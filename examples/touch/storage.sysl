@@ -1,18 +1,6 @@
 #if feature_storage
-import sysl.raw.ptr_cast
-import sh.sysl.spi as shared_spi
 import sh.sysl.sd as sd
-import sh.sysl.sd.spi as card_spi
 import sh.sysl.fat as fat
-
-struct SpiByte
-    value: volatile u8
-struct H7SpiBus
-    base: u32
-struct CardSelect
-    pin: u32
-struct CardTransport
-    device: shared_spi.Exclusive[H7SpiBus,CardSelect]
 
 var storage_previous: u32 = 0
 var storage_cycles: u64 = 0
@@ -21,7 +9,6 @@ storage_config() -> sd.Settings
     var config = sd.settings()
     config.transfer_hz = 25000000
     config
-var storage_card = card_spi.card(CardTransport(shared_spi.exclusive(H7SpiBus(0x40013000),CardSelect(4),shared_spi.config(400000))),storage_config())
 @export("storage_status")
 var storage_status: Word
 
@@ -31,95 +18,12 @@ storage_now() -> u64
     storage_previous = now
     storage_cycles / 240
 
-storage_wait(mask: u32) -> Result[unit,shared_spi.Error]
-    val start = storage_now()
-    for i in 0..<100000
-        val sr = word(0x40013014).value
-        if sr & 64 != 0 then return Err(shared_spi.Error.Io)
-        if sr & mask != 0 then return Ok(())
-        if storage_now() - start >= 10000 then return Err(shared_spi.Error.Timeout)
-    Err(shared_spi.Error.Timeout)
-
-// Pipeline byte transfers through the real hardware FIFO, keeping at most 32
-// bytes outstanding. Drain RX for writes too. Clock reads are amortized across
-// progress; a stalled peripheral still has the same bounded 10ms timeout.
-spi_bulk(base: u32, input: []const u8, out: []u8, count: usize, fill: u8) -> Result[unit,shared_spi.Error]
-    val tx: *SpiByte = ptr_cast(usize(base + 0x20))
-    val rx: *SpiByte = ptr_cast(usize(base + 0x30))
-    var sent: usize = 0
-    var received: usize = 0
-    var progress_at = storage_now()
-    while received < count
-        val sr = word(base + 0x14).value
-        if sr & 64 != 0 then return Err(shared_spi.Error.Io)
-        var progress = false
-        if sr & 1 != 0 && received < sent
-            val value = rx.value
-            if out.len != 0 then out[received] = value
-            received += 1
-            progress = true
-            if received & 31 == 0 then progress_at = storage_now()
-        if sr & 2 != 0 && sent < count && sent - received < 32
-            tx.value = if input.len == 0 then fill else input[sent]
-            sent += 1
-            progress = true
-        if !progress && storage_now() - progress_at >= 10000 then return Err(shared_spi.Error.Timeout)
-    Ok(())
-
-impl shared_spi.Bus for H7SpiBus
-    configure(*self, config: shared_spi.Config) -> Result[unit,shared_spi.Error]
-        if config.hz == 0 || config.order != shared_spi.BitOrder.MsbFirst then return Err(shared_spi.Error.Configuration)
-        var divider: u32 = 0
-        while divider < 7 && (60000000u32 >> (divider + 1)) > config.hz do divider += 1
-        if (60000000u32 >> (divider + 1)) > config.hz then return Err(shared_spi.Error.Configuration)
-        if word(self.base).value & 1 != 0 then storage_wait(4096)?
-        word(self.base).value = 0
-        word(self.base + 8).value = 7 | (divider << 28)
-        val phase = config.mode == shared_spi.Mode.Mode1 || config.mode == shared_spi.Mode.Mode3
-        val polarity = config.mode == shared_spi.Mode.Mode2 || config.mode == shared_spi.Mode.Mode3
-        word(self.base + 12).value = 0x84400000 | (if phase then 1u32 << 24 else 0) | (if polarity then 1u32 << 25 else 0)
-        word(self.base + 4).value = 0
-        word(self.base).value = 0x1001
-        word(self.base).value = 0x1201
-        Ok(())
-    exchange(*self, byte: u8) -> Result[u8,shared_spi.Error]
-        storage_wait(2)?
-        val tx: *SpiByte = ptr_cast(usize(self.base + 0x20))
-        val rx: *SpiByte = ptr_cast(usize(self.base + 0x30))
-        tx.value = byte
-        storage_wait(1)?
-        Ok(rx.value)
-    override flush(*self) -> Result[unit,shared_spi.Error] = storage_wait(4096)
-    override read(*self, out: []u8, fill: u8) -> Result[unit,shared_spi.Error] = spi_bulk(self.base,[],out,out.len,fill)
-    override write(*self, bytes: []const u8) -> Result[unit,shared_spi.Error] = spi_bulk(self.base,bytes,[],bytes.len,0xff)
-    override transfer(*self, bytes: []const u8, out: []u8) -> Result[unit,shared_spi.Error]
-        if bytes.len != out.len then return Err(shared_spi.Error.BadLength)
-        spi_bulk(self.base,bytes,out,bytes.len,0xff)
-impl shared_spi.ChipSelect for CardSelect
-    set_active(*self, active: bool) -> Result[unit,shared_spi.Error]
-        word(0x58020018).value = 1u32 << (self.pin + (if active then 16u32 else 0))
-        Ok(())
-impl shared_spi.Device for CardTransport
-    configure(*self, config: shared_spi.Config) -> Result[unit,shared_spi.Error] = self.device.configure(config)
-    select(*self, active: bool) -> Result[unit,shared_spi.Error] = self.device.select(active)
-    exchange(*self, byte: u8) -> Result[u8,shared_spi.Error] = self.device.exchange(byte)
-    override read(*self, out: []u8, fill: u8) -> Result[unit,shared_spi.Error] = self.device.read(out,fill)
-    override write(*self, bytes: []const u8) -> Result[unit,shared_spi.Error] = self.device.write(bytes)
-    override transfer(*self, bytes: []const u8, out: []u8) -> Result[unit,shared_spi.Error] = self.device.transfer(bytes,out)
-impl sd.Clock for CardTransport
-    now_us(self) -> u64 = storage_now()
-    delay_us(*self, micros: u32)
-        val start = storage_now()
-        while storage_now() - start < u64(micros) do ()
-
 storage_initialize()
     storage_previous = word(0xe000e018).value
     storage_cycles = 0
-    // CS high before enabling its output; PA5/6/7 AF5 for SPI1.
-    word(0x58020018).value = 1 << 4
-    word(0x58020000).value = (word(0x58020000).value & ~0xff00u32) | 0xa900
-    word(0x58020020).value = (word(0x58020020).value & 0x000fffff) | 0x55500000
-    word(0x5802000c).value = (word(0x5802000c).value & ~(3u32 << 12)) | (1 << 12)
+    if !storage_pin_setup()
+        storage_status.value = 3
+        return
     storage_status.value = 3
     if storage_card.initialize().is_err() then return
     storage_status.value = storage_load_settings() match
