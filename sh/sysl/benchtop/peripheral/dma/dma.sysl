@@ -1,0 +1,139 @@
+module sh.sysl.benchtop.peripheral.dma
+
+// STM32 DMA1/DMA2 register banks, eight streams. Direct mode, single transfers,
+// equal byte/halfword/word widths, circular and double buffering. Request timing
+// and bus arbitration belong to the board adapter, not a host sleep or UI tick.
+const ENABLE: u32 = 1
+const TRANSFER_ERROR: u32 = 8
+const HALF_TRANSFER: u32 = 16
+const TRANSFER_COMPLETE: u32 = 32
+const CIRCULAR: u32 = 1 << 8
+const DOUBLE_BUFFER: u32 = 1 << 18
+const CURRENT_TARGET: u32 = 1 << 19
+
+type BusRead = &Fn(u32,u32) -> Option[u32]
+type BusWrite = &Fn(u32,u32,u32) -> bool
+
+struct Stream
+    cr: u32
+    ndtr: u32
+    par: u32
+    m0ar: u32
+    m1ar: u32
+    fcr: u32
+    initial: u32
+    done: u32
+
+struct Controller
+    streams: [8]Stream
+    flags: [8]u32
+
+controller() -> &Controller = &Controller([Stream(0,0,0,0,0,0x21,0,0);8],[0;8])
+reset(c: *Controller) = *c = *controller()
+
+private flag_shift(stream: usize) -> u32 = [0u32,6,16,22][stream % 4]
+
+private status(c: *Controller, high: bool) -> u32
+    var value: u32 = 0
+    for i in 0..<4
+        val stream = i + (if high then 4 else 0)
+        value |= c.flags[stream] << flag_shift(stream)
+    value
+
+irq(c: *Controller, stream: usize) -> bool
+    require stream < 8, "DMA stream index"
+    val cr = c.streams[stream].cr
+    val flags = c.flags[stream]
+    (flags & TRANSFER_ERROR != 0 && cr & 4 != 0) ||
+        (flags & HALF_TRANSFER != 0 && cr & 8 != 0) ||
+        (flags & TRANSFER_COMPLETE != 0 && cr & 16 != 0)
+
+private valid(s: *Stream, cr: u32) -> bool
+    val peripheral = (cr >> 11) & 3
+    val memory = (cr >> 13) & 3
+    s.ndtr != 0 && peripheral < 3 && peripheral == memory && (cr >> 6) & 3 < 2 &&
+        cr & ((1 << 5) | (15 << 21)) == 0 && s.fcr & 4 == 0
+
+read(c: *Controller, offset: u32) -> Option[u32]
+    if offset == 0 || offset == 4 then return Some(status(c,offset == 4))
+    if offset == 8 || offset == 12 then return Some(0)
+    if offset < 0x10 || offset >= 0xd0 || offset & 3 != 0 then return None
+    val stream = usize((offset - 0x10) / 24)
+    val reg = (offset - 0x10) % 24
+    val s = &c.streams[stream]
+    reg match
+        0 -> Some(s.cr)
+        4 -> Some(s.ndtr)
+        8 -> Some(s.par)
+        12 -> Some(s.m0ar)
+        16 -> Some(s.m1ar)
+        _ -> Some(s.fcr)
+
+write(c: *Controller, offset: u32, value: u32) -> bool
+    if offset == 0 || offset == 4 then return true
+    if offset == 8 || offset == 12
+        for i in 0..<4
+            val stream = i + (if offset == 12 then 4 else 0)
+            c.flags[stream] &= ~((value >> flag_shift(stream)) & 0x3d)
+        return true
+    if offset < 0x10 || offset >= 0xd0 || offset & 3 != 0 then return false
+    val stream = usize((offset - 0x10) / 24)
+    val reg = (offset - 0x10) % 24
+    val s = &c.streams[stream]
+    val active = s.cr & ENABLE != 0
+    reg match
+        0 ->
+            if active then s.cr = (s.cr & ~31) | (value & 31)
+            else
+                val cr = value & 0x01ffffff
+                if cr & ENABLE != 0
+                    if !valid(s,cr) then return false
+                    s.initial = s.ndtr
+                    s.done = 0
+                s.cr = cr
+        4 -> if !active then s.ndtr = value & 65535
+        8 -> if !active then s.par = value
+        12 -> if !active || (s.cr & DOUBLE_BUFFER != 0 && s.cr & CURRENT_TARGET != 0) then s.m0ar = value
+        16 -> if !active || (s.cr & DOUBLE_BUFFER != 0 && s.cr & CURRENT_TARGET == 0) then s.m1ar = value
+        20 ->
+            if !active
+                if value & 4 != 0 then return false
+                s.fcr = (value & 0x83) | 0x20
+        _ -> return false
+    true
+
+// Exactly one peripheral request/beat. Bus failure leaves NDTR unchanged and
+// raises TEIF. A caller must gate requests using the peripheral's request line.
+request(c: *Controller, stream: usize, read_bus: BusRead, write_bus: BusWrite) -> bool
+    require stream < 8, "DMA stream index"
+    val s = &c.streams[stream]
+    if s.cr & ENABLE == 0 || s.ndtr == 0 then return false
+    val width = 1u32 << ((s.cr >> 11) & 3)
+    val base = if s.cr & CURRENT_TARGET != 0 && s.cr & DOUBLE_BUFFER != 0 then s.m1ar else s.m0ar
+    val memory = base + (if s.cr & (1 << 10) != 0 then s.done * width else 0)
+    val peripheral = s.par + (if s.cr & (1 << 9) != 0 then s.done * (if s.cr & (1 << 15) != 0 then 4 else width) else 0)
+    val sending = s.cr & (1 << 6) != 0
+    val source = if sending then memory else peripheral
+    val target = if sending then peripheral else memory
+    var ok = source % width == 0 && target % width == 0
+    if ok
+        (read_bus)(source,width) match
+            Some(value) ->
+                val mask: u32 = if width == 4 then 0xffffffff else (1u32 << (width * 8)) - 1
+                ok = (write_bus)(target,width,value & mask)
+            None -> ok = false
+    if !ok
+        c.flags[stream] |= TRANSFER_ERROR
+        s.cr &= ~ENABLE
+        return false
+    s.ndtr -= 1
+    s.done += 1
+    if s.ndtr == s.initial / 2 then c.flags[stream] |= HALF_TRANSFER
+    if s.ndtr == 0
+        c.flags[stream] |= TRANSFER_COMPLETE
+        if s.cr & (CIRCULAR | DOUBLE_BUFFER) != 0
+            if s.cr & DOUBLE_BUFFER != 0 then s.cr ^= CURRENT_TARGET
+            s.ndtr = s.initial
+            s.done = 0
+        else s.cr &= ~ENABLE
+    true

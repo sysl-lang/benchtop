@@ -1,0 +1,119 @@
+module sh.sysl.benchtop.peripheral.sai
+@tests
+
+import sysl.buf.{Buf,buf}
+
+private stereo(receive: bool = false, hz: u64 = 480000000, kernel: u64 = 12288000) -> &Block
+    val b = block(hz,kernel)
+    assert(write(b,8,63 | (31 << 8) | (1 << 16)))
+    assert(write(b,12,(3 << 16) | (1 << 8) | (2 << 6)))
+    assert(write(b,0,(4 << 5) | (1 << 20) | (if receive then 1u32 else 0)))
+    b
+
+@test("STM32 SAI: reset, protected registers, FIFO thresholds, interrupt masks and explicit unsupported modes")
+sai_registers()
+    val b = stereo()
+    assert(read(b,8) == Some(0x11f3f) && read(b,28) == Some(0))
+    assert(read(b,32).is_none() && !write(b,32,0))
+    assert(fifo_level(b) == 0 && status(b) & FIFO_REQUEST != 0 && !irq(b))
+    assert(write(b,16,FIFO_REQUEST) && irq(b))
+    for n in 1u32..8
+        assert(write(b,28,n))
+        assert(fifo_level(b) == (if n == 8 then 5 else n / 2 + 1))
+    assert(write(b,28,99) && b.count == 8)
+    for threshold in 0u32..4
+        assert(write(b,4,threshold))
+        assert(status(b) & FIFO_REQUEST == 0)
+    assert(!write(b,4,5) && !write(b,4,1 << 14))
+    assert(write(b,4,8) && b.count == 0 && b.cr2 & 8 == 0)
+    assert(write(b,0,b.cr1 | ENABLE | DMA_ENABLE) && dma_request(b))
+    val frame = b.frcr
+    assert(write(b,8,7) && b.frcr == frame)
+    assert(write(b,0,b.cr1 & ~ENABLE) && b.due == NEVER)
+    assert(!write(b,0,b.cr1 | ENABLE | (1 << 2)))
+    assert(!write(b,0,b.cr1 | ENABLE | (1 << 12)))
+    assert(!write(b,0,(b.cr1 & ~(7 << 5)) | ENABLE))
+    reset(b)
+    assert(b.hz == 480000000 && b.kernel_hz == 12288000 && b.cr1 == 0 && b.frcr == 7 && b.count == 0)
+
+@test("STM32 SAI: timed slots, masks, inactive TDM slots, underrun, mute and write-one-to-clear")
+sai_transmit()
+    val b = stereo()
+    val words: Buf[u32] = buf()
+    val times: Buf[u64] = buf()
+    val endpoint: Endpoint = (slot,word,time) ->
+        words.push(word)
+        times.push(time)
+        0
+    assert(write(b,0,b.cr1 | ENABLE))
+    assert(b.due == NEVER,"master TX starts frames when data arrives")
+    assert(write(b,28,0xffff8000) && write(b,28,0x7fff))
+    assert(b.due == 5000)
+    advance(b,4999,endpoint)
+    assert(words.is_empty())
+    advance(b,15000,endpoint)
+    assert(words.view() == [0x8000u32,0x7fff,0][..])
+    assert(times.view() == [5000u64,10000,15000][..] && b.flags == OVERRUN_UNDERRUN)
+    assert(write(b,16,1) && irq(b))
+    assert(write(b,24,1) && !irq(b))
+    assert(write(b,28,123) && write(b,4,32))
+    advance(b,20000,endpoint)
+    assert(words.at(3) == 0 && b.count == 0,"mute still consumes data")
+    advance(b,20000,endpoint)
+    advance(b,10000,endpoint)
+    assert(words.len() == 4,"repeated/backward time never replays slots")
+
+    val tdm = stereo()
+    assert(write(tdm,8,127 | (63 << 8) | (1 << 16)))
+    assert(write(tdm,12,(10 << 16) | (3 << 8) | (2 << 6)))
+    assert(write(tdm,28,11) && write(tdm,28,22) && write(tdm,0,tdm.cr1 | ENABLE))
+    val output: Buf[u32] = buf()
+    advance(tdm,10000,(slot,word,time) ->
+        output.push(word)
+        0)
+    assert(output.view() == [0u32,11,0,22][..] && tdm.count == 0)
+
+@test("STM32 SAI: receive FIFO, half-full DMA request, overflow and external slave slots")
+sai_receive()
+    val b = stereo(true)
+    assert(write(b,4,2) && write(b,0,b.cr1 | ENABLE | DMA_ENABLE))
+    assert(!dma_request(b))
+    advance(b,15000,(slot,word,time) -> u32(time) | 0xffff0000)
+    assert(b.count == 3 && !dma_request(b))
+    advance(b,20000,(slot,word,time) -> u32(time) | 0xffff0000)
+    assert(b.count == 4 && dma_request(b))
+    assert(read(b,28) == Some(5000) && !dma_request(b))
+    advance(b,50000,(slot,word,time) -> u32(time))
+    assert(b.count == 8 && b.flags & 1 != 0)
+    assert(write(b,24,0xffffffff) && b.flags == 0)
+    val slave = stereo(true)
+    assert(write(slave,0,slave.cr1 | 2 | ENABLE))
+    assert(slave.due == NEVER)
+    clock_slot(slave,0x12345678)
+    assert(read(slave,28) == Some(0x5678))
+
+@test("STM32 SAI: rational slot clock is independent of advance chunk size and NODIV uses frame length")
+sai_clock()
+    val a = stereo(false,100000000,13000000)
+    val b = stereo(false,100000000,13000000)
+    val left: Buf[u64] = buf()
+    val right: Buf[u64] = buf()
+    for c in [a,b] do assert(write(c,28,1) && write(c,0,c.cr1 | ENABLE))
+    advance(a,100000,(slot,word,time) ->
+        left.push(time)
+        0)
+    var time: u64 = 317
+    while time < 100000
+        advance(b,time,(slot,word,at) ->
+            right.push(at)
+            0)
+        time += 317
+    advance(b,100000,(slot,word,at) ->
+        right.push(at)
+        0)
+    assert(left.view() == right.view() && left.len() == 101 && left.at(0) == 985)
+    assert(a.due == b.due && a.phase == b.phase)
+    val direct = stereo()
+    assert(write(direct,0,direct.cr1 | (1 << 19)))
+    assert(write(direct,28,1) && write(direct,0,direct.cr1 | ENABLE))
+    assert(direct.due == 1250)
