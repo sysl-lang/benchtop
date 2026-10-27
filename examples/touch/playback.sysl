@@ -1,0 +1,165 @@
+#if feature_storage
+import sh.sysl.wav as wav
+import sh.sysl.fat as fat
+
+impl wav.Source for FatWave
+    size(self) -> Result[u64,wav.Error] = Ok(u64(self.file.size))
+    read_at(*self, offset: u64, out: []u8) -> Result[usize,wav.Error]
+        if offset >= u64(self.file.size) then return Ok(0)
+        self.file.seek(u32(offset))
+        self.volume.read(&self.file,out) match
+            Ok(count) -> Ok(count)
+            Err(_) -> Err(wav.Error.Io)
+
+struct PlayFile
+    source: FatWave
+    reader: wav.Reader
+var play_file: Option[PlayFile] = None
+var play_bytes: [4096]u8
+var play_loaded: u32 = 0
+var play_error: u32 = 0
+var play_peak: f32 = 0.0
+@export("play_status")
+var play_status: Word
+@export("play_command")
+var play_command: Word
+@export("play_ack")
+var play_ack: Word
+@export("play_head")
+var play_head: Word
+@export("play_tail")
+var play_tail: Word
+@export("play_total")
+var play_total: Word
+@export("play_done")
+var play_done: Word
+@export("play_underruns")
+var play_underruns: Word
+
+play_busy() -> bool = play_status.value == 1 || play_status.value == 2
+
+// M4 owns the file, WAV cursor and head; M7 owns tail. Total frame count is
+// published before start, so EOF never races a separate end-of-stream flag.
+play_refill() -> bool
+    val head = play_head.value
+    val tail = play_tail.value
+    audio_barrier()
+    val room = 16384 - (head - tail)
+    if room == 0 || play_loaded == play_total.value then return true
+    val take = if room > 1024 then 1024u32 else room
+    var file = play_file.unwrap()
+    val outcome = file.reader.read(&file.source,play_bytes[..<usize(take) * 4])
+    play_file = Some(file)
+    val got = outcome match
+        Ok(count) -> count
+        Err(_) -> return false
+    if got == 0 then return false // declared data still remains
+    val frames = u32(got / 4)
+    for i in 0u32..<frames
+        val at = usize(i) * 4
+        val target = usize((head + i) & 16383) * 2
+        storage_audio_ring[target].value = u16(play_bytes[at]) | (u16(play_bytes[at + 1]) << 8)
+        storage_audio_ring[target + 1].value = u16(play_bytes[at + 2]) | (u16(play_bytes[at + 3]) << 8)
+    play_loaded += frames
+    audio_barrier()
+    play_head.value = head + frames
+    true
+
+play_begin() -> u32
+    var volume = fat.mount(&storage_card,storage_sector[..]) match
+        Ok(v) -> v
+        Err(_) -> return 4
+    val file = volume.open("RECORD.WAV") match
+        Ok(f) -> f
+        Err(fat.FsError.NotFound) -> return 6
+        Err(_) -> return 4
+    var source = FatWave(volume,file)
+    val reader = wav.reader(&source) match
+        Ok(r) -> r
+        Err(wav.Error.Io) -> return 4
+        Err(_) -> return 7
+    val info = reader.info
+    if info.format.rate != 48000 || info.format.channels != 2 || info.format.encoding != wav.Encoding.Pcm16 then return 7
+    play_total.value = u32(info.frames)
+    play_head.value = 0
+    play_tail.value = 0
+    play_loaded = 0
+    play_done.value = 0
+    play_underruns.value = 0
+    play_peak = 0.0
+    play_error = 0
+    play_file = Some(PlayFile(source,reader))
+    while play_loaded < play_total.value && play_loaded < 16384
+        if !play_refill()
+            play_file = None
+            return 4
+    if play_total.value == 0
+        play_file = None
+        return 3
+    audio_barrier()
+    play_command.value += 1
+    1
+
+play_toggle()
+    if play_status.value == 2 then return
+    if play_status.value == 1
+        play_command.value += 1
+        play_status.value = 2
+        return
+    if record_status.value == 1 || record_status.value == 2 || record_ack.value != record_command.value then return
+    if storage_status.value == 3 || play_ack.value != play_command.value
+        play_status.value = 4
+        return
+    play_status.value = play_begin()
+
+play_poll()
+    if play_status.value == 1
+        if play_underruns.value != 0 then play_error = 5
+        elif play_done.value == 0 && !play_refill() then play_error = 4
+        if play_error != 0 || play_done.value != 0
+            play_command.value += 1
+            play_status.value = 2
+    if play_status.value != 2 || play_ack.value != play_command.value then return
+    audio_barrier()
+    play_file = None
+    play_status.value = if play_error != 0 then play_error else 3
+
+// The DMA refill always runs live DSP. Playback then replaces its output half;
+// MONITOR is independent, and resumes as soon as playback has stopped.
+play_audio_half(first: usize, last: usize)
+    val command = play_command.value
+    audio_barrier()
+    if command & 1 != 0
+        val head = play_head.value
+        var tail = play_tail.value
+        val total = play_total.value
+        audio_barrier()
+        var missing: u32 = 0
+        play_peak *= 0.95
+        var i = first
+        while i < last
+            var left: u16 = 0
+            var right: u16 = 0
+            if tail < head
+                val at = usize(tail & 16383) * 2
+                left = storage_audio_ring[at].value
+                right = storage_audio_ring[at + 1].value
+                tail += 1
+            elif tail < total then missing += 1
+            audio_buffer[i] = left
+            audio_buffer[i + 1] = right
+            val a = f32(int(u32(left) << 16) >> 16) / 32768.0
+            val b = f32(int(u32(right) << 16) >> 16) / 32768.0
+            val ma = if a < 0.0 then -a else a
+            val mb = if b < 0.0 then -b else b
+            if ma > play_peak then play_peak = ma
+            if mb > play_peak then play_peak = mb
+            i += 2
+        audio_barrier()
+        play_tail.value = tail
+        if missing != 0 then play_underruns.value += missing
+        if tail == total then play_done.value = 1
+        delay_output_peak = play_peak
+    audio_barrier()
+    play_ack.value = command
+#endif
