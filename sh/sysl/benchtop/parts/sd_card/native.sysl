@@ -1,0 +1,117 @@
+module sh.sysl.benchtop.parts.sd_card
+
+// Native SD state machine shares the same media, capacity, write protection,
+// programming delay and counters as the SPI endpoint. Response kinds match
+// SDMMC WAITRESP (0 none, 1 short CRC, 2 short without CRC, 3 long CRC).
+struct Native
+    card: &Card
+    state: u32
+    rca: u32
+    width: u32
+    app: bool
+    pending: u32
+    sector: u32
+struct Reply
+    present: bool
+    kind: u32
+    words: [4]u32
+    data: u32
+    length: u32
+native(card: &Card) -> &Native = Native(card,0,0x12340000,1,false,0,0)
+reset_native(n: &Native)
+    n.state = 0
+    n.width = 1
+    n.app = false
+    n.pending = 0
+    reset(n.card)
+private status(n: &Native, time: u64) -> u32
+    if n.state == 7 && time >= n.card.busy_until && (n.card.media.ready)() then n.state = 4
+    (n.state << 9) | (if (n.state == 3 || n.state == 4) && (n.card.media.ready)() then 256u32 else 0) |
+        (if (n.card.media.good)() then 0u32 else 1u32 << 20)
+private short(value: u32, data: u32 = 0, length: u32 = 0) -> Reply = Reply(true,1,[value,0,0,0],data,length)
+private long(bytes: []const u8) -> Reply
+    var words: [4]u32 = [0;4]
+    for i in 0usize..<16 do words[i / 4] |= u32(bytes[i]) << (24 - u32(i % 4) * 8)
+    Reply(true,3,words,0,0)
+
+native_command(n: &Native, index: u32, arg: u32, time: u64) -> Reply
+    n.card.commands += 1
+    val s = status(n,time)
+    val app = n.app
+    n.app = false
+    index match
+        0 ->
+            n.state = 0
+            n.width = 1
+            n.pending = 0
+            Reply(true,0,[0;4],0,0)
+        8 -> short(if arg & 0xf00 == 0x100 then arg & 0xfff else 0)
+        55 ->
+            if arg != (if n.state < 2 then 0u32 else n.rca) then return Reply(false,1,[0;4],0,0)
+            n.app = true
+            short(s | 32)
+        41 ->
+            if !app || n.state > 1 then return short(s | (1 << 22))
+            if arg & 0x00ff8000 == 0 then return Reply(true,2,[0x00ff8000,0,0,0],0,0)
+            n.state = 1
+            Reply(true,2,[0xc0ff8000,0,0,0],0,0)
+        2 ->
+            if n.state != 1 then return Reply(false,3,[0;4],0,0)
+            n.state = 2
+            var cid: [16]u8 = [0xfe,0x42,0x54,0x42,0x45,0x4e,0x43,0x48,0x10,0x12,0x34,0x56,0x78,0x01,0xa1,0]
+            cid[15] = crc7(cid[..<15])
+            long(cid[..])
+        3 ->
+            if n.state != 2 then return Reply(false,1,[0;4],0,0)
+            n.state = 3
+            short(n.rca | (3 << 9) | 256)
+        9 ->
+            if arg != n.rca || n.state != 3 then return Reply(false,3,[0;4],0,0)
+            val bytes = csd(n.card)
+            long(bytes[..])
+        7 ->
+            if arg == 0
+                n.state = 3
+                return Reply(true,0,[0;4],0,0)
+            if arg != n.rca || n.state != 3 then return Reply(false,1,[0;4],0,0)
+            n.state = 4
+            short(status(n,time))
+        13 -> if arg != n.rca then Reply(false,1,[0;4],0,0) else short(s)
+        6 ->
+            if !app || n.state != 4 || (arg != 0 && arg != 2) then return short(s | (1 << 22))
+            n.width = if arg == 2 then 4 else 1
+            short(s)
+        16 -> short(s | (if arg == 512 then 0u32 else 1u32 << 29))
+        17 | 24 | 51 ->
+            if n.state != 4 || (index == 51 && !app) then return short(s | (1 << 22))
+            if index != 51 && u64(arg) >= n.card.sectors then return short(s | (1 << 31))
+            if index == 24 && n.card.protected then return short(s | (1 << 26))
+            n.pending = index
+            n.sector = arg
+            n.state = if index == 24 then 6 else 5
+            short(s,index,if index == 51 then 8 else 512)
+        _ -> short(s | (1 << 22))
+
+native_read(n: &Native, out: []u8) -> bool
+    val pending = n.pending
+    n.pending = 0
+    n.state = 4
+    if pending == 51 && out.len == 8
+        for i in 0..<8 do out[i] = 0
+        out[0] = 2
+        out[1] = 5
+        return true
+    if pending != 17 || out.len != 512 then return false
+    n.card.reads += 1
+    (n.card.media.read)(n.sector,out)
+native_write(n: &Native, bytes: []const u8, time: u64) -> bool
+    if n.pending != 24 || bytes.len != 512 || n.card.protected then return false
+    n.pending = 0
+    if !(n.card.media.write)(n.sector,bytes)
+        n.state = 4
+        return false
+    n.card.writes += 1
+    n.card.busy_until = time + n.card.program_ticks
+    n.state = 7
+    true
+native_busy(n: &Native, time: u64) -> bool = status(n,time) & 256 == 0 && n.state >= 4

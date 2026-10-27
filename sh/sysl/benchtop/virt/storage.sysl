@@ -13,9 +13,16 @@ import sysl.sync.*
 import sysl.fs
 import sysl.io.Reader
 
-private var storage_lock = SleepLock.new()
+private[virt] var storage_lock = SleepLock.new()
 private var storage_spi = hspi.controller()
-private var storage_gpio = gpio.bank()
+private struct StorageGpio
+    base: u32
+    name: string
+    model: gpio.Bank
+private var storage_gpios: [16]StorageGpio = [StorageGpio(0,"",gpio.bank());16]
+private var storage_gpio_count: usize = 0
+private var storage_gpio_index: usize = 0
+private[virt] var storage_is_native = false
 private[virt] var storage_card: Option[&sd.Card] = None
 private var storage_bytes: Buf[u8] = buf()
 private var storage_path = ""
@@ -84,29 +91,42 @@ private val storage_media = sd.Media((sector,out) -> sector_read(sector,out),
     (sector,bytes) -> sector_write(sector,bytes),
     () -> atomic_load(&disk_pending,Acquire) == 0, () -> atomic_load(&disk_failed,Acquire) == 0)
 
-private local_pin(name: string, bank: string) -> Option[u32]
+private[virt] local_pin(name: string, bank: string) -> Option[u32]
     for pin in 0u32..<16 do if name == s"$bank$pin" then return Some(pin)
     None
 
+private[virt] storage_gpio_named(name: string) -> Option[usize]
+    for i in 0..<storage_gpio_count do if storage_gpios[i].name == name then return Some(i)
+    None
+private[virt] storage_gpio_alternate(bank: string, pin: u32, af: u32) -> bool = storage_gpio_named(bank) match
+    Some(i) -> gpio.alternate(storage_gpios[i].model,pin,af)
+    None -> false
 private[virt] configure_storage(b: Board) -> Result[unit,string]
     stop_disk()
     storage_present = false
+    storage_is_native = false
     storage_card = None
     storage_bytes = buf()
     storage_path = ""
+    storage_gpio_count = 0
     atomic_store(&disk_failed,0,Release)
     atomic_store(&disk_pending,0,Release)
-    var bank = ""
     var spi_name = ""
+    var native_name = ""
     var ratio: u32 = 8
-    var reset: u32 = 0xffffffff
     for p in b.chip.peripherals
         if p.kind == "stm32-gpio"
-            for q in p.params
-                q.value match
-                    Text(value) -> if q.name == "bank" then bank = value
-                    Whole(value) -> if q.name == "reset-mode" then reset = u32(value)
-                    _ -> ()
+            if storage_gpio_count == storage_gpios.len then return Err("too many GPIO banks")
+            var name = ""
+            var reset: u32 = 0xffffffff
+            for q in p.params do q.value match
+                Text(value) -> if q.name == "bank" then name = value
+                Whole(value) -> if q.name == "reset-mode" then reset = u32(value)
+                _ -> ()
+            if storage_gpio_named(name).is_some() then return Err("duplicate STM32 GPIO bank")
+            storage_gpios[storage_gpio_count] = StorageGpio(u32(p.at.unwrap().n),name,gpio.bank(reset))
+            storage_gpio_count += 1
+        if p.kind == "stm32-sdmmc" then native_name = p.name
         if p.kind != "stm32-spi" then continue
         storage_present = true
         spi_name = p.name
@@ -114,68 +134,75 @@ private[virt] configure_storage(b: Board) -> Result[unit,string]
             if q.name != "kernel-clock-hz" then continue
             q.value match
                 Whole(hz) ->
-                    if board_clock_hz == 0 || u64(hz) > board_clock_hz || board_clock_hz % u64(hz) != 0 then return Err("SPI kernel clock must divide mcu.clock-hz")
+                    if board_clock_hz == 0 || u64(hz) > board_clock_hz || board_clock_hz % u64(hz) != 0 || board_clock_hz / u64(hz) > 1024 then return Err("SPI kernel clock must divide mcu.clock-hz within its supported ratio")
                     ratio = u32(board_clock_hz / u64(hz))
                 _ -> ()
     storage_spi = hspi.controller(ratio)
-    storage_gpio = gpio.bank(reset)
-    if !storage_present then return Ok(())
-    if bank.is_empty() then return Err("stm32-spi routing needs a stm32-gpio bank")
-    // SPI1 AF5 routes are checked against the described pin bank; electrical
-    // characteristics are intentionally abstracted. Additional AF mappings can
-    // be supplied by future MCU adapters, without changing the SPI/SD models.
-    for p in b.chip.peripherals
-        if p.name != spi_name then continue
-        for route in p.signals
-            if route.pins.len() != 1 then return Err("SPI requires one routed pin per signal")
-            val pin = local_pin(route.pins.at(0).name,bank) match
-                Some(pin) -> pin
-                None -> return Err("SPI signal must belong to the configured GPIO bank")
-            if route.name == "sck" then storage_sck = pin
-            elif route.name == "tx" then storage_tx = pin
-            elif route.name == "rx" then storage_rx = pin
+    if storage_present
+        if storage_gpio_count == 0 then return Err("stm32-spi needs a GPIO bank")
+        storage_gpio_index = 0
+        for p in b.chip.peripherals
+            if p.name != spi_name then continue
+            for route in p.signals
+                if route.pins.len() != 1 then return Err("SPI requires one routed pin per signal")
+                val pin = local_pin(route.pins.at(0).name,storage_gpios[storage_gpio_index].name) match
+                    Some(pin) -> pin
+                    None -> return Err("SPI signal must belong to its GPIO bank")
+                if route.name == "sck" then storage_sck = pin
+                elif route.name == "tx" then storage_tx = pin
+                elif route.name == "rx" then storage_rx = pin
     for p in b.parts
         if part_model(p) != "sd-card" then continue
         if storage_card.is_some() then return Err("one SD card is currently supported")
-        var connected = false
+        var spi = false
+        var native = false
         var cs: Option[u32] = None
-        for wire in p.wires
-            wire.to match
-                Bus(name) -> if wire.port == "spi" && name == spi_name then connected = true
-                Port(owner,pin) -> if wire.port == "cs" && owner == b.chip.name then cs = local_pin(pin,bank)
-                Pin(pin) -> if wire.port == "cs" then cs = local_pin(pin,bank)
-        if !connected || cs.is_none() then return Err("SD card needs the STM32 SPI bus and a CS pin in its GPIO bank")
-        storage_cs = cs.unwrap()
-        if storage_cs == storage_sck || storage_cs == storage_tx || storage_cs == storage_rx || storage_sck == storage_tx || storage_sck == storage_rx || storage_tx == storage_rx then return Err("SPI and CS pins must be distinct")
-        val sectors = u64(part_whole(p,"sectors",32768))
-        if sectors % 1024 != 0 then return Err("SDHC sectors must be a multiple of 1024")
-        storage_path = part_text(p,"image","")
-        if storage_path.is_empty()
-            for i in 0..<usize(sectors * 512) do storage_bytes.push(0)
-        else
-            val loaded = fs.read_bytes(storage_path) match
-                Ok(bytes) -> bytes
-                Err(_) -> return Err(s"cannot read SD image `$storage_path`; create it with tools/mk-sd-image")
-            for byte in loaded do storage_bytes.push(byte)
-            if storage_bytes.len() != usize(sectors * 512) then return Err("SD image size must exactly match sectors * 512")
-            disk_queue = channel(disk_slots[..])
-            disk_thread = spawn(&disk_body,&disk_queue,1 << 20)
-            if disk_thread.is_none() then return Err("cannot create SD image worker")
-        storage_card = Some(sd.card(storage_media,sectors,part_flag(p,"write-protected",false),max(1,board_clock_hz / 2000)))
+        for wire in p.wires do wire.to match
+            Bus(name) ->
+                if wire.port == "spi" && name == spi_name then spi = true
+                if wire.port == "sdmmc" && name == native_name then native = true
+            Port(owner,pin) -> if wire.port == "cs" && owner == b.chip.name && storage_gpio_count > 0 then cs = local_pin(pin,storage_gpios[storage_gpio_index].name)
+            Pin(pin) -> if wire.port == "cs" && storage_gpio_count > 0 then cs = local_pin(pin,storage_gpios[storage_gpio_index].name)
+        if spi == native then return Err("SD card needs exactly one SPI or SDMMC connection")
+        storage_is_native = native
+        if spi
+            if cs.is_none() then return Err("SPI SD card needs a chip-select GPIO")
+            storage_cs = cs.unwrap()
+            if storage_cs == storage_sck || storage_cs == storage_tx || storage_cs == storage_rx || storage_sck == storage_tx || storage_sck == storage_rx || storage_tx == storage_rx then return Err("SPI and CS pins must be distinct")
+        load_storage_card(p)?
+    Ok(())
+
+private load_storage_card(p: sh.sysl.benchtop.Part) -> Result[unit,string]
+    val sectors = u64(part_whole(p,"sectors",32768))
+    if sectors % 1024 != 0 then return Err("SDHC sectors must be a multiple of 1024")
+    storage_path = part_text(p,"image","")
+    if storage_path.is_empty()
+        for i in 0..<usize(sectors * 512) do storage_bytes.push(0)
+    else
+        val loaded = fs.read_bytes(storage_path) match
+            Ok(bytes) -> bytes
+            Err(_) -> return Err(s"cannot read SD image `$storage_path`; create it with tools/mk-sd-image")
+        for byte in loaded do storage_bytes.push(byte)
+        if storage_bytes.len() != usize(sectors * 512) then return Err("SD image size must exactly match sectors * 512")
+        disk_queue = channel(disk_slots[..])
+        disk_thread = spawn(&disk_body,&disk_queue,1 << 20)
+        if disk_thread.is_none() then return Err("cannot create SD image worker")
+    storage_card = Some(sd.card(storage_media,sectors,part_flag(p,"write-protected",false),max(1,board_clock_hz / 2000)))
     Ok(())
 
 private[virt] boot_storage()
     hspi.reset(&storage_spi)
-    gpio.reset(&storage_gpio)
+    for i in 0..<storage_gpio_count do gpio.reset(&storage_gpios[i].model)
     storage_card match
         Some(c) -> sd.reset(c)
         None -> ()
 
 private storage_pins(sck: bool, mosi: bool, time: u64) -> bool
+    if storage_is_native then return true
     storage_card match
         Some(c) ->
-            val routed = gpio.alternate(storage_gpio,storage_sck,storage_af) && gpio.alternate(storage_gpio,storage_tx,storage_af) && gpio.alternate(storage_gpio,storage_rx,storage_af)
-            val selected = routed && gpio.output_enabled(storage_gpio,storage_cs) && !gpio.output_high(storage_gpio,storage_cs)
+            val routed = gpio.alternate(storage_gpios[storage_gpio_index].model,storage_sck,storage_af) && gpio.alternate(storage_gpios[storage_gpio_index].model,storage_tx,storage_af) && gpio.alternate(storage_gpios[storage_gpio_index].model,storage_rx,storage_af)
+            val selected = routed && gpio.output_enabled(storage_gpios[storage_gpio_index].model,storage_cs) && !gpio.output_high(storage_gpios[storage_gpio_index].model,storage_cs)
             sd.observe(c,selected,sck,mosi,time)
         None -> true
 private bring_storage(time: u64)
@@ -188,7 +215,7 @@ private[virt] storage_read(cpu: *Cpu, device: Device, address: u32, offset: u32,
     storage_lock.lock()
     defer storage_lock.unlock()
     bring_storage(board_time(cpu,n))
-    val result = if device == H7Spi then hspi.read(&storage_spi,offset,width) else if width == 4 && offset & 3 == 0 then gpio.read(storage_gpio,offset,storage_gpio.output | (1u32 << storage_rx)) else None
+    val result = if device == H7Spi then hspi.read(&storage_spi,offset,width) else if width == 4 && offset & 3 == 0 then storage_gpio_read(address - offset,offset) else None
     result match
         Some(value) -> value
         None ->
@@ -199,7 +226,7 @@ private[virt] storage_write(cpu: *Cpu, device: Device, address: u32, offset: u32
     defer storage_lock.unlock()
     val time = board_time(cpu,n)
     bring_storage(time)
-    val ok = if device == H7Spi then hspi.write(&storage_spi,offset,width,value) else width == 4 && offset & 3 == 0 && gpio.write(&storage_gpio,offset,value)
+    val ok = if device == H7Spi then hspi.write(&storage_spi,offset,width,value) else width == 4 && offset & 3 == 0 && storage_gpio_write(address - offset,offset,value)
     if !ok then halt(cpu,Stop.Fault,address)
     storage_pins(storage_spi.engine.sck,storage_spi.engine.mosi,time)
 
@@ -208,3 +235,19 @@ sd_image() -> []u8 = storage_bytes.view()
 sd_seed_image(bytes: []const u8)
     require bytes.len == storage_bytes.len(), "matching SD image length"
     for i in 0..<bytes.len do storage_bytes.view()[i] = bytes[i]
+
+private storage_gpio_read(base: u32, offset: u32) -> Option[u32]
+    for i in 0..<storage_gpio_count
+        val b = storage_gpios[i]
+        if b.base != base then continue
+        var input = b.model.output
+        for pin in 0u32..<16
+            if (b.model.pull >> (pin * 2)) & 3 == 1 then input |= 1u32 << pin
+        if storage_is_native && b.name == "PI" && storage_card.is_some() then input &= ~(1u32 << 8)
+        if !storage_is_native then input |= 1u32 << storage_rx
+        return gpio.read(b.model,offset,input)
+    None
+private storage_gpio_write(base: u32, offset: u32, value: u32) -> bool
+    for i in 0..<storage_gpio_count
+        if storage_gpios[i].base == base then return gpio.write(&storage_gpios[i].model,offset,value)
+    false

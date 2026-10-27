@@ -1,0 +1,195 @@
+module sh.sysl.benchtop.peripheral.sdmmc
+
+import sh.sysl.benchtop.parts.sd_card as card
+
+const NEVER: u64 = 0xffffffffffffffff
+const STATIC_FLAGS: u32 = 0x1fe00fff
+const DATA_ERRORS: u32 = 2 | 8 | 16 | 32 | (1 << 27)
+// STM32H7 SDMMC command/data paths, single-buffer IDMA, one 512-byte block or
+// 8-byte SCR. Wire-time completion is separate from host RAM/media callbacks.
+struct Host
+    hz: u64
+    kernel: u64
+    power: u32
+    clock: u32
+    arg: u32
+    command: u32
+    response_command: u32
+    response: [4]u32
+    timer: u32
+    length: u32
+    control: u32
+    remaining: u32
+    flags: u32
+    mask: u32
+    idma: u32
+    base: u32
+    at: u64
+    command_due: u64
+    data_due: u64
+    command_arg: u32
+    data_index: u32
+    data_base: u32
+    data_length: u32
+    data_write: bool
+    timeout_due: u64
+    commands: u64
+    transfers: u64
+
+host(hz: u64 = 480000000, kernel: u64 = 60000000) -> &Host
+    require hz > 0 && kernel > 0 && kernel <= hz, "SDMMC timebase and kernel clock"
+    Host(hz,kernel,0,0,0,0,0,[0;4],0,0,0,0,0,0,0,0,0,NEVER,NEVER,0,0,0,0,false,NEVER,0,0)
+reset(h: &Host)
+    val fresh = host(h.hz,h.kernel)
+    *h = *fresh
+clock_hz(h: &Host) -> u64 = if h.clock & 1023 == 0 then h.kernel else h.kernel / (2 * u64(h.clock & 1023))
+private ticks(h: &Host, clocks: u64) -> u64
+    val rate = clock_hz(h)
+    (clocks * h.hz + rate - 1) / rate
+irq(h: &Host) -> bool = h.flags & h.mask != 0
+due(h: &Host) -> u64 = if h.command_due < h.data_due then h.command_due else h.data_due
+status(h: &Host, c: Option[&card.Native], time: u64) -> u32
+    val busy = c match
+        Some(c) -> card.native_busy(c,time)
+        None -> false
+    h.flags | (if h.command_due != NEVER then 1u32 << 13 else 0) | (if h.data_due != NEVER then 1u32 << 12 else 0) |
+        (1u32 << 18) | (1u32 << 19) | (if busy then 1u32 << 20 else 0)
+
+// Callbacks are restricted to RAM by the board adapter. Entire blocks become
+// visible at wire completion. No host file I/O executes in either callback.
+advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
+        read_ram: &Fn(u32,[]u8) -> bool, write_ram: &Fn(u32,[]const u8) -> bool)
+    if time < h.at then return
+    if h.command_due <= time
+        val at = h.command_due
+        h.command_due = NEVER
+        h.commands += 1
+        if c.is_none() || !routed
+            h.flags |= 4
+        else
+            val native = c.unwrap()
+            val reply = card.native_command(native,h.command & 63,h.command_arg,at)
+            if !reply.present then h.flags |= 4
+            else
+                h.response = reply.words
+                h.response_command = h.command & 63
+                val expected = (h.command >> 8) & 3
+                if expected == 0 then h.flags |= 128
+                elif expected == reply.kind || (expected == 2 && reply.kind == 1) then h.flags |= 64
+                else h.flags |= 1
+                if reply.data != 0 && reply.words[0] & 0xfdffe008 == 0
+                    val writing = reply.data == 24
+                    val right_direction = (h.control & 2 == 0) == writing
+                    val block = 1u32 << ((h.control >> 4) & 15)
+                    if h.command & 64 == 0 || h.idma != 1 || !right_direction || h.length != reply.length || block != reply.length || h.base & 3 != 0
+                        h.flags |= 1u32 << 27
+                        native.pending = 0
+                        native.state = 4
+                    else
+                        h.data_index = reply.data
+                        h.data_base = h.base
+                        h.data_length = reply.length
+                        h.data_write = writing
+                        h.remaining = reply.length
+                        val lanes: u64 = if h.clock & 0xc000 == 0x4000 then 4 else 1
+                        if native.width != u32(lanes)
+                            h.flags |= 2
+                            native.pending = 0
+                            native.state = 4
+                        else
+                            val duration = ticks(h,8 + (u64(reply.length) * 8 + lanes - 1) / lanes + 18)
+                            h.timeout_due = at + ticks(h,u64(h.timer))
+                            h.data_due = at + duration
+                            if h.timeout_due < h.data_due then h.data_due = h.timeout_due
+    if h.data_due <= time
+        val at = h.data_due
+        h.data_due = NEVER
+        h.transfers += 1
+        if at >= h.timeout_due
+            h.flags |= 8
+        elif c.is_none() || !routed
+            h.flags |= 8
+        else
+            val native = c.unwrap()
+            var data: [512]u8 = [0;512]
+            val view = data[..<usize(h.data_length)]
+            if h.data_write
+                if !(read_ram)(h.data_base,view) then h.flags |= 1u32 << 27
+                elif !card.native_write(native,view,at) then h.flags |= 2
+                else h.flags |= 256 | 1024
+            else
+                if !card.native_read(native,view) then h.flags |= 2
+                elif !(write_ram)(h.data_base,view) then h.flags |= 1u32 << 27
+                else h.flags |= 256 | 1024
+            if h.flags & DATA_ERRORS == 0 then h.remaining = 0
+        if h.flags & DATA_ERRORS != 0 && c.is_some()
+            c.unwrap().pending = 0
+            c.unwrap().state = 4
+        h.idma = 0
+    h.at = time
+
+read(h: &Host, offset: u32, c: Option[&card.Native], time: u64) -> Option[u32] = offset match
+    0 -> Some(h.power)
+    4 -> Some(h.clock)
+    8 -> Some(h.arg)
+    12 -> Some(h.command)
+    16 -> Some(h.response_command)
+    20 | 24 | 28 | 32 -> Some(h.response[usize((offset - 20) / 4)])
+    36 -> Some(h.timer)
+    40 -> Some(h.length)
+    44 -> Some(h.control)
+    48 -> Some(h.remaining)
+    52 -> Some(status(h,c,time))
+    56 -> Some(0)
+    60 -> Some(h.mask)
+    64 -> Some(0)
+    80 -> Some(h.idma)
+    84 -> Some(0)
+    88 -> Some(h.base)
+    92 -> Some(0)
+    0x3fc -> Some(0x10)
+    _ -> None
+write(h: &Host, offset: u32, value: u32, time: u64) -> bool
+    offset match
+        0 ->
+            if value != 0 && value != 3 then return false
+            h.power = value
+            if value == 0
+                h.command_due = NEVER
+                h.data_due = NEVER
+                h.idma = 0
+                h.remaining = 0
+                h.flags = 0
+        4 ->
+            if value & ~0x000353ffu32 != 0 || value & 0xc000 > 0x4000 || h.command_due != NEVER || h.data_due != NEVER then return false
+            if h.kernel / (if value & 1023 == 0 then 1u64 else 2 * u64(value & 1023)) == 0 then return false
+            h.clock = value
+        8 -> h.arg = value
+        12 ->
+            if value & ~0x13ffu32 != 0 || h.command_due != NEVER then return false
+            h.command = value
+            if value & 4096 != 0
+                if h.power != 3 then return false
+                h.command_arg = h.arg
+                val response = (value >> 8) & 3
+                h.command_due = time + ticks(h,48 + (if response == 0 then 0u64 elif response == 3 then 144 else 56))
+        36 -> h.timer = value
+        40 ->
+            if h.data_due != NEVER || value > 512 then return false
+            h.length = value
+        44 ->
+            if h.data_due != NEVER || value & ~0x20f3u32 != 0 then return false
+            h.control = value & 0xf3
+        56 -> h.flags &= ~(value & STATIC_FLAGS)
+        60 ->
+            if value & ~STATIC_FLAGS != 0 then return false
+            h.mask = value
+        64 | 84 | 92 -> if value != 0 then return false
+        80 ->
+            if value > 1 || h.data_due != NEVER then return false
+            h.idma = value
+        88 ->
+            if h.data_due != NEVER then return false
+            h.base = value
+        _ -> return false
+    true
