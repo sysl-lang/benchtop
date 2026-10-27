@@ -1,0 +1,136 @@
+module sh.sysl.benchtop.virt
+@tests
+
+import sh.sysl.benchtop.v6m as cpu
+import sh.sysl.benchtop.parts.wm8994 as wm
+import sh.sysl.elf as elf
+import sysl.math.{min,max}
+import sysl.raw.bit_cast
+import sysl.text.replace_all
+import sysl.raw.str_cast
+
+private val MIC_GUEST = embed("../../../../examples/touch/mic-disco.elf")
+private val MIC_WAVE: [16]f32 = [0.0,0.191341716,0.353553391,0.461939766,0.5,0.461939766,0.353553391,0.191341716,0.0,-0.191341716,-0.353553391,-0.461939766,-0.5,-0.461939766,-0.353553391,-0.191341716]
+
+private microphone_chunks(n: int)
+    var samples: [240]f32
+    for i in 0..<240 do samples[i] = MIC_WAVE[i % 16]
+    for chunk in 0..<n
+        feed_microphone(samples[..])
+        submit_workers(2400000)
+        wait_workers()
+
+private microphone_energy() -> real
+    val samples = take_codec_sound()
+    assert(samples.len() >= 1024)
+    var energy: real = 0.0
+    var low: f32 = 1.0
+    var high: f32 = -1.0
+    for i in (samples.len() - 1024)..<samples.len()
+        val sample = samples.at(i)
+        energy += real(sample) * real(sample)
+        low = min(low,sample)
+        high = max(high,sample)
+    assert(low < -0.005 && high > 0.005,"signed microphone samples must survive RX DMA, M7 DSP and TX DMA")
+    energy / 1024.0
+
+@test("Discovery microphone: RX IRQ60 drives M7 effects, M4 meter and touch controls while TX plays processed PCM")
+codec_microphone_firmware()
+    assert(board_named("stm32h747-disco").is_ok())
+    boot(core0(),image_of(MIC_GUEST).unwrap().view())
+    assert(microphone_available())
+    val executable = elf.read(MIC_GUEST).unwrap()
+    val errors = u32(executable.symbol_named("audio_errors").unwrap().unwrap().value)
+    val misses = u32(executable.symbol_named("audio_deadline_misses").unwrap().unwrap().value)
+    val irqs = u32(executable.symbol_named("audio_capture_irqs").unwrap().unwrap().value)
+    val level = u32(executable.symbol_named("audio_input_level").unwrap().unwrap().value)
+    val frames = u32(executable.symbol_named("touch_frames").unwrap().unwrap().value)
+    start_workers(core0()).unwrap()
+    defer stop_workers()
+    submit_workers(150000000)
+    wait_workers()
+    pause_workers()
+    assert(workers_observe().running,stop_message(core0()))
+    assert(cpu.load32(core0(),errors) == 0 && cpu.load32(core0(),irqs) > 10)
+    val before = cpu.load32(core0(),frames)
+    val quiet = tft_frame("screen").unwrap()
+    var prefill: [4096]f32
+    for i in 0..<4096 do prefill[i] = MIC_WAVE[i % 16]
+    feed_microphone(prefill[..])
+    microphone_chunks(8)
+    pause_workers()
+    assert(cpu.load32(core0(),level) >= 49 && cpu.load32(core0(),level) <= 51)
+    for sample in take_codec_sound() do assert(sample == 0.0,"monitor is off while capture and the meter remain active")
+    val meter = tft_frame("screen").unwrap()
+    var changed = false
+    for y in 328..<344
+        for x in 292..<508
+            if quiet.pixels.at(y * 800 + x) != meter.pixels.at(y * 800 + x) then changed = true
+    assert(changed,"M4 must draw the input level measured by M7")
+    touch_point("touch",400,246,true)
+    microphone_chunks(8)
+    touch_point("touch",400,246,false)
+    microphone_chunks(40)
+    pause_workers()
+    val dry = microphone_energy()
+    assert(dry > 0.0016 && dry < 0.0020,"unity guest gain with 0.12 host gain gives the expected dry signal energy")
+    touch_point("touch",400,180,true)
+    microphone_chunks(8)
+    touch_point("touch",400,180,false)
+    microphone_chunks(32)
+    pause_workers()
+    val filtered = microphone_energy()
+    assert(filtered > dry * 0.05 && filtered < dry * 0.16,"one-pole low-pass must attenuate the 3kHz input")
+    touch_point("touch",400,180,true)
+    microphone_chunks(8)
+    touch_point("touch",400,180,false)
+    microphone_chunks(32)
+    pause_workers()
+    val high_pass = microphone_energy()
+    assert(high_pass > filtered * 5.0 && high_pass < dry)
+    touch_point("touch",400,246,true)
+    microphone_chunks(8)
+    touch_point("touch",400,246,false)
+    microphone_chunks(40)
+    pause_workers()
+    for sample in take_codec_sound() do assert(sample > -0.00001 && sample < 0.00001)
+    assert(cpu.load32(core0(),level) >= 49 && cpu.load32(core0(),frames) > before)
+    assert(cpu.load32(core0(),errors) == 0 && cpu.load32(core0(),misses) == 0,"continuous duplex DSP must meet DMA deadlines")
+    assert(workers_observe().running)
+
+@test("WM8994 host capture: prebuffer, stereo slots, all widths, saturation, NaN, bounded queue and reset")
+codec_host_capture()
+    assert(board_named("stm32h747-disco").is_ok())
+    boot(core0(),image_of([]).unwrap().view())
+    for pair in [(1u16,3u16),(4,0x30c),(0x200,1),(0x208,10),(0x606,2),(0x607,2)] do assert(wm.write_register(codec_model,pair.0,pair.1))
+    var samples: [1024]f32 = [0.5;1024]
+    samples[0] = -2.0
+    samples[1] = 2.0
+    samples[2] = bit_cast[u32,f32](0x7fc00000)
+    for width in 0u32..<4
+        clear_audio_host()
+        assert(wm.write_register(codec_model,0x300,u16(0x10 | (width << 5))))
+        publish_codec()
+        val bits = [16u32,20,24,32][usize(width)]
+        feed_microphone(samples[..<1023])
+        assert(codec_input_word(1,0,4,bits).unwrap() == 0,"wait for the capture prebuffer")
+        feed_microphone(samples[1023..])
+        val negative = u32(-(1i64 << (bits - 1)))
+        val positive = u32((1i64 << (bits - 1)) - 1)
+        assert(codec_input_word(1,0,4,bits).unwrap() == negative)
+        assert(codec_input_word(1,2,4,bits).unwrap() == negative,"both channels use the same frame")
+        assert(codec_input_word(1,0,4,bits).unwrap() == positive)
+        assert(codec_input_word(1,0,4,bits).unwrap() == 0,"NaN becomes silence")
+        assert(codec_input_word(1,1,4,bits).unwrap() == 0 && codec_input_word(0,0,4,bits).is_none())
+    clear_audio_host()
+    for i in 0..<6 do feed_microphone(samples[..])
+    assert(codec_input_count == 4096)
+    boot_codecs()
+    assert(codec_input_count == 0 && !codec_input_primed)
+    assert(board_named("virt").is_ok() && !microphone_available())
+
+@test("WM8994 host capture: microphone connections are validated against the catalog")
+codec_microphone_wiring()
+    val original = str_cast(embed("../../../../boards/stm32h747-disco.hocon"))
+    assert(board_from("bad-mic.hocon",replace_all(original,"dmic1 = microphone.out","dmic1 = speaker.input").bytes).is_err())
+    assert(board_from("unused-mic.hocon",replace_all(original,", dmic1 = microphone.out","").bytes).is_err())
