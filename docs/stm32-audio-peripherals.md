@@ -107,3 +107,12 @@ M4 frames, touch-controlled 440 Hz output, output amplitude and return to silenc
 The pure codec tests cover bus transactions, reset, volume latching and gating.
 
 Primary codec reference: [ST WM8994 driver](https://github.com/STMicroelectronics/stm32-wm8994).
+
+Validation on October 27, 2026: all 740 repository tests passed and the host
+build succeeded. The live window opened CoreAudio without an audio error.
+With the tone disabled, published simulated clocks were approximately 480/240 MHz
+and the host UI stayed near 120 FPS. M7 retired roughly 2 million instructions
+per second and slept between DMA interrupts; its simulated clock includes that
+sleep. These figures show headroom for this small workload, not arbitrary DSP
+throughput or cycle-exact hardware timing. The firmware test also enabled the
+tone and found no DMA refill deadline misses.
