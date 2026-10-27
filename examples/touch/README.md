@@ -202,3 +202,44 @@ the headphone part through SAI/DMA. M4 provides MONITOR, FEEDBACK, WET/DRY,
 input/output meters and estimated DSP peak load. Monitoring starts off. The
 headphone part uses the Mac's default playback device; the speaker, sine and
 microphone-filter demos remain available.
+
+## SPI SD-card settings
+
+The `storage` variant keeps the stereo delay and adds **SAVE SD**. It writes
+`SETTINGS.TXT` (feedback and wet/dry percentages) through the standalone
+[`spi`](https://github.com/sysl-lang/spi), [`sd`](https://github.com/sysl-lang/sd)
+and [`fat`](https://github.com/sysl-lang/fat) firmware dependencies.
+
+```sh
+sysl run tools/mk-sd-image
+./examples/touch/build.sh storage
+./benchtop run --window --board boards/stm32h747-sd.hocon examples/touch/storage-disco.elf
+```
+
+Run these commands from the Benchtop root. The image tool creates a 16 MiB FAT16
+volume at `target/disco-sd.img`; it preserves any existing file. The board's
+`image` and `sectors` parameters must agree exactly. Guest reset preserves the
+card's storage. Restarting Benchtop reloads the disk image. An omitted/empty
+`image` gives volatile zero-filled media instead. Firmware never formats media
+on initialization failure: the UI reports SD ERROR.
+
+This is an **external SPI slot**, with PA5 SCK, PA6 MISO, PA7 MOSI and PA4 active-low
+CS, using SPI1 AF5. It does not emulate the Discovery board's onboard SDMMC slot.
+M4 uses actual GPIO MODER/AFR/BSRR and STM32H7 SPI CR1/CFG1/CFG2/TXDR/RXDR
+registers. The SD model receives clock edges and commands, not filesystem calls.
+The driver runs at a ceiling of 400 kHz during initialization and 8 MHz afterwards
+(actual configured rates are 234.375 kHz and 7.5 MHz for a 60 MHz SPI kernel clock).
+Physical-board startup still needs the full RCC/PLL and board initialization.
+
+The initial SD model implements single-sector SDHC SPI commands, CSD/OCR,
+command/data CRC, programming busy and write protection. Its reduced 16 MiB
+SDHC-addressed capacity is convenient for development, rather than a real SDHC
+card's capacity class. The register adapter currently supports eight-bit polling,
+software chip select and continuous TSIZE=0 transfers; DMA, interrupts, hardware
+CRC/NSS and finite TSIZE are rejected. Existing SPI and audio demos remain.
+
+A separate host worker writes accepted sectors to disk; the guest core does no
+host filesystem I/O. Card busy stays asserted until that write has been flushed
+to the OS. SAVE SD reports success only after the firmware's FAT/SD flush. This
+is development storage, without power-cut simulation or a host-power-loss
+persistence guarantee. The model has one cached card (up to 64 MiB) per board.
