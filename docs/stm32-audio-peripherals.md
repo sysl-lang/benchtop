@@ -72,3 +72,8 @@ a flash-linked emulator regression, not complete Discovery hardware startup.
 WM8994 codec control, audible playback/capture and the M7 DSP workload are the
 next integration steps. The SAI/DMA models are usable through firmware registers
 now; this work does not claim complete audio hardware emulation.
+
+Validation: all 736 repository tests passed in the final full run, and the host
+build passed. The display demo sustained both configured simulated core clock
+rates after the per-core MMIO address cache was added. Codec/audio DSP throughput
+has not yet been benchmarked.

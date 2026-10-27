@@ -214,3 +214,25 @@ The two instruction rates differ from clock rates because each instruction now
 advances its estimated number of cycles. These results remain specific to the
 M7 idle-loop/M4 UI demonstration, not audio DSP validation or pipeline-accurate
 H747 execution timing. See [the timing model](../docs/instruction-timing.md).
+
+## Wider NVIC and firmware audio bus integration (2026-10-27)
+
+The NVIC now covers each Cortex-M catalog model's interrupt range, and the
+Discovery board maps SAI1, DMA2 and DMAMUX1 with their real IRQ assignments.
+A flash-linked Sysl regression wakes from WFI on DMA2 stream1 IRQ57, handles
+completion once, observes its active NVIC bank bit, and drains the sample FIFO.
+Synchronous capture, error IRQs, nested high exceptions and DMA memory coherence
+are also covered. All 736 tests passed in the final full run (120-second per-test
+limit for the exhaustive instruction corpus); the host build passed.
+
+Adding mapped peripherals exposed the linear MMIO decoder's cost on the
+M4 display workload. A per-core cache now remembers only the last address
+mapping, never register values. It retains all MMIO side effects, resets on
+board changes, and separates each core's writable cache line.
+
+The final 1,200-frame display run produced 9 trace samples averaging
+479.990 / 239.990 MHz of simulated core time, 319.989 /
+145.890 MIPS and 119.944 UI FPS. Both pacing targets were sustained.
+Host load was variable, so this is a functional realtime check rather than a
+controlled before/after speedup claim. SAI was idle in this display run; sustained
+codec/audio DSP performance remains to be measured with that firmware.
