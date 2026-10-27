@@ -176,3 +176,16 @@ VOLUME controls amplitude. Startup is silent. The guest uses its FPU to
 interpolate samples and DMA half/full IRQs to refill a circular buffer. Exported
 `audio_errors`, `audio_irqs` and `audio_deadline_misses` help inspect the workload.
 See [supported audio hardware](../../docs/stm32-audio-peripherals.md) for limitations.
+
+## Discovery microphone effects
+
+```sh
+./examples/touch/build.sh mic
+./benchtop run --window --board stm32h747-disco examples/touch/mic-disco.elf
+```
+
+The input meter shows the Mac microphone as measured by M7 after SAI capture DMA.
+MONITOR starts off; enable it for playback, CHANGE EFFECT for dry/low-pass/high-pass,
+and VOLUME for gain. M7 processes the completed receive half into the free transmit
+half on DMA IRQ60, while M4 draws the meter and handles touch. The generated sine
+example is retained as `audio-disco.elf` (`build.sh audio`).

@@ -5,7 +5,7 @@ This checkpoint provides reusable SAI, DMA and DMAMUX models under
 with no UI, host audio, hard-coded RAM mapping or Cortex-M dependencies.
 They are exposed as `stm32-sai`, `stm32-dma` and `stm32-dmamux` catalog entries
 and mapped on `stm32h747-disco`. The board also includes a WM8994 codec and
-speaker. `examples/sai-dma` remains a separate flash-linked Sysl interrupt regression.
+speaker and host-backed digital microphone. `examples/sai-dma` remains a separate flash-linked Sysl interrupt regression.
 
 SAI models one audio sub-block (A or B), with CR1/CR2/FRCR/SLOTR/IMR/SR/CLRFR/DR,
 an eight-word FIFO, data-width masking, active TDM slots, mute, FIFO-level flags,
@@ -89,8 +89,8 @@ with 16-bit DAC2 left/right samples in slots 1 and 3. The reusable codec part
 implements 16-bit register addressing/data, readback, software reset, power and
 clock gates, DAC2 routing, mute and latched speaker/digital volume. Unknown
 writes and unsupported sample rates/formats are rejected. The current path is
-48 kHz, codec-slave AIF1 DAC2 speaker playback; headphones, capture, microphone,
-EQ/DRC, analog settling and complete vendor driver initialization remain future work.
+48 kHz, codec-slave AIF1 DAC2 speaker playback; headphones, DMIC2/analog inputs,
+codec HPF/EQ/DRC, analog settling and complete vendor driver initialization remain future work.
 
 The host snapshots integer codec gains with each slot, then converts and mixes
 PCM outside the guest CPU worker. SDL3 sends the mono speaker mix to CoreAudio
@@ -116,3 +116,51 @@ per second and slept between DMA interrupts; its simulated clock includes that
 sleep. These figures show headroom for this small workload, not arbitrary DSP
 throughput or cycle-exact hardware timing. The firmware test also enabled the
 tone and found no DMA refill deadline misses.
+
+## Microphone capture and firmware effects
+
+```sh
+./examples/touch/build.sh mic
+./benchtop run --window --board stm32h747-disco examples/touch/mic-disco.elf
+```
+
+The Mac microphone feeds the board's `pdm-microphone` catalog part. The board
+connects it with `codec.dmic1 = microphone.out`; the codec's SAI connection is
+unchanged. This models ideal PDM decimation into PCM, not individual PDM bits.
+The host supplies mono 48 kHz samples to both microphone channels. Codec power,
+AIF clock, channel mixer routing and latched ADC digital volume gate the stream.
+DMIC1 travels through AIF1 ADC1 in slots 0/2 of the same four-slot frame used by
+speaker slots 1/3. DMA2 stream4, DMAMUX channel12/request88 and SAI1 B deliver the
+capture words into actual guest RAM. The receive block is internally synchronous
+to block A; it has no independent host audio clock.
+
+M7 wakes on real IRQ60 for capture half/full completions. It reads the completed
+RX half and writes the matching free TX half. TX FIFO prefetch makes that half
+free slightly before the RX interrupt; counters verify both DMA deadlines.
+Guest single-precision instructions implement dry monitoring, a roughly 1 kHz
+one-pole low-pass, and a complementary high-pass. Gain is adjustable from zero
+to two, output has a smooth enable ramp and clips at 95% full scale. M4 reads
+an input peak meter at 60 Hz and updates it without waiting for touch changes.
+
+Startup captures input and displays its level, with MONITOR off. Enable MONITOR
+to hear the result; CHANGE EFFECT cycles the three modes, and VOLUME controls
+the guest gain. The speaker's description gain still controls host listening
+level. The sine example remains available with `build.sh audio`.
+
+Host capture uses the same SDL3/CoreAudio recording bridge as the existing I2S
+microphone. A bounded 4096-frame queue drops old input after stalls, starts after
+a 1024-frame prebuffer (about 21 ms), and supplies silence if input runs out.
+Pause/reset clears stale capture and prebuffer state. NaNs become silence,
+out-of-range host input clips, and codec gain saturates to the configured signed
+16/20/24/32-bit format. Explicit `sai_feed_input` debug injection overrides the
+host source for that block until reset. Timing and buffering are development
+approximations, not physical microphone latency or bit-accurate PDM simulation.
+
+Codec input supports DMIC1/AIF1 ADC1 only. Nonzero codec ADC filter configuration
+is rejected; the example disables that codec filter and runs its filters on M7.
+Physical clock/pin/cache/MPU startup remains incomplete. The regression injects
+a known 3 kHz microphone signal and checks actual guest DMA/DSP output, expected
+filter attenuation, M4 display changes, monitor mute and refill deadlines.
+
+Register routing follows the [ST WM8994 component driver](https://github.com/STMicroelectronics/stm32-wm8994/blob/main/wm8994.c)
+and [Discovery audio BSP](https://github.com/STMicroelectronics/stm32h747i-disco-bsp/blob/main/stm32h747i_discovery_audio.c).

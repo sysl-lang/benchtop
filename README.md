@@ -674,6 +674,12 @@ For audible playback with M4 touch controls, build with
 `./examples/touch/build.sh audio` and run `examples/touch/audio-disco.elf` on
 `stm32h747-disco`. Enable TONE in the display UI; startup is silent.
 
+For live microphone effects, build with `./examples/touch/build.sh mic` and run
+`examples/touch/mic-disco.elf` on the same board. M7 captures through SAI/DMA and
+applies dry/low-pass/high-pass processing; M4 shows an input meter and controls
+MONITOR, effect and volume. MONITOR starts off. The `pdm-microphone` part connects
+to the WM8994 DMIC1 input, with ideal PDM-to-PCM conversion and CoreAudio capture.
+
 
 Normal DSI sessions also have a dedicated device worker. CPU workers enqueue
 completed packets through a bounded 64-packet host channel; pixel decoding runs
