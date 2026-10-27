@@ -22,6 +22,14 @@ var audio_phase: u32 = 0
 var audio_envelope: f32 = 0.0
 var audio_target: f32 = 0.0
 var audio_step: u32 = 39370534
+var audio_effect: u32 = 0
+var audio_filter: f32 = 0.0
+var audio_peak: f32 = 0.0
+@export("audio_input_level")
+var audio_input_level: Word
+@export("audio_capture_irqs")
+var audio_capture_irqs: Word
+var audio_capture_buffer: [512]u16
 
 // One sine cycle, interpolated by fractional phase rather than rounding to
 // table entries. This is firmware data, not samples synthesized by the host.
@@ -87,23 +95,49 @@ audio_controls()
     val note = audio_control.note
     audio_barrier()
     if before != audio_control.sequence then return
+#if feature_microphone
+    audio_target = if enabled != 0 then f32(if level > 100 then 100 else level) * 0.02 else 0.0
+    audio_effect = if note > 2 then 2 else note
+#else
     audio_target = if enabled != 0 then f32(if level > 100 then 100 else level) * 0.0035 else 0.0
+#endif
     audio_step = audio_steps[usize(if note > 9 then 9 else note)]
 
 audio_fill(first: usize, last: usize)
     audio_controls()
     var i = first
+    var peak: f32 = 0.0
     while i < last
         audio_envelope += (audio_target - audio_envelope) * 0.002
         if audio_target == 0.0 && audio_envelope < 0.0000001 then audio_envelope = 0.0
+#if feature_microphone
+        // The just-completed RX half is stable until DMA wraps around.
+        val left = int(audio_capture_buffer[i] << 16) >> 16
+        val right = int(audio_capture_buffer[i + 1] << 16) >> 16
+        val input = f32(left + right) / 65536.0
+        val magnitude = if input < 0.0 then -input else input
+        if magnitude > peak then peak = magnitude
+        // One-pole low-pass at roughly 1 kHz; subtract for the high-pass mode.
+        audio_filter += (input - audio_filter) * 0.122694
+        val wave = if audio_effect == 1 then audio_filter elif audio_effect == 2 then input - audio_filter else input
+        val amplified = wave * audio_envelope
+        val limited = if amplified < -0.95 then -0.95 elif amplified > 0.95 then 0.95 else amplified
+        val value = u16(int(limited * 32767.0))
+#else
         val index = usize(audio_phase >> 24)
         val fraction = f32(audio_phase & 0xffffff) / 16777216.0
         val wave = audio_wave[index] + (audio_wave[(index + 1) & 255] - audio_wave[index]) * fraction
         val value = u16(int(wave * audio_envelope * 32767.0))
+#endif
         audio_buffer[i] = value
         audio_buffer[i + 1] = value
         audio_phase += audio_step
         i += 2
+#if feature_microphone
+    audio_peak *= 0.95
+    if peak > audio_peak then audio_peak = peak
+    audio_input_level.value = u32(audio_peak * 100.0)
+#endif
 
 @export("audio_dma_interrupt")
 audio_interrupt()
@@ -111,6 +145,7 @@ audio_interrupt()
     word(0x40020408).value = flags & (0x3d << 6)
     audio_irqs.value += 1
     if flags & (8 << 6) != 0 then audio_errors.value += 1
+#if !feature_microphone
     // Each half must be ready before DMA starts consuming it again.
     if flags & (48 << 6) == (48 << 6) then audio_deadline_misses.value += 1
     if flags & (16 << 6) != 0
@@ -119,6 +154,24 @@ audio_interrupt()
     if flags & (32 << 6) != 0
         audio_fill(256,512)
         if word(0x4002042c).value <= 256 then audio_deadline_misses.value += 1
+#endif
+
+audio_capture_interrupt()
+#if feature_microphone
+    val flags = word(0x40020404).value
+    word(0x4002040c).value = flags & 0x3d
+    audio_capture_irqs.value += 1
+    if flags & 8 != 0 then audio_errors.value += 1
+    if flags & 48 == 48 then audio_deadline_misses.value += 1
+    if flags & 16 != 0
+        audio_fill(0,256)
+        if word(0x40020474).value > 256 || word(0x4002042c).value > 256 then audio_deadline_misses.value += 1
+    if flags & 32 != 0
+        audio_fill(256,512)
+        if word(0x40020474).value <= 256 || word(0x4002042c).value <= 256 then audio_deadline_misses.value += 1
+#else
+    ()
+#endif
 
 audio_i2c_byte(value: u32) -> bool
     while word(0x58001c18).value & 2 == 0
@@ -149,6 +202,11 @@ audio_initialize()
     for item in configuration
         if !audio_codec_write(item[0],item[1]) then audio_errors.value += 1
     if !audio_codec_write(0x26,0x179) || !audio_codec_write(0x27,0x179) then audio_errors.value += 1
+#if feature_microphone
+    val capture_configuration: [6][2]u32 = [[4,0x30c],[0x606,2],[0x607,2],[0x400,0x1c0],[0x401,0x1c0],[0x410,0]]
+    for item in capture_configuration
+        if !audio_codec_write(item[0],item[1]) then audio_errors.value += 1
+#endif
     audio_fill(0,512)
     // Four 32-bit TDM slots; only speaker slots1 and3 consume FIFO words.
     word(0x4001580c).value = 127 | (63 << 8) | (1 << 16) | (1 << 18)
@@ -160,9 +218,30 @@ audio_initialize()
     word(0x40020430).value = 0x40015820
     word(0x40020434).value = u32(usize(&audio_buffer[0]))
     word(0xe000e104).value = 1 << 25
-    word(0x40020428).value = 1 | 28 | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 11) | (1 << 13)
+#if feature_microphone
+    // SAI B follows A's four-slot clock; ADC1 occupies slots0/2.
+    word(0x4001582c).value = 127 | (63 << 8) | (1 << 16) | (1 << 18)
+    word(0x40015830).value = (5 << 16) | (3 << 8) | (2 << 6)
+    word(0x40015828).value = 0
+    word(0x40015824).value = (4 << 5) | 3 | (1 << 10)
+    word(0x40020830).value = 88
+    word(0x40020474).value = 512
+    word(0x40020478).value = 0x40015840
+    word(0x4002047c).value = u32(usize(&audio_capture_buffer[0]))
+    word(0xe000e104).value = 1 << 28
+    word(0x40020470).value = 1 | 28 | (1 << 8) | (1 << 10) | (1 << 11) | (1 << 13)
+    // RX IRQ refills the matching TX half after it has become free. TX DMA's
+    // FIFO prefetch makes its half-transfer happen slightly before RX's.
+    val tx_interrupts: u32 = 4
+#else
+    val tx_interrupts: u32 = 28
+#endif
+    word(0x40020428).value = 1 | tx_interrupts | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 11) | (1 << 13)
     audio_ready.value = 1
 
 audio_start()
+#if feature_microphone
+    word(0x40015824).value = (4 << 5) | 3 | (1 << 10) | (1 << 16) | (1 << 17)
+#endif
     word(0x40015804).value = (4 << 5) | (1 << 20) | (1 << 27) | (1 << 16) | (1 << 17)
 #endif
