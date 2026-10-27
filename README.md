@@ -332,9 +332,12 @@ timebase. Different supported Cortex-M models may share a board, with independen
 instruction records and FPU settings. Existing boards that omit clocks retain
 their previous defaults. Legacy
 peripheral `clock-hz` values must match an explicitly configured MCU timebase.
-The emulator currently uses one tick per instruction, so a clock setting is an
-instruction-rate approximation, not cycle-exact hardware performance. Host
-capacity can limit the achieved rate; headless execution remains unthrottled.
+Each core may select `instruction-timing = estimated` to use fixed per-instruction
+cycle costs, or `unit` (the default) for one cycle per instruction. The Discovery
+demo selects estimated timing. Cycle costs drive pacing, SysTick and peripherals;
+retired instruction counts remain separate. These are approximate serial costs,
+without cache or pipeline simulation. See [instruction timing](docs/instruction-timing.md).
+Host capacity can limit the achieved rate; headless execution remains unthrottled.
 
 A description is a HOCON file, and the shortest names a board built into benchtop:
 
@@ -555,17 +558,19 @@ M-profile core does: SP from the vector table's first word, PC from its second. 
 0 launches it as on the RP2040 (`multicore_launch_core1_raw`): core 0 pushes 0, 0, 1, VTOR, SP and
 ENTRY through the FIFO, each echoed back, and core 1 starts at ENTRY. Each core takes exceptions as its
 kind does — SVC, PendSV, SysTick, IRQs, with priorities, PRIMASK and both stacks, and on an M33
-BASEPRI, FAULTMASK and the stack limits; SysTick counts one per instruction. [DESIGN.md](DESIGN.md)
+BASEPRI, FAULTMASK and the stack limits; SysTick counts local core cycles. [DESIGN.md](DESIGN.md)
 §2.2 and §2.9 say what is modelled and what is not.
 
-**With `--deterministic`, both cores run on one host thread, taking turns** of 1000 instructions each, so a run is the same
+**With `--deterministic`, both cores run on one host thread, taking turns** of 1000 MCU ticks each, so a run is the same
 every time, to the instruction. A core asleep in `WFI` costs nothing while the other runs, and the
 board stops at `Asleep` only when both sleep with nothing that can wake them. A program that never
 launches core 1 runs exactly as on a single core. [DESIGN.md](DESIGN.md) §1.1 and §11 have the rest.
 
-**By default, each launched Cortex-M core runs on a host thread of its own**, and neither gets more than 4000
-instructions ahead of the other; a core asleep in `WFI` blocks its thread until the other core or its
-own SysTick wakes it. On the two-core bench that is about 1.8 times the speed of taking turns
+**By default, each launched Cortex-M core runs on a host thread of its own**.
+Realtime sessions pace each core independently without a global lead limit.
+Unpaced manual execution retains a bounded lead; a core asleep in `WFI` waits
+for a wake event or its next deadline. On the historical two-core bench this was
+about 1.8 times the speed of taking turns
 ([bench/README.md](bench/README.md)). Guest RAM accesses are the host's relaxed atomic accesses and
 `DMB`/`DSB`/`ISB` a host fence, so a program that orders its accesses with barriers, or through the
 SIO's spinlocks and FIFOs, sees them in order; code one core writes is run by the other after the

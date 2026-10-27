@@ -37,13 +37,15 @@ Integer ALU operations default to one cycle; single loads/stores use two,
 doubleword transfers three. Division uses seven as a constant representative
 of the M4's published operand-dependent range. Conditional branches use two;
 unconditional branches use three except M0+ and M7, where the estimate is two.
+BL uses three on M0+ and two on M7.
 Special-register accesses use the baseline/mainline differences in the table.
 Multiple transfers use a fixed five cycles, assuming four registers, and
 returns through a multiple load use seven. They deliberately do not inspect
 register-list lengths or operands during execution.
 
 M4 single-precision FP division/square root use fourteen; multiply-accumulate
-and fused operations use three. Ordinary FP arithmetic uses one. For M7 double
+and fused operations use three. Ordinary FP arithmetic uses one; FP word/doubleword memory transfers use
+two/three and paired core-register transfers use two. For M7 double
 precision the initial estimates are twenty-eight for division/square root,
 five for accumulate and three for ordinary arithmetic. These double-precision
 constants are provisional estimates, not a published M7 cycle table.

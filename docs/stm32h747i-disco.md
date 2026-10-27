@@ -114,8 +114,10 @@ STM32 interrupt routing beyond the existing 32 external lines; GPIO and full I2C
 LTDC video streaming and complete Discovery panel-specific initialization; SAI/DMA/codec and microphone
 adapters; board description and flashable dual-core demo firmware.
 
-Clock pacing currently counts one local tick per retired instruction. It does
-not yet model M7 superscalar issue, caches, bus bandwidth or flash wait states.
+The demo selects fixed per-instruction cycle estimates for both cores.
+Unit timing remains available through `instruction-timing = unit`. See
+[instruction timing](instruction-timing.md) for constants and limitations. This
+does not model M7 superscalar issue, caches, bus bandwidth or flash wait states.
 Raw interpreter throughput is evidence of host headroom, not a guarantee that
 audio firmware will match the execution time of a physical H747.
 
