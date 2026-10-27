@@ -1,0 +1,85 @@
+module sh.sysl.benchtop.virt
+@tests
+import sh.sysl.benchtop.v6m as cpu
+import sh.sysl.elf as elf
+import sh.sysl.fat as fat
+import sh.sysl.wav as wav
+import sysl.raw.str_cast
+import sysl.text.replace_all
+import sysl.buf.{Buf,buf}
+import sysl.fs
+
+private val RECORD_GUEST = embed("../../../../examples/touch/storage-disco.elf")
+private struct WaveBytes
+    bytes: []const u8
+impl wav.Source for WaveBytes
+    size(self) -> Result[u64,wav.Error] = Ok(u64(self.bytes.len))
+    read_at(*self, offset: u64, out: []u8) -> Result[usize,wav.Error]
+        if offset >= u64(self.bytes.len) then return Ok(0)
+        val at = usize(offset)
+        val take = if out.len < self.bytes.len - at then out.len else self.bytes.len - at
+        for i in 0..<take do out[i] = self.bytes[at + i]
+        Ok(take)
+private record_chunks(count: int)
+    var signal: [240]f32 = [0.0;240]
+    for i in 0..<240 do signal[i] = if i % 48 < 24 then 0.25 else -0.25
+    for i in 0..<count
+        feed_microphone(signal[..])
+        submit_workers(2400000)
+        wait_workers()
+private record_tap()
+    touch_point("touch",456,332,true)
+    record_chunks(8)
+    touch_point("touch",456,332,false)
+    record_chunks(8)
+
+@test("Discovery WAV: real microphone DMA records stereo PCM16 through FAT/SD while DSP continues, then finalizes a readable file")
+recording_firmware()
+    val description = replace_all(str_cast(embed("../../../../boards/stm32h747-sd.hocon")),"target/disco-sd.img","")
+    board_from("recording-test.hocon",description.bytes).unwrap()
+    var disk = fat.ram_device(32768)
+    fat.format(&disk,Some(fat.FatType.Fat16)).unwrap()
+    sd_seed_image(disk.image())
+    boot(core0(),image_of(RECORD_GUEST).unwrap().view())
+    val executable = elf.read(RECORD_GUEST).unwrap()
+    val state = u32(executable.symbol_named("record_status").unwrap().unwrap().value)
+    val overruns = u32(executable.symbol_named("record_overruns").unwrap().unwrap().value)
+    val errors = u32(executable.symbol_named("audio_errors").unwrap().unwrap().value)
+    val misses = u32(executable.symbol_named("audio_deadline_misses").unwrap().unwrap().value)
+    start_workers(core0()).unwrap()
+    defer stop_workers()
+    submit_workers(240000000)
+    wait_workers()
+    record_tap()
+    record_chunks(300)
+    pause_workers()
+    assert(workers_observe().running,stop_message(core1()))
+    assert(cpu.load32(core0(),state) == 1,s"record state=${cpu.load32(core0(),state)} overruns=${cpu.load32(core0(),overruns)}")
+    record_tap()
+    record_chunks(150)
+    pause_workers()
+    assert(workers_observe().running,stop_message(core1()))
+    assert(cpu.load32(core0(),state) == 3,s"finish state=${cpu.load32(core0(),state)} overruns=${cpu.load32(core0(),overruns)}")
+    assert(cpu.load32(core0(),overruns) == 0)
+    assert(cpu.load32(core0(),errors) == 0 && cpu.load32(core0(),misses) == 0)
+    for sector in 0u64..<32768 do disk.write(sector,sd_image()[usize(sector)*512..<usize(sector+1)*512]).unwrap()
+    var scratch: [512]u8 = [0;512]
+    var volume = fat.mount(&disk,scratch[..]).unwrap()
+    var file = volume.open("RECORD.WAV").unwrap()
+    var bytes: Buf[u8] = buf()
+    loop
+        val got = volume.read(&file,scratch[..]).unwrap()
+        if got == 0 then break
+        for i in 0..<got do bytes.push(scratch[i])
+    var source = WaveBytes(bytes.view())
+    val info = wav.inspect(&source).unwrap()
+    assert(info.format == wav.format(48000,2,wav.Encoding.Pcm16))
+    assert(info.frames > 60000 && info.frames < 85000,s"frames=${info.frames}")
+    assert(bytes.len() == usize(info.data_offset) + usize(info.data_bytes))
+    var nonzero = false
+    for i in 0..<usize(info.frames)
+        val at = usize(info.data_offset) + i * 4
+        assert(bytes.at(at) == bytes.at(at + 2) && bytes.at(at + 1) == bytes.at(at + 3),"mono host input must retain identical stereo slots")
+        if bytes.at(at) != 0 || bytes.at(at + 1) != 0 then nonzero = true
+    assert(nonzero,"recording must contain captured audio even with MONITOR off")
+    fs.write_bytes("target/disco-recording-test.wav",bytes.view()).unwrap()
