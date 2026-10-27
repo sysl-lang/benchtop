@@ -14,6 +14,10 @@ record remains 16 bytes. Fused compare/branch handlers charge both instructions
 exactly once. Faulting memory instructions and debugger breakpoints do not
 retire or charge cycles. Skipped IT instructions consume one cycle.
 
+The decoder selects timing-specialized handlers. The `unit` variants compile
+away charging and keep the original instruction-count branch checks; they do
+not test the timing option on every executed instruction. Cores with different
+timing modes use separate decoded caches even when their ISA model matches.
 The `unit` option bypasses extra charging. `CYCLE_ACCOUNTING` in
 `v6m/cycles.sysl` can also disable accounting at compile time while retaining the
 implementation. The benchmark accepts `--timing unit|estimated` after `--core`:
