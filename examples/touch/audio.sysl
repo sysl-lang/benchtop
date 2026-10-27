@@ -6,9 +6,11 @@ struct AudioControl
     enabled: volatile u32
     level: volatile u32
     note: volatile u32
+    feedback: volatile u32
+    wet: volatile u32
 
 @export("audio_control")
-var audio_control = AudioControl(0,0,50,0)
+var audio_control = AudioControl(0,0,50,0,35,35)
 @export("audio_errors")
 var audio_errors: Word
 @export("audio_irqs")
@@ -95,18 +97,32 @@ audio_controls()
     val enabled = audio_control.enabled
     val level = audio_control.level
     val note = audio_control.note
+#if feature_delay
+    val feedback = audio_control.feedback
+    val wet = audio_control.wet
+#endif
     audio_barrier()
     if before != audio_control.sequence then return
+#if feature_delay
+    audio_target = if enabled != 0 then 1.0 else 0.0
+    delay_feedback_target = f32(if feedback > 85 then 85 else feedback) * 0.01
+    delay_wet_target = f32(if wet > 100 then 100 else wet) * 0.01
+#else
 #if feature_microphone
     audio_target = if enabled != 0 then f32(if level > 100 then 100 else level) * 0.02 else 0.0
     audio_effect = if note > 2 then 2 else note
 #else
     audio_target = if enabled != 0 then f32(if level > 100 then 100 else level) * 0.0035 else 0.0
 #endif
+#endif
     audio_step = audio_steps[usize(if note > 9 then 9 else note)]
 
 audio_fill(first: usize, last: usize)
     audio_controls()
+#if feature_delay
+    delay_output_peak *= 0.95
+    if delay_output_peak < 0.00001 then delay_output_peak = 0.0
+#endif
     var i = first
     var peak: f32 = 0.0
     while i < last
@@ -119,6 +135,15 @@ audio_fill(first: usize, last: usize)
         val input = f32(left + right) / 65536.0
         val magnitude = if input < 0.0 then -input else input
         if magnitude > peak then peak = magnitude
+#if feature_delay
+        val stereo = delay_frame(f32(left) / 32768.0,f32(right) / 32768.0)
+        val output_peak = if stereo[0] < 0.0 then -stereo[0] else stereo[0]
+        val output_right = if stereo[1] < 0.0 then -stereo[1] else stereo[1]
+        if output_peak > delay_output_peak then delay_output_peak = output_peak
+        if output_right > delay_output_peak then delay_output_peak = output_right
+        val value = u16(int(stereo[0] * 32767.0))
+        val value_right = u16(int(stereo[1] * 32767.0))
+#else
         // One-pole low-pass at roughly 1 kHz; subtract for the high-pass mode.
         audio_filter += (input - audio_filter) * 0.122694
         if input == 0.0 && audio_filter > -0.00000001 && audio_filter < 0.00000001 then audio_filter = 0.0
@@ -126,6 +151,7 @@ audio_fill(first: usize, last: usize)
         val amplified = wave * audio_envelope
         val limited = if amplified < -0.95 then -0.95 elif amplified > 0.95 then 0.95 else amplified
         val value = u16(int(limited * 32767.0))
+#endif
 #else
         val index = usize(audio_phase >> 24)
         val fraction = f32(audio_phase & 0xffffff) / 16777216.0
@@ -133,7 +159,11 @@ audio_fill(first: usize, last: usize)
         val value = u16(int(wave * audio_envelope * 32767.0))
 #endif
         audio_buffer[i] = value
+#if feature_delay
+        audio_buffer[i + 1] = value_right
+#else
         audio_buffer[i + 1] = value
+#endif
         audio_phase += audio_step
         i += 2
 #if feature_microphone
@@ -141,6 +171,9 @@ audio_fill(first: usize, last: usize)
     if audio_peak < 0.00001 then audio_peak = 0.0
     if peak > audio_peak then audio_peak = peak
     audio_input_level.value = u32(audio_peak * 100.0)
+#if feature_delay
+    audio_output_level.value = u32(delay_output_peak * 100.0)
+#endif
 #endif
 
 @export("audio_dma_interrupt")
@@ -160,6 +193,17 @@ audio_interrupt()
         if word(0x4002042c).value <= 256 then audio_deadline_misses.value += 1
 #endif
 
+audio_refill(first: usize, last: usize)
+#if feature_delay
+    val before = word(0xe000e018).value
+#endif
+    audio_fill(first,last)
+#if feature_delay
+    val used = (before - word(0xe000e018).value) & 0xffffff
+    audio_dsp_cycles.value = used
+    if used > audio_dsp_peak_cycles.value then audio_dsp_peak_cycles.value = used
+#endif
+
 audio_capture_interrupt()
 #if feature_microphone
     val flags = word(0x40020404).value
@@ -168,10 +212,10 @@ audio_capture_interrupt()
     if flags & 8 != 0 then audio_errors.value += 1
     if flags & 48 == 48 then audio_deadline_misses.value += 1
     if flags & 16 != 0
-        audio_fill(0,256)
+        audio_refill(0,256)
         if word(0x40020474).value > 256 || word(0x4002042c).value > 256 then audio_deadline_misses.value += 1
     if flags & 32 != 0
-        audio_fill(256,512)
+        audio_refill(256,512)
         if word(0x40020474).value <= 256 || word(0x4002042c).value <= 256 then audio_deadline_misses.value += 1
 #else
     ()
@@ -211,10 +255,21 @@ audio_initialize()
     for item in capture_configuration
         if !audio_codec_write(item[0],item[1]) then audio_errors.value += 1
 #endif
+#if feature_delay
+    // DAC1 -> HPOUT1. Speaker hardware remains attached but powered down.
+    val headphones: [17][2]u32 = [[1,0x303],[3,0x30],[5,0x303],[0x601,1],[0x602,1],[0x2d,1],[0x2e,1],[0x610,0x1c0],[0x611,0x1c0],[0x402,0x1c0],[0x403,0x1c0],[0x1c,0x179],[0x1d,0x179],[0x4c,0x9f25],[0x54,0x33],[0x60,0xee],[0x420,0x10]]
+    for item in headphones
+        if !audio_codec_write(item[0],item[1]) then audio_errors.value += 1
+    delay_initialize()
+#endif
     audio_fill(0,512)
     // Four 32-bit TDM slots; only speaker slots1 and3 consume FIFO words.
     word(0x4001580c).value = 127 | (63 << 8) | (1 << 16) | (1 << 18)
+#if feature_delay
+    word(0x40015810).value = (5 << 16) | (3 << 8) | (2 << 6)
+#else
     word(0x40015810).value = (10 << 16) | (3 << 8) | (2 << 6)
+#endif
     word(0x40015808).value = 4
     word(0x40015804).value = (4 << 5) | (1 << 20) | (1 << 27)
     word(0x40020824).value = 87
