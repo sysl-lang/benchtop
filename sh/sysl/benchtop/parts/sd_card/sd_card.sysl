@@ -1,0 +1,247 @@
+module sh.sysl.benchtop.parts.sd_card
+
+// SPI-mode SDHC protocol endpoint. Storage callbacks see whole 512-byte sectors;
+// no filesystem, MCU register addresses or host files are part of this model.
+struct Media
+    read: &Fn(u32,[]u8) -> bool
+    write: &Fn(u32,[]const u8) -> bool
+    ready: &Fn() -> bool
+    good: &Fn() -> bool
+
+struct Card
+    media: Media
+    sectors: u64
+    protected: bool
+    program_ticks: u64
+    selected: bool
+    high: bool
+    clocks: u32
+    bits: u32
+    input: u8
+    output: u8
+    next_byte: bool
+    frame: [6]u8
+    frame_count: usize
+    reply: [520]u8
+    reply_at: usize
+    reply_count: usize
+    data: [514]u8
+    data_count: usize
+    write_stage: u32
+    write_sector: u32
+    idle: bool
+    app: bool
+    crc: bool
+    busy_until: u64
+    commands: u64
+    reads: u64
+    writes: u64
+
+card(media: Media, sectors: u64, protected: bool = false, program_ticks: u64 = 240000) -> &Card
+    require sectors >= 1024 && sectors <= 4294967296 && sectors % 1024 == 0, "CSD v2 capacity in 1024-sector units"
+    val c: &Card = Card(media,sectors,protected,program_ticks,false,false,0,0,0,0xff,false,[0;6],0,[0;520],0,0,[0;514],0,0,0,true,false,false,0,0,0,0)
+    c
+
+reset(c: &Card)
+    c.selected = false
+    c.high = false
+    c.clocks = 0
+    c.bits = 0
+    c.input = 0
+    c.output = 0xff
+    c.next_byte = false
+    c.frame_count = 0
+    c.reply_at = 0
+    c.reply_count = 0
+    c.write_stage = 0
+    c.idle = true
+    c.app = false
+    c.crc = false
+    c.busy_until = 0
+    c.commands = 0
+    c.reads = 0
+    c.writes = 0
+
+private crc7(bytes: []const u8) -> u8
+    var rem: u16 = 0
+    for byte in bytes
+        for bit in 0u32..<8
+            rem = (rem << 1) | u16((byte >> (7 - bit)) & 1)
+            if rem & 0x80 != 0 then rem ^= 0x89
+    for bit in 0..<7
+        rem <<= 1
+        if rem & 0x80 != 0 then rem ^= 0x89
+    u8((rem << 1) | 1)
+private crc16(bytes: []const u8) -> u16
+    var crc: u16 = 0
+    for byte in bytes
+        crc ^= u16(byte) << 8
+        for bit in 0..<8 do crc = if crc & 0x8000 != 0 then (crc << 1) ^ 0x1021 else crc << 1
+    crc
+private push(c: &Card, byte: u8)
+    assert(c.reply_count < c.reply.len,"bounded SD response")
+    c.reply[c.reply_count] = byte
+    c.reply_count += 1
+private response(c: &Card, status: u8)
+    push(c,0xff)
+    push(c,status)
+private packet(c: &Card, bytes: []const u8)
+    push(c,0xff)
+    push(c,0xfe)
+    for byte in bytes do push(c,byte)
+    val crc = crc16(bytes)
+    push(c,u8(crc >> 8))
+    push(c,u8(crc))
+private take(c: &Card, time: u64) -> u8
+    if c.reply_at < c.reply_count
+        val value = c.reply[c.reply_at]
+        c.reply_at += 1
+        return value
+    if time < c.busy_until || !(c.media.ready)() then 0 else 0xff
+private csd(c: &Card) -> [16]u8
+    var bytes: [16]u8 = [0;16]
+    bytes[0] = 0x40
+    bytes[1] = 0x0e
+    bytes[3] = 0x32
+    bytes[4] = 0x5b
+    bytes[5] = 0x59
+    val size = u32(c.sectors / 1024 - 1)
+    bytes[7] = u8(size >> 16)
+    bytes[8] = u8(size >> 8)
+    bytes[9] = u8(size)
+    bytes[12] = 2
+    bytes[13] = 0x40
+    bytes[14] = if c.protected then 0x20 else 0
+    bytes[15] = crc7(bytes[..<15])
+    bytes
+
+private command(c: &Card)
+    c.commands += 1
+    c.reply_at = 0
+    c.reply_count = 0
+    val index = c.frame[0] & 63
+    val arg = (u32(c.frame[1]) << 24) | (u32(c.frame[2]) << 16) | (u32(c.frame[3]) << 8) | u32(c.frame[4])
+    val idle: u8 = if c.idle then 1 else 0
+    if (c.crc || index == 0 || index == 8) && c.frame[5] != crc7(c.frame[..<5])
+        response(c,idle | 8)
+        return
+    val app = c.app
+    c.app = false
+    index match
+        0 ->
+            if c.clocks < 74 then return
+            c.idle = true
+            c.crc = false
+            response(c,1)
+        8 ->
+            if arg & 0xf00 != 0x100
+                response(c,idle | 64)
+            else
+                response(c,idle)
+                push(c,0)
+                push(c,0)
+                push(c,1)
+                push(c,u8(arg))
+        55 ->
+            c.app = true
+            response(c,idle)
+        41 ->
+            if !app then response(c,idle | 4)
+            else
+                if arg & 0x40000000 != 0 then c.idle = false
+                response(c,if c.idle then 1 else 0)
+        58 ->
+            response(c,idle)
+            push(c,if c.idle then 0 else 0xc0)
+            push(c,0xff)
+            push(c,0x80)
+            push(c,0)
+        59 ->
+            c.crc = arg & 1 != 0
+            response(c,idle)
+        9 ->
+            if c.idle then response(c,1)
+            else
+                response(c,0)
+                val bytes = csd(c)
+                packet(c,bytes[..])
+        13 ->
+            response(c,idle)
+            push(c,if (c.media.good)() then 0 else 0x20)
+        16 -> response(c,if arg == 512 then idle else idle | 64)
+        17 | 24 ->
+            if c.idle then response(c,1)
+            elif u64(arg) >= c.sectors then response(c,0x20)
+            elif index == 24 && c.protected then response(c,0x40)
+            else
+                response(c,0)
+                if index == 17
+                    c.reads += 1
+                    if (c.media.read)(arg,c.data[..<512]) then packet(c,c.data[..<512])
+                    else push(c,0x01)
+                else
+                    c.write_sector = arg
+                    c.write_stage = 1
+        _ -> response(c,idle | 4)
+
+private byte(c: &Card, value: u8, time: u64)
+    if c.write_stage == 1
+        if value == 0xfe
+            c.write_stage = 2
+            c.data_count = 0
+        return
+    if c.write_stage == 2
+        c.data[c.data_count] = value
+        c.data_count += 1
+        if c.data_count == 514
+            c.write_stage = 0
+            c.reply_at = 0
+            c.reply_count = 0
+            val crc = (u16(c.data[512]) << 8) | u16(c.data[513])
+            if c.crc && crc != crc16(c.data[..<512]) then push(c,0x0b)
+            elif !(c.media.write)(c.write_sector,c.data[..<512]) then push(c,0x0d)
+            else
+                c.writes += 1
+                push(c,5)
+                c.busy_until = time + c.program_ticks
+        return
+    if c.frame_count == 0 && value & 0xc0 != 0x40 then return
+    c.frame[c.frame_count] = value
+    c.frame_count += 1
+    if c.frame_count == 6
+        c.frame_count = 0
+        command(c)
+
+// Mode 0: data is sampled on rising edges; the next response byte is loaded
+// only on the following falling edge, preserving the eighth sample bit.
+observe(c: &Card, selected: bool, sck: bool, mosi: bool, time: u64) -> bool
+    val rising = sck && !c.high
+    val falling = !sck && c.high
+    c.high = sck
+    if !selected
+        if rising && c.clocks < 80 then c.clocks += 1
+        c.selected = false
+        c.bits = 0
+        c.frame_count = 0
+        c.write_stage = 0
+        c.reply_at = 0
+        c.reply_count = 0
+        c.output = 0xff
+        c.next_byte = false
+        return true
+    if !c.selected
+        c.selected = true
+        c.output = take(c,time)
+    val result = c.output & (0x80u8 >> c.bits) != 0
+    if rising
+        c.input = (c.input << 1) | (if mosi then 1 else 0)
+        c.bits += 1
+        if c.bits == 8
+            byte(c,c.input,time)
+            c.bits = 0
+            c.input = 0
+            c.next_byte = true
+    elif falling && c.next_byte
+        c.output = take(c,time)
+        c.next_byte = false
+    result

@@ -1,0 +1,109 @@
+#if feature_storage
+import sh.sysl.spi as shared_spi
+import sh.sysl.sd as sd
+import sh.sysl.sd.spi as card_spi
+import sh.sysl.fat as fat
+
+struct SpiByte
+    value: volatile u8
+struct H7SpiBus
+    base: u32
+struct CardSelect
+    pin: u32
+struct CardTransport
+    device: shared_spi.Exclusive[H7SpiBus,CardSelect]
+
+var storage_previous: u32 = 0
+var storage_cycles: u64 = 0
+var storage_sector: [512]u8
+var storage_card = card_spi.card(CardTransport(shared_spi.exclusive(H7SpiBus(0x40013000),CardSelect(4),shared_spi.config(400000))))
+@export("storage_status")
+var storage_status: Word
+
+storage_now() -> u64
+    val now = word(0xe000e018).value
+    storage_cycles += u64((storage_previous - now) & 0xffffff)
+    storage_previous = now
+    storage_cycles / 240
+
+storage_wait(mask: u32) -> Result[unit,shared_spi.Error]
+    val start = storage_now()
+    for i in 0..<100000
+        val sr = word(0x40013014).value
+        if sr & 64 != 0 then return Err(shared_spi.Error.Io)
+        if sr & mask != 0 then return Ok(())
+        if storage_now() - start >= 10000 then return Err(shared_spi.Error.Timeout)
+    Err(shared_spi.Error.Timeout)
+
+impl shared_spi.Bus for H7SpiBus
+    configure(*self, config: shared_spi.Config) -> Result[unit,shared_spi.Error]
+        if config.hz == 0 || config.order != shared_spi.BitOrder.MsbFirst then return Err(shared_spi.Error.Configuration)
+        var divider: u32 = 0
+        while divider < 7 && (60000000u32 >> (divider + 1)) > config.hz do divider += 1
+        if (60000000u32 >> (divider + 1)) > config.hz then return Err(shared_spi.Error.Configuration)
+        if word(self.base).value & 1 != 0 then storage_wait(4096)?
+        word(self.base).value = 0
+        word(self.base + 8).value = 7 | (divider << 28)
+        val phase = config.mode == shared_spi.Mode.Mode1 || config.mode == shared_spi.Mode.Mode3
+        val polarity = config.mode == shared_spi.Mode.Mode2 || config.mode == shared_spi.Mode.Mode3
+        word(self.base + 12).value = 0x84400000 | (if phase then 1u32 << 24 else 0) | (if polarity then 1u32 << 25 else 0)
+        word(self.base + 4).value = 0
+        word(self.base).value = 0x1001
+        word(self.base).value = 0x1201
+        Ok(())
+    exchange(*self, byte: u8) -> Result[u8,shared_spi.Error]
+        storage_wait(2)?
+        val tx: *SpiByte = ptr_cast(usize(self.base + 0x20))
+        val rx: *SpiByte = ptr_cast(usize(self.base + 0x30))
+        tx.value = byte
+        storage_wait(1)?
+        Ok(rx.value)
+    override flush(*self) -> Result[unit,shared_spi.Error] = storage_wait(4096)
+impl shared_spi.ChipSelect for CardSelect
+    set_active(*self, active: bool) -> Result[unit,shared_spi.Error]
+        word(0x58020018).value = 1u32 << (self.pin + (if active then 16u32 else 0))
+        Ok(())
+impl shared_spi.Device for CardTransport
+    configure(*self, config: shared_spi.Config) -> Result[unit,shared_spi.Error] = self.device.configure(config)
+    select(*self, active: bool) -> Result[unit,shared_spi.Error] = self.device.select(active)
+    exchange(*self, byte: u8) -> Result[u8,shared_spi.Error] = self.device.exchange(byte)
+impl sd.Clock for CardTransport
+    now_us(self) -> u64 = storage_now()
+    delay_us(*self, micros: u32)
+        val start = storage_now()
+        while storage_now() - start < u64(micros) do ()
+
+storage_initialize()
+    storage_previous = word(0xe000e018).value
+    storage_cycles = 0
+    // CS high before enabling its output; PA5/6/7 AF5 for SPI1.
+    word(0x58020018).value = 1 << 4
+    word(0x58020000).value = (word(0x58020000).value & ~0xff00u32) | 0xa900
+    word(0x58020020).value = (word(0x58020020).value & 0x000fffff) | 0x55500000
+    word(0x5802000c).value = (word(0x5802000c).value & ~(3u32 << 12)) | (1 << 12)
+    storage_status.value = 3
+    if storage_card.initialize().is_err() then return
+    if fat.mount(&storage_card,storage_sector[..]).is_ok() then storage_status.value = 1
+
+storage_write_settings() -> Result[unit,fat.FsError]
+    var volume = fat.mount(&storage_card,storage_sector[..])?
+    var file = volume.open("SETTINGS.TXT") match
+        Ok(f) -> f
+        Err(fat.FsError.NotFound) -> volume.create("SETTINGS.TXT")?
+        Err(e) -> return Err(e)
+    var bytes: [23]u8 = [0;23]
+    val prefix = "feedback=00\nwet=000\n"
+    for i in 0..<prefix.len do bytes[i] = prefix[i]
+    bytes[9] = u8(delay_ui_feedback / 10) + 48
+    bytes[10] = u8(delay_ui_feedback % 10) + 48
+    bytes[16] = u8(delay_ui_wet / 100) + 48
+    bytes[17] = u8((delay_ui_wet / 10) % 10) + 48
+    bytes[18] = u8(delay_ui_wet % 10) + 48
+    val written = volume.write(&file,bytes[..<prefix.len])?
+    if written != prefix.len then return Err(fat.FsError.Device(fat.DeviceError.Io))
+    volume.truncate(&file,u32(written))?
+    volume.flush()
+storage_save()
+    if storage_status.value == 3 then return
+    storage_status.value = if storage_write_settings().is_ok() then 2 else 3
+#endif
