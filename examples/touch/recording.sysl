@@ -1,0 +1,148 @@
+#if feature_storage
+import sh.sysl.wav as wav
+import sh.sysl.fat as fat
+import sh.sysl.sd.spi as card_spi
+
+// Single producer (M7 DMA IRQ), single consumer (M4 filesystem). D2 SRAM is
+// shared with caches disabled by this startup. Barriers publish whole halves,
+// not individual samples. The producer never waits for the filesystem.
+@section(".audio_delay")
+var record_ring: [32768]AudioSample
+@export("record_head")
+var record_head: Word
+@export("record_tail")
+var record_tail: Word
+@export("record_command")
+var record_command: Word
+@export("record_ack")
+var record_ack: Word
+@export("record_overruns")
+var record_overruns: Word
+@export("record_status")
+var record_status: Word
+@export("record_frames")
+var record_frames: Word
+var record_failed: bool = false
+var record_bytes: [4096]u8
+
+struct FatWave
+    volume: fat.Volume[card_spi.Card[CardTransport]]
+    file: fat.File
+impl wav.Sink for FatWave
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize,wav.Error]
+        if offset > u64(self.file.size) then return Err(wav.Error.Io)
+        self.file.seek(u32(offset))
+        self.volume.write(&self.file,bytes) match
+            Ok(count) -> Ok(count)
+            Err(_) -> Err(wav.Error.Io)
+    sync(*self) -> Result[unit,wav.Error]
+        self.volume.flush() match
+            Ok(_) -> Ok(())
+            Err(_) -> Err(wav.Error.Io)
+
+var record_file: Option[FatWave] = None
+var record_writer: Option[wav.Writer] = None
+
+record_audio_half(first: usize, last: usize)
+    val command = record_command.value
+    audio_barrier()
+    if command & 1 != 0 && record_overruns.value == 0
+        val head = record_head.value
+        val tail = record_tail.value
+        val frames = u32((last - first) / 2)
+        if head - tail > 16384 - frames
+            record_overruns.value += frames
+        else
+            var i = first
+            var at = head
+            while i < last
+                val target = usize(at & 16383) * 2
+                record_ring[target].value = audio_capture_buffer[i].value
+                record_ring[target + 1].value = audio_capture_buffer[i + 1].value
+                at += 1
+                i += 2
+            audio_barrier()
+            record_head.value = at
+    audio_barrier()
+    record_ack.value = command
+
+record_begin() -> Result[unit,wav.Error]
+    var volume = fat.mount(&storage_card,storage_sector[..]) match
+        Ok(v) -> v
+        Err(_) -> return Err(wav.Error.Io)
+    var file = volume.open("RECORD.WAV") match
+        Ok(f) -> f
+        Err(fat.FsError.NotFound) -> volume.create("RECORD.WAV") match
+            Ok(f) -> f
+            Err(_) -> return Err(wav.Error.Io)
+        Err(_) -> return Err(wav.Error.Io)
+    if volume.truncate(&file,0).is_err() then return Err(wav.Error.Io)
+    var sink = FatWave(volume,file)
+    val writer = wav.writer(&sink,wav.format(48000,2,wav.Encoding.Pcm16))?
+    record_file = Some(sink)
+    record_writer = Some(writer)
+    Ok(())
+
+record_toggle()
+    if record_status.value == 2 then return
+    if record_status.value == 1
+        record_command.value += 1 // even: stop, wait for this exact M7 acknowledgment
+        record_status.value = 2
+        return
+    if storage_status.value == 3 || record_ack.value != record_command.value
+        record_status.value = 4
+        return
+    record_failed = false
+    record_overruns.value = 0
+    record_frames.value = 0
+    record_tail.value = record_head.value
+    if record_begin().is_err()
+        record_status.value = 4
+        return
+    audio_barrier()
+    record_command.value += 1 // odd: record; headers are already written
+    record_status.value = 1
+
+record_poll()
+    if record_status.value != 1 && record_status.value != 2 then return
+    if record_overruns.value != 0 && record_status.value == 1
+        record_command.value += 1
+        record_status.value = 2
+    val tail = record_tail.value
+    val head = record_head.value
+    audio_barrier()
+    val available = head - tail
+    val take = if available > 1024 then 1024u32 else available
+    if take > 0 && !record_failed
+        for i in 0u32..<take
+            val source = usize((tail + i) & 16383) * 2
+            val left = record_ring[source].value
+            val right = record_ring[source + 1].value
+            val at = usize(i) * 4
+            record_bytes[at] = u8(left)
+            record_bytes[at + 1] = u8(left >> 8)
+            record_bytes[at + 2] = u8(right)
+            record_bytes[at + 3] = u8(right >> 8)
+        // Release copied ring slots before the slower card operation.
+        audio_barrier()
+        record_tail.value = tail + take
+        var sink = record_file.unwrap()
+        var writer = record_writer.unwrap()
+        if writer.append(&sink,record_bytes[..<usize(take) * 4]).is_err()
+            record_failed = true
+            if record_status.value == 1 then record_command.value += 1
+            record_status.value = 2
+        else record_frames.value = u32(writer.frames())
+        record_file = Some(sink)
+        record_writer = Some(writer)
+    if record_status.value != 2 || record_ack.value != record_command.value then return
+    audio_barrier()
+    if !record_failed && record_tail.value != record_head.value then return
+    if !record_failed
+        var sink = record_file.unwrap()
+        var writer = record_writer.unwrap()
+        if writer.finish(&sink).is_err() then record_failed = true
+    record_file = None
+    record_writer = None
+    record_status.value = if record_failed then 4 elif record_overruns.value != 0 then 5 else 3
+#endif
