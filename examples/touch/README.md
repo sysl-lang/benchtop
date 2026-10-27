@@ -206,7 +206,7 @@ microphone-filter demos remain available.
 ## SPI SD-card settings
 
 The `storage` variant keeps the stereo delay and adds **SAVE SD**. It writes
-`SETTINGS.TXT` (feedback and wet/dry percentages) through the standalone
+`SETTINGS.TXT` (feedback and wet/dry percentages) and restores it at startup through the standalone
 [`spi`](https://github.com/sysl-lang/spi), [`sd`](https://github.com/sysl-lang/sd)
 and [`fat`](https://github.com/sysl-lang/fat) firmware dependencies.
 
@@ -243,3 +243,9 @@ host filesystem I/O. Card busy stays asserted until that write has been flushed
 to the OS. SAVE SD reports success only after the firmware's FAT/SD flush. This
 is development storage, without power-cut simulation or a host-power-loss
 persistence guarantee. The model has one cached card (up to 64 MiB) per board.
+
+Startup accepts the exact settings format written by SAVE SD, with feedback
+0–85 and wet/dry 0–100. LOADED confirms successful restoration. A missing file
+keeps the 35/35 defaults and shows SD READY. Invalid contents keep both defaults
+and show BAD FILE; SAVE SD can replace that file. Storage read/mount failures
+show SD ERROR. Monitor always starts off, including after settings restoration.
