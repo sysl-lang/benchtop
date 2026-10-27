@@ -29,7 +29,7 @@ if [ "$transport" = storage-spi ] || [ "$transport" = storage ] || [ "$transport
     fpu=fpv4-sp-d16
     script=h7.ld
 fi
-if [ "$transport" = delay ] || [ "$transport" = storage ]; then script=h7-delay.ld; fi
+if [ "$transport" = delay ] || [ "$transport" = storage ] || [ "$transport" = storage-spi ]; then script=h7-delay.ld; fi
 libc=$($ARM_CC -mcpu="$cpu" -mthumb -mfpu="$fpu" -mfloat-abi=hard -print-file-name=libc.a)
 libm=$($ARM_CC -mcpu="$cpu" -mthumb -mfpu="$fpu" -mfloat-abi=hard -print-file-name=libm.a)
 libgcc=$($ARM_CC -mcpu="$cpu" -mthumb -mfpu="$fpu" -mfloat-abi=hard -print-libgcc-file-name)
