@@ -1,6 +1,7 @@
 module sh.sysl.benchtop.peripheral.stm32_spi
 
 import sh.sysl.benchtop.peripheral.spi as serial
+import sh.sysl.stm32h747.spi1 as reg
 
 // STM32H7 enhanced SPI: eight-bit polling full-duplex master, software NSS,
 // TSIZE=0 continuous transfers. The existing timed edge engine owns FIFO data.
@@ -10,9 +11,19 @@ import sh.sysl.benchtop.peripheral.spi as serial
 // - A write that selects an unsupported feature is refused (`write` answers false, a bus fault)
 //   rather than accepted: a CR1 bit other than SPE/CSTART/SSI, a nonzero CR2 (TSIZE) or IER,
 //   a CFG1 data size other than eight bits or any DMA/CRC/FIFO-threshold field, a CFG2 field other
-//   than CPOL/CPHA/SSM/MASTER, enabling without master + software NSS, a CFG write while enabled,
+//   than CPOL/CPHA/SSM/MASTER/AFCNTR, enabling without master + software NSS, a CFG write while enabled,
 //   and a TXDR write while disabled.
 // - Only 32-bit accesses reach the configuration registers, and only 8-bit ones TXDR/RXDR.
+
+// CFG1 DSIZE holds the frame size less one: 7 for the eight-bit frames this model shifts.
+const DSIZE_8BIT: u32 = 7
+const CR1_WRITABLE: u32 = reg.CR1_SPE_MASK | reg.CR1_CSTART_MASK | reg.CR1_SSI_MASK
+const CFG1_WRITABLE: u32 = reg.CFG1_MBR_MASK | DSIZE_8BIT
+const CFG2_WRITABLE: u32 = reg.CFG2_AFCNTR_MASK | reg.CFG2_SSM_MASK | reg.CFG2_CPOL_MASK | reg.CFG2_CPHA_MASK |
+    reg.CFG2_MASTER_MASK
+// A master that drives its own NSS in software: the only configuration the model enables.
+const SOFTWARE_MASTER: u32 = reg.CFG2_SSM_MASK | reg.CFG2_MASTER_MASK
+
 struct Controller
     engine: serial.Controller
     cr1: u32
@@ -22,51 +33,54 @@ struct Controller
 
 controller(ratio: u32 = 8) -> Controller
     require ratio > 0 && ratio <= 1024, "integer SPI kernel-clock ratio"
-    Controller(serial.controller(64),0,7,0,ratio)
+    Controller(serial.controller(64),0,DSIZE_8BIT,0,ratio)
 reset(c: *Controller) = *c = controller(c.ratio)
 
 status(c: Controller) -> u32
     val rx = c.engine.rx_count > 0
     val tx = c.engine.tx_count < c.engine.capacity
-    (if rx then 1u32 else 0) | (if tx then 2u32 else 0) | (if rx && tx then 4u32 else 0) |
-        (if c.engine.overrun then 64u32 else 0) | (if !c.engine.shifting && c.engine.tx_count == 0 then 4096u32 else 0)
+    (if rx then reg.SR_RXP_MASK else 0) | (if tx then reg.SR_TXP_MASK else 0) | (if rx && tx then reg.SR_DXP_MASK else 0) |
+        (if c.engine.overrun then reg.SR_OVR_MASK else 0) |
+        (if !c.engine.shifting && c.engine.tx_count == 0 then reg.SR_TXC_MASK else 0)
 read(c: *Controller, offset: u32, width: u32) -> Option[u32]
-    if offset == 0x30 && width == 1 then return serial.read(&c.engine,8)
+    if offset == reg.RXDR_OFFSET && width == 1 then return serial.read(&c.engine,8)
     if width != 4 || offset & 3 != 0 then return None
     offset match
-        0 -> Some(c.cr1)
-        4 -> Some(0)
-        8 -> Some(c.cfg1)
-        12 -> Some(c.cfg2)
-        16 -> Some(0)
-        20 -> Some(status(*c))
-        24 -> Some(0)
+        reg.CR1_OFFSET -> Some(c.cr1)
+        reg.CR2_OFFSET -> Some(0)
+        reg.CFG1_OFFSET -> Some(c.cfg1)
+        reg.CFG2_OFFSET -> Some(c.cfg2)
+        reg.IER_OFFSET -> Some(0)
+        reg.SR_OFFSET -> Some(status(*c))
+        reg.IFCR_OFFSET -> Some(0)
         _ -> None
 write(c: *Controller, offset: u32, width: u32, value: u32) -> bool
-    if offset == 0x20 && width == 1
-        if c.cr1 & 1 == 0 then return false
+    if offset == reg.TXDR_OFFSET && width == 1
+        if c.cr1 & reg.CR1_SPE_MASK == 0 then return false
         return serial.write(&c.engine,8,value)
     if width != 4 || offset & 3 != 0 then return false
     offset match
-        0 ->
-            if value & ~0x1201u32 != 0 then return false
-            if value & 1 == 0
+        reg.CR1_OFFSET ->
+            if value & ~CR1_WRITABLE != 0 then return false
+            if value & reg.CR1_SPE_MASK == 0
                 serial.reset(&c.engine)
             else
-                if c.cfg2 & 0x04400000 != 0x04400000 || value & 0x1000 == 0 then return false
-                c.engine.cr0 = 7 | (if c.cfg2 & (1 << 25) != 0 then 64u32 else 0) | (if c.cfg2 & (1 << 24) != 0 then 128u32 else 0)
-                c.engine.cpsr = c.ratio * (1u32 << ((c.cfg1 >> 28) + 1))
-                c.engine.cr1 = if value & 512 != 0 then 2 else 0
-                c.engine.sck = c.cfg2 & (1 << 25) != 0
+                if c.cfg2 & SOFTWARE_MASTER != SOFTWARE_MASTER || value & reg.CR1_SSI_MASK == 0 then return false
+                c.engine.cr0 = serial.CR0_DSS_8BIT | (if c.cfg2 & reg.CFG2_CPOL_MASK != 0 then serial.CR0_SPO else 0) |
+                    (if c.cfg2 & reg.CFG2_CPHA_MASK != 0 then serial.CR0_SPH else 0)
+                // MBR divides the kernel clock by 2^(MBR + 1).
+                c.engine.cpsr = c.ratio * (1u32 << (((c.cfg1 & reg.CFG1_MBR_MASK) >> reg.CFG1_MBR_SHIFT) + 1))
+                c.engine.cr1 = if value & reg.CR1_CSTART_MASK != 0 then serial.CR1_SSE else 0
+                c.engine.sck = c.cfg2 & reg.CFG2_CPOL_MASK != 0
                 serial.kick(&c.engine)
             c.cr1 = value
-        4 | 16 -> if value != 0 then return false
-        8 ->
-            if c.cr1 & 1 != 0 || value & ~0x70000007u32 != 0 || value & 31 != 7 then return false
+        reg.CR2_OFFSET | reg.IER_OFFSET -> if value != 0 then return false
+        reg.CFG1_OFFSET ->
+            if c.cr1 & reg.CR1_SPE_MASK != 0 || value & ~CFG1_WRITABLE != 0 || value & reg.CFG1_DSIZE_MASK != DSIZE_8BIT then return false
             c.cfg1 = value
-        12 ->
-            if c.cr1 & 1 != 0 || value & ~0x87400000u32 != 0 then return false
+        reg.CFG2_OFFSET ->
+            if c.cr1 & reg.CR1_SPE_MASK != 0 || value & ~CFG2_WRITABLE != 0 then return false
             c.cfg2 = value
-        24 -> if value & 64 != 0 then c.engine.overrun = false
+        reg.IFCR_OFFSET -> if value & reg.IFCR_OVRC_MASK != 0 then c.engine.overrun = false
         _ -> return false
     true

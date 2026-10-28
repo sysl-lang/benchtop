@@ -1,5 +1,7 @@
 module sh.sysl.benchtop.peripheral.dma
 
+import sh.sysl.stm32h747.dma1 as reg
+
 // STM32 DMA1/DMA2 register banks, eight streams. Direct mode, single transfers,
 // equal byte/halfword/word widths, circular and double buffering. Request timing
 // and bus arbitration belong to the board adapter, not a host sleep or UI tick.
@@ -10,13 +12,42 @@ module sh.sysl.benchtop.peripheral.dma
 //   answers false, which the bus adapter reports as a fault. Silicon would accept them.
 // - Writes to the read-only status registers LISR/HISR are ignored, as on the silicon; they are
 //   the one kind of write this model accepts without effect rather than refusing.
-const ENABLE: u32 = 1
-const TRANSFER_ERROR: u32 = 8
-const HALF_TRANSFER: u32 = 16
-const TRANSFER_COMPLETE: u32 = 32
-const CIRCULAR: u32 = 1 << 8
-const DOUBLE_BUFFER: u32 = 1 << 18
-const CURRENT_TARGET: u32 = 1 << 19
+
+// Stream 0's register names stand for every stream's; a stream's flags are stream 0's bits of
+// LISR, shifted into place by `flag_shift`.
+const ENABLE: u32 = reg.S0CR_EN_MASK
+const FIFO_ERROR: u32 = reg.LISR_FEIF0_MASK
+const DIRECT_MODE_ERROR: u32 = reg.LISR_DMEIF0_MASK
+const TRANSFER_ERROR: u32 = reg.LISR_TEIF0_MASK
+const HALF_TRANSFER: u32 = reg.LISR_HTIF0_MASK
+const TRANSFER_COMPLETE: u32 = reg.LISR_TCIF0_MASK
+const STREAM_FLAGS: u32 = FIFO_ERROR | DIRECT_MODE_ERROR | TRANSFER_ERROR | HALF_TRANSFER | TRANSFER_COMPLETE
+const CIRCULAR: u32 = reg.S0CR_CIRC_MASK
+const DOUBLE_BUFFER: u32 = reg.S0CR_DBM_MASK
+const CURRENT_TARGET: u32 = reg.S0CR_CT_MASK
+// SxCR bits an enabled stream still takes: EN and the four interrupt enables.
+const CR_LIVE: u32 = ENABLE | reg.S0CR_DMEIE_MASK | reg.S0CR_TEIE_MASK | reg.S0CR_HTIE_MASK | reg.S0CR_TCIE_MASK
+// SxCR bits 24:0, the fields from EN to MBURST, as a disabled stream keeps them.
+const CR_WRITABLE: u32 = 0x01ffffff
+// SxCR DIR: 0 peripheral to memory, 1 memory to peripheral, 2 memory to memory (refused).
+const DIR_MEMORY_TO_MEMORY: u32 = 2
+// SxCR PSIZE/MSIZE: 0 byte, 1 halfword, 2 word, 3 reserved.
+const SIZE_RESERVED: u32 = 3
+// SxFCR: FS reads 100, FIFO empty, since the model moves each beat directly; FEIE and FTH are kept.
+const FCR_EMPTY: u32 = 4 << reg.S0FCR_FS_SHIFT
+const FCR_KEPT: u32 = reg.S0FCR_FEIE_MASK | reg.S0FCR_FTH_MASK
+const FCR_RESET: u32 = FCR_EMPTY | 1
+// One stream's registers, from its own CR; the eight streams follow each other from S0CR.
+const CR: u32 = 0
+const NDTR: u32 = reg.S0NDTR_OFFSET - reg.S0CR_OFFSET
+const PAR: u32 = reg.S0PAR_OFFSET - reg.S0CR_OFFSET
+const M0AR: u32 = reg.S0M0AR_OFFSET - reg.S0CR_OFFSET
+const M1AR: u32 = reg.S0M1AR_OFFSET - reg.S0CR_OFFSET
+const FCR: u32 = reg.S0FCR_OFFSET - reg.S0CR_OFFSET
+const STREAM_STRIDE: u32 = reg.S1CR_OFFSET - reg.S0CR_OFFSET
+const STREAMS_END: u32 = reg.S7FCR_OFFSET + 4
+
+private field(word: u32, mask: u32, shift: u32) -> u32 = (word & mask) >> shift
 
 type BusRead = &Fn(u32,u32) -> Option[u32]
 type BusWrite = &Fn(u32,u32,u32) -> bool
@@ -35,10 +66,10 @@ struct Controller
     streams: [8]Stream
     flags: [8]u32
 
-controller() -> &Controller = Controller([Stream(0,0,0,0,0,0x21,0,0);8],[0;8])
+controller() -> &Controller = Controller([Stream(0,0,0,0,0,FCR_RESET,0,0);8],[0;8])
 reset(c: &Controller)
     for i in 0..<8
-        c.streams[i] = Stream(0,0,0,0,0,0x21,0,0)
+        c.streams[i] = Stream(0,0,0,0,0,FCR_RESET,0,0)
         c.flags[i] = 0
 
 private flag_shift(stream: usize) -> u32 = [0u32,6,16,22][stream % 4]
@@ -54,61 +85,62 @@ irq(c: &Controller, stream: usize) -> bool
     require stream < 8, "DMA stream index"
     val cr = c.streams[stream].cr
     val flags = c.flags[stream]
-    (flags & TRANSFER_ERROR != 0 && cr & 4 != 0) ||
-        (flags & HALF_TRANSFER != 0 && cr & 8 != 0) ||
-        (flags & TRANSFER_COMPLETE != 0 && cr & 16 != 0)
+    (flags & TRANSFER_ERROR != 0 && cr & reg.S0CR_TEIE_MASK != 0) ||
+        (flags & HALF_TRANSFER != 0 && cr & reg.S0CR_HTIE_MASK != 0) ||
+        (flags & TRANSFER_COMPLETE != 0 && cr & reg.S0CR_TCIE_MASK != 0)
 
 private valid(s: *Stream, cr: u32) -> bool
-    val peripheral = (cr >> 11) & 3
-    val memory = (cr >> 13) & 3
-    s.ndtr != 0 && peripheral < 3 && peripheral == memory && (cr >> 6) & 3 < 2 &&
-        cr & ((1 << 5) | (15 << 21)) == 0 && s.fcr & 4 == 0
+    val peripheral = field(cr,reg.S0CR_PSIZE_MASK,reg.S0CR_PSIZE_SHIFT)
+    val memory = field(cr,reg.S0CR_MSIZE_MASK,reg.S0CR_MSIZE_SHIFT)
+    s.ndtr != 0 && peripheral < SIZE_RESERVED && peripheral == memory &&
+        field(cr,reg.S0CR_DIR_MASK,reg.S0CR_DIR_SHIFT) < DIR_MEMORY_TO_MEMORY &&
+        cr & (reg.S0CR_PFCTRL_MASK | reg.S0CR_PBURST_MASK | reg.S0CR_MBURST_MASK) == 0 && s.fcr & reg.S0FCR_DMDIS_MASK == 0
 
 read(c: &Controller, offset: u32) -> Option[u32]
-    if offset == 0 || offset == 4 then return Some(status(c,offset == 4))
-    if offset == 8 || offset == 12 then return Some(0)
-    if offset < 0x10 || offset >= 0xd0 || offset & 3 != 0 then return None
-    val stream = usize((offset - 0x10) / 24)
-    val reg = (offset - 0x10) % 24
+    if offset == reg.LISR_OFFSET || offset == reg.HISR_OFFSET then return Some(status(c,offset == reg.HISR_OFFSET))
+    if offset == reg.LIFCR_OFFSET || offset == reg.HIFCR_OFFSET then return Some(0)
+    if offset < reg.S0CR_OFFSET || offset >= STREAMS_END || offset & 3 != 0 then return None
+    val stream = usize((offset - reg.S0CR_OFFSET) / STREAM_STRIDE)
     val s = &c.streams[stream]
-    reg match
-        0 -> Some(s.cr)
-        4 -> Some(s.ndtr)
-        8 -> Some(s.par)
-        12 -> Some(s.m0ar)
-        16 -> Some(s.m1ar)
+    val register = (offset - reg.S0CR_OFFSET) % STREAM_STRIDE
+    register match
+        CR -> Some(s.cr)
+        NDTR -> Some(s.ndtr)
+        PAR -> Some(s.par)
+        M0AR -> Some(s.m0ar)
+        M1AR -> Some(s.m1ar)
         _ -> Some(s.fcr)
 
 write(c: &Controller, offset: u32, value: u32) -> bool
-    if offset == 0 || offset == 4 then return true
-    if offset == 8 || offset == 12
+    if offset == reg.LISR_OFFSET || offset == reg.HISR_OFFSET then return true
+    if offset == reg.LIFCR_OFFSET || offset == reg.HIFCR_OFFSET
         for i in 0usize..<4
-            val stream = i + (if offset == 12 then 4 else 0)
-            c.flags[stream] &= ~((value >> flag_shift(stream)) & 0x3d)
+            val stream = i + (if offset == reg.HIFCR_OFFSET then 4 else 0)
+            c.flags[stream] &= ~((value >> flag_shift(stream)) & STREAM_FLAGS)
         return true
-    if offset < 0x10 || offset >= 0xd0 || offset & 3 != 0 then return false
-    val stream = usize((offset - 0x10) / 24)
-    val reg = (offset - 0x10) % 24
+    if offset < reg.S0CR_OFFSET || offset >= STREAMS_END || offset & 3 != 0 then return false
+    val stream = usize((offset - reg.S0CR_OFFSET) / STREAM_STRIDE)
     val s = &c.streams[stream]
     val active = s.cr & ENABLE != 0
-    reg match
-        0 ->
-            if active then s.cr = (s.cr & ~31) | (value & 31)
+    val register = (offset - reg.S0CR_OFFSET) % STREAM_STRIDE
+    register match
+        CR ->
+            if active then s.cr = (s.cr & ~CR_LIVE) | (value & CR_LIVE)
             else
-                val cr = value & 0x01ffffff
+                val cr = value & CR_WRITABLE
                 if cr & ENABLE != 0
                     if !valid(s,cr) then return false
                     s.initial = s.ndtr
                     s.done = 0
                 s.cr = cr
-        4 -> if !active then s.ndtr = value & 65535
-        8 -> if !active then s.par = value
-        12 -> if !active || (s.cr & DOUBLE_BUFFER != 0 && s.cr & CURRENT_TARGET != 0) then s.m0ar = value
-        16 -> if !active || (s.cr & DOUBLE_BUFFER != 0 && s.cr & CURRENT_TARGET == 0) then s.m1ar = value
-        20 ->
+        NDTR -> if !active then s.ndtr = value & reg.S0NDTR_NDT_MASK
+        PAR -> if !active then s.par = value
+        M0AR -> if !active || (s.cr & DOUBLE_BUFFER != 0 && s.cr & CURRENT_TARGET != 0) then s.m0ar = value
+        M1AR -> if !active || (s.cr & DOUBLE_BUFFER != 0 && s.cr & CURRENT_TARGET == 0) then s.m1ar = value
+        FCR ->
             if !active
-                if value & 4 != 0 then return false
-                s.fcr = (value & 0x83) | 0x20
+                if value & reg.S0FCR_DMDIS_MASK != 0 then return false
+                s.fcr = (value & FCR_KEPT) | FCR_EMPTY
         _ -> return false
     true
 
@@ -118,11 +150,13 @@ request(c: &Controller, stream: usize, read_bus: BusRead, write_bus: BusWrite) -
     require stream < 8, "DMA stream index"
     val s = &c.streams[stream]
     if s.cr & ENABLE == 0 || s.ndtr == 0 then return false
-    val width = 1u32 << ((s.cr >> 11) & 3)
+    val width = 1u32 << field(s.cr,reg.S0CR_PSIZE_MASK,reg.S0CR_PSIZE_SHIFT)
     val base = if s.cr & CURRENT_TARGET != 0 && s.cr & DOUBLE_BUFFER != 0 then s.m1ar else s.m0ar
-    val memory = base + (if s.cr & (1 << 10) != 0 then s.done * width else 0)
-    val peripheral = s.par + (if s.cr & (1 << 9) != 0 then s.done * (if s.cr & (1 << 15) != 0 then 4 else width) else 0)
-    val sending = s.cr & (1 << 6) != 0
+    val memory = base + (if s.cr & reg.S0CR_MINC_MASK != 0 then s.done * width else 0)
+    // PINCOS steps the peripheral address by a word whatever PSIZE is.
+    val peripheral = s.par + (if s.cr & reg.S0CR_PINC_MASK != 0 then s.done * (if s.cr & reg.S0CR_PINCOS_MASK != 0 then 4 else width) else 0)
+    // DIR 1, memory to peripheral (2 is refused when the stream is enabled).
+    val sending = s.cr & (1 << reg.S0CR_DIR_SHIFT) != 0
     val source = if sending then memory else peripheral
     val target = if sending then peripheral else memory
     var ok = source % width == 0 && target % width == 0

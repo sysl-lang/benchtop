@@ -1,6 +1,46 @@
 module sh.sysl.benchtop.peripheral.dsi
 
 import sysl.buf.{Buf,buf}
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.stm32h747.dsihost as reg
+
+// MIPI DSI packet data types the host sends (MIPI DSI 1.3, table 16).
+const GENERIC_SHORT_WRITE_0: u32 = 0x03
+const GENERIC_SHORT_WRITE_1: u32 = 0x13
+const GENERIC_SHORT_WRITE_2: u32 = 0x23
+const GENERIC_READ_0: u32 = 0x04
+const GENERIC_READ_1: u32 = 0x14
+const GENERIC_READ_2: u32 = 0x24
+const DCS_SHORT_WRITE_0: u32 = 0x05
+const DCS_SHORT_WRITE_1: u32 = 0x15
+const DCS_READ: u32 = 0x06
+const SET_MAXIMUM_RETURN_SIZE: u32 = 0x37
+const GENERIC_LONG_WRITE: u32 = 0x29
+const DCS_LONG_WRITE: u32 = 0x39
+
+/** A packet data type that asks the peripheral for a reply. */
+is_read(kind: u32) -> bool = kind == DCS_READ || kind == GENERIC_READ_0 || kind == GENERIC_READ_1 || kind == GENERIC_READ_2
+private is_long(kind: u32) -> bool = kind == GENERIC_LONG_WRITE || kind == DCS_LONG_WRITE
+
+// DSI_GHCR: data type, virtual channel, and the 16-bit word count (or the short packet's two bytes).
+const GHCR_WC_SHIFT: u32 = reg.DSI_GHCR_WCLSB_SHIFT
+const GHCR_WC_MASK: u32 = reg.DSI_GHCR_WCLSB_MASK | reg.DSI_GHCR_WCMSB_MASK
+const GHCR_WRITABLE: u32 = reg.DSI_GHCR_DT_MASK | reg.DSI_GHCR_VCID_MASK | GHCR_WC_MASK
+private word_count(header: u32) -> u32 = (header & GHCR_WC_MASK) >> GHCR_WC_SHIFT
+// The DSI Host's version register: 1.30 ("130*").
+const VERSION: u32 = 0x3133302a
+// DSI_PCTLR as this model reads it: bits 1:0 both set enable the D-PHY. RM0399 places DEN at bit 1 and
+// CKE at bit 2, so a guest that writes ST's DEN | CKE (6) is not ready here.
+const PCTLR_ENABLED: u32 = 3
+// DSI_PSR in stop state: the clock lane and data lane 0 (and lane 1 on a two-lane link) stopped. Bit
+// 0, reserved in RM0399, reads as set.
+const PSR_STOPPED: u32 = 1 | reg.DSI_PSR_PSSC_MASK | reg.DSI_PSR_PSS0_MASK
+// DSI_PCONFR NL: 0 one lane, 1 two.
+const TWO_LANES: u32 = 1
+// The regulator and the PLL both on: what DSI_WISR's RRS and PLLLS report.
+const WRPCR_RUNNING: u32 = reg.DSI_WRPCR_REGEN_MASK | reg.DSI_WRPCR_PLLEN_MASK
+private field(word: u32, mask: u32, shift: u32) -> u32 = (word & mask) >> shift
+private register(h: &Host, offset: u32) -> u32 = h.regs[offset / 4]
 
 /** STM32 DSI command-mode host. Packets cross a timed link before the attached
  * endpoint receives them. Endpoints are independent of MCU addresses and GPIO.
@@ -35,7 +75,7 @@ struct Host
 host(hz: u64, reference_hz: u64 = 25000000) -> &Host
     require hz > 0 && hz <= 1000000000 && reference_hz > 0 && reference_hz <= 1000000000, "bounded DSI clock rates"
     val h: &Host = Host(hz,reference_hz,0,[0;269],[0;1024],0,[0;1024],0,0,false,0,0,[0;1024],0,0,1,false,false,0)
-    h.regs[0x34 / 4] = 1 // Command mode.
+    h.regs[reg.DSI_MCR_OFFSET / 4] = reg.DSI_MCR_CMDM_MASK
     h
 
 /** Callback arguments are VC, packet data type, exact unpadded payload, and the host's request
@@ -48,15 +88,16 @@ advance(h: &Host, time: u64, endpoint: Endpoint)
     if time <= h.time then return
     h.time = time
     if !h.busy || h.response_pending || time < h.due then return
-    val kind = h.header & 63
-    if kind == 0x37
-        h.max_return = usize((h.header >> 8) & 0xffff)
+    val kind = h.header & reg.DSI_GHCR_DT_MASK
+    if kind == SET_MAXIMUM_RETURN_SIZE
+        h.max_return = usize(word_count(h.header))
     else
-        val reading = kind == 0x06 || kind == 0x04 || kind == 0x14 || kind == 0x24
+        val reading = is_read(kind)
         if reading && h.defer_reads
             h.response_pending = true
-            h.due = 0xffffffffffffffff
-        val response = endpoint((h.header >> 6) & 3,kind,h.packet[..<h.packet_count],h.request_id)
+            h.due = NEVER
+        val channel = field(h.header,reg.DSI_GHCR_VCID_MASK,reg.DSI_GHCR_VCID_SHIFT)
+        val response = endpoint(channel,kind,h.packet[..<h.packet_count],h.request_id)
         if reading && h.defer_reads then return
         if reading
             h.rx_count = if response.len() < h.max_return then response.len() else h.max_return
@@ -64,36 +105,49 @@ advance(h: &Host, time: u64, endpoint: Endpoint)
             for i in 0..<h.rx_count do h.rx[i] = response.at(i)
     h.busy = false
 
-private ready(h: &Host) -> bool = h.regs[1] & 1 != 0 && h.regs[0x34 / 4] & 1 != 0 &&
-    h.regs[0xa0 / 4] & 3 == 3 && h.regs[0x404 / 4] & 8 != 0 && h.regs[0x430 / 4] & 0x01000001 == 0x01000001
+private ready(h: &Host) -> bool =
+    register(h,reg.DSI_CR_OFFSET) & reg.DSI_CR_EN_MASK != 0 && register(h,reg.DSI_MCR_OFFSET) & reg.DSI_MCR_CMDM_MASK != 0 &&
+    register(h,reg.DSI_PCTLR_OFFSET) & PCTLR_ENABLED == PCTLR_ENABLED &&
+    register(h,reg.DSI_WCR_OFFSET) & reg.DSI_WCR_DSIEN_MASK != 0 &&
+    register(h,reg.DSI_WRPCR_OFFSET) & WRPCR_RUNNING == WRPCR_RUNNING
 
 /** Configuration registers for implemented command-mode behavior only. */
 private configured(offset: u32) -> bool = offset match
-    0x04 | 0x08 | 0x0c | 0x10 | 0x14 | 0x18 | 0x2c | 0x30 | 0x34 | 0x64 | 0x68 |
-    0x78 | 0x7c | 0x80 | 0x84 | 0x88 | 0x8c | 0x94 | 0x98 | 0x9c | 0xa0 | 0xa4 |
-    0x400 | 0x404 | 0x418 | 0x41c | 0x420 | 0x424 | 0x428 | 0x430 -> true
+    reg.DSI_CR_OFFSET | reg.DSI_CCR_OFFSET | reg.DSI_LVCIDR_OFFSET | reg.DSI_LCOLCR_OFFSET | reg.DSI_LPCR_OFFSET |
+    reg.DSI_LPMCR_OFFSET | reg.DSI_PCR_OFFSET | reg.DSI_GVCIDR_OFFSET | reg.DSI_MCR_OFFSET | reg.DSI_LCCR_OFFSET |
+    reg.DSI_CMCR_OFFSET | reg.DSI_TCCR0_OFFSET | reg.DSI_TCCR1_OFFSET | reg.DSI_TCCR2_OFFSET | reg.DSI_TCCR3_OFFSET |
+    reg.DSI_TCCR4_OFFSET | reg.DSI_TCCR5_OFFSET | reg.DSI_CLCR_OFFSET | reg.DSI_CLTCR_OFFSET | reg.DSI_DLTCR_OFFSET |
+    reg.DSI_PCTLR_OFFSET | reg.DSI_PCONFR_OFFSET | reg.DSI_WCFGR_OFFSET | reg.DSI_WCR_OFFSET | reg.DSI_WPCR0_OFFSET |
+    reg.DSI_WPCR1_OFFSET | reg.DSI_WPCR2_OFFSET | reg.DSI_WPCR3_OFFSET | reg.DSI_WPCR4_OFFSET | reg.DSI_WRPCR_OFFSET -> true
     _ -> false
 
 read(h: &Host, offset: u32) -> Option[u32]
     if offset & 3 != 0 then return None
     if configured(offset) then return Some(h.regs[offset / 4])
     offset match
-        0x00 -> Some(0x3133302a)
-        0x6c -> Some(h.header)
-        0x74 -> Some((if h.busy then 2u32 else 1u32) | (if h.tx_count == 0 then 4 else 0) |
-            (if h.tx_count == 1024 then 8 else 0) | (if h.rx_at == h.rx_count then 16 else 0) |
-            (if h.rx_count - h.rx_at == 1024 then 32 else 0) |
-            (if h.busy && ((h.header & 63) == 6 || (h.header & 63) == 4 || (h.header & 63) == 0x14 || (h.header & 63) == 0x24) then 64 else 0))
-        0x70 ->
+        reg.DSI_VR_OFFSET -> Some(VERSION)
+        reg.DSI_GHCR_OFFSET -> Some(h.header)
+        reg.DSI_GPSR_OFFSET -> Some((if h.busy then reg.DSI_GPSR_CMDFF_MASK else reg.DSI_GPSR_CMDFE_MASK) |
+            (if h.tx_count == 0 then reg.DSI_GPSR_PWRFE_MASK else 0) |
+            (if h.tx_count == 1024 then reg.DSI_GPSR_PWRFF_MASK else 0) |
+            (if h.rx_at == h.rx_count then reg.DSI_GPSR_PRDFE_MASK else 0) |
+            (if h.rx_count - h.rx_at == 1024 then reg.DSI_GPSR_PRDFF_MASK else 0) |
+            (if h.busy && is_read(h.header & reg.DSI_GHCR_DT_MASK) then reg.DSI_GPSR_RCB_MASK else 0))
+        reg.DSI_GPDR_OFFSET ->
             var result: u32 = 0
             for i in 0..<4
                 if h.rx_at < h.rx_count
                     result |= u32(h.rx[h.rx_at]) << u32(i * 8)
                     h.rx_at += 1
             Some(result)
-        0xb0 -> Some(if ready(h) then 0x15 | (if h.regs[0xa4 / 4] & 1 != 0 then 0x80 else 0) else 0)
-        0x40c -> Some((if h.regs[0x430 / 4] & 0x01000000 != 0 then 0x1000u32 else 0) |
-            (if h.regs[0x430 / 4] & 0x01000001 == 0x01000001 then 0x100 else 0))
+        reg.DSI_PSR_OFFSET ->
+            if !ready(h) then return Some(0)
+            val lane1 = if register(h,reg.DSI_PCONFR_OFFSET) & TWO_LANES != 0 then reg.DSI_PSR_PSS1_MASK else 0
+            Some(PSR_STOPPED | lane1)
+        reg.DSI_WISR_OFFSET ->
+            val wrpcr = register(h,reg.DSI_WRPCR_OFFSET)
+            Some((if wrpcr & reg.DSI_WRPCR_REGEN_MASK != 0 then reg.DSI_WISR_RRS_MASK else 0) |
+                (if wrpcr & WRPCR_RUNNING == WRPCR_RUNNING then reg.DSI_WISR_PLLLS_MASK else 0))
         _ -> None
 
 /** False means an unsupported or invalid operation; the bus adapter must report
@@ -102,17 +156,18 @@ read(h: &Host, offset: u32) -> Option[u32]
 write(h: &Host, offset: u32, value: u32) -> bool
     if offset & 3 != 0 then return false
     if configured(offset)
-        if offset == 0x430 && value & 1 != 0
-            val n = (value >> 2) & 127
-            val input = (value >> 11) & 15
-            val output = 1u64 << ((value >> 16) & 3)
+        if offset == reg.DSI_WRPCR_OFFSET && value & reg.DSI_WRPCR_PLLEN_MASK != 0
+            val n = field(value,reg.DSI_WRPCR_NDIV_MASK,reg.DSI_WRPCR_NDIV_SHIFT)
+            val input = field(value,reg.DSI_WRPCR_IDF_MASK,reg.DSI_WRPCR_IDF_SHIFT)
+            val output = 1u64 << field(value,reg.DSI_WRPCR_ODF_MASK,reg.DSI_WRPCR_ODF_SHIFT)
             if n < 10 || n > 125 || input == 0 || input > 7 then return false
             val rate = h.reference_hz * u64(n) / u64(input) / output
             if rate == 0 || rate > 1000000000 then return false
             h.lane_rate = rate
-        if offset == 0x34 && value & 1 == 0 then return false // No video mode yet.
-        if offset == 0xa4 && value & 3 > 1 then return false // One or two lanes.
-        if offset == 0x04 && value & 1 == 0
+        // Command mode only: no video mode.
+        if offset == reg.DSI_MCR_OFFSET && value & reg.DSI_MCR_CMDM_MASK == 0 then return false
+        if offset == reg.DSI_PCONFR_OFFSET && value & reg.DSI_PCONFR_NL_MASK > TWO_LANES then return false
+        if offset == reg.DSI_CR_OFFSET && value & reg.DSI_CR_EN_MASK == 0
             h.busy = false
             h.response_pending = false
             h.request_id += 1
@@ -126,24 +181,25 @@ write(h: &Host, offset: u32, value: u32) -> bool
             h.request_id += 1
             h.tx_count = 0
         return true
-    if offset == 0x70
+    if offset == reg.DSI_GPDR_OFFSET
         if !ready(h) || h.tx_count > 1020 then return false
         for i in 0..<4 do h.tx[h.tx_count + usize(i)] = u8(value >> u32(i * 8))
         h.tx_count += 4
         return true
-    if offset != 0x6c || !ready(h) || h.busy then return false
-    val kind = value & 63
+    if offset != reg.DSI_GHCR_OFFSET || !ready(h) || h.busy then return false
+    val kind = value & reg.DSI_GHCR_DT_MASK
+    val count = word_count(value)
     var size: usize = 0
     kind match
-        0x03 | 0x04 | 0x37 -> size = 0
-        0x05 | 0x06 | 0x13 | 0x14 -> size = 1
-        0x15 | 0x23 | 0x24 -> size = 2
-        0x29 | 0x39 ->
-            size = usize((value >> 8) & 0xffff)
+        GENERIC_SHORT_WRITE_0 | GENERIC_READ_0 | SET_MAXIMUM_RETURN_SIZE -> size = 0
+        DCS_SHORT_WRITE_0 | DCS_READ | GENERIC_SHORT_WRITE_1 | GENERIC_READ_1 -> size = 1
+        DCS_SHORT_WRITE_1 | GENERIC_SHORT_WRITE_2 | GENERIC_READ_2 -> size = 2
+        GENERIC_LONG_WRITE | DCS_LONG_WRITE ->
+            size = usize(count)
             if size == 0 || size > 1024 || h.tx_count != ((size + 3) / 4) * 4 then return false
         _ -> return false
-    if kind == 0x37 && ((value >> 8) & 0xffff == 0 || (value >> 8) & 0xffff > 1024) then return false
-    if kind == 0x29 || kind == 0x39
+    if kind == SET_MAXIMUM_RETURN_SIZE && (count == 0 || count > 1024) then return false
+    if is_long(kind)
         for i in 0..<size do h.packet[i] = h.tx[i]
         h.tx_count = 0
     else
@@ -152,11 +208,11 @@ write(h: &Host, offset: u32, value: u32) -> bool
         if size > 1 then h.packet[1] = u8(value >> 16)
     h.request_id += 1
     h.response_pending = false
-    h.header = value & 0xffffff
+    h.header = value & GHCR_WRITABLE
     h.packet_count = size
     h.busy = true
-    val bytes = if kind == 0x29 || kind == 0x39 then u64(size) + 6 else 4u64
-    val rate = h.lane_rate * u64((h.regs[0xa4 / 4] & 3) + 1)
+    val bytes = if is_long(kind) then u64(size) + 6 else 4u64
+    val rate = h.lane_rate * u64((register(h,reg.DSI_PCONFR_OFFSET) & reg.DSI_PCONFR_NL_MASK) + 1)
     h.due = h.time + (bytes * 8 * h.hz + rate - 1) / rate
     true
 

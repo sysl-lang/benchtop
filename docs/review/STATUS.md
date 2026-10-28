@@ -10,10 +10,10 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 |---|---|---|
 | cores#1 | the RISC-V core is not wired into any board, and has no bus | open |
 | cores#2 | the memory map is process-global state the core reads on every access | fixed by slice 1 (`ce0b959`): `v6m.Memory` holds the map, `Cpu.mem` points at it |
-| cores#3 | every new `Op` must be written in five places | open |
-| cores#4 | hand-unrolled const-generic dispatch ladders, doubled by `TIMED` | open |
-| cores#5 | `TIMED`, `V8`, `SINGLE` are `const u32` used as booleans | open |
-| cores#6 | the timing switch checked at decode in three spellings; IT re-dispatch | open |
+| cores#3 | every new `Op` must be written in five places | partly fixed in `35449b8`: the hand list is gone (`configure_instruction_timing` walks `Op::Variants`), `instruction_cycles` is the one cost table and `costed(op)` derives from it whether a shared handler charges cycles; left: the handler table is still an exhaustive `match` — a `for const c in Op::Variants` table needs `Op::Make(c, ())` as a value argument, which sysl 0.7.8 refuses (sysl finding) |
+| cores#4 | hand-unrolled const-generic dispatch ladders, doubled by `TIMED` | fixed in `35449b8`: every ladder is a `for const` (B<cond>, fused, wide CMP, IT, FP, DP imm/logic/reg×shift, bit, extend, the load families) |
+| cores#5 | `TIMED`, `V8`, `SINGLE` are `const u32` used as booleans | fixed in `35449b8` (`const …: bool`; FP's precision `D` left a `u32`) |
+| cores#6 | the timing switch checked at decode in three spellings; IT re-dispatch | partly fixed in `35449b8`: `CYCLE_ACCOUNTING` deleted; one spelling (`handler_for`, `fused_handler_for`, `cmp_w_bcond_handler`, `pred_handler` all take the core); `h_pred[K, L, TIMED]` no longer tests the timing switch at run time; left: it still re-selects its inner handler per run — the 16-byte record has no room for a second handler pointer |
 | cores#7 | the RISC-V core is RP2350-specific while claiming to be generic | open |
 | cores#8 | RISC-V per-instruction cost far from "real-world speed" | open |
 | cores#9 | NVIC banks use three indexing schemes | open |
@@ -21,8 +21,8 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#11 | sentinel and guard-record arithmetic in place of named concepts | open |
 | cores#12 | `Kind`, `Arch` and the `is_*` predicates overlap | open |
 | cores#13 | `h_dsp` re-checks DSP at run time against a second source of truth | open |
-| cores#14 | duplicated bit utilities and hand-rolled loops the library has | open |
-| cores#15 | boilerplate handler bodies | open |
+| cores#14 | duplicated bit utilities and hand-rolled loops the library has | partly fixed in `d435c66` (`t2sem` CLZ is `leading_zeros`); left: `rbit` (waits for sysl 0.7.9's `reverse_bits`), the RISC-V `bitops` loops, the duplicated `sext`/`bits`/`bad`/`st` helpers |
+| cores#15 | boilerplate handler bodies | fixed in `35449b8`: `h_step[OP, L, TIMED]` and `h_access[OP, L, TIMED]`, whose `match` on the constant `OP` folds, replace ~85 hand-written handlers |
 | cores#16 | RISC-V `execute` mixes decode, validation and commit | open |
 | cores#17 | `Stop.Budget` means "running" | open |
 | cores#18 | RISC-V `Model` fields that nothing reads | open |
@@ -35,7 +35,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#4 | locks guard nothing: `Mutex.new(0)` around separate globals | fixed by slice 3 (`679528a`, `d72cffd`, `a53b6ff`): `Mutex[WorkerControl]`, device state in `Mutex[T]`; the one `Mutex[u64]` owns the board clock it guards |
 | runtime#5 | `assemble` mutates globals before it can still fail | fixed by slices 1–2 (`ce0b959`, `3024687`): `plan` checks everything, the apply step cannot fail |
 | runtime#6 | peripheral kinds and window sizes duplicated; one wrong error message | partly fixed in `013e796` (the duplicate-I2C refusal names both kinds); the kind table and the double `controller` parse remain |
-| runtime#7 | magic register fields where the comments name the field | open |
+| runtime#7 | magic register fields where the comments name the field | fixed in `d013662`: `h7` names RCC_GCR (`sh.sysl.stm32h747.rcc`) and BOOT_C1/C2; the SYNCEN, SLOTEN and A/B block layout live in `peripheral/sai` (`synchronous`, `slot_enabled`, `block_index`, `data_register`); DMAMUX request IDs, default clocks and storage pins are named; `dsi.is_read` replaces the worker's kind test |
 | runtime#8 | hand-rolled ring buffers where `Ring` exists | open |
 | runtime#9 | the DMA bus master is "whichever core last touched audio" | fixed in `0181428`: no `core` global; the requesting thread is passed as `via`, IRQs reach both NVICs through `deliver_audio_irq`, and the device-time rule (one clock that only advances; a lagging core sees the later state) is documented on `AudioLive`. The DMA's RAM stores still go through `device_store` on `via`'s thread, which already invalidates both cores' monitors and code; no separate v6m requester was needed |
 | runtime#10 | conditional locking keyed on a mutable global | fixed by slice 3 (`d72cffd`): `rp.live` is taken on every access, whichever thread |
@@ -50,7 +50,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#19 | cache-line padding by hand, sized for the wrong machine | open (`BusCache` still pads to 64) |
 | runtime#20 | sysl idiom (redundant suffixes, hand `min`/`max`, qualified calls) | open |
 | runtime#21 | stale or misleading comments, dead paths | partly fixed (slice 3 deleted `parallel.sysl` and its "legacy" comments); the rest open |
-| peripherals#1 | registers are magic offsets and masks; bitfields never used | open |
+| peripherals#1 | registers are magic offsets and masks; bitfields never used | fixed in `d013662`, `6252927`, `5d04466`: SDMMC, SAI, DSI, DMA, DMAMUX and the STM32 SPI name every offset and field from `sh.sysl.stm32h747` 0.1.1 (SVD-generated, the one definition); WM8994, FT6x06, GT911, DS3231 and the PL022 engine have named constants from their data sheets. Named constants rather than bitfield structs, so the field positions have one source (the generated package) instead of a hand-written second copy |
 | peripherals#2 | no common peripheral interface | open (slice 4 part 2) |
 | peripherals#3 | the STM32H747 MCU is pasted into three board files | open |
 | peripherals#4 | MCU facts in board files; pin routing written twice | open |
@@ -65,12 +65,12 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | peripherals#13 | the SPI SD card re-implements the SPI shifter | open |
 | peripherals#14 | positional constructors with 20 to 40 arguments | open |
 | peripherals#15 | dead or diagnostic-only state inside the models | open |
-| peripherals#16 | `NEVER` defined three times, the literal three more | open (still in `v6m`, `sdmmc`, `sai`) |
+| peripherals#16 | `NEVER` defined three times, the literal three more | fixed in `d013662`: one `NEVER` in `sh.sysl.benchtop.timing`, imported by `v6m`, the peripherals and `virt`; the literals in `dsi` and `spi` are gone |
 | peripherals#17 | "MIPI DCS" part carries ST7789 vendor commands | fixed in `0181428`: `mipi_dcs.Controller` (`Dcs`, `St7789`); the DCS core table is shared and the ST7789's vendor table applies only to the SPI ST7789 |
 | peripherals#18 | comments that name development steps, or are stale | open |
 | peripherals#19 | `hd44780` pins are a `[7]int` indexed by position | open |
 | peripherals#20 | sysl idiom: redundant suffixes, types and parentheses | open |
-| peripherals#21 | 8-bit register pointers wrap through `+= 1` | open |
+| peripherals#21 | 8-bit register pointers wrap through `+= 1` | fixed in `6252927`: FT6x06 (u8), GT911 and WM8994 (u16) wrap their auto-increment explicitly with a mask (sysl 0.7.8 has no `+%`); DS3231's pointer already wraps at 19 |
 | peripherals#22 | tests assert implementation with magic numbers | open |
 | ui-firmware#1 | example sources are not compiled by the gate | fixed in `80b8a2f` (every example firmware source is built in the suite) |
 | ui-firmware#2 | the UI owns emulator control and the board's input model | open |
@@ -80,7 +80,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | ui-firmware#6 | pot state stored twice and synced every frame | open |
 | ui-firmware#7 | `rasterize` clones the desktop by hand-copying fields | open |
 | ui-firmware#8 | a 20-argument positional constructor | open |
-| ui-firmware#9 | hand-written SDL externs where the SDL binding owns the job | open (`SDL_GetCurrentAudioDriver` is still declared in `ui/audio.sysl`) |
+| ui-firmware#9 | hand-written SDL externs where the SDL binding owns the job | fixed in `d435c66` (sdl3 0.3.12: the touch window's size and scale through `sdl3.c`, `current_audio_driver()`, `current_time()`/`date_time()`; no `extern "SDL_` is left in benchtop) |
 | ui-firmware#10 | instrument sources hard-code register maps | open |
 | ui-firmware#11 | example firmware is not readable | open |
 | ui-firmware#12 | startup and vector-table boilerplate copied into every example | open |
