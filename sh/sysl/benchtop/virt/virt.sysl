@@ -71,10 +71,10 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.v6m.{configure_instruction_timing, Cpu, Kind, Stop, IRQ0, NEVER, RAM_BYTES, clear, could_wake, halt, load32, raise, reset, run_single, run_threaded, set_limit}
 import sh.sysl.benchtop.v6m as memory
 import sh.sysl.elf as elf
-import sysl.buf.{Buf, buf}
+import sysl.buf.{Buf, buf, Frozen}
 import sysl.math.{min, max}
 import sysl.sync.*
-import sysl.threads.{Channel, SleepLock, channel, spawn}
+import sysl.threads.{Channel, Mutex, channel, spawn}
 import sysl.io.stdin
 
 // The console's registers, from its base.
@@ -203,17 +203,34 @@ attached() -> usize = machine.devices.bus.attached
 private[virt] console_irq() -> int = machine.devices.bus.console_irq
 private[virt] fifo_irq() -> int = machine.devices.bus.fifo_irq
 
-var typed_slots: [4096]u8
-var typed = channel(typed_slots[..])
-// A byte taken from the channel to answer STATUS, and not yet read through DATA; -1 for none.
-var held: int = -1
-var out: Buf[u8] = buf()
-var capturing = false
-var capture_limit: usize = 0
-// CTRL, read by both cores' threads without the console's lock to decide whether to take it.
-var ctrl: u32 = 0
-// The console's state is under this lock while the cores run on host threads.
-var console_lock = SleepLock.new()
+/** The debug console (`debug-console`): the guest's input, as a channel the host fills (`typed`, its
+ * values held in `slots`, whose lock no thread takes), CTRL, which both cores' threads read without
+ * a lock, and under `live` the rest. The input thread `listen` starts holds the channel's address, so
+ * a console is reset in place (`open_console`), never replaced.
+ */
+struct Console
+    slots: Mutex[Buf[u8]]
+    typed: Channel[u8]
+    ctrl: u32
+    live: Mutex[ConsoleLive]
+
+/** A byte taken from the input to answer STATUS and not yet read through DATA (-1 for none), what the
+ * guest has written and not yet flushed, and whether, and how much of, it is kept for `output` instead.
+ */
+struct ConsoleLive
+    held: int
+    out: Buf[u8]
+    capturing: bool
+    capture_limit: usize
+
+private console_live() -> ConsoleLive = ConsoleLive(-1, buf(), false, 0)
+
+/** A console with no input waiting, its output going to the host, and its interrupt off. */
+console() -> Console
+    var slots: Buf[u8] = buf()
+    for i in 0..<4096 do slots.push(0)
+    val typed = channel(slots.view())
+    Console(Mutex.new(slots), typed, 0, Mutex.new(console_live()))
 
 // What the two cores are, as the board description says.
 var core_instruction_timing: [2]bool = [false,false]
@@ -245,41 +262,42 @@ var locks: u32 = 0
 // Ready the console with an empty input, its output going to the host, and its interrupt off.
 open_console()
     pause_workers()
-    typed = channel(typed_slots[..])
-    held = -1
-    out = buf()
-    capturing = false
-    capture_limit = 0
-    ctrl = 0
+    val c = &machine.console
+    c.typed = c.slots.with(slots -> channel(slots.view()))
+    c.live.with(l -> *l = console_live())
+    atomic_store(&c.ctrl, 0, Relaxed)
 
 // Keep the guest's output for `output` rather than writing it to the host.
 capture()
-    hold_console()
-    capturing = true
-    free_console()
+    machine.console.live.with(l -> l.capturing = true)
 
 /** Console tail for a long-running visual session. */
 capture_bounded(limit: usize)
-    hold_console()
-    capturing = true
-    capture_limit = if limit < 128 then 128 else limit
-    free_console()
+    machine.console.live.with(l ->
+        l.capturing = true
+        l.capture_limit = if limit < 128 then 128 else limit)
 
-// Everything the guest has written since `capture`.
-output() -> []const u8 = out.view()
+/** A read-only copy of everything the guest has written since `capture`. */
+output() -> &sync Frozen[u8]
+    val copy = machine.console.live.with(l ->
+        var bytes: Buf[u8] = buf()
+        bytes.extend(l.out.view())
+        bytes.freeze())
+    copy
 
 /** Owned copy for a UI reading concurrently with console writes. */
 output_snapshot() -> Buf[u8]
-    hold_console()
-    defer free_console()
     var result: Buf[u8] = buf()
-    for byte in out do result.push(byte)
+    result.extend(output().view())
     result
+
+/** The console's input, which `type_in` and the input thread send to. */
+input() -> *Channel[u8] = &machine.console.typed
 
 // Give the guest `bytes` to read, and then the end of its input.
 type_in(bytes: []const u8)
-    for b in bytes do typed.send(b)
-    typed.close()
+    for b in bytes do machine.console.typed.send(b)
+    machine.console.typed.close()
 
 // The byte that ends benchtop from the keyboard, whatever the guest is doing: Ctrl-], as telnet's.
 const QUIT: u8 = 0x1D
@@ -287,7 +305,7 @@ const QUIT: u8 = 0x1D
 // Copy the host's standard input to the guest, from a thread of its own, until it ends. Ctrl-] is not
 // passed on: it ends benchtop with status 130, as an interrupt would, the terminal put back by the
 // exit hook `sysl.tty.raw` registered.
-listen() -> bool = spawn(&pump, &typed).is_some()
+listen() -> bool = spawn(&pump, &machine.console.typed).is_some()
 
 private pump(ch: *Channel[u8])
     var r = stdin()
@@ -303,97 +321,78 @@ private pump(ch: *Channel[u8])
     ch.close()
 
 // Write out what the guest has written, unless it is being captured.
-flush_console()
-    hold_console()
-    flush_out()
-    free_console()
+flush_console() = machine.console.live.with(l -> flush_out(l))
 
-// The console's state is one core's at a time, where the cores run on threads of their own.
-@inline
-private hold_console()
-    if scheduler.workers.active || scheduler.threaded then console_lock.lock()
+private flush_out(l: *ConsoleLive)
+    if l.capturing || l.out.len() == 0 then return
 
-@inline
-private free_console()
-    if scheduler.workers.active || scheduler.threaded then console_lock.unlock()
-
-private flush_out()
-    if capturing || out.len() == 0 then return
-
-    putbytes(out.view())
+    putbytes(l.out.view())
     flush()
-    out.clear()
+    l.out.clear()
 
 // The next byte of input if one is waiting, without taking it.
-private peek() -> int
-    if held < 0
-        typed.try_receive() match
-            Some(b) -> held = int(b)
+private peek(c: *Console, l: *ConsoleLive) -> int
+    if l.held < 0
+        c.typed.try_receive() match
+            Some(b) -> l.held = int(b)
             None -> ()
 
-    held
+    l.held
 
-private[virt] console_status() -> u32
-    if peek() >= 0 then return WAITING
-    if typed.is_closed() then return ENDED
+private status(c: *Console, l: *ConsoleLive) -> u32
+    if peek(c, l) >= 0 then return WAITING
+    if c.typed.is_closed() then return ENDED
 
     0
 
+private[virt] console_status() -> u32
+    val c = &machine.console
+    c.live.with(l -> status(c, l))
+
 // The console's half of an access to address `a`, register `o` from its base.
 private console_read(cpu: *Cpu, a: u32, o: u32) -> u32
-    hold_console()
+    val c = &machine.console
+    if o == CTRL then return console_ctrl()
+    if o != DATA && o != STATUS
+        halt(cpu, Stop.Unmapped, a)
+        return 0
+    c.live.with(l ->
+        flush_out(l)
+        if o == STATUS then status(c, l) else take(c, l))
 
-    val x = o match
-        DATA ->
-            flush_out()
-
-            val b = peek()
-
-            held = -1
-            if b < 0 then 0xFFFFFFFF else u32(b)
-        STATUS ->
-            flush_out()
-            console_status()
-        CTRL -> console_ctrl()
-        _ ->
-            halt(cpu, Stop.Unmapped, a)
-            0
-
-    free_console()
-    x
+// DATA: the byte waiting, taken, or all ones where none is.
+private take(c: *Console, l: *ConsoleLive) -> u32
+    val b = peek(c, l)
+    l.held = -1
+    if b < 0 then 0xFFFFFFFF else u32(b)
 
 private console_write(cpu: *Cpu, a: u32, o: u32, x: u32)
-    hold_console()
-
     o match
-        DATA ->
-            if capturing && capture_limit != 0 && out.len() >= capture_limit
-                var tail: Buf[u8] = buf()
-                tail.extend(out.view()[(out.len() - capture_limit / 2)..])
-                out = tail
-            out.push(u8(x & 0xFF))
-            if x & 0xFF == 10 || out.len() >= 4096 then flush_out()
+        DATA -> machine.console.live.with(l -> put(l, u8(x & 0xFF)))
         EXIT ->
             cpu.exit_code = x
             halt(cpu, Stop.Exit, a)
-        CTRL -> atomic_store(&ctrl, x & RX_INTERRUPT, Relaxed)
+        CTRL -> atomic_store(&machine.console.ctrl, x & RX_INTERRUPT, Relaxed)
         _ -> halt(cpu, Stop.Unmapped, a)
 
-    free_console()
+// The guest writes `b`: kept, and written out at a newline or when 4 KB have gathered, or, where the
+// output is captured with a limit, the oldest half let go once it reaches the limit.
+private put(l: *ConsoleLive, b: u8)
+    if l.capturing && l.capture_limit != 0 && l.out.len() >= l.capture_limit
+        var tail: Buf[u8] = buf()
+        tail.extend(l.out.view()[(l.out.len() - l.capture_limit / 2)..])
+        l.out = tail
+    l.out.push(b)
+    if b == 10 || l.out.len() >= 4096 then flush_out(l)
 
 @inline
-private[virt] console_ctrl() -> u32 = atomic_load(&ctrl, Relaxed)
+private[virt] console_ctrl() -> u32 = atomic_load(&machine.console.ctrl, Relaxed)
 
 // Whether the console raises its interrupt now: it is enabled and STATUS is not 0.
 private[virt] console_raising() -> bool
     if console_irq() < 0 || console_ctrl() & RX_INTERRUPT == 0 then return false
 
-    hold_console()
-
-    val raising = console_status() != 0
-
-    free_console()
-    raising
+    console_status() != 0
 
 // The board's RAM as `file` fills it: an ELF file's segments at their load addresses, or, for a file
 // that is not ELF, its bytes from address 0.
@@ -500,13 +499,9 @@ private[virt] device_wake(cpu: *Cpu) -> u64 = min(sdmmc_wake(cpu), min(min(min(m
 
 // A byte of input the board waited for, kept to answer STATUS and DATA; nothing where the input ended.
 private[virt] hold_input(got: Option[u8])
-    hold_console()
-
     got match
-        Some(b) -> held = int(b)
+        Some(b) -> machine.console.live.with(l -> l.held = int(b))
         None -> ()
-
-    free_console()
 
 // What `benchtop run` says when the board's core has stopped: why, and for a stop the guest did not
 // ask for, where the core stopped and after how many instructions.

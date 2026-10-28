@@ -100,12 +100,21 @@ enum ProductView
      `dsi.host`, `audio.live` (with the SAI's host queues) and the codec's `input` and `mix`. The DSI
      worker's progress is a `Mutex[DsiProgress]`. `apply_devices` parks every thread that reaches
      a device and then replaces the whole set, locks included.
-   - Left for slice 4: the storage path (`StorageState`, the SDMMC host and card, the SD image and
-     the image writer's queue, `disk_failed` and `disk_pending`) is still under the module-level
-     `storage_lock`; the console's state is under `console_lock`.
 4. **Delete the remaining globals.** A `Peripheral` trait (`read`, `write`, `advance`, `due`,
    `reset`) replaces the closed `enum Device` and its dispatch sites, over the device structs.
    `first`, `second`, the SIO FIFOs, the console and `virt.machine` itself go. Every entry point
    takes a `*Machine`.
+   - Done: the storage path and the console. `StorageState` keeps what the board fixes and holds
+     the SPI controller, the GPIO banks and an SPI card in `live: Mutex[StorageLive]`; the SDMMC
+     host and its card are `sdmmc.live: Mutex[SdmmcLive]`, and `check_storage` hands a card on the
+     SDMMC to the SDMMC (`(StorageState, Option[&sd.Card])`). Where both are held, the SDMMC's lock
+     is taken first, never the reverse. The SD image is one `&sync SdImage`: its bytes in a
+     `Mutex[Buf[u8]]`, and its writer (the sector queue, the frozen file name, atomic `failed` and
+     `pending`, the thread) beside them; `sd_image()` answers a `&sync Frozen[u8]` copy. The
+     console is `Machine.console: Console` (its channel, an atomic `ctrl` and
+     `live: Mutex[ConsoleLive]`), and `output()` answers a `&sync Frozen[u8]`. The DSI worker is
+     `Scheduler.dsi: DsiWorker`. `storage_lock` and `console_lock` are gone.
+   - Left: `first`, `second`, the cores' option globals, the SIO FIFOs and spinlocks, the bus
+     cache, the `enum Device` dispatch, and `virt.machine` itself.
 5. **Headers and Product.** `Pin` and `header` on boards, product files with wiring, run-time wire
    edits, and the product view.

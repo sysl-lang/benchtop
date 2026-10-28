@@ -1,14 +1,18 @@
 module sh.sysl.benchtop.virt
 
 import sh.sysl.benchtop.peripheral.dsi as dsi
-import sysl.threads.{Thread,Mutex,Condvar,channel,spawn,current}
+import sysl.threads.{Thread,Mutex,Condvar,Channel,channel,spawn,current}
 import sysl.buf.{Buf,buf}
 
 // Fixed packet values cross the channel; no views, display references or CPU
 // pointers cross domains. The existing bounded channel supplies the semaphore-
 // style queue wakeups. CPU producers use try_send, never a blocking send.
 private const DSI_QUEUE_CAPACITY: usize = 64
-private struct DsiPacket
+
+/** A DSI packet a core's write sends the DSI worker: its virtual channel, its kind, the read it
+ * answers (if any), and its first `count` bytes.
+ */
+struct DsiPacket
     channel: u32
     kind: u32
     request: u64
@@ -16,17 +20,30 @@ private struct DsiPacket
     bytes: [1024]u8
 
 /** What the DSI worker has been given and has done, and its thread's id once it runs. */
-private struct DsiProgress
+struct DsiProgress
     outstanding: u64
     completed: u64
     thread_id: u64
 
-private var dsi_slots: [64]DsiPacket = [DsiPacket(0,0,0,0,[0;1024]);64]
-private var dsi_queue = channel(dsi_slots[..])
-private var dsi_handle: Option[Thread] = None
-private var dsi_progress = Mutex.new(DsiProgress(0,0,0))
-private var dsi_changed = Condvar.new()
-private[virt] var dsi_async = false
+/** The DSI worker: the host thread that applies the packets the cores' writes send it to the
+ * displays, which runs while the CPU workers do (`running`), its queue (`queue`, its packets held in
+ * `slots`, whose lock no thread takes), and its progress, which `changed` is notified of. The scheduler
+ * owns it, and the worker's thread holds the queue's address, so it is reset in place, never replaced.
+ */
+struct DsiWorker
+    slots: Mutex[Buf[DsiPacket]]
+    queue: Channel[DsiPacket]
+    handle: Option[Thread]
+    progress: Mutex[DsiProgress]
+    changed: Condvar
+    running: bool
+
+/** A DSI worker not started. */
+dsi_worker() -> DsiWorker
+    var slots: Buf[DsiPacket] = buf()
+    for i in 0..<DSI_QUEUE_CAPACITY do slots.push(DsiPacket(0,0,0,0,[0;1024]))
+    val queue = channel(slots.view())
+    DsiWorker(Mutex.new(slots), queue, None, Mutex.new(DsiProgress(0,0,0)), Condvar.new(), false)
 
 struct DsiWorkerStatus
     worker_id: u64
@@ -35,66 +52,75 @@ struct DsiWorkerStatus
     completed: u64
 
 dsi_worker_status() -> DsiWorkerStatus
-    val queued = if dsi_async then dsi_queue.len() else 0
-    dsi_progress.with(p -> DsiWorkerStatus(p.thread_id,queued,p.outstanding,p.completed))
+    val w = &scheduler.dsi
+    val queued = if w.running then w.queue.len() else 0
+    w.progress.with(p -> DsiWorkerStatus(p.thread_id,queued,p.outstanding,p.completed))
+
+// Whether the DSI worker runs: a core's DSI write then queues its packet rather than applying it.
+@inline
+private[virt] dsi_async() -> bool = scheduler.dsi.running
 
 private[virt] start_dsi_worker() -> Result[unit,string]
     if !machine.devices.dsi.present then return Ok(())
-    dsi_queue = channel(dsi_slots[..])
-    dsi_progress.with(p -> *p = DsiProgress(0,0,0))
-    dsi_async = true
+    val w = &scheduler.dsi
+    w.queue = w.slots.with(slots -> channel(slots.view()))
+    w.progress.with(p -> *p = DsiProgress(0,0,0))
+    w.running = true
     machine.devices.dsi.host.with(h -> (*h).defer_reads = true)
-    dsi_handle = spawn(&dsi_device_body,&dsi_queue,1 << 20)
-    if dsi_handle.is_none()
-        dsi_async = false
+    w.handle = spawn(&dsi_device_body,w,1 << 20)
+    if w.handle.is_none()
+        w.running = false
         machine.devices.dsi.host.with(h -> (*h).defer_reads = false)
         return Err("cannot create the DSI device worker")
-    val p = dsi_progress.lock_raw()
-    while p.thread_id == 0 do dsi_changed.wait(&dsi_progress)
-    dsi_progress.unlock_raw()
+    val p = w.progress.lock_raw()
+    while p.thread_id == 0 do w.changed.wait(&w.progress)
+    w.progress.unlock_raw()
     Ok(())
 
 // Only call with CPU producers parked. This is a control/debug barrier, never
 // part of normal instruction execution or status polling.
 private[virt] flush_dsi_worker()
-    if !dsi_async then return
+    val w = &scheduler.dsi
+    if !w.running then return
     loop
-        val p = dsi_progress.lock_raw()
-        while p.outstanding != 0 do dsi_changed.wait(&dsi_progress)
-        dsi_progress.unlock_raw()
+        val p = w.progress.lock_raw()
+        while p.outstanding != 0 do w.changed.wait(&w.progress)
+        w.progress.unlock_raw()
         // A previously full queue may have held a due hardware command busy.
         // Catch it up to the parked board clock before declaring the barrier.
         machine.devices.dsi.host.with(h ->
             advance_dsi(h,scheduler.now)
             publish_dsi_deadline(h))
-        if dsi_progress.with(p -> p.outstanding == 0) then return
+        if w.progress.with(p -> p.outstanding == 0) then return
 
 private[virt] stop_dsi_worker()
-    if !dsi_async then return
+    val w = &scheduler.dsi
+    if !w.running then return
     flush_dsi_worker()
-    dsi_queue.close()
-    dsi_handle.unwrap().join()
-    dsi_handle = None
-    dsi_async = false
+    w.queue.close()
+    w.handle.unwrap().join()
+    w.handle = None
+    w.running = false
     machine.devices.dsi.host.with(h -> (*h).defer_reads = false)
-    dsi_progress.with(p -> p.thread_id = 0)
+    w.progress.with(p -> p.thread_id = 0)
 
-private[virt] dsi_queue_has_room() -> bool = !dsi_async || dsi_queue.len() < DSI_QUEUE_CAPACITY
+private[virt] dsi_queue_has_room() -> bool = !dsi_async() || scheduler.dsi.queue.len() < DSI_QUEUE_CAPACITY
 
 // Under the host's lock: there is only one producer at a time, and advance_dsi
 // already checked capacity. A full host queue leaves the command FIFO busy.
 private[virt] enqueue_dsi_packet(vc: u32, kind: u32, bytes: []const u8, request: u64)
+    val w = &scheduler.dsi
     var packet = DsiPacket(vc,kind,request,bytes.len,[0;1024])
     for i in 0..<bytes.len do packet.bytes[i] = bytes[i]
-    dsi_progress.with(p -> p.outstanding += 1)
-    assert(dsi_queue.try_send(packet),"DSI queue capacity checked under the host's lock")
+    w.progress.with(p -> p.outstanding += 1)
+    assert(w.queue.try_send(packet),"DSI queue capacity checked under the host's lock")
 
-private dsi_device_body(queue: *sysl.threads.Channel[DsiPacket])
-    dsi_progress.with(p ->
+private dsi_device_body(w: *DsiWorker)
+    w.progress.with(p ->
         p.thread_id = current().id
-        dsi_changed.notify_all())
+        w.changed.notify_all())
     loop
-        val packet = queue.receive() match
+        val packet = w.queue.receive() match
             Some(p) -> p
             None -> break
         // Freeing a queue slot lets a due hardware command complete. Never
@@ -107,7 +133,7 @@ private dsi_device_body(queue: *sysl.threads.Channel[DsiPacket])
             machine.devices.dsi.host.with(h ->
                 dsi.complete_read(*h,packet.request,response.view())
                 publish_dsi_deadline(h))
-        dsi_progress.with(p ->
+        w.progress.with(p ->
             p.completed += 1
             p.outstanding -= 1
-            dsi_changed.notify_all())
+            w.changed.notify_all())
