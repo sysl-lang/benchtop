@@ -34,14 +34,14 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#3 | four schedulers share one set of globals | fixed by slice 3 (`679528a`): one `Scheduler`; `pump_parallel` and `parallel.sysl` gone; `run_on_threads` and `threaded` split |
 | runtime#4 | locks guard nothing: `Mutex.new(0)` around separate globals | fixed by slice 3 (`679528a`, `d72cffd`, `a53b6ff`): `Mutex[WorkerControl]`, device state in `Mutex[T]`; the one `Mutex[u64]` owns the board clock it guards |
 | runtime#5 | `assemble` mutates globals before it can still fail | fixed by slices 1–2 (`ce0b959`, `3024687`): `plan` checks everything, the apply step cannot fail |
-| runtime#6 | peripheral kinds and window sizes duplicated; one wrong error message | partly fixed in `013e796` (the duplicate-I2C refusal names both kinds); the kind table and the double `controller` parse remain |
+| runtime#6 | peripheral kinds and window sizes duplicated; one wrong error message | fixed in `SHA` (one `DEVICE_KINDS` table gives the device and its refusal name; sizes from the registry; `controller` read once into the DMA device, which `check_audio` takes from the bus) |
 | runtime#7 | magic register fields where the comments name the field | open |
 | runtime#8 | hand-rolled ring buffers where `Ring` exists | open |
 | runtime#9 | the DMA bus master is "whichever core last touched audio" | open |
 | runtime#10 | conditional locking keyed on a mutable global | fixed by slice 3 (`d72cffd`): `rp.live` is taken on every access, whichever thread |
 | runtime#11 | host workflow reaches into virt globals and duplicates the image layout | open |
 | runtime#12 | per-core configuration as parallel arrays, copy-pasted core setup | open (part of slice 4 part 2: the cores' option globals) |
-| runtime#13 | generic checker contains part-specific rules | open |
+| runtime#13 | generic checker contains part-specific rules | fixed in `SHA` (`PartSpec.rule` and `defaults` beside each part in the registry; `PinOwner` struct) |
 | runtime#14 | boolean-trap positional constructors | open |
 | runtime#15 | wall-clock, busy-spinning tests | open |
 | runtime#16 | `start_workers` mutates state before it validates | fixed by slice 3 (`679528a`): the divisor check runs before anything is set |
@@ -52,9 +52,9 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#21 | stale or misleading comments, dead paths | partly fixed (slice 3 deleted `parallel.sysl` and its "legacy" comments); the rest open |
 | peripherals#1 | registers are magic offsets and masks; bitfields never used | open |
 | peripherals#2 | no common peripheral interface | open (slice 4 part 2) |
-| peripherals#3 | the STM32H747 MCU is pasted into three board files | open |
-| peripherals#4 | MCU facts in board files; pin routing written twice | open |
-| peripherals#5 | the board/MCU schema is inconsistent with itself | open |
+| peripherals#3 | the STM32H747 MCU is pasted into three board files | fixed in `SHA` (`mcus/stm32h747.hocon`, every GPIO bank; the three boards say `mcu = stm32h747`; `h747-cores` is a virtual harness chip and says so) |
+| peripherals#4 | MCU facts in board files; pin routing written twice | fixed in `SHA` (GPIO reset modes and each signal's possible pins in the mcu; the board picks under `buses` only, which the SPI/SDMMC read) |
+| peripherals#5 | the board/MCU schema is inconsistent with itself | fixed in `SHA` (kebab-case keys; `wire { }` the one wiring form and bare pins the one board pin form, the others refused; Hazard3 is `mcus/rp2350-hazard3.hocon`) |
 | peripherals#6 | two ownership conventions and three `reset` styles | open |
 | peripherals#7 | five or more hand-rolled ring buffers | open |
 | peripherals#8 | protocol states and reply kinds are bare integers | open |
@@ -91,8 +91,8 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | ui-firmware#17 | dead code and unused imports | open |
 | ui-firmware#18 | the TFT raster cache grows without bound | open |
 | ui-firmware#19 | display renderers repeat the same scaffold | open |
-| ui-firmware#20 | validation duplicated with different bounds | open |
-| ui-firmware#21 | HOCON parse errors are discarded | open |
+| ui-firmware#20 | validation duplicated with different bounds | fixed in `SHA` (`plot.MIN_CAPACITY`/`MAX_CAPACITY` are the one bound) |
+| ui-firmware#21 | HOCON parse errors are discarded | fixed in `SHA` (the diagnostic is rendered; `KNOWN_FIELDS` with `sysl.slices.contains`) |
 | ui-firmware#22 | tests in `ui/` that test firmware; hand-computed struct offsets | open |
 | ui-firmware#23 | inconsistent formatting suggests no formatter | open |
 | ui-firmware#24 | stale notes, development-step wording | partly fixed in `6f28a13` (the docs say what is true now); the source comments remain |
