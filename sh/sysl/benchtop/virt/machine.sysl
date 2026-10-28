@@ -3,7 +3,7 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.{Board, ChipForm, Core, Description, Peripheral, ProductForm, Registry, article_of, built_in_shelf, core_option, library, param_named, load, open_description, unemulated_core_option}
 import sh.sysl.benchtop.v6m.{Kind, RAM_BYTES, default_priority_bits, has_fixed_dsp, model_named, model_names}
 import sh.sysl.parsing.{Diagnostic, Source, Span, source}
-import sh.sysl.benchtop.v6m.{Cpu, Memory, MemoryMap, RamBank, memory, ram_only}
+import sh.sysl.benchtop.v6m.{Cpu, Fpu, Memory, MemoryMap, RamBank, memory, ram_only}
 import sysl.buf.{Buf, buf}
 
 // A board description made into the machine benchtop runs.
@@ -73,19 +73,10 @@ end runnable
 assemble(b: Board, reg: Registry) -> Result[unit, string]
     val p = plan(b, reg)?
 
-    board_clock_hz = p.clock_hz
+    machine.clock_hz = p.clock_hz
     machine.map = p.map
     apply_devices(p.devices)
-    core_clock_divisors = p.divisors
-    for k in 0..<2
-        val c = p.cores[k]
-
-        core_instruction_timing[k] = c.timed
-        core_kinds[k] = c.kind
-        core_priority_bits[k] = c.priority_bits
-        core_dsp[k] = c.dsp
-        core_fpu[k] = c.fpu
-
+    machine.configs = p.cores
     Ok(())
 
 /** What a description makes of a machine, decided and checked whole before any of it is set. */
@@ -93,15 +84,22 @@ private struct Plan
     map: MemoryMap
     devices: Devices
     clock_hz: u64
-    divisors: [2]u64
-    cores: [2]CoreSetup
+    cores: [2]CoreConfig
 
-private struct CoreSetup
+/** One core as the description makes it: its model and options, and how many ticks of the chip's
+ * clock one tick of its own takes (`divisor`; 1 where it runs at the chip's clock). `boot` and
+ * `launch` give a core its configuration with `configure`.
+ */
+struct CoreConfig
     kind: Kind
     timed: bool
     priority_bits: u32
     dsp: bool
-    fpu: u32
+    fpu: Fpu
+    divisor: u64
+
+/** A core no description has configured: an ARMv6-M with its default options, at the chip's clock. */
+private[virt] unconfigured() -> CoreConfig = CoreConfig(Kind.V6m, false, 2, false, Fpu.Absent, 1)
 
 /** The machine `b` describes, or why benchtop cannot run it. It sets nothing. */
 private plan(b: Board, reg: Registry) -> Result[Plan, string]
@@ -247,11 +245,11 @@ private plan(b: Board, reg: Registry) -> Result[Plan, string]
     val map = MemoryMap(memory_ram_at, memory_ram_size, memory_flash_at, memory_flash_size, banks)
     val devices = check_devices(b, ds.view(), clock_hz)?
 
-    Ok(Plan(map, devices, clock_hz, divisors, [core_setup(cores.at(0)), core_setup(cores.at(1))]))
+    Ok(Plan(map, devices, clock_hz, [core_config(cores.at(0), divisors[0]), core_config(cores.at(1), divisors[1])]))
 end plan
 
-// A core's kind and options, from a core `plan` has checked.
-private core_setup(core: Core) -> CoreSetup
+// A core's kind and options, from a core `plan` has checked, and its clock's divisor.
+private core_config(core: Core, divisor: u64) -> CoreConfig
     val kind = model_named(core.name).unwrap().kind
     val timed = core_option(core, "instruction-timing") match
         Text(mode) -> mode == "estimated"
@@ -262,11 +260,11 @@ private core_setup(core: Core) -> CoreSetup
     val dsp = core_option(core, "dsp") match
         Flag(on) -> on
         _ -> has_fixed_dsp(kind)
-    val fpu: u32 = core_option(core, "fpu") match
-        Text(unit) -> if unit == "dp" then 2 elif unit == "sp" then 1 else 0
-        _ -> 0
+    val fpu = core_option(core, "fpu") match
+        Text(unit) -> if unit == "dp" then Fpu.Double elif unit == "sp" then Fpu.Single else Fpu.Absent
+        _ -> Fpu.Absent
 
-    CoreSetup(kind, timed, priority_bits, dsp, fpu)
+    CoreConfig(kind, timed, priority_bits, dsp, fpu, divisor)
 
 // The device on the cores' bus that a peripheral of the description is, or none for a kind benchtop
 // does not put there.
@@ -343,8 +341,10 @@ private core_names(cores: Buf[Core]) -> string
 /** One board as benchtop runs it. It holds the board's memory: the map `assemble` planned, which
  * `boot` lays out, and the storage both cores run on, which the machine owns and the cores point at.
  * It holds its devices: the bus and each peripheral's state (devices.sysl). It holds its two cores,
- * each of which reaches the machine back through its `bus`, which `boot` and `launch` point here.
- * docs/machine.md says what joins it next.
+ * each of which reaches the machine back through its `bus`, which `boot` and `launch` point here,
+ * and what the description makes of each (`configs`), with the chip's clock (`clock_hz`, 0 where it
+ * names none). `bus_cache` is each core's last device on the bus. docs/machine.md says what joins it
+ * next.
  */
 struct Machine
     map: MemoryMap
@@ -352,9 +352,12 @@ struct Machine
     devices: Devices
     console: Console
     cores: [2]Cpu
+    configs: [2]CoreConfig
+    clock_hz: u64
+    bus_cache: [2]BusCache
 
 /** The board this process runs, until every entry point is handed its machine. */
-var machine = Machine(ram_only(), memory(), no_devices(), console(), unbooted_cores())
+var machine = Machine(ram_only(), memory(), no_devices(), console(), unbooted_cores(), [unconfigured(); 2], 0, [no_bus_cache(); 2])
 
 // Two cores before any `boot`, every field zero; `boot` gives them their kind, memory and bus.
 private unbooted_cores() -> [2]Cpu
@@ -364,7 +367,8 @@ private unbooted_cores() -> [2]Cpu
 /** Where the board puts its memory, as the last description assembled said. */
 memory_map() -> MemoryMap = machine.map
 
-var board_clock_hz: u64 = 0
+/** The chip's clock; zero means the description uses legacy pacing. */
+clock_hz() -> u64 = machine.clock_hz
 
-/** Zero means the description uses legacy pacing. */
-clock_hz() -> u64 = board_clock_hz
+/** How many ticks of the chip's clock one tick of each core's takes. */
+clock_divisors() -> [2]u64 = [machine.configs[0].divisor, machine.configs[1].divisor]

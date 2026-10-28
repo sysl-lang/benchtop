@@ -171,28 +171,38 @@ private[virt] bus_of(ds: []const Mapped) -> BusState
             _ -> ()
     bus
 
-// Each CPU owns one cache line. Cache only address decoding, never register
-// values or peripheral side effects. The device table is immutable while running.
-private struct BusCache
+/** The largest cache line of the hosts benchtop runs on: Apple silicon's are 128 bytes (x86's 64,
+ * whose adjacent-line prefetch pairs them into 128 too). Two cores' threads writing within one line
+ * slow each other down although they share no data.
+ */
+const HOST_CACHE_LINE: usize = 128
+
+/** A core's last device on the bus, `index` into `mapped` (past `attached` for none). It caches only
+ * where an address goes, never a register's value or a device's side effect, and the bus does not
+ * change while the cores run. Each core's has a host cache line of its own, since each core's thread
+ * writes its own.
+ */
+@align(HOST_CACHE_LINE)
+struct BusCache
     index: usize
-    padding: [56]u8
-private var bus_cache: [2]BusCache = [BusCache(0xffffffffffffffff,[0;56]);2]
+
+private[virt] no_bus_cache() -> BusCache = BusCache(0xffffffffffffffff)
 
 // Forget each core's last device, for a bus that has changed.
 private[virt] forget_bus_cache()
-    for k in 0..<2 do bus_cache[k].index = 0xffffffffffffffff
+    for k in 0..<2 do machine.bus_cache[k] = no_bus_cache()
 
 private bus_mapping(c: *Cpu, address: u32) -> *Mapped
     val bus = &machine.devices.bus
-    val k = usize(c.core)
-    val cached = bus_cache[k].index
+    val cache = &machine.bus_cache[usize(c.core)]
+    val cached = cache.index
     if cached < bus.attached
         val m = &bus.mapped[cached]
         if address >= m.base && address <= m.last then return m
     for i in 0..<bus.attached
         val m = &bus.mapped[i]
         if address >= m.base && address <= m.last
-            bus_cache[k].index = i
+            cache.index = i
             return m
     null
 
@@ -232,13 +242,6 @@ console() -> Console
     val typed = channel(slots.view())
     Console(Mutex.new(slots), typed, 0, Mutex.new(console_live()))
 
-// What the two cores are, as the board description says.
-var core_instruction_timing: [2]bool = [false,false]
-var core_kinds: [2]Kind = [Kind.V6m, Kind.V6m]
-var core_priority_bits: [2]u32 = [2, 2]
-var core_dsp: [2]bool = [false, false]
-// Each core's floating-point unit: none (0), single precision (1) or double (2).
-var core_fpu: [2]u32 = [0, 0]
 // The boot ROM's place in the launch sequence, 0 to 5, and the VTOR and SP it has taken.
 var step = 0
 var sent: [2]u32
@@ -422,26 +425,19 @@ image_of(file: []const u8) -> Result[Buf[u8], string]
 // quantum.
 boot(cpu: *Cpu, image: []const u8)
     pause_workers()
-    cpu.kind = core_kinds[0]
+    cpu.kind = machine.configs[0].kind
     memory.reset_mapped(cpu, machine.memory, image, machine.map)
-    configure_instruction_timing(cpu,core_instruction_timing[0])
-    cpu.priority_bits = core_priority_bits[0]
-    cpu.dsp = core_dsp[0]
-    cpu.fpu = core_fpu[0]
-    cpu.bus = &machine
+    configure(cpu, machine.configs[0])
     cpu.vtor = if machine.map.flash_size == 0 then machine.map.ram_at else machine.map.flash_at
     cpu.r[13] = load32(cpu, cpu.vtor)
     cpu.pc = load32(cpu, cpu.vtor + 4) & ~1
 
     val second = core1()
-    second.kind = core_kinds[1]
+    second.kind = machine.configs[1].kind
     second.core = 1
     memory.attach_memory(second, machine.memory)
     clear(second, 0)
-    configure_instruction_timing(second,core_instruction_timing[1])
-    second.priority_bits = core_priority_bits[1]
-    second.dsp = core_dsp[1]
-    second.fpu = core_fpu[1]
+    configure(second, machine.configs[1])
     step = 0
 
     for k in 0..<2
@@ -471,11 +467,7 @@ launch(vtor: u32, sp: u32, entry: u32)
     val second = core1()
     memory.attach_memory(second, machine.memory)
     clear(second, entry & ~1)
-    configure_instruction_timing(second,core_instruction_timing[1])
-    second.priority_bits = core_priority_bits[1]
-    second.dsp = core_dsp[1]
-    second.fpu = core_fpu[1]
-    second.bus = &machine
+    configure(second, machine.configs[1])
     second.vtor = vtor
     second.r[13] = sp
     if cpu_models_differ()
@@ -487,6 +479,15 @@ launch(vtor: u32, sp: u32, entry: u32)
     if entry & 1 == 0
         second.pc = entry
         halt(second, Stop.Fault, entry)
+
+// Make core `c`, just reset, the core `cfg` describes, on this machine's bus.
+private configure(c: *Cpu, cfg: CoreConfig)
+    c.kind = cfg.kind
+    configure_instruction_timing(c, cfg.timed)
+    c.priority_bits = cfg.priority_bits
+    c.dsp = cfg.dsp
+    c.fpu = cfg.fpu
+    c.bus = &machine
 
 private[virt] device_due() -> u64 = min(sdmmc_due(), min(min(min(min(timer_due(), adc_due()), spi_due()),dsi_due()),sai_dma_due()))
 private[virt] device_wake(cpu: *Cpu) -> u64 = min(sdmmc_wake(cpu), min(min(min(min(timer_wake(cpu), adc_wake(cpu)), spi_wake(cpu)),dsi_due()),sai_dma_wake(cpu)))
@@ -709,4 +710,7 @@ private boot_rom(cpu: *Cpu, w: u32)
     launch(sent[0], sent[1], w)
     set_limit(cpu, 0)
 
-private[virt] cpu_models_differ() -> bool = core_kinds[0] != core_kinds[1] || core_instruction_timing[0] != core_instruction_timing[1]
+private[virt] cpu_models_differ() -> bool
+    val (a, b) = (machine.configs[0], machine.configs[1])
+
+    a.kind != b.kind || a.timed != b.timed
