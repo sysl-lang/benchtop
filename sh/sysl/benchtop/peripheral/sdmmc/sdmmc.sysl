@@ -4,9 +4,18 @@ import sh.sysl.benchtop.parts.sd_card as card
 
 const NEVER: u64 = 0xffffffffffffffff
 const STATIC_FLAGS: u32 = 0x1fe00fff
-const DATA_ERRORS: u32 = 2 | 8 | 16 | 32 | (1 << 27)
 const IDMABTC: u32 = 1 << 28
 const BUSYEND: u32 = 1 << 21
+
+/** What the host has done, for tests and instruments; nothing in the model reads it back. */
+struct Stats
+    commands: u64
+    transfers: u64
+    blocks: u64
+    buffer_completions: u64
+    multi_transfers: u64
+    double_transfers: u64
+
 // Timed native SD command/data paths. IDMA advances in <=32-byte wire bursts,
 // so inactive buffers can be replaced while the other buffer is in flight.
 struct Host
@@ -30,13 +39,8 @@ struct Host
     command_due: u64
     data_due: u64
     command_arg: u32
-    data_index: u32
-    data_base: u32
-    data_length: u32
     data_write: bool
     timeout_due: u64
-    commands: u64
-    transfers: u64
     base1: u32
     buffer_size: u32
     buffer_used: u32
@@ -47,16 +51,26 @@ struct Host
     loaded: bool
     payload: [512]u8
     busy_due: u64
-    blocks: u64
-    buffer_completions: u64
-    multi_transfers: u64
-    double_transfers: u64
+    stats: Stats
+
+/** A host at reset with the given clocks: every register zero and nothing due. The one place the
+ * reset state is written; `host` boxes it and `reset` stores it over a live host.
+ */
+private fresh(hz: u64, kernel: u64) -> Host
+    var h: Host
+    h.hz = hz
+    h.kernel = kernel
+    h.command_due = NEVER
+    h.data_due = NEVER
+    h.timeout_due = NEVER
+    h.busy_due = NEVER
+    h
 
 host(hz: u64 = 480000000, kernel: u64 = 60000000) -> &Host
     require hz > 0 && kernel > 0 && kernel <= hz, "SDMMC timebase and kernel clock"
-    Host(hz,kernel,0,0,0,0,0,[0;4],0,0,0,0,0,0,0,0,0,NEVER,NEVER,0,0,0,0,false,NEVER,0,0,
-        0,0,0,0,0,0,0,false,[0;512],NEVER,0,0,0,0)
-reset(h: &Host) = *h = *host(h.hz,h.kernel)
+    fresh(hz,kernel)
+
+reset(h: &Host) = *h = fresh(h.hz,h.kernel)
 clock_hz(h: &Host) -> u64 = if h.clock & 1023 == 0 then h.kernel else h.kernel / (2 * u64(h.clock & 1023))
 private ticks(h: &Host, clocks: u64) -> u64
     val rate = clock_hz(h)
@@ -89,7 +103,7 @@ private schedule(h: &Host, time: u64)
     if h.timeout_due < h.data_due then h.data_due = h.timeout_due
 private finish_command(h: &Host, c: Option[&card.Native], routed: bool, at: u64)
     h.command_due = NEVER
-    h.commands += 1
+    h.stats.commands += 1
     if c.is_none() || !routed
         h.flags |= 4
         return
@@ -102,28 +116,27 @@ private finish_command(h: &Host, c: Option[&card.Native], routed: bool, at: u64)
     if !reply.present
         h.flags |= 4
         return
-    if reply.kind != 0
+    if reply.kind != card.NoResponse
         h.response = reply.words
-        h.response_command = if reply.kind == 2 || reply.kind == 3 then 63 else index
+        h.response_command = if reply.kind.reports_no_index() then 63 else index
     val expected = (h.command >> 8) & 3
     if expected == 0 then h.flags |= 128
-    elif expected == reply.kind || (expected == 2 && reply.kind == 1) then h.flags |= 64
+    elif expected == u32(reply.kind) || (expected == u32(card.ShortNoCrc) && reply.kind == card.Short) then h.flags |= 64
     else h.flags |= 1
-    if reply.data == 0 || reply.words[0] & 0xfdffe008 != 0 then return
-    val writing = reply.data == 24 || reply.data == 25
-    val multiple = reply.data == 18 || reply.data == 25
+    if reply.data == card.NoTransfer || reply.words[0] & 0xfdffe008 != 0 then return
+    val writing = reply.data.writes()
+    val multiple = reply.data.multiple()
+    val length = reply.data.block_length()
     val block = 1u32 << ((h.control >> 4) & 15)
     val total = if block <= 512 then h.length / block * block else 0
-    val count_ok = total >= reply.length && (multiple || total == reply.length)
-    if h.data_due != NEVER || h.command & 64 == 0 || h.idma & 1 == 0 || ((h.control & 2 == 0) != writing) || !count_ok || block != reply.length || h.base & 3 != 0 || (h.idma & 2 != 0 && (h.buffer_size == 0 || h.base1 & 3 != 0))
+    val count_ok = total >= length && (multiple || total == length)
+    if h.data_due != NEVER || h.command & 64 == 0 || h.idma & 1 == 0 || ((h.control & 2 == 0) != writing) || !count_ok || block != length || h.base & 3 != 0 || (h.idma & 2 != 0 && (h.buffer_size == 0 || h.base1 & 3 != 0))
         abort_data(h,c,at,1 << 27)
         return
     val lanes: u32 = if h.clock & 0xc000 == 0x4000 then 4 else 1
     if native.width != lanes
         abort_data(h,c,at,2)
         return
-    h.data_index = reply.data
-    h.data_length = total
     h.data_write = writing
     h.remaining = total
     h.transferred = 0
@@ -132,8 +145,8 @@ private finish_command(h: &Host, c: Option[&card.Native], routed: bool, at: u64)
     h.buffer_used = 0
     h.loaded = false
     h.timeout_due = at + ticks(h,u64(h.timer))
-    if multiple then h.multi_transfers += 1
-    if h.idma & 2 != 0 then h.double_transfers += 1
+    if multiple then h.stats.multi_transfers += 1
+    if h.idma & 2 != 0 then h.stats.double_transfers += 1
     schedule(h,at)
 
 // RAM callbacks validate complete views before accessing memory. Card/media
@@ -175,7 +188,6 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
         if address + u64(h.chunk) > 0x100000000
             abort_data(h,c,at,1 << 27)
             continue
-        h.data_base = u32(address)
         val piece = h.payload[usize(h.block_used)..<usize(h.block_used + h.chunk)]
         val moved = if h.data_write then (read_ram)(u32(address),piece) else (write_ram)(u32(address),piece)
         if !moved
@@ -188,7 +200,7 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
         if h.idma & 2 != 0 && h.buffer_used == h.buffer_size
             h.idma ^= 4
             h.buffer_used = 0
-            h.buffer_completions += 1
+            h.stats.buffer_completions += 1
             h.flags |= IDMABTC
         if h.block_used == h.block_size
             if h.data_write
@@ -197,14 +209,14 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
                     continue
                 h.busy_due = if native.card.busy_until > at then native.card.busy_until else retry(h,at)
             else card.native_read_complete(native)
-            h.blocks += 1
+            h.stats.blocks += 1
             h.flags |= 1024
             h.block_used = 0
             h.loaded = false
             h.timeout_due = at + ticks(h,u64(h.timer))
         if h.remaining == 0
             h.flags |= 256
-            h.transfers += 1
+            h.stats.transfers += 1
         else schedule(h,at)
     h.at = time
 

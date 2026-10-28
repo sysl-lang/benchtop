@@ -1,6 +1,8 @@
 module sh.sysl.benchtop.peripheral.dsi
 
 import sysl.buf.{Buf,buf}
+import sysl.container.ring.InlineRing
+import sysl.math.min
 
 /** STM32 DSI command-mode host. Packets cross a timed link before the attached
  * endpoint receives them. Endpoints are independent of MCU addresses and GPIO.
@@ -19,9 +21,7 @@ struct Host
     busy: bool
     due: u64
     time: u64
-    rx: [1024]u8
-    rx_count: usize
-    rx_at: usize
+    rx: InlineRing[u8, 1024]
     max_return: usize
     defer_reads: bool
     response_pending: bool
@@ -29,9 +29,17 @@ struct Host
 
 host(hz: u64, reference_hz: u64 = 25000000) -> &Host
     require hz > 0 && hz <= 1000000000 && reference_hz > 0 && reference_hz <= 1000000000, "bounded DSI clock rates"
-    val h: &Host = Host(hz,reference_hz,0,[0;269],[0;1024],0,[0;1024],0,0,false,0,0,[0;1024],0,0,1,false,false,0)
+    var h: Host
+    h.hz = hz
+    h.reference_hz = reference_hz
+    h.max_return = 1
     h.regs[0x34 / 4] = 1 // Command mode.
     h
+
+/** Replaces the receive FIFO's contents with a read response, cut at the maximum return size. */
+private receive(h: &Host, response: []const u8)
+    h.rx.clear()
+    for i in 0..<min(response.len,h.max_return) do h.rx.push_back(response[i])
 
 /** Callback arguments are VC, packet data type, exact unpadded payload, and the host's request
  * number, which a deferred read's completion names. Read-request responses are raw device bytes. A
@@ -53,10 +61,7 @@ advance(h: &Host, time: u64, endpoint: Endpoint)
             h.due = 0xffffffffffffffff
         val response = endpoint((h.header >> 6) & 3,kind,h.packet[..<h.packet_count],h.request_id)
         if reading && h.defer_reads then return
-        if reading
-            h.rx_count = if response.len() < h.max_return then response.len() else h.max_return
-            h.rx_at = 0
-            for i in 0..<h.rx_count do h.rx[i] = response.at(i)
+        if reading then receive(h,response.view())
     h.busy = false
 
 private ready(h: &Host) -> bool = h.regs[1] & 1 != 0 && h.regs[0x34 / 4] & 1 != 0 &&
@@ -76,15 +81,15 @@ read(h: &Host, offset: u32) -> Option[u32]
         0x00 -> Some(0x3133302a)
         0x6c -> Some(h.header)
         0x74 -> Some((if h.busy then 2u32 else 1u32) | (if h.tx_count == 0 then 4 else 0) |
-            (if h.tx_count == 1024 then 8 else 0) | (if h.rx_at == h.rx_count then 16 else 0) |
-            (if h.rx_count - h.rx_at == 1024 then 32 else 0) |
+            (if h.tx_count == 1024 then 8 else 0) | (if h.rx.is_empty() then 16 else 0) |
+            (if h.rx.is_full() then 32 else 0) |
             (if h.busy && ((h.header & 63) == 6 || (h.header & 63) == 4 || (h.header & 63) == 0x14 || (h.header & 63) == 0x24) then 64 else 0))
         0x70 ->
             var result: u32 = 0
             for i in 0..<4
-                if h.rx_at < h.rx_count
-                    result |= u32(h.rx[h.rx_at]) << u32(i * 8)
-                    h.rx_at += 1
+                h.rx.pop_front() match
+                    Some(byte) -> result |= u32(byte) << u32(i * 8)
+                    None -> break
             Some(result)
         0xb0 -> Some(if ready(h) then 0x15 | (if h.regs[0xa4 / 4] & 1 != 0 then 0x80 else 0) else 0)
         0x40c -> Some((if h.regs[0x430 / 4] & 0x01000000 != 0 then 0x1000u32 else 0) |
@@ -112,8 +117,7 @@ write(h: &Host, offset: u32, value: u32) -> bool
             h.response_pending = false
             h.request_id += 1
             h.tx_count = 0
-            h.rx_at = 0
-            h.rx_count = 0
+            h.rx.clear()
         h.regs[offset / 4] = value
         if h.busy && !ready(h)
             h.busy = false
@@ -160,9 +164,7 @@ write(h: &Host, offset: u32, value: u32) -> bool
  */
 complete_read(h: &Host, request_id: u64, response: []const u8) -> bool
     if !h.busy || !h.response_pending || h.request_id != request_id then return false
-    h.rx_count = if response.len < h.max_return then response.len else h.max_return
-    h.rx_at = 0
-    for i in 0..<h.rx_count do h.rx[i] = response[i]
+    receive(h,response)
     h.response_pending = false
     h.busy = false
     true
