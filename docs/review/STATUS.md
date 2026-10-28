@@ -8,14 +8,14 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 
 | finding | title | status |
 |---|---|---|
-| cores#1 | the RISC-V core is not wired into any board, and has no bus | open |
+| cores#1 | the RISC-V core is not wired into any board, and has no bus | partly fixed (core bus) in `aff3dad`: the hart reaches devices through a `riscv.Bus` trait off its RAM window; left: wiring a hart into a board, which waits on device handlers that take a v6m `*Cpu` and on the RP2350 chip layer (GPIO, UART, SIO, ROM) |
 | cores#2 | the memory map is process-global state the core reads on every access | fixed by slice 1 (`ce0b959`): `v6m.Memory` holds the map, `Cpu.mem` points at it |
 | cores#3 | every new `Op` must be written in five places | open |
 | cores#4 | hand-unrolled const-generic dispatch ladders, doubled by `TIMED` | open |
 | cores#5 | `TIMED`, `V8`, `SINGLE` are `const u32` used as booleans | open |
 | cores#6 | the timing switch checked at decode in three spellings; IT re-dispatch | open |
-| cores#7 | the RISC-V core is RP2350-specific while claiming to be generic | open |
-| cores#8 | RISC-V per-instruction cost far from "real-world speed" | open |
+| cores#7 | the RISC-V core is RP2350-specific while claiming to be generic | fixed in `aff3dad`: a `Chip` record holds what the integration fixes, `riscv/rp2350.sysl` is the one that names the RP2350 |
+| cores#8 | RISC-V per-instruction cost far from "real-world speed" | partly fixed in `aff3dad`, `6e909be`: cached IRQ line, decoded PMP with a Machine-mode fast path, word RAM access; 1247 → 224 host instructions per guest instruction (bench/README.md); left: a decode cache and the threaded executor v6m has |
 | cores#9 | NVIC banks use three indexing schemes | open |
 | cores#10 | flash write protection is an extra compare on every store | open |
 | cores#11 | sentinel and guard-record arithmetic in place of named concepts | open |
@@ -23,10 +23,10 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#13 | `h_dsp` re-checks DSP at run time against a second source of truth | open |
 | cores#14 | duplicated bit utilities and hand-rolled loops the library has | open |
 | cores#15 | boilerplate handler bodies | open |
-| cores#16 | RISC-V `execute` mixes decode, validation and commit | open |
+| cores#16 | RISC-V `execute` mixes decode, validation and commit | fixed in `aff3dad`: one `retire` commit path, faults carry an `Access` instead of a side channel |
 | cores#17 | `Stop.Budget` means "running" | open |
-| cores#18 | RISC-V `Model` fields that nothing reads | open |
-| cores#19 | Python-generated tests addressed by hard-coded record ranges | open (`6c2e46b` moved the vectors to `testdata/riscv`; the record ranges remain) |
+| cores#18 | RISC-V `Model` fields that nothing reads | fixed in `aff3dad`: `model.irqs` sizes the interrupt scan; the chip-fixed fields moved to `Chip` |
+| cores#19 | Python-generated tests addressed by hard-coded record ranges | fixed in `aff3dad`: each vector carries its mnemonic and the harness selects by it, iterating `MODELS` |
 | cores#20 | tests that restate the cost table | open |
 | cores#21 | comments that record history rather than invariants | open |
 | runtime#1 | no board object: the machine is module globals shared across threads | partly fixed by slices 1–4 (`ce0b959`, `3024687`, `679528a`, `d72cffd`, `a53b6ff`, `9d54348`): memory, devices, scheduler, workers and cores are owned; left: the cores' option globals, SIO FIFOs and spinlocks, the bus cache and `virt.machine` (slice 4 part 2) |
