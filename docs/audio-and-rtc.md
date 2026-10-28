@@ -3,8 +3,8 @@
 Board descriptions can name either a generic model or a real catalog part:
 
 ```hocon
-buzzer { part = PS1240P02BT, ref = BZ1, pin = controller.GP5, gain = 12 }
-rtc { part = DS3231SN, ref = U2, i2c = i2c0, initial-time = host }
+buzzer { part = PS1240P02BT, ref = BZ1, gain = 12, wire { pin = GP5 } }
+rtc { part = DS3231SN, ref = U2, initial-time = host, wire { i2c = i2c0 } }
 ```
 
 The catalog preserves manufacturer and ordering identity separately from behavior.

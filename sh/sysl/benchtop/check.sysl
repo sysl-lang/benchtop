@@ -2,7 +2,6 @@ module sh.sysl.benchtop
 
 import sh.sysl.parsing.{Report, Source, Span, error, nearest_name}
 import sysl.buf.{Buf, buf}
-import sh.sysl.benchtop.parts.ds3231 as rtc
 
 // A board or a product held to the library: every part is one the registry has, every wire goes to
 // something its port can take, pin sharing is limited to component inputs, every element is in the view, every key drives
@@ -127,33 +126,46 @@ private unmapped(p: Part, a: Option[Amount], key: string, spec: PartSpec, r: *Re
         None -> ()
 end unmapped
 
-// Pin owners retain a shared-input flag, including pins already used inside product boards.
+/** Who holds a pin: `who` (as `part.port`), wired at `at`, or on `board` itself where a product's
+ * board wired it (`at` is then nowhere); `shared` while every holder is a component input, which
+ * other inputs may share.
+ */
+struct PinOwner
+    pin: string
+    who: string
+    at: Span
+    board: string
+    shared: bool
+
+/** The pins wired so far, each with who holds it. */
 struct PinUses
-    owner: Buf[(string, string, Span, string, bool)]
+    owner: Buf[PinOwner]
 end PinUses
 
 // A pin wired to `who`, unless something has it already. `label` is how a message names the pin.
 claim(uses: *PinUses, src: Source, r: *Report, pin: string, label: string, who: string, span: Span, shared: bool = false)
-    for (held, first, at, board, input) in uses.owner
-        if held == pin then
-            if shared && input then return
-            val where = if board.is_empty() then s"at ${src.locate(at.start)}" else s"on the board `$board` itself"
+    for held in uses.owner
+        if held.pin == pin then
+            if shared && held.shared then return
+            val where = if held.board.is_empty() then s"at ${src.locate(held.at.start)}" else s"on the board `${held.board}` itself"
 
             r.add(error(span, s"$label is wired twice")
-                .with_note(s"it is already `$first`'s, $where"))
+                .with_note(s"it is already `${held.who}`'s, $where"))
             return
 
-    uses.owner.push((pin, who, span, "", shared))
+    uses.owner.push(PinOwner(pin, who, span, "", shared))
 end claim
 
 // Carry the board's ownership into a product, preserving explicitly shareable inputs.
 held_by_board(uses: *PinUses, pin: string, who: string, board: string, shared: bool = false)
     for i in 0..<uses.owner.len()
-        val held = uses.owner.at(i)
-        if held.0 != pin then continue
-        if !shared && held.4 then uses.owner.set(i, (held.0, held.1, held.2, held.3, false))
+        var held = uses.owner.at(i)
+        if held.pin != pin then continue
+        if !shared && held.shared
+            held.shared = false
+            uses.owner.set(i, held)
         return
-    uses.owner.push((pin, who, Span(0, 0), board, shared))
+    uses.owner.push(PinOwner(pin, who, Span(0, 0), board, shared))
 end held_by_board
 
 // Whether a pin exists on the chip, saying so where it does not.
@@ -217,15 +229,14 @@ end carries
 
 // -- parts -----------------------------------------------------------------------------------------
 
-// Direct fields are classified against the actual registry passed to the checker,
-// so custom catalogs and built-in parts use the same schema-driven connection syntax.
-private resolve_terminals(p: *Part, spec: PartSpec, r: *Report)
+// A part's ports are wired under `wire` and nowhere else: a setting named for one of its ports is
+// refused, and taken out of its parameters so it is not reported a second time as unknown.
+private misplaced_ports(p: *Part, spec: PartSpec, r: *Report)
     var params: Buf[Param] = buf()
     for q in p.params
         if spec.port(q.name).is_some()
-            q.value match
-                Text(value) -> p.wires.push(Wire(q.name, q.name_span, target_of(value), q.span))
-                _ -> r.add(error(q.span, s"`${p.name}.${q.name}` must name a connection point"))
+            r.add(error(q.name_span, s"`${p.name}.${q.name}` is a port, and a port is wired under `wire`")
+                .with_note(s"write it as `wire { ${q.name} = ${setting_text(q.value)} }`"))
         else params.push(q)
     p.params = params
 
@@ -259,7 +270,7 @@ private check_parts(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Sourc
                         .with_note(s"the parts benchtop knows are ${listing(reg.part_names())}"))
                 continue
 
-        resolve_terminals(&p, spec, r)
+        misplaced_ports(&p, spec, r)
         b.parts.set(index, p)
         unmapped(p, p.at, "at", spec, r)
         unmapped(p, p.size, "size", spec, r)
@@ -293,11 +304,9 @@ private check_parts(b: *Board, chip: Option[ChipSpec], reg: Registry, src: Sourc
                             r.add(error(w.span, s"`$who` takes a pin, and `$name` is a bus")
                                 .with_note("a pin is written `GP16`, or another part's port as `wifi.gpio0`"))
                         Port(other, its) ->
-                            if other == b.chip.name
-                                if real_pin(chip, r, its, w.span)
-                                    if (need == AdcPin || need == AnalogPin) && !adc_pin(chip, its)
-                                        r.add(error(w.span, s"`$who` needs an analogue-capable connection point; `$other.$its` has no ADC channel"))
-                                    else claim(pins, src, r, its, s"$other.$its", who, w.span, need == InputPin)
+                            if other == b.chip.name && b.chip.name != "" && part_named(b.parts, other).is_none()
+                                r.add(error(w.span, s"`$other.$its` names the board's own mcu, whose pins are written bare")
+                                    .with_note(s"write it as `$its`"))
                                 continue
                             wire_offered(b.parts, reg, src, r, &offered, need, who, other, its, w.span)
                 BusPort(kind) ->
@@ -403,35 +412,9 @@ check_params(p: Part, spec: PartSpec, r: *Report)
             Some(fixed) -> if setting_text(prm.value) != setting_text(fixed)
                 r.add(error(prm.span, s"${p.kind} has fixed ${prm.name} = ${setting_text(fixed)}"))
             None -> ()
-    if part_model(p) == "sd-card"
-        if wired(p,"spi") == wired(p,"sdmmc") then r.add(error(p.name_span,"SD card needs exactly one SPI or SDMMC connection"))
-        if wired(p,"spi") && !wired(p,"cs") then r.add(error(p.name_span,"SPI SD card needs cs connected"))
-        if wired(p,"sdmmc") && wired(p,"cs") then r.add(error(p.name_span,"native SD cards do not use SPI chip select"))
-    if part_model(p) == "seven-segment"
-        val count = part_whole(p, "digits", 1)
-        for i in 0..<8
-            val terminal = s"digit$i"
-            if long(i) < count && !wired(p, terminal) then r.add(error(p.name_span, s"`${p.name}.$terminal` is not connected"))
-            if long(i) >= count && wired(p, terminal) then r.add(error(p.name_span, s"`${p.name}.$terminal` exceeds its configured digit count"))
-    if part_model(p) == "st7789"
-        if part_whole(p, "width", 240) + part_whole(p, "column-offset", 0) > 240 || part_whole(p, "height", 240) + part_whole(p, "row-offset", 0) > 320
-            r.add(error(p.name_span, "ST7789 glass and offsets must fit its 240x320 controller memory"))
-    if part_model(p) == "potentiometer" || part_model(p) == "joystick"
-        val low = part_whole(p, "low-uv", 0)
-        val high = part_whole(p, "high-uv", 3300000)
-        if low > high then r.add(error(p.name_span, "analogue source low-uv must not exceed high-uv"))
-    if part_model(p) == "gt911"
-        val address = part_whole(p, "address", 93)
-        if address != 20 && address != 93 then r.add(error(p.name_span, "GT911 address must be 0x14 or 0x5d"))
-    if part_model(p) == "ds3231"
-        val year = int(part_whole(p, "initial-year", 2026))
-        val month = int(part_whole(p, "initial-month", 1))
-        val day = int(part_whole(p, "initial-day", 1))
-        if month >= 1 && month <= 12 && day > rtc.days(year, month) then r.add(error(p.name_span, "RTC initial day is invalid for its month"))
-    if part_model(p) == "hd44780"
-        val write_only = part_flag(p, "write-only", false)
-        if !wired(p, "rw") && !write_only then r.add(error(p.name_span, "LCD needs rw connected or write-only = true (RW tied low)"))
-        if wired(p, "rw") && write_only then r.add(error(p.name_span, "LCD write-only ties RW low; omit its rw connection"))
+    spec.rule match
+        Some(rule) -> for message in rule(p, spec) do r.add(error(p.name_span, message))
+        None -> ()
     for ps in spec.params
         if ps.required && part_setting(p, ps.name).is_none() then
             r.add(error(p.name_span, s"`${p.name}` (${spec.name}) needs `${ps.name}`")
@@ -672,7 +655,6 @@ check_product(p: *Product, reg: Registry, src: Source, r: *Report)
                     None -> false
                 w.to match
                     Pin(n) -> held_by_board(&uses, n, s"${q.name}.${w.port}", inst.name, shared)
-                    Port(owner, n) -> if owner == inst.board.chip.name then held_by_board(&uses, n, s"${q.name}.${w.port}", inst.name, shared)
                     _ -> ()
 
         val chip: Option[ChipSpec] = if inst.board.chip_found then Some(chip_spec(inst.board.chip, reg)) else None
@@ -731,7 +713,7 @@ check_product(p: *Product, reg: Registry, src: Source, r: *Report)
                         .with_note(s"the parts benchtop knows are ${listing(reg.part_names())}"))
                 continue
 
-        resolve_terminals(&q, spec, r)
+        misplaced_ports(&q, spec, r)
         p.parts.set(index, q)
         outside(q, q.at, "at", r)
         outside(q, q.size, "size", r)
@@ -958,7 +940,8 @@ guessed(d: sh.sysl.parsing.Diagnostic, name: string, among: Buf[string]) -> sh.s
         Some(n) -> d.with_label(s"did you mean `$n`?")
         None -> d
 
-private wired(p: Part, port: string) -> bool
+/** Whether `p` has `port` wired. */
+wired(p: Part, port: string) -> bool
     for w in p.wires
         if w.port == port then return true
 
