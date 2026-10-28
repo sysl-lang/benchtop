@@ -1,5 +1,6 @@
 module sh.sysl.benchtop.v6m
 
+import sysl.buf.{Buf, buf}
 import sysl.raw.ptr_cast
 import sysl.sync.*
 
@@ -47,11 +48,6 @@ const RAM_BYTES: u32 = 1024 * 1024
 const FLASH_BYTES: u32 = 4 * 1024 * 1024
 const FLASH_OFFSET: u32 = RAM_BYTES + 2 // Guard record prevents RAM fall-through into flash.
 const MEMORY_BYTES: u32 = FLASH_OFFSET + FLASH_BYTES
-var ram_base: u32 = 0
-var ram_size: u32 = RAM_BYTES
-var flash_base: u32 = 0x10000000
-var flash_size: u32 = 0
-var flash: [4194304]u8
 
 // RAM banks share the existing backing/code/monitor arrays. Guard pages in
 // backing space redirect threaded fall-through to the correct guest address.
@@ -59,54 +55,101 @@ struct RamBank
     base: u32
     size: u32
     offset: u32
-var extra_ram: [7]RamBank
-var extra_ram_count: usize = 0
 
-@inline
-ram_offset(a: u32, width: u32) -> u32
-    if a >= ram_base && u64(a) + u64(width) <= u64(ram_base) + u64(ram_size) then return a - ram_base
-    extra_ram_offset(a,width)
+/** Where a board puts its memory: its first RAM region, its flash (none where `flash_size` is 0),
+ * and its other RAM regions, each with its offset in the RAM backing. A board's assembler checks it;
+ * `reset_mapped` lays a `Memory` out by it.
+ */
+struct MemoryMap
+    ram_at: u32
+    ram_size: u32
+    flash_at: u32
+    flash_size: u32
+    banks: Buf[RamBank]
 
-@noinline
-@cold
-private extra_ram_offset(a: u32, width: u32) -> u32
-    for i in 0..<extra_ram_count
-        val b = extra_ram[i]
-        if a >= b.base && u64(a) + u64(width) <= u64(b.base) + u64(b.size) then return b.offset + a - b.base
-    RAM_BYTES
+/** The map of a board with 1 MB of RAM at address 0 and no flash. */
+ram_only() -> MemoryMap = MemoryMap(0, RAM_BYTES, 0x10000000, 0, buf())
 
-@inline
-ram_range(a: u32, width: u32) -> bool
-    if a >= ram_base && u64(a) + u64(width) <= u64(ram_base) + u64(ram_size) then return true
-    extra_ram_offset(a,width) < RAM_BYTES
+/** A machine's memory: the map that places its RAM and flash in the address space, and the host
+ * storage behind it — the bytes, the page table, the map of lines holding code, and the decoded
+ * records. A machine owns one, and each of its cores points at it (`Cpu.mem`), so two machines in one
+ * process have two.
+ */
+struct Memory
+    ram_base: u32
+    ram_size: u32
+    flash_base: u32
+    flash_size: u32
+    extra_ram: [7]RamBank
+    extra_ram_count: usize
+    ram: [1048576]u8
+    flash: [4194304]u8
+    // One entry per 4 KB page of the 4 GB address space (`PAGES`).
+    page_table: [1048576]usize
+    // One byte per 64-byte line of RAM, and what a store to the line must do besides the store
+    // itself: `LINE_CODE` once a record has been decoded from it or from the 3 bytes after it,
+    // `LINE_WATCHED` once a load-exclusive has read it or the 3 bytes after it.
+    code_lines: [16384]u8
+    // Each core's count of the stores it has made to each watched line, which the other core's
+    // store-exclusive checks (t2sem.sysl).
+    line_stores: [2][16384]u32
+    // One record per halfword of RAM and of flash, and the record for everywhere else.
+    decoded: [2621442]Insn
+    // The same, for the second core while it has records of its own.
+    decoded_own: [2621442]Insn
 
-@inline
-flash_range(a: u32, width: u32) -> bool = flash_size != 0 && a >= flash_base && u64(a) + u64(width) <= u64(flash_base) + u64(flash_size)
+    @inline
+    ram_offset(*self, a: u32, width: u32) -> u32
+        if a >= self.ram_base && u64(a) + u64(width) <= u64(self.ram_base) + u64(self.ram_size) then return a - self.ram_base
+        self.extra_ram_offset(a, width)
 
-@inline
-code_offset(a: u32) -> u32
-    if a >= ram_base && u64(a) + 2 <= u64(ram_base) + u64(ram_size) then return a - ram_base
-    if flash_range(a, 2) then return FLASH_OFFSET + a - flash_base
-    val offset = extra_ram_offset(a,2)
-    if offset < RAM_BYTES then offset else MEMORY_BYTES
+    @noinline
+    @cold
+    extra_ram_offset(*self, a: u32, width: u32) -> u32
+        for i in 0..<self.extra_ram_count
+            val b = self.extra_ram[i]
+            if a >= b.base && u64(a) + u64(width) <= u64(b.base) + u64(b.size) then return b.offset + a - b.base
+        RAM_BYTES
 
-@inline
-code_address(offset: u32) -> u32
-    if offset >= FLASH_OFFSET then return flash_base + offset - FLASH_OFFSET
-    if offset < ram_size + 4096 then return ram_base + offset
-    for i in 0..<extra_ram_count
-        val b = extra_ram[i]
-        if offset >= b.offset && offset < b.offset + b.size + 4096 then return b.base + offset - b.offset
-    ram_base + offset
+    @inline
+    ram_range(*self, a: u32, width: u32) -> bool
+        if a >= self.ram_base && u64(a) + u64(width) <= u64(self.ram_base) + u64(self.ram_size) then return true
+        self.extra_ram_offset(a, width) < RAM_BYTES
 
-private install_ram_guards(records: *Insn)
-    if extra_ram_count == 0 then return
-    for k in 0..extra_ram_count
-        val end = if k == 0 then ram_size else extra_ram[k - 1].offset + extra_ram[k - 1].size
-        val address = if k == 0 then ram_base + ram_size else extra_ram[k - 1].base + extra_ram[k - 1].size
-        for i in 0u32..<2048
-            if end + i * 2 > RAM_BYTES then break
-            records[(end >> 1) + i] = Insn(&h_ram_boundary,address + i * 2,Op.Undecoded,0,0,0)
+    @inline
+    flash_range(*self, a: u32, width: u32) -> bool =
+        self.flash_size != 0 && a >= self.flash_base && u64(a) + u64(width) <= u64(self.flash_base) + u64(self.flash_size)
+
+    @inline
+    code_offset(*self, a: u32) -> u32
+        if a >= self.ram_base && u64(a) + 2 <= u64(self.ram_base) + u64(self.ram_size) then return a - self.ram_base
+        if self.flash_range(a, 2) then return FLASH_OFFSET + a - self.flash_base
+        val offset = self.extra_ram_offset(a, 2)
+        if offset < RAM_BYTES then offset else MEMORY_BYTES
+
+    @inline
+    code_address(*self, offset: u32) -> u32
+        if offset >= FLASH_OFFSET then return self.flash_base + offset - FLASH_OFFSET
+        if offset < self.ram_size + 4096 then return self.ram_base + offset
+        for i in 0..<self.extra_ram_count
+            val b = self.extra_ram[i]
+            if offset >= b.offset && offset < b.offset + b.size + 4096 then return b.base + offset - b.offset
+        self.ram_base + offset
+
+    install_ram_guards(*self, records: *Insn)
+        if self.extra_ram_count == 0 then return
+        for k in 0..self.extra_ram_count
+            val end = if k == 0 then self.ram_size else self.extra_ram[k - 1].offset + self.extra_ram[k - 1].size
+            val address = if k == 0 then self.ram_base + self.ram_size else self.extra_ram[k - 1].base + self.extra_ram[k - 1].size
+            for i in 0u32..<2048
+                if end + i * 2 > RAM_BYTES then break
+                records[(end >> 1) + i] = Insn(&h_ram_boundary, address + i * 2, Op.Undecoded, 0, 0, 0)
+end Memory
+
+/** A memory with the map of `ram_only` and nothing in it, which `reset` or `reset_mapped` lays out. */
+memory() -> &Memory =
+    Memory(0, RAM_BYTES, 0x10000000, 0, [RamBank(0, 0, 0); 7], 0, [0; 1048576], [0; 4194304], [0; 1048576], [0; 16384],
+        [[0; 16384]; 2], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442])
 
 
 // One page-table entry per 4 KB page of the 4 GB address space. An entry is the host address of the
@@ -201,8 +244,10 @@ struct Cpu
     stop: Stop
     stop_at: u32
     exit_code: u32
+    // The machine's memory, and three of its arrays the hot paths reach through: the page table, the
+    // line map, and the records this core runs (the machine's, or its own after `pair`).
+    mem: *Memory
     pages: *usize
-    // The machine's `code_lines`.
     lines: *u8
     dec: *Insn
     io_read: IoRead
@@ -304,46 +349,40 @@ struct Cpu
     incoming_extra: [7]u64
     incoming_banks: u32
 
-var ram: [1048576]u8
-var page_table: [1048576]usize
-// One byte per 64-byte line of RAM, and what a store to the line must do besides the store itself:
-// `LINE_CODE` once a record has been decoded from it or from the 3 bytes after it, `LINE_WATCHED`
-// once a load-exclusive has read it or the 3 bytes after it.
-var code_lines: [16384]u8
-// Each core's count of the stores it has made to each watched line, which the other core's
-// store-exclusive checks (t2sem.sysl).
-var line_stores: [2][16384]u32
-
 const LINE_CODE: u8 = 1
 const LINE_WATCHED: u8 = 2
-// One record per halfword of RAM, and the record for everywhere else.
-var decoded: [2621442]Insn
-// The same, for the second core while it has records of its own.
-var decoded_own: [2621442]Insn
 
-// A machine with `image` at address 0, ready to start at `entry`, and no devices.
-reset(cpu: *Cpu, image: []const u8, entry: u32)
-    ram_base = 0
-    ram_size = RAM_BYTES
-    extra_ram_count = 0
-    flash_size = 0
-    for i in 0..<ram.len do ram[i] = 0
-    for i in 0..<image.len do ram[i] = image[i]
-    for i in 0..<page_table.len do page_table[i] = 0
-    for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do page_table[p] = usize(&ram[p << PAGE_SHIFT])
-    for i in 0..<code_lines.len do code_lines[i] = 0
-    for i in 0..<code_lines.len
-        line_stores[0][i] = 0
-        line_stores[1][i] = 0
-    for i in 0..(RAM_BYTES >> 1) do decoded[i] = undecoded()
-    decoded[MEMORY_BYTES >> 1] = undecoded()
+// A machine with `image` at address 0 of `mem`, which `cpu` is attached to, ready to start at
+// `entry`, and no devices. The caller keeps `mem` alive while the core points at it.
+reset(cpu: *Cpu, mem: &Memory, image: []const u8, entry: u32)
+    mem.ram_base = 0
+    mem.ram_size = RAM_BYTES
+    mem.extra_ram_count = 0
+    mem.flash_size = 0
+    for i in 0..<mem.ram.len do mem.ram[i] = 0
+    for i in 0..<image.len do mem.ram[i] = image[i]
+    for i in 0..<mem.page_table.len do mem.page_table[i] = 0
+    for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do mem.page_table[p] = usize(&mem.ram[p << PAGE_SHIFT])
+    for i in 0..<mem.code_lines.len do mem.code_lines[i] = 0
+    for i in 0..<mem.code_lines.len
+        mem.line_stores[0][i] = 0
+        mem.line_stores[1][i] = 0
+    for i in 0..(RAM_BYTES >> 1) do mem.decoded[i] = undecoded()
+    mem.decoded[MEMORY_BYTES >> 1] = undecoded()
 
+    attach_memory(cpu, mem)
     clear(cpu, entry)
     cpu.io_read = &no_device_read
     cpu.io_write = &no_device_write
 
-// The core's own state as a reset leaves it, to start at `entry`. Memory is the machine's, untouched,
-// and so is the core's kind.
+/** Point `cpu` at `mem`, sharing the machine's records; `clear` keeps the attachment. The caller keeps
+ * `mem` alive while the core points at it.
+ */
+attach_memory(cpu: *Cpu, mem: &Memory)
+    cpu.mem = &*mem
+
+// The core's own state as a reset leaves it, to start at `entry`, on the memory it is attached to.
+// Memory is the machine's, untouched, and so is the core's kind.
 clear(cpu: *Cpu, entry: u32)
     for i in 0..<16 do cpu.r[i] = 0
     cpu.nz = 1
@@ -359,9 +398,9 @@ clear(cpu: *Cpu, entry: u32)
     cpu.stop = Stop.Budget
     cpu.stop_at = 0
     cpu.exit_code = 0
-    cpu.pages = &page_table[0]
-    cpu.lines = &code_lines[0]
-    cpu.dec = &decoded[0]
+    cpu.pages = &cpu.mem.page_table[0]
+    cpu.lines = &cpu.mem.code_lines[0]
+    cpu.dec = &cpu.mem.decoded[0]
     cpu.peer = null
     for w in 0..<cpu.stale.len do cpu.stale[w] = 0
     cpu.stale_any = 0
@@ -389,18 +428,21 @@ clear(cpu: *Cpu, entry: u32)
  * the writer's records and posts its line to the other core (`forget`).
  */
 pair(first: *Cpu, second: *Cpu)
-    for i in 0..(RAM_BYTES >> 1) do decoded_own[i] = undecoded()
-    for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + flash_size) >> 1) do decoded_own[i] = undecoded()
-    decoded_own[MEMORY_BYTES >> 1] = undecoded()
+    require first.mem == second.mem, "two cores of one machine"
+    val mem = first.mem
 
-    install_ram_guards(&decoded_own[0])
-    second.dec = &decoded_own[0]
+    for i in 0..(RAM_BYTES >> 1) do mem.decoded_own[i] = undecoded()
+    for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + mem.flash_size) >> 1) do mem.decoded_own[i] = undecoded()
+    mem.decoded_own[MEMORY_BYTES >> 1] = undecoded()
+
+    mem.install_ram_guards(&mem.decoded_own[0])
+    second.dec = &mem.decoded_own[0]
     first.peer = second
     second.peer = first
 
 /** Undo `pair` before `second` has run on its own records: both cores share the machine's again. */
 unpair(first: *Cpu, second: *Cpu)
-    second.dec = &decoded[0]
+    second.dec = &second.mem.decoded[0]
     first.peer = null
     second.peer = null
 
@@ -428,7 +470,7 @@ lower_limit(cpu: *Cpu, n: u64)
 // once, since the stop has spent the budget.
 @inline
 insn_at(cpu: *Cpu, a: u32) -> *Insn
-    val offset = code_offset(a)
+    val offset = cpu.mem.code_offset(a)
     if offset < MEMORY_BYTES then return &cpu.dec[offset >> 1]
 
     if cpu.stop == Stop.Budget then cpu.pc = a
@@ -473,21 +515,23 @@ undecoded() -> Insn = Insn(&h_decode, 0, Op.Undecoded, 0, 0, 0)
 // The record at RAM address `pc` is being decoded from the bytes `pc` to `pc + 3`. A store whose
 // first byte is within 3 of them may write one of them, so the lines holding `pc - 3` to `pc + 3` are
 // marked as holding code.
-holds_code(address: u32)
-    if !ram_range(address, 2) then return
-    val pc = ram_offset(address,2)
+holds_code(cpu: *Cpu, address: u32)
+    val mem = cpu.mem
+
+    if !mem.ram_range(address, 2) then return
+    val pc = mem.ram_offset(address, 2)
     val from = if pc >= 4 then pc - 4 else 0
     val to = if pc + 2 < RAM_BYTES then pc + 2 else RAM_BYTES - 1
 
-    for a in from..to do atomic_or(&code_lines[a >> LINE_SHIFT], LINE_CODE, Relaxed)
+    for a in from..to do atomic_or(&mem.code_lines[a >> LINE_SHIFT], LINE_CODE, Relaxed)
 
 // A load-exclusive of the `width` bytes at RAM address `a`: watch the lines a store touching them
 // can start on, as `holds_code` marks code, and answer the other core's count of stores to `a`'s line.
 watch(cpu: *Cpu, address: u32, width: u32) -> u32
-    val a = ram_storage_offset(address)
+    val a = ram_storage_offset(cpu, address)
     val from = if a >= 3 then a - 3 else 0
 
-    for b in from..(a + width - 1) do atomic_or(&code_lines[b >> LINE_SHIFT], LINE_WATCHED, SeqCst)
+    for b in from..(a + width - 1) do atomic_or(&cpu.mem.code_lines[b >> LINE_SHIFT], LINE_WATCHED, SeqCst)
 
     others_stores(cpu, address)
 
@@ -495,19 +539,21 @@ watch(cpu: *Cpu, address: u32, width: u32) -> u32
 // Valid RAM accesses already have a page mapping. Reuse it for bookkeeping
 // with multiple banks, without searching banks on each ordinary data store.
 @inline
-private ram_storage_offset(a: u32) -> u32
-    if extra_ram_count == 0 then return a - ram_base
-    u32(page_table[a >> PAGE_SHIFT] - usize(&ram[0])) + (a & 4095)
+private ram_storage_offset(cpu: *Cpu, a: u32) -> u32
+    val mem = cpu.mem
+
+    if mem.extra_ram_count == 0 then return a - mem.ram_base
+    u32(cpu.pages[a >> PAGE_SHIFT] - usize(&mem.ram[0])) + (a & 4095)
 
 @inline
-others_stores(cpu: *Cpu, a: u32) -> u32 = atomic_load(&line_stores[1 - cpu.core][ram_storage_offset(a) >> LINE_SHIFT], SeqCst)
+others_stores(cpu: *Cpu, a: u32) -> u32 = atomic_load(&cpu.mem.line_stores[1 - cpu.core][ram_storage_offset(cpu, a) >> LINE_SHIFT], SeqCst)
 
 // The store of `width` bytes just made at RAM address `a`: where it is on a line holding code, every
 // record that read any of its bytes is decoded again when control next reaches it, and where it is on
 // a watched line, the store is counted. A store to a line of neither costs this one test.
 @inline
 stored(cpu: *Cpu, address: u32, width: u32)
-    val a = ram_storage_offset(address)
+    val a = ram_storage_offset(cpu, address)
     val mark = atomic_load(&cpu.lines[a >> LINE_SHIFT], Relaxed)
 
     if mark != 0 then touched(cpu, a, width, mark)
@@ -517,9 +563,10 @@ stored(cpu: *Cpu, address: u32, width: u32)
 private touched(cpu: *Cpu, a: u32, width: u32, mark: u8)
     if mark & LINE_WATCHED != 0
         val last = a + width - 1
+        val mem = cpu.mem
 
-        atomic_add(&line_stores[cpu.core][a >> LINE_SHIFT], 1, SeqCst)
-        if last >> LINE_SHIFT != a >> LINE_SHIFT then atomic_add(&line_stores[cpu.core][last >> LINE_SHIFT], 1, SeqCst)
+        atomic_add(&mem.line_stores[cpu.core][a >> LINE_SHIFT], 1, SeqCst)
+        if last >> LINE_SHIFT != a >> LINE_SHIFT then atomic_add(&mem.line_stores[cpu.core][last >> LINE_SHIFT], 1, SeqCst)
 
     if mark & LINE_CODE != 0 then forget(cpu, a, width)
 
@@ -608,7 +655,7 @@ target_of(ip: *Insn) -> *Insn = &ip[i32(ip.imm)]
 
 // The guest address of a record.
 @inline
-addr_of(cpu: *Cpu, ip: *Insn) -> u32 = code_address(u32(ip - cpu.dec) << 1)
+addr_of(cpu: *Cpu, ip: *Insn) -> u32 = cpu.mem.code_address(u32(ip - cpu.dec) << 1)
 
 // ---------------------------------------------------------------------------------------------------
 // Memory. The fast path is one table load, one test and one host access; everything else (a page
@@ -630,7 +677,7 @@ page_of(cpu: *Cpu, a: u32) -> usize = cpu.pages[a >> PAGE_SHIFT]
 // unaligned access at the RAM's very end would reach the host memory after it, and it takes the
 // slow path, which stops the core on it.
 @inline
-page_for(cpu: *Cpu, a: u32, width: u32) -> usize = if ram_range(a, width) || flash_range(a, width) then page_of(cpu, a) else 0
+page_for(cpu: *Cpu, a: u32, width: u32) -> usize = if cpu.mem.ram_range(a, width) || cpu.mem.flash_range(a, width) then page_of(cpu, a) else 0
 
 // The slow path of a read, `width` bytes at `a`.
 slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
@@ -701,7 +748,7 @@ load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
 
 @inline
 store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
-    if flash_range(a, 1)
+    if cpu.mem.flash_range(a, 1)
         halt(cpu, Stop.Fault, a)
         return false
     val page = page_for(cpu, a, width)
@@ -741,7 +788,7 @@ read8(cpu: *Cpu, a: u32, n: u64) -> u32
 
 @inline
 write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
-    if flash_range(a, 1)
+    if cpu.mem.flash_range(a, 1)
         halt(cpu, Stop.Fault, a)
         return
     val page = page_for(cpu, a, width)
@@ -875,36 +922,38 @@ ror_reg(cpu: *Cpu, x: u32, by: u32) -> u32
     cpu.c = res >> 31
     res
 
-/** Reset memory from a packed image: RAM backing first, then flash contents.
- * Mappings are page aligned and validated by the board assembler, which
- * coalesces physically adjacent banks before assigning backing offsets.
+/** Reset `mem` from a packed image laid out by `map`: RAM backing first, then flash contents, and
+ * attach `cpu` to it. The map is page aligned and checked by the board assembler, which coalesces
+ * physically adjacent banks before assigning backing offsets.
  */
-reset_mapped(cpu: *Cpu, image: []const u8, ram_at: u32, ram_length: u32, flash_at: u32, flash_length: u32, banks: []const RamBank = [])
-    require banks.len <= 7, "at most eight RAM banks"
-    reset(cpu, if image.len > usize(RAM_BYTES) then image[..<usize(RAM_BYTES)] else image, 0)
-    ram_base = ram_at
-    ram_size = ram_length
-    flash_base = flash_at
-    flash_size = flash_length
-    for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do page_table[p] = 0
-    for p in 0..<(ram_size >> PAGE_SHIFT) do page_table[(ram_base >> PAGE_SHIFT) + p] = usize(&ram[p << PAGE_SHIFT])
-    for bank in banks
+reset_mapped(cpu: *Cpu, mem: &Memory, image: []const u8, map: MemoryMap)
+    require map.banks.len() <= 7, "at most eight RAM banks"
+    require map.ram_size <= RAM_BYTES && map.flash_size <= FLASH_BYTES, "the map fits the backing"
+    require map.flash_size == 0 || image.len >= usize(RAM_BYTES + map.flash_size), "the image holds the flash"
+    reset(cpu, mem, if image.len > usize(RAM_BYTES) then image[..<usize(RAM_BYTES)] else image, 0)
+    mem.ram_base = map.ram_at
+    mem.ram_size = map.ram_size
+    mem.flash_base = map.flash_at
+    mem.flash_size = map.flash_size
+    for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do mem.page_table[p] = 0
+    for p in 0..<(mem.ram_size >> PAGE_SHIFT) do mem.page_table[(mem.ram_base >> PAGE_SHIFT) + p] = usize(&mem.ram[p << PAGE_SHIFT])
+    for bank in map.banks
         assert(bank.base & 4095 == 0 && bank.size & 4095 == 0 && bank.offset & 4095 == 0, "page-aligned RAM bank")
         assert(u64(bank.offset) + u64(bank.size) <= u64(RAM_BYTES), "RAM bank fits backing")
-        extra_ram[extra_ram_count] = bank
-        extra_ram_count += 1
-        for p in 0..<(bank.size >> PAGE_SHIFT) do page_table[(bank.base >> PAGE_SHIFT) + p] = usize(&ram[bank.offset + (p << PAGE_SHIFT)])
-    install_ram_guards(&decoded[0])
-    for i in 0..<flash_size do flash[i] = image[usize(RAM_BYTES + i)]
-    for p in 0..<(flash_size >> PAGE_SHIFT) do page_table[(flash_base >> PAGE_SHIFT) + p] = usize(&flash[p << PAGE_SHIFT])
-    for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + flash_size) >> 1) do decoded[i] = undecoded()
+        mem.extra_ram[mem.extra_ram_count] = bank
+        mem.extra_ram_count += 1
+        for p in 0..<(bank.size >> PAGE_SHIFT) do mem.page_table[(bank.base >> PAGE_SHIFT) + p] = usize(&mem.ram[bank.offset + (p << PAGE_SHIFT)])
+    mem.install_ram_guards(&mem.decoded[0])
+    for i in 0..<mem.flash_size do mem.flash[i] = image[usize(RAM_BYTES + i)]
+    for p in 0..<(mem.flash_size >> PAGE_SHIFT) do mem.page_table[(mem.flash_base >> PAGE_SHIFT) + p] = usize(&mem.flash[p << PAGE_SHIFT])
+    for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + mem.flash_size) >> 1) do mem.decoded[i] = undecoded()
 
 /** A DMA/device bus write made on this core's host thread. Never enters MMIO or
  * faults the CPU. Existing store bookkeeping invalidates decoded instructions
  * and the peer's monitor; the device also invalidates this core's monitor.
  */
 device_store(cpu: *Cpu, address: u32, width: u32, value: u32) -> bool
-    if (width != 1 && width != 2 && width != 4) || address & (width - 1) != 0 || !ram_range(address,width) then return false
+    if (width != 1 && width != 2 && width != 4) || address & (width - 1) != 0 || !cpu.mem.ram_range(address, width) then return false
     val page = page_for(cpu,address,width)
     if page == 0 then return false
     host_write(page,address,width,value)

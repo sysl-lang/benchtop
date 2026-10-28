@@ -1,0 +1,86 @@
+# Machine and Product
+
+benchtop runs a **product**. A product is one or more **boards** plus the parts around them, wired
+together and driven by one clock. A **machine** is one board. This page names the types, and gives
+the order in which the module-level globals move into them.
+
+## Machine: one board
+
+```sysl
+struct Machine
+    map: MemoryMap            // where the board puts RAM and flash (v6m)
+    memory: &Memory           // the storage behind them, which the machine owns
+    cores: [2]Cpu             // the chip's cores; each points at `memory` (Cpu.mem)
+    devices: Buf[&Peripheral] // the chip's peripherals on the bus, each owning its state
+    parts: Buf[&Part]         // parts soldered to the board (the Pico 2 W's LED, the DISCO's panel)
+    header: Buf[Pin]          // named header pins: the board's only external interface
+    clock_hz: u64
+```
+
+- **A machine owns its state.** No machine field is reachable as a global. Two machines in one
+  process (two boards in one product, or two tests on one thread) share nothing.
+- **A core is the raw tier.** `Cpu.mem` is a `*Memory`, and the hot paths read it beside `pages`,
+  `lines` and `dec`. The owning `&Memory` is the machine's. A core never outlives its machine.
+- **State that crosses threads lives in a `Mutex[T]` that owns its data**, for example
+  `Mutex[WorkerControl]` holding `paused`, `busy`, `step_pending` and `generation`. Short holds use
+  `with`, and `lock_raw` appears only where `Condvar.wait` needs it. A `Mutex.new(0)` beside the
+  globals it guards does not count as ownership.
+- **`assemble` plans, then applies.** `plan(board) -> Result[Plan, string]` reads the description
+  and sets nothing. The apply step cannot fail. A refused description leaves the machine as the last
+  board left it.
+
+`Pin` is `{ name: string, gpio: u32 }`: a header pin is a name (`GP15`, `3V3`, `D7`) bound to the
+chip's pad.
+
+## Product: boards, parts, wiring, one clock
+
+```sysl
+struct Product
+    name: string
+    boards: Buf[BoardSlot]   // `pico2` names a built-in board; `name` is how wiring refers to it
+    parts: Buf[&Part]        // off-board parts: a display, buttons, a breadboard module
+    wiring: Buf[Wire]        // editable at run time: moving a jumper is a Wire change
+    scheduler: Scheduler     // the one clock every board and part advances on
+    view: ProductView
+
+struct BoardSlot
+    name: string
+    machine: &Machine
+
+struct Wire
+    from: PinRef             // `pico.GP15`, or a part's pin `oled.SDA`
+    to: PinRef
+
+enum ProductView
+    Enclosure(view: View)    // a case drawn over the boards (the hidden-board product)
+    Open(view: View)         // the boards themselves, drawn whole, with the parts beside them (Pinova)
+```
+
+- A product file names its boards by built-in name (`pico2`, `stm32h747-disco`), adds parts, and
+  lists wires. It never edits a board file.
+- **Parts work the same on a board or in a product.** A part sees only its pins, through one
+  `Part` trait (the device/part interface is slice 2).
+- **Views.** `Open` reuses the `product-view` branch's model: an element whose `show` names a board
+  draws it whole (`Shows.ShowBoard`), and the window draws a flat `Drawing` of `Drawn` items, each
+  carrying the board's turn and offset. "Open the case" switches an `Enclosure` product to the board
+  view of the same machines. The product keeps running underneath.
+- First target: **Pinova P2**, which is `pico2` (a Pico 2 W, with CYW43 stubbed for the LED and "no
+  network") plus a carrier board's labelled headers, plus modules on jumpers.
+
+## Slices
+
+1. **Memory map** (done): `v6m.Memory` holds the map, the RAM, flash, page table, line map and
+   decoded records. `Cpu.mem` points at it. `virt.Machine { map, memory }` owns the board's memory,
+   and `assemble` checks the whole description (memory map, bus, clocks, cores) before setting
+   anything.
+2. **Devices.** A `Peripheral` trait (`read`, `write`, `advance`, `due`, `reset`) replaces the
+   closed `enum Device` and its seven dispatch sites. Each device file's globals become that
+   device's struct, owned by `Machine.devices`. Each `configure_*` splits into a pure check that
+   answers a config and an apply that cannot fail. This finishes "nothing is set until everything is
+   checked" for device state.
+3. **Scheduler and threads.** One scheduler, owned by the product. The worker, parallel and pump
+   globals move into it. Cross-thread state moves into `Mutex[T]` values that own it.
+4. **Delete the remaining globals.** `first`, `second`, the SIO FIFOs, the console and
+   `virt.machine` itself. Every entry point takes a `*Machine`.
+5. **Headers and Product.** `Pin` and `header` on boards, product files with wiring, run-time wire
+   edits, and the product view.

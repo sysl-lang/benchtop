@@ -3,7 +3,7 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.{Board, ChipForm, Core, Description, Peripheral, ProductForm, Registry, article_of, built_in_shelf, core_option, library, param_named, load, open_description, unemulated_core_option}
 import sh.sysl.benchtop.v6m.{Kind, RAM_BYTES, default_priority_bits, has_fixed_dsp, model_named, model_names}
 import sh.sysl.parsing.{Diagnostic, Source, Span, source}
-import sh.sysl.benchtop.v6m.RamBank
+import sh.sysl.benchtop.v6m.{Memory, MemoryMap, RamBank, memory, ram_only}
 import sysl.buf.{Buf, buf}
 
 // A board description made into the machine benchtop runs.
@@ -66,10 +66,68 @@ runnable(d: Description) -> Result[Board, string]
     Ok(p.boards.at(0).board)
 end runnable
 
-/** Put the devices a checked board's chip describes on the cores' bus, or say why benchtop cannot run
- * it.
+/** Make the machine a checked board describes — its memory map, the devices on its bus, its cores and
+ * its clock — or say why benchtop cannot run it. The whole description is checked before anything is
+ * set, so a refused one leaves the machine as the last board made it.
  */
 assemble(b: Board, reg: Registry) -> Result[unit, string]
+    val p = plan(b, reg)?
+    val clock_before = board_clock_hz
+
+    // The devices read the board's clock while they are configured.
+    board_clock_hz = p.clock_hz
+    configure_devices(b) match
+        Ok(_) -> ()
+        Err(why) ->
+            board_clock_hz = clock_before
+            return Err(why)
+
+    machine.map = p.map
+    attach(p.devices.view(), p.kind)
+    core_clock_divisors = p.divisors
+    for k in 0..<2
+        val c = p.cores[k]
+
+        core_instruction_timing[k] = c.timed
+        core_kinds[k] = c.kind
+        core_priority_bits[k] = c.priority_bits
+        core_dsp[k] = c.dsp
+        core_fpu[k] = c.fpu
+
+    Ok(())
+
+/** What a description makes of a machine, decided and checked whole before any of it is set. */
+private struct Plan
+    map: MemoryMap
+    devices: Buf[Mapped]
+    kind: Kind
+    clock_hz: u64
+    divisors: [2]u64
+    cores: [2]CoreSetup
+
+private struct CoreSetup
+    kind: Kind
+    timed: bool
+    priority_bits: u32
+    dsp: bool
+    fpu: u32
+
+private configure_devices(b: Board) -> Result[unit, string]
+    configure_h7(b)?
+    configure_spi(b)?
+    configure_storage(b)?
+    configure_sdmmc(b)?
+    configure_adc(b)
+    configure_rtcs(b)?
+    configure_sound(b)?
+    configure_digital_audio(b)?
+    configure_displays(b)
+    configure_dsi(b)?
+    configure_sai_dma(b)?
+    Ok(())
+
+/** The machine `b` describes, or why benchtop cannot run it. It sets nothing. */
+private plan(b: Board, reg: Registry) -> Result[Plan, string]
     val chip = b.chip
     val cores = chip.cores
 
@@ -208,70 +266,54 @@ assemble(b: Board, reg: Registry) -> Result[unit, string]
         if u64(offset) + u64(region.size) > u64(RAM_BYTES) then return Err("RAM banks and backing guards must fit within 1 MB")
         banks.push(RamBank(region.base,region.size,offset))
         ram_used = offset + region.size
-    board_extra_ram = banks
-    board_ram_at = memory_ram_at
-    board_ram_size = memory_ram_size
-    board_flash_at = memory_flash_at
-    board_flash_size = memory_flash_size
 
     for i in 0..<ds.len()
         for j in 0..<i
             if ds.at(i).device == ds.at(j).device && ds.at(i).device != Stm32Gpio then
                 return Err(s"benchtop runs one ${device_name(ds.at(i).device)}, and the ${chip.name} has two")
 
-    attach(ds.view(), model.kind)
-    board_clock_hz = chip.clock_hz match
+    val clock_hz = chip.clock_hz match
         Some(hz) -> u64(hz.n)
         None -> 0
     for p in chip.peripherals
-        if board_clock_hz == 0 || (p.kind != "virt-i2c" && p.kind != "virt-pwm" && p.kind != "virt-i2s") then continue
+        if clock_hz == 0 || (p.kind != "virt-i2c" && p.kind != "virt-pwm" && p.kind != "virt-i2s") then continue
         for q in p.params
             if q.name != "clock-hz" then continue
             q.value match
-                Whole(hz) -> if u64(hz) != board_clock_hz
+                Whole(hz) -> if u64(hz) != clock_hz
                     return Err(s"`${p.name}.clock-hz` is a guest timebase and must match `mcu.clock-hz`; omit it to inherit the MCU clock")
                 _ -> ()
-    core_clock_divisors = [1,1]
+    var divisors: [2]u64 = [1, 1]
     for k in 0..<cores.len()
         core_option(cores.at(k), "clock-hz") match
             Whole(hz) ->
-                if board_clock_hz == 0 || u64(hz) > board_clock_hz || board_clock_hz % u64(hz) != 0 then
+                if clock_hz == 0 || u64(hz) > clock_hz || clock_hz % u64(hz) != 0 then
                     return Err("core `clock-hz` must divide `mcu.clock-hz` exactly; omit it to inherit the MCU timebase")
-                core_clock_divisors[k] = board_clock_hz / u64(hz)
-            _ -> ()
-    configure_h7(b)?
-    configure_spi(b)?
-    configure_storage(b)?
-    configure_sdmmc(b)?
-    configure_adc(b)
-    configure_rtcs(b)?
-    configure_sound(b)?
-    configure_digital_audio(b)?
-    configure_displays(b)
-    configure_dsi(b)?
-    configure_sai_dma(b)?
-    for k in 0..<cores.len()
-        val selected = model_named(cores.at(k).name).unwrap()
-        core_instruction_timing[k] = core_option(cores.at(k),"instruction-timing") match
-            Text(mode) -> mode == "estimated"
-            _ -> false
-        core_kinds[k] = selected.kind
-        core_priority_bits[k] = default_priority_bits(selected.kind)
-        core_dsp[k] = has_fixed_dsp(selected.kind)
-        core_option(cores.at(k), "nvic_priority_bits") match
-            Whole(n) -> core_priority_bits[k] = u32(n)
+                divisors[k] = clock_hz / u64(hz)
             _ -> ()
 
-        core_option(cores.at(k), "dsp") match
-            Flag(on) -> core_dsp[k] = on
-            _ -> ()
+    val map = MemoryMap(memory_ram_at, memory_ram_size, memory_flash_at, memory_flash_size, banks)
 
-        core_option(cores.at(k), "fpu") match
-            Text(unit) -> core_fpu[k] = if unit == "dp" then 2 elif unit == "sp" then 1 else 0
-            _ -> ()
+    Ok(Plan(map, ds, model.kind, clock_hz, divisors, [core_setup(cores.at(0)), core_setup(cores.at(1))]))
+end plan
 
-    Ok(())
-end assemble
+// A core's kind and options, from a core `plan` has checked.
+private core_setup(core: Core) -> CoreSetup
+    val kind = model_named(core.name).unwrap().kind
+    val timed = core_option(core, "instruction-timing") match
+        Text(mode) -> mode == "estimated"
+        _ -> false
+    val priority_bits = core_option(core, "nvic_priority_bits") match
+        Whole(n) -> u32(n)
+        _ -> default_priority_bits(kind)
+    val dsp = core_option(core, "dsp") match
+        Flag(on) -> on
+        _ -> has_fixed_dsp(kind)
+    val fpu: u32 = core_option(core, "fpu") match
+        Text(unit) -> if unit == "dp" then 2 elif unit == "sp" then 1 else 0
+        _ -> 0
+
+    CoreSetup(kind, timed, priority_bits, dsp, fpu)
 
 private placed(d: Device, p: Peripheral, at: long, fixed: long, irqs: [8]int) -> Mapped
     val size: long = p.size match
@@ -312,6 +354,20 @@ private core_names(cores: Buf[Core]) -> string
 
     out
 
+
+/** One board as benchtop runs it. It holds the board's memory: the map `assemble` planned, which
+ * `boot` lays out, and the storage both cores run on, which the machine owns and the cores point at.
+ * docs/machine.md says what joins it next — the devices, the cores and the scheduler.
+ */
+struct Machine
+    map: MemoryMap
+    memory: &Memory
+
+/** The board this process runs, until the cores and devices move into `Machine` too. */
+var machine = Machine(ram_only(), memory())
+
+/** Where the board puts its memory, as the last description assembled said. */
+memory_map() -> MemoryMap = machine.map
 
 var board_clock_hz: u64 = 0
 
