@@ -59,7 +59,7 @@ enum ProductView
 - A product file names its boards by built-in name (`pico2`, `stm32h747-disco`), adds parts, and
   lists wires. It never edits a board file.
 - **Parts work the same on a board or in a product.** A part sees only its pins, through one
-  `Part` trait (the device/part interface is slice 2).
+  `Part` trait (the device/part interface is slice 4).
 - **Views.** `Open` reuses the `product-view` branch's model: an element whose `show` names a board
   draws it whole (`Shows.ShowBoard`), and the window draws a flat `Drawing` of `Drawn` items, each
   carrying the board's turn and offset. "Open the case" switches an `Enclosure` product to the board
@@ -73,14 +73,20 @@ enum ProductView
    decoded records. `Cpu.mem` points at it. `virt.Machine { map, memory }` owns the board's memory,
    and `assemble` checks the whole description (memory map, bus, clocks, cores) before setting
    anything.
-2. **Devices.** A `Peripheral` trait (`read`, `write`, `advance`, `due`, `reset`) replaces the
-   closed `enum Device` and its seven dispatch sites. Each device file's globals become that
-   device's struct, owned by `Machine.devices`. Each `configure_*` splits into a pure check that
-   answers a config and an apply that cannot fail. This finishes "nothing is set until everything is
-   checked" for device state.
+2. **Devices** (done). Each device file's state is that device's struct (`AdcState`, `SpiState`,
+   `AudioState`, ...), and `Machine.devices` (`Devices`, in `virt/devices.sysl`) owns one of each,
+   with the bus (`BusState`). Each device has a check, `check_*(board) -> Result[State, string]`,
+   that reads the description and sets nothing, and `apply_devices` puts the checked set in place
+   and cannot fail; so a refused description leaves every device as the last board left it. A
+   device's window on the bus is the registry's where the chip gives it no size. The locks the
+   devices are read under, and the queues and threads that carry their data to the host (the SD
+   image writer, the DSI worker, the SAI and codec sample queues), stay module-level for slice 3.
 3. **Scheduler and threads.** One scheduler, owned by the product. The worker, parallel and pump
-   globals move into it. Cross-thread state moves into `Mutex[T]` values that own it.
-4. **Delete the remaining globals.** `first`, `second`, the SIO FIFOs, the console and
-   `virt.machine` itself. Every entry point takes a `*Machine`.
+   globals move into it. Cross-thread state moves into `Mutex[T]` values that own it: the device
+   locks with the device state they guard, and the host-facing device queues.
+4. **Delete the remaining globals.** A `Peripheral` trait (`read`, `write`, `advance`, `due`,
+   `reset`) replaces the closed `enum Device` and its dispatch sites, over the device structs.
+   `first`, `second`, the SIO FIFOs, the console and `virt.machine` itself go. Every entry point
+   takes a `*Machine`.
 5. **Headers and Product.** `Pin` and `header` on boards, product files with wiring, run-time wire
    edits, and the product view.

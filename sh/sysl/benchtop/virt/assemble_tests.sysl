@@ -2,7 +2,7 @@ module sh.sysl.benchtop.virt
 @tests
 
 // `assemble` checks a whole description before it sets anything, so a refused one leaves the machine
-// exactly as the last board made it: its memory map, its bus, its cores and its clock.
+// exactly as the last board made it: its memory map, its bus, its cores, its clock and every device.
 
 import sh.sysl.benchtop.v6m.Kind
 
@@ -16,15 +16,52 @@ private struct Snapshot
     attached: usize
     kinds: [2]Kind
     clock_hz: u64
+    devices: DeviceSnapshot
+
+// The devices' parts a board description sets, one or more for each device.
+private struct DeviceSnapshot
+    console_irq: int
+    rcc_boot: u32
+    spi: bool
+    gpio_banks: usize
+    sdmmc: bool
+    adc: bool
+    analog_driven: u32
+    panel: bool
+    timer: bool
+    rtcs: usize
+    stm32_i2c: bool
+    codec: bool
+    pwm: bool
+    buzzers: usize
+    i2s: bool
+    displays: usize
+    dsi: bool
+    sai: bool
+
+private device_snapshot() -> DeviceSnapshot
+    val d = &machine.devices
+
+    DeviceSnapshot(d.bus.console_irq, d.rcc.cm4_boot, d.spi.present, d.storage.gpio_count, d.sdmmc.present, d.adc.present,
+        d.adc.analog_driven, d.panel.present, d.rp.has_timer, d.i2c.rtcs.len(), d.i2c.stm32, !d.codec.name.is_empty(),
+        d.pwm.present, d.pwm.buzzers.len(), d.i2s.present,
+        d.displays.sevens.len() + d.displays.lcds.len() + d.displays.oleds.len() + d.displays.tfts.len(), d.dsi.present,
+        d.audio.sai_present)
 
 private snapshot() -> Snapshot
     val map = memory_map()
 
-    Snapshot(map.ram_at, map.ram_size, map.flash_at, map.flash_size, map.banks.len(), attached, core_kinds, clock_hz())
+    Snapshot(map.ram_at, map.ram_size, map.flash_at, map.flash_size, map.banks.len(), attached(), core_kinds, clock_hz(), device_snapshot())
+
+private same_devices(a: DeviceSnapshot, b: DeviceSnapshot) -> bool =
+    a.console_irq == b.console_irq && a.rcc_boot == b.rcc_boot && a.spi == b.spi && a.gpio_banks == b.gpio_banks &&
+        a.sdmmc == b.sdmmc && a.adc == b.adc && a.analog_driven == b.analog_driven && a.panel == b.panel && a.timer == b.timer &&
+        a.rtcs == b.rtcs && a.stm32_i2c == b.stm32_i2c && a.codec == b.codec && a.pwm == b.pwm && a.buzzers == b.buzzers &&
+        a.i2s == b.i2s && a.displays == b.displays && a.dsi == b.dsi && a.sai == b.sai
 
 private same(a: Snapshot, b: Snapshot) -> bool =
     a.ram_at == b.ram_at && a.ram_size == b.ram_size && a.flash_at == b.flash_at && a.flash_size == b.flash_size &&
-        a.banks == b.banks && a.attached == b.attached && a.kinds == b.kinds && a.clock_hz == b.clock_hz
+        a.banks == b.banks && a.attached == b.attached && a.kinds == b.kinds && a.clock_hz == b.clock_hz && same_devices(a.devices, b.devices)
 
 // A board on an M7 + M4 chip with RAM in two banks at 0x24000000, flash at 0x08000000, a clock of
 // `clock`, and `more` peripherals besides.
@@ -43,6 +80,15 @@ private h7_like(clock: string, more: string) -> string = s"""
     }
     """
 
+// Peripherals whose checks pass, and which change devices the workbench board has set: the RCC is
+// the first device checked, and every device after it is set again by any board.
+private val PASSING = "      rcc { peripheral = stm32h7-rcc, at = 0x58024400, cm4-boot-address = 0x08200000 }\n"
+// DSI needs the chip's clock, which only its own check reads; it is checked after every device but the SAI.
+private val DSI = "      dsi { peripheral = stm32-dsi, at = 0x50000000 }\n"
+// The SAI's two blocks may not share a DMA request; it is the last device checked.
+private val SAI = "      sai { peripheral = stm32-sai, at = 0x40015800, request-a = 5, request-b = 5 }\n"
+private val SAI_FIXED = "      sai { peripheral = stm32-sai, at = 0x40015800, request-a = 5, request-b = 6 }\n"
+
 @test("a description refused by its bus, its clocks or a device leaves the machine as the last board made it")
 asm_refusal_keeps_machine()
     assert(board_named("workbench").is_ok())
@@ -50,14 +96,18 @@ asm_refusal_keeps_machine()
     val before = snapshot()
 
     assert(before.flash_size == 4194304 && before.flash_at == 0x10000000, "the workbench board is in place")
+    assert(before.devices.buzzers == 1 && before.devices.rtcs == 1 && before.devices.displays == 4 && before.devices.analog_driven != 0,
+        "the workbench board's parts are on its devices")
 
     val refused = [
         // The bus: two consoles, found after the memory map is planned.
         h7_like("", "      a { peripheral = debug-console, at = 0x40000000 }\n      b { peripheral = debug-console, at = 0x40000010 }\n"),
         // The clocks: a peripheral's timebase that is not the chip's.
         h7_like(", clock-hz = 480000000", "      i2c { peripheral = virt-i2c, at = 0x40000000, clock-hz = 12000000 }\n"),
-        // A device: DSI needs the chip's clock, which only its configuration checks.
-        h7_like("", "      dsi { peripheral = stm32-dsi, at = 0x50000000 }\n"),
+        // A device: DSI refuses after the RCC, the ADC, the I2C bus, the PWM and the displays pass.
+        h7_like("", PASSING + DSI),
+        // The last device: the SAI refuses after every other device passes.
+        h7_like(", clock-hz = 480000000", PASSING + SAI),
     ]
 
     for text in refused
@@ -66,7 +116,7 @@ asm_refusal_keeps_machine()
             Err(_) -> ()
         assert(same(snapshot(), before), s"unchanged after refusing:\n$text")
 
-    // The same description without its mistake is accepted, and changes all of it.
+    // The same descriptions without their mistakes are accepted, and change all of it.
     assert(board_from("good.hocon", h7_like(", clock-hz = 480000000", "").bytes).is_ok())
 
     val after = snapshot()
@@ -74,6 +124,55 @@ asm_refusal_keeps_machine()
     assert(after.ram_at == 0x24000000 && after.ram_size == 65536 && after.banks == 1, "RAM")
     assert(after.flash_at == 0x08000000 && after.flash_size == 262144, "flash")
     assert(after.kinds[0] == Kind.V7emM7 && after.kinds[1] == Kind.V7em && after.clock_hz == 480000000, "cores and clock")
+    assert(!same_devices(after.devices, before.devices), "a board with no parts clears the workbench's devices")
+    assert(board_named("virt").is_ok())
+
+@test("the devices a refused description would have set are ones an accepted description sets")
+asm_refused_devices_are_observed()
+    // Each refusal above is checked against the device snapshot. Here the same descriptions, with the
+    // mistake removed, set each device the snapshot reads, so a refusal that set any of them would fail.
+    for fixed in [h7_like(", clock-hz = 480000000", PASSING + DSI), h7_like(", clock-hz = 480000000", PASSING + SAI_FIXED)]
+        assert(board_named("workbench").is_ok())
+
+        val before = device_snapshot()
+
+        board_from("fixed.hocon", fixed.bytes) match
+            Ok(_) -> ()
+            Err(why) -> assert(false, s"accepted without its mistake: $why\n$fixed")
+
+        val after = device_snapshot()
+
+        assert(after.rcc_boot == 0x08200000 && before.rcc_boot == 0x08100000, "the RCC's boot address")
+        assert(after.buzzers == 0 && after.rtcs == 0 && after.displays == 0 && after.analog_driven == 0, "the workbench's parts are gone")
+        assert(!after.pwm && !after.adc && !after.panel && after.console_irq == -1, "and so are its devices")
+    val last = device_snapshot()
+    assert(last.sai && !last.dsi, "the SAI board")
+    assert(board_named("virt").is_ok())
+
+@test("a device snapshot tells apart a change to any one device")
+asm_snapshot_sees_each_device()
+    assert(board_named("workbench").is_ok())
+
+    val before = device_snapshot()
+
+    // Each change, applied to the machine and undone, is one a partial apply would make.
+    val saved = machine.devices.rcc.cm4_boot
+    machine.devices.rcc.cm4_boot = 0x08200000
+    assert(!same_devices(device_snapshot(), before), "the RCC")
+    machine.devices.rcc.cm4_boot = saved
+    machine.devices.adc.analog_driven = 0
+    assert(!same_devices(device_snapshot(), before), "the ADC's pins")
+    assert(board_named("workbench").is_ok())
+    machine.devices.pwm.buzzers.clear()
+    assert(!same_devices(device_snapshot(), before), "the buzzers")
+    assert(board_named("workbench").is_ok())
+    machine.devices.sdmmc.present = true
+    assert(!same_devices(device_snapshot(), before), "the SDMMC")
+    machine.devices.sdmmc.present = false
+    machine.devices.audio.sai_present = true
+    assert(!same_devices(device_snapshot(), before), "the SAI")
+    assert(board_named("workbench").is_ok())
+    assert(same_devices(device_snapshot(), before), "a board made again is the board it was")
     assert(board_named("virt").is_ok())
 
 @test("the image a board loads is laid out by the map it was assembled with")
@@ -86,3 +185,24 @@ asm_image_follows_map()
     assert(image.at(1048576) == 1 && image.at(0) == 0, "a raw image goes into flash")
     assert(board_named("virt").is_ok())
     assert(image_of([1, 2, 3, 4]).unwrap().at(0) == 1, "and a RAM board takes it at 0")
+
+@test("each device's window comes from the registry where the chip gives it no size")
+asm_windows_from_registry()
+    assert(board_named("workbench").is_ok())
+
+    val reg = sh.sysl.benchtop.library()
+    val bus = &machine.devices.bus
+
+    for i in 0..<bus.attached
+        val m = bus.mapped[i]
+        val kind = m.device match
+            Console -> "debug-console"
+            Sio -> "virt-sio"
+            PanelGpio -> "panel-gpio"
+            Pwm -> "virt-pwm"
+            I2c -> "virt-i2c"
+            Adc -> "virt-adc"
+            _ -> ""
+        assert(!kind.is_empty(), "the workbench's devices")
+        assert(u64(m.last) - u64(m.base) + 1 == u64(reg.peripheral(kind).unwrap().window.size), kind)
+    assert(board_named("virt").is_ok())

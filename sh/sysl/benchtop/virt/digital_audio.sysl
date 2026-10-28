@@ -6,34 +6,41 @@ import sh.sysl.benchtop.v6m.{Cpu, Stop, halt}
 import sysl.buf.{Buf, buf}
 import sysl.threads.SleepLock
 
-var digital_audio = i2s.controller()
-var digital_present = false
-var digital_speaker = false
-var digital_mic = false
-var digital_gain: f32 = 0.12
+/** The I2S controller (`virt-i2s`) and the amplifier, speaker and microphone on it: whether the bus
+ * has it, whether a speaker plays what it sends and at what gain, and whether a microphone feeds it.
+ */
+struct I2sState
+    controller: i2s.Controller
+    present: bool
+    speaker: bool
+    mic: bool
+    gain: f32
+
 var digital_lock = SleepLock.new()
 
-private[virt] configure_digital_audio(b: Board) -> Result[unit, string]
-    digital_present = false
-    digital_speaker = false
-    digital_mic = false
+/** No I2S controller on the bus. */
+i2s_state() -> I2sState = I2sState(i2s.controller(), false, false, false, 0.12)
+
+// The I2S path `b` makes, beside the buzzers `pwm` drives and the codec `codec` makes.
+private[virt] check_i2s(b: Board, pwm: *PwmState, codec: *CodecState) -> Result[I2sState, string]
+    var s = i2s_state()
     var hz: u64 = mcu_clock_hz(b.chip)
     var bus = ""
     for p in b.chip.peripherals
         if p.kind != "virt-i2s" then continue
-        digital_present = true
+        s.present = true
         bus = p.name
         param_named(p.params, "clock-hz") match
             Some(q) -> q.value match
                 Whole(n) -> hz = u64(n)
                 _ -> ()
             None -> ()
-    if digital_present && !buzzers.is_empty() && hz != pwm_channel.hz then return Err("PWM and I2S audio must share the same guest clock")
-    digital_audio = i2s.controller(hz)
+    if s.present && !pwm.buzzers.is_empty() && hz != pwm.channel.hz then return Err("PWM and I2S audio must share the same guest clock")
+    s.controller = i2s.controller(hz)
     var amplifier = ""
     for p in b.parts
         if part_model(p) != "i2s-amplifier" && part_model(p) != "i2s-microphone" then continue
-        if !digital_present then return Err("digital audio parts require a virt-i2s peripheral")
+        if !s.present then return Err("digital audio parts require a virt-i2s peripheral")
         for wire in p.wires
             if wire.port != "i2s" then continue
             wire.to match
@@ -43,23 +50,23 @@ private[virt] configure_digital_audio(b: Board) -> Result[unit, string]
             if !amplifier.is_empty() then return Err("one I2S amplifier is supported per controller")
             amplifier = p.name
         else
-            if digital_mic then return Err("one left-channel I2S microphone is supported per controller")
-            digital_mic = true
+            if s.mic then return Err("one left-channel I2S microphone is supported per controller")
+            s.mic = true
     for p in b.parts
-        if part_model(p) != "speaker" || codec_speaker(p) then continue
-        if digital_speaker then return Err("one speaker is supported per amplifier")
+        if part_model(p) != "speaker" || codec_speaker(codec, p) then continue
+        if s.speaker then return Err("one speaker is supported per amplifier")
         for wire in p.wires
             wire.to match
                 Port(owner, terminal) -> if owner == amplifier && terminal == "out"
-                    if digital_speaker then return Err("one speaker is supported per amplifier")
-                    digital_speaker = true
-                    digital_gain = f32(real(part_whole(p, "gain", 12)) / 100.0)
+                    if s.speaker then return Err("one speaker is supported per amplifier")
+                    s.speaker = true
+                    s.gain = f32(real(part_whole(p, "gain", 12)) / 100.0)
                 _ -> ()
-        if !digital_speaker then return Err("speaker input must connect to the I2S amplifier's out terminal")
-    Ok(())
+        if !s.speaker then return Err("speaker input must connect to the I2S amplifier's out terminal")
+    Ok(s)
 
 private[virt] boot_digital_audio()
-    i2s.reset(&digital_audio)
+    i2s.reset(&machine.devices.i2s.controller)
 
 private[virt] digital_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || (offset & 3) != 0
@@ -67,8 +74,9 @@ private[virt] digital_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: 
         return 0
     digital_lock.lock()
     defer digital_lock.unlock()
-    i2s.advance(&digital_audio, board_time(cpu, n))
-    i2s.read(&digital_audio, offset) match
+    val s = &machine.devices.i2s
+    i2s.advance(&s.controller, board_time(cpu, n))
+    i2s.read(&s.controller, offset) match
         Some(value) -> value
         None ->
             halt(cpu, Stop.Unmapped, address)
@@ -80,30 +88,32 @@ private[virt] digital_write(cpu: *Cpu, address: u32, offset: u32, width: u32, va
         return
     digital_lock.lock()
     defer digital_lock.unlock()
-    i2s.advance(&digital_audio, board_time(cpu, n))
-    if !i2s.write(&digital_audio, offset, value) then halt(cpu, Stop.Unmapped, address)
+    val s = &machine.devices.i2s
+    i2s.advance(&s.controller, board_time(cpu, n))
+    if !i2s.write(&s.controller, offset, value) then halt(cpu, Stop.Unmapped, address)
 
-microphone_available() -> bool = digital_mic || codec_mic
+microphone_available() -> bool = machine.devices.i2s.mic || machine.devices.codec.mic
 
 feed_microphone(samples: []const f32)
     feed_codec_microphone(samples)
-    if !digital_mic then return
+    if !machine.devices.i2s.mic then return
     digital_lock.lock()
     defer digital_lock.unlock()
-    i2s.feed(&digital_audio, samples)
+    i2s.feed(&machine.devices.i2s.controller, samples)
 
 clear_audio_host()
     clear_codec_input()
     digital_lock.lock()
     defer digital_lock.unlock()
-    i2s.clear_host(&digital_audio)
+    i2s.clear_host(&machine.devices.i2s.controller)
 
 private[virt] take_digital_sound(time: u64) -> Buf[f32]
     digital_lock.lock()
     defer digital_lock.unlock()
-    i2s.advance(&digital_audio, time)
-    val samples = i2s.take(&digital_audio)
-    if !digital_speaker then return buf()
+    val s = &machine.devices.i2s
+    i2s.advance(&s.controller, time)
+    val samples = i2s.take(&s.controller)
+    if !s.speaker then return buf()
     var out: Buf[f32] = buf()
-    for sample in samples do out.push(sample * digital_gain)
+    for sample in samples do out.push(sample * s.gain)
     out

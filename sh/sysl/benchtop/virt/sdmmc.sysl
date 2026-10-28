@@ -6,36 +6,45 @@ import sh.sysl.benchtop.parts.sd_card as card
 import sh.sysl.benchtop.v6m as memory
 import sysl.sync.*
 
-private[virt] var sdmmc_host = sdmmc.host()
-private[virt] var native_card: Option[&card.Native] = None
-private var has_sdmmc = false
-private var sdmmc_irq: int = -1
-private var sdmmc_next: u64 = memory.NEVER
-private var sdmmc_level: u32 = 0
-private struct SdRoute
+/** A pin of an STM32 GPIO bank, named by the bank. */
+struct SdRoute
     bank: string
     pin: u32
-private var sd_routes: [6]SdRoute = [SdRoute("",0);6]
+
+/** The SDMMC (`stm32-sdmmc`): its host, the card on it, the IRQ it raises (-1 for none), and the pins
+ * its CK, CMD and D0-D3 are routed to. `next` and `level` are its next event's clock and its
+ * interrupt line, published for the cores to read without its lock.
+ */
+struct SdmmcState
+    host: &sdmmc.Host
+    card: Option[&card.Native]
+    present: bool
+    irq: int
+    next: u64
+    level: u32
+    routes: [6]SdRoute
+
 private val sd_signal_names: [6]string = ["ck","cmd","d0","d1","d2","d3"]
 
-private[virt] configure_sdmmc(b: Board) -> Result[unit,string]
-    has_sdmmc = false
-    atomic_store(&sdmmc_next,memory.NEVER,Release)
-    atomic_store(&sdmmc_level,0,Release)
-    native_card = None
-    sdmmc_irq = -1
+/** No SDMMC on the bus. */
+sdmmc_state() -> SdmmcState = SdmmcState(sdmmc.host(), None, false, -1, memory.NEVER, 0, [SdRoute("",0);6])
+
+// The SDMMC `b` makes on a chip whose clock is `clock_hz`, its pins on the banks of `storage`, and the
+// card on it where `storage` puts the SD card on the SDMMC.
+private[virt] check_sdmmc(b: Board, clock_hz: u64, storage: *StorageState) -> Result[SdmmcState,string]
+    var s = sdmmc_state()
     var kernel: u64 = 60000000
     var name = ""
     for p in b.chip.peripherals
         if p.kind != "stm32-sdmmc" then continue
-        has_sdmmc = true
+        s.present = true
         name = p.name
-        if !p.irqs.is_empty() then sdmmc_irq = int(p.irqs.at(0).n)
+        if !p.irqs.is_empty() then s.irq = int(p.irqs.at(0).n)
         for q in p.params do if q.name == "kernel-clock-hz" then q.value match
             Whole(hz) -> kernel = u64(hz)
             _ -> ()
-    if !has_sdmmc then return Ok(())
-    if board_clock_hz == 0 || kernel > board_clock_hz then return Err("SDMMC requires a valid MCU/kernel clock")
+    if !s.present then return Ok(s)
+    if clock_hz == 0 || kernel > clock_hz then return Err("SDMMC requires a valid MCU/kernel clock")
     for i in 0usize..<6
         var found = false
         for bus in b.buses
@@ -45,32 +54,35 @@ private[virt] configure_sdmmc(b: Board) -> Result[unit,string]
                 for bank in ["PA","PB","PC","PD","PE","PF","PG","PH","PI","PJ","PK"]
                     local_pin(signal.pin,bank) match
                         Some(pin) ->
-                            if storage_gpio_named(bank).is_none() then return Err("SDMMC routed pin needs its STM32 GPIO bank")
-                            sd_routes[i] = SdRoute(bank,pin)
+                            if gpio_named(storage,bank).is_none() then return Err("SDMMC routed pin needs its STM32 GPIO bank")
+                            s.routes[i] = SdRoute(bank,pin)
                             found = true
                         None -> ()
         if !found then return Err("SDMMC requires routed ck/cmd/d0/d1/d2/d3 pins")
-    sdmmc_host = sdmmc.host(board_clock_hz,kernel)
-    if storage_is_native && storage_card.is_some() then native_card = Some(card.native(storage_card.unwrap()))
-    boot_sdmmc()
-    Ok(())
+    s.host = sdmmc.host(clock_hz,kernel)
+    if storage.is_native && storage.card.is_some() then s.card = Some(card.native(storage.card.unwrap()))
+    Ok(s)
+
 private[virt] boot_sdmmc()
-    sdmmc.reset(sdmmc_host)
-    native_card match
+    val s = &machine.devices.sdmmc
+    sdmmc.reset(s.host)
+    s.card match
         Some(c) -> card.reset_native(c)
         None -> ()
-    atomic_store(&sdmmc_next,memory.NEVER,Release)
-    atomic_store(&sdmmc_level,0,Release)
+    atomic_store(&s.next,memory.NEVER,Release)
+    atomic_store(&s.level,0,Release)
 
 private sdmmc_routed() -> bool
-    val count = if sdmmc_host.clock & 0xc000 == 0x4000 then 6usize else 3usize
+    val s = &machine.devices.sdmmc
+    val count = if s.host.clock & 0xc000 == 0x4000 then 6usize else 3usize
     for i in 0..<count
-        val route = sd_routes[i]
+        val route = s.routes[i]
         if !storage_gpio_alternate(route.bank,route.pin,12) then return false
     true
 private publish_sdmmc()
-    atomic_store(&sdmmc_next,sdmmc.due(sdmmc_host),Release)
-    atomic_store(&sdmmc_level,if sdmmc.irq(sdmmc_host) then 1 else 0,Release)
+    val s = &machine.devices.sdmmc
+    atomic_store(&s.next,sdmmc.due(s.host),Release)
+    atomic_store(&s.level,if sdmmc.irq(s.host) then 1 else 0,Release)
 private bring_sdmmc(cpu: *memory.Cpu, time: u64)
     val read_ram: &Fn(u32,[]u8) -> bool = (address,out) ->
         if address & 3 != 0 || out.len & 3 != 0 || !cpu.mem.ram_range(address, u32(out.len)) then return false
@@ -86,29 +98,33 @@ private bring_sdmmc(cpu: *memory.Cpu, time: u64)
             for j in 0usize..<4 do value |= u32(bytes[i * 4 + j]) << (u32(j) * 8)
             if !memory.device_store(cpu,address + u32(i * 4),4,value) then return false
         true
-    sdmmc.advance(sdmmc_host,time,native_card,sdmmc_routed(),read_ram,write_ram)
+    val s = &machine.devices.sdmmc
+    sdmmc.advance(s.host,time,s.card,sdmmc_routed(),read_ram,write_ram)
     publish_sdmmc()
-private[virt] sdmmc_due() -> u64 = atomic_load(&sdmmc_next,Acquire)
+private[virt] sdmmc_due() -> u64 = atomic_load(&machine.devices.sdmmc.next,Acquire)
 private[virt] sdmmc_wake(cpu: *memory.Cpu) -> u64
-    if !has_sdmmc || sdmmc_irq < 0 || !memory.could_wake(cpu,memory.IRQ0 + u32(sdmmc_irq)) then return memory.NEVER
-    if atomic_load(&sdmmc_level,Acquire) != 0 then board_time(cpu,cpu.retired) else sdmmc_due()
+    val s = &machine.devices.sdmmc
+    if !s.present || s.irq < 0 || !memory.could_wake(cpu,memory.IRQ0 + u32(s.irq)) then return memory.NEVER
+    if atomic_load(&s.level,Acquire) != 0 then board_time(cpu,cpu.retired) else sdmmc_due()
 private[virt] signal_sdmmc(cpu: *memory.Cpu)
-    if !has_sdmmc then return
+    val s = &machine.devices.sdmmc
+    if !s.present then return
     val time = board_time(cpu,cpu.retired)
     if sdmmc_due() <= time
         storage_lock.lock()
         bring_sdmmc(cpu,time)
         storage_lock.unlock()
-    if atomic_load(&sdmmc_level,Acquire) != 0 && sdmmc_irq >= 0 && !memory.exception_active(cpu,memory.IRQ0 + u32(sdmmc_irq)) then memory.raise(cpu,u32(sdmmc_irq))
+    if atomic_load(&s.level,Acquire) != 0 && s.irq >= 0 && !memory.exception_active(cpu,memory.IRQ0 + u32(s.irq)) then memory.raise(cpu,u32(s.irq))
 private[virt] sdmmc_read(cpu: *memory.Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || offset & 3 != 0
         memory.halt(cpu,memory.Stop.Fault,address)
         return 0
     storage_lock.lock()
     defer storage_lock.unlock()
+    val s = &machine.devices.sdmmc
     val time = board_time(cpu,n)
     bring_sdmmc(cpu,time)
-    sdmmc.read(sdmmc_host,offset,native_card,time) match
+    sdmmc.read(s.host,offset,s.card,time) match
         Some(value) -> value
         None ->
             memory.halt(cpu,memory.Stop.Unmapped,address)
@@ -121,7 +137,7 @@ private[virt] sdmmc_write(cpu: *memory.Cpu, address: u32, offset: u32, width: u3
     defer storage_lock.unlock()
     val time = board_time(cpu,n)
     bring_sdmmc(cpu,time)
-    if !sdmmc.write(sdmmc_host,offset,value,time) then memory.halt(cpu,memory.Stop.Fault,address)
+    if !sdmmc.write(machine.devices.sdmmc.host,offset,value,time) then memory.halt(cpu,memory.Stop.Fault,address)
     publish_sdmmc()
     val next = sdmmc_due()
     if next != memory.NEVER then memory.lower_limit(cpu,retirement_limit(cpu,next))

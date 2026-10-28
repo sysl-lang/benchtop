@@ -5,14 +5,21 @@ import sh.sysl.benchtop.peripheral.spi as spi
 import sh.sysl.benchtop.v6m.{Cpu, Stop, IRQ0, NEVER, halt, raise, could_wake, lower_limit}
 import sysl.sync.*
 
-var serial = spi.controller()
-var serial_present = false
-var serial_irq: int = -1
-var serial_sck: int = -1
-var serial_tx: int = -1
-var serial_rx: int = -1
-var serial_mask: u32 = 0
-var serial_output: u32 = 0
+/** The PL022 (`pl022`): its controller, the IRQ it raises (-1 for none), the GPIOs its SCK, TX and RX
+ * are routed to, and the pads it drives, which `mask` selects and `output` sets.
+ */
+struct SpiState
+    serial: spi.Controller
+    present: bool
+    irq: int
+    sck: int
+    tx: int
+    rx: int
+    mask: u32
+    output: u32
+
+/** No PL022 on the bus. */
+spi_state() -> SpiState = SpiState(spi.controller(), false, -1, -1, -1, -1, 0, 0)
 
 /** Select a board-routed signal, or the sole permitted pin in a simple MCU. */
 private spi_pin(b: Board, name: string, signal: string) -> int
@@ -27,61 +34,65 @@ private spi_pin(b: Board, name: string, signal: string) -> int
                 return connection_pin(Target.Pin(route.pins.at(0).name), b.chip.name)
     -1
 
-private[virt] configure_spi(b: Board) -> Result[unit,string]
-    serial_present = false
-    serial_irq = -1
+private[virt] check_spi(b: Board) -> Result[SpiState,string]
+    var s = spi_state()
     for p in b.chip.peripherals
         if p.kind != "pl022" then continue
-        if serial_present then return Err("one hardware SPI controller is currently supported")
-        serial_present = true
-        serial_sck = spi_pin(b, p.name, "sck")
-        serial_tx = spi_pin(b, p.name, "tx")
-        serial_rx = spi_pin(b, p.name, "rx")
-        if serial_sck < 0 || serial_tx < 0 || serial_sck == serial_tx
+        if s.present then return Err("one hardware SPI controller is currently supported")
+        s.present = true
+        s.sck = spi_pin(b, p.name, "sck")
+        s.tx = spi_pin(b, p.name, "tx")
+        s.rx = spi_pin(b, p.name, "rx")
+        if s.sck < 0 || s.tx < 0 || s.sck == s.tx
             return Err("pl022 needs distinct routed sck and tx GPIOs")
-        if !p.irqs.is_empty() then serial_irq = int(p.irqs.at(0).n)
-    boot_spi()
-    Ok(())
+        if !p.irqs.is_empty() then s.irq = int(p.irqs.at(0).n)
+    Ok(s)
 
 private[virt] boot_spi()
-    spi.reset(&serial)
-    atomic_store(&serial_mask,0,Relaxed)
-    atomic_store(&serial_output,0,Relaxed)
+    val s = &machine.devices.spi
+    spi.reset(&s.serial)
+    atomic_store(&s.mask,0,Relaxed)
+    atomic_store(&s.output,0,Relaxed)
 
-private[virt] spi_pad() -> (u32,u32) = (atomic_load(&serial_mask,Relaxed), atomic_load(&serial_output,Relaxed))
+private[virt] spi_pad() -> (u32,u32) = (atomic_load(&machine.devices.spi.mask,Relaxed), atomic_load(&machine.devices.spi.output,Relaxed))
 
 private spi_drive(sck: bool, mosi: bool, time: u64) -> bool
-    val mask = if spi.enabled(serial) then (1u32 << u32(serial_sck)) | (1u32 << u32(serial_tx)) else 0u32
-    val output = (if sck then 1u32 << u32(serial_sck) else 0u32) | (if mosi then 1u32 << u32(serial_tx) else 0u32)
-    atomic_store(&serial_mask,mask,Relaxed)
-    atomic_store(&serial_output,output & mask,Relaxed)
+    val s = &machine.devices.spi
+    val mask = if spi.enabled(s.serial) then (1u32 << u32(s.sck)) | (1u32 << u32(s.tx)) else 0u32
+    val output = (if sck then 1u32 << u32(s.sck) else 0u32) | (if mosi then 1u32 << u32(s.tx) else 0u32)
+    atomic_store(&s.mask,mask,Relaxed)
+    atomic_store(&s.output,output & mask,Relaxed)
     observe_displays(panel_levels_at(time), panel_drive_mask_at(time), time)
-    serial_rx >= 0 && (atomic_load(&panel_in,Relaxed) & (1u32 << u32(serial_rx))) != 0
+    s.rx >= 0 && (atomic_load(&machine.devices.panel.input,Relaxed) & (1u32 << u32(s.rx))) != 0
 
 val serial_pins: &Fn(bool,bool,u64) -> bool = (sck,mosi,time) -> spi_drive(sck,mosi,time)
 
 /** Caller owns panel_lock, preserving ordering with guest CS/DC/OE changes. */
 private[virt] bring_spi(time: u64)
-    if serial_present then spi.advance(&serial,time,serial_pins)
+    val s = &machine.devices.spi
+    if s.present then spi.advance(&s.serial,time,serial_pins)
 
 private[virt] spi_due() -> u64
-    if !serial_present then return NEVER
+    val s = &machine.devices.spi
+    if !s.present then return NEVER
     panel_lock.lock()
     defer panel_lock.unlock()
-    spi.due(serial).unwrap_or(NEVER)
+    spi.due(s.serial).unwrap_or(NEVER)
 
 private[virt] spi_wake(cpu: *Cpu) -> u64
-    if !serial_present || serial_irq < 0 || !could_wake(cpu,IRQ0 + u32(serial_irq)) then return NEVER
+    val s = &machine.devices.spi
+    if !s.present || s.irq < 0 || !could_wake(cpu,IRQ0 + u32(s.irq)) then return NEVER
     panel_lock.lock()
     defer panel_lock.unlock()
-    if serial.mask != 0 then spi.due(serial).unwrap_or(NEVER) else NEVER
+    if s.serial.mask != 0 then spi.due(s.serial).unwrap_or(NEVER) else NEVER
 
 private[virt] signal_spi(cpu: *Cpu)
-    if !serial_present then return
+    val s = &machine.devices.spi
+    if !s.present then return
     panel_lock.lock()
     defer panel_lock.unlock()
     bring_spi(board_time(cpu,cpu.retired))
-    if serial_irq >= 0 && spi.irq(serial) then raise(cpu,u32(serial_irq))
+    if s.irq >= 0 && spi.irq(s.serial) then raise(cpu,u32(s.irq))
 
 private[virt] spi_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if (width != 2 && width != 4) || (offset & (width - 1)) != 0 || (offset & 3) != 0
@@ -90,7 +101,7 @@ private[virt] spi_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64)
     panel_lock.lock()
     defer panel_lock.unlock()
     bring_spi(board_time(cpu,n))
-    spi.read(&serial,offset) match
+    spi.read(&machine.devices.spi.serial,offset) match
         Some(value) -> value
         None ->
             halt(cpu,Stop.Unmapped,address)
@@ -102,12 +113,13 @@ private[virt] spi_write(cpu: *Cpu, address: u32, offset: u32, width: u32, value:
         return
     panel_lock.lock()
     defer panel_lock.unlock()
+    val s = &machine.devices.spi
     val time = board_time(cpu,n)
     bring_spi(time)
-    if !spi.write(&serial,offset,value)
+    if !spi.write(&s.serial,offset,value)
         halt(cpu,Stop.Fault,address)
         return
-    spi_drive(serial.sck,serial.mosi,time)
-    spi.due(serial) match
+    spi_drive(s.serial.sck,s.serial.mosi,time)
+    spi.due(s.serial) match
         Some(due) -> lower_limit(cpu,retirement_limit(cpu,due))
         None -> ()

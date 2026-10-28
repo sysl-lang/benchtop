@@ -5,15 +5,24 @@ import sh.sysl.benchtop.peripheral.adc as adc
 import sh.sysl.benchtop.v6m.{Cpu, Stop, IRQ0, NEVER, could_wake, halt, raise, lower_limit}
 import sysl.threads.SleepLock
 
-var converter = adc.adc()
-var has_adc = false
-var adc_irq: int = -1
-var analog_uv: [32]u32
-var analog_driven: u32 = 0
-var channel_pins: [32]int
-var channel_count: u32 = 0
-var adc_at: u64 = 0
+/** The ADC (`virt-adc`) and the analogue levels on the pins: its converter, the IRQ it raises (-1 for
+ * none), each pin's level in microvolts and which pins something drives, the pin of each of its
+ * `channel_count` channels, and the clock the converter has been brought to.
+ */
+struct AdcState
+    converter: adc.Adc
+    present: bool
+    irq: int
+    analog_uv: [32]u32
+    analog_driven: u32
+    channel_pins: [32]int
+    channel_count: u32
+    at: u64
+
 var adc_lock = SleepLock.new()
+
+/** No ADC on the bus, and nothing on the pins. */
+adc_state() -> AdcState = AdcState(adc.adc(), false, -1, [0;32], 0, [-1;32], 0, 0)
 
 /** Resolve a pin endpoint against the owning chip's name. Legacy bare pins remain accepted. */
 connection_pin(t: Target, chip: string) -> int
@@ -40,23 +49,22 @@ set_analog_pin(pin: int, uv: u32)
     require pin >= 0 && pin < 32, "analogue pin is GP0..GP31"
     adc_lock.lock()
     defer adc_lock.unlock()
-    analog_uv[pin] = uv
-    analog_driven |= 1u32 << u32(pin)
+    val s = &machine.devices.adc
+    s.analog_uv[pin] = uv
+    s.analog_driven |= 1u32 << u32(pin)
 
 analog_level(pin: int) -> u32
     require pin >= 0 && pin < 32, "analogue pin is GP0..GP31"
     adc_lock.lock()
     defer adc_lock.unlock()
-    analog_uv[pin]
+    machine.devices.adc.analog_uv[pin]
 
-private[virt] configure_adc(b: Board)
-    adc_lock.lock()
-    defer adc_lock.unlock()
-    converter = adc.adc()
-    analog_driven = 0
-    analog_uv = [0; 32]
-    channel_pins = [-1; 32]
-    channel_count = 0
+// The ADC a bus of `mapped` has, as `b` configures it, and the levels its parts put on the pins.
+private[virt] check_adc(b: Board, mapped: []const Mapped) -> AdcState
+    var s = adc_state()
+    val (present, irq) = mapped_irq(mapped, Adc)
+    s.present = present
+    s.irq = irq
     for p in b.chip.peripherals
         if p.kind != "virt-adc" then continue
         var reference: u32 = 3300000
@@ -67,52 +75,57 @@ private[virt] configure_adc(b: Board)
                     if q.name == "reference-uv" then reference = u32(n)
                     elif q.name == "conversion-cycles" then cycles = u64(n)
                 _ -> ()
-        converter = adc.adc(reference, cycles)
+        s.converter = adc.adc(reference, cycles)
         for ch in p.channels
             pin_parts(ch.name) match
-                Some((bank, pin)) -> if bank == "GP" && pin >= 0 && pin < 32 && channel_count < 32
-                    channel_pins[channel_count] = pin
-                    channel_count += 1
+                Some((bank, pin)) -> if bank == "GP" && pin >= 0 && pin < 32 && s.channel_count < 32
+                    s.channel_pins[s.channel_count] = pin
+                    s.channel_count += 1
                 None -> ()
     for p in b.parts
         if p.kind == "joystick"
             for axis in ["x", "y"]
                 val pin = terminal_pin(p, axis, b.chip.name)
                 if pin >= 0
-                    analog_uv[pin] = pot_voltage(p, 5000)
-                    analog_driven |= 1u32 << u32(pin)
+                    s.analog_uv[pin] = pot_voltage(p, 5000)
+                    s.analog_driven |= 1u32 << u32(pin)
         if p.kind != "potentiometer" then continue
         val pin = terminal_pin(p, "wiper", b.chip.name)
         if pin < 0 then continue
-        analog_uv[pin] = pot_voltage(p, int(part_whole(p, "position", 50)) * 100)
-        analog_driven |= 1u32 << u32(pin)
+        s.analog_uv[pin] = pot_voltage(p, int(part_whole(p, "position", 50)) * 100)
+        s.analog_driven |= 1u32 << u32(pin)
+    s
 
 private[virt] boot_adc()
-    adc.reset(&converter)
-    adc_at = 0
+    val s = &machine.devices.adc
+    adc.reset(&s.converter)
+    s.at = 0
 
-private bring_adc(t: u64)
-    if t > adc_at then adc_at = t
-    adc.advance(&converter, adc_at)
+private bring_adc(s: *AdcState, t: u64)
+    if t > s.at then s.at = t
+    adc.advance(&s.converter, s.at)
 
 private[virt] adc_due() -> u64
-    if !has_adc then return NEVER
+    val s = &machine.devices.adc
+    if !s.present then return NEVER
     adc_lock.lock()
     defer adc_lock.unlock()
-    if has_adc && converter.busy then converter.due else NEVER
+    if s.converter.busy then s.converter.due else NEVER
 
 private[virt] adc_wake(cpu: *Cpu) -> u64
-    if !has_adc || adc_irq < 0 || !could_wake(cpu, IRQ0 + u32(adc_irq)) then return NEVER
+    val s = &machine.devices.adc
+    if !s.present || s.irq < 0 || !could_wake(cpu, IRQ0 + u32(s.irq)) then return NEVER
     adc_lock.lock()
     defer adc_lock.unlock()
-    if converter.busy && (converter.mask & 1) != 0 then converter.due else NEVER
+    if s.converter.busy && (s.converter.mask & 1) != 0 then s.converter.due else NEVER
 
 private[virt] signal_adc(cpu: *Cpu)
-    if !has_adc then return
+    val s = &machine.devices.adc
+    if !s.present then return
     adc_lock.lock()
     defer adc_lock.unlock()
-    bring_adc(board_time(cpu, cpu.retired))
-    if adc_irq >= 0 && adc.irq(converter) then raise(cpu, u32(adc_irq))
+    bring_adc(s, board_time(cpu, cpu.retired))
+    if s.irq >= 0 && adc.irq(s.converter) then raise(cpu, u32(s.irq))
 
 private[virt] adc_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || (offset & 3) != 0
@@ -120,8 +133,9 @@ private[virt] adc_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64)
         return 0
     adc_lock.lock()
     defer adc_lock.unlock()
-    bring_adc(board_time(cpu, n))
-    adc.read(converter, offset) match
+    val s = &machine.devices.adc
+    bring_adc(s, board_time(cpu, n))
+    adc.read(s.converter, offset) match
         Some(value) -> value
         None ->
             halt(cpu, Stop.Unmapped, address)
@@ -133,16 +147,18 @@ private[virt] adc_write(cpu: *Cpu, address: u32, offset: u32, width: u32, value:
         return
     adc_lock.lock()
     defer adc_lock.unlock()
-    bring_adc(board_time(cpu, n))
-    val channel = converter.channel
-    val pin = if channel < channel_count then channel_pins[channel] else -1
-    val connected = pin >= 0 && (analog_driven & (1u32 << u32(pin))) != 0
-    if !adc.write(&converter, offset, value, if connected then analog_uv[pin] else 0, connected, adc_at) then halt(cpu, Stop.Unmapped, address)
-    if converter.busy then lower_limit(cpu, retirement_limit(cpu,converter.due))
+    val s = &machine.devices.adc
+    bring_adc(s, board_time(cpu, n))
+    val channel = s.converter.channel
+    val pin = if channel < s.channel_count then s.channel_pins[channel] else -1
+    val connected = pin >= 0 && (s.analog_driven & (1u32 << u32(pin))) != 0
+    if !adc.write(&s.converter, offset, value, if connected then s.analog_uv[pin] else 0, connected, s.at) then halt(cpu, Stop.Unmapped, address)
+    if s.converter.busy then lower_limit(cpu, retirement_limit(cpu,s.converter.due))
 
 /** Debug observation: no guest clock advancement, acknowledgement, or IRQ changes. */
 peek_adc(offset: u32) -> Option[u32]
     adc_lock.lock()
     defer adc_lock.unlock()
-    if !has_adc then return None
-    adc.read(converter, offset)
+    val s = &machine.devices.adc
+    if !s.present then return None
+    adc.read(s.converter, offset)

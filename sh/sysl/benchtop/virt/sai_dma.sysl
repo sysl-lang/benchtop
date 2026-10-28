@@ -9,22 +9,36 @@ import sysl.buf.{Buf,buf}
 import sysl.threads.SleepLock
 import sysl.sync.*
 
-private var sai_present = false
-private var dma_present: [2]bool = [false,false]
-private var mux_present = false
-private var sai_at: u32 = 0
-private var sai_requests: [2]u32 = [87,88]
-private var sai_blocks: [2]&sai.Block = [sai.block(),sai.block()]
-private var dma_units: [2]&dma.Controller = [dma.controller(),dma.controller()]
-private var audio_mux = dma.mux()
+/** The SAI (`stm32-sai`), the two DMA controllers (`stm32-dma`) and the DMAMUX (`stm32-dmamux`):
+ * which of them the bus has, the SAI's base and the DMA request each of its blocks makes, the
+ * models, and the IRQ each interrupt line raises (the SAI's, then each DMA stream's; -1 for none).
+ * `next` and `irq_levels` are published for the cores to read without the lock. `core` is the core
+ * whose access is being served, stable only under `audio_lock`, on that core's own host thread: the
+ * core's number rather than a borrowed MMIO callback pointer.
+ */
+struct AudioState
+    sai_present: bool
+    dma_present: [2]bool
+    mux_present: bool
+    sai_at: u32
+    requests: [2]u32
+    blocks: [2]&sai.Block
+    units: [2]&dma.Controller
+    mux: &dma.Mux
+    next: u64
+    irq_levels: u32
+    irq_routes: [17]int
+    core: u32
+
 private var audio_lock = SleepLock.new()
-private var audio_next: u64 = NEVER
-private var audio_irq_levels: u32 = 0
-private var audio_irq_routes: [17]int = [-1;17]
-// Stable only under audio_lock, on the calling core's own host thread.
-// Store the core ID rather than retaining a borrowed MMIO callback pointer.
-private var audio_core: u32 = 0
-private audio_cpu() -> *Cpu = if audio_core == 0 then core0() else core1()
+
+/** No SAI, DMA or DMAMUX on the bus. */
+audio_state() -> AudioState =
+    AudioState(false, [false,false], false, 0, [87,88], [sai.block(),sai.block()], [dma.controller(),dma.controller()], dma.mux(), NEVER, 0, [-1;17], 0)
+
+private audio_cpu() -> *Cpu = if machine.devices.audio.core == 0 then core0() else core1()
+
+// What the SAI's blocks played and what they are given to record, crossing to and from the host.
 struct SaiPacket
     frame: u64
     word: u32
@@ -42,27 +56,23 @@ private var audio_debug_input: [2]bool = [false,false]
 private var audio_in_head: [2]usize = [0,0]
 private var audio_in_count: [2]usize = [0,0]
 
-private[virt] configure_sai_dma(b: Board) -> Result[unit,string]
-    sai_present = false
-    dma_present = [false,false]
-    mux_present = false
-    sai_at = 0
-    sai_requests = [87,88]
-    audio_irq_routes = [-1;17]
+// The SAI and DMA `b` makes on a chip whose clock is `clock_hz`.
+private[virt] check_audio(b: Board, clock_hz: u64) -> Result[AudioState,string]
+    var s = audio_state()
     var kernel: u64 = 12288000
     for p in b.chip.peripherals
         if p.kind == "stm32-sai"
-            if sai_present then return Err("one STM32 SAI instance is currently supported")
-            if board_clock_hz == 0 then return Err("stm32-sai requires mcu.clock-hz")
-            if !p.irqs.is_empty() then audio_irq_routes[0] = int(p.irqs.at(0).n)
-            sai_present = true
-            sai_at = u32(p.at.unwrap().n)
+            if s.sai_present then return Err("one STM32 SAI instance is currently supported")
+            if clock_hz == 0 then return Err("stm32-sai requires mcu.clock-hz")
+            if !p.irqs.is_empty() then s.irq_routes[0] = int(p.irqs.at(0).n)
+            s.sai_present = true
+            s.sai_at = u32(p.at.unwrap().n)
             for q in p.params
                 q.value match
                     Whole(n) ->
                         if q.name == "kernel-clock-hz" then kernel = u64(n)
-                        elif q.name == "request-a" then sai_requests[0] = u32(n)
-                        elif q.name == "request-b" then sai_requests[1] = u32(n)
+                        elif q.name == "request-a" then s.requests[0] = u32(n)
+                        elif q.name == "request-b" then s.requests[1] = u32(n)
                     _ -> ()
         elif p.kind == "stm32-dma"
             var index: usize = 0
@@ -71,31 +81,31 @@ private[virt] configure_sai_dma(b: Board) -> Result[unit,string]
                     Whole(n) -> index = usize(n - 1)
                     _ -> ()
                 None -> ()
-            dma_present[index] = true
-            for k in 0..<p.irqs.len() do audio_irq_routes[1 + index * 8 + k] = int(p.irqs.at(k).n)
-        elif p.kind == "stm32-dmamux" then mux_present = true
-    if sai_requests[0] == sai_requests[1] then return Err("SAI A and B need distinct DMA request IDs")
-    val hz = if board_clock_hz == 0 then 480000000 else board_clock_hz
-    sai_blocks = [sai.block(hz,kernel),sai.block(hz,kernel)]
-    boot_sai_dma()
-    Ok(())
+            s.dma_present[index] = true
+            for k in 0..<p.irqs.len() do s.irq_routes[1 + index * 8 + k] = int(p.irqs.at(k).n)
+        elif p.kind == "stm32-dmamux" then s.mux_present = true
+    if s.requests[0] == s.requests[1] then return Err("SAI A and B need distinct DMA request IDs")
+    val hz = if clock_hz == 0 then 480000000 else clock_hz
+    s.blocks = [sai.block(hz,kernel),sai.block(hz,kernel)]
+    Ok(s)
 
 private[virt] boot_sai_dma()
     audio_lock.lock()
     defer audio_lock.unlock()
+    val s = &machine.devices.audio
     for i in 0..<2
-        sai.reset(sai_blocks[i])
-        dma.reset(dma_units[i])
-    dma.reset_mux(audio_mux)
-    audio_core = 0
+        sai.reset(s.blocks[i])
+        dma.reset(s.units[i])
+    dma.reset_mux(s.mux)
+    s.core = 0
     audio_frame_number = [0,0]
     audio_out_head = [0,0]
     audio_out_count = [0,0]
     audio_debug_input = [false,false]
     audio_in_head = [0,0]
     audio_in_count = [0,0]
-    atomic_store(&audio_next,NEVER,Release)
-    atomic_store(&audio_irq_levels,0,Release)
+    atomic_store(&s.next,NEVER,Release)
+    atomic_store(&s.irq_levels,0,Release)
 
 // These debug/codec-facing queues never advance guest time or take UI locks.
 sai_feed_input(block: usize, words: []const u32)
@@ -134,7 +144,7 @@ private input_word(block: usize) -> u32
 
 private output_word(block: usize, slot: u32, word: u32)
     if slot == 0 then audio_frame_number[block] += 1
-    val b = sai_blocks[block]
+    val b = machine.devices.audio.blocks[block]
     val bits = sh.sysl.benchtop.peripheral.sai.sample_bits(b)
     val count = sai.slots(b)
     val gain = codec_slot_gain(block,slot,count,bits)
@@ -145,51 +155,53 @@ private output_word(block: usize, slot: u32, word: u32)
     audio_out_count[block] += 1
 
 private data_block(address: u32) -> int
-    if !sai_present then return -1
-    if address == sai_at + 0x20 then 0 elif address == sai_at + 0x40 then 1 else -1
+    val s = &machine.devices.audio
+    if !s.sai_present then return -1
+    if address == s.sai_at + 0x20 then 0 elif address == s.sai_at + 0x40 then 1 else -1
 
 private audio_bus_read(address: u32, width: u32) -> Option[u32]
     val block = data_block(address)
-    if block >= 0 then return sai.read(sai_blocks[block],sai.DR)
+    if block >= 0 then return sai.read(machine.devices.audio.blocks[block],sai.DR)
     val page = memory.page_for(audio_cpu(),address,width)
     if page == 0 then None else Some(memory.host_read(page,address,width))
 
 private audio_bus_write(address: u32, width: u32, value: u32) -> bool
     val block = data_block(address)
-    if block >= 0 then return sai.write(sai_blocks[block],sai.DR,value)
+    if block >= 0 then return sai.write(machine.devices.audio.blocks[block],sai.DR,value)
     memory.device_store(audio_cpu(),address,width,value)
 
 private val audio_read_bus: dma.BusRead = (address,width) -> audio_bus_read(address,width)
 private val audio_write_bus: dma.BusWrite = (address,width,value) -> audio_bus_write(address,width,value)
 
 private service_audio_dma()
-    if !mux_present || !sai_present then return
+    val s = &machine.devices.audio
+    if !s.mux_present || !s.sai_present then return
     for unit in 0usize..<2
-        if !dma_present[unit] then continue
+        if !s.dma_present[unit] then continue
         for stream in 0usize..<8
             for block in 0usize..<2
-                if !dma.routed(audio_mux,unit * 8 + stream,sai_requests[block]) then continue
+                if !dma.routed(s.mux,unit * 8 + stream,s.requests[block]) then continue
                 // Bounded even for a misconfigured circular PAR which does not
                 // service the selected FIFO. No bus callbacks recurse into MMIO.
                 for beat in 0..<8
-                    if !sai.dma_request(sai_blocks[block]) then break
-                    if !dma.request(dma_units[unit],stream,audio_read_bus,audio_write_bus) then break
+                    if !sai.dma_request(s.blocks[block]) then break
+                    if !dma.request(s.units[unit],stream,audio_read_bus,audio_write_bus) then break
 
 private input_slot(block: usize, slot: u32) -> u32
-    val b = sai_blocks[block]
+    val b = machine.devices.audio.blocks[block]
     val source = if audio_debug_input[block] then None else codec_input_word(block,slot,sai.slots(b),sai.sample_bits(b))
     source match
         Some(word) -> word
         None -> if (b.slotr >> 16) & (1u32 << slot) != 0 then input_word(block) else 0
 
 private audio_slot(block: usize, slot: u32, word: u32, time: u64) -> u32
-    val b = sai_blocks[block]
+    val b = machine.devices.audio.blocks[block]
     var input: u32 = 0
     if sai.receiving(b)
         input = input_slot(block,slot)
     else output_word(block,slot,word)
     val peer = 1 - block
-    val other = sai_blocks[peer]
+    val other = machine.devices.audio.blocks[peer]
     if sai.enabled(other) && (other.cr1 >> 10) & 3 == 1
         other.time = time
         val sample = if sai.receiving(other) then input_slot(peer,other.slot) else 0
@@ -204,92 +216,96 @@ private val audio_a: sai.Endpoint = (slot,word,time) -> audio_slot(0,slot,word,t
 private val audio_b: sai.Endpoint = (slot,word,time) -> audio_slot(1,slot,word,time)
 
 private publish_audio()
-    val due = if sai_blocks[0].due < sai_blocks[1].due then sai_blocks[0].due else sai_blocks[1].due
-    atomic_store(&audio_next,if sai_present then due else NEVER,Release)
-    var levels: u32 = if sai_present && (sai.irq(sai_blocks[0]) || sai.irq(sai_blocks[1])) then 1 else 0
+    val s = &machine.devices.audio
+    val due = if s.blocks[0].due < s.blocks[1].due then s.blocks[0].due else s.blocks[1].due
+    atomic_store(&s.next,if s.sai_present then due else NEVER,Release)
+    var levels: u32 = if s.sai_present && (sai.irq(s.blocks[0]) || sai.irq(s.blocks[1])) then 1 else 0
     for unit in 0usize..<2
-        if !dma_present[unit] then continue
+        if !s.dma_present[unit] then continue
         for stream in 0usize..<8
-            if dma.irq(dma_units[unit],stream) then levels |= 1u32 << u32(1 + unit * 8 + stream)
-    val rising = levels & ~atomic_swap(&audio_irq_levels,levels,AcqRel)
+            if dma.irq(s.units[unit],stream) then levels |= 1u32 << u32(1 + unit * 8 + stream)
+    val rising = levels & ~atomic_swap(&s.irq_levels,levels,AcqRel)
     for k in 0usize..<17
-        if rising & (1u32 << u32(k)) == 0 || audio_irq_routes[k] < 0 then continue
-        val irq = u32(audio_irq_routes[k])
+        if rising & (1u32 << u32(k)) == 0 || s.irq_routes[k] < 0 then continue
+        val irq = u32(s.irq_routes[k])
         val own = audio_cpu()
         memory.raise(own,irq)
         memory.cut(own)
-        if launched then memory.poke(if audio_core == 0 then core1() else core0(),irq)
+        if launched then memory.poke(if s.core == 0 then core1() else core0(),irq)
 
 private bring_audio(c: *Cpu, time: u64)
-    audio_core = c.core
+    val s = &machine.devices.audio
+    s.core = c.core
     service_audio_dma()
     loop
-        val first = sai_blocks[0].due
-        val second = sai_blocks[1].due
+        val first = s.blocks[0].due
+        val second = s.blocks[1].due
         val due = if first < second then first else second
         if due == NEVER || due > time then break
         // Interleave DMA between slots even when a caller advances a large
         // interval, so batching cannot create artificial FIFO underruns.
-        if first <= second then sai.advance(sai_blocks[0],due,audio_a)
-        else sai.advance(sai_blocks[1],due,audio_b)
+        if first <= second then sai.advance(s.blocks[0],due,audio_a)
+        else sai.advance(s.blocks[1],due,audio_b)
         service_audio_dma()
-    for b in sai_blocks
+    for b in s.blocks
         if time > b.time then b.time = time
     publish_audio()
 
-private[virt] sai_dma_due() -> u64 = atomic_load(&audio_next,Acquire)
+private[virt] sai_dma_due() -> u64 = atomic_load(&machine.devices.audio.next,Acquire)
 
 private audio_raise_levels(c: *Cpu)
-    val levels = atomic_load(&audio_irq_levels,Acquire)
+    val s = &machine.devices.audio
+    val levels = atomic_load(&s.irq_levels,Acquire)
     if levels == 0 then return
     for k in 0usize..<17
-        if levels & (1u32 << u32(k)) == 0 || audio_irq_routes[k] < 0 then continue
-        val irq = u32(audio_irq_routes[k])
+        if levels & (1u32 << u32(k)) == 0 || s.irq_routes[k] < 0 then continue
+        val irq = u32(s.irq_routes[k])
         if !memory.exception_active(c,memory.IRQ0 + irq) then memory.raise(c,irq)
 
 private[virt] signal_sai_dma(c: *Cpu)
     val due = sai_dma_due()
     val time = board_time(c,c.retired)
-    if sai_present && due != NEVER && time >= due
+    if machine.devices.audio.sai_present && due != NEVER && time >= due
         audio_lock.lock()
         bring_audio(c,time)
         audio_lock.unlock()
     audio_raise_levels(c)
 
 private[virt] sai_dma_wake(c: *Cpu) -> u64
-    val levels = atomic_load(&audio_irq_levels,Acquire)
+    val s = &machine.devices.audio
+    val levels = atomic_load(&s.irq_levels,Acquire)
     if levels != 0
         for k in 0usize..<17
-            if levels & (1u32 << u32(k)) != 0 && audio_irq_routes[k] >= 0 && memory.could_wake(c,memory.IRQ0 + u32(audio_irq_routes[k])) then return board_time(c,c.retired)
+            if levels & (1u32 << u32(k)) != 0 && s.irq_routes[k] >= 0 && memory.could_wake(c,memory.IRQ0 + u32(s.irq_routes[k])) then return board_time(c,c.retired)
     sai_dma_due()
 
 private valid_audio_access(device: Device, offset: u32, width: u32) -> bool
     if device == Device.Sai && (offset == 0x20 || offset == 0x40) then return width == 1 || width == 2 || width == 4
     width == 4 && offset & 3 == 0
 
-private audio_register_read(device: Device, offset: u32) -> Option[u32] = device match
-    Dma1 -> dma.read(dma_units[0],offset)
-    Dma2 -> dma.read(dma_units[1],offset)
-    Dmamux -> dma.read_mux(audio_mux,offset)
+private audio_register_read(s: *AudioState, device: Device, offset: u32) -> Option[u32] = device match
+    Dma1 -> dma.read(s.units[0],offset)
+    Dma2 -> dma.read(s.units[1],offset)
+    Dmamux -> dma.read_mux(s.mux,offset)
     Sai ->
         if offset == 0 || offset == 0x44 || offset == 0x48 then Some(0)
-        elif offset >= 4 && offset <= 0x40 then sai.read(sai_blocks[if offset < 0x24 then 0 else 1],(offset - 4) % 32)
+        elif offset >= 4 && offset <= 0x40 then sai.read(s.blocks[if offset < 0x24 then 0 else 1],(offset - 4) % 32)
         else None
     _ -> None
 
-private audio_register_write(device: Device, offset: u32, value: u32) -> bool = device match
-    Dma1 -> dma.write(dma_units[0],offset,value)
-    Dma2 -> dma.write(dma_units[1],offset,value)
-    Dmamux -> dma.write_mux(audio_mux,offset,value)
+private audio_register_write(s: *AudioState, device: Device, offset: u32, value: u32) -> bool = device match
+    Dma1 -> dma.write(s.units[0],offset,value)
+    Dma2 -> dma.write(s.units[1],offset,value)
+    Dmamux -> dma.write_mux(s.mux,offset,value)
     Sai ->
         if offset == 0 || offset == 0x44 || offset == 0x48 then value == 0
         elif offset >= 4 && offset <= 0x40
             val index: usize = if offset < 0x24 then 0 else 1
             val reg = (offset - 4) % 32
-            val b = sai_blocks[index]
+            val b = s.blocks[index]
             // Internal synchronous blocks must use the driving block's frame.
             if reg == 0 && value & sai.ENABLE != 0 && (value >> 10) & 3 == 1
-                val peer = sai_blocks[1 - index]
+                val peer = s.blocks[1 - index]
                 if b.frcr != peer.frcr || sai.slots(b) != sai.slots(peer) then return false
             sai.write(b,reg,value)
         else false
@@ -302,7 +318,7 @@ private[virt] sai_dma_read(c: *Cpu, device: Device, address: u32, offset: u32, w
     audio_lock.lock()
     defer audio_lock.unlock()
     bring_audio(c,board_time(c,n))
-    val result = audio_register_read(device,offset)
+    val result = audio_register_read(&machine.devices.audio,device,offset)
     // Reading RX DR may release space; always publish the resulting request state.
     service_audio_dma()
     publish_audio()
@@ -320,7 +336,7 @@ private[virt] sai_dma_write(c: *Cpu, device: Device, address: u32, offset: u32, 
     defer audio_lock.unlock()
     bring_audio(c,board_time(c,n))
     val word = if width == 4 then value else value & ((1u32 << (width * 8)) - 1)
-    if !audio_register_write(device,offset,word) then halt(c,Stop.Fault,address)
+    if !audio_register_write(&machine.devices.audio,device,offset,word) then halt(c,Stop.Fault,address)
     service_audio_dma()
     publish_audio()
     val due = sai_dma_due()

@@ -72,18 +72,10 @@ end runnable
  */
 assemble(b: Board, reg: Registry) -> Result[unit, string]
     val p = plan(b, reg)?
-    val clock_before = board_clock_hz
 
-    // The devices read the board's clock while they are configured.
     board_clock_hz = p.clock_hz
-    configure_devices(b) match
-        Ok(_) -> ()
-        Err(why) ->
-            board_clock_hz = clock_before
-            return Err(why)
-
     machine.map = p.map
-    attach(p.devices.view(), p.kind)
+    apply_devices(p.devices)
     core_clock_divisors = p.divisors
     for k in 0..<2
         val c = p.cores[k]
@@ -99,8 +91,7 @@ assemble(b: Board, reg: Registry) -> Result[unit, string]
 /** What a description makes of a machine, decided and checked whole before any of it is set. */
 private struct Plan
     map: MemoryMap
-    devices: Buf[Mapped]
-    kind: Kind
+    devices: Devices
     clock_hz: u64
     divisors: [2]u64
     cores: [2]CoreSetup
@@ -111,20 +102,6 @@ private struct CoreSetup
     priority_bits: u32
     dsp: bool
     fpu: u32
-
-private configure_devices(b: Board) -> Result[unit, string]
-    configure_h7(b)?
-    configure_spi(b)?
-    configure_storage(b)?
-    configure_sdmmc(b)?
-    configure_adc(b)
-    configure_rtcs(b)?
-    configure_sound(b)?
-    configure_digital_audio(b)?
-    configure_displays(b)
-    configure_dsi(b)?
-    configure_sai_dma(b)?
-    Ok(())
 
 /** The machine `b` describes, or why benchtop cannot run it. It sets nothing. */
 private plan(b: Board, reg: Registry) -> Result[Plan, string]
@@ -208,34 +185,9 @@ private plan(b: Board, reg: Registry) -> Result[Plan, string]
                     if attached != 1 then return Err("flash-interface needs exactly one external flash part")
                 memory_flash_at = u32(at)
                 memory_flash_size = u32(size)
-            "stm32-sai" -> ds.push(placed(Sai,p,at,0x400,irqs))
-            "stm32-dmamux" -> ds.push(placed(Dmamux,p,at,0x400,irqs))
-            "stm32-dma" ->
-                var index = 1
-                param_named(p.params,"controller") match
-                    Some(q) -> q.value match
-                        Whole(n) -> index = int(n)
-                        _ -> ()
-                    None -> ()
-                ds.push(placed(if index == 1 then Dma1 else Dma2,p,at,0x400,irqs))
-            "stm32-dsi" -> ds.push(placed(Dsi, p, at, 0x800, irqs))
-            "stm32h7-rcc" -> ds.push(placed(H7Rcc, p, at, 0x400, irqs))
-            "debug-console" -> ds.push(placed(Console, p, at, 16, irqs))
-            "virt-i2s" -> ds.push(placed(DigitalAudio, p, at, 256, irqs))
-            "virt-pwm" -> ds.push(placed(Pwm, p, at, 256, irqs))
-            "stm32-sdmmc" -> ds.push(placed(Sdmmc,p,at,0x400,irqs))
-            "stm32-spi" -> ds.push(placed(H7Spi,p,at,0x400,irqs))
-            "stm32-gpio" -> ds.push(placed(Stm32Gpio,p,at,0x400,irqs))
-            "pl022" -> ds.push(placed(Spi, p, at, 0x1000, irqs))
-            "stm32-i2c" -> ds.push(placed(I2c, p, at, 0x400, irqs))
-            "virt-i2c" -> ds.push(placed(I2c, p, at, 256, irqs))
-            "virt-adc" -> ds.push(placed(Adc, p, at, 256, irqs))
-            "panel-gpio" -> ds.push(placed(PanelGpio, p, at, 256, irqs))
-            "virt-sio" -> ds.push(placed(Sio, p, at, 0x180, irqs))
-            "rp-resets" -> ds.push(placed(Resets, p, at, 0x4000, irqs))
-            "rp-timer" -> ds.push(placed(Timer, p, at, 0x4000, irqs))
-            "rp-watchdog" -> ds.push(placed(Watchdog, p, at, 0x4000, irqs))
-            _ -> return Err(s"`${p.name}` is ${article_of(p.kind)} ${p.kind}, which benchtop does not emulate")
+            _ -> device_of(p) match
+                Some(d) -> ds.push(placed(d, p, at, irqs, reg))
+                None -> return Err(s"`${p.name}` is ${article_of(p.kind)} ${p.kind}, which benchtop does not emulate")
     end for
 
     if !ram then return Err(s"the ${chip.name} has no `ram` region")
@@ -293,8 +245,9 @@ private plan(b: Board, reg: Registry) -> Result[Plan, string]
             _ -> ()
 
     val map = MemoryMap(memory_ram_at, memory_ram_size, memory_flash_at, memory_flash_size, banks)
+    val devices = check_devices(b, ds.view(), clock_hz)?
 
-    Ok(Plan(map, ds, model.kind, clock_hz, divisors, [core_setup(cores.at(0)), core_setup(cores.at(1))]))
+    Ok(Plan(map, devices, clock_hz, divisors, [core_setup(cores.at(0)), core_setup(cores.at(1))]))
 end plan
 
 // A core's kind and options, from a core `plan` has checked.
@@ -315,10 +268,42 @@ private core_setup(core: Core) -> CoreSetup
 
     CoreSetup(kind, timed, priority_bits, dsp, fpu)
 
-private placed(d: Device, p: Peripheral, at: long, fixed: long, irqs: [8]int) -> Mapped
+// The device on the cores' bus that a peripheral of the description is, or none for a kind benchtop
+// does not put there.
+private device_of(p: Peripheral) -> Option[Device] = p.kind match
+    "stm32-sai" -> Some(Sai)
+    "stm32-dmamux" -> Some(Dmamux)
+    "stm32-dma" ->
+        val controller = param_named(p.params, "controller") match
+            Some(q) -> q.value match
+                Whole(n) -> n
+                _ -> 1
+            None -> 1
+        Some(if controller == 1 then Dma1 else Dma2)
+    "stm32-dsi" -> Some(Dsi)
+    "stm32h7-rcc" -> Some(H7Rcc)
+    "debug-console" -> Some(Console)
+    "virt-i2s" -> Some(DigitalAudio)
+    "virt-pwm" -> Some(Pwm)
+    "stm32-sdmmc" -> Some(Sdmmc)
+    "stm32-spi" -> Some(H7Spi)
+    "stm32-gpio" -> Some(Stm32Gpio)
+    "pl022" -> Some(Spi)
+    "stm32-i2c" | "virt-i2c" -> Some(I2c)
+    "virt-adc" -> Some(Adc)
+    "panel-gpio" -> Some(PanelGpio)
+    "virt-sio" -> Some(Sio)
+    "rp-resets" -> Some(Resets)
+    "rp-timer" -> Some(Timer)
+    "rp-watchdog" -> Some(Watchdog)
+    _ -> None
+
+// A device's window on the bus: from `at`, the size the chip gives it, or else the size the
+// registry's peripheral declares. A checked chip names only peripherals the registry has.
+private placed(d: Device, p: Peripheral, at: long, irqs: [8]int, reg: Registry) -> Mapped
     val size: long = p.size match
         Some(s) -> s.n
-        None -> fixed
+        None -> reg.peripheral(p.kind).unwrap().window.size
 
     Mapped(d, u32(at), u32(at + size - 1), irqs)
 
@@ -357,14 +342,16 @@ private core_names(cores: Buf[Core]) -> string
 
 /** One board as benchtop runs it. It holds the board's memory: the map `assemble` planned, which
  * `boot` lays out, and the storage both cores run on, which the machine owns and the cores point at.
- * docs/machine.md says what joins it next — the devices, the cores and the scheduler.
+ * It holds its devices: the bus and each peripheral's state (devices.sysl). docs/machine.md says what
+ * joins it next — the cores and the scheduler.
  */
 struct Machine
     map: MemoryMap
     memory: &Memory
+    devices: Devices
 
-/** The board this process runs, until the cores and devices move into `Machine` too. */
-var machine = Machine(ram_only(), memory())
+/** The board this process runs, until the cores move into `Machine` too. */
+var machine = Machine(ram_only(), memory(), no_devices())
 
 /** Where the board puts its memory, as the last description assembled said. */
 memory_map() -> MemoryMap = machine.map

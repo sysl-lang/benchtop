@@ -7,28 +7,47 @@ import sh.sysl.benchtop.v6m.{Cpu, Stop, halt, raise, clock}
 import sysl.sync.*
 import sysl.threads.SleepLock
 
-var panel_out: u32 = 0
-var panel_oe: u32 = 0
-var panel_in: u32 = 0xFFFFFFFF
-var panel_edges: u32 = 0
-var panel_mask: u32 = 0
-var panel_irq: int = -1
-var has_panel = false
+/** The panel GPIO (`panel-gpio`): its output latch, output enables, the levels the host drives on
+ * its inputs, the edges latched since the guest cleared them, the edges that interrupt, and the IRQ
+ * it raises (-1 for none). The registers are read and written atomically, by the guest and the host.
+ */
+struct PanelState
+    out: u32
+    oe: u32
+    input: u32
+    edges: u32
+    mask: u32
+    irq: int
+    present: bool
+
 var panel_lock = SleepLock.new()
 
+/** No panel GPIO on the bus. */
+panel_state() -> PanelState = PanelState(0, 0, 0xFFFFFFFF, 0, 0, -1, false)
+
+// The panel GPIO a bus of `ds` has.
+private[virt] panel_of(ds: []const Mapped) -> PanelState
+    var s = panel_state()
+    val (present, irq) = mapped_irq(ds, PanelGpio)
+    s.present = present
+    s.irq = irq
+    s
+
 private[virt] boot_panel()
-    atomic_store(&panel_out, 0, Relaxed)
-    atomic_store(&panel_oe, 0, Relaxed)
-    atomic_store(&panel_in, 0xFFFFFFFF, Relaxed)
-    atomic_store(&panel_edges, 0, Relaxed)
-    atomic_store(&panel_mask, 0, Relaxed)
+    val s = &machine.devices.panel
+    atomic_store(&s.out, 0, Relaxed)
+    atomic_store(&s.oe, 0, Relaxed)
+    atomic_store(&s.input, 0xFFFFFFFF, Relaxed)
+    atomic_store(&s.edges, 0, Relaxed)
+    atomic_store(&s.mask, 0, Relaxed)
     reset_displays()
 
 panel_levels() -> u32 = panel_levels_at(observe_core(0).time)
 
 private[virt] panel_levels_at(time: u64) -> u32
-    val oe = atomic_load(&panel_oe, Relaxed)
-    val levels = (atomic_load(&panel_out, Relaxed) & oe) | (atomic_load(&panel_in, Relaxed) & ~oe)
+    val s = &machine.devices.panel
+    val oe = atomic_load(&s.oe, Relaxed)
+    val levels = (atomic_load(&s.out, Relaxed) & oe) | (atomic_load(&s.input, Relaxed) & ~oe)
     val (mask, output) = pwm_pad(time)
     val merged = (levels & ~mask) | output
     val (spi_mask, spi_output) = spi_pad()
@@ -36,35 +55,38 @@ private[virt] panel_levels_at(time: u64) -> u32
 
 panel_drive_mask() -> u32 = panel_drive_mask_at(observe_core(0).time)
 
-private[virt] panel_drive_mask_at(time: u64) -> u32 = atomic_load(&panel_oe, Relaxed) | pwm_pad(time).0 | spi_pad().0
+private[virt] panel_drive_mask_at(time: u64) -> u32 = atomic_load(&machine.devices.panel.oe, Relaxed) | pwm_pad(time).0 | spi_pad().0
 
-panel_outputs() -> u32 = atomic_load(&panel_out, Relaxed) & atomic_load(&panel_oe, Relaxed)
+panel_outputs() -> u32 = atomic_load(&machine.devices.panel.out, Relaxed) & atomic_load(&machine.devices.panel.oe, Relaxed)
 
 /** Set all external input levels. Changes latch regardless of interrupt mask. */
 panel_inputs(levels: u32)
-    val old = atomic_load(&panel_in, Relaxed)
-    atomic_store(&panel_in, levels, Relaxed)
-    atomic_or(&panel_edges, old ^ levels, Relaxed)
+    val s = &machine.devices.panel
+    val old = atomic_load(&s.input, Relaxed)
+    atomic_store(&s.input, levels, Relaxed)
+    atomic_or(&s.edges, old ^ levels, Relaxed)
 
 private[virt] signal_panel(cpu: *Cpu)
-    if has_panel && panel_irq >= 0 && (atomic_load(&panel_edges, Relaxed) & atomic_load(&panel_mask, Relaxed)) != 0 then raise(cpu, u32(panel_irq))
+    val s = &machine.devices.panel
+    if s.present && s.irq >= 0 && (atomic_load(&s.edges, Relaxed) & atomic_load(&s.mask, Relaxed)) != 0 then raise(cpu, u32(s.irq))
 
 private[virt] panel_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || (offset & 3) != 0
         halt(cpu, Stop.Fault, address)
         return 0
+    val s = &machine.devices.panel
     offset match
-        0 -> atomic_load(&panel_out, Relaxed)
+        0 -> atomic_load(&s.out, Relaxed)
         4 ->
             panel_lock.lock()
             bring_spi(board_time(cpu,n))
             val levels = panel_levels_at(board_time(cpu,n))
             panel_lock.unlock()
             levels
-        8 -> atomic_load(&panel_oe, Relaxed)
-        12 -> atomic_load(&panel_edges, Relaxed)
-        16 -> atomic_load(&panel_mask, Relaxed)
-        20 -> atomic_load(&panel_edges, Relaxed) & atomic_load(&panel_mask, Relaxed)
+        8 -> atomic_load(&s.oe, Relaxed)
+        12 -> atomic_load(&s.edges, Relaxed)
+        16 -> atomic_load(&s.mask, Relaxed)
+        20 -> atomic_load(&s.edges, Relaxed) & atomic_load(&s.mask, Relaxed)
         _ ->
             halt(cpu, Stop.Unmapped, address)
             0
@@ -75,17 +97,18 @@ private[virt] panel_write(cpu: *Cpu, address: u32, offset: u32, width: u32, valu
         return
     panel_lock.lock()
     defer panel_lock.unlock()
+    val s = &machine.devices.panel
     bring_spi(board_time(cpu,n))
-    val old_levels = atomic_load(&panel_out, Relaxed)
-    val old_driven = atomic_load(&panel_oe, Relaxed)
+    val old_levels = atomic_load(&s.out, Relaxed)
+    val old_driven = atomic_load(&s.oe, Relaxed)
     val new_levels = if offset == 0 then value else old_levels
     val new_driven = if offset == 8 then value else old_driven
     sound_gpio(new_levels, new_driven, (old_levels ^ new_levels) | (old_driven ^ new_driven), board_time(cpu, n))
     offset match
-        0 -> atomic_store(&panel_out, value, Relaxed)
-        8 -> atomic_store(&panel_oe, value, Relaxed)
-        12 -> atomic_and(&panel_edges, ~value, Relaxed)
-        16 -> atomic_store(&panel_mask, value, Relaxed)
+        0 -> atomic_store(&s.out, value, Relaxed)
+        8 -> atomic_store(&s.oe, value, Relaxed)
+        12 -> atomic_and(&s.edges, ~value, Relaxed)
+        16 -> atomic_store(&s.mask, value, Relaxed)
         4 | 20 -> () // Read-only registers.
         _ -> halt(cpu, Stop.Unmapped, address)
     observe_displays(panel_levels_at(board_time(cpu,n)), panel_drive_mask_at(board_time(cpu,n)), board_time(cpu,n))
@@ -119,4 +142,4 @@ panel_parts(b: Board) -> bool
     true
 
 /** Raw output latch, including pins currently configured as inputs. */
-panel_output_latch() -> u32 = atomic_load(&panel_out, Relaxed)
+panel_output_latch() -> u32 = atomic_load(&machine.devices.panel.out, Relaxed)
