@@ -318,6 +318,13 @@ EXPECTED_I='LUI AUIPC JAL JALR BEQ BNE BLT BGE BLTU BGEU LB LH LW LBU LHU SB SH 
 EXPECTED_M='MUL MULH MULHSU MULHU DIV DIVU REM REMU'.split()
 EXPECTED_C='C.ADDI4SPN C.LW C.SW C.NOP C.ADDI C.JAL C.LI C.ADDI16SP C.LUI C.SRLI C.SRAI C.ANDI C.SUB C.XOR C.OR C.AND C.J C.BEQZ C.BNEZ C.SLLI C.LWSP C.JR C.MV C.EBREAK C.JALR C.ADD C.SWSP'.split()
 
+NAME_BYTES=16
+
+def pack_record(name,record):
+    # 17 little-endian words, then the mnemonic, NUL-padded: the tests select records by it.
+    assert len(name)<NAME_BYTES
+    return struct.pack('<17I',*record)+name.encode().ljust(NAME_BYTES,b'\0')
+
 def emit():
     assert set(groups)==set(EXPECTED_I+EXPECTED_M+EXPECTED_C)
     data=bytearray()
@@ -341,9 +348,9 @@ def emit():
     first=0
     for name in EXPECTED_I+EXPECTED_M+EXPECTED_C:
         records=groups[name]
-        for record in records:data.extend(struct.pack('<17I',*record))
+        for record in records:data.extend(pack_record(name,record))
         need=1 if name in EXPECTED_M else 4 if name.startswith('C.') else 0
-        wrappers += [f'\n@test("RV32 instruction {name}: architectural boundaries and state preservation")\ninstruction_{name.lower().replace(".","_")}()\n    check_instruction_vectors("{name}", {first}, {len(records)}, {need})\n']
+        wrappers += [f'\n@test("RV32 instruction {name}: architectural boundaries and state preservation")\ninstruction_{name.lower().replace(".","_")}()\n    check_instruction_vectors("{name}", {need})\n']
         matrix.append(f'| {name} | {len(records)} | {notes[name]} |')
         first+=len(records)
     matrix+=['',f'{len(groups)} instructions; {first:,} vectors, each checked on five profiles ({first*5:,} executions).',
