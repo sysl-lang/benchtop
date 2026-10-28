@@ -12,7 +12,8 @@ import sysl.sync.*
 /** The SAI (`stm32-sai`), the two DMA controllers (`stm32-dma`) and the DMAMUX (`stm32-dmamux`):
  * which of them the bus has, the SAI's base, the DMA request each of its blocks makes and the IRQ
  * each interrupt line raises (the SAI's, then each DMA stream's; -1 for none), which the board fixes;
- * `next` and `irq_levels`, published for the cores to read without the lock; and under `live` the
+ * `next` and `irq_levels`, published for the cores to read without the lock; `driver`, the core that
+ * brings the slots in (`claim_device`); and under `live` the
  * models and the queues that carry samples to and from the host.
  */
 struct AudioState
@@ -24,6 +25,7 @@ struct AudioState
     irq_routes: [17]int
     next: u64
     irq_levels: u32
+    driver: u32
     live: Mutex[AudioLive]
 
 /** The SAI's blocks, the DMA controllers and the DMAMUX; `core`, the core whose access is being
@@ -75,7 +77,7 @@ private audio_live(hz: u64, kernel: u64, sai_present: bool) -> AudioLive
 
 /** No SAI, DMA or DMAMUX on the bus. */
 audio_state() -> AudioState =
-    AudioState(false, [false,false], false, 0, [87,88], [-1;17], NEVER, 0, Mutex.new(AudioLive([sai.block(),sai.block()],
+    AudioState(false, [false,false], false, 0, [87,88], [-1;17], NEVER, 0, 0, Mutex.new(AudioLive([sai.block(),sai.block()],
         [dma.controller(),dma.controller()], dma.mux(), 0, [0,0], [buf(),buf()], [0,0], [0,0], [buf(),buf()], [false,false], [0,0], [0,0], false)))
 
 private audio_cpu(s: *AudioLive) -> *Cpu = if s.core == 0 then core0() else core1()
@@ -129,6 +131,7 @@ private[virt] boot_sai_dma()
         s.settled = false)
     atomic_store(&d.next,NEVER,Release)
     atomic_store(&d.irq_levels,0,Release)
+    atomic_store(&d.driver,0,Release)
 
 // These debug/codec-facing queues never advance guest time or take UI locks.
 sai_feed_input(block: usize, words: []const u32)
@@ -308,11 +311,15 @@ private audio_raise_levels(c: *Cpu)
         val irq = u32(d.irq_routes[k])
         if !memory.exception_active(c,memory.IRQ0 + irq) then memory.raise(c,irq)
 
+// The next slot, for the core that brings the slots in; NEVER for the other.
+private[virt] sai_dma_due_for(c: *Cpu) -> u64 = if drives_device(&machine.devices.audio.driver,c) then sai_dma_due() else NEVER
+
 private[virt] signal_sai_dma(c: *Cpu)
-    val due = sai_dma_due()
-    val time = board_time(c,c.retired)
-    if machine.devices.audio.sai_present && due != NEVER && time >= due
-        machine.devices.audio.live.with(s -> bring_audio(s,c,time))
+    val d = &machine.devices.audio
+    if d.sai_present && drives_device(&d.driver,c)
+        val due = sai_dma_due()
+        val time = board_time(c,c.retired)
+        if due != NEVER && time >= due then d.live.with(s -> bring_audio(s,c,time))
     audio_raise_levels(c)
 
 private[virt] sai_dma_wake(c: *Cpu) -> u64
@@ -321,7 +328,7 @@ private[virt] sai_dma_wake(c: *Cpu) -> u64
     if levels != 0
         for k in 0usize..<17
             if levels & (1u32 << u32(k)) != 0 && d.irq_routes[k] >= 0 && memory.could_wake(c,memory.IRQ0 + u32(d.irq_routes[k])) then return board_time(c,c.retired)
-    sai_dma_due()
+    sai_dma_due_for(c)
 
 private valid_audio_access(device: Device, offset: u32, width: u32) -> bool
     if device == Device.Sai && (offset == 0x20 || offset == 0x40) then return width == 1 || width == 2 || width == 4
@@ -392,6 +399,7 @@ private[virt] sai_dma_write(c: *Cpu, device: Device, address: u32, offset: u32, 
     if !valid_audio_access(device,offset,width)
         halt(c,Stop.Fault,address)
         return
+    claim_device(&machine.devices.audio.driver,c)
     machine.devices.audio.live.with(s ->
         bring_audio(s,c,board_time(c,n))
         val word = if width == 4 then value else value & ((1u32 << (width * 8)) - 1)
