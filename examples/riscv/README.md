@@ -23,9 +23,10 @@ sysl test . --filter RV32
 ```
 
 `chip.hocon` demonstrates core names in the shared description format. It is not a
-runnable board. Bare ISA profiles have no interrupt controller; `hazard3.hocon` uses the
-executable Hazard3 profile, whose core-local interrupt controller is implemented. Neither
-configuration supplies RP2350 devices or a firmware boot protocol.
+runnable board. Bare ISA profiles have no interrupt controller; the built-in mcu
+`rp2350-hazard3` (`mcus/rp2350-hazard3.hocon`) uses the executable Hazard3 profile, whose
+core-local interrupt controller is implemented. Neither supplies RP2350 devices or a firmware
+boot protocol.
 
 Every implemented mnemonic also has a named instruction unit test and a row in
 [the coverage matrix](../../sh/sysl/benchtop/riscv/COVERAGE.md). The independent Python
@@ -46,7 +47,7 @@ operand or machine-state combination. No claim is made for unimplemented instruc
 
 ```sh
 ./benchtop bench --core hazard3 examples/riscv/kernel-hazard3.bin 3132271724
-./benchtop check --mcu examples/riscv/hazard3.hocon
+./benchtop check --mcu rp2350-hazard3
 python3 examples/riscv/generate-hazard3-tests.py
 python3 examples/riscv/generate-hazard3-tests.py --check
 sysl test . --filter Hazard3

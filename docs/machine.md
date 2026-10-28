@@ -121,5 +121,8 @@ enum ProductView
      instructions on the interpreter and board benches.
    - Left: the cores' option globals, the SIO FIFOs and spinlocks, the bus cache, the
      `enum Device` dispatch, and `virt.machine` itself.
+   - Left: a RISC-V hart in a board. The hart already reaches devices through its own
+     `riscv.Bus` trait off its RAM window; what it waits on is device handlers that take a v6m
+     `*Cpu`, and the RP2350 chip layer (GPIO, UART, SIO, ROM), which does not exist yet.
 5. **Headers and Product.** `Pin` and `header` on boards, product files with wiring, run-time wire
    edits, and the product view.

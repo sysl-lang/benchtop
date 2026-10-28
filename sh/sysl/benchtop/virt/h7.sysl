@@ -3,11 +3,19 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.{Board, param_named}
 import sh.sysl.benchtop.v6m.{Cpu,Stop,halt,load32,set_limit}
 import sysl.threads.Mutex
+import sh.sysl.stm32h747.rcc.GCR_OFFSET
 
 // Initial boot-control subset of RCC. Unknown registers fault explicitly; this
 // does not substitute ready bits for unimplemented oscillator/PLL behavior.
-// ST CMSIS stm32h747xx.h: GCR offset 0xa0, BOOT_C1 bit 2, BOOT_C2 bit 3.
 // CM4's reset address is a board option-byte setting, not a fictitious MMIO.
+
+// RCC_GCR's boot requests (ST CMSIS stm32h747xx.h; the SVD lists only WW1RSC): BOOT_C1 lets the
+// CM7 run, and is set from reset; BOOT_C2 starts the CM4.
+private const GCR_BOOT_C1: u32 = 1 << 2
+private const GCR_BOOT_C2: u32 = 1 << 3
+private const GCR_BOOT: u32 = GCR_BOOT_C1 | GCR_BOOT_C2
+// The CM4 boot address's alignment: the option bytes hold its top 16 bits.
+private const CM4_BOOT_GRANULE_MASK: u32 = 0xffff
 
 /** The RCC's boot control: the CM4's boot address, from the board's option bytes, and GCR, which
  * either core may reach.
@@ -17,7 +25,7 @@ struct RccState
     gcr: Mutex[u32]
 
 /** The RCC as a board without one leaves it. */
-rcc_state() -> RccState = RccState(0x08100000, Mutex.new(4))
+rcc_state() -> RccState = RccState(0x08100000, Mutex.new(GCR_BOOT_C1))
 
 private[virt] check_rcc(b: Board) -> Result[RccState,string]
     var s = rcc_state()
@@ -30,16 +38,16 @@ private[virt] check_rcc(b: Board) -> Result[RccState,string]
                 Whole(at) -> s.cm4_boot = u32(at)
                 _ -> ()
             None -> ()
-        if s.cm4_boot & 0xffff != 0 then return Err("CM4 boot address must align to the option bytes' 64 KB granularity")
+        if s.cm4_boot & CM4_BOOT_GRANULE_MASK != 0 then return Err("CM4 boot address must align to the option bytes' 64 KB granularity")
     Ok(s)
 
-private[virt] boot_h7() = machine.devices.rcc.gcr.with(gcr -> *gcr = 4)
+private[virt] boot_h7() = machine.devices.rcc.gcr.with(gcr -> *gcr = GCR_BOOT_C1)
 
 private[virt] h7_rcc_read(c: *Cpu, address: u32, offset: u32, width: u32) -> u32
     if width != 4 || offset & 3 != 0
         halt(c,Stop.Fault,address)
         return 0
-    if offset == 0xa0 then return machine.devices.rcc.gcr.with(gcr -> *gcr)
+    if offset == GCR_OFFSET then return machine.devices.rcc.gcr.with(gcr -> *gcr)
     halt(c,Stop.Unmapped,address)
     0
 
@@ -47,18 +55,18 @@ private[virt] h7_rcc_write(c: *Cpu, address: u32, offset: u32, width: u32, value
     if width != 4 || offset & 3 != 0
         halt(c,Stop.Fault,address)
         return
-    if offset != 0xa0
+    if offset != GCR_OFFSET
         halt(c,Stop.Unmapped,address)
         return
     val boot = machine.devices.rcc.cm4_boot
     machine.devices.rcc.gcr.with(gcr ->
         // Boot control is handled before both workers start; no second thread may
         // alter reset/launch state or clear a running CPU's boot request.
-        if c.core != 0 || (scheduler.launched && (value & 12) != *gcr)
+        if c.core != 0 || (scheduler.launched && (value & GCR_BOOT) != *gcr)
             halt(c,Stop.Fault,address)
         else
-            *gcr = 4 | (value & 8)
-            if !scheduler.launched && *gcr & 8 != 0
+            *gcr = GCR_BOOT_C1 | (value & GCR_BOOT_C2)
+            if !scheduler.launched && *gcr & GCR_BOOT_C2 != 0
                 val sp = load32(c,boot)
                 val entry = load32(c,boot + 4)
                 if c.stop == Stop.Budget
