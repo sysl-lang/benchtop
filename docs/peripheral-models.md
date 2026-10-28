@@ -29,6 +29,28 @@ integration. Its PWM and byte-level I²C register adapters are explicitly virtua
 and reusable; the DS3231 is a separate slave model behind I²C device callbacks.
 See [audio and RTC](audio-and-rtc.md) for the implemented boundaries.
 
+## Unsupported writes are refused, not ignored
+
+Every chip peripheral model follows one policy for a write it cannot honour — a reserved
+bit, a mode the model does not implement, a configuration change the silicon would
+accept but the model cannot carry out: the model's `write` answers `false`, and the bus
+adapter turns that into a fault the guest (and the person running it) sees at the
+offending store. Real silicon would accept such a write and then behave in a way the
+model cannot reproduce, so a silent acceptance would let firmware run on into behaviour
+that is wrong without any sign. A refusal therefore marks the edge of a model, never a
+hardware error the firmware should expect.
+
+Each model's header lists its own divergences. The current ones:
+
+| model | divergence |
+|---|---|
+| `peripheral/sdmmc` | refuses reserved bits and reconfiguration during a transfer; starts the data path only after an error-free R1, where the real DPSM does not look at the response |
+| `peripheral/dma` | refuses FIFO/burst/unequal-width/memory-to-memory streams; ignores writes to the read-only LISR/HISR, as the silicon does |
+| `peripheral/stm32_spi` | refuses CRC, DMA, hardware NSS, finite TSIZE and non-8-bit frames |
+| `peripheral/dsi` | refuses video mode, more than two lanes and out-of-range PLL settings |
+| `parts/wm8994` | NACKs an unmodelled register address and configurations outside the 48 kHz slave subset |
+| `parts/ds3231` | none: it keeps the chip's own leap-year rule (2100 is a leap year), not the Gregorian one |
+
 These are model boundaries for extending real-chip support, not a claim that PIO,
 a complete pin mux, clock tree or DMA is already emulated. Host Kairos/libuv timers
 serve build/watch/I/O workflows and do not stand in for guest hardware clocks.
