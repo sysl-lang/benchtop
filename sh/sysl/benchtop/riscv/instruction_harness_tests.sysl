@@ -4,8 +4,10 @@ module sh.sysl.benchtop.riscv
 // Expected state is generated from mathematical results, independently of execute/decompress.
 // See examples/riscv/generate-instruction-tests.py and COVERAGE.md for record layout and scope.
 private val INSTRUCTION_VECTORS = embed("../../../../testdata/riscv/instructions.bin")
+// A record is 17 words, then its mnemonic in 16 NUL-padded bytes; a test selects its records by name.
 private const VECTOR_WORDS: usize = 17
-private const VECTOR_BYTES: usize = VECTOR_WORDS * 4
+private const NAME_BYTES: usize = 16
+private const VECTOR_BYTES: usize = VECTOR_WORDS * 4 + NAME_BYTES
 
 private vector_word(data: []const u8, record: usize, field: usize) -> u32
     val at = record * VECTOR_BYTES + field * 4
@@ -13,78 +15,99 @@ private vector_word(data: []const u8, record: usize, field: usize) -> u32
     for i in 0..<4 do value |= u32(data[at + usize(i)]) << (8 * u32(i))
     value
 
+// Whether record `record` is one of `name`'s.
+private vector_named(data: []const u8, record: usize, name: string) -> bool
+    val at = record * VECTOR_BYTES + VECTOR_WORDS * 4
+    if name.len >= NAME_BYTES then return false
+    for i in 0..<NAME_BYTES
+        val want = if i < name.len then name[i] else 0
+        if data[at + i] != want then return false
+    true
+
 instruction_put_word(ram: []u8, at: usize, value: u32, width: usize)
     for i in 0..<width do ram[at + i] = u8(value >> (8 * u32(i)))
 
-check_instruction_vectors(name: string, first: usize, count: usize, needed: u32)
-    check_vectors(INSTRUCTION_VECTORS, name, first, count, needed)
+/** The chip a test puts a profile on: the RP2350's for the privileged Hazard3, none for a bare ISA. */
+chip_of(model: Model) -> Chip = if has(model, EXT_PRIV) then RP2350 else BARE
 
-check_vectors(data: []const u8, name: string, first: usize, count: usize, needed: u32)
+check_instruction_vectors(name: string, needed: u32)
+    check_vectors(INSTRUCTION_VECTORS, name, needed)
+
+// Every record named `name` (there must be one), on every profile; `needed` is the extensions it
+// takes, and a profile without them must refuse it untouched.
+check_vectors(data: []const u8, name: string, needed: u32)
     assert(data.len % VECTOR_BYTES == 0)
-    assert(count != 0 && first + count <= data.len / VECTOR_BYTES)
+    var count = 0
+    for index in 0..<(data.len / VECTOR_BYTES)
+        if !vector_named(data, index, name) then continue
+        for model in MODELS do check_vector(data, index, s"$name vector $count, ${model.name}", model, needed)
+        count += 1
+    assert(count != 0, s"no vectors named $name")
+
+private check_vector(data: []const u8, index: usize, context: string, model: Model, needed: u32)
     var ram: [512]u8
     var expected_ram: [512]u8
     var expected_r: [32]u32
     var cpu: Cpu
-    val profiles: []string = ["rv32i", "rv32im", "rv32ic", "rv32imc", "hazard3"]
-    val extensions: []u32 = [0, 1, 4, 5, 4095]
-    for index in first..<(first + count)
-        val length = vector_word(data, index, 0)
-        val code = vector_word(data, index, 1)
-        val pc = vector_word(data, index, 2)
-        val base = vector_word(data, index, 3)
-        val rd = vector_word(data, index, 8)
-        val target = vector_word(data, index, 10)
-        val mem_at = vector_word(data, index, 13)
-        for profile in 0..<5
-            val model = model_named(profiles[profile]).unwrap()
-            assert(model.extensions == extensions[profile], s"${model.name}: unexpected extension set")
-            reset(&cpu, model, ram, base, pc)
-            cpu.halt_faults = true
-            for i in 0..<ram.len do ram[i] = u8(i * 37 + 11)
-            if mem_at < 512 then instruction_put_word(ram, usize(mem_at), vector_word(data, index, 14), 4)
-            instruction_put_word(ram, usize(pc - base), code, usize(length))
-            for i in 0..<ram.len do expected_ram[i] = ram[i]
-            for i in 1..<32 do cpu.r[i] = 0x11220000 + u32(i) * 0x010101
-            val r1 = vector_word(data, index, 4)
-            val r2 = vector_word(data, index, 6)
-            if r1 != 0 then cpu.r[r1] = vector_word(data, index, 5)
-            if r2 != 0 then cpu.r[r2] = vector_word(data, index, 7)
-            for i in 0..<32 do expected_r[i] = cpu.r[i]
-            var stop = vector_word(data, index, 11)
-            var at = vector_word(data, index, 12)
-            var next = target
-            var retired = vector_word(data, index, 16)
-            if (extensions[profile] & needed) != needed
-                stop = 3 // Undefined: the instruction's extension is not enabled.
-                at = pc
-                next = pc
-                retired = 0
-            elif stop == 0 && (extensions[profile] & 4) == 0 && (target & 3) != 0
-                stop = 4 // Misaligned: taken halfword target on an IALIGN=32 core.
-                at = target
-                next = pc
-                retired = 0
-            if stop == 0
-                if rd != 0 && rd < 32 then expected_r[rd] = vector_word(data, index, 9)
-                if mem_at < 512 then instruction_put_word(expected_ram, usize(mem_at), vector_word(data, index, 15), 4)
-            val context = s"$name vector ${index - first}, ${model.name}"
-            run(&cpu, 1)
-            val expected_stop = stop match
-                0 -> Stop.Budget
-                1 -> Stop.Breakpoint
-                2 -> Stop.Ecall
-                3 -> Stop.Undefined
-                4 -> Stop.Misaligned
-                _ -> Stop.Unmapped
-            assert(cpu.stop == expected_stop, s"$context: ${cpu.stop}, expected $expected_stop")
-            assert(cpu.pc == next && cpu.retired == u64(retired), s"$context: pc ${cpu.pc}, expected $next; retired ${cpu.retired}, expected $retired")
-            if stop != 0
-                assert(cpu.stop_at == at, s"$context: address ${cpu.stop_at}, expected $at")
-                // A stopped CPU must be inert, including after a caller supplies another budget.
-                run(&cpu, 2)
-                assert(cpu.stop == expected_stop && cpu.pc == next && cpu.retired == u64(retired) && cpu.stop_at == at, context)
-            for i in 0..<32
-                assert(cpu.r[i] == expected_r[i], s"$context: x$i = ${cpu.r[i]}, expected ${expected_r[i]}")
-            for i in 0..<ram.len
-                assert(ram[i] == expected_ram[i], s"$context: byte $i = ${ram[i]}, expected ${expected_ram[i]}")
+    val length = vector_word(data, index, 0)
+    val code = vector_word(data, index, 1)
+    val pc = vector_word(data, index, 2)
+    val base = vector_word(data, index, 3)
+    val rd = vector_word(data, index, 8)
+    val target = vector_word(data, index, 10)
+    val mem_at = vector_word(data, index, 13)
+    reset(&cpu, model, chip_of(model), ram, base, pc)
+    cpu.halt_faults = true
+    for i in 0..<ram.len do ram[i] = u8(i * 37 + 11)
+    if mem_at < 512 then instruction_put_word(ram, usize(mem_at), vector_word(data, index, 14), 4)
+    instruction_put_word(ram, usize(pc - base), code, usize(length))
+    for i in 0..<ram.len do expected_ram[i] = ram[i]
+    for i in 1..<32 do cpu.r[i] = 0x11220000 + u32(i) * 0x010101
+    val r1 = vector_word(data, index, 4)
+    val r2 = vector_word(data, index, 6)
+    if r1 != 0 then cpu.r[r1] = vector_word(data, index, 5)
+    if r2 != 0 then cpu.r[r2] = vector_word(data, index, 7)
+    for i in 0..<32 do expected_r[i] = cpu.r[i]
+    var stop = vector_word(data, index, 11)
+    var at = vector_word(data, index, 12)
+    var next = target
+    var retired = vector_word(data, index, 16)
+    if !has(model, needed)
+        stop = 3 // Undefined: the instruction's extension is not enabled.
+        at = pc
+        next = pc
+        retired = 0
+    elif stop == 0 && !has(model, EXT_C) && (target & 3) != 0
+        stop = 4 // Misaligned: taken halfword target on an IALIGN=32 core.
+        at = target
+        next = pc
+        retired = 0
+    if stop == 0
+        if rd != 0 && rd < 32 then expected_r[rd] = vector_word(data, index, 9)
+        if mem_at < 512 then instruction_put_word(expected_ram, usize(mem_at), vector_word(data, index, 15), 4)
+    run(&cpu, 1)
+    val expected_stop = stop match
+        0 -> Stop.Budget
+        1 -> Stop.Breakpoint
+        2 -> Stop.Ecall
+        3 -> Stop.Undefined
+        4 -> Stop.Misaligned
+        _ -> Stop.Unmapped
+    assert(cpu.stop == expected_stop, s"$context: ${cpu.stop}, expected $expected_stop")
+    assert(cpu.pc == next && cpu.retired == u64(retired), s"$context: pc ${cpu.pc}, expected $next; retired ${cpu.retired}, expected $retired")
+    if stop != 0
+        assert(cpu.stop_at == at, s"$context: address ${cpu.stop_at}, expected $at")
+        // A stopped CPU must be inert, including after a caller supplies another budget.
+        run(&cpu, 2)
+        assert(cpu.stop == expected_stop && cpu.pc == next && cpu.retired == u64(retired) && cpu.stop_at == at, context)
+    for i in 0..<32
+        assert(cpu.r[i] == expected_r[i], s"$context: x$i = ${cpu.r[i]}, expected ${expected_r[i]}")
+    for i in 0..<ram.len
+        assert(ram[i] == expected_ram[i], s"$context: byte $i = ${ram[i]}, expected ${expected_ram[i]}")
+
+@test("instruction vectors are selected by mnemonic, and every record names one the tests check")
+vectors_named()
+    // A name no record carries finds none, rather than a neighbour's range.
+    assert(!vector_named(INSTRUCTION_VECTORS, 0, "NOSUCH"))
+    assert(vector_named(INSTRUCTION_VECTORS, 0, "LUI") && !vector_named(INSTRUCTION_VECTORS, 0, "LU"))
+    assert(INSTRUCTION_VECTORS.len % VECTOR_BYTES == 0)
