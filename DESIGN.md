@@ -1874,7 +1874,7 @@ held to its part's type: a whole number in a range, a number, text, `true`/`fals
 ### 12.2.1 Per-core configuration and defaults
 
 Each entry of a chip's `cores` is either a core name or an object with `core = <name>` and optional
-`dsp`, `fpu`, `mpu_regions`, `security`, `icache`, `dcache`, `nvic_priority_bits`. Names remain
+`dsp`, `fpu`, `mpu-regions`, `security`, `icache`, `dcache`, `nvic-priority-bits`. Names remain
 shorthand for the current emulated integer configuration. Defaults are DSP on for the M4 and M7,
 which always have it (`dsp = false` is refused for them), and off elsewhere, FPU `none`, zero
 MPU regions, security `none`, caches off, and two priority bits on M0/M0+/M1/M23 or four on Mainline models.
