@@ -138,7 +138,7 @@ Sources, and how far each was checked:
   same image, input and quantum give the same run, counts and all. This single-threaded run is the
   oracle the threaded mode is checked against.
 - **`benchtop run --threads` gives each of the virtual board's cores a host thread of its own**
-  (`virt/parallel.sysl`). Core 0 runs alone, exactly as above, until it launches core 1; then core 1
+  (`virt/scheduler.sysl`). Core 0 runs alone, exactly as above, until it launches core 1; then core 1
   gets a thread and the two run at once, each a quantum at a time, with the lag bound of §1.3 between
   them. Between its runs a core does what a turn's start does on one thread — takes in what the other
   core raised in it, raises the board's interrupts, wakes or sleeps — and publishes its clock. A core
@@ -763,7 +763,7 @@ executes without the FP, Security and MPU extensions; integer DSP is optional vi
   decodes, `t2sem.sysl` is the semantics, `t2threaded.sysl` the handlers, `t2system.sysl` the system
   registers and instructions, and switch.sysl's `match` loop has the cases. A separate module was the
   alternative, and it would have needed a second `Cpu`: the record's `op`, the decode arrays, the
-  store-invalidation path, the exception engine and the whole board (`virt.sysl`, `parallel.sysl`) are
+  store-invalidation path, the exception engine and the whole board (`virt.sysl`, `scheduler.sysl`) are
   typed on the one `Cpu` and `Insn`, so the board would have been duplicated for a type. **The ARMv6-M
   handlers are unchanged code**: `decode` consults the kind once per instruction decoded, never per
   instruction run, and the new state is at the end of `Cpu`, so the M0+'s speed is unchanged (the

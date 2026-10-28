@@ -84,6 +84,14 @@ enum ProductView
 3. **Scheduler and threads.** One scheduler, owned by the product. The worker, parallel and pump
    globals move into it. Cross-thread state moves into `Mutex[T]` values that own it: the device
    locks with the device state they guard, and the host-facing device queues.
+   - Done: `Scheduler` (`virt/scheduler.sysl`) holds the board's clock, the quantum, launch state,
+     the lockstep pairing (`Lockstep`, atomics) and the board's lock (`Mutex[u64]`, owning the clock
+     both sleeping cores skip to), and the CPU workers (`Workers`, `virt/workers.sysl`), whose
+     shared control state is one `Mutex[WorkerControl]`. It runs a board in turns (`run_board`,
+     `pump_board`), in lockstep (`set_threads`) or paced on the workers, and one `pair_cores`
+     readies both lockstep modes. `threads` is split into the request (`run_on_threads`) and the
+     live state (`threaded`). The desktop's old bounded-batch path (`pump_parallel`) is gone; its
+     tests run on the workers. It is still one module-level `scheduler` until the product exists.
 4. **Delete the remaining globals.** A `Peripheral` trait (`read`, `write`, `advance`, `due`,
    `reset`) replaces the closed `enum Device` and its dispatch sites, over the device structs.
    `first`, `second`, the SIO FIFOs, the console and `virt.machine` itself go. Every entry point

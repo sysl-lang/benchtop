@@ -203,10 +203,6 @@ attached() -> usize = machine.devices.bus.attached
 private[virt] console_irq() -> int = machine.devices.bus.console_irq
 private[virt] fifo_irq() -> int = machine.devices.bus.fifo_irq
 
-// Instructions each core runs in its turn, and the run of core 0 alone.
-const QUANTUM: u64 = 1000
-const ALONE: u64 = 1000000
-
 var typed_slots: [4096]u8
 var typed = channel(typed_slots[..])
 // A byte taken from the channel to answer STATUS, and not yet read through DATA; -1 for none.
@@ -216,13 +212,9 @@ var capturing = false
 var capture_limit: usize = 0
 // CTRL, read by both cores' threads without the console's lock to decide whether to take it.
 var ctrl: u32 = 0
-// Whether each core runs on a thread of its own (`set_threads`). The console's state is then under
-// `console_lock`, and an interrupt one core raises in the other is a `poke`.
-var threads = false
+// The console's state is under this lock while the cores run on host threads.
 var console_lock = SleepLock.new()
 
-// Core 1; whether core 0 has launched it; and whether that happened in the turn now ending, so its
-// clock is still to be set to core 0's.
 // What the two cores are, as the board description says.
 var core_instruction_timing: [2]bool = [false,false]
 var core_kinds: [2]Kind = [Kind.V6m, Kind.V6m]
@@ -234,8 +226,6 @@ var core_fpu: [2]u32 = [0, 0]
 // 0 lives here, as long as the board, rather than in its caller.
 var first: Cpu
 var second: Cpu
-var launched = false
-var starting = false
 // The boot ROM's place in the launch sequence, 0 to 5, and the VTOR and SP it has taken.
 var step = 0
 var sent: [2]u32
@@ -251,15 +241,10 @@ var popped: [2]u32
 var fifo_errors: [2]u32
 // Bit k set while spinlock k is claimed; claimed and released with atomic operations.
 var locks: u32 = 0
-var quantum: u64 = QUANTUM
-var alone_slice: u64 = ALONE
-var pumping = false
-// The board's clock: the end of the last round, which every running core has reached.
-var now: u64 = 0
 
 // Ready the console with an empty input, its output going to the host, and its interrupt off.
 open_console()
-    if workers_active then pause_workers()
+    pause_workers()
     typed = channel(typed_slots[..])
     held = -1
     out = buf()
@@ -326,11 +311,11 @@ flush_console()
 // The console's state is one core's at a time, where the cores run on threads of their own.
 @inline
 private hold_console()
-    if workers_active || threads then console_lock.lock()
+    if scheduler.workers.active || scheduler.threaded then console_lock.lock()
 
 @inline
 private free_console()
-    if workers_active || threads then console_lock.unlock()
+    if scheduler.workers.active || scheduler.threaded then console_lock.unlock()
 
 private flush_out()
     if capturing || out.len() == 0 then return
@@ -348,7 +333,7 @@ private peek() -> int
 
     held
 
-private status() -> u32
+private[virt] console_status() -> u32
     if peek() >= 0 then return WAITING
     if typed.is_closed() then return ENDED
 
@@ -368,7 +353,7 @@ private console_read(cpu: *Cpu, a: u32, o: u32) -> u32
             if b < 0 then 0xFFFFFFFF else u32(b)
         STATUS ->
             flush_out()
-            status()
+            console_status()
         CTRL -> console_ctrl()
         _ ->
             halt(cpu, Stop.Unmapped, a)
@@ -397,7 +382,7 @@ private console_write(cpu: *Cpu, a: u32, o: u32, x: u32)
     free_console()
 
 @inline
-private console_ctrl() -> u32 = atomic_load(&ctrl, Relaxed)
+private[virt] console_ctrl() -> u32 = atomic_load(&ctrl, Relaxed)
 
 // Whether the console raises its interrupt now: it is enabled and STATUS is not 0.
 private[virt] console_raising() -> bool
@@ -405,7 +390,7 @@ private[virt] console_raising() -> bool
 
     hold_console()
 
-    val raising = status() != 0
+    val raising = console_status() != 0
 
     free_console()
     raising
@@ -443,7 +428,7 @@ image_of(file: []const u8) -> Result[Buf[u8], string]
 // 1 waiting in its boot ROM, with the SIO's FIFOs empty, every spinlock free, and the default
 // quantum.
 boot(cpu: *Cpu, image: []const u8)
-    if workers_active then pause_workers()
+    pause_workers()
     cpu.kind = core_kinds[0]
     memory.reset_mapped(cpu, machine.memory, image, machine.map)
     configure_instruction_timing(cpu,core_instruction_timing[0])
@@ -464,8 +449,6 @@ boot(cpu: *Cpu, image: []const u8)
     second.priority_bits = core_priority_bits[1]
     second.dsp = core_dsp[1]
     second.fpu = core_fpu[1]
-    launched = false
-    starting = false
     step = 0
 
     for k in 0..<2
@@ -474,13 +457,7 @@ boot(cpu: *Cpu, image: []const u8)
         fifo_errors[k] = 0
 
     locks = 0
-    quantum = QUANTUM
-    alone_slice = ALONE
-    pumping = false
-    now = 0
-    threads = false
-    slice_paired = false
-    slice_horizon = NEVER
+    reset_scheduler()
     boot_sai_dma()
     boot_dsi()
     boot_h7()
@@ -493,20 +470,7 @@ boot(cpu: *Cpu, image: []const u8)
     boot_i2c()
     boot_sound()
     boot_digital_audio()
-    if workers_active then rebase_workers()
-
-// Core 0, which `boot` and `run_board` are given.
-core0() -> *Cpu = &first
-
-// Core 1.
-core1() -> *Cpu = &second
-
-// Whether core 1 has been launched.
-running_both() -> bool = launched
-
-// Set the instructions each core runs in its turn.
-set_quantum(n: u64)
-    quantum = n
+    rebase_workers()
 
 // Start core 1 at `entry` with `sp` and `vtor`, as the boot ROM does at the end of the launch
 // sequence. An entry without its Thumb bit stops core 1 at `Stop.Fault`, there.
@@ -523,123 +487,16 @@ launch(vtor: u32, sp: u32, entry: u32)
     second.r[13] = sp
     if cpu_models_differ()
         memory.pair(core0(),&second)
-        slice_paired = true
-    launched = true
-    starting = true
+        scheduler.paired = true
+    scheduler.launched = true
+    scheduler.starting = true
 
     if entry & 1 == 0
         second.pc = entry
         halt(&second, Stop.Fault, entry)
 
-// Run the board until a core stops, writing out the console's output and raising the interrupts
-// between runs; answer the core that stopped. Where both stop together, at `Asleep`, it is core 0.
-// After `set_threads`, each core runs on a thread of its own from core 1's launch (parallel.sysl).
-run_board(cpu: *Cpu) -> *Cpu
-    if threads then return run_threads(cpu)
-
-    while round(cpu) do ()
-
-    flush_console()
-    if cpu.stop == Stop.Budget then &second else cpu
-
-/** One bounded, nonblocking slice for a UI event loop. Never starts host CPU threads. */
-pump_board(cpu: *Cpu, budget: u64) -> bool
-    require !threads, "the UI scheduler uses deterministic core turns"
-    if budget == 0 then return cpu.stop == Stop.Budget
-    val old_alone = alone_slice
-    val old_quantum = quantum
-    alone_slice = budget
-    quantum = budget
-    pumping = true
-    val running = round(cpu)
-    pumping = false
-    alone_slice = old_alone
-    quantum = old_quantum
-    running
-
-// One round: core 0's turn and then, once it is launched, core 1's, each to the same clock. Answers
-// whether every core is still running.
-round(cpu: *Cpu) -> bool
-    val until = now + (if launched then quantum else alone_slice)
-
-    turn(cpu, until)
-
-    if starting
-        // Core 1 starts at the time core 0 launched it, and the rounds start from there.
-        starting = false
-        now = board_time(cpu, cpu.retired)
-        second.slept = local_time(&second,now)
-        flush_console()
-        return cpu.stop == Stop.Budget && second.stop == Stop.Budget
-
-    if launched && cpu.stop == Stop.Budget then turn(&second, until)
-
-    flush_console()
-
-    if cpu.stop != Stop.Budget || second.stop != Stop.Budget then return false
-
-    now = if pumping then max(until, board_time(cpu, cpu.retired)) else until
-    if !cpu.sleeping || (launched && !second.sleeping) then return true
-
-    settle(cpu)
-
 private[virt] device_due() -> u64 = min(sdmmc_due(), min(min(min(min(timer_due(), adc_due()), spi_due()),dsi_due()),sai_dma_due()))
 private[virt] device_wake(cpu: *Cpu) -> u64 = min(sdmmc_wake(cpu), min(min(min(min(timer_wake(cpu), adc_wake(cpu)), spi_wake(cpu)),dsi_due()),sai_dma_wake(cpu)))
-
-// A core's turn: run it until its clock reaches `until`, or it sleeps past it, or it stops.
-private[virt] turn(cpu: *Cpu, until: u64)
-    while cpu.stop == Stop.Budget && !starting
-        if !worker_checkpoint(cpu) then return
-        memory.take_incoming(cpu)
-        memory.refresh(cpu)
-        signal(cpu)
-        if !board_wake_by(cpu, min(min(until, device_wake(cpu)),worker_clock_limit(cpu)))
-            // Asleep until a timer alarm before the round's end: its interrupt is raised from here.
-            if board_time(cpu, cpu.retired) >= until then return
-            continue
-        if board_time(cpu, cpu.retired) >= until then return
-
-        set_limit(cpu, retirement_limit(cpu,min(min(until, device_due()),worker_clock_limit(cpu))))
-        if pumping && quantum == 1 then run_single(cpu) else run_threaded(cpu)
-
-// Every running core ended the round asleep. One the other core interrupted in its last turn wakes
-// now; failing that, the board's clock skips to the first SysTick that wakes one; failing that, the
-// board waits for the console's input where its interrupt would wake a core. Otherwise every running
-// core stops at `Asleep`. Answers whether the board runs on.
-private settle(cpu: *Cpu) -> bool
-    if roused(cpu) || (launched && roused(&second)) then return true
-
-    var due = min(board_next_wake(cpu), device_wake(cpu))
-
-    if launched
-        val other = min(board_next_wake(&second), device_wake(&second))
-
-        if other < due then due = other
-
-    if due != NEVER
-        now = due
-        return true
-
-    if pumping then return true
-
-    val n = u32(console_irq())
-    val console_wakes = console_irq() >= 0 &&(could_wake(cpu, IRQ0 + n) || (launched && could_wake(&second, IRQ0 + n)))
-
-    if console_ctrl() & RX_INTERRUPT != 0 && console_wakes
-        // Input that came since the interrupts were raised is raised in the next round.
-        if status() != 0 then return true
-
-        flush_console()
-
-        typed.receive() match
-            Some(b) -> held = int(b)
-            None -> ()
-
-        return true
-
-    halt(cpu, Stop.Asleep, cpu.pc)
-    if launched then halt(&second, Stop.Asleep, second.pc)
-    false
 
 // A byte of input the board waited for, kept to answer STATUS and DATA; nothing where the input ended.
 private[virt] hold_input(got: Option[u8])
@@ -650,11 +507,6 @@ private[virt] hold_input(got: Option[u8])
         None -> ()
 
     free_console()
-
-// Whether a sleeping core wakes on an interrupt raised now, its clock where it is.
-private roused(cpu: *Cpu) -> bool
-    signal(cpu)
-    board_wake_by(cpu, board_time(cpu, cpu.retired))
 
 // What `benchtop run` says when the board's core has stopped: why, and for a stop the guest did not
 // ask for, where the core stopped and after how many instructions.
@@ -789,10 +641,10 @@ private sio_write(cpu: *Cpu, a: u32, o: u32, x: u32)
     o match
         FIFO_ST -> fifo_errors[k] &= ~(x & (WOF | ROE))
         FIFO_WR ->
-            if k == 0 && !launched
+            if k == 0 && !scheduler.launched
                 boot_rom(cpu, x)
             else if push(1 - k, x)
-                if threads && fifo_irq() >= 0 then wake_core(1 - k, u32(fifo_irq()))
+                if scheduler.threaded && fifo_irq() >= 0 then wake_core(1 - k, u32(fifo_irq()))
             else
                 fifo_errors[k] |= WOF
         CPUID | FIFO_RD | SPINLOCK_ST -> ()
@@ -812,7 +664,7 @@ private fifo_status(k: int) -> u32
     var st = fifo_errors[k]
 
     if waiting_in(k) > 0 then st |= VLD
-    if (k == 0 && !launched) || room_in(1 - k) then st |= RDY
+    if (k == 0 && !scheduler.launched) || room_in(1 - k) then st |= RDY
     st
 
 // The words in core k's RX FIFO, as core k, its consumer, sees them.
