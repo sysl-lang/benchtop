@@ -21,8 +21,9 @@ struct StorageGpio
     model: gpio.Bank
 
 /** The STM32 storage path: the SPI controller (`stm32-spi`), the GPIO banks, and the SD card on the
- * SPI or on the SDMMC (`is_native`). What the board fixes is here: `gpio_index` is the bank the SPI's
- * pins are on, `detect` the bank and pin the card's detect switch pulls low, `has_card` whether a
+ * SPI or on the SDMMC (`is_native`). What the board fixes is here: `routed` whether the board wires the
+ * SPI's bus, `gpio_index` the bank its pins are on, `detect` the bank and pin the card's detect switch
+ * pulls low, `has_card` whether a
  * card is in the slot, and `path` the file its image was read from (empty for none). The registers,
  * the banks and the card on the SPI change under `live`; a card on the SDMMC is the SDMMC's
  * (sdmmc.sysl). The card's image is `image`, which the card reaches through its media.
@@ -39,6 +40,7 @@ struct StorageState
     cs: u32
     af: u32
     present: bool
+    routed: bool
     image: &sync SdImage
     live: Mutex[StorageLive]
 
@@ -54,7 +56,7 @@ struct StorageLive
 private storage_live() -> StorageLive = StorageLive(hspi.controller(), [StorageGpio(0,"",gpio.bank());16], 0, None)
 
 /** No SPI, no GPIO bank and no card. */
-storage_state() -> StorageState = StorageState(0, None, false, false, "", 5, 7, 6, 4, 5, false, sd_image_of(buf(), ""), Mutex.new(storage_live()))
+storage_state() -> StorageState = StorageState(0, None, false, false, "", 5, 7, 6, 4, 5, false, false, sd_image_of(buf(), ""), Mutex.new(storage_live()))
 
 /** A sector the image writer is to write to the image file. */
 struct SectorWrite
@@ -166,6 +168,14 @@ private[virt] local_pin(name: string, bank: string) -> Option[u32]
     for pin in 0u32..<16 do if name == s"$bank$pin" then return Some(pin)
     None
 
+// The bank of `l` a pin such as `PA5` is on, and its number there.
+private bank_pin(l: *StorageLive, name: string) -> Option[(usize,u32)]
+    for i in 0..<l.gpio_count
+        local_pin(name,l.gpios[i].name) match
+            Some(n) -> return Some((i,n))
+            None -> ()
+    None
+
 // The bank of `l` named `name`.
 private[virt] gpio_named(l: *StorageLive, name: string) -> Option[usize]
     for i in 0..<l.gpio_count do if l.gpios[i].name == name then return Some(i)
@@ -214,19 +224,23 @@ private check_storage_into(b: Board, clock_hz: u64, s: *StorageState, l: *Storag
                     ratio = u32(clock_hz / u64(hz))
                 _ -> ()
     l.spi = hspi.controller(ratio)
-    if s.present
-        if l.gpio_count == 0 then return Err("stm32-spi needs a GPIO bank")
-        s.gpio_index = 0
-        for p in b.chip.peripherals
-            if p.name != spi_name then continue
-            for route in p.signals
-                if route.pins.len() != 1 then return Err("SPI requires one routed pin per signal")
-                val pin = local_pin(route.pins.at(0).name,l.gpios[s.gpio_index].name) match
-                    Some(pin) -> pin
-                    None -> return Err("SPI signal must belong to its GPIO bank")
-                if route.name == "sck" then s.sck = pin
-                elif route.name == "tx" then s.tx = pin
-                elif route.name == "rx" then s.rx = pin
+    // The SPI's pins are where the board's `buses` puts them, all on one bank; a board that does not
+    // wire the bus leaves the SPI unrouted.
+    for bus in b.buses
+        if !s.present || bus.name != spi_name then continue
+        var bank: Option[usize] = None
+        for route in bus.signals
+            val (i, pin) = bank_pin(l, route.pin) match
+                Some(at) -> at
+                None -> return Err("SPI signal needs its STM32 GPIO bank")
+            if bank.is_some() && bank != Some(i) then return Err("SPI signals must share one GPIO bank")
+            bank = Some(i)
+            if route.name == "sck" then s.sck = pin
+            elif route.name == "tx" then s.tx = pin
+            elif route.name == "rx" then s.rx = pin
+        if bus.signals.len() != 3 then return Err("SPI requires routed sck, tx and rx pins")
+        s.gpio_index = bank.unwrap()
+        s.routed = true
     for p in b.parts
         if part_model(p) != "sd-card" then continue
         if s.has_card then return Err("one SD card is currently supported")
@@ -237,24 +251,20 @@ private check_storage_into(b: Board, clock_hz: u64, s: *StorageState, l: *Storag
             Bus(name) ->
                 if wire.port == "spi" && name == spi_name then spi = true
                 if wire.port == "sdmmc" && name == native_name then native = true
-            Port(owner,pin) -> if wire.port == "cs" && owner == b.chip.name && l.gpio_count > 0 then cs = local_pin(pin,l.gpios[s.gpio_index].name)
-            Pin(pin) -> if wire.port == "cs" && l.gpio_count > 0 then cs = local_pin(pin,l.gpios[s.gpio_index].name)
+            Pin(pin) -> if wire.port == "cs" && s.routed then cs = local_pin(pin,l.gpios[s.gpio_index].name)
+            _ -> ()
         if spi == native then return Err("SD card needs exactly one SPI or SDMMC connection")
         s.is_native = native
         if spi
+            if !s.routed then return Err("an SD card on the SPI needs the SPI's pins wired under `buses`")
             if cs.is_none() then return Err("SPI SD card needs a chip-select GPIO")
             s.cs = cs.unwrap()
             if s.cs == s.sck || s.cs == s.tx || s.cs == s.rx || s.sck == s.tx || s.sck == s.rx || s.tx == s.rx then return Err("SPI and CS pins must be distinct")
         for wire in p.wires
             if wire.port != "detect" then continue
-            val pin = wire.to match
-                Port(owner,pin) -> if owner == b.chip.name then pin else ""
-                Pin(pin) -> pin
-                _ -> ""
-            for i in 0..<l.gpio_count
-                local_pin(pin,l.gpios[i].name) match
-                    Some(n) -> s.detect = Some((i,n))
-                    None -> ()
+            s.detect = wire.to match
+                Pin(pin) -> bank_pin(l, pin)
+                _ -> None
             if s.detect.is_none() then return Err("SD detect pin needs its STM32 GPIO bank")
         load_storage_card(s, l, p, clock_hz)?
     Ok(())
@@ -354,7 +364,8 @@ private storage_gpio_read(s: *StorageState, l: *StorageLive, base: u32, offset: 
         s.detect match
             Some((bank,pin)) -> if bank == i && s.has_card then input &= ~(1u32 << pin)
             None -> ()
-        if !s.is_native then input |= 1u32 << s.rx
+        // The SPI's idle MISO reads high on its own bank.
+        if s.routed && i == s.gpio_index && !s.is_native then input |= 1u32 << s.rx
         return gpio.read(b.model,offset,input)
     None
 private storage_gpio_write(l: *StorageLive, base: u32, offset: u32, value: u32) -> bool

@@ -100,7 +100,7 @@ changed during a conversion affect the next sample. A guest WFI can wake on the
 completion interrupt. Reset clears ADC registers while the external knob retains
 its position. No analogue circuit solver, noise or source-impedance model is used.
 
-The component declaration uses `ref = RV1` and `wiper = controller.GP26` directly.
+The component declaration uses `ref = RV1` and `wire { wiper = GP26 }`.
 Its ideal voltage range and initial position come from its HOCON instance parameters.
 
 ## Seven-segment display
@@ -108,7 +108,7 @@ Its ideal voltage range and initial position come from its HOCON instance parame
 The built-in `seven-segment` part has `digits` (1–8, default 1), `common` (`cathode`
 or `anode`, default `cathode`), `color` and `persistence-cycles` (default 50000).
 All `a`–`g` terminals and `digit0` through `digitN` must be connected. `dp` is optional.
-Each terminal uses a named chip connection, for example `a = controller.GP10`.
+Each terminal is wired under `wire` to a pin of the chip, for example `a = GP10`.
 
 DS1 uses four common-cathode digits. Segment bits a,b,c,d,e,f,g,dp map to GP10–17;
 left-to-right digit commons map to GP18–21. Firmware makes these pins outputs,
@@ -183,11 +183,7 @@ GDDRAM and never translates an ADC value directly into display pixels.
 oled {
   part = ssd1306
   ref = DS3
-  sck = controller.GP6
-  mosi = controller.GP7
-  cs = controller.GP27
-  dc = controller.GP28
-  reset = controller.GP29
+  wire { sck = GP6, mosi = GP7, cs = GP27, dc = GP28, reset = GP29 }
 }
 ```
 
@@ -248,11 +244,7 @@ tft {
   ref = DS4
   width = 240
   height = 240
-  sck = controller.GP6
-  mosi = controller.GP7
-  cs = controller.GP30
-  dc = controller.GP31
-  reset = controller.GP29
+  wire { sck = GP6, mosi = GP7, cs = GP30, dc = GP31, reset = GP29 }
 }
 ```
 
