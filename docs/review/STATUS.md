@@ -10,10 +10,10 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 |---|---|---|
 | cores#1 | the RISC-V core is not wired into any board, and has no bus | open |
 | cores#2 | the memory map is process-global state the core reads on every access | fixed by slice 1 (`ce0b959`): `v6m.Memory` holds the map, `Cpu.mem` points at it |
-| cores#3 | every new `Op` must be written in five places | open |
-| cores#4 | hand-unrolled const-generic dispatch ladders, doubled by `TIMED` | open |
-| cores#5 | `TIMED`, `V8`, `SINGLE` are `const u32` used as booleans | open |
-| cores#6 | the timing switch checked at decode in three spellings; IT re-dispatch | open |
+| cores#3 | every new `Op` must be written in five places | partly fixed in `35449b8`: the hand list is gone (`configure_instruction_timing` walks `Op::Variants`), `instruction_cycles` is the one cost table and `costed(op)` derives from it whether a shared handler charges cycles; left: the handler table is still an exhaustive `match` — a `for const c in Op::Variants` table needs `Op::Make(c, ())` as a value argument, which sysl 0.7.8 refuses (sysl finding) |
+| cores#4 | hand-unrolled const-generic dispatch ladders, doubled by `TIMED` | fixed in `35449b8`: every ladder is a `for const` (B<cond>, fused, wide CMP, IT, FP, DP imm/logic/reg×shift, bit, extend, the load families) |
+| cores#5 | `TIMED`, `V8`, `SINGLE` are `const u32` used as booleans | fixed in `35449b8` (`const …: bool`; FP's precision `D` left a `u32`) |
+| cores#6 | the timing switch checked at decode in three spellings; IT re-dispatch | partly fixed in `35449b8`: `CYCLE_ACCOUNTING` deleted; one spelling (`handler_for`, `fused_handler_for`, `cmp_w_bcond_handler`, `pred_handler` all take the core); `h_pred[K, L, TIMED]` no longer tests the timing switch at run time; left: it still re-selects its inner handler per run — the 16-byte record has no room for a second handler pointer |
 | cores#7 | the RISC-V core is RP2350-specific while claiming to be generic | open |
 | cores#8 | RISC-V per-instruction cost far from "real-world speed" | open |
 | cores#9 | NVIC banks use three indexing schemes | open |
@@ -22,7 +22,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#12 | `Kind`, `Arch` and the `is_*` predicates overlap | open |
 | cores#13 | `h_dsp` re-checks DSP at run time against a second source of truth | open |
 | cores#14 | duplicated bit utilities and hand-rolled loops the library has | open |
-| cores#15 | boilerplate handler bodies | open |
+| cores#15 | boilerplate handler bodies | fixed in `35449b8`: `h_step[OP, L, TIMED]` and `h_access[OP, L, TIMED]`, whose `match` on the constant `OP` folds, replace ~85 hand-written handlers |
 | cores#16 | RISC-V `execute` mixes decode, validation and commit | open |
 | cores#17 | `Stop.Budget` means "running" | open |
 | cores#18 | RISC-V `Model` fields that nothing reads | open |
