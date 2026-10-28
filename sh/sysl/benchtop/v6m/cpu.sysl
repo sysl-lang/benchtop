@@ -18,7 +18,7 @@ import sysl.sync.*
 //
 // **An access with no page is the board's**, unless it is to the system control space, which is the
 // core's own (except.sysl). Devices live at addresses the page table leaves empty, and the core hands
-// such an access to the board through `io_read` and `io_write`.
+// such an access to the board through its `bus`.
 //
 // **A store never leaves a stale record behind.** A map of the RAM's 64-byte lines marks each line a
 // record has been decoded from, and a store to a marked line puts back to "not decoded" every record
@@ -164,12 +164,15 @@ const LINE_SHIFT: u32 = 6
 // instructions retired so far, and replaces its own frame with the next handler's.
 type Handler = *extern(*Cpu, *Insn, u64) -> unit
 
-// The board's half of an access with no page: a read answers the value, `width` bytes (1, 2 or 4)
-// zero-extended; a write takes it. Either may stop the core with `halt`. The last argument is the
-// count of instructions retired before the one making the access, for a device that answers by the
-// time.
-type IoRead = *extern(*Cpu, u32, u32, u64) -> u32
-type IoWrite = *extern(*Cpu, u32, u32, u32, u64) -> unit
+/** The board's half of an access with no page, which the core reaches through its `bus`: a read
+ * answers the value, `width` bytes (1, 2 or 4) zero-extended; a write takes it. Either may stop the
+ * core with `halt`. `n` is the count of instructions retired before the one making the access, for a
+ * device that answers by the time. The object is the core's one way back to the machine it is part
+ * of: each core holds its own.
+ */
+trait Bus
+    read(*self, cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
 
 // Why `run` came back. Every stop but `Budget` also leaves `pc` where the guest was: on an access
 // that stopped the core, the instruction that made it (not retired); after a jump off the RAM, its
@@ -250,8 +253,7 @@ struct Cpu
     pages: *usize
     lines: *u8
     dec: *Insn
-    io_read: IoRead
-    io_write: IoWrite
+    bus: *Bus
     // The exception model (except.sysl). `r[13]` is the stack pointer in use; `sp_other` is the
     // other one: the main stack's while thread mode runs on the process stack, the process stack's
     // otherwise.
@@ -372,8 +374,7 @@ reset(cpu: *Cpu, mem: &Memory, image: []const u8, entry: u32)
 
     attach_memory(cpu, mem)
     clear(cpu, entry)
-    cpu.io_read = &no_device_read
-    cpu.io_write = &no_device_write
+    cpu.bus = &nothing_attached
 
 /** Point `cpu` at `mem`, sharing the machine's records; `clear` keeps the attachment. The caller keeps
  * `mem` alive while the core points at it.
@@ -502,11 +503,18 @@ leave(cpu: *Cpu, ip: *Insn, n: u64)
     cpu.retired = n + 1
 
 // A machine with no devices: every access off the page table stops the core.
-no_device_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
-    halt(cpu, Stop.Unmapped, a)
-    0
+struct NoDevices
+end NoDevices
 
-no_device_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64) = halt(cpu, Stop.Unmapped, a)
+impl Bus for NoDevices
+    read(*self, cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+        halt(cpu, Stop.Unmapped, a)
+        0
+
+    write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64) = halt(cpu, Stop.Unmapped, a)
+
+/** The bus `reset` gives a core: nothing is on it. */
+var nothing_attached = NoDevices()
 
 // A record that decodes itself the first time control reaches it.
 @inline
@@ -660,7 +668,7 @@ addr_of(cpu: *Cpu, ip: *Insn) -> u32 = cpu.mem.code_address(u32(ip - cpu.dec) <<
 // ---------------------------------------------------------------------------------------------------
 // Memory. The fast path is one table load, one test and one host access; everything else (a page
 // with no entry) is the slow path: the system control space (except.sysl), or else the board's
-// `io_read` and `io_write`.
+// `bus`.
 //
 // A guest access is made at `n`, the count of instructions retired before the one making it, since
 // the system timer's registers answer by the time. `load32` and the rest are the same accesses made
@@ -683,14 +691,14 @@ page_for(cpu: *Cpu, a: u32, width: u32) -> usize = if cpu.mem.ram_range(a, width
 slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
     if a >= SCS && a < SCS_END then return scs_read(cpu, a, width, n)
 
-    cpu.io_read(cpu, a, width, n)
+    cpu.bus.read(cpu, a, width, n)
 
 slow_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
     if a >= SCS && a < SCS_END
         scs_write(cpu, a, width, x, n)
         return
 
-    cpu.io_write(cpu, a, width, x, n)
+    cpu.bus.write(cpu, a, width, x, n)
 
 // The `width` bytes at `a` on the host page `page`, zero-extended; and storing them.
 @inline

@@ -114,7 +114,12 @@ enum ProductView
      console is `Machine.console: Console` (its channel, an atomic `ctrl` and
      `live: Mutex[ConsoleLive]`), and `output()` answers a `&sync Frozen[u8]`. The DSI worker is
      `Scheduler.dsi: DsiWorker`. `storage_lock` and `console_lock` are gone.
-   - Left: `first`, `second`, the cores' option globals, the SIO FIFOs and spinlocks, the bus
-     cache, the `enum Device` dispatch, and `virt.machine` itself.
+   - Done: the cores. `Machine.cores: [2]Cpu` replaces `first` and `second`; `core0()` and
+     `core1()` answer `&machine.cores[k]`. A core reaches its machine through `Cpu.bus: *Bus`, a
+     v6m `trait Bus` that `Machine` implements and `boot` and `launch` point at, in place of the
+     `io_read`/`io_write` function globals. The trait call costs at most about 1% in host
+     instructions on the interpreter and board benches.
+   - Left: the cores' option globals, the SIO FIFOs and spinlocks, the bus cache, the
+     `enum Device` dispatch, and `virt.machine` itself.
 5. **Headers and Product.** `Pin` and `header` on boards, product files with wiring, run-time wire
    edits, and the product view.
