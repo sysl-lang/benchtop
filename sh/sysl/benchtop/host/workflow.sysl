@@ -19,6 +19,23 @@ struct Config
 config() -> Config = Config(false, "", buf(), buf())
 enabled(c: Config) -> bool = c.watch || !c.program.is_empty() || c.sources.len() > 0 || c.args.len() > 0
 
+/** Where a workflow is: watching with its last attempt good, running a build, watching after a build
+ * or reload that failed (the running firmware is kept), or closed for good.
+ */
+enum Phase
+    Watching = 0
+    Building
+    Failed
+    Closed
+
+/** The work the service loop owes next. A build supersedes a reload: a build that succeeds reloads,
+ * and one that fails keeps the running firmware.
+ */
+enum Request
+    NoRequest = 0
+    Reload
+    Build
+
 /** Host state is owned by the UI thread. Tasks only stage images; the frame boundary applies them. */
 struct Workflow
     config: Config
@@ -30,10 +47,8 @@ struct Workflow
     jobs: Buf[Job]
     readers: Buf[Job]
     process: Option[&Process]
-    closed: bool
-    building: bool
-    build_requested: bool
-    reload_requested: bool
+    phase: Phase
+    request: Request
     ready_at: Duration
     last_good: []const u8
     pending: Option[Buf[u8]]
@@ -41,7 +56,20 @@ struct Workflow
     status: string
     builds: u64
     reloads: u64
-    failed: bool
+
+    closed -> bool = self.phase == Closed
+    building -> bool = self.phase == Building
+    failed -> bool = self.phase == Failed
+end Workflow
+
+/** Moves to `phase`, unless the workflow is closed: a task finishing after `close` changes nothing. */
+private[host] enter(w: &Workflow, phase: Phase) = if w.phase != Closed then w.phase = phase
+
+/** Asks for a reload, which a pending build already includes. */
+private[host] want_reload(w: &Workflow) = if w.request == NoRequest then w.request = Reload
+
+/** Drops a pending reload; a pending build stays. */
+private[host] drop_reload(w: &Workflow) = if w.request == Reload then w.request = NoRequest
 
 validate(c: Config, firmware: string) -> Result[unit, string]
     if !enabled(c) then return Ok(())
@@ -63,8 +91,11 @@ open(c: Config, firmware: string, initial: []const u8 = []) -> Result[&Workflow,
         Err(e) -> return Err(s"libuv loop: ${e.name()}")
     val io = uv_on(native)
     val lp = event_loop(io)
-    val w: &Workflow = Workflow(c, absolute(firmware), native, io, lp, buf(), buf(), buf(), None, false,
-        false, !c.program.is_empty(), c.program.is_empty() && c.watch, lp.now(), initial, None, buf(), "Watching firmware", 0, 0, false)
+    val first = if !c.program.is_empty() then Build elif c.watch then Reload else NoRequest
+    val w: &Workflow = Workflow(config = c, firmware = absolute(firmware), native = native, io = io, lp = lp,
+        watchers = buf(), jobs = buf(), readers = buf(), process = None, phase = Watching, request = first,
+        ready_at = lp.now(), last_good = initial, pending = None, log = buf(), status = "Watching firmware",
+        builds = 0, reloads = 0)
     var paths: Buf[string] = buf()
     if c.watch || !c.program.is_empty() then paths.push(w.firmware)
     for source in c.sources do paths.push(absolute(source))
@@ -104,7 +135,7 @@ private append(w: &Workflow, bytes: []const u8)
 
 request_build(w: &Workflow)
     if w.closed || w.config.program.is_empty() then return
-    w.build_requested = true
+    w.request = Build
     w.ready_at = w.lp.now()
     if !w.building then w.status = "Build queued"
 
@@ -119,7 +150,7 @@ private async watch_file(w: &Workflow, watcher: &Watch, name: string, source: bo
         change.filename match
             Some(file) -> if file != name then continue
             None -> ()
-        if source then w.build_requested = true else w.reload_requested = true
+        if source then w.request = Build else want_reload(w)
         w.ready_at = w.lp.now() + millis(150)
 
 private async service(w: &Workflow)
@@ -128,12 +159,12 @@ private async service(w: &Workflow)
     await w.lp.sleep(millis(150))
     while !w.closed
         if w.lp.now() >= w.ready_at
-            if w.build_requested
-                w.build_requested = false
-                await build(w)
-            elif w.reload_requested
-                w.reload_requested = false
-                await reload(w)
+            val request = w.request
+            w.request = NoRequest
+            request match
+                Build -> await build(w)
+                Reload -> await reload(w)
+                NoRequest -> ()
         await w.lp.sleep(millis(20))
 
 private struct Drain
@@ -152,8 +183,7 @@ private async drain(w: &Workflow, pipe: &Pipe, drained: &Drain)
         append(w, bytes)
 
 private async build(w: &Workflow)
-    w.building = true
-    w.failed = false
+    enter(w,Building)
     w.status = "Building…"
     w.builds += 1
     note(w, s"Build ${w.builds}: ${w.config.program}")
@@ -161,8 +191,7 @@ private async build(w: &Workflow)
         stdout = Stdio.Piped, stderr = Stdio.Piped) match
         Ok(p) -> p
         Err(e) ->
-            w.building = false
-            w.failed = true
+            enter(w,Failed)
             w.status = s"Build could not start: ${e.name()}"
             note(w, w.status)
             return
@@ -175,7 +204,7 @@ private async build(w: &Workflow)
     w.readers.push(err)
     val ended = await child.exit()
     w.process = None
-    w.building = false
+    enter(w,Watching)
     // Drain both pipes concurrently, including output larger than the pipe buffers.
     val deadline = w.lp.now() + millis(500)
     while (!out_done.done || !err_done.done) && w.lp.now() < deadline
@@ -184,16 +213,16 @@ private async build(w: &Workflow)
     w.lp.abort(err)
     w.readers.clear()
     if ended.status != 0 || ended.signal != 0
-        w.failed = true
+        enter(w,Failed)
         w.status = if ended.signal != 0 then s"Build ended by signal ${ended.signal}" else s"Build failed (exit ${ended.status})"
-        w.reload_requested = false
+        drop_reload(w)
         note(w, w.status + "; keeping the running firmware")
         return
     w.status = "Build succeeded"
     note(w, w.status)
     // A source edit during a build queues one more build; never reload that stale intermediate image.
-    if !w.build_requested
-        w.reload_requested = false
+    if w.request != Build
+        drop_reload(w)
         await reload(w)
 
 private async read_image(w: &Workflow) -> Result[[]u8, string]
@@ -222,7 +251,7 @@ private async reload(w: &Workflow)
                 why = e
                 continue
         if !equal(first, bytes) then continue
-        if w.build_requested then return
+        if w.request == Build then return
         if equal(w.last_good, bytes)
             w.status = "Firmware unchanged"
             return
@@ -235,10 +264,10 @@ private async reload(w: &Workflow)
         w.last_good = bytes
         w.pending = Some(image)
         w.status = "Firmware ready"
-        w.failed = false
+        enter(w,Watching)
         return
     w.status = "Reload rejected"
-    w.failed = true
+    enter(w,Failed)
     note(w, s"Reload rejected: $why; keeping the running firmware")
 
 /** Refuse empty/truncated images before replacing the guest's last known working state. */
@@ -275,7 +304,7 @@ take_image(w: &Workflow) -> Option[Buf[u8]]
 /** Close watchers, cancel parked tasks, terminate an active child, then reap libuv handles. */
 close(w: &Workflow) -> Result[unit, string]
     if w.closed then return Ok(())
-    w.closed = true
+    w.phase = Closed
     for watcher in w.watchers do watcher.close()
     w.process match
         Some(p) ->
