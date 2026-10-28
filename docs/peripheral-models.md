@@ -4,7 +4,7 @@ Chip peripherals expose the registers firmware reads and writes. External compon
 consume or supply signals on named connection points. Their behavior is independent
 of the chip register map: the seven-segment model takes resolved digital levels,
 output enables and guest time, while the potentiometer supplies integer microvolts.
-The virtual workbench currently publishes GPIO transitions to its bound display
+The virtual workbench publishes GPIO transitions to its bound display
 models. Conversion completion and timer alarms use the board's shared guest clock
 and scheduler, and raise the configured interrupt inputs.
 
@@ -12,8 +12,8 @@ GPIO bases already come from each peripheral's HOCON `at`. A reusable GPIO engin
 can also accept register layouts: offsets, widths, reset values and operations such
 as output, direction, set bits and clear bits. Address parameters alone do not change
 register semantics. A real MCU model must choose the matching operations and bit
-layout, with named profiles reusable across chips. The current `panel-gpio` model
-has a fixed register layout; configurable layouts are not implemented yet.
+layout, with named profiles reusable across chips. The `panel-gpio` model has a
+fixed register layout; configurable layouts are not implemented.
 
 For PIO, PWM, alternate functions and GPIO to share pads, a chip model needs a pin
 routing/multiplexer layer. Each producer supplies output values and output enables;

@@ -52,7 +52,7 @@ constants are provisional estimates, not a published M7 cycle table.
 
 M7 estimates borrow the M4 scalar baseline where a portable serial cost is
 unavailable; they do not model dual issue or overlapping FP execution. Other
-catalog Cortex-M models currently share this scalar baseline, with model
+catalog Cortex-M models share this scalar baseline, with model
 specific branch, system-register and long-multiply choices. Their tables should
 be calibrated further before using them to predict workload execution time.
 No cache misses, flash wait states, bus contention, exception stacking latency,

@@ -12,7 +12,8 @@ is still in progress. It is an interpreter; a JIT is not planned.
 **Twelve Cortex-M models run scalar firmware on virtual boards:** M0, M0+, M1, M3, M4, M7,
 M23, M33, M35P, M52, M55 and M85. Extensions and limitations are listed below; this is not
 TrustZone or Helium emulation. Integer DSP and the floating-point unit (single precision, or double
-on the M7) are available through board options. No real board is emulated yet.
+on the M7) are available through board options. No complete real board is emulated; the
+STM32H747I-Discovery description is a core bring-up with virtual peripherals.
 [DESIGN.md](DESIGN.md) is the design note: the architecture, the CPU interpreter, each board's
 devices, how fidelity is tested against real boards, and the milestones with their estimates.
 
@@ -98,7 +99,7 @@ to the window, with fonts rasterized at the display density.
 
 `view` and `render` inspect existing descriptions, including products. Hardware
 without modelled peripherals is labelled **LAYOUT PREVIEW**; display placeholders
-are not emulated displays. Live execution currently uses Cortex-M virtual boards
+are not emulated displays. Live execution uses Cortex-M virtual boards
 and parallel execution of launched guest cores on distinct host threads.
 Use `--deterministic` for reproducible serial interleaving. Headless UI runs
 remain deterministic. Normal desktop execution uses two persistent host CPU
@@ -308,8 +309,8 @@ wake events are updated. `irq` and `interrupt_inputs` supply external, software 
 levels. Concurrent host-thread execution is not supported by this RISC-V API.
 
 `run --board` still uses the Cortex-M board runtime. Neither the `pico2` nor `pico2w` description
-boots firmware yet. RP2350 MMIO devices, ROM/flash boot, core selection and multicore startup remain
-subsequent board work; the core's `pair` API does not supply a boot protocol.
+boots firmware. RP2350 MMIO devices, ROM/flash boot, core selection and multicore startup are not
+implemented; the core's `pair` API does not supply a boot protocol.
 
 Every implemented RISC-V mnemonic has a named test in the [base coverage matrix](sh/sysl/benchtop/riscv/COVERAGE.md)
 or [Hazard3 coverage matrix](sh/sysl/benchtop/riscv/HAZARD3-COVERAGE.md), with stateful instruction
@@ -449,7 +450,7 @@ options, and writing a description back preserves them. **Integer DSP is impleme
 multiply/accumulate families, including APSR.GE and exception stacking. It defaults to off.
 `fpu = sp` (or `dp` on the M7) gives a core its floating-point unit, whose results and flags
 match QEMU's (DESIGN §2.13).
-`run` currently rejects enabled MPU, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
+`run` rejects enabled MPU, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
 unsupported selection; it never silently
 ignores them. A chip's integrated core configuration is defined by its chip model; these options
 apply to boards that declare `cores` directly.
@@ -490,7 +491,7 @@ handlers are shared. M23 is a separate Baseline decoder profile, with two priori
 system-register accesses, fixed CCR and no IT, BASEPRI, FAULTMASK or stack limits in its current
 configuration without the Security Extension. M0/M1 have no VTOR; M3 has the v7-M register profile.
 
-**All models currently omit the MPU and Security extensions; the floating-point unit is a board option.**
+**All models omit the MPU and Security extensions; the floating-point unit is a board option.**
 M4 and M7 always have integer DSP; M33/M35P/M52/M55/M85 can enable it independently per core. The M52/M55/M85
 models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
 MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. Unsupported instruction

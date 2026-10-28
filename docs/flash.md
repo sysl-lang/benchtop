@@ -47,7 +47,7 @@ Ordinary CPU writes to flash fault and leave storage intact. Flash controller
 registers, serial QSPI transactions, erase/program commands, boot ROMs, security
 metadata, UF2 packaging, and hardware programming are not implemented here.
 The demos have a flash-linked embedded layout, but still target Benchtop's
-virtual MCU peripherals. They are not yet binaries for a physical Pico.
+virtual MCU peripherals. They are not binaries for a physical Pico.
 
 The RAM-only descriptions and older architectural test images remain supported.
 `bench/guest/workbench-ram.hocon` and `panel-ram.elf` retain the earlier RAM-only

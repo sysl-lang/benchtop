@@ -15,5 +15,5 @@ Status symbols: `dma_probe_status` is 1 on success, 2 on DMA error and 3 on
 underrun; `dma_probe_irq_count` should be 1; `dma_probe_active` should contain
 bit25 (IRQ57 in NVIC bank1). The sixteen raw samples are observed by the SAI
 adapter in integration tests; this regression has no codec or audible output.
-The board currently supplies a fixed SAI kernel clock through its description.
+The board supplies a fixed SAI kernel clock through its description.
 Physical-board RCC/pin initialization is not implemented by this regression.

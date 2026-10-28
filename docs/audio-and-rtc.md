@@ -98,9 +98,10 @@ freezes with the emulation, and survives MCU reset/reload. Rebuilding a board
 creates a fresh RTC from its selected seed. There is no disk persistence, host-clock
 resynchronization, disk-persisted battery,
 supply-switching, oscillator drift, SQW/32 kHz pin waveform or routed alarm IRQ
-behavior is implemented yet. The model exposes the alarm assertion for future wiring.
+behavior is implemented. The model exposes the alarm assertion (`interrupt`), but no
+pin or interrupt input is wired to it.
 
-The current virtual MCU provides a byte-level I²C controller at `0x50000300`:
+The virtual MCU provides a byte-level I²C controller at `0x50000300`:
 
 | Offset | Register | Behavior |
 | --- | --- | --- |

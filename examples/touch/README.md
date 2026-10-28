@@ -76,7 +76,7 @@ the older ST7789V catalog entry remains available. Both share the existing DCS
 behavior model. See the [Sitronix ST7789VW datasheet](https://www.hestore.eu/en/prod_getfile.php?id=12938).
 Button-press SPI work drops from about 1.26 million to 656 thousand guest ticks.
 DMA request-control registers are present, but a DMA engine, SPI slave mode,
-TI/Microwire framing and automatic hardware CS are not implemented yet.
+TI/Microwire framing and automatic hardware CS are not implemented.
 
 The original GPIO implementation is preserved as a buildable feature:
 

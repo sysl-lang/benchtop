@@ -69,8 +69,9 @@ The boot configuration corresponds to BCM4 disabled in option bytes. The current
 `stm32h7-rcc` adapter implements GCR boot control only; oscillator, PLL and other
 RCC accesses fail explicitly. Clock rates are supplied by the description.
 
-The UI executes on M4. M7 currently spins and is reserved for subsequent audio
-firmware; it does not yet process audio. The screen/touch are still the existing
+The UI executes on M4. In images built without the `audio` feature M7 only spins;
+`audio-disco.elf` (built with `audio`) runs sine DSP on M7 and sleeps in `wfi`
+between interrupts. The screen/touch are still the existing
 ST7789/GT911 test harness using virtual peripherals. This is **not** the complete
 Discovery board, and the window labels it as core bring-up. The original M33
 board and all original SPI/GPIO firmware modes remain available.
@@ -85,16 +86,15 @@ board and all original SPI/GPIO firmware modes remain available.
 The built-in description lives in `boards/stm32h747-disco.hocon`. It uses the real
 internal flash and AXI SRAM addresses, RCC CM4 release, STM32 DSI at 0x50000000,
 and I2C4 at 0x58001c00 routed to PD12/PD13. An FT6206 at address 0x2a supplies touch
-reports. The display part currently implements common MIPI DCS behavior rather
+reports. The display part implements common MIPI DCS behavior rather
 than a complete NT35510/OTM8009A vendor-specific controller.
 
 M4 sends real DCS short/long packets through GHCR/GPDR. The host emulates their
 completion and updates the separate display model. Host painting does not write
 pixels into the device. Packet timing uses PLL-derived lane rate, lane count and
 packet length; PHY transitions, LP/HS timing overhead, TE and ECC/CRC faults are
-not modeled. The hardware's complete 16-bit long-packet length range is not yet
-supported: the implemented packet payload limit is 1024 bytes, rejected above
-that bound.
+not modeled. The hardware's long-packet length is 16 bits, but the packet payload
+limit is 1024 bytes, rejected above that bound.
 
 The example keeps its 240x240 imui surface centered on the 800x480 native glass.
 The full glass is initialized over DSI. Interactions arrive through FT6206

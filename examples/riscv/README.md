@@ -22,7 +22,7 @@ sysl build . -o benchtop
 sysl test . --filter RV32
 ```
 
-`chip.hocon` demonstrates core names in the shared description format. It is not yet a
+`chip.hocon` demonstrates core names in the shared description format. It is not a
 runnable board. Bare ISA profiles have no interrupt controller; `hazard3.hocon` uses the
 executable Hazard3 profile, whose core-local interrupt controller is implemented. Neither
 configuration supplies RP2350 devices or a firmware boot protocol.

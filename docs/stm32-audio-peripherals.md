@@ -234,7 +234,7 @@ existing shared memory, code-cache and exclusive-monitor backing. Physically
 adjacent banks are coalesced so cross-boundary instructions and data accesses
 remain contiguous. Disjoint regions get backing guards that redirect threaded
 fall-through to the correct guest address instead of another packed bank. Total
-RAM plus 4 KiB guards must currently fit the existing 1 MiB RAM backing budget.
+RAM plus 4 KiB guards must fit the existing 1 MiB RAM backing budget.
 ELF loading covers each mapped region; reset clears all bank contents. Tests
 cover DMA/device writes, exclusive tracking, self-modifying code, adjacent-bank
 Thumb32 execution, disjoint fall-through and independent per-core decode records.

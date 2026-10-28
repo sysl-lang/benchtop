@@ -40,7 +40,7 @@ rejected before opening the application window.
 
 The plot model accepts a numeric callback returning a value or a missing sample;
 it has no knowledge of ADCs, parts or CPU architectures. The windowed Cortex-M
-backend currently binds these read-only names:
+backend binds these read-only names:
 
 | Source | Observation |
 | --- | --- |
