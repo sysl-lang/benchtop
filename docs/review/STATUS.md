@@ -21,7 +21,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#11 | sentinel and guard-record arithmetic in place of named concepts | open |
 | cores#12 | `Kind`, `Arch` and the `is_*` predicates overlap | open |
 | cores#13 | `h_dsp` re-checks DSP at run time against a second source of truth | open |
-| cores#14 | duplicated bit utilities and hand-rolled loops the library has | open |
+| cores#14 | duplicated bit utilities and hand-rolled loops the library has | partly fixed in `d435c66` (`t2sem` CLZ is `leading_zeros`); left: `rbit` (waits for sysl 0.7.9's `reverse_bits`), the RISC-V `bitops` loops, the duplicated `sext`/`bits`/`bad`/`st` helpers |
 | cores#15 | boilerplate handler bodies | open |
 | cores#16 | RISC-V `execute` mixes decode, validation and commit | open |
 | cores#17 | `Stop.Budget` means "running" | open |
@@ -80,7 +80,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | ui-firmware#6 | pot state stored twice and synced every frame | open |
 | ui-firmware#7 | `rasterize` clones the desktop by hand-copying fields | open |
 | ui-firmware#8 | a 20-argument positional constructor | open |
-| ui-firmware#9 | hand-written SDL externs where the SDL binding owns the job | open (`SDL_GetCurrentAudioDriver` is still declared in `ui/audio.sysl`) |
+| ui-firmware#9 | hand-written SDL externs where the SDL binding owns the job | fixed in `d435c66` (sdl3 0.3.12: the touch window's size and scale through `sdl3.c`, `current_audio_driver()`, `current_time()`/`date_time()`; no `extern "SDL_` is left in benchtop) |
 | ui-firmware#10 | instrument sources hard-code register maps | open |
 | ui-firmware#11 | example firmware is not readable | open |
 | ui-firmware#12 | startup and vector-table boilerplate copied into every example | open |
