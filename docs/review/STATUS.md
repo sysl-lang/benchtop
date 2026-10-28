@@ -37,7 +37,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#6 | peripheral kinds and window sizes duplicated; one wrong error message | partly fixed in `013e796` (the duplicate-I2C refusal names both kinds); the kind table and the double `controller` parse remain |
 | runtime#7 | magic register fields where the comments name the field | open |
 | runtime#8 | hand-rolled ring buffers where `Ring` exists | open |
-| runtime#9 | the DMA bus master is "whichever core last touched audio" | open |
+| runtime#9 | the DMA bus master is "whichever core last touched audio" | fixed in `0181428`: no `core` global; the requesting thread is passed as `via`, IRQs reach both NVICs through `deliver_audio_irq`, and the device-time rule (one clock that only advances; a lagging core sees the later state) is documented on `AudioLive`. The DMA's RAM stores still go through `device_store` on `via`'s thread, which already invalidates both cores' monitors and code; no separate v6m requester was needed |
 | runtime#10 | conditional locking keyed on a mutable global | fixed by slice 3 (`d72cffd`): `rp.live` is taken on every access, whichever thread |
 | runtime#11 | host workflow reaches into virt globals and duplicates the image layout | open |
 | runtime#12 | per-core configuration as parallel arrays, copy-pasted core setup | open (part of slice 4 part 2: the cores' option globals) |
@@ -46,7 +46,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#15 | wall-clock, busy-spinning tests | open |
 | runtime#16 | `start_workers` mutates state before it validates | fixed by slice 3 (`679528a`): the divisor check runs before anything is set |
 | runtime#17 | asymmetric worker entry points (`cpu_worker0(ignored)`) | open |
-| runtime#18 | disk-queue backpressure becomes a guest-visible write error | open |
+| runtime#18 | disk-queue backpressure becomes a guest-visible write error | fixed in `0181428`: a full queue blocks the writing core for a slot (host time, no guest time); only a stopped writer refuses. `disk_failed` stays sticky by design: it records a real failed host write, and is cleared at the next `start_disk` |
 | runtime#19 | cache-line padding by hand, sized for the wrong machine | open (`BusCache` still pads to 64) |
 | runtime#20 | sysl idiom (redundant suffixes, hand `min`/`max`, qualified calls) | open |
 | runtime#21 | stale or misleading comments, dead paths | partly fixed (slice 3 deleted `parallel.sysl` and its "legacy" comments); the rest open |
@@ -59,14 +59,14 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | peripherals#7 | five or more hand-rolled ring buffers | open |
 | peripherals#8 | protocol states and reply kinds are bare integers | open |
 | peripherals#9 | a status getter mutates state | open |
-| peripherals#10 | silent truncation of guest time in `i2s.advance` | open |
-| peripherals#11 | undocumented fidelity shortcuts | open |
+| peripherals#10 | silent truncation of guest time in `i2s.advance` | fixed in `0181428`: every elapsed period reaches the guest FIFOs, flags and LEVEL (an idle tail in closed form); only the host rings are bounded. `peak` renamed `level`, as the register map documents it |
+| peripherals#11 | undocumented fidelity shortcuts | fixed in `0181428`: the refuse-on-unsupported policy and a divergence table in `docs/peripheral-models.md`; each model's header lists its own; the DS3231 now uses the chip's leap rule (2100 is a leap year) |
 | peripherals#12 | GPIO-level parts assume a 32-pin `u32` level mask | open |
 | peripherals#13 | the SPI SD card re-implements the SPI shifter | open |
 | peripherals#14 | positional constructors with 20 to 40 arguments | open |
 | peripherals#15 | dead or diagnostic-only state inside the models | open |
 | peripherals#16 | `NEVER` defined three times, the literal three more | open (still in `v6m`, `sdmmc`, `sai`) |
-| peripherals#17 | "MIPI DCS" part carries ST7789 vendor commands | open |
+| peripherals#17 | "MIPI DCS" part carries ST7789 vendor commands | fixed in `0181428`: `mipi_dcs.Controller` (`Dcs`, `St7789`); the DCS core table is shared and the ST7789's vendor table applies only to the SPI ST7789 |
 | peripherals#18 | comments that name development steps, or are stale | open |
 | peripherals#19 | `hd44780` pins are a `[7]int` indexed by position | open |
 | peripherals#20 | sysl idiom: redundant suffixes, types and parentheses | open |
