@@ -67,6 +67,26 @@ cycles are a range and the host instructions are not):
 Thumb-2 says the same in 12% fewer instructions, and each costs about what an M0+ instruction does,
 so a round takes about as long on either. The M0+'s count is the same as before the M33 existed.
 
+## The Hazard3
+
+`kernel-rv.bin` is the same `kernel.c` built for RV32IMAC (`start-rv.S` sets the stack, calls `run`
+and ends with `EBREAK`), and `benchtop bench --core hazard3` runs it on the RISC-V interpreter,
+which has no decode cache and no threaded executor:
+
+```
+/usr/bin/time -l ./benchtop bench --core hazard3 bench/guest/kernel-rv.bin 1380735027
+```
+
+On the M5 Pro, sysl 0.7.8, three rounds of 429.3 M guest instructions:
+
+| | host instructions | per guest instruction | MIPS |
+|---|---|---|---|
+| a priority scan of every interrupt and of every PMP region per access, byte-wise RAM | 1606.0 G | 1247 | ~16 |
+| now: a cached interrupt line, decoded PMP with a Machine-mode fast path, word RAM access | **289.0 G** | **224** | **~104** |
+
+That is still about fifteen times the ARM cores' cost per instruction; the rest is the decode on
+every step.
+
 ## Two cores
 
 `guest/dual.c` runs on the virtual board: each core folds the CRC over a 4 KB buffer of its own a
