@@ -4,12 +4,16 @@ import sh.sysl.benchtop.{Board, Target}
 import sh.sysl.benchtop.peripheral.spi as spi
 import sh.sysl.benchtop.v6m.{Cpu, Stop, IRQ0, NEVER, halt, raise, could_wake, lower_limit}
 import sysl.sync.*
+import sysl.threads.Mutex
 
-/** The PL022 (`pl022`): its controller, the IRQ it raises (-1 for none), the GPIOs its SCK, TX and RX
- * are routed to, and the pads it drives, which `mask` selects and `output` sets.
+/** The PL022 (`pl022`): whether the bus has it, the IRQ it raises (-1 for none) and the GPIOs its
+ * SCK, TX and RX are routed to, which the board fixes; the pads it drives, which `mask` selects and
+ * `output` sets, published for lock-free readers; and the controller.
+ *
+ * The controller's lock is also the one the panel GPIO's writes take, so a guest's CS, DC and OE
+ * changes and the serial edges around them stay in order.
  */
 struct SpiState
-    serial: spi.Controller
     present: bool
     irq: int
     sck: int
@@ -17,9 +21,10 @@ struct SpiState
     rx: int
     mask: u32
     output: u32
+    serial: Mutex[spi.Controller]
 
 /** No PL022 on the bus. */
-spi_state() -> SpiState = SpiState(spi.controller(), false, -1, -1, -1, -1, 0, 0)
+spi_state() -> SpiState = SpiState(false, -1, -1, -1, -1, 0, 0, Mutex.new(spi.controller()))
 
 /** Select a board-routed signal, or the sole permitted pin in a simple MCU. */
 private spi_pin(b: Board, name: string, signal: string) -> int
@@ -50,58 +55,55 @@ private[virt] check_spi(b: Board) -> Result[SpiState,string]
 
 private[virt] boot_spi()
     val s = &machine.devices.spi
-    spi.reset(&s.serial)
+    s.serial.with(c -> spi.reset(c))
     atomic_store(&s.mask,0,Relaxed)
     atomic_store(&s.output,0,Relaxed)
 
 private[virt] spi_pad() -> (u32,u32) = (atomic_load(&machine.devices.spi.mask,Relaxed), atomic_load(&machine.devices.spi.output,Relaxed))
 
-private spi_drive(sck: bool, mosi: bool, time: u64) -> bool
+// The controller has put `sck` and `mosi` on its pins at `time`, enabled or not: drive the pads and
+// answer the level on RX.
+private spi_drive(enabled: bool, sck: bool, mosi: bool, time: u64) -> bool
     val s = &machine.devices.spi
-    val mask = if spi.enabled(s.serial) then (1u32 << u32(s.sck)) | (1u32 << u32(s.tx)) else 0u32
+    val mask = if enabled then (1u32 << u32(s.sck)) | (1u32 << u32(s.tx)) else 0u32
     val output = (if sck then 1u32 << u32(s.sck) else 0u32) | (if mosi then 1u32 << u32(s.tx) else 0u32)
     atomic_store(&s.mask,mask,Relaxed)
     atomic_store(&s.output,output & mask,Relaxed)
     observe_displays(panel_levels_at(time), panel_drive_mask_at(time), time)
     s.rx >= 0 && (atomic_load(&machine.devices.panel.input,Relaxed) & (1u32 << u32(s.rx))) != 0
 
-val serial_pins: &Fn(bool,bool,u64) -> bool = (sck,mosi,time) -> spi_drive(sck,mosi,time)
+private val enabled_pins: &Fn(bool,bool,u64) -> bool = (sck,mosi,time) -> spi_drive(true,sck,mosi,time)
+private val disabled_pins: &Fn(bool,bool,u64) -> bool = (sck,mosi,time) -> spi_drive(false,sck,mosi,time)
 
-/** Caller owns panel_lock, preserving ordering with guest CS/DC/OE changes. */
-private[virt] bring_spi(time: u64)
-    val s = &machine.devices.spi
-    if s.present then spi.advance(&s.serial,time,serial_pins)
+/** Under the controller's lock, which the panel GPIO's accesses take too. */
+private[virt] bring_spi(c: *spi.Controller, time: u64)
+    if machine.devices.spi.present then spi.advance(c,time,if spi.enabled(*c) then enabled_pins else disabled_pins)
 
 private[virt] spi_due() -> u64
     val s = &machine.devices.spi
     if !s.present then return NEVER
-    panel_lock.lock()
-    defer panel_lock.unlock()
-    spi.due(s.serial).unwrap_or(NEVER)
+    s.serial.with(c -> spi.due(*c).unwrap_or(NEVER))
 
 private[virt] spi_wake(cpu: *Cpu) -> u64
     val s = &machine.devices.spi
     if !s.present || s.irq < 0 || !could_wake(cpu,IRQ0 + u32(s.irq)) then return NEVER
-    panel_lock.lock()
-    defer panel_lock.unlock()
-    if s.serial.mask != 0 then spi.due(s.serial).unwrap_or(NEVER) else NEVER
+    s.serial.with(c -> if c.mask != 0 then spi.due(*c).unwrap_or(NEVER) else NEVER)
 
 private[virt] signal_spi(cpu: *Cpu)
     val s = &machine.devices.spi
     if !s.present then return
-    panel_lock.lock()
-    defer panel_lock.unlock()
-    bring_spi(board_time(cpu,cpu.retired))
-    if s.irq >= 0 && spi.irq(s.serial) then raise(cpu,u32(s.irq))
+    val irq = s.irq
+    s.serial.with(c ->
+        bring_spi(c,board_time(cpu,cpu.retired))
+        if irq >= 0 && spi.irq(*c) then raise(cpu,u32(irq)))
 
 private[virt] spi_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if (width != 2 && width != 4) || (offset & (width - 1)) != 0 || (offset & 3) != 0
         halt(cpu,Stop.Fault,address)
         return 0
-    panel_lock.lock()
-    defer panel_lock.unlock()
-    bring_spi(board_time(cpu,n))
-    spi.read(&machine.devices.spi.serial,offset) match
+    machine.devices.spi.serial.with(c ->
+        bring_spi(c,board_time(cpu,n))
+        spi.read(c,offset)) match
         Some(value) -> value
         None ->
             halt(cpu,Stop.Unmapped,address)
@@ -111,15 +113,13 @@ private[virt] spi_write(cpu: *Cpu, address: u32, offset: u32, width: u32, value:
     if (width != 2 && width != 4) || (offset & (width - 1)) != 0 || (offset & 3) != 0
         halt(cpu,Stop.Fault,address)
         return
-    panel_lock.lock()
-    defer panel_lock.unlock()
-    val s = &machine.devices.spi
     val time = board_time(cpu,n)
-    bring_spi(time)
-    if !spi.write(&s.serial,offset,value)
-        halt(cpu,Stop.Fault,address)
-        return
-    spi_drive(s.serial.sck,s.serial.mosi,time)
-    spi.due(s.serial) match
-        Some(due) -> lower_limit(cpu,retirement_limit(cpu,due))
-        None -> ()
+    machine.devices.spi.serial.with(c ->
+        bring_spi(c,time)
+        if !spi.write(c,offset,value)
+            halt(cpu,Stop.Fault,address)
+        else
+            spi_drive(spi.enabled(*c),c.sck,c.mosi,time)
+            spi.due(*c) match
+                Some(due) -> lower_limit(cpu,retirement_limit(cpu,due))
+                None -> ())

@@ -3,11 +3,18 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.{Board, part_model, Part, part_whole, param_named}
 import sh.sysl.benchtop.parts.seven_segment as seven
 import sysl.buf.{Buf, buf}
-import sysl.threads.SleepLock
+import sysl.threads.Mutex
 
 struct DisplayBinding
     name: string
     model: seven.Display
+
+/** The displays on the board: whether it has any, which the board fixes, and the displays
+ * themselves, which the cores drive and the host's renderer and the DSI worker read.
+ */
+struct Displays
+    present: bool
+    live: Mutex[DisplayState]
 
 /** The displays on the board, each watching the pins it is wired to: seven-segment digits and LED
  * matrices, HD44780 LCDs (lcd.sysl), SSD1306 OLEDs (oled.sysl) and MIPI DCS panels (tft.sysl).
@@ -18,13 +25,11 @@ struct DisplayState
     oleds: Buf[OledBinding]
     tfts: Buf[TftBinding]
 
-var display_lock = SleepLock.new()
-
 /** No display on the board. */
-display_state() -> DisplayState = DisplayState(buf(), buf(), buf(), buf())
+display_state() -> Displays = Displays(false, Mutex.new(DisplayState(buf(), buf(), buf(), buf())))
 
 // The displays `b` wires to its chip.
-private[virt] check_displays(b: Board) -> DisplayState
+private[virt] check_displays(b: Board) -> Displays
     var s = DisplayState(buf(), lcds_of(b), oleds_of(b), tfts_of(b))
     for p in b.parts
         if part_model(p) == "led-matrix-5x5"
@@ -50,47 +55,48 @@ private[virt] check_displays(b: Board) -> DisplayState
             None -> false
         val model = seven.display(int(part_whole(p, "digits", 1)), anode, u64(part_whole(p, "persistence-cycles", 50000)), segments, commons)
         s.sevens.push(DisplayBinding(p.name, model))
-    s
+    val present = !s.sevens.is_empty() || !s.lcds.is_empty() || !s.oleds.is_empty() || !s.tfts.is_empty()
+    Displays(present, Mutex.new(s))
 
 private[virt] reset_displays()
-    val s = &machine.devices.displays
-    reset_lcds(s)
-    reset_oleds(s)
-    reset_tfts(s)
-    for i in 0..<s.sevens.len()
-        var binding = s.sevens.at(i)
-        seven.reset(&binding.model)
-        s.sevens.set(i, binding)
+    machine.devices.displays.live.with(s ->
+        reset_lcds(s)
+        reset_oleds(s)
+        reset_tfts(s)
+        for i in 0..<s.sevens.len()
+            var binding = s.sevens.at(i)
+            seven.reset(&binding.model)
+            s.sevens.set(i, binding))
 
 private[virt] observe_displays(levels: u32, driven: u32, time: u64)
-    val s = &machine.devices.displays
-    if s.sevens.is_empty() && s.lcds.is_empty() && s.oleds.is_empty() && s.tfts.is_empty() then return
-    display_lock.lock()
-    defer display_lock.unlock()
-    observe_lcds(s, levels, driven, time)
-    observe_oleds(s, levels, driven)
-    observe_tfts(s, levels, driven)
-    for i in 0..<s.sevens.len()
-        var binding = s.sevens.at(i)
-        seven.observe(&binding.model, levels, driven, time)
-        s.sevens.set(i, binding)
+    val d = &machine.devices.displays
+    if !d.present then return
+    d.live.with(s ->
+        observe_lcds(s, levels, driven, time)
+        observe_oleds(s, levels, driven)
+        observe_tfts(s, levels, driven)
+        for i in 0..<s.sevens.len()
+            var binding = s.sevens.at(i)
+            seven.observe(&binding.model, levels, driven, time)
+            s.sevens.set(i, binding))
 
 /** The renderer reads only physical segment patterns derived from guest GPIO writes. */
 display_segments(name: string) -> [8]u8
-    var result: [8]u8 = [0; 8]
-    display_lock.lock()
-    defer display_lock.unlock()
     val now = observation_time()
-    for binding in machine.devices.displays.sevens
-        if binding.name != name then continue
-        for i in 0..<binding.model.digits do result[i] = seven.read(binding.model, i, now)
-    result
+    machine.devices.displays.live.with(s ->
+        var result: [8]u8 = [0; 8]
+        for binding in s.sevens
+            if binding.name != name then continue
+            for i in 0..<binding.model.digits do result[i] = seven.read(binding.model, i, now)
+        result)
 
 /** Duty-cycle brightness for GPIO LED components; indices are row * 8 + column. */
 display_brightness(name: string) -> [64]u8
-    display_lock.lock()
-    defer display_lock.unlock()
     val now = observation_time()
-    for binding in machine.devices.displays.sevens
-        if binding.name == name then return seven.brightness(binding.model, now)
-    [0; 64]
+    machine.devices.displays.live.with(s ->
+        var result: [64]u8 = [0; 64]
+        for binding in s.sevens
+            if binding.name == name
+                result = seven.brightness(binding.model, now)
+                break
+        result)

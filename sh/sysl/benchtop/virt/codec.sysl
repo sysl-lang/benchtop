@@ -5,7 +5,7 @@ import sh.sysl.benchtop.parts.wm8994 as wm
 import sh.sysl.benchtop.peripheral.i2c as i2c
 import sysl.buf.{Buf,buf}
 import sysl.sync.*
-import sysl.threads.SleepLock
+import sysl.threads.Mutex
 import sysl.math.{min,max}
 
 /** The WM8994 codec (`wm8994`) on the I2C bus and the SAI: its model, its name on the board, the SAI
@@ -27,22 +27,31 @@ struct CodecState
     hp_gains: [2]u32
     gains: [2]u32
     bits: u32
+    // The microphone frame the SAI is recording, published for its slots to read without a lock.
+    input_frame: int
+    input: Mutex[CodecInput]
+    mix: Mutex[CodecMix]
+
+/** What the host has given the microphone and not yet sent: a ring of `count` words from `head`,
+ * and whether enough has arrived to start sending.
+ */
+struct CodecInput
+    words: [4096]int
+    head: usize
+    count: usize
+    primed: bool
+
+/** The frame the host is taking from what the codec played: each output's sum so far, the frame's
+ * number, and whether its first slot has been seen.
+ */
+struct CodecMix
+    sums: [2]real
+    frame: u64
+    started: bool
 
 /** No codec on the board. */
-codec_state() -> CodecState = CodecState(wm.codec(), "", 0, false, false, false, false, [12,12], [0,0], [0,0], [0,0], 16)
-
-// What the host has given the microphone and not yet sent, and the frame the SAI is recording.
-private var codec_input_lock = SleepLock.new()
-private var codec_input: [4096]int
-private var codec_input_head: usize = 0
-private var codec_input_count: usize = 0
-private var codec_input_primed = false
-private var codec_input_frame: int = 0
-// The frame the host is taking from what the codec played.
-private var codec_mix: [2]real = [0.0,0.0]
-private var codec_mix_lock = SleepLock.new()
-private var codec_frame: u64 = 0
-private var codec_frame_started = false
+codec_state() -> CodecState = CodecState(wm.codec(), "", 0, false, false, false, false, [12,12], [0,0], [0,0], [0,0], 16,
+    0, Mutex.new(CodecInput([0;4096], 0, 0, false)), Mutex.new(CodecMix([0.0,0.0], 0, false)))
 
 // Whether `p` is a speaker the codec `c` drives.
 codec_speaker(c: *CodecState, p: Part) -> bool
@@ -127,10 +136,9 @@ private publish_codec()
 private[virt] boot_codecs()
     wm.reset(machine.devices.codec.model)
     publish_codec()
-    codec_mix_lock.lock()
-    codec_mix = [0.0,0.0]
-    codec_frame_started = false
-    codec_mix_lock.unlock()
+    machine.devices.codec.mix.with(m ->
+        m.sums = [0.0,0.0]
+        m.started = false)
     clear_codec_input()
 
 // Called under the SAI queue lock: integer snapshots only, no codec/I2C lock.
@@ -146,25 +154,27 @@ private[virt] codec_slot_gain(block: usize, slot: u32, slots: u32, bits: u32) ->
 
 private[virt] take_codec_sound(channels: u32 = 1) -> Buf[f32]
     require channels == 1 || channels == 2, "mono or stereo output"
-    codec_mix_lock.lock()
-    defer codec_mix_lock.unlock()
     var result: Buf[f32] = buf()
-    val packets = sai_take_packets(machine.devices.codec.block)
-    for p in packets
-        if p.slot == 0
-            codec_mix = [0.0,0.0]
-            codec_frame = p.frame
-            codec_frame_started = true
-        if !codec_frame_started || p.frame != codec_frame then continue
-        if p.bits > 0 && p.bits <= 32 && p.slot < 4
-            val signed = long(int(p.word << (32 - p.bits))) >> (32 - p.bits)
-            codec_mix[usize(p.slot / 2)] += real(signed) / real(1u64 << (p.bits - 1)) * real(p.gain) / 65536.0
-        if p.slot + 1 == p.slots
-            codec_frame_started = false
-            if channels == 1
-                result.push(f32(max(-1.0,min(1.0,(codec_mix[0] + codec_mix[1]) * 0.5))))
-            else
-                for value in codec_mix do result.push(f32(max(-1.0,min(1.0,value))))
+    val into = &result
+    val s = &machine.devices.codec
+    val block = s.block
+    s.mix.with(m ->
+        val packets = sai_take_packets(block)
+        for p in packets
+            if p.slot == 0
+                m.sums = [0.0,0.0]
+                m.frame = p.frame
+                m.started = true
+            if !m.started || p.frame != m.frame then continue
+            if p.bits > 0 && p.bits <= 32 && p.slot < 4
+                val signed = long(int(p.word << (32 - p.bits))) >> (32 - p.bits)
+                m.sums[usize(p.slot / 2)] += real(signed) / real(1u64 << (p.bits - 1)) * real(p.gain) / 65536.0
+            if p.slot + 1 == p.slots
+                m.started = false
+                if channels == 1
+                    into.push(f32(max(-1.0,min(1.0,(m.sums[0] + m.sums[1]) * 0.5))))
+                else
+                    for value in m.sums do into.push(f32(max(-1.0,min(1.0,value)))))
     result
 
 // Host conversion never runs on a guest CPU worker. The bounded queue holds
@@ -175,40 +185,38 @@ private[virt] feed_codec_microphone(samples: []const f32)
     for sample in samples
         val clipped = if sample != sample then 0.0f32 else max(-1.0f32,min(1.0f32,sample))
         words.push(int(min(2147483647.0,real(clipped) * 2147483648.0)))
-    codec_input_lock.lock()
-    defer codec_input_lock.unlock()
-    for word in words
-        if codec_input_count == 4096
-            codec_input_head = (codec_input_head + 1) % 4096
-            codec_input_count -= 1
-        codec_input[(codec_input_head + codec_input_count) % 4096] = word
-        codec_input_count += 1
+    machine.devices.codec.input.with(q ->
+        for word in words
+            if q.count == 4096
+                q.head = (q.head + 1) % 4096
+                q.count -= 1
+            q.words[(q.head + q.count) % 4096] = word
+            q.count += 1)
 
 private[virt] clear_codec_input()
-    codec_input_lock.lock()
-    defer codec_input_lock.unlock()
-    codec_input_head = 0
-    codec_input_count = 0
-    codec_input_primed = false
-    atomic_store(&codec_input_frame,0,Release)
+    val s = &machine.devices.codec
+    s.input.with(q ->
+        q.head = 0
+        q.count = 0
+        q.primed = false
+        atomic_store(&machine.devices.codec.input_frame,0,Release))
 
 private[virt] codec_input_word(block: usize, slot: u32, slots: u32, bits: u32) -> Option[u32]
     val s = &machine.devices.codec
     if !s.mic || block != 1 - s.block then return None
     if slots != 4 || bits != atomic_load(&s.bits,Acquire) then return Some(0)
     if slot == 0
-        codec_input_lock.lock()
-        // A short host prebuffer absorbs capture/UI scheduling jitter.
-        if !codec_input_primed && codec_input_count >= 1024 then codec_input_primed = true
-        atomic_store(&codec_input_frame,0,Release)
-        if codec_input_primed && codec_input_count > 0
-            atomic_store(&codec_input_frame,codec_input[codec_input_head],Release)
-            codec_input_head = (codec_input_head + 1) % 4096
-            codec_input_count -= 1
-        else codec_input_primed = false
-        codec_input_lock.unlock()
+        s.input.with(q ->
+            // A short host prebuffer absorbs capture/UI scheduling jitter.
+            if !q.primed && q.count >= 1024 then q.primed = true
+            atomic_store(&machine.devices.codec.input_frame,0,Release)
+            if q.primed && q.count > 0
+                atomic_store(&machine.devices.codec.input_frame,q.words[q.head],Release)
+                q.head = (q.head + 1) % 4096
+                q.count -= 1
+            else q.primed = false)
     if slot != 0 && slot != 2 then return Some(0)
     val gain = atomic_load(&s.capture_gains[usize(slot / 2)],Acquire)
-    val sample = ((long(atomic_load(&codec_input_frame,Acquire)) * long(gain)) >> 16) >> (32 - bits)
+    val sample = ((long(atomic_load(&s.input_frame,Acquire)) * long(gain)) >> 16) >> (32 - bits)
     val limit = 1i64 << (bits - 1)
     Some(u32(max(-limit,min(limit - 1,sample))))

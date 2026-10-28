@@ -2,7 +2,7 @@ module sh.sysl.benchtop.virt
 
 import sh.sysl.benchtop.peripheral.dsi as dsi
 import sysl.threads.{Thread,Mutex,Condvar,channel,spawn,current}
-import sysl.sync.*
+import sysl.buf.{Buf,buf}
 
 // Fixed packet values cross the channel; no views, display references or CPU
 // pointers cross domains. The existing bounded channel supplies the semaphore-
@@ -15,14 +15,17 @@ private struct DsiPacket
     count: usize
     bytes: [1024]u8
 
+/** What the DSI worker has been given and has done, and its thread's id once it runs. */
+private struct DsiProgress
+    outstanding: u64
+    completed: u64
+    thread_id: u64
+
 private var dsi_slots: [64]DsiPacket = [DsiPacket(0,0,0,0,[0;1024]);64]
 private var dsi_queue = channel(dsi_slots[..])
 private var dsi_handle: Option[Thread] = None
-private var dsi_done_gate = Mutex.new(0)
-private var dsi_done = Condvar.new()
-private var dsi_outstanding: u64 = 0
-private var dsi_completed: u64 = 0
-private var dsi_thread_id: u64 = 0
+private var dsi_progress = Mutex.new(DsiProgress(0,0,0))
+private var dsi_changed = Condvar.new()
 private[virt] var dsi_async = false
 
 struct DsiWorkerStatus
@@ -31,25 +34,24 @@ struct DsiWorkerStatus
     outstanding: u64
     completed: u64
 
-dsi_worker_status() -> DsiWorkerStatus = DsiWorkerStatus(atomic_load(&dsi_thread_id,Acquire),
-    if dsi_async then dsi_queue.len() else 0,atomic_load(&dsi_outstanding,Acquire),atomic_load(&dsi_completed,Acquire))
+dsi_worker_status() -> DsiWorkerStatus
+    val queued = if dsi_async then dsi_queue.len() else 0
+    dsi_progress.with(p -> DsiWorkerStatus(p.thread_id,queued,p.outstanding,p.completed))
 
 private[virt] start_dsi_worker() -> Result[unit,string]
     if !machine.devices.dsi.present then return Ok(())
     dsi_queue = channel(dsi_slots[..])
-    atomic_store(&dsi_outstanding,0,Release)
-    atomic_store(&dsi_completed,0,Release)
-    atomic_store(&dsi_thread_id,0,Release)
+    dsi_progress.with(p -> *p = DsiProgress(0,0,0))
     dsi_async = true
-    machine.devices.dsi.host.defer_reads = true
+    machine.devices.dsi.host.with(h -> (*h).defer_reads = true)
     dsi_handle = spawn(&dsi_device_body,&dsi_queue,1 << 20)
     if dsi_handle.is_none()
         dsi_async = false
-        machine.devices.dsi.host.defer_reads = false
+        machine.devices.dsi.host.with(h -> (*h).defer_reads = false)
         return Err("cannot create the DSI device worker")
-    dsi_done_gate.lock_raw()
-    while atomic_load(&dsi_thread_id,Acquire) == 0 do dsi_done.wait(&dsi_done_gate)
-    dsi_done_gate.unlock_raw()
+    val p = dsi_progress.lock_raw()
+    while p.thread_id == 0 do dsi_changed.wait(&dsi_progress)
+    dsi_progress.unlock_raw()
     Ok(())
 
 // Only call with CPU producers parked. This is a control/debug barrier, never
@@ -57,17 +59,15 @@ private[virt] start_dsi_worker() -> Result[unit,string]
 private[virt] flush_dsi_worker()
     if !dsi_async then return
     loop
-        dsi_done_gate.lock_raw()
-        while atomic_load(&dsi_outstanding,Acquire) != 0 do dsi_done.wait(&dsi_done_gate)
-        dsi_done_gate.unlock_raw()
+        val p = dsi_progress.lock_raw()
+        while p.outstanding != 0 do dsi_changed.wait(&dsi_progress)
+        dsi_progress.unlock_raw()
         // A previously full queue may have held a due hardware command busy.
         // Catch it up to the parked board clock before declaring the barrier.
-        dsi_reg_lock.lock()
-        advance_dsi(scheduler.now)
-        publish_dsi_deadline()
-        val drained = atomic_load(&dsi_outstanding,Acquire) == 0
-        dsi_reg_lock.unlock()
-        if drained then return
+        machine.devices.dsi.host.with(h ->
+            advance_dsi(h,scheduler.now)
+            publish_dsi_deadline(h))
+        if dsi_progress.with(p -> p.outstanding == 0) then return
 
 private[virt] stop_dsi_worker()
     if !dsi_async then return
@@ -76,43 +76,38 @@ private[virt] stop_dsi_worker()
     dsi_handle.unwrap().join()
     dsi_handle = None
     dsi_async = false
-    machine.devices.dsi.host.defer_reads = false
-    atomic_store(&dsi_thread_id,0,Release)
+    machine.devices.dsi.host.with(h -> (*h).defer_reads = false)
+    dsi_progress.with(p -> p.thread_id = 0)
 
 private[virt] dsi_queue_has_room() -> bool = !dsi_async || dsi_queue.len() < DSI_QUEUE_CAPACITY
 
-// Register lock held: there is only one producer at a time, and advance_dsi
+// Under the host's lock: there is only one producer at a time, and advance_dsi
 // already checked capacity. A full host queue leaves the command FIFO busy.
 private[virt] enqueue_dsi_packet(vc: u32, kind: u32, bytes: []const u8, request: u64)
     var packet = DsiPacket(vc,kind,request,bytes.len,[0;1024])
     for i in 0..<bytes.len do packet.bytes[i] = bytes[i]
-    atomic_add(&dsi_outstanding,1,AcqRel)
-    assert(dsi_queue.try_send(packet),"DSI queue capacity checked under register lock")
+    dsi_progress.with(p -> p.outstanding += 1)
+    assert(dsi_queue.try_send(packet),"DSI queue capacity checked under the host's lock")
 
 private dsi_device_body(queue: *sysl.threads.Channel[DsiPacket])
-    dsi_done_gate.lock_raw()
-    atomic_store(&dsi_thread_id,current().id,Release)
-    dsi_done.notify_all()
-    dsi_done_gate.unlock_raw()
+    dsi_progress.with(p ->
+        p.thread_id = current().id
+        dsi_changed.notify_all())
     loop
         val packet = queue.receive() match
             Some(p) -> p
             None -> break
         // Freeing a queue slot lets a due hardware command complete. Never
         // hold the queue lock while processing pixels or waiting for the UI.
-        dsi_reg_lock.lock()
-        publish_dsi_deadline()
-        dsi_reg_lock.unlock()
-        display_lock.lock()
-        val response = apply_dsi_packet(packet.channel,packet.kind,packet.bytes[..<packet.count])
-        display_lock.unlock()
+        machine.devices.dsi.host.with(h -> publish_dsi_deadline(h))
+        var response: Buf[u8] = buf()
+        val into = &response
+        machine.devices.displays.live.with(s -> apply_dsi_packet(s,packet.channel,packet.kind,packet.bytes[..<packet.count],into))
         if packet.kind == 6 || packet.kind == 4 || packet.kind == 0x14 || packet.kind == 0x24
-            dsi_reg_lock.lock()
-            dsi.complete_read(machine.devices.dsi.host,packet.request,response.view())
-            publish_dsi_deadline()
-            dsi_reg_lock.unlock()
-        dsi_done_gate.lock_raw()
-        atomic_add(&dsi_completed,1,AcqRel)
-        atomic_sub(&dsi_outstanding,1,AcqRel)
-        dsi_done.notify_all()
-        dsi_done_gate.unlock_raw()
+            machine.devices.dsi.host.with(h ->
+                dsi.complete_read(*h,packet.request,response.view())
+                publish_dsi_deadline(h))
+        dsi_progress.with(p ->
+            p.completed += 1
+            p.outstanding -= 1
+            dsi_changed.notify_all())

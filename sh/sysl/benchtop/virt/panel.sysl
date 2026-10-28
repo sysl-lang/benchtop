@@ -5,11 +5,11 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.{Board, Part, pin_parts, part_model}
 import sh.sysl.benchtop.v6m.{Cpu, Stop, halt, raise, clock}
 import sysl.sync.*
-import sysl.threads.SleepLock
 
 /** The panel GPIO (`panel-gpio`): its output latch, output enables, the levels the host drives on
  * its inputs, the edges latched since the guest cleared them, the edges that interrupt, and the IRQ
- * it raises (-1 for none). The registers are read and written atomically, by the guest and the host.
+ * it raises (-1 for none). The registers are read and written atomically, by the guest and the host;
+ * a guest's write is made under the SPI controller's lock, which keeps it in order with serial edges.
  */
 struct PanelState
     out: u32
@@ -19,8 +19,6 @@ struct PanelState
     mask: u32
     irq: int
     present: bool
-
-var panel_lock = SleepLock.new()
 
 /** No panel GPIO on the bus. */
 panel_state() -> PanelState = PanelState(0, 0, 0xFFFFFFFF, 0, 0, -1, false)
@@ -77,12 +75,9 @@ private[virt] panel_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u6
     val s = &machine.devices.panel
     offset match
         0 -> atomic_load(&s.out, Relaxed)
-        4 ->
-            panel_lock.lock()
-            bring_spi(board_time(cpu,n))
-            val levels = panel_levels_at(board_time(cpu,n))
-            panel_lock.unlock()
-            levels
+        4 -> machine.devices.spi.serial.with(c ->
+            bring_spi(c,board_time(cpu,n))
+            panel_levels_at(board_time(cpu,n)))
         8 -> atomic_load(&s.oe, Relaxed)
         12 -> atomic_load(&s.edges, Relaxed)
         16 -> atomic_load(&s.mask, Relaxed)
@@ -95,23 +90,23 @@ private[virt] panel_write(cpu: *Cpu, address: u32, offset: u32, width: u32, valu
     if width != 4 || (offset & 3) != 0
         halt(cpu, Stop.Fault, address)
         return
-    panel_lock.lock()
-    defer panel_lock.unlock()
-    val s = &machine.devices.panel
-    bring_spi(board_time(cpu,n))
-    val old_levels = atomic_load(&s.out, Relaxed)
-    val old_driven = atomic_load(&s.oe, Relaxed)
-    val new_levels = if offset == 0 then value else old_levels
-    val new_driven = if offset == 8 then value else old_driven
-    sound_gpio(new_levels, new_driven, (old_levels ^ new_levels) | (old_driven ^ new_driven), board_time(cpu, n))
-    offset match
-        0 -> atomic_store(&s.out, value, Relaxed)
-        8 -> atomic_store(&s.oe, value, Relaxed)
-        12 -> atomic_and(&s.edges, ~value, Relaxed)
-        16 -> atomic_store(&s.mask, value, Relaxed)
-        4 | 20 -> () // Read-only registers.
-        _ -> halt(cpu, Stop.Unmapped, address)
-    observe_displays(panel_levels_at(board_time(cpu,n)), panel_drive_mask_at(board_time(cpu,n)), board_time(cpu,n))
+    // The SPI controller's lock orders this write with the serial edges around it.
+    machine.devices.spi.serial.with(c ->
+        val s = &machine.devices.panel
+        bring_spi(c,board_time(cpu,n))
+        val old_levels = atomic_load(&s.out, Relaxed)
+        val old_driven = atomic_load(&s.oe, Relaxed)
+        val new_levels = if offset == 0 then value else old_levels
+        val new_driven = if offset == 8 then value else old_driven
+        sound_gpio(new_levels, new_driven, (old_levels ^ new_levels) | (old_driven ^ new_driven), board_time(cpu, n))
+        offset match
+            0 -> atomic_store(&s.out, value, Relaxed)
+            8 -> atomic_store(&s.oe, value, Relaxed)
+            12 -> atomic_and(&s.edges, ~value, Relaxed)
+            16 -> atomic_store(&s.mask, value, Relaxed)
+            4 | 20 -> () // Read-only registers.
+            _ -> halt(cpu, Stop.Unmapped, address)
+        observe_displays(panel_levels_at(board_time(cpu,n)), panel_drive_mask_at(board_time(cpu,n)), board_time(cpu,n)))
 
 /** A panel part's directly wired GP pin, or -1 for an unsupported connection. */
 part_pin(p: Part, chip: string = "") -> int =

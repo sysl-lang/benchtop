@@ -4,22 +4,22 @@ import sh.sysl.benchtop.{mcu_clock_hz, Board, part_model, part_whole, param_name
 import sh.sysl.benchtop.peripheral.i2s as i2s
 import sh.sysl.benchtop.v6m.{Cpu, Stop, halt}
 import sysl.buf.{Buf, buf}
-import sysl.threads.SleepLock
+import sysl.threads.Mutex
 
 /** The I2S controller (`virt-i2s`) and the amplifier, speaker and microphone on it: whether the bus
- * has it, whether a speaker plays what it sends and at what gain, and whether a microphone feeds it.
+ * has it, its clock, whether a speaker plays what it sends and at what gain, and whether a microphone
+ * feeds it, which the board fixes; and the controller, which the cores and the host's audio share.
  */
 struct I2sState
-    controller: i2s.Controller
     present: bool
+    hz: u64
     speaker: bool
     mic: bool
     gain: f32
-
-var digital_lock = SleepLock.new()
+    controller: Mutex[i2s.Controller]
 
 /** No I2S controller on the bus. */
-i2s_state() -> I2sState = I2sState(i2s.controller(), false, false, false, 0.12)
+i2s_state() -> I2sState = I2sState(false, 0, false, false, 0.12, Mutex.new(i2s.controller()))
 
 // The I2S path `b` makes, beside the buzzers `pwm` drives and the codec `codec` makes.
 private[virt] check_i2s(b: Board, pwm: *PwmState, codec: *CodecState) -> Result[I2sState, string]
@@ -35,8 +35,10 @@ private[virt] check_i2s(b: Board, pwm: *PwmState, codec: *CodecState) -> Result[
                 Whole(n) -> hz = u64(n)
                 _ -> ()
             None -> ()
-    if s.present && !pwm.buzzers.is_empty() && hz != pwm.channel.hz then return Err("PWM and I2S audio must share the same guest clock")
-    s.controller = i2s.controller(hz)
+    if s.present && pwm.buzzer_count != 0 && hz != pwm.hz then return Err("PWM and I2S audio must share the same guest clock")
+    val controller = i2s.controller(hz)
+    s.hz = controller.hz
+    s.controller = Mutex.new(controller)
     var amplifier = ""
     for p in b.parts
         if part_model(p) != "i2s-amplifier" && part_model(p) != "i2s-microphone" then continue
@@ -65,18 +67,15 @@ private[virt] check_i2s(b: Board, pwm: *PwmState, codec: *CodecState) -> Result[
         if !s.speaker then return Err("speaker input must connect to the I2S amplifier's out terminal")
     Ok(s)
 
-private[virt] boot_digital_audio()
-    i2s.reset(&machine.devices.i2s.controller)
+private[virt] boot_digital_audio() = machine.devices.i2s.controller.with(c -> i2s.reset(c))
 
 private[virt] digital_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || (offset & 3) != 0
         halt(cpu, Stop.Fault, address)
         return 0
-    digital_lock.lock()
-    defer digital_lock.unlock()
-    val s = &machine.devices.i2s
-    i2s.advance(&s.controller, board_time(cpu, n))
-    i2s.read(&s.controller, offset) match
+    machine.devices.i2s.controller.with(c ->
+        i2s.advance(c, board_time(cpu, n))
+        i2s.read(c, offset)) match
         Some(value) -> value
         None ->
             halt(cpu, Stop.Unmapped, address)
@@ -86,34 +85,27 @@ private[virt] digital_write(cpu: *Cpu, address: u32, offset: u32, width: u32, va
     if width != 4 || (offset & 3) != 0
         halt(cpu, Stop.Fault, address)
         return
-    digital_lock.lock()
-    defer digital_lock.unlock()
-    val s = &machine.devices.i2s
-    i2s.advance(&s.controller, board_time(cpu, n))
-    if !i2s.write(&s.controller, offset, value) then halt(cpu, Stop.Unmapped, address)
+    machine.devices.i2s.controller.with(c ->
+        i2s.advance(c, board_time(cpu, n))
+        if !i2s.write(c, offset, value) then halt(cpu, Stop.Unmapped, address))
 
 microphone_available() -> bool = machine.devices.i2s.mic || machine.devices.codec.mic
 
 feed_microphone(samples: []const f32)
     feed_codec_microphone(samples)
     if !machine.devices.i2s.mic then return
-    digital_lock.lock()
-    defer digital_lock.unlock()
-    i2s.feed(&machine.devices.i2s.controller, samples)
+    machine.devices.i2s.controller.with(c -> i2s.feed(c, samples))
 
 clear_audio_host()
     clear_codec_input()
-    digital_lock.lock()
-    defer digital_lock.unlock()
-    i2s.clear_host(&machine.devices.i2s.controller)
+    machine.devices.i2s.controller.with(c -> i2s.clear_host(c))
 
 private[virt] take_digital_sound(time: u64) -> Buf[f32]
-    digital_lock.lock()
-    defer digital_lock.unlock()
-    val s = &machine.devices.i2s
-    i2s.advance(&s.controller, time)
-    val samples = i2s.take(&s.controller)
-    if !s.speaker then return buf()
+    val d = &machine.devices.i2s
+    val samples = d.controller.with(c ->
+        i2s.advance(c, time)
+        i2s.take(c))
+    if !d.speaker then return buf()
     var out: Buf[f32] = buf()
-    for sample in samples do out.push(sample * s.gain)
+    for sample in samples do out.push(sample * d.gain)
     out

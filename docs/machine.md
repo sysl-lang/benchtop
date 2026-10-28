@@ -92,6 +92,17 @@ enum ProductView
      readies both lockstep modes. `threads` is split into the request (`run_on_threads`) and the
      live state (`threaded`). The desktop's old bounded-batch path (`pump_parallel`) is gone; its
      tests run on the workers. It is still one module-level `scheduler` until the product exists.
+   - Done: a device more than one thread reaches keeps what the board fixes (whether the bus has
+     it, its IRQs, its clock) and the atomics it publishes for lock-free readers beside a `Mutex`
+     that owns everything else: `adc.live`, `rp.live` (taken on every access, whichever thread),
+     `rcc.gcr`, `pwm.live`, `i2s.controller`, `i2c.live` (with the touch controllers), `displays.live`,
+     `spi.serial` (which the panel GPIO's writes take too, to stay in order with serial edges),
+     `dsi.host`, `audio.live` (with the SAI's host queues) and the codec's `input` and `mix`. The DSI
+     worker's progress is a `Mutex[DsiProgress]`. `apply_devices` parks every thread that reaches
+     a device and then replaces the whole set, locks included.
+   - Left for slice 4: the storage path (`StorageState`, the SDMMC host and card, the SD image and
+     the image writer's queue, `disk_failed` and `disk_pending`) is still under the module-level
+     `storage_lock`; the console's state is under `console_lock`.
 4. **Delete the remaining globals.** A `Peripheral` trait (`read`, `write`, `advance`, `due`,
    `reset`) replaces the closed `enum Device` and its dispatch sites, over the device structs.
    `first`, `second`, the SIO FIFOs, the console and `virt.machine` itself go. Every entry point

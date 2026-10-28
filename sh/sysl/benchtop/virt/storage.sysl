@@ -6,8 +6,9 @@ import sh.sysl.benchtop.peripheral.stm32_gpio as gpio
 import sh.sysl.benchtop.peripheral.spi as edge
 import sh.sysl.benchtop.parts.sd_card as sd
 import sh.sysl.benchtop.v6m.{Cpu,Stop,halt}
-import sysl.buf.{Buf,buf}
+import sysl.buf.{Buf,buf,Frozen}
 import sysl.math.max
+import sysl.raw.str_cast
 import sysl.threads.{SleepLock,Thread,Channel,channel,spawn}
 import sysl.sync.*
 import sysl.fs
@@ -54,13 +55,27 @@ private struct SectorWrite
     sector: u32
     bytes: [512]u8
 private var disk_slots: [64]SectorWrite = [SectorWrite(0,[0;512]);64]
-private var disk_queue = channel(disk_slots[..])
 private var disk_thread: Option[Thread] = None
 
-private disk_body(queue: *Channel[SectorWrite])
-    var file = fs.open_update(machine.devices.storage.path)
+/** What the image writer's thread is given: its queue, and the image file's name, frozen. The
+ * board's description holds the name as a string, whose count is not atomic and which the thread
+ * that read the description lets go, so the writer is handed its own read-only copy instead.
+ */
+private struct DiskWriter
+    queue: Channel[SectorWrite]
+    path: &sync Frozen[u8]
+
+private frozen_text(text: string) -> &sync Frozen[u8]
+    var bytes: Buf[u8] = buf()
+    for b in text.bytes do bytes.push(b)
+    bytes.freeze()
+
+private var disk_writer = DiskWriter(channel(disk_slots[..]), frozen_text(""))
+
+private disk_body(writer: *DiskWriter)
+    var file = fs.open_update(str_cast(writer.path.view()))
     loop
-        val job = queue.receive() match
+        val job = writer.queue.receive() match
             Some(job) -> job
             None -> break
         file match
@@ -83,7 +98,7 @@ private disk_body(queue: *Channel[SectorWrite])
 // Let the last board's image writer finish what it was given, and end it.
 private[virt] stop_disk()
     if disk_thread.is_some()
-        disk_queue.close()
+        disk_writer.queue.close()
         disk_thread.unwrap().join()
         disk_thread = None
 
@@ -93,8 +108,8 @@ private[virt] start_disk()
     atomic_store(&disk_failed,0,Release)
     atomic_store(&disk_pending,0,Release)
     if machine.devices.storage.path.is_empty() then return
-    disk_queue = channel(disk_slots[..])
-    disk_thread = spawn(&disk_body,&disk_queue,1 << 20)
+    disk_writer = DiskWriter(channel(disk_slots[..]), frozen_text(machine.devices.storage.path))
+    disk_thread = spawn(&disk_body,&disk_writer,1 << 20)
     if disk_thread.is_none() then atomic_store(&disk_failed,1,Release)
 
 private sector_read(sector: u32, out: []u8) -> bool
@@ -111,7 +126,7 @@ private sector_write(sector: u32, bytes: []const u8) -> bool
         var job = SectorWrite(sector,[0;512])
         for i in 0usize..<512 do job.bytes[i] = bytes[i]
         atomic_add(&disk_pending,1,AcqRel)
-        if !disk_queue.try_send(job)
+        if !disk_writer.queue.try_send(job)
             atomic_sub(&disk_pending,1,AcqRel)
             return false
     for i in 0usize..<512 do s.bytes.view()[at + i] = bytes[i]
