@@ -7,19 +7,29 @@ import sh.sysl.benchtop.v6m.{Cpu,Stop,NEVER,halt,lower_limit}
 import sysl.buf.{Buf,buf}
 import sysl.sync.*
 import sysl.threads.Mutex
+import sysl.math.max
 
-/** The DSI host (`stm32-dsi`): whether the bus has it, the clock of its next event, published for the
- * cores to read without the lock, and the packet engine, which both cores and the DSI worker reach.
+/** The DSI host (`stm32-dsi`): whether the bus has it, and the packet engine, which both cores and the
+ * DSI worker reach, under `host`. Beside it, published under the lock after every change for the cores
+ * to read without it: the clock of its next event (`next`); the status register (`status`, GPSR) and
+ * the clock below which reading it changes nothing but the host's clock (`quiet`); and the latest
+ * clock such a lock-free read was made at (`seen`), which the next locked access brings the host's
+ * clock up to first, exactly as the read itself would have.
  */
 struct DsiState
     present: bool
     next: u64
+    status: u32
+    quiet: u64
+    seen: u64
     host: Mutex[&dsi.Host]
+
+private const GPSR: u32 = 0x74
 
 private val dsi_sink: dsi.Endpoint = (vc,kind,bytes,request) -> dsi_endpoint(vc,kind,bytes,request)
 
 /** No DSI host on the bus. */
-dsi_state() -> DsiState = DsiState(false, NEVER, Mutex.new(dsi.host(480000000)))
+dsi_state() -> DsiState = DsiState(false, NEVER, 0, 0, 0, Mutex.new(dsi.host(480000000)))
 
 // The DSI host `b` makes on a chip whose clock is `clock_hz`, and a check of the panels on it.
 private[virt] check_dsi(b: Board, clock_hz: u64) -> Result[DsiState,string]
@@ -41,14 +51,15 @@ private[virt] check_dsi(b: Board, clock_hz: u64) -> Result[DsiState,string]
         val vc = u32(part_whole(p,"channel",0))
         if channels & (1u32 << vc) != 0 then return Err("two DSI displays share a virtual channel")
         channels |= 1u32 << vc
-    Ok(DsiState(present, NEVER, Mutex.new(dsi.host(if present then clock_hz else 480000000,reference))))
+    Ok(DsiState(present, NEVER, 0, 0, 0, Mutex.new(dsi.host(if present then clock_hz else 480000000,reference))))
 
 private[virt] boot_dsi()
     val s = &machine.devices.dsi
     s.host.with(h ->
         *h = dsi.host((*h).hz,(*h).reference_hz)
-        (*h).defer_reads = dsi_async())
-    atomic_store(&s.next,NEVER,Release)
+        (*h).defer_reads = dsi_async()
+        atomic_store(&s.seen,0,Release)
+        publish_dsi_deadline(h))
 
 // CPU-side completion enqueues only; display interpretation runs on its worker.
 private dsi_endpoint(vc: u32, kind: u32, payload: []const u8, request: u64) -> Buf[u8]
@@ -95,23 +106,55 @@ private[virt] dsi_due() -> u64
 
 // Under the host's lock. Publish after every state change, including MMIO-driven completion and
 // reset/cancellation of a queued packet.
+//
+// The status register and the clock it holds still to are published with the deadline. Before that
+// clock, `advance` would only move the host's clock: the link is idle, or waiting on the DSI worker
+// for a read's answer, or carrying a packet that is not yet due. A full queue holds a due packet back
+// and moves no clock, so then every read takes the lock.
 private[virt] publish_dsi_deadline(h: *&dsi.Host)
+    val s = &machine.devices.dsi
     val blocked = dsi_async() && !dsi_queue_has_room()
-    atomic_store(&machine.devices.dsi.next,if (*h).busy && !blocked then (*h).due else NEVER,Release)
+    val host = *h
+    atomic_store(&s.next,if host.busy && !blocked then host.due else NEVER,Release)
+    atomic_store(&s.status,dsi.read(host,GPSR).unwrap(),Release)
+    val quiet = if !host.busy || host.response_pending then NEVER elif blocked then 0 else host.due
+    atomic_store(&s.quiet,quiet,Release)
 
-// Under the host's lock.
+// Under the host's lock. The host's clock first catches up with the lock-free status reads.
 private[virt] advance_dsi(h: *&dsi.Host, time: u64)
     if dsi_async() && (*h).busy && !(*h).response_pending &&!dsi_queue_has_room() then return
-    dsi.advance(*h,time,dsi_sink)
+    dsi.advance(*h,max(time,atomic_load(&machine.devices.dsi.seen,Acquire)),dsi_sink)
+
+// A status read at `time` that changes nothing but the host's clock: answer the published status, and
+// leave the clock for the next locked access to bring the host up to. None where the read must lock.
+private quiet_status(time: u64) -> Option[u32]
+    val s = &machine.devices.dsi
+    if time >= atomic_load(&s.quiet,Acquire) then return None
+    var seen = atomic_load(&s.seen,Acquire)
+    while seen < time
+        val was = atomic_cas(&s.seen,seen,time,AcqRel)
+        if was == seen then break
+        seen = was
+    // A locked access between the two loads may have changed the status and the quiet clock.
+    val status = atomic_load(&s.status,Acquire)
+    if time >= atomic_load(&s.quiet,Acquire) then return None
+    Some(status)
 
 private[virt] dsi_read(c: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || offset & 3 != 0
         halt(c,Stop.Fault,address)
         return 0
+    val time = board_time(c,n)
+    // Firmware polls the status register while a packet crosses the link; most polls change nothing.
+    if offset == GPSR
+        quiet_status(time) match
+            Some(status) -> return status
+            None -> ()
     machine.devices.dsi.host.with(h ->
-        advance_dsi(h,board_time(c,n))
+        advance_dsi(h,time)
+        val value = dsi.read(*h,offset)
         publish_dsi_deadline(h)
-        dsi.read(*h,offset)) match
+        value) match
         Some(v) -> v
         None ->
             halt(c,Stop.Unmapped,address)
