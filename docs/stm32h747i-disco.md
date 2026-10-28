@@ -130,7 +130,9 @@ audio firmware will match the execution time of a physical H747.
 `./benchtop realtime examples/touch/mic-disco.elf` runs the microphone variant on both cores'
 workers with no window, the DSI display and the audio in both directions running, and reports each
 core's speed against real time; [bench](../bench/README.md#real-time-on-the-stm32h747i-disco) has the
-numbers and what they show.
+numbers and what they show. `examples/touch/busy-disco.elf` is the same check with an M7 that never
+sleeps (memory, double precision, branches and peripheral polls between its audio interrupts), and
+`--set busy_kernel=N` runs one of those alone.
 
 ## Primary references
 
