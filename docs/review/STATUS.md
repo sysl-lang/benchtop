@@ -73,24 +73,24 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | peripherals#21 | 8-bit register pointers wrap through `+= 1` | open |
 | peripherals#22 | tests assert implementation with magic numbers | open |
 | ui-firmware#1 | example sources are not compiled by the gate | fixed in `80b8a2f` (every example firmware source is built in the suite) |
-| ui-firmware#2 | the UI owns emulator control and the board's input model | open |
+| ui-firmware#2 | the UI owns emulator control and the board's input model | fixed in `6e166e1`: `virt.Session` (`virt/session.sysl`) owns restart, advance, pause, workers and stop-to-status, and the parts' controls → pins/voltages (`set_part_input`); instruments read `virt.ram_peek`; `ui/` imports no core module |
 | ui-firmware#3 | duplicate, unreachable `"buzzer"` arm in `draw_part` | fixed in `61cac6f` |
-| ui-firmware#4 | `draw_part` string switch, geometry duplicated in hit-testing | open |
-| ui-firmware#5 | stringly typed session state; notices owned by prefixes | open |
-| ui-firmware#6 | pot state stored twice and synced every frame | open |
-| ui-firmware#7 | `rasterize` clones the desktop by hand-copying fields | open |
-| ui-firmware#8 | a 20-argument positional constructor | open |
+| ui-firmware#4 | `draw_part` string switch, geometry duplicated in hit-testing | fixed in `6e166e1`: `PartLook` (one model-name match in `look_of`) drives drawing, hit-testing and touch; `stick_point`/`stick_position`, `element_label`, `dial_angle` and `virt.POSITION_MAX/CENTRE` are shared; the palette is named in `scene.sysl` |
+| ui-firmware#5 | stringly typed session state; notices owned by prefixes | fixed in `6e166e1`: `virt.RunStatus`, `Notice(NoticeKind, text)`, `Held(key, part)`, `Capture { Free, Joystick, Glass }`; pots and switches are `virt.PartInput`s per part |
+| ui-firmware#6 | pot state stored twice and synced every frame | fixed in `6e166e1`: `State.pots`/`switches` are gone; the knob's signal is the desktop's one copy, the session the model's; drags no longer write state from `paint`; `edit`/`say`/`select_part` do read-modify-set in one call. Pointer handling stays in `BoardView.paint` (`take_pointer`), because syslUI answers pointer queries while a view paints |
+| ui-firmware#7 | `rasterize` clones the desktop by hand-copying fields | fixed in `6e166e1`: `Workbench(d, interactive)` renders the live desktop; a non-interactive paint takes no input and scrolls a copy |
+| ui-firmware#8 | a 20-argument positional constructor | fixed in `6e166e1`: `Desktop`, `State`, `AudioPlayer` built with named arguments; `launch(which, file, LaunchOptions)` via `launch_options(...)` |
 | ui-firmware#9 | hand-written SDL externs where the SDL binding owns the job | open (`SDL_GetCurrentAudioDriver` is still declared in `ui/audio.sysl`) |
 | ui-firmware#10 | instrument sources hard-code register maps | open |
 | ui-firmware#11 | example firmware is not readable | open |
 | ui-firmware#12 | startup and vector-table boilerplate copied into every example | open |
 | ui-firmware#13 | redundant casts and suffixes in the examples and the UI | open |
 | ui-firmware#14 | firmware state as dozens of prefixed module globals | open |
-| ui-firmware#15 | clock and budget policy duplicated in a ternary chain | open |
+| ui-firmware#15 | clock and budget policy duplicated in a ternary chain | fixed in `6e166e1`: `virt.pacing_source(touch) -> PacingSource` with named `TOUCH_HZ`/`FALLBACK_HZ`/`FALLBACK_BUDGET`; the frame budget is a `match` on it |
 | ui-firmware#16 | hand-rolled helpers the standard library has | open |
-| ui-firmware#17 | dead code and unused imports | open |
-| ui-firmware#18 | the TFT raster cache grows without bound | open |
-| ui-firmware#19 | display renderers repeat the same scaffold | open |
+| ui-firmware#17 | dead code and unused imports | fixed in `6e166e1`: unused `v6m` imports gone, `board_transform(r)` takes no scene and its comment says what it does, the audio trace flags are `AudioPlayer` fields |
+| ui-firmware#18 | the TFT raster cache grows without bound | fixed in `6e166e1`: `raster_for` keeps one raster per display and replaces it in place on a size change |
+| ui-firmware#19 | display renderers repeat the same scaffold | fixed in `6e166e1`: `draw_module` frames every display, module, control and readout; the I2S and RTC arms are one `Module(caption)`. The captions keep their own positions, which differ per display |
 | ui-firmware#20 | validation duplicated with different bounds | open |
 | ui-firmware#21 | HOCON parse errors are discarded | open |
 | ui-firmware#22 | tests in `ui/` that test firmware; hand-computed struct offsets | open |
