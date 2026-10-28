@@ -1,7 +1,10 @@
 module sh.sysl.benchtop.riscv
 
-// Little-endian RV32 interpreter. The caller owns the RAM and chooses its address and entry point;
-// this is not an RP2350 boot model. No decoder cache, so self-modifying code is immediately visible.
+import sysl.raw.ptr_cast
+
+// Little-endian RV32 interpreter. The caller gives a hart a window of RAM, at an address it chooses,
+// and a bus for every other address; a board puts its devices on the bus, and the chip's
+// integration facts in a `Chip`. No decoder cache, so self-modifying code is immediately visible.
 // Unsupported encodings and accesses stop before retirement, with PC and destination preserved.
 // Spec: https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html
 
@@ -14,16 +17,50 @@ enum Stop
     Unmapped
     AccessFault
     Sleep
+    // The guest asked the board to end, with `exit_code`.
+    Exit
+
+/** What an access is for: it selects the PMP permission and the cause of a fault it takes. */
+enum Access
+    Fetch = 0
+    Load
+    Store
+
+/** A hart's way to everything that is not its RAM window: the board's devices. An access nothing
+ * answers calls `halt(cpu, Stop.Unmapped, a)`. `n` is the hart's retired-instruction count.
+ */
+trait Bus
+    read(*self, cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+
+// A bus with nothing on it: every access off the RAM stops the hart.
+struct NoDevices
+end NoDevices
+
+impl Bus for NoDevices
+    read(*self, cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+        halt(cpu, Stop.Unmapped, a)
+        0
+
+    write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64) = halt(cpu, Stop.Unmapped, a)
+
+/** The bus `reset` gives a hart: nothing is on it. */
+var nothing_attached = NoDevices()
 
 struct Cpu
     model: Model
+    chip: Chip
     r: [32]u32
     pc: u32
     retired: u64
     stop: Stop
     stop_at: u32
+    exit_code: u32
+    // What the access that stopped the hart was for; it selects the trap cause.
+    fault_access: Access
     ram: []u8
     base: u32
+    bus: *Bus
     cs: Machine
     peer: *Cpu
     hart: u32
@@ -31,59 +68,123 @@ struct Cpu
     reservation: u32
     event: bool
     sleep_kind: u32
-    pending_sleep: bool
     halt_faults: bool
     halt_breakpoint: bool
-    access: u32
     instruction: u32
 
-reset(cpu: *Cpu, model: Model, ram: []u8, base: u32, entry: u32)
+reset(cpu: *Cpu, model: Model, chip: Chip, ram: []u8, base: u32, entry: u32)
     if cpu.peer != null then unpair(cpu)
     cpu.model = model
+    cpu.chip = chip
     for i in 0..<32 do cpu.r[i] = 0
     cpu.pc = entry
     cpu.retired = 0
     cpu.stop = if implemented(model) then Stop.Budget else Stop.Undefined
     cpu.stop_at = entry
+    cpu.exit_code = 0
+    cpu.fault_access = Access.Fetch
     cpu.ram = ram
     cpu.base = base
+    cpu.bus = &nothing_attached
     reset_machine(cpu)
 
-private[riscv] fail(cpu: *Cpu, why: Stop, at: u32)
+/** Stop the hart at `at` for `why`: what a bus does with an access it cannot answer. */
+halt(cpu: *Cpu, why: Stop, at: u32)
     cpu.stop = why
     cpu.stop_at = at
 
-private[riscv] accessible(cpu: *Cpu, address: u32, width: u32) -> bool
-    if (address & (width - 1)) != 0
-        fail(cpu, Stop.Misaligned, address)
-        return false
-    if address < cpu.base || u64(address - cpu.base) + u64(width) > u64(cpu.ram.len)
-        fail(cpu, Stop.Unmapped, address)
-        return false
-    true
+private[riscv] fail(cpu: *Cpu, why: Stop, at: u32) = halt(cpu, why, at)
 
+private[riscv] fault(cpu: *Cpu, why: Stop, at: u32, access: Access)
+    halt(cpu, why, at)
+    cpu.fault_access = access
+
+/** A guest load of `width` (1, 2 or 4) bytes at `address`, as an instruction makes it. */
 read(cpu: *Cpu, address: u32, width: u32) -> u32
     if width != 1 && width != 2 && width != 4
         fail(cpu, Stop.Unmapped, address)
         return 0
-    if !accessible(cpu, address, width) then return 0
-    if !pmp_allows(cpu, address, width, cpu.access)
-        fail(cpu, Stop.AccessFault, address)
-        return 0
-    var value: u32 = 0
-    for i in 0u32..<width do value |= u32(cpu.ram[address - cpu.base + i]) << (8 * i)
-    value
+    load(cpu, address, width, Access.Load)
 
+/** A guest store of `width` (1, 2 or 4) bytes at `address`, as an instruction makes it. */
 write(cpu: *Cpu, address: u32, width: u32, value: u32)
     if width != 1 && width != 2 && width != 4
         fail(cpu, Stop.Unmapped, address)
         return
-    if !accessible(cpu, address, width) then return
-    if !pmp_allows(cpu, address, width, 2)
-        fail(cpu, Stop.AccessFault, address)
+    store(cpu, address, width, value)
+
+// The RAM window's offset of an access, or -1 where any byte of it is outside the window.
+@inline
+private[riscv] window(cpu: *Cpu, address: u32, width: u32) -> i64
+    val offset = address - cpu.base
+    if u64(offset) + u64(width) > u64(cpu.ram.len) then return -1
+    i64(offset)
+
+@inline
+private ram_load(cpu: *Cpu, offset: usize, width: u32) -> u32
+    val at = usize(&cpu.ram[offset])
+    width match
+        4 ->
+            val p: *u32 = ptr_cast(at)
+            *p
+        2 ->
+            val p: *u16 = ptr_cast(at)
+            u32(*p)
+        _ -> u32(cpu.ram[offset])
+
+@inline
+private ram_store(cpu: *Cpu, offset: usize, width: u32, value: u32)
+    val at = usize(&cpu.ram[offset])
+    width match
+        4 ->
+            val p: *u32 = ptr_cast(at)
+            *p = value
+        2 ->
+            val p: *u16 = ptr_cast(at)
+            *p = u16(value)
+        _ -> cpu.ram[offset] = u8(value)
+
+// An aligned access the PMP allows reaches the RAM window, or else the bus. An access that stops the
+// hart answers 0 and changes nothing.
+private[riscv] load(cpu: *Cpu, address: u32, width: u32, access: Access) -> u32
+    if (address & (width - 1)) != 0
+        fault(cpu, Stop.Misaligned, address, access)
+        return 0
+    if !pmp_allows(cpu, address, width, access)
+        fault(cpu, Stop.AccessFault, address, access)
+        return 0
+    val offset = window(cpu, address, width)
+    if offset >= 0 then return ram_load(cpu, usize(offset), width)
+    cpu.fault_access = access
+    cpu.bus.read(cpu, address, width, cpu.retired)
+
+private[riscv] store(cpu: *Cpu, address: u32, width: u32, value: u32)
+    if (address & (width - 1)) != 0
+        fault(cpu, Stop.Misaligned, address, Access.Store)
+        return
+    if !pmp_allows(cpu, address, width, Access.Store)
+        fault(cpu, Stop.AccessFault, address, Access.Store)
         return
     invalidate(cpu, address, width)
-    for i in 0u32..<width do cpu.ram[address - cpu.base + i] = u8(value >> (8 * i))
+    val offset = window(cpu, address, width)
+    if offset >= 0
+        ram_store(cpu, usize(offset), width, value)
+        return
+    cpu.fault_access = Access.Store
+    cpu.bus.write(cpu, address, width, value, cpu.retired)
+
+/** Another master's store (a DMA, a debugger) into the RAM window; false where it is not all there. */
+external_write(cpu: *Cpu, address: u32, width: u32, value: u32) -> bool
+    if width != 1 && width != 2 && width != 4 then return false
+    val offset = window(cpu, address, width)
+    if (address & (width - 1)) != 0 || offset < 0 then return false
+    val own = cpu.reserved && reservation_tag(cpu, address) == cpu.reservation
+    ram_store(cpu, usize(offset), width, value)
+    invalidate(cpu, address, width)
+    if own
+        cpu.reserved = false
+        notify_unblock(cpu)
+    true
 
 private sext(value: u32, bits: u32) -> u32 = u32(i32(value << (32 - bits)) >> (32 - bits))
 
@@ -108,37 +209,78 @@ private multiply(op: u32, a: u32, b: u32) -> u32 = op match
     6 -> if b == 0 then a else u32(i64(i32(a)) % i64(i32(b)))
     _ -> if b == 0 then a else a % b
 
-// Execute a canonical 32-bit instruction. Compressed encodings expand into this same path.
+// The low bits a PC must have clear: halfword alignment with C, word alignment without.
+@inline
+private[riscv] ialign_mask(cpu: *Cpu) -> u32 = if has(cpu.model, EXT_C) then 1 else 3
+
+// The one way an instruction retires: a target off the instruction alignment stops it (nothing is
+// written), else `rd` takes `value` (x0 never does), the PC moves on and the count goes up. Answers
+// whether it retired.
+private[riscv] retire(cpu: *Cpu, next: u32, rd: u32, value: u32) -> bool
+    if (next & ialign_mask(cpu)) != 0
+        fault(cpu, Stop.Misaligned, next, Access.Fetch)
+        return false
+    if rd != 0 then cpu.r[rd] = value
+    cpu.pc = next
+    cpu.retired += 1
+    true
+
+// Retire, then sleep: WFI and h3.block retire before the hart stops.
+private retire_to_sleep(cpu: *Cpu, next: u32, kind: u32)
+    if !retire(cpu, next, 0, 0) then return
+    cpu.sleep_kind = kind
+    cpu.stop = Stop.Sleep
+
+// User mode with mstatus.TW set may not wait: WFI and h3.block are illegal there.
+private waits_trapped(cpu: *Cpu) -> bool = cpu.cs.privilege == PRIV_USER && (cpu.cs.mstatus & MSTATUS_TW) != 0
+
+// h3.block and h3.unblock (Xh3power), slt hints with rd = x0.
+private execute_power(cpu: *Cpu, insn: u32, next: u32)
+    if waits_trapped(cpu)
+        fail(cpu, Stop.Undefined, cpu.pc)
+        return
+    if insn == H3_UNBLOCK
+        send_unblock(cpu)
+        retire(cpu, next, 0, 0)
+    elif cpu.event
+        cpu.event = false
+        retire(cpu, next, 0, 0)
+    elif pending_bits(cpu) & cpu.cs.mie == 0
+        retire_to_sleep(cpu, next, SLEEP_BLOCK)
+    else
+        retire(cpu, next, 0, 0)
+
+// ECALL, EBREAK, MRET and WFI.
+private execute_system(cpu: *Cpu, insn: u32, next: u32)
+    val privileged = has(cpu.model, EXT_PRIV)
+    if insn == EBREAK then fail(cpu, Stop.Breakpoint, cpu.pc)
+    elif insn == ECALL then fail(cpu, Stop.Ecall, cpu.pc)
+    elif insn == MRET && privileged && cpu.cs.privilege == PRIV_MACHINE then retire(cpu, return_from_trap(cpu), 0, 0)
+    elif insn == WFI && privileged && !waits_trapped(cpu)
+        if pending_bits(cpu) & cpu.cs.mie == 0 then retire_to_sleep(cpu, next, SLEEP_WFI) else retire(cpu, next, 0, 0)
+    else fail(cpu, Stop.Undefined, cpu.pc)
+
+// Execute a canonical 32-bit instruction. Compressed encodings expand into this same path. Decoding
+// and validation finish before anything is committed, through `retire`; a load or store that stops
+// the hart is the only side effect before it, and it leaves `rd` and the PC alone.
 private execute(cpu: *Cpu, insn: u32, length: u32)
-    cpu.access = 1
     val rd = (insn >> 7) & 31
     val rs1 = (insn >> 15) & 31
     val rs2 = (insn >> 20) & 31
-    val a = if rs1 == 0 then 0 else cpu.r[rs1]
-    val b = if rs2 == 0 then 0 else cpu.r[rs2]
+    val a = cpu.r[rs1]
+    val b = cpu.r[rs2]
     val op = (insn >> 12) & 7
-    val top = insn >> 25
     val imm = sext(insn >> 20, 12)
-    var next = cpu.pc + length
+    val next = cpu.pc + length
+
+    if (insn == H3_BLOCK || insn == H3_UNBLOCK) && has(cpu.model, EXT_H3POWER)
+        execute_power(cpu, insn, next)
+        return
+
+    var target = next
     var result: u32 = 0
     var put = true
     var valid = true
-
-    if has(cpu.model, EXT_H3POWER) && (insn == 0x00002033 || insn == 0x00102033)
-        if cpu.cs.privilege == 0 && (cpu.cs.mstatus & 0x200000) != 0
-            fail(cpu, Stop.Undefined, cpu.pc)
-            return
-        if insn == 0x00102033 then send_unblock(cpu)
-        elif cpu.event then cpu.event = false
-        elif (pending_bits(cpu) & cpu.cs.mie) == 0
-            cpu.pending_sleep = true
-            cpu.sleep_kind = 2
-        cpu.pc = next
-        cpu.retired += 1
-        if cpu.pending_sleep
-            cpu.pending_sleep = false
-            cpu.stop = Stop.Sleep
-        return
 
     (insn & 127) match
         0x37 -> result = insn & 0xFFFFF000
@@ -146,27 +288,26 @@ private execute(cpu: *Cpu, insn: u32, length: u32)
         0x6F ->
             val offset = sext(((insn >> 31) << 20) | (((insn >> 12) & 255) << 12) | (((insn >> 20) & 1) << 11) | (((insn >> 21) & 1023) << 1), 21)
             result = next
-            next = cpu.pc + offset
+            target = cpu.pc + offset
         0x67 ->
             valid = op == 0
             result = next
-            next = (a + imm) & ~1u32
+            target = (a + imm) & ~1u32
         0x63 ->
             put = false
             valid = op != 2 && op != 3
             val offset = sext(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11) | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)
-            if branch(op, a, b) then next = cpu.pc + offset
+            if valid && branch(op, a, b) then target = cpu.pc + offset
         0x03 ->
             valid = op == 0 || op == 1 || op == 2 || op == 4 || op == 5
             if valid
-                result = read(cpu, a + imm, 1u32 << (op & 3))
+                result = load(cpu, a + imm, 1u32 << (op & 3), Access.Load)
                 if op < 2 then result = sext(result, 8u32 << op)
         0x23 ->
-            cpu.access = 2
             put = false
             valid = op <= 2
             val offset = sext(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
-            if valid then write(cpu, a + offset, 1u32 << op, b)
+            if valid then store(cpu, a + offset, 1u32 << op, b)
         0x0B ->
             valid = has(cpu.model, EXT_H3BEXTM) && (insn & 0xE2000000) == 0 && (op == 0 || op == 4)
             if valid
@@ -178,50 +319,30 @@ private execute(cpu: *Cpu, insn: u32, length: u32)
                 Some(value) -> result = value
                 None -> valid = false
         0x13 | 0x33 ->
-            val bit_result = if has(cpu.model, EXT_B) then bit_operation(insn, a, b) else None
-            if bit_result.is_some()
-                result = bit_result.unwrap()
-            else
-                alu_operation(cpu, insn, a, b) match
-                    Some(value) -> result = value
-                    None -> valid = false
+            // The base/M and bit-manipulation encodings are disjoint, so the common one is tried first.
+            alu_operation(cpu, insn, a, b) match
+                Some(value) -> result = value
+                None ->
+                    val bit_result = if has(cpu.model, EXT_B) then bit_operation(insn, a, b) else None
+                    if bit_result.is_some() then result = bit_result.unwrap() else valid = false
         0x0F ->
             put = false
             valid = op == 0 || (op == 1 && has(cpu.model, EXT_IFENCE))
         0x73 ->
             if op == 0
-                put = false
-                if insn == 0x00100073 then fail(cpu, Stop.Breakpoint, cpu.pc)
-                elif insn == 0x00000073 then fail(cpu, Stop.Ecall, cpu.pc)
-                elif insn == 0x30200073 && has(cpu.model, EXT_PRIV) && cpu.cs.privilege == 3 then next = return_from_trap(cpu)
-                elif insn == 0x10500073 && has(cpu.model, EXT_PRIV)
-                    if cpu.cs.privilege == 0 && (cpu.cs.mstatus & 0x200000) != 0 then valid = false
-                    elif (pending_bits(cpu) & cpu.cs.mie) == 0
-                        cpu.pending_sleep = true
-                        cpu.sleep_kind = 1
-                else valid = false
-            else
-                val source = if (op & 4) != 0 then rs1 else a
-                val writing = (op & 3) == 1 || rs1 != 0
-                val reading = (op & 3) != 1 || rd != 0
-                csr_access(cpu, insn >> 20, op & 3, source, reading, writing) match
-                    Some(value) -> result = value
-                    None -> valid = false
+                execute_system(cpu, insn, next)
+                return
+            val source = if (op & 4) != 0 then rs1 else a
+            val writing = (op & 3) == 1 || rs1 != 0
+            val reading = (op & 3) != 1 || rd != 0
+            csr_access(cpu, insn >> 20, op & 3, source, reading, writing) match
+                Some(value) -> result = value
+                None -> valid = false
         _ -> valid = false
 
     if !valid then fail(cpu, Stop.Undefined, cpu.pc)
     if cpu.stop != Stop.Budget then return
-    val alignment: u32 = if has(cpu.model, EXT_C) then 2 else 4
-    if (next & (alignment - 1)) != 0
-        fail(cpu, Stop.Misaligned, next)
-        return
-    if put && rd != 0 then cpu.r[rd] = result
-    cpu.r[0] = 0
-    cpu.pc = next
-    cpu.retired += 1
-    if cpu.pending_sleep
-        cpu.pending_sleep = false
-        cpu.stop = Stop.Sleep
+    retire(cpu, target, if put then rd else 0, result)
 
 // Shared base/M ALU semantics are unchanged; extensions only add validated encodings.
 private alu_operation(cpu: *Cpu, insn: u32, a: u32, b: u32) -> Option[u32]
@@ -254,52 +375,63 @@ private alu_operation(cpu: *Cpu, insn: u32, a: u32, b: u32) -> Option[u32]
             _ -> ()
     if valid then Some(result) else None
 
+/** Run up to `budget` steps: an instruction, or an interrupt taken in its place. A hart that has
+ * stopped stays stopped; one asleep wakes when an enabled interrupt is pending, or, after
+ * h3.block, on an event.
+ */
 run(cpu: *Cpu, budget: u64)
     if budget == 0 then return
     if cpu.stop == Stop.Sleep
-        if (pending_bits(cpu) & cpu.cs.mie) == 0 && !(cpu.sleep_kind == 2 && cpu.event) then return
-        if cpu.sleep_kind == 2 then cpu.event = false
+        if pending_bits(cpu) & cpu.cs.mie == 0 && !(cpu.sleep_kind == SLEEP_BLOCK && cpu.event) then return
+        if cpu.sleep_kind == SLEEP_BLOCK then cpu.event = false
         cpu.stop = Stop.Budget
     if cpu.stop != Stop.Budget then return
+    if !has(cpu.model, EXT_PRIV)
+        // No CSRs, no counters, no traps: a stop ends the run.
+        var left = budget
+        while left != 0 && cpu.stop == Stop.Budget
+            left -= 1
+            step(cpu)
+        return
     var left = budget
     while left != 0 && cpu.stop == Stop.Budget
         left -= 1
-        if has(cpu.model, EXT_PRIV) && (cpu.cs.inhibit & 1) == 0 then cpu.cs.cycle += 1
-        if take_interrupt(cpu) then continue
+        val s = &cpu.cs
+        if (s.inhibit & INHIBIT_CY) == 0 then s.cycle += 1
+        // The interrupt test is two loads and an AND: the external line is cached when it changes.
+        if (s.mip | s.meip) & s.mie != 0 && take_interrupt(cpu) then continue
         val before = cpu.retired
-        val inhibited = (cpu.cs.inhibit & 4) != 0
-        cpu.cs.wrote_instret = false
-        cpu.access = 0
+        val counting = (s.inhibit & INHIBIT_IR) == 0
+        s.wrote_instret = false
         step(cpu)
-        if cpu.retired != before && !inhibited && !cpu.cs.wrote_instret then cpu.cs.instret += 1
-        resolve_fault(cpu)
+        if cpu.retired != before && counting && !s.wrote_instret then s.instret += 1
+        if cpu.stop != Stop.Budget then resolve_fault(cpu)
 
 private step(cpu: *Cpu)
-    val alignment: u32 = if has(cpu.model, EXT_C) then 2 else 4
-    if (cpu.pc & (alignment - 1)) != 0
-        fail(cpu, Stop.Misaligned, cpu.pc)
+    val pc = cpu.pc
+    if (pc & ialign_mask(cpu)) != 0
+        fault(cpu, Stop.Misaligned, pc, Access.Fetch)
         return
-    val lo = read(cpu, cpu.pc, 2)
+    val lo = load(cpu, pc, 2, Access.Fetch)
     if cpu.stop != Stop.Budget then return
     cpu.instruction = lo
     if (lo & 3) != 3
         if !has(cpu.model, EXT_C)
-            fail(cpu, Stop.Undefined, cpu.pc)
+            fail(cpu, Stop.Undefined, pc)
             return
-        cpu.access = 1
         if has(cpu.model, EXT_ZC) && execute_zcmp(cpu, lo) then return
         var expanded = decompress(lo)
         if expanded == 0 && has(cpu.model, EXT_ZC) then expanded = decompress_extra(lo)
         if expanded == 0
-            fail(cpu, Stop.Undefined, cpu.pc)
+            fail(cpu, Stop.Undefined, pc)
             return
         execute(cpu, expanded, 2)
     else
-        val hi = read(cpu, cpu.pc + 2, 2)
+        val hi = load(cpu, pc + 2, 2, Access.Fetch)
         if cpu.stop != Stop.Budget then return
         // A 32-bit instruction must fit a single winning PMP region, even with C.
-        if !pmp_allows(cpu, cpu.pc, 4, 0)
-            fail(cpu, Stop.AccessFault, cpu.pc)
+        if !pmp_allows(cpu, pc, 4, Access.Fetch)
+            fault(cpu, Stop.AccessFault, pc, Access.Fetch)
             return
         cpu.instruction = lo | (hi << 16)
         execute(cpu, cpu.instruction, 4)

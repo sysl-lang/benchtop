@@ -3,6 +3,7 @@ module sh.sysl.benchtop
 import sh.sysl.benchtop.v6m.MODELS
 import sysl.buf.{Buf, buf}
 import sh.sysl.benchtop.riscv.{MODELS as RISCV_MODELS}
+import sh.sysl.benchtop.parts.ds3231 as rtc
 
 // The library, as the checker sees it: what each core, peripheral and part declares about itself.
 //
@@ -93,6 +94,9 @@ end PeripheralSpec
 /** A part of the library. `modelled` is false for a part the emulator accepts and draws but does not
  * emulate yet; a part wired to one of its offered pins is reported as driven through it. `display`
  * marks a part whose `width` and `height` parameters are its glass, which is an element's natural size.
+ * `defaults` are what an optional parameter is where a part leaves it out, and `rule` what the part
+ * asks of its settings and wiring together, beyond each parameter's own type and range: the checker
+ * reports each message it answers against the part.
  */
 struct PartSpec
     name: string
@@ -102,6 +106,8 @@ struct PartSpec
     params: Buf[ParamSpec]
     ports: Buf[PortSpec]
     controls: Buf[string]
+    defaults: Buf[(string, Setting)]
+    rule: Option[&Fn(Part, PartSpec) -> Buf[string]]
 
     port(self, name: string) -> Option[PortSpec]
         for p in self.ports
@@ -116,7 +122,39 @@ struct PartSpec
 
         None
     end param
+
+    /** What `name` is where a part leaves it out, if the part says. */
+    default(self, name: string) -> Option[Setting]
+        for (key, value) in self.defaults do if key == name then return Some(value)
+        None
+
+    /** This part with `name` defaulting to `value`. */
+    defaulting(self, name: string, value: Setting) -> PartSpec
+        var out = self
+        out.defaults.push((name, value))
+        out
+
+    /** This part asking `rule` of each part of its kind. */
+    ruled(self, rule: &Fn(Part, PartSpec) -> Buf[string]) -> PartSpec
+        var out = self
+        out.rule = Some(rule)
+        out
 end PartSpec
+
+/** A part's setting `name`: its own, its catalogue entry's, or else its spec's default. */
+spec_setting(p: Part, spec: PartSpec, name: string) -> Option[Setting] = part_setting(p, name) match
+    Some(s) -> Some(s)
+    None -> spec.default(name)
+
+/** `spec_setting` as a whole number, 0 where it is none. */
+spec_whole(p: Part, spec: PartSpec, name: string) -> long = spec_setting(p, spec, name) match
+    Some(Whole(n)) -> n
+    _ -> 0
+
+/** `spec_setting` as a flag, false where it is none. */
+spec_flag(p: Part, spec: PartSpec, name: string) -> bool = spec_setting(p, spec, name) match
+    Some(Flag(on)) -> on
+    _ -> false
 
 /** A core: what a chip is built around. `irqs` is its external interrupt input count, IRQ 0
  * up to `irqs - 1`; bare ISA profiles without an interrupt controller have zero.
@@ -208,20 +246,20 @@ library() -> Registry
         Window(0, true, 4096, 0), "", names([]), false))
     peripherals.push(PeripheralSpec("flash-interface", "memory-mapped external flash interface (direct execution, no serial controller registers yet)", true, specs([]),
         Window(0, true, 4096, 0), "flash", names([]), false))
-    parts.push(PartSpec("flash", "external flash storage attached to a memory-mapped flash interface", true, false,
+    parts.push(part_spec("flash", "external flash storage attached to a memory-mapped flash interface", true, false,
         specs([ParamSpec("capacity", PWhole(4096, 4194304), true)]),
         ports([PortSpec("interface", BusPort("flash"), true)]), names([])))
     peripherals.push(PeripheralSpec("virt-i2s", "48kHz mono-left PCM audio adapter with bounded TX/RX FIFOs and 24-bit I2S frames", true,
         specs([ParamSpec("clock-hz", PWhole(48000, 1000000000), false)]), Window(256, false, 256, 0), "i2s", names(["bclk", "ws", "tx", "rx"]), false))
-    parts.push(PartSpec("i2s-amplifier", "I2S left-channel amplifier with a speaker output", true, false, specs([]),
+    parts.push(part_spec("i2s-amplifier", "I2S left-channel amplifier with a speaker output", true, false, specs([]),
         ports([PortSpec("i2s", BusPort("i2s"), true), PortSpec("out", Offer, false)]), names([])))
-    parts.push(PartSpec("i2s-microphone", "24-bit signed I2S MEMS microphone, left channel", true, false, specs([]),
+    parts.push(part_spec("i2s-microphone", "24-bit signed I2S MEMS microphone, left channel", true, false, specs([]),
         ports([PortSpec("i2s", BusPort("i2s"), true)]), names([])))
-    parts.push(PartSpec("pdm-microphone", "host-backed digital MEMS microphone; ideal PDM decimation at the attached codec", true,false,specs([]),
+    parts.push(part_spec("pdm-microphone", "host-backed digital MEMS microphone; ideal PDM decimation at the attached codec", true,false,specs([]),
         ports([PortSpec("out",Offer,false)]),names([])))
-    parts.push(PartSpec("headphones", "stereo headphones driven by a codec output; gain is the host listening level", true,false,
+    parts.push(part_spec("headphones", "stereo headphones driven by a codec output; gain is the host listening level", true,false,
         specs([ParamSpec("gain",PWhole(0,100),false)]),ports([PortSpec("input",PinPort(AnalogPin),true)]),names([])))
-    parts.push(PartSpec("speaker", "speaker driven by an amplifier; host playback gain is a debugging parameter", true, false,
+    parts.push(part_spec("speaker", "speaker driven by an amplifier; host playback gain is a debugging parameter", true, false,
         specs([ParamSpec("gain", PWhole(0, 100), false)]), ports([PortSpec("input", PinPort(AnalogPin), true)]), names([])))
     peripherals.push(PeripheralSpec("rom", "a boot ROM, `size` bytes from `at`", false, specs([]),
         Window(0, true, 4096, 0), "", names([]), false))
@@ -233,15 +271,16 @@ library() -> Registry
         specs([ParamSpec("kernel-clock-hz",PWhole(1,1000000000),true)]), Window(0x400,false,0x400,0), "spi", names(["sck","tx","rx"]),false))
     peripherals.push(PeripheralSpec("stm32-gpio", "STM32 GPIO bank: MODER, BSRR and alternate-function routing", true,
         specs([ParamSpec("bank",PText,true),ParamSpec("reset-mode",PWhole(0,4294967295),false)]), Window(0x400,false,0x400,0), "", names([]),false))
-    parts.push(PartSpec("sd-card", "SPI-mode SDHC block storage, optionally backed by a disk image", true,false,
+    parts.push(part_spec("sd-card", "SPI-mode SDHC block storage, optionally backed by a disk image", true,false,
         specs([ParamSpec("sectors",PWhole(1024,131072),true),ParamSpec("image",PText,false),ParamSpec("write-protected",PFlag,false)]),
-        ports([PortSpec("spi",BusPort("spi"),false),PortSpec("sdmmc",BusPort("sdmmc"),false),PortSpec("cs",PinPort(InputPin),false),PortSpec("detect",PinPort(AnyPin),false)]),names([])))
+        ports([PortSpec("spi",BusPort("spi"),false),PortSpec("sdmmc",BusPort("sdmmc"),false),PortSpec("cs",PinPort(InputPin),false),PortSpec("detect",PinPort(AnyPin),false)]),names([]))
+        .ruled(sd_card_rule))
     peripherals.push(PeripheralSpec("stm32-i2c", "STM32 I2C v2 polling master, real byte/word data registers and transaction flags", true, specs([]),
         Window(0x400,false,0x400,0), "i2c", names(["sda","scl"]),false))
-    parts.push(PartSpec("wm8994", "WM8994 I2C-controlled AIF1 DAC2 speaker and DMIC1 ADC1 capture subset", true,false,
+    parts.push(part_spec("wm8994", "WM8994 I2C-controlled AIF1 DAC2 speaker and DMIC1 ADC1 capture subset", true,false,
         specs([ParamSpec("address",PWhole(0,127),false),ParamSpec("block",PWhole(0,1),false)]),
         ports([PortSpec("i2c",BusPort("i2c"),true),PortSpec("sai",BusPort("sai"),true),PortSpec("out",Offer,false),PortSpec("headphones",Offer,false),PortSpec("dmic1",PinPort(InputPin),false)]),names([])))
-    parts.push(PartSpec("ft6x06", "FT6206 capacitive touch controller, two-contact I2C polling subset", true,false,
+    parts.push(part_spec("ft6x06", "FT6206 capacitive touch controller, two-contact I2C polling subset", true,false,
         specs([ParamSpec("address",PWhole(0,127),false),ParamSpec("width",PWhole(1,4096),false),ParamSpec("height",PWhole(1,4096),false)]),
         ports([PortSpec("i2c",BusPort("i2c"),true)]),names(["point"])))
     peripherals.push(PeripheralSpec("stm32-sai", "STM32H7 SAI A/B audio blocks with timed FIFO slots and DMA requests", true,
@@ -254,7 +293,7 @@ library() -> Registry
     peripherals.push(PeripheralSpec("stm32-dsi", "STM32 DSI host command-mode packet engine, with timed DCS/generic writes and reads", true,
         specs([ParamSpec("reference-clock-hz", PWhole(1,1000000000), false)]),
         Window(0x800, false, 0x800, 0), "dsi", names([]), false))
-    parts.push(PartSpec("mipi-dcs-display", "MIPI DCS display connected to a DSI virtual channel (common DCS subset)", true, false,
+    parts.push(part_spec("mipi-dcs-display", "MIPI DCS display connected to a DSI virtual channel (common DCS subset)", true, false,
         specs([ParamSpec("width", PWhole(1,800), true), ParamSpec("height", PWhole(1,800), true), ParamSpec("channel", PWhole(0,3), false)]),
         ports([PortSpec("dsi", BusPort("dsi"), true)]), names([])))
     peripherals.push(PeripheralSpec("stm32h7-rcc", "STM32H7 dual-core boot control subset: RCC_GCR and configured CM4 option-byte boot address", true,
@@ -289,13 +328,13 @@ library() -> Registry
     peripherals.push(PeripheralSpec("rp-adc", "the RP2040's and RP2350's 12-bit ADC, its channels on the pins it lists", false, specs([]),
         Window(0x1000, false, 4096, 1), "", names([]), true))
 
-    parts.push(PartSpec("led", "a single-colour LED, lit while its pin is at its active level", true, false,
+    parts.push(part_spec("led", "a single-colour LED, lit while its pin is at its active level", true, false,
         specs([ParamSpec("color", choice(["red", "green", "blue", "yellow", "orange", "white"]), false),
                ParamSpec("active", choice(["high", "low"]), false)]),
         ports([PortSpec("anode", PinPort(AnyPin), true)]),
         names([])))
 
-    parts.push(PartSpec("led-matrix-5x5", "5x5 GPIO-scanned LEDs: active-high rows and active-low columns", true, false,
+    parts.push(part_spec("led-matrix-5x5", "5x5 GPIO-scanned LEDs: active-high rows and active-low columns", true, false,
         specs([ParamSpec("color", choice(["red", "green", "blue", "yellow", "orange", "white"]), false),
                ParamSpec("persistence-cycles", PWhole(1, 10000000), false)]),
         ports([PortSpec("row0", PinPort(InputPin), true),
@@ -309,7 +348,7 @@ library() -> Registry
                PortSpec("col3", PinPort(InputPin), true),
                PortSpec("col4", PinPort(InputPin), true)]), names([])))
 
-    parts.push(PartSpec("seven-segment", "GPIO-driven multiplexed LED digits with a..g/dp segments and common digit terminals", true, false,
+    parts.push(part_spec("seven-segment", "GPIO-driven multiplexed LED digits with a..g/dp segments and common digit terminals", true, false,
         specs([ParamSpec("digits", PWhole(1, 8), false),
                ParamSpec("common", choice(["cathode", "anode"]), false),
                ParamSpec("color", choice(["red", "green", "blue", "yellow", "orange", "white"]), false),
@@ -329,16 +368,19 @@ library() -> Registry
                PortSpec("digit4", PinPort(AnyPin), false),
                PortSpec("digit5", PinPort(AnyPin), false),
                PortSpec("digit6", PinPort(AnyPin), false),
-               PortSpec("digit7", PinPort(AnyPin), false)]), names([])))
+               PortSpec("digit7", PinPort(AnyPin), false)]), names([]))
+        .defaulting("digits", Whole(1)).ruled(seven_segment_rule))
 
-    parts.push(PartSpec("st7789", "ST7789 color TFT with 240x320 controller memory and four-wire GPIO SPI", true, false,
+    parts.push(part_spec("st7789", "ST7789 color TFT with 240x320 controller memory and four-wire GPIO SPI", true, false,
         specs([ParamSpec("width", PWhole(1, 240), false), ParamSpec("height", PWhole(1, 320), false),
                ParamSpec("column-offset", PWhole(0, 239), false), ParamSpec("row-offset", PWhole(0, 319), false)]),
         ports([PortSpec("sck", PinPort(InputPin), true), PortSpec("mosi", PinPort(InputPin), true),
                PortSpec("cs", PinPort(InputPin), true), PortSpec("dc", PinPort(InputPin), true),
-               PortSpec("reset", PinPort(InputPin), true)]), names([])))
+               PortSpec("reset", PinPort(InputPin), true)]), names([]))
+        .defaulting("width", Whole(240)).defaulting("height", Whole(240))
+        .defaulting("column-offset", Whole(0)).defaulting("row-offset", Whole(0)).ruled(st7789_rule))
 
-    parts.push(PartSpec("ssd1306", "128x64 monochrome OLED driven by four-wire mode-0 GPIO SPI", true, false,
+    parts.push(part_spec("ssd1306", "128x64 monochrome OLED driven by four-wire mode-0 GPIO SPI", true, false,
         specs([]),
         ports([PortSpec("sck", PinPort(InputPin), true),
                PortSpec("mosi", PinPort(InputPin), true),
@@ -346,7 +388,7 @@ library() -> Registry
                PortSpec("dc", PinPort(InputPin), true),
                PortSpec("reset", PinPort(InputPin), true)]), names([])))
 
-    parts.push(PartSpec("hd44780", "GPIO-driven HD44780 character LCD with a four-bit write interface", true, false,
+    parts.push(part_spec("hd44780", "GPIO-driven HD44780 character LCD with a four-bit write interface", true, false,
         specs([ParamSpec("write-only", PFlag, false), ParamSpec("columns", PWhole(1, 40), false),
                ParamSpec("rows", PWhole(1, 2), false),
                ParamSpec("instruction-cycles", PWhole(1, 10000000), false),
@@ -357,46 +399,51 @@ library() -> Registry
                PortSpec("d4", PinPort(AnyPin), true),
                PortSpec("d5", PinPort(AnyPin), true),
                PortSpec("d6", PinPort(AnyPin), true),
-               PortSpec("d7", PinPort(AnyPin), true)]), names([])))
+               PortSpec("d7", PinPort(AnyPin), true)]), names([]))
+        .defaulting("write-only", Flag(false)).ruled(hd44780_rule))
 
-    parts.push(PartSpec("potentiometer", "an ideal potentiometer supplying its wiper voltage from a host-controlled position", true, false,
+    parts.push(part_spec("potentiometer", "an ideal potentiometer supplying its wiper voltage from a host-controlled position", true, false,
         specs([ParamSpec("low-uv", PWhole(0, 5000000), false),
                ParamSpec("high-uv", PWhole(0, 5000000), false),
                ParamSpec("position", PWhole(0, 100), false),
                ParamSpec("taper", choice(["linear"]), false)]),
-        ports([PortSpec("wiper", PinPort(AnalogPin), true)]), names([])))
+        ports([PortSpec("wiper", PinPort(AnalogPin), true)]), names([]))
+        .defaulting("low-uv", Whole(0)).defaulting("high-uv", Whole(3300000)).ruled(analog_range_rule))
 
-    parts.push(PartSpec("button", "a push button between its pin and ground (or 3V3 when `active = high`)", true, false,
+    parts.push(part_spec("button", "a push button between its pin and ground (or 3V3 when `active = high`)", true, false,
         specs([ParamSpec("active", choice(["low", "high"]), false)]),
         ports([PortSpec("pin", PinPort(AnyPin), true)]),
         names(["press"])))
 
-    parts.push(PartSpec("switch", "an ideal maintained SPST switch between its GPIO pin and ground (or supply when active = high)", true, false,
+    parts.push(part_spec("switch", "an ideal maintained SPST switch between its GPIO pin and ground (or supply when active = high)", true, false,
         specs([ParamSpec("active", choice(["low", "high"]), false), ParamSpec("closed", PFlag, false)]),
         ports([PortSpec("pin", PinPort(AnyPin), true)]), names([])))
 
-    parts.push(PartSpec("joystick", "a spring-centred two-axis analogue stick, each axis a voltage on an ADC pin", true, false,
+    parts.push(part_spec("joystick", "a spring-centred two-axis analogue stick, each axis a voltage on an ADC pin", true, false,
         specs([ParamSpec("low-uv", PWhole(0, 5000000), false),
                ParamSpec("high-uv", PWhole(0, 5000000), false)]),
         ports([PortSpec("x", PinPort(AdcPin), true), PortSpec("y", PinPort(AdcPin), true)]),
-        names(["up", "down", "left", "right"])))
+        names(["up", "down", "left", "right"]))
+        .defaulting("low-uv", Whole(0)).defaulting("high-uv", Whole(3300000)).ruled(analog_range_rule))
 
-    parts.push(PartSpec("ds3231", "DS3231 I2C real-time clock with calendar, alarms and temperature registers", true, false,
+    parts.push(part_spec("ds3231", "DS3231 I2C real-time clock with calendar, alarms and temperature registers", true, false,
         specs([ParamSpec("initial-time", choice(["host","fixed"]), false), ParamSpec("initial-year", PWhole(2000,2199), false), ParamSpec("initial-month", PWhole(1,12), false),
                ParamSpec("initial-day", PWhole(1,31), false), ParamSpec("temperature-quarter-c", PWhole(-160,340), false)]),
-        ports([PortSpec("i2c", BusPort("i2c"), true)]), names([])))
-    parts.push(PartSpec("buzzer", "a buzzer: `active` sounds a fixed tone while its pin is high, `passive` sounds the pin's waveform", true, false,
+        ports([PortSpec("i2c", BusPort("i2c"), true)]), names([]))
+        .defaulting("initial-year", Whole(2026)).defaulting("initial-month", Whole(1)).defaulting("initial-day", Whole(1))
+        .ruled(ds3231_rule))
+    parts.push(part_spec("buzzer", "a buzzer: `active` sounds a fixed tone while its pin is high, `passive` sounds the pin's waveform", true, false,
         specs([ParamSpec("kind", choice(["active", "passive"]), true),
                ParamSpec("tone", PWhole(20, 20000), false), ParamSpec("gain", PWhole(0, 100), false)]),
         ports([PortSpec("pin", PinPort(AnyPin), true)]),
         names([])))
 
-    parts.push(PartSpec("ws2812", "an addressable RGB LED, decoded from its data pin's waveform", true, false,
+    parts.push(part_spec("ws2812", "an addressable RGB LED, decoded from its data pin's waveform", true, false,
         specs([ParamSpec("count", PWhole(1, 1024), false)]),
         ports([PortSpec("din", PinPort(AnyPin), true)]),
         names([])))
 
-    parts.push(PartSpec("st7796", "the Sitronix ST7796 TFT controller and its glass, over SPI", true, true,
+    parts.push(part_spec("st7796", "the Sitronix ST7796 TFT controller and its glass, over SPI", true, true,
         specs([ParamSpec("width", PWhole(1, 4096), true),
                ParamSpec("height", PWhole(1, 4096), true),
                ParamSpec("invert", PFlag, false),
@@ -408,21 +455,22 @@ library() -> Registry
                PortSpec("backlight", PinPort(AnyPin), false)]),
         names([])))
 
-    parts.push(PartSpec("gt911", "the Goodix GT911 capacitive touch controller, over I2C", true, false,
+    parts.push(part_spec("gt911", "the Goodix GT911 capacitive touch controller, over I2C", true, false,
         specs([ParamSpec("address", PWhole(0, 127), false), ParamSpec("width", PWhole(1,4096), false), ParamSpec("height", PWhole(1,4096), false)]),
         ports([PortSpec("i2c", BusPort("i2c"), true),
                PortSpec("int", PinPort(AnyPin), false),
                PortSpec("reset", PinPort(AnyPin), false)]),
-        names(["point"])))
+        names(["point"]))
+        .defaulting("address", Whole(0x5d)).ruled(gt911_rule))
 
-    parts.push(PartSpec("terminal", "the host's terminal on a UART: what the board writes is printed, what is typed is sent", true, false,
+    parts.push(part_spec("terminal", "the host's terminal on a UART: what the board writes is printed, what is typed is sent", true, false,
         specs([ParamSpec("baud", PWhole(300, 4000000), false)]),
         ports([PortSpec("uart", BusPort("uart"), true)]),
         names([])))
 
-    parts.push(PartSpec("cyw43439", "the Infineon CYW43439 Wi-Fi and Bluetooth mcu, over gSPI; its GPIOs drive other parts", false, false,
+    parts.push(part_spec("cyw43439", "the Infineon CYW43439 Wi-Fi and Bluetooth mcu, over gSPI; its GPIOs drive other parts", false, false,
         specs([]),
-        ports([PortSpec("wl_on", PinPort(AnyPin), true),
+        ports([PortSpec("wl-on", PinPort(AnyPin), true),
                PortSpec("data", PinPort(AnyPin), true),
                PortSpec("cs", PinPort(AnyPin), true),
                PortSpec("clock", PinPort(AnyPin), true),
@@ -433,6 +481,67 @@ library() -> Registry
 
     Registry(cores, peripherals, parts)
 end library
+
+// A part with no defaults and no rule; `defaulting` and `ruled` add them.
+private part_spec(name: string, summary: string, modelled: bool, display: bool, params: Buf[ParamSpec], ports: Buf[PortSpec],
+                  controls: Buf[string]) -> PartSpec =
+    PartSpec(name, summary, modelled, display, params, ports, controls, buf(), None)
+
+// -- what a part asks of its settings and wiring together ----------------------------------------------
+
+// A card is on one bus: an SPI one with its chip select, or an SDMMC one without.
+private sd_card_rule(p: Part, spec: PartSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+    if wired(p, "spi") == wired(p, "sdmmc") then out.push("SD card needs exactly one SPI or SDMMC connection")
+    if wired(p, "spi") && !wired(p, "cs") then out.push("SPI SD card needs cs connected")
+    if wired(p, "sdmmc") && wired(p, "cs") then out.push("native SD cards do not use SPI chip select")
+    out
+
+// Every digit it has has its common terminal wired, and no other.
+private seven_segment_rule(p: Part, spec: PartSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+    val count = spec_whole(p, spec, "digits")
+    for i in 0..<8
+        val terminal = s"digit$i"
+        if i < count && !wired(p, terminal) then out.push(s"`${p.name}.$terminal` is not connected")
+        if i >= count && wired(p, terminal) then out.push(s"`${p.name}.$terminal` exceeds its configured digit count")
+    out
+
+// The ST7789's frame memory is 240 columns by 320 rows; the glass and its offset sit inside it.
+private st7789_rule(p: Part, spec: PartSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+    if spec_whole(p, spec, "width") + spec_whole(p, spec, "column-offset") > 240 || spec_whole(p, spec, "height") + spec_whole(p, spec, "row-offset") > 320
+        out.push("ST7789 glass and offsets must fit its 240x320 controller memory")
+    out
+
+// An analogue source's range runs upwards.
+private analog_range_rule(p: Part, spec: PartSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+    if spec_whole(p, spec, "low-uv") > spec_whole(p, spec, "high-uv") then out.push("analogue source low-uv must not exceed high-uv")
+    out
+
+// The GT911 answers at one of the two addresses its INT strap selects.
+private gt911_rule(p: Part, spec: PartSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+    val address = spec_whole(p, spec, "address")
+    if address != 0x14 && address != 0x5d then out.push("GT911 address must be 0x14 or 0x5d")
+    out
+
+// The starting date is a day its month has.
+private ds3231_rule(p: Part, spec: PartSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+    val month = int(spec_whole(p, spec, "initial-month"))
+    if month >= 1 && month <= 12 && spec_whole(p, spec, "initial-day") > long(rtc.days(int(spec_whole(p, spec, "initial-year")), month))
+        out.push("RTC initial day is invalid for its month")
+    out
+
+// RW is wired, or tied low and said so.
+private hd44780_rule(p: Part, spec: PartSpec) -> Buf[string]
+    var out: Buf[string] = buf()
+    val write_only = spec_flag(p, spec, "write-only")
+    if !wired(p, "rw") && !write_only then out.push("LCD needs rw connected or write-only = true (RW tied low)")
+    if wired(p, "rw") && write_only then out.push("LCD write-only ties RW low; omit its rw connection")
+    out
 
 private choice(options: []const string) -> ParamKind = PChoice(names(options))
 

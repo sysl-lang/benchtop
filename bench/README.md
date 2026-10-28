@@ -67,6 +67,26 @@ cycles are a range and the host instructions are not):
 Thumb-2 says the same in 12% fewer instructions, and each costs about what an M0+ instruction does,
 so a round takes about as long on either. The M0+'s count is the same as before the M33 existed.
 
+## The Hazard3
+
+`kernel-rv.bin` is the same `kernel.c` built for RV32IMAC (`start-rv.S` sets the stack, calls `run`
+and ends with `EBREAK`), and `benchtop bench --core hazard3` runs it on the RISC-V interpreter,
+which has no decode cache and no threaded executor:
+
+```
+/usr/bin/time -l ./benchtop bench --core hazard3 bench/guest/kernel-rv.bin 1380735027
+```
+
+On the M5 Pro, sysl 0.7.8, three rounds of 429.3 M guest instructions:
+
+| | host instructions | per guest instruction | MIPS |
+|---|---|---|---|
+| a priority scan of every interrupt and of every PMP region per access, byte-wise RAM | 1606.0 G | 1247 | ~16 |
+| now: a cached interrupt line, decoded PMP with a Machine-mode fast path, word RAM access | **289.0 G** | **224** | **~104** |
+
+That is still about fifteen times the ARM cores' cost per instruction; the rest is the decode on
+every step.
+
 ## Two cores
 
 `guest/dual.c` runs on the virtual board: each core folds the CRC over a 4 KB buffer of its own a
@@ -167,3 +187,51 @@ on the DSI worker (DCS writes into the panel's memory) or on the desktop's threa
 the texture). The copy out held the panel's lock while it converted all 384 000 pixels, about a
 millisecond, and the DSI worker waited behind it (2.0–2.4 % busy, much of it blocked); it now copies
 whole rows under the lock and converts after, and the DSI worker is at 0.6–0.8 %.
+
+### A busy M7
+
+`mic-disco.elf` leaves the M7 asleep most of the time, so a slowdown in heavy M7 code would not show
+there. `busy-disco.elf` (`examples/touch/build.sh busy`; [what it runs](../examples/touch/README.md#a-busy-m7))
+is the same firmware with an M7 that never sleeps: a 255-tap FIR in its audio interrupts and, between
+them, kernels for memory across three regions, double precision, unpredictable branches and
+peripheral polls. `--set busy_kernel=N` runs one kernel alone (1 memory, 2 double, 3 branches,
+4 polls, 5 none), so a fall below real time names its category.
+
+```
+caffeinate -dimsu ./benchtop realtime --seconds 10 examples/touch/busy-disco.elf
+caffeinate -dimsu ./benchtop realtime --seconds 5 --unpaced --set busy_kernel=4 examples/touch/busy-disco.elf
+```
+
+Each core's line gives the guest MHz and MIPS it ran at, and the MHz its worker could have sustained:
+what it ran at over the share of the window it was busy (unpaced, simply what it ran at).
+
+On the M5 Pro, sysl 0.7.8, 2026-10-28, on a machine saturated by other work (load average 21–26: the
+unpaced `mic-disco.elf` reference measured 0.17–0.19 x in the same minutes, against 1.31–1.40 x
+above, so these are a floor, not the quiet-machine figures), two rounds:
+
+| | M7 | M4 |
+|---|---|---|
+| paced, all kernels | 1.000 x, 272 MIPS, busy 78 % (could sustain 617 MHz); one round 0.685 x | 1.006 x, 154 MIPS, busy 89 %; one round 0.471 x |
+| `mic-disco.elf` paced, same minutes | 1.000 x both rounds | 1.001 x; one round 0.773 x |
+
+The M7 alone, unpaced (the cores in lockstep, the M4 drawing as above):
+
+| kernel | M7 sustained | M7 MIPS |
+|---|---|---|
+| all, in turn | 364–387 MHz | 207–220 |
+| 1 memory | 244–279 MHz | 172–197 |
+| 2 double | 263–373 MHz | 49–69 |
+| 3 branches | 140–212 MHz | 89–134 |
+| **4 peripheral polls** | **49–58 MHz** | **38–45** |
+| 5 none (asleep between interrupts) | 102–153 MHz | 9–14 |
+
+**The peripheral polls are the limit, by a factor of five against every other kernel: an M7 polling
+the SAI and DMA registers runs at about a tenth of real time.** A profile of that run (`sample <pid>
+5 1`) puts two thirds of the M7's thread (1288 of 1939 samples) in `virt.sai_dma_read`: every SAI or DMA register read brings
+the audio up to the core's time (`bring_audio` → `service_audio_dma`, with a `malloc` and a `free` on
+each), publishes it (`publish_audio`, `dma.irq`) and takes the audio lock (`sysl_futex_wait`, about
+5 % of the thread). In the mixed run the polls are a small share of the work, and the profile is
+instead the M7's loads and stores (`h_ld_imm`, `h_ldr_imm`, `h_ld_reg`, `h_fp_ldr` → `fp_words`, and the stores: about
+two fifths of its thread), with 22 % in `run_core`'s per-slice `signal`: `signal_dsi` 13 % and
+`signal_sai_dma` 8 %, on a core that drives neither. The sleeping kernel runs slower than the busy
+ones because, in lockstep, every wake-up is a thread hand-off, which a loaded machine makes slow.
