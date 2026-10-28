@@ -322,3 +322,19 @@ including files smaller than one DMA half or exactly one ring buffer long.
 EOF and Stop use a generation acknowledgment before the shared ring is reused.
 EOF/Stop does not alter the WAV or card contents. Rate conversion, compressed
 formats and simultaneous record/playback are future extensions.
+
+## Analog joystick
+
+Build with `./examples/touch/build.sh joystick`, then run:
+
+```sh
+./benchtop run --window --board boards/joystick.hocon examples/touch/joystick.elf
+```
+
+Drag JS1 to move the circle; release (or lose window focus) to centre it.
+The reusable `joystick` part supplies independent X/Y voltages to two ADC pins.
+`low-uv` and `high-uv` default to 0 and 3300000; neutral is their midpoint.
+The Sysl firmware reads two virtual ADC channels and renders an antialiased
+circle with PlutoVG, sending changed pixels through PL022 SPI to the ST7789.
+This board uses the existing virtual ADC register interface, not an RP2350 ADC
+register model. No joystick button is modelled in this first version.

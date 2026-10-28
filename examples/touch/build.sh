@@ -3,6 +3,7 @@ set -eu
 cd "$(dirname "$0")"
 transport=${1:-spi}
 case "$transport" in
+    joystick) feature_args="--features joystick"; output=joystick.elf ;;
     spi) feature_args=""; output=demo.elf ;;
     gpio) feature_args="--features gpio_spi"; output=gpio.elf ;;
     storage-spi) feature_args="--features h7_cores,dsi,audio,microphone,delay,storage"; output=storage-spi-disco.elf ;;
