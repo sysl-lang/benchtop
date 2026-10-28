@@ -121,3 +121,49 @@ one-second samples of per-core MIPS, launched status and UI FPS. The existing
 150 MHz touchscreen demo measured approximately 150 MIPS on core 0 and zero on
 its unlaunched core 1, while the UI ran at approximately 120 FPS. This is a live
 paced polling workload, distinct from the unthrottled benchmark above.
+
+## Real time on the STM32H747I-DISCO
+
+The bar: both cores of the H747 emulated at real time with the DSI display and the audio running.
+`benchtop realtime` runs a firmware on the CPU workers exactly as the desktop does (each core on its
+own host thread, paced against the host's clock, DSI packets applied by the DSI worker), with no
+window. The main thread plays the desktop's part: it takes the audio a sound card would, feeds the
+microphone a 440 Hz tone whose loudness swells once a second, drags a finger along the slider, and
+copies the 800 x 480 panel out sixty times a second as the window paints it.
+
+```
+sysl build . -o benchtop
+caffeinate -dimsu ./benchtop realtime --seconds 10 examples/touch/mic-disco.elf
+caffeinate -dimsu ./benchtop realtime --seconds 10 --unpaced examples/touch/mic-disco.elf
+```
+
+`mic-disco.elf` is the firmware that exercises the most at once: the M7 takes the WM8994's DMIC
+input over SAI1 B and DMA, filters it and fills the speaker's buffer; the M4 runs imui and PlutoVG,
+draws the input meter as the level moves, and sends changed pixel runs to the panel over DSI. The
+board models no LTDC and no DMA2D, so the M4 draws every pixel itself and the panel takes DCS
+command-mode packets; video-mode streaming is not part of this check.
+
+It prints, per core, guest seconds over host seconds (1.000 is real time) and how busy that core's
+worker was (the host time it did not spend waiting for the clock); the DSI worker's and the display
+copy's share of the host time; the audio rates; and exits 1 where a core falls below real time.
+`--unpaced` runs the cores in lockstep as fast as the host can, for the headroom.
+
+On the M5 Pro, sysl 0.7.8, 10 guest seconds after 1 of boot, on a machine loaded with other work
+(load average 6–9), three runs each:
+
+| | M7 (480 MHz) | M4 (240 MHz) | DSI worker | display copy | audio out / in |
+|---|---|---|---|---|---|
+| paced | 1.000 x, 3.5 MIPS, busy 4–5 % | 1.000 x, 153 MIPS, busy 45–57 % | 0.6–0.8 % | 3.6–4.2 % | 48 000 / 48 000 frames/s |
+| unpaced (lockstep) | 1.31–1.40 x | 1.31–1.40 x | | | |
+
+`ps -M` agrees with the busy column: over the same ten seconds the M4's thread used 4.7 s of
+processor, the M7's 0.4 s, the main thread 0.4 s and the DSI worker 0.15 s. Both cores keep real time
+with the M4 at about half a host core.
+
+A profile of that run (`sample <pid> 5 1`) finds no pixel operation on either guest core's thread.
+The M4's thread spends its time on guest instructions and on the guest's own MMIO: the DSI status
+polls while a packet crosses the link, the I2C touch polls. Every pixel the host touches is touched
+on the DSI worker (DCS writes into the panel's memory) or on the desktop's thread (the copy out and
+the texture). The copy out held the panel's lock while it converted all 384 000 pixels, about a
+millisecond, and the DSI worker waited behind it (2.0–2.4 % busy, much of it blocked); it now copies
+whole rows under the lock and converts after, and the DSI worker is at 0.6–0.8 %.

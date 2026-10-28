@@ -4,7 +4,6 @@ import sh.sysl.benchtop.peripheral.dsi as dsi
 import sysl.threads.{Thread,Mutex,Condvar,Channel,channel,spawn,current}
 import sysl.buf.{Buf,buf}
 import sysl.time.monotonic
-import sysl.sync.*
 
 // Fixed packet values cross the channel; no views, display references or CPU
 // pointers cross domains. The existing bounded channel supplies the semaphore-
@@ -32,15 +31,12 @@ struct DsiProgress
 
 /** The DSI worker: the host thread that applies the packets the cores' writes send it to the
  * displays, which runs while the CPU workers do (`running`), its queue (`queue`, its packets held in
- * `slots`, whose lock no thread takes), how many packets are in the queue (`queued`, atomic, so a
- * core's status read asks it without the queue's lock), and its progress, which `changed` is notified
- * of. The scheduler owns it, and the worker's thread holds the queue's address, so it is reset in
- * place, never replaced.
+ * `slots`, whose lock no thread takes), and its progress, which `changed` is notified of. The scheduler
+ * owns it, and the worker's thread holds the queue's address, so it is reset in place, never replaced.
  */
 struct DsiWorker
     slots: Mutex[Buf[DsiPacket]]
     queue: Channel[DsiPacket]
-    queued: usize
     handle: Option[Thread]
     progress: Mutex[DsiProgress]
     changed: Condvar
@@ -51,7 +47,7 @@ dsi_worker() -> DsiWorker
     var slots: Buf[DsiPacket] = buf()
     for i in 0..<DSI_QUEUE_CAPACITY do slots.push(DsiPacket(0,0,0,0,[0;1024]))
     val queue = channel(slots.view())
-    DsiWorker(Mutex.new(slots), queue, 0, None, Mutex.new(DsiProgress(0,0,0,0)), Condvar.new(), false)
+    DsiWorker(Mutex.new(slots), queue, None, Mutex.new(DsiProgress(0,0,0,0)), Condvar.new(), false)
 
 struct DsiWorkerStatus
     worker_id: u64
@@ -62,7 +58,7 @@ struct DsiWorkerStatus
 
 dsi_worker_status() -> DsiWorkerStatus
     val w = &scheduler.dsi
-    val queued = if w.running then atomic_load(&w.queued,Acquire) else 0
+    val queued = if w.running then w.queue.len() else 0
     w.progress.with(p -> DsiWorkerStatus(p.thread_id,queued,p.outstanding,p.completed,p.busy_us))
 
 // Whether the DSI worker runs: a core's DSI write then queues its packet rather than applying it.
@@ -73,7 +69,6 @@ private[virt] start_dsi_worker() -> Result[unit,string]
     if !machine.devices.dsi.present then return Ok(())
     val w = &scheduler.dsi
     w.queue = w.slots.with(slots -> channel(slots.view()))
-    atomic_store(&w.queued,0,Release)
     w.progress.with(p -> *p = DsiProgress(0,0,0,0))
     w.running = true
     machine.devices.dsi.host.with(h -> (*h).defer_reads = true)
@@ -114,7 +109,7 @@ private[virt] stop_dsi_worker()
     machine.devices.dsi.host.with(h -> (*h).defer_reads = false)
     w.progress.with(p -> p.thread_id = 0)
 
-private[virt] dsi_queue_has_room() -> bool = !dsi_async() || atomic_load(&scheduler.dsi.queued,Acquire) < DSI_QUEUE_CAPACITY
+private[virt] dsi_queue_has_room() -> bool = !dsi_async() || scheduler.dsi.queue.len() < DSI_QUEUE_CAPACITY
 
 // Under the host's lock: there is only one producer at a time, and advance_dsi
 // already checked capacity. A full host queue leaves the command FIFO busy.
@@ -123,7 +118,6 @@ private[virt] enqueue_dsi_packet(vc: u32, kind: u32, bytes: []const u8, request:
     var packet = DsiPacket(vc,kind,request,bytes.len,[0;1024])
     for i in 0..<bytes.len do packet.bytes[i] = bytes[i]
     w.progress.with(p -> p.outstanding += 1)
-    atomic_add(&w.queued,1,AcqRel)
     assert(w.queue.try_send(packet),"DSI queue capacity checked under the host's lock")
 
 private dsi_device_body(w: *DsiWorker)
@@ -135,7 +129,6 @@ private dsi_device_body(w: *DsiWorker)
             Some(p) -> p
             None -> break
         val start = monotonic()
-        atomic_sub(&w.queued,1,AcqRel)
         // Freeing a queue slot lets a due hardware command complete. Never
         // hold the queue lock while processing pixels or waiting for the UI.
         machine.devices.dsi.host.with(h -> publish_dsi_deadline(h))

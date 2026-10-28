@@ -125,6 +125,13 @@ does not model M7 superscalar issue, caches, bus bandwidth or flash wait states.
 Raw interpreter throughput is evidence of host headroom, not a guarantee that
 audio firmware will match the execution time of a physical H747.
 
+## Real time
+
+`./benchtop realtime examples/touch/mic-disco.elf` runs the microphone variant on both cores'
+workers with no window, the DSI display and the audio in both directions running, and reports each
+core's speed against real time; [bench](../bench/README.md#real-time-on-the-stm32h747i-disco) has the
+numbers and what they show.
+
 ## Primary references
 
 - [ST board user manual UM2411](https://www.st.com/resource/en/user_manual/um2411-discovery-kit-with-stm32h747xi-mcu-stmicroelectronics.pdf)
