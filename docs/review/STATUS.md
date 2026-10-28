@@ -10,10 +10,10 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 |---|---|---|
 | cores#1 | the RISC-V core is not wired into any board, and has no bus | partly fixed (core bus) in `aff3dad`: the hart reaches devices through a `riscv.Bus` trait off its RAM window; left: wiring a hart into a board, which waits on device handlers that take a v6m `*Cpu` and on the RP2350 chip layer (GPIO, UART, SIO, ROM) |
 | cores#2 | the memory map is process-global state the core reads on every access | fixed by slice 1 (`ce0b959`): `v6m.Memory` holds the map, `Cpu.mem` points at it |
-| cores#3 | every new `Op` must be written in five places | open |
-| cores#4 | hand-unrolled const-generic dispatch ladders, doubled by `TIMED` | open |
-| cores#5 | `TIMED`, `V8`, `SINGLE` are `const u32` used as booleans | open |
-| cores#6 | the timing switch checked at decode in three spellings; IT re-dispatch | open |
+| cores#3 | every new `Op` must be written in five places | partly fixed in `35449b8`: the hand list is gone (`configure_instruction_timing` walks `Op::Variants`), `instruction_cycles` is the one cost table and `costed(op)` derives from it whether a shared handler charges cycles; left: the handler table is still an exhaustive `match` — a `for const c in Op::Variants` table needs `Op::Make(c, ())` as a value argument, which sysl 0.7.8 refuses (sysl finding) |
+| cores#4 | hand-unrolled const-generic dispatch ladders, doubled by `TIMED` | fixed in `35449b8`: every ladder is a `for const` (B<cond>, fused, wide CMP, IT, FP, DP imm/logic/reg×shift, bit, extend, the load families) |
+| cores#5 | `TIMED`, `V8`, `SINGLE` are `const u32` used as booleans | fixed in `35449b8` (`const …: bool`; FP's precision `D` left a `u32`) |
+| cores#6 | the timing switch checked at decode in three spellings; IT re-dispatch | partly fixed in `35449b8`: `CYCLE_ACCOUNTING` deleted; one spelling (`handler_for`, `fused_handler_for`, `cmp_w_bcond_handler`, `pred_handler` all take the core); `h_pred[K, L, TIMED]` no longer tests the timing switch at run time; left: it still re-selects its inner handler per run — the 16-byte record has no room for a second handler pointer |
 | cores#7 | the RISC-V core is RP2350-specific while claiming to be generic | fixed in `aff3dad`: a `Chip` record holds what the integration fixes, `riscv/rp2350.sysl` is the one that names the RP2350 |
 | cores#8 | RISC-V per-instruction cost far from "real-world speed" | partly fixed in `aff3dad`, `6e909be`: cached IRQ line, decoded PMP with a Machine-mode fast path, word RAM access; 1247 → 224 host instructions per guest instruction (bench/README.md); left: a decode cache and the threaded executor v6m has |
 | cores#9 | NVIC banks use three indexing schemes | open |
@@ -21,8 +21,8 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#11 | sentinel and guard-record arithmetic in place of named concepts | open |
 | cores#12 | `Kind`, `Arch` and the `is_*` predicates overlap | open |
 | cores#13 | `h_dsp` re-checks DSP at run time against a second source of truth | open |
-| cores#14 | duplicated bit utilities and hand-rolled loops the library has | open |
-| cores#15 | boilerplate handler bodies | open |
+| cores#14 | duplicated bit utilities and hand-rolled loops the library has | partly fixed in `d435c66` (`t2sem` CLZ is `leading_zeros`); left: `rbit` (waits for sysl 0.7.9's `reverse_bits`), the RISC-V `bitops` loops, the duplicated `sext`/`bits`/`bad`/`st` helpers |
+| cores#15 | boilerplate handler bodies | fixed in `35449b8`: `h_step[OP, L, TIMED]` and `h_access[OP, L, TIMED]`, whose `match` on the constant `OP` folds, replace ~85 hand-written handlers |
 | cores#16 | RISC-V `execute` mixes decode, validation and commit | fixed in `aff3dad`: one `retire` commit path, faults carry an `Access` instead of a side channel |
 | cores#17 | `Stop.Budget` means "running" | open |
 | cores#18 | RISC-V `Model` fields that nothing reads | fixed in `aff3dad`: `model.irqs` sizes the interrupt scan; the chip-fixed fields moved to `Chip` |
@@ -80,7 +80,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | ui-firmware#6 | pot state stored twice and synced every frame | open |
 | ui-firmware#7 | `rasterize` clones the desktop by hand-copying fields | open |
 | ui-firmware#8 | a 20-argument positional constructor | open |
-| ui-firmware#9 | hand-written SDL externs where the SDL binding owns the job | open (`SDL_GetCurrentAudioDriver` is still declared in `ui/audio.sysl`) |
+| ui-firmware#9 | hand-written SDL externs where the SDL binding owns the job | fixed in `d435c66` (sdl3 0.3.12: the touch window's size and scale through `sdl3.c`, `current_audio_driver()`, `current_time()`/`date_time()`; no `extern "SDL_` is left in benchtop) |
 | ui-firmware#10 | instrument sources hard-code register maps | open |
 | ui-firmware#11 | example firmware is not readable | open |
 | ui-firmware#12 | startup and vector-table boilerplate copied into every example | open |
