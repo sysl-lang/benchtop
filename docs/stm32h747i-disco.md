@@ -83,9 +83,12 @@ board and all original SPI/GPIO firmware modes remain available.
 ./benchtop run --window --board stm32h747-disco examples/touch/disco.elf
 ```
 
-The built-in description lives in `boards/stm32h747-disco.hocon`. It uses the real
-internal flash and AXI SRAM addresses, RCC CM4 release, STM32 DSI at 0x50000000,
-and I2C4 at 0x58001c00 routed to PD12/PD13. An FT6206 at address 0x2a supplies touch
+The built-in description lives in `boards/stm32h747-disco.hocon`, on the built-in mcu
+`stm32h747` (`mcus/stm32h747.hocon`), which holds the chip's facts: the real internal
+flash and AXI SRAM addresses, RCC CM4 release, STM32 DSI at 0x50000000, I2C4 at
+0x58001c00, SDMMC1, SPI1, GPIO A to K with their reset modes, and the pins each signal
+can be routed to. The board picks I2C4's pins, PD12/PD13, under `buses`;
+`stm32h747-sd.hocon` and `stm32h747-spi-sd.hocon` are the same board with a card. An FT6206 at address 0x2a supplies touch
 reports. The display part implements common MIPI DCS behavior rather
 than a complete NT35510/OTM8009A vendor-specific controller.
 
