@@ -126,16 +126,19 @@ val NO_IRQS: [8]int = [-1;8]
 
 /** The cores' bus: the devices on it, at most one of each kind (`attached` of `mapped`), and the
  * IRQs the console and the SIO raise, -1 where the board has no such device or gave it no IRQ.
- * `mapped` is a plain array, which both cores' threads read at once without touching it.
+ * `mapped` is a plain array, which both cores' threads read at once without touching it. `windows[i]`
+ * answers the accesses to `mapped[i]`, which `attach` points at the machine's device once the
+ * devices are in place.
  */
 struct BusState
     mapped: [32]Mapped
+    windows: [32]*BusWindow
     attached: usize
     console_irq: int
     fifo_irq: int
 
 /** A bus with no device on it. */
-bus_state() -> BusState = BusState([Mapped(Console,0,0,NO_IRQS);32], 0, -1, -1)
+bus_state() -> BusState = BusState([Mapped(Console,0,0,NO_IRQS);32], [null; 32], 0, -1, -1)
 
 // The bus that puts `ds` there, at most one device of each kind.
 private[virt] bus_of(ds: []const Mapped) -> BusState
@@ -175,19 +178,20 @@ private[virt] no_bus_cache() -> BusCache = BusCache(0xffffffffffffffff)
 private[virt] forget_bus_cache()
     for k in 0..<2 do machine.bus_cache[k] = no_bus_cache()
 
-private bus_mapping(c: *Cpu, address: u32) -> *Mapped
+// The index in the bus of the window that holds `address`, past `attached` for none.
+private bus_mapping(c: *Cpu, address: u32) -> usize
     val bus = &machine.devices.bus
     val cache = &machine.bus_cache[usize(c.core)]
     val cached = cache.index
     if cached < bus.attached
         val m = &bus.mapped[cached]
-        if address >= m.base && address <= m.last then return m
+        if address >= m.base && address <= m.last then return cached
     for i in 0..<bus.attached
         val m = &bus.mapped[i]
         if address >= m.base && address <= m.last
             cache.index = i
-            return m
-    null
+            return i
+    bus.attached
 
 /** How many devices the bus has on it. */
 attached() -> usize = machine.devices.bus.attached
@@ -315,6 +319,13 @@ private[virt] console_status() -> u32
     c.live.with(l -> status(c, l))
 
 // The console's half of an access to address `a`, register `o` from its base.
+impl Peripheral for Console
+    override signal(*self, cpu: *Cpu) = if console_raising() then raise(cpu, u32(console_irq()))
+
+impl BusWindow for Console
+    read(*self, cpu: *Cpu, a: u32, o: u32, width: u32, n: u64) -> u32 = console_read(cpu, a, o)
+    write(*self, cpu: *Cpu, a: u32, o: u32, width: u32, x: u32, n: u64) = console_write(cpu, a, o, x)
+
 private console_read(cpu: *Cpu, a: u32, o: u32) -> u32
     val c = &machine.console
     if o == CTRL then return console_ctrl()
@@ -406,20 +417,8 @@ boot(cpu: *Cpu, image: []const u8)
     memory.attach_memory(second, machine.memory)
     clear(second, 0)
     configure(second, machine.configs[1])
-    machine.devices.sio = sio_state()
     reset_scheduler()
-    boot_sai_dma()
-    boot_dsi()
-    boot_h7()
-    boot_rp()
-    boot_spi()
-    boot_storage()
-    boot_sdmmc()
-    boot_panel()
-    boot_adc()
-    boot_i2c()
-    boot_sound()
-    boot_digital_audio()
+    for d in every_device(&machine) do d.boot()
     rebase_workers()
 
 // Start core 1 at `entry` with `sp` and `vtor`, as the boot ROM does at the end of the launch
@@ -450,8 +449,6 @@ private configure(c: *Cpu, cfg: CoreConfig)
     c.fpu = cfg.fpu
     c.bus = &machine
 
-private[virt] device_due() -> u64 = min(sdmmc_due(), min(min(min(min(timer_due(), adc_due()), spi_due()),dsi_due()),sai_dma_due()))
-private[virt] device_wake(cpu: *Cpu) -> u64 = min(sdmmc_wake(cpu), min(min(min(min(timer_wake(cpu), adc_wake(cpu)), spi_wake(cpu)),dsi_due()),sai_dma_wake(cpu)))
 
 // A byte of input the board waited for, kept to answer STATUS and DATA; nothing where the input ended.
 private[virt] hold_input(got: Option[u8])
@@ -480,16 +477,9 @@ private stopped(cpu: *Cpu, why: string) -> string
 // Raise a core's interrupts: the console's while it is enabled and STATUS is not 0, the FIFO's while
 // the core's VLD, WOF or ROE is set, and the timer's alarms' while they are raised at its clock.
 private[virt] signal(cpu: *Cpu)
-    if console_raising() then raise(cpu, u32(console_irq()))
-    if fifo_irq() >= 0 && sio_raising(&machine.devices.sio, cpu) then raise(cpu, u32(fifo_irq()))
-    signal_rp(cpu)
-    signal_sai_dma(cpu)
-    signal_dsi(cpu)
-    signal_spi(cpu)
-    signal_sdmmc(cpu)
-    signal_panel(cpu)
-    signal_adc(cpu)
-    signal_rtcs(cpu)
+    val r = &machine.devices.running
+
+    for i in 0..<r.count do r.devices[i].signal(cpu)
 
 // Each core's bus is the machine it is part of.
 impl Bus for Machine
@@ -500,45 +490,18 @@ impl Bus for Machine
 // whose window holds the address answers it, with the register's offset from its base. An address
 // in no window stops the core at `Unmapped`. The RAM's own accesses never come here.
 board_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
-    val m = bus_mapping(cpu,a)
-    if m != null
-        return m.device match
-            Sai | Dma1 | Dma2 | Dmamux -> sai_dma_read(cpu,m.device,a,a - m.base,width,n)
-            Dsi -> dsi_read(cpu,a,a - m.base,width,n)
-            Sdmmc -> sdmmc_read(cpu,a,a - m.base,width,n)
-            H7Spi | Stm32Gpio -> storage_read(cpu,m.device,a,a - m.base,width,n)
-            H7Rcc -> h7_rcc_read(cpu,a,a - m.base,width)
-            Console -> console_read(cpu, a, a - m.base)
-            DigitalAudio -> digital_read(cpu, a, a - m.base, width, n)
-            Pwm -> pwm_read(cpu, a, a - m.base, width, n)
-            Spi -> spi_read(cpu, a, a - m.base, width, n)
-            I2c -> i2c_read(cpu, a, a - m.base, width, n)
-            Adc -> adc_read(cpu, a, a - m.base, width, n)
-            PanelGpio -> panel_read(cpu, a, a - m.base, width, n)
-            Sio -> sio_read(&machine.devices.sio, cpu, a, a - m.base)
-            d -> rp_read(cpu, d, a, a - m.base, width, n)
+    val bus = &machine.devices.bus
+    val i = bus_mapping(cpu,a)
+    if i < bus.attached then return bus.windows[i].read(cpu, a, a - bus.mapped[i].base, width, n)
 
     halt(cpu, Stop.Unmapped, a)
     0
 
 board_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
-    val m = bus_mapping(cpu,a)
-    if m != null
-        m.device match
-            Sai | Dma1 | Dma2 | Dmamux -> sai_dma_write(cpu,m.device,a,a - m.base,width,x,n)
-            Dsi -> dsi_write(cpu,a,a - m.base,width,x,n)
-            Sdmmc -> sdmmc_write(cpu,a,a - m.base,width,x,n)
-            H7Spi | Stm32Gpio -> storage_write(cpu,m.device,a,a - m.base,width,x,n)
-            H7Rcc -> h7_rcc_write(cpu,a,a - m.base,width,x)
-            Console -> console_write(cpu, a, a - m.base, x)
-            DigitalAudio -> digital_write(cpu, a, a - m.base, width, x, n)
-            Pwm -> pwm_write(cpu, a, a - m.base, width, x, n)
-            Spi -> spi_write(cpu, a, a - m.base, width, x, n)
-            I2c -> i2c_write(cpu, a, a - m.base, width, x, n)
-            Adc -> adc_write(cpu, a, a - m.base, width, x, n)
-            PanelGpio -> panel_write(cpu, a, a - m.base, width, x, n)
-            Sio -> sio_write(&machine.devices.sio, cpu, a, a - m.base, x)
-            d -> rp_write(cpu, d, a, a - m.base, width, x, n)
+    val bus = &machine.devices.bus
+    val i = bus_mapping(cpu,a)
+    if i < bus.attached
+        bus.windows[i].write(cpu, a, a - bus.mapped[i].base, width, x, n)
         return
 
     halt(cpu, Stop.Unmapped, a)
