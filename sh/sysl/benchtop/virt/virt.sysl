@@ -90,23 +90,6 @@ const ENDED: u32 = 2
 // CTRL's bit, which enables the console's interrupt.
 const RX_INTERRUPT: u32 = 1
 
-// The SIO's registers, from its base.
-const CPUID: u32 = 0x00
-const FIFO_ST: u32 = 0x50
-const FIFO_WR: u32 = 0x54
-const FIFO_RD: u32 = 0x58
-const SPINLOCK_ST: u32 = 0x5C
-const SPINLOCK0: u32 = 0x100
-const SPINLOCK31: u32 = 0x17C
-
-// FIFO_ST bits.
-const VLD: u32 = 1
-const RDY: u32 = 2
-const WOF: u32 = 4
-const ROE: u32 = 8
-
-const FIFO_DEPTH: u32 = 8
-
 /** A device on the cores' bus: what it is, the addresses it answers, `base` to `last`, and the IRQs
  * it raises, in the order its description gives them, -1 past the last.
  */
@@ -242,21 +225,6 @@ console() -> Console
     val typed = channel(slots.view())
     Console(Mutex.new(slots), typed, 0, Mutex.new(console_live()))
 
-// The boot ROM's place in the launch sequence, 0 to 5, and the VTOR and SP it has taken.
-var step = 0
-var sent: [2]u32
-// Core k's RX FIFO, a ring that core 1 - k pushes to and core k pops from: `pushed[k]` and
-// `popped[k]` count the words each side has moved, so it holds `pushed[k] - popped[k]` of them, from
-// `fifo[k][popped[k] % 8]`. Each count is written by its own side alone and read by the other with
-// acquire, after a release, which is what makes the ring safe with the cores on two threads: a
-// single-producer single-consumer queue with no lock. `fifo_errors[k]` is core k's WOF and ROE, which
-// only core k sets and clears.
-var fifo: [2][8]u32
-var pushed: [2]u32
-var popped: [2]u32
-var fifo_errors: [2]u32
-// Bit k set while spinlock k is claimed; claimed and released with atomic operations.
-var locks: u32 = 0
 
 // Ready the console with an empty input, its output going to the host, and its interrupt off.
 open_console()
@@ -438,14 +406,7 @@ boot(cpu: *Cpu, image: []const u8)
     memory.attach_memory(second, machine.memory)
     clear(second, 0)
     configure(second, machine.configs[1])
-    step = 0
-
-    for k in 0..<2
-        pushed[k] = 0
-        popped[k] = 0
-        fifo_errors[k] = 0
-
-    locks = 0
+    machine.devices.sio = sio_state()
     reset_scheduler()
     boot_sai_dma()
     boot_dsi()
@@ -520,10 +481,7 @@ private stopped(cpu: *Cpu, why: string) -> string
 // the core's VLD, WOF or ROE is set, and the timer's alarms' while they are raised at its clock.
 private[virt] signal(cpu: *Cpu)
     if console_raising() then raise(cpu, u32(console_irq()))
-
-    val k = core_of(cpu)
-
-    if fifo_irq() >= 0 && (waiting_in(k) > 0 || fifo_errors[k] != 0) then raise(cpu, u32(fifo_irq()))
+    if fifo_irq() >= 0 && sio_raising(&machine.devices.sio, cpu) then raise(cpu, u32(fifo_irq()))
     signal_rp(cpu)
     signal_sai_dma(cpu)
     signal_dsi(cpu)
@@ -532,12 +490,6 @@ private[virt] signal(cpu: *Cpu)
     signal_panel(cpu)
     signal_adc(cpu)
     signal_rtcs(cpu)
-
-// ---------------------------------------------------------------------------------------------------
-// The SIO.
-
-// The core that made an access: 1 for core 1, 0 for core 0.
-private core_of(cpu: *Cpu) -> int = if cpu == core1() then 1 else 0
 
 // Each core's bus is the machine it is part of.
 impl Bus for Machine
@@ -563,7 +515,7 @@ board_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
             I2c -> i2c_read(cpu, a, a - m.base, width, n)
             Adc -> adc_read(cpu, a, a - m.base, width, n)
             PanelGpio -> panel_read(cpu, a, a - m.base, width, n)
-            Sio -> sio_read(cpu, a, a - m.base)
+            Sio -> sio_read(&machine.devices.sio, cpu, a, a - m.base)
             d -> rp_read(cpu, d, a, a - m.base, width, n)
 
     halt(cpu, Stop.Unmapped, a)
@@ -585,7 +537,7 @@ board_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
             I2c -> i2c_write(cpu, a, a - m.base, width, x, n)
             Adc -> adc_write(cpu, a, a - m.base, width, x, n)
             PanelGpio -> panel_write(cpu, a, a - m.base, width, x, n)
-            Sio -> sio_write(cpu, a, a - m.base, x)
+            Sio -> sio_write(&machine.devices.sio, cpu, a, a - m.base, x)
             d -> rp_write(cpu, d, a, a - m.base, width, x, n)
         return
 
@@ -595,120 +547,6 @@ board_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
 private[virt] mapped_irq(ds: []const Mapped, d: Device) -> (bool, int)
     for m in ds do if m.device == d then return (true, m.irqs[0])
     (false, -1)
-
-// Spinlock k's bit, for a register that is one of the spinlocks; 0 for any other.
-private lock_bit(o: u32) -> u32
-    if o < SPINLOCK0 || o > SPINLOCK31 || o & 3 != 0 then return 0
-
-    1 << ((o - SPINLOCK0) >> 2)
-
-// The SIO's half of an access to address `a`, register `o` from its base.
-private sio_read(cpu: *Cpu, a: u32, o: u32) -> u32
-    val k = core_of(cpu)
-    val bit = lock_bit(o)
-
-    if bit != 0 then return claim(bit)
-
-    o match
-        CPUID -> u32(k)
-        FIFO_ST -> fifo_status(k)
-        FIFO_WR -> 0
-        FIFO_RD ->
-            if waiting_in(k) == 0
-                fifo_errors[k] |= ROE
-                return 0
-
-            pop(k)
-        SPINLOCK_ST -> atomic_load(&locks, Relaxed)
-        _ ->
-            halt(cpu, Stop.Unmapped, a)
-            0
-
-private sio_write(cpu: *Cpu, a: u32, o: u32, x: u32)
-    val k = core_of(cpu)
-    val bit = lock_bit(o)
-
-    if bit != 0
-        // Release: what the core wrote while it held the lock is seen by the next core to claim it.
-        atomic_and(&locks, ~bit, Release)
-        return
-
-    o match
-        FIFO_ST -> fifo_errors[k] &= ~(x & (WOF | ROE))
-        FIFO_WR ->
-            if k == 0 && !scheduler.launched
-                boot_rom(cpu, x)
-            else if push(1 - k, x)
-                if scheduler.threaded && fifo_irq() >= 0 then wake_core(1 - k, u32(fifo_irq()))
-            else
-                fifo_errors[k] |= WOF
-        CPUID | FIFO_RD | SPINLOCK_ST -> ()
-        _ -> halt(cpu, Stop.Unmapped, a)
-
-// Claim the spinlock whose bit is `bit`: answer the bit, having claimed it, if it was free, and 0 if
-// it was already claimed. One atomic test-and-set, so of two cores claiming at once exactly one
-// gets it; acquire, so the claimer sees what the last holder wrote. A claimed lock is first read, to
-// leave its word alone while it is spun on.
-private claim(bit: u32) -> u32
-    if atomic_load(&locks, Relaxed) & bit != 0 then return 0
-    if atomic_or(&locks, bit, Acquire) & bit != 0 then return 0
-
-    bit
-
-private fifo_status(k: int) -> u32
-    var st = fifo_errors[k]
-
-    if waiting_in(k) > 0 then st |= VLD
-    if (k == 0 && !scheduler.launched) || room_in(1 - k) then st |= RDY
-    st
-
-// The words in core k's RX FIFO, as core k, its consumer, sees them.
-private[virt] waiting_in(k: int) -> u32 = atomic_load(&pushed[k], Acquire) - atomic_load(&popped[k], Relaxed)
-
-// Whether core k's RX FIFO has room, as its producer sees it.
-private room_in(k: int) -> bool = atomic_load(&pushed[k], Relaxed) - atomic_load(&popped[k], Acquire) < FIFO_DEPTH
-
-// Push `x` to core k's RX FIFO, answering whether it had room. The word is in its slot before the
-// release that counts it.
-private push(k: int, x: u32) -> bool
-    if !room_in(k) then return false
-
-    val p = atomic_load(&pushed[k], Relaxed)
-
-    fifo[k][p % FIFO_DEPTH] = x
-    atomic_store(&pushed[k], p + 1, Release)
-    true
-
-// Pop core k's RX FIFO, which holds a word. The word is read before the release that frees its slot.
-private pop(k: int) -> u32
-    val q = atomic_load(&popped[k], Relaxed)
-    val x = fifo[k][q % FIFO_DEPTH]
-
-    atomic_store(&popped[k], q + 1, Release)
-    x
-
-// Core 1's boot ROM taking word `w` from core 0: it echoes it, and follows the launch sequence 0, 0,
-// 1, VTOR, SP, ENTRY. Zeros at its start keep the last two; any other word out of place starts it
-// again. VTOR, SP and ENTRY may be any word. The echo of ENTRY is the last, and core 1 starts after it.
-private boot_rom(cpu: *Cpu, w: u32)
-    push(0, w)
-
-    if step < 2
-        step = if w == 0 then step + 1 else 0
-        return
-
-    if step == 2
-        step = if w == 1 then 3 else if w == 0 then 2 else 0
-        return
-
-    if step < 5
-        sent[step - 3] = w
-        step += 1
-        return
-
-    step = 0
-    launch(sent[0], sent[1], w)
-    set_limit(cpu, 0)
 
 private[virt] cpu_models_differ() -> bool
     val (a, b) = (machine.configs[0], machine.configs[1])

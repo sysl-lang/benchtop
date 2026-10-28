@@ -1,0 +1,171 @@
+module sh.sysl.benchtop.virt
+
+// The SIO (`virt-sio`): the two cores' FIFOs, the spinlocks and core 1's boot ROM, which answer each
+// core by which one made the access. virt.sysl's header gives the registers and how core 1 is
+// launched. Its state is `Machine.devices.sio`, which `boot` resets.
+
+import sh.sysl.benchtop.v6m.{Cpu, Stop, halt, set_limit}
+import sysl.sync.*
+
+// The SIO's registers, from its base.
+const CPUID: u32 = 0x00
+const FIFO_ST: u32 = 0x50
+const FIFO_WR: u32 = 0x54
+const FIFO_RD: u32 = 0x58
+const SPINLOCK_ST: u32 = 0x5C
+const SPINLOCK0: u32 = 0x100
+const SPINLOCK31: u32 = 0x17C
+
+// FIFO_ST bits.
+const VLD: u32 = 1
+const RDY: u32 = 2
+const WOF: u32 = 4
+const ROE: u32 = 8
+
+const FIFO_DEPTH: u32 = 8
+
+/** The SIO's state.
+ *
+ * Core k's RX FIFO is a ring that core 1 - k pushes to and core k pops from: `pushed[k]` and
+ * `popped[k]` count the words each side has moved, so it holds `pushed[k] - popped[k]` of them, from
+ * `fifo[k][popped[k] % 8]`. Each count is written by its own side alone and read by the other with
+ * acquire, after a release, which is what makes the ring safe with the cores on two threads: a
+ * single-producer single-consumer queue with no lock. `errors[k]` is core k's WOF and ROE, which only
+ * core k sets and clears. `locks` has bit k set while spinlock k is claimed, claimed and released
+ * with atomic operations. `step` is the boot ROM's place in the launch sequence, 0 to 5, and `sent`
+ * the VTOR and SP it has taken; only core 0 reaches them, before core 1 runs.
+ */
+struct SioState
+    fifo: [2][8]u32
+    pushed: [2]u32
+    popped: [2]u32
+    errors: [2]u32
+    locks: u32
+    step: int
+    sent: [2]u32
+
+/** An SIO as at power-on: both FIFOs empty, no error, every spinlock free, the boot ROM waiting. */
+sio_state() -> SioState = SioState([[0; 8]; 2], [0, 0], [0, 0], [0, 0], 0, 0, [0, 0])
+
+// The core that made an access: 1 for core 1, 0 for core 0.
+private core_of(cpu: *Cpu) -> int = if cpu == core1() then 1 else 0
+
+// Spinlock k's bit, for a register that is one of the spinlocks; 0 for any other.
+private lock_bit(o: u32) -> u32
+    if o < SPINLOCK0 || o > SPINLOCK31 || o & 3 != 0 then return 0
+
+    1 << ((o - SPINLOCK0) >> 2)
+
+// The SIO's half of an access to address `a`, register `o` from its base.
+private[virt] sio_read(s: *SioState, cpu: *Cpu, a: u32, o: u32) -> u32
+    val k = core_of(cpu)
+    val bit = lock_bit(o)
+
+    if bit != 0 then return claim(s, bit)
+
+    o match
+        CPUID -> u32(k)
+        FIFO_ST -> fifo_status(s, k)
+        FIFO_WR -> 0
+        FIFO_RD ->
+            if waiting_in(s, k) == 0
+                s.errors[k] |= ROE
+                return 0
+
+            pop(s, k)
+        SPINLOCK_ST -> atomic_load(&s.locks, Relaxed)
+        _ ->
+            halt(cpu, Stop.Unmapped, a)
+            0
+
+private[virt] sio_write(s: *SioState, cpu: *Cpu, a: u32, o: u32, x: u32)
+    val k = core_of(cpu)
+    val bit = lock_bit(o)
+
+    if bit != 0
+        // Release: what the core wrote while it held the lock is seen by the next core to claim it.
+        atomic_and(&s.locks, ~bit, Release)
+        return
+
+    o match
+        FIFO_ST -> s.errors[k] &= ~(x & (WOF | ROE))
+        FIFO_WR ->
+            if k == 0 && !scheduler.launched
+                boot_rom(s, cpu, x)
+            else if push(s, 1 - k, x)
+                if scheduler.threaded && fifo_irq() >= 0 then wake_core(1 - k, u32(fifo_irq()))
+            else
+                s.errors[k] |= WOF
+        CPUID | FIFO_RD | SPINLOCK_ST -> ()
+        _ -> halt(cpu, Stop.Unmapped, a)
+
+// Whether the FIFO's interrupt is raised in core `cpu`: its VLD, WOF or ROE is set.
+private[virt] sio_raising(s: *SioState, cpu: *Cpu) -> bool
+    val k = core_of(cpu)
+
+    waiting_in(s, k) > 0 || s.errors[k] != 0
+
+// Claim the spinlock whose bit is `bit`: answer the bit, having claimed it, if it was free, and 0 if
+// it was already claimed. One atomic test-and-set, so of two cores claiming at once exactly one
+// gets it; acquire, so the claimer sees what the last holder wrote. A claimed lock is first read, to
+// leave its word alone while it is spun on.
+private claim(s: *SioState, bit: u32) -> u32
+    if atomic_load(&s.locks, Relaxed) & bit != 0 then return 0
+    if atomic_or(&s.locks, bit, Acquire) & bit != 0 then return 0
+
+    bit
+
+private fifo_status(s: *SioState, k: int) -> u32
+    var st = s.errors[k]
+
+    if waiting_in(s, k) > 0 then st |= VLD
+    if (k == 0 && !scheduler.launched) || room_in(s, 1 - k) then st |= RDY
+    st
+
+// The words in core k's RX FIFO, as core k, its consumer, sees them.
+private waiting_in(s: *SioState, k: int) -> u32 = atomic_load(&s.pushed[k], Acquire) - atomic_load(&s.popped[k], Relaxed)
+
+// Whether core k's RX FIFO has room, as its producer sees it.
+private room_in(s: *SioState, k: int) -> bool = atomic_load(&s.pushed[k], Relaxed) - atomic_load(&s.popped[k], Acquire) < FIFO_DEPTH
+
+// Push `x` to core k's RX FIFO, answering whether it had room. The word is in its slot before the
+// release that counts it.
+private push(s: *SioState, k: int, x: u32) -> bool
+    if !room_in(s, k) then return false
+
+    val p = atomic_load(&s.pushed[k], Relaxed)
+
+    s.fifo[k][p % FIFO_DEPTH] = x
+    atomic_store(&s.pushed[k], p + 1, Release)
+    true
+
+// Pop core k's RX FIFO, which holds a word. The word is read before the release that frees its slot.
+private pop(s: *SioState, k: int) -> u32
+    val q = atomic_load(&s.popped[k], Relaxed)
+    val x = s.fifo[k][q % FIFO_DEPTH]
+
+    atomic_store(&s.popped[k], q + 1, Release)
+    x
+
+// Core 1's boot ROM taking word `w` from core 0: it echoes it, and follows the launch sequence 0, 0,
+// 1, VTOR, SP, ENTRY. Zeros at its start keep the last two; any other word out of place starts it
+// again. VTOR, SP and ENTRY may be any word. The echo of ENTRY is the last, and core 1 starts after it.
+private boot_rom(s: *SioState, cpu: *Cpu, w: u32)
+    push(s, 0, w)
+
+    if s.step < 2
+        s.step = if w == 0 then s.step + 1 else 0
+        return
+
+    if s.step == 2
+        s.step = if w == 1 then 3 else if w == 0 then 2 else 0
+        return
+
+    if s.step < 5
+        s.sent[s.step - 3] = w
+        s.step += 1
+        return
+
+    s.step = 0
+    launch(s.sent[0], s.sent[1], w)
+    set_limit(cpu, 0)
