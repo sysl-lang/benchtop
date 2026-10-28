@@ -105,26 +105,51 @@ write(c: &Controller, offset: u32, value: u32) -> bool
         _ -> return false
     true
 
-// Exactly one peripheral request/beat. Bus failure leaves NDTR unchanged and
-// raises TEIF. A caller must gate requests using the peripheral's request line.
-request(c: &Controller, stream: usize, read_bus: BusRead, write_bus: BusWrite) -> bool
+/** One beat's bus transfer: `width` bytes read at `source` and written to `target`. */
+struct Beat
+    source: u32
+    target: u32
+    width: u32
+
+/** Whether both ends of `b` are aligned to its width; a misaligned beat is a bus failure. */
+aligned(b: Beat) -> bool = b.source % b.width == 0 && b.target % b.width == 0
+
+/** The bits of a `width`-byte value. */
+width_mask(width: u32) -> u32 = if width == 4 then 0xffffffff else (1u32 << (width * 8)) - 1
+
+/** The transfer the next beat of `stream` makes, or None while the stream is disabled or has
+ * nothing left to move. It changes nothing: `finish_beat` retires the beat once the bus has made it.
+ */
+next_beat(c: &Controller, stream: usize) -> Option[Beat]
     require stream < 8, "DMA stream index"
     val s = &c.streams[stream]
-    if s.cr & ENABLE == 0 || s.ndtr == 0 then return false
+    if s.cr & ENABLE == 0 || s.ndtr == 0 then return None
     val width = 1u32 << ((s.cr >> 11) & 3)
     val base = if s.cr & CURRENT_TARGET != 0 && s.cr & DOUBLE_BUFFER != 0 then s.m1ar else s.m0ar
     val memory = base + (if s.cr & (1 << 10) != 0 then s.done * width else 0)
     val peripheral = s.par + (if s.cr & (1 << 9) != 0 then s.done * (if s.cr & (1 << 15) != 0 then 4 else width) else 0)
     val sending = s.cr & (1 << 6) != 0
-    val source = if sending then memory else peripheral
-    val target = if sending then peripheral else memory
-    var ok = source % width == 0 && target % width == 0
-    if ok
-        (read_bus)(source,width) match
-            Some(value) ->
-                val mask: u32 = if width == 4 then 0xffffffff else (1u32 << (width * 8)) - 1
-                ok = (write_bus)(target,width,value & mask)
-            None -> ok = false
+    Some(Beat(if sending then memory else peripheral, if sending then peripheral else memory, width))
+
+// Exactly one peripheral request/beat. Bus failure leaves NDTR unchanged and
+// raises TEIF. A caller must gate requests using the peripheral's request line.
+request(c: &Controller, stream: usize, read_bus: BusRead, write_bus: BusWrite) -> bool
+    next_beat(c,stream) match
+        None -> false
+        Some(b) ->
+            var ok = aligned(b)
+            if ok
+                (read_bus)(b.source,b.width) match
+                    Some(value) -> ok = (write_bus)(b.target,b.width,value & width_mask(b.width))
+                    None -> ok = false
+            finish_beat(c,stream,ok)
+
+/** Retire the beat `next_beat` answered for `stream`, which the bus made (`ok`) or failed: a failure
+ * leaves NDTR unchanged, raises TEIF and disables the stream. Answers `ok`.
+ */
+finish_beat(c: &Controller, stream: usize, ok: bool) -> bool
+    require stream < 8, "DMA stream index"
+    val s = &c.streams[stream]
     if !ok
         c.flags[stream] |= TRANSFER_ERROR
         s.cr &= ~ENABLE
