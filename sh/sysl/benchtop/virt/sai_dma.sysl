@@ -3,7 +3,8 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.{Board,param_named}
 import sh.sysl.benchtop.peripheral.sai as sai
 import sh.sysl.benchtop.peripheral.dma as dma
-import sh.sysl.benchtop.v6m.{Cpu,Stop,NEVER,halt,lower_limit}
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.benchtop.v6m.{Cpu,Stop,halt,lower_limit}
 import sh.sysl.benchtop.v6m as memory
 import sysl.buf.{Buf,buf}
 import sysl.threads.Mutex
@@ -75,17 +76,30 @@ private audio_live(hz: u64, kernel: u64, sai_present: bool) -> AudioLive
         [ring(output,SaiPacket(0,0,0,0,0,0)),ring(output,SaiPacket(0,0,0,0,0,0))], [0,0], [0,0],
         [ring(input,0u32),ring(input,0u32)], [false,false], [0,0], [0,0], false)
 
+// The DMAMUX1 request lines of SAI1's blocks (RM0399, table "DMAMUX1: assignment of multiplexer
+// inputs to resources"), which a board's `request-a`/`request-b` replace.
+private const DMAMUX_SAI1_A: u32 = 87
+private const DMAMUX_SAI1_B: u32 = 88
+
 /** No SAI, DMA or DMAMUX on the bus. */
 audio_state() -> AudioState =
-    AudioState(false, [false,false], false, 0, [87,88], [-1;17], NEVER, 0, 0, Mutex.new(AudioLive([sai.block(),sai.block()],
+    AudioState(false, [false,false], false, 0, [DMAMUX_SAI1_A,DMAMUX_SAI1_B], [-1;17], NEVER, 0, 0, Mutex.new(AudioLive([sai.block(),sai.block()],
         [dma.controller(),dma.controller()], dma.mux(), 0, [0,0], [buf(),buf()], [0,0], [0,0], [buf(),buf()], [false,false], [0,0], [0,0], false)))
 
 private audio_cpu(s: *AudioLive) -> *Cpu = if s.core == 0 then core0() else core1()
 
-// The SAI and DMA `b` makes on a chip whose clock is `clock_hz`.
-private[virt] check_audio(b: Board, clock_hz: u64) -> Result[AudioState,string]
+// The SAI and DMA `b` makes on a chip whose clock is `clock_hz`, with the DMA controllers where
+// `mapped` puts them: which controller each is was read once, into its device.
+private[virt] check_audio(b: Board, mapped: []const Mapped, clock_hz: u64) -> Result[AudioState,string]
     var s = audio_state()
-    var kernel: u64 = 12288000
+    for m in mapped
+        val index: usize = m.device match
+            Dma1 -> 0
+            Dma2 -> 1
+            _ -> continue
+        s.dma_present[index] = true
+        for k in 0..<8 do if m.irqs[k] >= 0 then s.irq_routes[1 + index * 8 + k] = m.irqs[k]
+    var kernel = sai.DEFAULT_KERNEL_HZ
     for p in b.chip.peripherals
         if p.kind == "stm32-sai"
             if s.sai_present then return Err("one STM32 SAI instance is currently supported")
@@ -100,18 +114,9 @@ private[virt] check_audio(b: Board, clock_hz: u64) -> Result[AudioState,string]
                         elif q.name == "request-a" then s.requests[0] = u32(n)
                         elif q.name == "request-b" then s.requests[1] = u32(n)
                     _ -> ()
-        elif p.kind == "stm32-dma"
-            var index: usize = 0
-            param_named(p.params,"controller") match
-                Some(q) -> q.value match
-                    Whole(n) -> index = usize(n - 1)
-                    _ -> ()
-                None -> ()
-            s.dma_present[index] = true
-            for k in 0..<p.irqs.len() do s.irq_routes[1 + index * 8 + k] = int(p.irqs.at(k).n)
         elif p.kind == "stm32-dmamux" then s.mux_present = true
     if s.requests[0] == s.requests[1] then return Err("SAI A and B need distinct DMA request IDs")
-    s.live = Mutex.new(audio_live(if clock_hz == 0 then 480000000 else clock_hz,kernel,s.sai_present))
+    s.live = Mutex.new(audio_live(if clock_hz == 0 then sai.DEFAULT_HZ else clock_hz,kernel,s.sai_present))
     Ok(s)
 
 private[virt] boot_sai_dma()
@@ -182,7 +187,7 @@ private output_word(s: *AudioLive, block: usize, slot: u32, word: u32)
 private data_block(address: u32) -> int
     val d = &machine.devices.audio
     if !d.sai_present then return -1
-    if address == d.sai_at + 0x20 then 0 elif address == d.sai_at + 0x40 then 1 else -1
+    if address == d.sai_at + sai.data_register(0) then 0 elif address == d.sai_at + sai.data_register(1) then 1 else -1
 
 private audio_bus_read(s: *AudioLive, address: u32, width: u32) -> Option[u32]
     val block = data_block(address)
@@ -236,7 +241,7 @@ private input_slot(s: *AudioLive, block: usize, slot: u32) -> u32
     val source = if s.debug_input[block] then None else codec_input_word(block,slot,sai.slots(b),sai.sample_bits(b))
     source match
         Some(word) -> word
-        None -> if (b.slotr >> 16) & (1u32 << slot) != 0 then input_word(s,block) else 0
+        None -> if sai.slot_enabled(b,slot) then input_word(s,block) else 0
 
 private audio_slot(s: *AudioLive, block: usize, slot: u32, word: u32, time: u64) -> u32
     val b = s.blocks[block]
@@ -246,7 +251,7 @@ private audio_slot(s: *AudioLive, block: usize, slot: u32, word: u32, time: u64)
     else output_word(s,block,slot,word)
     val peer = 1 - block
     val other = s.blocks[peer]
-    if sai.enabled(other) && (other.cr1 >> 10) & 3 == 1
+    if sai.enabled(other) && sai.synchronous(other.cr1)
         other.time = time
         val sample = if sai.receiving(other) then input_slot(s,peer,other.slot) else 0
         val peer_slot = other.slot
@@ -331,7 +336,7 @@ private[virt] sai_dma_wake(c: *Cpu) -> u64
     sai_dma_due_for(c)
 
 private valid_audio_access(device: Device, offset: u32, width: u32) -> bool
-    if device == Device.Sai && (offset == 0x20 || offset == 0x40) then return width == 1 || width == 2 || width == 4
+    if device == Device.Sai && (offset == sai.data_register(0) || offset == sai.data_register(1)) then return width == 1 || width == 2 || width == 4
     width == 4 && offset & 3 == 0
 
 private audio_register_read(s: *AudioLive, device: Device, offset: u32) -> Option[u32] = device match
@@ -339,8 +344,8 @@ private audio_register_read(s: *AudioLive, device: Device, offset: u32) -> Optio
     Dma2 -> dma.read(s.units[1],offset)
     Dmamux -> dma.read_mux(s.mux,offset)
     Sai ->
-        if offset == 0 || offset == 0x44 || offset == 0x48 then Some(0)
-        elif offset >= 4 && offset <= 0x40 then sai.read(s.blocks[if offset < 0x24 then 0 else 1],(offset - 4) % 32)
+        if sai.global_register(offset) then Some(0)
+        elif sai.block_index(offset) >= 0 then sai.read(s.blocks[usize(sai.block_index(offset))],sai.block_register(offset))
         else None
     _ -> None
 
@@ -349,13 +354,13 @@ private audio_register_write(s: *AudioLive, device: Device, offset: u32, value: 
     Dma2 -> dma.write(s.units[1],offset,value)
     Dmamux -> dma.write_mux(s.mux,offset,value)
     Sai ->
-        if offset == 0 || offset == 0x44 || offset == 0x48 then value == 0
-        elif offset >= 4 && offset <= 0x40
-            val index: usize = if offset < 0x24 then 0 else 1
-            val reg = (offset - 4) % 32
+        if sai.global_register(offset) then value == 0
+        elif sai.block_index(offset) >= 0
+            val index = usize(sai.block_index(offset))
+            val reg = sai.block_register(offset)
             val b = s.blocks[index]
             // Internal synchronous blocks must use the driving block's frame.
-            if reg == 0 && value & sai.ENABLE != 0 && (value >> 10) & 3 == 1
+            if reg == sai.CR1 && value & sai.ENABLE != 0 && sai.synchronous(value)
                 val peer = s.blocks[1 - index]
                 if b.frcr != peer.frcr || sai.slots(b) != sai.slots(peer) then return false
             sai.write(b,reg,value)
@@ -366,7 +371,7 @@ private audio_register_write(s: *AudioLive, device: Device, offset: u32, value: 
 // access ended with the DMA serviced and the state published, no slot is due by `time`, the DMA has
 // nothing left to move, and the register is not a data register, whose read takes from the FIFO.
 private quiet_audio_read(s: *AudioLive, device: Device, offset: u32, time: u64) -> bool =
-    s.settled && time < audio_event(s) && !(device == Device.Sai && (offset == 0x20 || offset == 0x40))
+    s.settled && time < audio_event(s) && !(device == Device.Sai && (offset == sai.data_register(0) || offset == sai.data_register(1)))
 
 private[virt] sai_dma_read(c: *Cpu, device: Device, address: u32, offset: u32, width: u32, n: u64) -> u32
     if !valid_audio_access(device,offset,width)
