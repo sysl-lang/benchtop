@@ -1,0 +1,284 @@
+module sh.sysl.benchtop.virt
+
+// A front end's session on the board: the run controller (restart, advance, pause, stop-to-status)
+// and the board's input model (what each part's control is doing, and the pin levels and voltages
+// that follow from it). The desktop, headless runs and tests all drive the board through it, so none
+// of them needs to know which core the board has or how its parts are wired.
+
+import sh.sysl.benchtop.{Part, part_flag, part_whole, param_named}
+import sh.sysl.benchtop.v6m.Stop
+import sysl.buf.{Buf, buf}
+import sysl.sync.*
+
+/** A control's position: hundredths of a percent of its travel. */
+const POSITION_MAX: int = 10000
+/** Where a sprung control (a joystick axis) rests. */
+const POSITION_CENTRE: int = 5000
+
+/** The guest clock a session paces itself against, when the board does not name one. */
+const TOUCH_HZ: u64 = 12000000
+const FALLBACK_HZ: u64 = 1200000
+/** The instructions a frame of an unpaced session gives the guest. */
+const FALLBACK_BUDGET: u64 = 20000
+
+/** What the session is doing, as the desktop shows it. */
+enum RunStatus derives Eq
+    Preview
+    Running
+    Paused
+    Waiting
+    WaitingForBuild
+    Breakpoint
+    Exit(code: int)
+    ResetRequest
+    Fault
+
+impl RunStatus
+    label(self) -> string = self match
+        Preview -> "LAYOUT PREVIEW"
+        Running -> "RUNNING"
+        Paused -> "PAUSED"
+        Waiting -> "WAITING"
+        WaitingForBuild -> "WAITING FOR BUILD"
+        Breakpoint -> "BREAKPOINT"
+        Exit(code) -> s"EXIT $code"
+        ResetRequest -> "RESET REQUEST"
+        Fault -> "GUEST FAULT"
+
+/** The state of one part's control. A part with no control is `Inert`. */
+enum PartInput derives Eq
+    Inert
+    Pressed(down: bool)
+    Closed(on: bool)
+    Position(at: int)
+    Axes(x: int, y: int)
+
+/** Which clock paces an interactive session: the board's own, its sound peripheral's, the touch
+ * clock for a board with a touch screen, or a fixed slice per frame.
+ */
+enum PacingSource derives Eq
+    BoardClock(hz: u64)
+    SoundClock(hz: u64)
+    TouchClock
+    Fixed
+
+impl PacingSource
+    hz(self) -> u64 = self match
+        BoardClock(hz) -> hz
+        SoundClock(hz) -> hz
+        TouchClock -> TOUCH_HZ
+        Fixed -> FALLBACK_HZ
+
+/** The pacing source for the loaded board; `touch` says whether its view binds a touch screen. */
+pacing_source(touch: bool) -> PacingSource =
+    if clock_hz() != 0 then PacingSource.BoardClock(clock_hz())
+    elif sound_available() then PacingSource.SoundClock(sound_clock_hz())
+    elif touch then PacingSource.TouchClock
+    else PacingSource.Fixed
+
+struct Session
+    parts: Buf[Part]
+    chip: string
+    inputs: Buf[PartInput]
+    live: bool
+    paused: bool
+    stopped: bool
+    status: RunStatus
+    message: string
+    background: bool
+    pc: u32
+    instructions: u64
+
+private clamp_position(at: int) -> int = if at < 0 then 0 elif at > POSITION_MAX then POSITION_MAX else at
+
+private written(p: Part, key: string, fallback: string) -> string = param_named(p.params, key) match
+    Some(param) -> param.value match
+        Text(value) -> value
+        _ -> fallback
+    None -> fallback
+
+private resting(p: Part) -> PartInput = p.kind match
+    "button" -> PartInput.Pressed(false)
+    "switch" -> PartInput.Closed(part_flag(p, "closed", false))
+    "potentiometer" -> PartInput.Position(clamp_position(int(part_whole(p, "position", 50)) * 100))
+    "joystick" -> PartInput.Axes(POSITION_CENTRE, POSITION_CENTRE)
+    _ -> PartInput.Inert
+
+/** A session over `parts` on `chip`; a session that is not `live` only previews the layout. */
+session(parts: Buf[Part], chip: string, live: bool) -> &Session
+    var inputs: Buf[PartInput] = buf()
+    for p in parts do inputs.push(resting(p))
+    Session(parts = parts, chip = chip, inputs = inputs, live = live, paused = false, stopped = false,
+        status = if live then RunStatus.Running else RunStatus.Preview, message = "", background = false, pc = 0, instructions = 0)
+
+impl Session
+    private index(&self, name: string) -> Option[usize]
+        for i in 0..<self.parts.len() do if self.parts.at(i).name == name then return Some(i)
+        None
+
+    /** What the named part's control is doing; `Inert` for a part with none. */
+    part_input(&self, name: string) -> PartInput = self.index(name) match
+        Some(i) -> self.inputs.at(i)
+        None -> PartInput.Inert
+
+    /** Set the named part's control. A position is held to the control's travel. */
+    set_part_input(&self, name: string, input: PartInput)
+        val i = self.index(name) match
+            Some(i) -> i
+            None -> return
+        self.inputs.set(i, input match
+            Position(at) -> PartInput.Position(clamp_position(at))
+            Axes(x, y) -> PartInput.Axes(clamp_position(x), clamp_position(y))
+            other -> other)
+
+    /** A potentiometer's position. */
+    position(&self, name: string) -> int = self.part_input(name) match
+        Position(at) -> at
+        _ -> 0
+
+    /** A joystick's two axes; centred for any other part. */
+    axes(&self, name: string) -> (int, int) = self.part_input(name) match
+        Axes(x, y) -> (x, y)
+        _ -> (POSITION_CENTRE, POSITION_CENTRE)
+
+    closed(&self, name: string) -> bool = self.part_input(name) match
+        Closed(on) -> on
+        _ -> false
+
+    pressed(&self, name: string) -> bool = self.part_input(name) match
+        Pressed(down) -> down
+        _ -> false
+
+    toggle(&self, name: string) = self.set_part_input(name, PartInput.Closed(!self.closed(name)))
+
+    /** Let go of every button; switches and knobs stay where they were put. */
+    release_buttons(&self)
+        for i in 0..<self.inputs.len()
+            if self.inputs.at(i) == PartInput.Pressed(true) then self.inputs.set(i, PartInput.Pressed(false))
+
+    /** Drive the board's input pins and analogue sources from the parts' controls. */
+    apply_inputs(&self)
+        if !self.live then return
+        var levels: u32 = 0xFFFFFFFF
+        for i in 0..<self.parts.len()
+            val closed = self.inputs.at(i) match
+                Pressed(down) -> down
+                Closed(on) -> on
+                _ -> continue
+            val p = self.parts.at(i)
+            val pin = part_pin(p, self.chip)
+            if pin < 0 then continue
+            val high = if written(p, "active", "low") == "low" then !closed else closed
+            if high then levels |= 1u32 << u32(pin) else levels &= ~(1u32 << u32(pin))
+        panel_inputs(levels)
+        for i in 0..<self.parts.len()
+            val p = self.parts.at(i)
+            self.inputs.at(i) match
+                Axes(x, y) ->
+                    for (axis, at) in [("x", x), ("y", y)]
+                        val pin = terminal_pin(p, axis, self.chip)
+                        if pin >= 0 then set_analog_pin(pin, pot_voltage(p, at))
+                Position(at) ->
+                    val pin = part_pin(p, self.chip)
+                    if pin >= 0 then set_analog_pin(pin, pot_voltage(p, at))
+                _ -> ()
+
+    /** Whether an output part (an LED) is lit by the pin it is wired to. */
+    lit(&self, p: Part) -> bool
+        val pin = part_pin(p, self.chip)
+        if !self.live || pin < 0 || (panel_drive_mask() & (1u32 << u32(pin))) == 0 then return false
+        val high = (panel_levels() & (1u32 << u32(pin))) != 0
+        if written(p, "active", "high") == "low" then !high else high
+
+    /** Boot `image` on the board and run it from the start. */
+    restart(&self, image: []const u8)
+        pause_workers()
+        open_console()
+        capture_bounded(8192)
+        boot(core0(), image)
+        self.release_buttons()
+        self.paused = false
+        self.stopped = false
+        self.status = RunStatus.Running
+        self.message = ""
+        self.instructions = 0
+        self.pc = core0().pc
+
+    /** A live session with nothing to run until a build delivers an image. */
+    await_build(&self)
+        self.stopped = true
+        self.paused = true
+        self.status = RunStatus.WaitingForBuild
+
+    /** Start the board's CPU workers; from then on `advance` observes them rather than running the
+     * cores itself. `parallel` gives each core a thread of its own.
+     */
+    start(&self, parallel: bool, hz: u64) -> Result[unit, string]
+        start_workers(core0(), parallel, hz)?
+        self.background = true
+        Ok(())
+
+    stop(&self) = stop_workers()
+
+    pause(&self)
+        if !self.live || self.stopped then return
+        self.paused = !self.paused
+        if self.background && self.paused then pause_workers()
+
+    /** One frame of the guest: `budget` instructions run here, or, once the workers are started, the
+     * workers paused, resumed or stepped to match. A paused frame advances nothing; `step` runs one
+     * instruction and pauses. Answers the workers' observation when they drive the board.
+     */
+    advance(&self, step: bool = false, budget: u64 = FALLBACK_BUDGET) -> Option[WorkerObservation]
+        self.apply_inputs()
+        if !self.live || self.stopped then return None
+        if self.background then return Some(self.observe_workers(step))
+        if self.paused && !step
+            self.status = RunStatus.Paused
+            return None
+        val c = core0()
+        if !pump_board(c, if step then 1 else budget) then self.halt()
+        self.pc = c.pc
+        self.instructions = c.retired + core1().retired
+        if step then self.paused = true
+        if !self.stopped then self.status = if self.paused then RunStatus.Paused elif c.sleeping then RunStatus.Waiting else RunStatus.Running
+        None
+
+    private observe_workers(&self, step: bool) -> WorkerObservation
+        if step
+            step_workers()
+            self.paused = true
+        elif self.paused then pause_workers()
+        else resume_workers()
+        val snapshot = workers_observe()
+        self.pc = snapshot.cores[0].pc
+        self.instructions = snapshot.cores[0].retired + snapshot.cores[1].retired
+        if !snapshot.running then self.halt()
+        else self.status = if self.paused then RunStatus.Paused elif snapshot.cores[0].sleeping && (!snapshot.launched || snapshot.cores[1].sleeping) then RunStatus.Waiting else RunStatus.Running
+        snapshot
+
+    private halt(&self)
+        self.stopped = true
+        self.paused = true
+        val c = if core0().stop != Stop.Budget then core0() else core1()
+        self.status = c.stop match
+            Breakpoint -> RunStatus.Breakpoint
+            Exit -> RunStatus.Exit(int(c.exit_code))
+            Reset -> RunStatus.ResetRequest
+            _ -> RunStatus.Fault
+        self.message = stop_message(c)
+
+/** The size of the board's backing RAM, in bytes. */
+ram_size() -> usize
+    val mem = machine.memory
+    mem.ram.len
+
+/** A little-endian `width`-byte value at `offset` into the board's backing RAM, read without stopping
+ * the cores; `None` outside it.
+ */
+ram_peek(width: usize, offset: usize) -> Option[u32]
+    val mem = machine.memory
+    if width > 4 || offset + width > mem.ram.len then return None
+    var n: u32 = 0
+    for byte in 0..<width do n |= u32(atomic_load(&mem.ram[offset + byte], Relaxed)) << u32(byte * 8)
+    Some(n)
