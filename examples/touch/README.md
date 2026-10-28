@@ -338,3 +338,11 @@ The Sysl firmware reads two virtual ADC channels and renders an antialiased
 circle with PlutoVG, sending changed pixels through PL022 SPI to the ST7789.
 This board uses the existing virtual ADC register interface, not an RP2350 ADC
 register model. No joystick button is modelled in this first version.
+
+The joystick board also connects maintained switch SW1 to GP8. Click it to
+select an outlined circle; click again for a filled circle. The `switch` part
+models an ideal SPST contact with an external pull resistor: `pin` selects the
+GPIO connection, `active = low` closes to ground (default), `active = high`
+closes to supply, and `closed` sets its initial state. Open contacts read the
+opposite level. Position survives pointer release, focus loss and MCU reset.
+Contact bounce and floating inputs are not modelled.
