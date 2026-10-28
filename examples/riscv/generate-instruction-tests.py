@@ -354,7 +354,7 @@ def emit():
         '- [M extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/m-st-ext.html)',
         '- [C extension](https://docs.riscv.org/reference/isa/v20260120/unpriv/c-st-ext.html)', '']
     products = {
-        OUT/'instructions.bin': bytes(data),
+        ROOT/'testdata/riscv/instructions.bin': bytes(data),
         TEST: ''.join(wrappers).encode(),
         ROOT/'sh/sysl/benchtop/riscv/COVERAGE.md': '\n'.join(matrix).encode(),
     }
