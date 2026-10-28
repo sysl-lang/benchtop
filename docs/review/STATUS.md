@@ -35,7 +35,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#4 | locks guard nothing: `Mutex.new(0)` around separate globals | fixed by slice 3 (`679528a`, `d72cffd`, `a53b6ff`): `Mutex[WorkerControl]`, device state in `Mutex[T]`; the one `Mutex[u64]` owns the board clock it guards |
 | runtime#5 | `assemble` mutates globals before it can still fail | fixed by slices 1–2 (`ce0b959`, `3024687`): `plan` checks everything, the apply step cannot fail |
 | runtime#6 | peripheral kinds and window sizes duplicated; one wrong error message | partly fixed in `013e796` (the duplicate-I2C refusal names both kinds); the kind table and the double `controller` parse remain |
-| runtime#7 | magic register fields where the comments name the field | open |
+| runtime#7 | magic register fields where the comments name the field | fixed in `d013662`: `h7` names RCC_GCR (`sh.sysl.stm32h747.rcc`) and BOOT_C1/C2; the SYNCEN, SLOTEN and A/B block layout live in `peripheral/sai` (`synchronous`, `slot_enabled`, `block_index`, `data_register`); DMAMUX request IDs, default clocks and storage pins are named; `dsi.is_read` replaces the worker's kind test |
 | runtime#8 | hand-rolled ring buffers where `Ring` exists | open |
 | runtime#9 | the DMA bus master is "whichever core last touched audio" | open |
 | runtime#10 | conditional locking keyed on a mutable global | fixed by slice 3 (`d72cffd`): `rp.live` is taken on every access, whichever thread |
@@ -50,7 +50,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#19 | cache-line padding by hand, sized for the wrong machine | fixed in `bb79bea`: `@align(HOST_CACHE_LINE) struct BusCache` (128, Apple silicon's line), held in `Machine.bus_cache` |
 | runtime#20 | sysl idiom (redundant suffixes, hand `min`/`max`, qualified calls) | open |
 | runtime#21 | stale or misleading comments, dead paths | partly fixed (slice 3 deleted `parallel.sysl` and its "legacy" comments); the rest open |
-| peripherals#1 | registers are magic offsets and masks; bitfields never used | open |
+| peripherals#1 | registers are magic offsets and masks; bitfields never used | fixed in `d013662`, `6252927`, `5d04466`: SDMMC, SAI, DSI, DMA, DMAMUX and the STM32 SPI name every offset and field from `sh.sysl.stm32h747` 0.1.1 (SVD-generated, the one definition); WM8994, FT6x06, GT911, DS3231 and the PL022 engine have named constants from their data sheets. Named constants rather than bitfield structs, so the field positions have one source (the generated package) instead of a hand-written second copy |
 | peripherals#2 | no common peripheral interface | open (slice 4 part 2) |
 | peripherals#3 | the STM32H747 MCU is pasted into three board files | open |
 | peripherals#4 | MCU facts in board files; pin routing written twice | open |
@@ -65,12 +65,12 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | peripherals#13 | the SPI SD card re-implements the SPI shifter | open |
 | peripherals#14 | positional constructors with 20 to 40 arguments | open |
 | peripherals#15 | dead or diagnostic-only state inside the models | open |
-| peripherals#16 | `NEVER` defined three times, the literal three more | open (still in `v6m`, `sdmmc`, `sai`) |
+| peripherals#16 | `NEVER` defined three times, the literal three more | fixed in `d013662`: one `NEVER` in `sh.sysl.benchtop.timing`, imported by `v6m`, the peripherals and `virt`; the literals in `dsi` and `spi` are gone |
 | peripherals#17 | "MIPI DCS" part carries ST7789 vendor commands | open |
 | peripherals#18 | comments that name development steps, or are stale | open |
 | peripherals#19 | `hd44780` pins are a `[7]int` indexed by position | open |
 | peripherals#20 | sysl idiom: redundant suffixes, types and parentheses | open |
-| peripherals#21 | 8-bit register pointers wrap through `+= 1` | open |
+| peripherals#21 | 8-bit register pointers wrap through `+= 1` | fixed in `6252927`: FT6x06 (u8), GT911 and WM8994 (u16) wrap their auto-increment explicitly with a mask (sysl 0.7.8 has no `+%`); DS3231's pointer already wraps at 19 |
 | peripherals#22 | tests assert implementation with magic numbers | open |
 | ui-firmware#1 | example sources are not compiled by the gate | fixed in `80b8a2f` (every example firmware source is built in the suite) |
 | ui-firmware#2 | the UI owns emulator control and the board's input model | open |
