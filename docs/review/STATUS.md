@@ -36,13 +36,13 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#5 | `assemble` mutates globals before it can still fail | fixed by slices 1–2 (`ce0b959`, `3024687`): `plan` checks everything, the apply step cannot fail |
 | runtime#6 | peripheral kinds and window sizes duplicated; one wrong error message | partly fixed in `013e796` (the duplicate-I2C refusal names both kinds); the kind table and the double `controller` parse remain |
 | runtime#7 | magic register fields where the comments name the field | open |
-| runtime#8 | hand-rolled ring buffers where `Ring` exists | open |
+| runtime#8 | hand-rolled ring buffers where `Ring` exists | fixed in `7c9b59b`: `sai_dma` output/input are `Ring`s over their `Buf` storage, the codec microphone queue an `InlineRing`; the two remaining byte loops are `sysl.slices.copy` |
 | runtime#9 | the DMA bus master is "whichever core last touched audio" | open |
 | runtime#10 | conditional locking keyed on a mutable global | fixed by slice 3 (`d72cffd`): `rp.live` is taken on every access, whichever thread |
 | runtime#11 | host workflow reaches into virt globals and duplicates the image layout | open |
 | runtime#12 | per-core configuration as parallel arrays, copy-pasted core setup | open (part of slice 4 part 2: the cores' option globals) |
 | runtime#13 | generic checker contains part-specific rules | open |
-| runtime#14 | boolean-trap positional constructors | open |
+| runtime#14 | boolean-trap positional constructors | fixed in `7c9b59b`: `Workflow` built with named arguments, its five flags are `Phase` + `Request` enums; `library()` uses `peripheral`/`part`/`window`/`param`/`port` builders with named defaults (also `core_options`) |
 | runtime#15 | wall-clock, busy-spinning tests | open |
 | runtime#16 | `start_workers` mutates state before it validates | fixed by slice 3 (`679528a`): the divisor check runs before anything is set |
 | runtime#17 | asymmetric worker entry points (`cpu_worker0(ignored)`) | open |
@@ -55,20 +55,20 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | peripherals#3 | the STM32H747 MCU is pasted into three board files | open |
 | peripherals#4 | MCU facts in board files; pin routing written twice | open |
 | peripherals#5 | the board/MCU schema is inconsistent with itself | open |
-| peripherals#6 | two ownership conventions and three `reset` styles | open |
-| peripherals#7 | five or more hand-rolled ring buffers | open |
-| peripherals#8 | protocol states and reply kinds are bare integers | open |
-| peripherals#9 | a status getter mutates state | open |
+| peripherals#6 | two ownership conventions and three `reset` styles | partly fixed in `7c9b59b`: one reset style everywhere but `mipi_dcs` — a single power-on constructor (`fresh`/zeroed `var` + the non-zero fields) that `reset` stores over the live model (sdmmc, sai, wm8994, sd_card, dma, i2c, ssd1306, seven_segment, parts/spi, gt911 `boot`); sd_card's reset now clears the half-received block. Left: `mipi_dcs` (bt-fidelity is splitting it, #17) and the value-vs-`&T` convention, which needs virt's `Mutex[T]` holders and UI snapshots changed |
+| peripherals#7 | five or more hand-rolled ring buffers | fixed in `7c9b59b`: `InlineRing` (sysl 0.7.8, `sysl.container.ring`) in sai, i2s (four), PL022, gt911, sd_card reply, dsi rx. The suspected sysl gap is not one |
+| peripherals#8 | protocol states and reply kinds are bare integers | fixed in `7c9b59b`: `CardState`, `ResponseKind` (WAITRESP values), `Transfer`, SPI `WriteStage`, `wm8994.Stage` |
+| peripherals#9 | a status getter mutates state | fixed in `7c9b59b`: `settle` does Prg→Tran; `status` is pure |
 | peripherals#10 | silent truncation of guest time in `i2s.advance` | open |
 | peripherals#11 | undocumented fidelity shortcuts | open |
 | peripherals#12 | GPIO-level parts assume a 32-pin `u32` level mask | open |
 | peripherals#13 | the SPI SD card re-implements the SPI shifter | open |
-| peripherals#14 | positional constructors with 20 to 40 arguments | open |
-| peripherals#15 | dead or diagnostic-only state inside the models | open |
+| peripherals#14 | positional constructors with 20 to 40 arguments | partly fixed in `7c9b59b`: sdmmc, sd_card, dsi, hd44780, i2s, sai, wm8994, gt911, ssd1306, PL022 write only their non-zero fields. Left: `mipi_dcs` (its `Buf` field has no zero; needs a state split while bt-fidelity reworks the file) |
+| peripherals#15 | dead or diagnostic-only state inside the models | fixed in `7c9b59b`: `DATA_ERRORS`, `data_index`, `data_base`, `data_length` deleted (`transferred` is behaviour: the single-buffer offset); sdmmc and sd_card counters moved to `Stats` |
 | peripherals#16 | `NEVER` defined three times, the literal three more | open (still in `v6m`, `sdmmc`, `sai`) |
 | peripherals#17 | "MIPI DCS" part carries ST7789 vendor commands | open |
 | peripherals#18 | comments that name development steps, or are stale | open |
-| peripherals#19 | `hd44780` pins are a `[7]int` indexed by position | open |
+| peripherals#19 | `hd44780` pins are a `[7]int` indexed by position | fixed in `7c9b59b`: `Pins { rs, rw: Option[int], e, d: [4]int }`. `seven_segment`'s arrays stay: they are indexed by segment bit and digit, which is what an array is |
 | peripherals#20 | sysl idiom: redundant suffixes, types and parentheses | open |
 | peripherals#21 | 8-bit register pointers wrap through `+= 1` | open |
 | peripherals#22 | tests assert implementation with magic numbers | open |
