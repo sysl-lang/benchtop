@@ -105,17 +105,17 @@ private struct Host
 private const MIC_HZ: u64 = 48000
 private const PAINT_US: long = 16667
 
-/** Boot `file` (an ELF or raw image) on the board `which` names and run it as `o` says. */
-run(which: string, file: []const u8, o: Options) -> Result[Run,string]
+/** Boot `file` (an ELF or raw image) on `m`, made the board `which` names, and run it as `o` says. */
+run(m: *virt.Machine, which: string, file: []const u8, o: Options) -> Result[Run,string]
     if o.seconds == 0 then return Err("--seconds must be at least 1")
-    virt.board_named(which)?
-    val image = virt.image_of(file)?
-    val hz = virt.clock_hz()
+    virt.board_named(m, which)?
+    val image = virt.image_of(m, file)?
+    val hz = virt.clock_hz(m)
     if hz == 0 then return Err(s"$which has no mcu.clock-hz to pace against")
-    val cpu = virt.core0()
-    virt.open_console()
-    virt.capture_bounded(8192)
-    virt.boot(cpu, image.view())
+    val cpu = virt.core0(m)
+    virt.open_console(m)
+    virt.capture_bounded(m, 8192)
+    virt.boot(m, image.view())
     o.poke match
         Some(p) ->
             val symbol = elf.read(file).map_err(e -> s"--set needs an ELF image: $e")?.symbol_named(p.symbol).map_err(e -> s"$e")?
@@ -123,7 +123,7 @@ run(which: string, file: []const u8, o: Options) -> Result[Run,string]
                 Some(s) -> v6m.store32(cpu, u32(s.value), p.value)
                 None -> return Err(s"the image has no symbol ${p.symbol}")
         None -> ()
-    virt.start_workers(cpu, true, if o.paced then hz else 0)?
+    virt.start_workers(m, true, if o.paced then hz else 0)?
     val start = o.warmup * hz
     val end = (o.warmup + o.seconds) * hz
     if o.paced then virt.resume_workers() else virt.submit_workers(end)
@@ -131,10 +131,10 @@ run(which: string, file: []const u8, o: Options) -> Result[Run,string]
     var first: Option[Mark] = None
     var failed = ""
     loop
-        serve(&host, o)
+        serve(m, &host, o)
         val snapshot = virt.workers_observe()
         if !snapshot.running
-            failed = virt.stop_message(if snapshot.cores[0].stop != Stop.Running then cpu else virt.core1())
+            failed = virt.stop_message(if snapshot.cores[0].stop != Stop.Running then cpu else virt.core1(m))
             break
         val now = max(snapshot.cores[0].time, snapshot.cores[1].time)
         if first.is_none() && now >= start then first = Some(mark(snapshot, host))
@@ -145,10 +145,10 @@ run(which: string, file: []const u8, o: Options) -> Result[Run,string]
     virt.stop_workers()
     if !failed.is_empty() then return Err(s"the guest stopped: $failed")
     val from = first.unwrap()
-    Ok(Run(hz, virt.clock_divisors(), launched, o.paced, u64(last.wall_us - from.wall_us),
+    Ok(Run(hz, virt.clock_divisors(m), launched, o.paced, u64(last.wall_us - from.wall_us),
         [core_run(from, last, 0), core_run(from, last, 1)],
         last.dsi.completed - from.dsi.completed, last.dsi.busy_us - from.dsi.busy_us,
-        last.sound_frames - from.sound_frames, u64(virt.sound_channels()), last.mic_frames - from.mic_frames,
+        last.sound_frames - from.sound_frames, u64(virt.sound_channels(m)), last.mic_frames - from.mic_frames,
         last.display_reads - from.display_reads, last.display_read_us - from.display_read_us,
         u64(last.cpu_us - from.cpu_us)))
 
@@ -162,12 +162,12 @@ private mark(snapshot: virt.WorkerObservation, host: Host) -> Mark =
 
 // The desktop's share of a frame: take the sound played so far, give the microphone the tone owed up
 // to the guest's clock, move the finger, and copy the display out where a window would paint it.
-private serve(host: *Host, o: Options)
-    val time = virt.observation_time()
-    val channels = u64(virt.sound_channels())
-    host.sound_frames += u64(virt.take_sound(time, u32(channels)).len()) / channels
-    val seconds = real(time) / real(virt.clock_hz())
-    if virt.microphone_available()
+private serve(m: *virt.Machine, host: *Host, o: Options)
+    val time = virt.observation_time(m)
+    val channels = u64(virt.sound_channels(m))
+    host.sound_frames += u64(virt.take_sound(m, time, u32(channels)).len()) / channels
+    val seconds = real(time) / real(virt.clock_hz(m))
+    if virt.microphone_available(m)
         val owed = u64(seconds * real(MIC_HZ))
         if owed > host.mic_frames
             var tone: [4800]f32 = [0.0; 4800]
@@ -177,16 +177,16 @@ private serve(host: *Host, o: Options)
                 // A 440 Hz tone whose loudness swells and fades once a second, so the meter moves.
                 val level = 0.5 + 0.4 * (tau * t).sin()
                 tone[i] = f32(level * (tau * 440.0 * t).sin())
-            virt.feed_microphone(tone[..<count])
+            virt.feed_microphone(m, tone[..<count])
             host.mic_frames += count
-    if virt.touch_dimensions(o.touch).is_some()
+    if virt.touch_dimensions(m, o.touch).is_some()
         // Drag along the slider's row and back once every two guest seconds, lifting at each end.
         val phase = seconds.fmod(2.0)
         val x = 300 + int(200.0 * (if phase < 1.0 then phase else 2.0 - phase))
-        virt.touch_point(o.touch, x, 302, phase > 0.05 && phase < 0.95 || phase > 1.05 && phase < 1.95)
+        virt.touch_point(m, o.touch, x, 302, phase > 0.05 && phase < 0.95 || phase > 1.05 && phase < 1.95)
     val now = monotonic().us
     if now >= host.next_paint_us
         host.next_paint_us = now + PAINT_US
-        if virt.tft_frame(o.display).is_some()
+        if virt.tft_frame(m, o.display).is_some()
             host.display_reads += 1
             host.display_read_us += u64(monotonic().us - now)
