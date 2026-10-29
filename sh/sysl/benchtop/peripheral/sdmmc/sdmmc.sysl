@@ -4,6 +4,15 @@ import sh.sysl.benchtop.parts.sd_card as card
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.stm32h747.sdmmc1 as reg
 
+/** What the host has done, for tests and instruments; nothing in the model reads it back. */
+struct Stats
+    commands: u64
+    transfers: u64
+    blocks: u64
+    buffer_completions: u64
+    multi_transfers: u64
+    double_transfers: u64
+
 // Every flag SDMMC_ICR can clear: bits 0-11 and 21-28 of SDMMC_STAR.
 const STATIC_FLAGS: u32 = reg.ICR_CCRCFAILC_MASK | reg.ICR_DCRCFAILC_MASK | reg.ICR_CTIMEOUTC_MASK |
     reg.ICR_DTIMEOUTC_MASK | reg.ICR_TXUNDERRC_MASK | reg.ICR_RXOVERRC_MASK | reg.ICR_CMDRENDC_MASK |
@@ -51,6 +60,7 @@ const RESPONSE_SHORT_NO_CRC: u32 = 2
 const RESPONSE_LONG: u32 = 3
 // SDMMC_RESPCMDR after a long response: R2 carries no command index, and the field reads all ones.
 const RESPCMD_LONG: u32 = reg.RESPCMDR_RESPCMD_MASK
+
 // Timed native SD command/data paths. IDMA advances in <=32-byte wire bursts,
 // so inactive buffers can be replaced while the other buffer is in flight.
 struct Host
@@ -74,13 +84,8 @@ struct Host
     command_due: u64
     data_due: u64
     command_arg: u32
-    data_index: u32
-    data_base: u32
-    data_length: u32
     data_write: bool
     timeout_due: u64
-    commands: u64
-    transfers: u64
     base1: u32
     buffer_size: u32
     buffer_used: u32
@@ -91,16 +96,26 @@ struct Host
     loaded: bool
     payload: [512]u8
     busy_due: u64
-    blocks: u64
-    buffer_completions: u64
-    multi_transfers: u64
-    double_transfers: u64
+    stats: Stats
+
+/** A host at reset with the given clocks: every register zero and nothing due. The one place the
+ * reset state is written; `host` boxes it and `reset` stores it over a live host.
+ */
+private fresh(hz: u64, kernel: u64) -> Host
+    var h: Host
+    h.hz = hz
+    h.kernel = kernel
+    h.command_due = NEVER
+    h.data_due = NEVER
+    h.timeout_due = NEVER
+    h.busy_due = NEVER
+    h
 
 host(hz: u64 = 480000000, kernel: u64 = 60000000) -> &Host
     require hz > 0 && kernel > 0 && kernel <= hz, "SDMMC timebase and kernel clock"
-    Host(hz,kernel,0,0,0,0,0,[0;4],0,0,0,0,0,0,0,0,0,NEVER,NEVER,0,0,0,0,false,NEVER,0,0,
-        0,0,0,0,0,0,0,false,[0;512],NEVER,0,0,0,0)
-reset(h: &Host) = *h = *host(h.hz,h.kernel)
+    fresh(hz,kernel)
+
+reset(h: &Host) = *h = fresh(h.hz,h.kernel)
 // The SDMMC_CK divider of a CLKCR word: CLKDIV 0 passes the kernel clock through, n divides it by 2n.
 private divisor(clock: u32) -> u64
     val clkdiv = clock & reg.CLKCR_CLKDIV_MASK
@@ -142,7 +157,7 @@ private schedule(h: &Host, time: u64)
     if h.timeout_due < h.data_due then h.data_due = h.timeout_due
 private finish_command(h: &Host, c: Option[&card.Native], routed: bool, at: u64)
     h.command_due = NEVER
-    h.commands += 1
+    h.stats.commands += 1
     if c.is_none() || !routed
         h.flags |= reg.STAR_CTIMEOUT_MASK
         return
@@ -155,30 +170,29 @@ private finish_command(h: &Host, c: Option[&card.Native], routed: bool, at: u64)
     if !reply.present
         h.flags |= reg.STAR_CTIMEOUT_MASK
         return
-    if reply.kind != RESPONSE_NONE
+    if reply.kind != card.NoResponse
         h.response = reply.words
-        h.response_command = if reply.kind == RESPONSE_SHORT_NO_CRC || reply.kind == RESPONSE_LONG then RESPCMD_LONG else index
+        h.response_command = if reply.kind.reports_no_index() then RESPCMD_LONG else index
     val expected = (h.command & reg.CMDR_WAITRESP_MASK) >> reg.CMDR_WAITRESP_SHIFT
     if expected == RESPONSE_NONE then h.flags |= reg.STAR_CMDSENT_MASK
-    elif expected == reply.kind || (expected == RESPONSE_SHORT_NO_CRC && reply.kind == RESPONSE_SHORT) then h.flags |= reg.STAR_CMDREND_MASK
+    elif expected == u32(reply.kind) || (expected == RESPONSE_SHORT_NO_CRC && reply.kind == card.Short) then h.flags |= reg.STAR_CMDREND_MASK
     else h.flags |= reg.STAR_CCRCFAIL_MASK
-    if reply.data == 0 || reply.words[0] & CARD_STATUS_ERRORS != 0 then return
-    val writing = reply.data == CMD_WRITE_SINGLE || reply.data == CMD_WRITE_MULTIPLE
-    val multiple = reply.data == CMD_READ_MULTIPLE || reply.data == CMD_WRITE_MULTIPLE
+    if reply.data == card.NoTransfer || reply.words[0] & CARD_STATUS_ERRORS != 0 then return
+    val writing = reply.data.writes()
+    val multiple = reply.data.multiple()
+    val length = reply.data.block_length()
     val block = 1u32 << ((h.control & reg.DCTRL_DBLOCKSIZE_MASK) >> reg.DCTRL_DBLOCKSIZE_SHIFT)
     val total = if block <= 512 then h.length / block * block else 0
-    val count_ok = total >= reply.length && (multiple || total == reply.length)
+    val count_ok = total >= length && (multiple || total == length)
     val to_card = h.control & reg.DCTRL_DTDIR_MASK == 0
     if h.data_due != NEVER || h.command & reg.CMDR_CMDTRANS_MASK == 0 || h.idma & reg.IDMACTRLR_IDMAEN_MASK == 0 ||
-            to_card != writing || !count_ok || block != reply.length || h.base & 3 != 0 ||
+            to_card != writing || !count_ok || block != length || h.base & 3 != 0 ||
             (double_buffered(h) && (h.buffer_size == 0 || h.base1 & 3 != 0))
         abort_data(h,c,at,reg.STAR_IDMATE_MASK)
         return
     if native.width != lanes(h)
         abort_data(h,c,at,reg.STAR_DCRCFAIL_MASK)
         return
-    h.data_index = reply.data
-    h.data_length = total
     h.data_write = writing
     h.remaining = total
     h.transferred = 0
@@ -187,8 +201,8 @@ private finish_command(h: &Host, c: Option[&card.Native], routed: bool, at: u64)
     h.buffer_used = 0
     h.loaded = false
     h.timeout_due = at + ticks(h,u64(h.timer))
-    if multiple then h.multi_transfers += 1
-    if double_buffered(h) then h.double_transfers += 1
+    if multiple then h.stats.multi_transfers += 1
+    if double_buffered(h) then h.stats.double_transfers += 1
     schedule(h,at)
 
 // RAM callbacks validate complete views before accessing memory. Card/media
@@ -230,7 +244,6 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
         if address + u64(h.chunk) > 0x100000000
             abort_data(h,c,at,reg.STAR_IDMATE_MASK)
             continue
-        h.data_base = u32(address)
         val piece = h.payload[usize(h.block_used)..<usize(h.block_used + h.chunk)]
         val moved = if h.data_write then (read_ram)(u32(address),piece) else (write_ram)(u32(address),piece)
         if !moved
@@ -243,7 +256,7 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
         if double_buffered(h) && h.buffer_used == h.buffer_size
             h.idma ^= reg.IDMACTRLR_IDMABACT_MASK
             h.buffer_used = 0
-            h.buffer_completions += 1
+            h.stats.buffer_completions += 1
             h.flags |= reg.STAR_IDMABTC_MASK
         if h.block_used == h.block_size
             if h.data_write
@@ -252,14 +265,14 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
                     continue
                 h.busy_due = if native.card.busy_until > at then native.card.busy_until else retry(h,at)
             else card.native_read_complete(native)
-            h.blocks += 1
+            h.stats.blocks += 1
             h.flags |= reg.STAR_DBCKEND_MASK
             h.block_used = 0
             h.loaded = false
             h.timeout_due = at + ticks(h,u64(h.timer))
         if h.remaining == 0
             h.flags |= reg.STAR_DATAEND_MASK
-            h.transfers += 1
+            h.stats.transfers += 1
         else schedule(h,at)
     h.at = time
 

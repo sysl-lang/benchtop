@@ -1,6 +1,8 @@
 module sh.sysl.benchtop.peripheral.dsi
 
 import sysl.buf.{Buf,buf}
+import sysl.container.ring.InlineRing
+import sysl.math.min
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.stm32h747.dsihost as reg
 
@@ -59,9 +61,7 @@ struct Host
     busy: bool
     due: u64
     time: u64
-    rx: [1024]u8
-    rx_count: usize
-    rx_at: usize
+    rx: InlineRing[u8, 1024]
     max_return: usize
     defer_reads: bool
     response_pending: bool
@@ -69,9 +69,17 @@ struct Host
 
 host(hz: u64, reference_hz: u64 = 25000000) -> &Host
     require hz > 0 && hz <= 1000000000 && reference_hz > 0 && reference_hz <= 1000000000, "bounded DSI clock rates"
-    val h: &Host = Host(hz,reference_hz,0,[0;269],[0;1024],0,[0;1024],0,0,false,0,0,[0;1024],0,0,1,false,false,0)
+    var h: Host
+    h.hz = hz
+    h.reference_hz = reference_hz
+    h.max_return = 1
     h.regs[reg.DSI_MCR_OFFSET / 4] = reg.DSI_MCR_CMDM_MASK
     h
+
+/** Replaces the receive FIFO's contents with a read response, cut at the maximum return size. */
+private receive(h: &Host, response: []const u8)
+    h.rx.clear()
+    for i in 0..<min(response.len,h.max_return) do h.rx.push_back(response[i])
 
 /** Callback arguments are VC, packet data type, exact unpadded payload, and the host's request
  * number, which a deferred read's completion names. Read-request responses are raw device bytes. A
@@ -94,10 +102,7 @@ advance(h: &Host, time: u64, endpoint: Endpoint)
         val channel = field(h.header,reg.DSI_GHCR_VCID_MASK,reg.DSI_GHCR_VCID_SHIFT)
         val response = endpoint(channel,kind,h.packet[..<h.packet_count],h.request_id)
         if reading && h.defer_reads then return
-        if reading
-            h.rx_count = if response.len() < h.max_return then response.len() else h.max_return
-            h.rx_at = 0
-            for i in 0..<h.rx_count do h.rx[i] = response.at(i)
+        if reading then receive(h,response.view())
     h.busy = false
 
 private ready(h: &Host) -> bool =
@@ -125,15 +130,15 @@ read(h: &Host, offset: u32) -> Option[u32]
         reg.DSI_GPSR_OFFSET -> Some((if h.busy then reg.DSI_GPSR_CMDFF_MASK else reg.DSI_GPSR_CMDFE_MASK) |
             (if h.tx_count == 0 then reg.DSI_GPSR_PWRFE_MASK else 0) |
             (if h.tx_count == 1024 then reg.DSI_GPSR_PWRFF_MASK else 0) |
-            (if h.rx_at == h.rx_count then reg.DSI_GPSR_PRDFE_MASK else 0) |
-            (if h.rx_count - h.rx_at == 1024 then reg.DSI_GPSR_PRDFF_MASK else 0) |
+            (if h.rx.is_empty() then reg.DSI_GPSR_PRDFE_MASK else 0) |
+            (if h.rx.is_full() then reg.DSI_GPSR_PRDFF_MASK else 0) |
             (if h.busy && is_read(h.header & reg.DSI_GHCR_DT_MASK) then reg.DSI_GPSR_RCB_MASK else 0))
         reg.DSI_GPDR_OFFSET ->
             var result: u32 = 0
             for i in 0..<4
-                if h.rx_at < h.rx_count
-                    result |= u32(h.rx[h.rx_at]) << u32(i * 8)
-                    h.rx_at += 1
+                h.rx.pop_front() match
+                    Some(byte) -> result |= u32(byte) << u32(i * 8)
+                    None -> break
             Some(result)
         reg.DSI_PSR_OFFSET ->
             if !ready(h) then return Some(0)
@@ -167,8 +172,7 @@ write(h: &Host, offset: u32, value: u32) -> bool
             h.response_pending = false
             h.request_id += 1
             h.tx_count = 0
-            h.rx_at = 0
-            h.rx_count = 0
+            h.rx.clear()
         h.regs[offset / 4] = value
         if h.busy && !ready(h)
             h.busy = false
@@ -216,9 +220,7 @@ write(h: &Host, offset: u32, value: u32) -> bool
  */
 complete_read(h: &Host, request_id: u64, response: []const u8) -> bool
     if !h.busy || !h.response_pending || h.request_id != request_id then return false
-    h.rx_count = if response.len < h.max_return then response.len else h.max_return
-    h.rx_at = 0
-    for i in 0..<h.rx_count do h.rx[i] = response[i]
+    receive(h,response)
     h.response_pending = false
     h.busy = false
     true

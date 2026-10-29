@@ -7,6 +7,7 @@ import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.benchtop.v6m.{Cpu,Stop,halt,lower_limit}
 import sh.sysl.benchtop.v6m as memory
 import sysl.buf.{Buf,buf}
+import sysl.container.ring.{Ring,ring}
 import sysl.threads.Mutex
 import sysl.sync.*
 
@@ -30,7 +31,9 @@ struct AudioState
 /** The SAI's blocks, the DMA controllers and the DMAMUX; `core`, the core whose access is being
  * served (its number rather than a borrowed MMIO callback pointer); and, per block, the frames
  * played so far, the packets played and not yet taken by the host, and the words the host has given
- * it to record (`debug_input` once a test has fed it directly).
+ * it to record (`debug_input` once a test has fed it directly). Each queue keeps the newest values;
+ * `output_slots` and `input_slots` are the storage the rings lay over, empty where the bus has no
+ * SAI to fill them.
  */
 struct AudioLive
     blocks: [2]&sai.Block
@@ -38,13 +41,11 @@ struct AudioLive
     mux: &dma.Mux
     core: u32
     frame_number: [2]u64
-    output: [2]Buf[SaiPacket]
-    out_head: [2]usize
-    out_count: [2]usize
-    input: [2]Buf[u32]
+    output: [2]Ring[SaiPacket]
+    input: [2]Ring[u32]
     debug_input: [2]bool
-    in_head: [2]usize
-    in_count: [2]usize
+    output_slots: [2]Buf[SaiPacket]
+    input_slots: [2]Buf[u32]
 
 // What the SAI's blocks played and what they are given to record, crossing to and from the host.
 struct SaiPacket
@@ -58,19 +59,23 @@ struct SaiPacket
 private const OUTPUT_RING: usize = 16384
 private const INPUT_RING: usize = 4096
 
-private ring[T](size: usize, value: T) -> Buf[T]
+private slots[T](size: usize, value: T) -> Buf[T]
     var b: Buf[T] = buf()
     for i in 0..<size do b.push(value)
     b
 
 // The models for a chip clocked at `hz` with the SAI's kernel clock at `kernel`, and the host's
 // queues where the bus has an SAI to fill them.
-private audio_live(hz: u64, kernel: u64, sai_present: bool) -> AudioLive
-    val output = if sai_present then OUTPUT_RING else 0
-    val input = if sai_present then INPUT_RING else 0
-    AudioLive([sai.block(hz,kernel),sai.block(hz,kernel)], [dma.controller(),dma.controller()], dma.mux(), 0, [0,0],
-        [ring(output,SaiPacket(0,0,0,0,0,0)),ring(output,SaiPacket(0,0,0,0,0,0))], [0,0], [0,0],
-        [ring(input,0u32),ring(input,0u32)], [false,false], [0,0], [0,0])
+private audio_live(hz: u64 = 480000000, kernel: u64 = 12288000, sai_present: bool = false) -> AudioLive
+    val packets = if sai_present then OUTPUT_RING else 0
+    val words = if sai_present then INPUT_RING else 0
+    val output_slots = [slots(packets,SaiPacket(0,0,0,0,0,0)),slots(packets,SaiPacket(0,0,0,0,0,0))]
+    val input_slots = [slots(words,0u32),slots(words,0u32)]
+    AudioLive(blocks = [sai.block(hz,kernel),sai.block(hz,kernel)], units = [dma.controller(),dma.controller()],
+        mux = dma.mux(), core = 0, frame_number = [0,0],
+        output = [ring(output_slots[0].view()),ring(output_slots[1].view())],
+        input = [ring(input_slots[0].view()),ring(input_slots[1].view())], debug_input = [false,false],
+        output_slots = output_slots, input_slots = input_slots)
 
 // The DMAMUX1 request lines of SAI1's blocks (RM0399, table "DMAMUX1: assignment of multiplexer
 // inputs to resources"), which a board's `request-a`/`request-b` replace.
@@ -79,8 +84,7 @@ private const DMAMUX_SAI1_B: u32 = 88
 
 /** No SAI, DMA or DMAMUX on the bus. */
 audio_state() -> AudioState =
-    AudioState(false, [false,false], false, 0, [DMAMUX_SAI1_A,DMAMUX_SAI1_B], [-1;17], NEVER, 0, Mutex.new(AudioLive([sai.block(),sai.block()],
-        [dma.controller(),dma.controller()], dma.mux(), 0, [0,0], [buf(),buf()], [0,0], [0,0], [buf(),buf()], [false,false], [0,0], [0,0])))
+    AudioState(false, [false,false], false, 0, [DMAMUX_SAI1_A,DMAMUX_SAI1_B], [-1;17], NEVER, 0, Mutex.new(audio_live()))
 
 private audio_cpu(s: *AudioLive) -> *Cpu = if s.core == 0 then core0() else core1()
 
@@ -124,11 +128,10 @@ private[virt] boot_sai_dma()
         dma.reset_mux(s.mux)
         s.core = 0
         s.frame_number = [0,0]
-        s.out_head = [0,0]
-        s.out_count = [0,0]
         s.debug_input = [false,false]
-        s.in_head = [0,0]
-        s.in_count = [0,0])
+        for i in 0..<2
+            s.output[i].clear()
+            s.input[i].clear())
     atomic_store(&d.next,NEVER,Release)
     atomic_store(&d.irq_levels,0,Release)
 
@@ -137,12 +140,7 @@ sai_feed_input(block: usize, words: []const u32)
     require block < 2, "SAI block index"
     machine.devices.audio.live.with(s ->
         s.debug_input[block] = true
-        for word in words
-            if s.in_count[block] == INPUT_RING
-                s.in_head[block] = (s.in_head[block] + 1) % INPUT_RING
-                s.in_count[block] -= 1
-            s.input[block].set((s.in_head[block] + s.in_count[block]) % INPUT_RING,word)
-            s.in_count[block] += 1)
+        for word in words do s.input[block].overwrite(word))
 
 sai_take_output(block: usize) -> Buf[u32]
     var words: Buf[u32] = buf()
@@ -154,17 +152,11 @@ private[virt] sai_take_packets(block: usize) -> Buf[SaiPacket]
     var packets: Buf[SaiPacket] = buf()
     val into = &packets
     machine.devices.audio.live.with(s ->
-        for i in 0..<s.out_count[block] do into.push(s.output[block].at((s.out_head[block] + i) % OUTPUT_RING))
-        s.out_head[block] = 0
-        s.out_count[block] = 0)
+        for packet in s.output[block] do into.push(packet)
+        s.output[block].clear())
     packets
 
-private input_word(s: *AudioLive, block: usize) -> u32
-    if s.in_count[block] == 0 then return 0
-    val word = s.input[block].at(s.in_head[block])
-    s.in_head[block] = (s.in_head[block] + 1) % INPUT_RING
-    s.in_count[block] -= 1
-    word
+private input_word(s: *AudioLive, block: usize) -> u32 = s.input[block].pop_front().unwrap_or(0)
 
 private output_word(s: *AudioLive, block: usize, slot: u32, word: u32)
     if slot == 0 then s.frame_number[block] += 1
@@ -172,11 +164,7 @@ private output_word(s: *AudioLive, block: usize, slot: u32, word: u32)
     val bits = sai.sample_bits(b)
     val count = sai.slots(b)
     val gain = codec_slot_gain(block,slot,count,bits)
-    if s.out_count[block] == OUTPUT_RING
-        s.out_head[block] = (s.out_head[block] + 1) % OUTPUT_RING
-        s.out_count[block] -= 1
-    s.output[block].set((s.out_head[block] + s.out_count[block]) % OUTPUT_RING,SaiPacket(s.frame_number[block],word,slot,count,bits,gain))
-    s.out_count[block] += 1
+    s.output[block].overwrite(SaiPacket(s.frame_number[block],word,slot,count,bits,gain))
 
 private data_block(address: u32) -> int
     val d = &machine.devices.audio

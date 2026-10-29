@@ -1,5 +1,6 @@
 module sh.sysl.benchtop.peripheral.sai
 
+import sysl.container.ring.InlineRing
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.stm32h747.sai1 as reg
 
@@ -93,9 +94,7 @@ struct Block
     slotr: u32
     imr: u32
     flags: u32
-    fifo: [8]u32
-    head: usize
-    count: usize
+    fifo: InlineRing[u32, 8]
     slot: u32
     time: u64
     due: u64
@@ -103,26 +102,20 @@ struct Block
     last: u32
     started: bool
 
+/** A block at reset with the given clocks — the one place its reset values are written. */
+private fresh(hz: u64, kernel_hz: u64) -> Block
+    var b: Block
+    b.hz = hz
+    b.kernel_hz = kernel_hz
+    b.frcr = 7
+    b.due = NEVER
+    b
+
 block(hz: u64 = DEFAULT_HZ, kernel_hz: u64 = DEFAULT_KERNEL_HZ) -> &Block
     require hz > 0 && hz <= 1000000000 && kernel_hz > 0 && kernel_hz <= 1000000000, "valid SAI clocks"
-    Block(hz,kernel_hz,0,0,7,0,0,0,[0;8],0,0,0,0,NEVER,0,0,false)
+    fresh(hz,kernel_hz)
 
-reset(b: &Block)
-    b.cr1 = 0
-    b.cr2 = 0
-    b.frcr = 7
-    b.slotr = 0
-    b.imr = 0
-    b.flags = 0
-    b.head = 0
-    b.count = 0
-    b.slot = 0
-    b.time = 0
-    b.due = NEVER
-    b.phase = 0
-    b.last = 0
-    b.started = false
-    for i in 0..<8 do b.fifo[i] = 0
+reset(b: &Block) = *b = fresh(b.hz,b.kernel_hz)
 enabled(b: &Block) -> bool = b.cr1 & ENABLE != 0
 receiving(b: &Block) -> bool = b.cr1 & MODE_RECEIVE != 0
 slots(b: &Block) -> u32 = field(b.slotr,reg.SAI_ASLOTR_NBSLOT_MASK,reg.SAI_ASLOTR_NBSLOT_SHIFT) + 1
@@ -179,15 +172,16 @@ private schedule(b: &Block)
     b.due += ticks
 
 private start(b: &Block)
-    if b.started || !enabled(b) || !autonomous(b) || (!receiving(b) && b.count == 0) then return
+    if b.started || !enabled(b) || !autonomous(b) || (!receiving(b) && b.fifo.is_empty()) then return
     b.started = true
     b.slot = 0
     b.phase = b.kernel_hz * u64(slots(b)) - 1
     b.due = b.time
     schedule(b)
 
-fifo_level(b: &Block) -> u32 =
-    if b.count == 0 then 0 elif b.count == 8 then 5 else u32(b.count / 2 + 1)
+fifo_level(b: &Block) -> u32
+    val count = b.fifo.len()
+    if count == 0 then 0 elif count == b.fifo.capacity() then 5 else u32(count / 2 + 1)
 
 status(b: &Block) -> u32
     val level = fifo_level(b)
@@ -205,16 +199,11 @@ clock_slot(b: &Block, input: u32) -> u32
     var output: u32 = 0
     if slot_enabled(b,b.slot)
         if receiving(b)
-            if b.count == 8 then b.flags |= OVERRUN_UNDERRUN
-            else
-                b.fifo[(b.head + b.count) % 8] = input & mask(b)
-                b.count += 1
+            if !b.fifo.push_back(input & mask(b)) then b.flags |= OVERRUN_UNDERRUN
         else
-            if b.count == 0 then b.flags |= OVERRUN_UNDERRUN
-            else
-                output = b.fifo[b.head] & mask(b)
-                b.head = (b.head + 1) % 8
-                b.count -= 1
+            b.fifo.pop_front() match
+                Some(word) -> output = word & mask(b)
+                None -> b.flags |= OVERRUN_UNDERRUN
             if b.cr2 & reg.SAI_ACR2_MUTE_MASK != 0 then output = if b.cr2 & reg.SAI_ACR2_MUTEVAL_MASK != 0 then b.last else 0
             b.last = output
     b.slot = (b.slot + 1) % slots(b)
@@ -242,13 +231,7 @@ read(b: &Block, offset: u32) -> Option[u32] = offset match
     IM -> Some(b.imr)
     SR -> Some(status(b))
     CLRFR -> Some(0)
-    DR ->
-        if !receiving(b) || b.count == 0 then Some(0)
-        else
-            val word = b.fifo[b.head]
-            b.head = (b.head + 1) % 8
-            b.count -= 1
-            Some(word)
+    DR -> if receiving(b) then Some(b.fifo.pop_front().unwrap_or(0)) else Some(0)
     _ -> None
 
 write(b: &Block, offset: u32, value: u32) -> bool
@@ -264,19 +247,13 @@ write(b: &Block, offset: u32, value: u32) -> bool
         CR2 ->
             if value & reg.SAI_ACR2_FTH_MASK > FTH_FULL || value & COMPANDING != 0 then return false
             b.cr2 = value & CR2_KEPT
-            if value & reg.SAI_ACR2_FFLUSH_MASK != 0
-                b.head = 0
-                b.count = 0
+            if value & reg.SAI_ACR2_FFLUSH_MASK != 0 then b.fifo.clear()
         FRCR -> if !enabled(b) then b.frcr = value & FRCR_WRITABLE
         SLOTR -> if !enabled(b) then b.slotr = value & SLOTR_WRITABLE
         IM -> b.imr = value & IM_WRITABLE
         SR -> ()
         CLRFR -> b.flags &= ~(value & CLRFR_WRITABLE)
-        DR ->
-            if !receiving(b) && b.count < 8
-                b.fifo[(b.head + b.count) % 8] = value
-                b.count += 1
-                start(b)
+        DR -> if !receiving(b) && b.fifo.push_back(value) then start(b)
         _ -> return false
     true
 
