@@ -1,0 +1,163 @@
+module sh.sysl.benchtop.chip
+
+import sh.sysl.benchtop.riscv as rv
+import sh.sysl.benchtop.riscv.{Insn, Stop}
+import sh.sysl.elf
+import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
+import sysl.math.min
+
+// An RP2350 booted on its two Hazard3 cores (`mcus/rp2350-hazard3.hocon`): the chip, its SRAM as both
+// harts' RAM window, and the harts reaching every other address through the chip.
+//
+// **Boot** is DESIGN.md §9.2's debugger entry, as a probe loads a RAM image: the ELF's segments are
+// written into SRAM, hart 0 starts at the ELF entry, and hart 1 waits in the boot ROM until core 0
+// launches it through the SIO FIFOs (§9.6), when it starts at the entry it was sent with the stack
+// pointer and `mtvec` it was sent. Flash (XIP) is not on this board's bus yet, so an image is linked
+// to run from SRAM.
+//
+// **Time** runs in quanta of clk_sys cycles, one per retired instruction: each started hart runs the
+// quantum through its decode cache, a device access is timed at the quantum's start plus the hart's
+// instructions into it, and the chip is brought to the quantum's end before the next. While both
+// harts sleep the board skips to the next device event. A hart that EBREAKs ends the run.
+
+/** Where and how large the SRAM is: the description's `ram`. */
+struct SramMap
+    base: u32
+    size: u32
+
+/** How a run ended. */
+enum RunEnd
+    // The cycle budget is spent.
+    Budget
+    // A hart executed EBREAK.
+    Breakpoint
+    // The chip refused an access (`RiscvBoard.refused` says which), or a hart stopped on a fault.
+    Fault
+    // Both harts sleep and no device will wake them.
+    Asleep
+
+struct RiscvBoard
+    chip: Rp2350
+    harts: [2]rv.Cpu
+    sram: Buf[u8]
+    base: u32
+    records: [2]Buf[Insn]
+    lines: [2]Buf[u8]
+    started: [2]bool
+    // The chip's clock at the start of the running quantum, and each hart's retired count there.
+    quantum_at: u64
+    retired_at: [2]u64
+    quantum: u64
+    refused: string
+    // Every byte UART0 has sent.
+    console: Buf[u8]
+
+/** A board with `map`'s SRAM, powered on, holding no image. */
+riscv_board(map: SramMap) -> &RiscvBoard
+    // Harts and records before `boot`, every field zero; `boot` resets the harts and forgets the records.
+    var harts: [2]rv.Cpu
+    var blank: Insn
+    val b = RiscvBoard(rp2350(), harts, buf(), map.base, [buf(), buf()], [buf(), buf()], [false, false], 0, [0, 0], 1000, "", buf())
+    for i in 0..<map.size do b.sram.push(0)
+    for k in 0..<2
+        for i in 0..<rv.code_records(usize(map.size)) do b.records[k].push(blank)
+        for i in 0..<rv.code_lines(usize(map.size)) do b.lines[k].push(0)
+    b
+
+impl RiscvBoard
+    /** Power on with `image` (an ELF) in SRAM: hart 0 at its entry, hart 1 in the boot ROM. */
+    boot(*self, image: []const u8) -> Result[unit, string]
+        val e = elf.read(image).map_err(why -> s"$why")?
+        for i in 0..<self.sram.len() do self.sram.set(i, 0)
+        var regions = [elf.Region(u64(self.base), self.sram.view())]
+        val entry = elf.load(e, regions[..]).map_err(why -> s"$why: the image must be linked into the SRAM")?
+        self.chip.reset()
+        val model = rv.model_named("hazard3").unwrap()
+        for k in 0..<2
+            val h = &self.harts[k]
+            rv.reset(h, model, rv.RP2350, self.sram.view(), self.base, u32(entry))
+            h.bus = self
+            // EBREAK is the guest's way to end a run; other faults trap as on silicon.
+            h.halt_breakpoint = true
+            rv.use_code_cache(h, self.records[k].view(), self.lines[k].view())
+        rv.pair(&self.harts[0], &self.harts[1])
+        self.started = [true, false]
+        self.quantum_at = 0
+        self.refused = ""
+        self.console.clear()
+        Ok(())
+
+    /** Run until `cycles` more clk_sys cycles have passed, or something ends the run first. */
+    run(*self, cycles: u64) -> RunEnd
+        val limit = self.chip.now + cycles
+        while self.chip.now < limit
+            val q = min(self.quantum, limit - self.chip.now)
+            self.quantum_at = self.chip.now
+            for k in 0..<2
+                if !self.started[k] then continue
+                val h = &self.harts[k]
+                self.retired_at[k] = h.retired
+                rv.run_threaded(h, q)
+                if !self.refused.is_empty() then return RunEnd.Fault
+                h.stop match
+                    Budget | Sleep -> ()
+                    Breakpoint -> return RunEnd.Breakpoint
+                    _ -> return RunEnd.Fault
+            self.chip.catch_up(self.quantum_at + q)
+            self.settle()
+            if self.asleep()
+                val next = self.chip.next_event() match
+                    Some(n) -> n
+                    None -> return RunEnd.Asleep
+                self.chip.advance(min(next, limit - self.chip.now))
+                self.settle()
+        RunEnd.Budget
+    end run
+
+    /** The harts that have started are all asleep. */
+    asleep(self) -> bool
+        for k in 0..<2 do if self.started[k] && self.harts[k].stop != Stop.Sleep then return false
+        true
+
+    // After the chip has moved: the bytes UART0 sent, core 1's launch, and every hart's interrupts.
+    private settle(*self)
+        loop
+            self.chip.uarts[0].take() match
+                Some(c) -> self.console.push(c)
+                None -> break
+        self.chip.take_launch() match
+            Some(l) -> self.launch(l)
+            None -> ()
+        for k in 0..<2 do self.chip.signal(&self.harts[k])
+
+    // Core 1 leaves the boot ROM as it was told to.
+    private launch(*self, l: Launch)
+        val h = &self.harts[1]
+        h.pc = l.entry
+        h.r[2] = l.stack_pointer
+        h.cs.mtvec = l.vector_table
+        self.started[1] = true
+
+    // The chip's clock at hart `cpu`'s `n`th retired instruction.
+    private at(self, cpu: *rv.Cpu, n: u64) -> u64 = self.quantum_at + (n - self.retired_at[usize(cpu.hart)])
+
+    private refuse(*self, cpu: *rv.Cpu, a: u32, why: string)
+        self.refused = s"hart ${cpu.hart} at pc 0x${hex(cpu.pc, 8)}: $why"
+        rv.halt(cpu, Stop.Unmapped, a)
+end RiscvBoard
+
+impl rv.Bus for RiscvBoard
+    read(*self, cpu: *rv.Cpu, a: u32, width: u32, n: u64) -> u32
+        self.chip.catch_up(self.at(cpu, n))
+        self.chip.read(cpu.hart, a, width) match
+            Ok(v) -> v
+            Err(why) ->
+                self.refuse(cpu, a, why)
+                0
+
+    write(*self, cpu: *rv.Cpu, a: u32, width: u32, x: u32, n: u64)
+        self.chip.catch_up(self.at(cpu, n))
+        self.chip.write(cpu.hart, a, width, x) match
+            Ok(_) -> self.settle()
+            Err(why) -> self.refuse(cpu, a, why)

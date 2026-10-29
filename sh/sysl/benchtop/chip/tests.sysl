@@ -1,0 +1,104 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.riscv.Stop
+import sh.sysl.rp2350.io_bank0 as io_reg
+import sh.sysl.rp2350.pads_bank0 as pads_reg
+import sh.sysl.rp2350.resets as resets_reg
+import sh.sysl.rp2350.sio as sio_reg
+import sh.sysl.rp2350.uart0 as uart0_reg
+import sysl.text.from_utf8_lossy
+
+private val BLINK = embed("../../../../examples/pico2-riscv/blink.elf")
+
+private val PICO2_SRAM = SramMap(0x20000000, 520 * 1024)
+
+@test("a Pico 2 on its Hazard3 cores runs blink.elf: UART0 prints, core 1 launches through the boot ROM and drives GP15, GP25 blinks")
+riscv_blink()
+    val b = riscv_board(PICO2_SRAM)
+    b.boot(BLINK).unwrap()
+    assert(!b.started[1], "core 1 waits in the boot ROM")
+    var lit = 0
+    var was = false
+    var end = RunEnd.Budget
+    // Sample the LED every 0.1 ms of clk_sys at 150 MHz.
+    while end == RunEnd.Budget && b.chip.now < 200000000
+        end = b.run(15000)
+        val led = b.chip.pin(25)
+        if led.drives && led.level && !was then lit += 1
+        was = led.drives && led.level
+    assert(end == RunEnd.Breakpoint, s"${b.refused}")
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == "hello from hazard3\ncore 1 launched\nled on\nled off\nled on\nled off\nled on\nled off\ndone\n", text)
+    assert(lit == 3, s"the LED lit $lit times")
+    assert(b.started[1] && b.chip.pin(15).drives && b.chip.pin(15).level, "core 1 drives GP15 high")
+    assert(!b.chip.pin(25).level, "the LED ends off")
+    assert(b.chip.sys_hz() == 150000000 && b.chip.ref_hz() == 12000000, "the PLL and crystal clock the chip")
+    // Six 10 ms sleeps at 150 MHz: at least 9 M cycles of clk_sys, most of them skipped asleep.
+    assert(b.chip.now >= 9000000 && b.chip.now < 12000000, s"${b.chip.now} cycles")
+    assert(b.harts[0].retired < 1000000, s"hart 0 slept through its delays: ${b.harts[0].retired} retired")
+
+@test("the chip refuses a block held in reset, an address nothing answers, and the ROM, naming each")
+riscv_refusals()
+    var c = rp2350()
+    val held = c.read(0, io_reg.BASE + io_reg.GPIO0_CTRL_OFFSET, 4)
+    assert(held.is_err() && held.unwrap_err().contains("IO_BANK0 is held in reset"), held.unwrap_err())
+    assert(c.read(0, 0x00000010, 4).unwrap_err().contains("not on the RP2350's bus"))
+    assert(c.read(0, 0x40fff000, 4).is_err())
+    c.write(0, resets_reg.BASE + 0x3000 + resets_reg.RESET_OFFSET, 4, resets_reg.RESET_IO_BANK0_MASK).unwrap()
+    assert(c.read(0, resets_reg.BASE + resets_reg.RESET_DONE_OFFSET, 4).unwrap() & resets_reg.RESET_IO_BANK0_MASK != 0)
+    assert(c.read(0, io_reg.BASE + io_reg.GPIO0_CTRL_OFFSET, 4).unwrap() == io_reg.GPIO0_CTRL_FUNCSEL_NULL)
+    val unmapped = c.read(0, io_reg.BASE + 0x200, 4)
+    assert(unmapped.unwrap_err().contains("IO_BANK0 + 0x200"), unmapped.unwrap_err())
+
+@test("asserting a block's reset puts it back as at power-on")
+reset_fanout()
+    var c = rp2350()
+    val clr = resets_reg.BASE + 0x3000 + resets_reg.RESET_OFFSET
+    val set = resets_reg.BASE + 0x2000 + resets_reg.RESET_OFFSET
+    c.write(0, clr, 4, resets_reg.RESET_UART0_MASK).unwrap()
+    c.write(0, uart0_reg.BASE + uart0_reg.UARTIBRD_OFFSET, 4, 81).unwrap()
+    c.write(0, set, 4, resets_reg.RESET_UART0_MASK).unwrap()
+    assert(c.read(0, uart0_reg.BASE, 4).is_err(), "held again")
+    assert(c.read(0, resets_reg.BASE + resets_reg.RESET_DONE_OFFSET, 4).unwrap() & resets_reg.RESET_UART0_MASK == 0, "RESET_DONE falls")
+    c.write(0, clr, 4, resets_reg.RESET_UART0_MASK).unwrap()
+    assert(c.read(0, uart0_reg.BASE + uart0_reg.UARTIBRD_OFFSET, 4).unwrap() == 0, "the divisor is gone")
+
+@test("CPUID answers the core, and a pin drives only once IO_BANK0 selects SIO and its pad leaves isolation")
+pins_and_cpuid()
+    var c = rp2350()
+    assert(c.read(0, sio_reg.BASE + sio_reg.CPUID_OFFSET, 4).unwrap() == 0 && c.read(1, sio_reg.BASE + sio_reg.CPUID_OFFSET, 4).unwrap() == 1)
+    c.write(0, resets_reg.BASE + 0x3000, 4, resets_reg.RESET_IO_BANK0_MASK | resets_reg.RESET_PADS_BANK0_MASK).unwrap()
+    c.write(0, sio_reg.BASE + sio_reg.GPIO_OE_SET_OFFSET, 4, 1 << 25).unwrap()
+    c.write(0, sio_reg.BASE + sio_reg.GPIO_OUT_SET_OFFSET, 4, 1 << 25).unwrap()
+    assert(!c.pin(25).drives, "IO_BANK0 still selects NULL")
+    c.write(0, io_reg.BASE + io_reg.GPIO25_CTRL_OFFSET, 4, io_reg.GPIO25_CTRL_FUNCSEL_SIO_25).unwrap()
+    assert(!c.pin(25).drives, "the pad is isolated: the RP2350's power-on state")
+    c.write(0, pads_reg.BASE + 0x3000 + pads_reg.GPIO25_OFFSET, 4, pads_reg.GPIO25_ISO_MASK).unwrap()
+    assert(c.pin(25).drives && c.pin(25).level)
+    assert(c.read(0, io_reg.BASE + io_reg.GPIO25_STATUS_OFFSET, 4).unwrap() & (io_reg.GPIO25_STATUS_OUTTOPAD_MASK | io_reg.GPIO25_STATUS_OETOPAD_MASK)
+        == io_reg.GPIO25_STATUS_OUTTOPAD_MASK | io_reg.GPIO25_STATUS_OETOPAD_MASK)
+    assert(c.read(0, sio_reg.BASE + sio_reg.GPIO_IN_OFFSET, 4).unwrap() & (1 << 25) == 0, "IE is clear at power-on, so the input reads 0")
+    c.write(0, pads_reg.BASE + 0x2000 + pads_reg.GPIO25_OFFSET, 4, pads_reg.GPIO25_IE_MASK).unwrap()
+    assert(c.read(1, sio_reg.BASE + sio_reg.GPIO_IN_OFFSET, 4).unwrap() & (1 << 25) != 0, "both cores read the pin")
+    // OUTOVER LOW wins over SIO's high.
+    c.write(0, io_reg.BASE + 0x2000 + io_reg.GPIO25_CTRL_OFFSET, 4, io_reg.GPIO25_CTRL_OUTOVER_LOW << io_reg.GPIO25_CTRL_OUTOVER_SHIFT).unwrap()
+    assert(c.pin(25).drives && !c.pin(25).level)
+
+@test("core 1's boot ROM echoes each launch word, restarts on one out of order, and launches after the sixth")
+rom_launch()
+    var c = rp2350()
+    val wr = sio_reg.BASE + sio_reg.FIFO_WR_OFFSET
+    val rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
+    // A stray word restarts the sequence; it is still echoed.
+    for x in [0u32, 7, 0, 0, 1, 0x20000100, 0x20081000]
+        c.write(0, wr, 4, x).unwrap()
+        assert(c.read(0, rd, 4).unwrap() == x, "echoed")
+        assert(c.take_launch().is_none())
+    c.write(0, wr, 4, 0x20000041).unwrap()
+    assert(c.read(0, rd, 4).unwrap() == 0x20000041)
+    val l = c.take_launch().unwrap()
+    assert(l.vector_table == 0x20000100 && l.stack_pointer == 0x20081000 && l.entry == 0x20000041)
+    // Out of the ROM, core 1's FIFO keeps what core 0 sends.
+    c.write(0, wr, 4, 9).unwrap()
+    assert(c.read(1, rd, 4).unwrap() == 9 && c.read(0, sio_reg.BASE + sio_reg.FIFO_ST_OFFSET, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0)

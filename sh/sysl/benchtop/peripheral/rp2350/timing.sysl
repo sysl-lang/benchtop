@@ -1,0 +1,190 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Resets, TickGenerator, Timer as Rp2040Timer, access, read_lane, replicated, written}
+import sh.sysl.rp2040.timer as rp2040_timer
+import sh.sysl.rp2350.resets as resets_reg
+import sh.sysl.rp2350.ticks as ticks_reg
+import sh.sysl.rp2350.timer0 as timer_reg
+import sh.sysl.rp2350.watchdog as watchdog_reg
+
+// The RP2350's resets, tick generators, timers and watchdog (datasheet, "Resets", "Ticks", "Timers",
+// "Watchdog"). Like the RP2040's models these know no core and no host clock: the chip delivers clk_ref
+// cycles to `Ticks`, each generator's ticks to the device it drives, and routes the level outputs to
+// the cores' interrupt inputs.
+
+/** The RP2350's 29 reset outputs, ADC (bit 0) to USBCTRL (bit 28). */
+const RESET_BITS: u32 = (resets_reg.RESET_USBCTRL_MASK << 1) - 1
+
+/** RESETS as the RP2350 has it: the RP2040's handshake over 29 outputs. */
+rp2350_resets() -> Resets
+    var state: Resets
+    state.reset_outputs(RESET_BITS)
+    state
+
+/** The six tick generators, in register order. */
+enum Tick
+    Proc0 = 0
+    Proc1
+    Timer0
+    Timer1
+    Watchdog
+    Riscv
+
+// Each generator's CTRL, CYCLES and COUNT, 12 bytes apart.
+private const GENERATOR_STRIDE: u32 = ticks_reg.PROC1_CTRL_OFFSET - ticks_reg.PROC0_CTRL_OFFSET
+
+/** TICKS: six generators, each dividing clk_ref by its CYCLES into a 1 µs tick for one consumer. Each
+ * powers up disabled with CYCLES 0; writing CTRL or CYCLES restarts its count.
+ */
+struct Ticks
+    generators: [6]TickGenerator
+
+    reset(*self)
+        for i in 0..<6 do self.generators[i].reset(false)
+
+    /** Advance every generator by `cycles` of clk_ref; answer each one's ticks, in `Tick` order. */
+    advance(*self, cycles: u64) -> [6]u64
+        var made: [6]u64 = [0; 6]
+        for i in 0..<6 do made[i] = self.generators[i].advance(cycles)
+        made
+
+    generator(self, t: Tick) -> TickGenerator = self.generators[usize(t)]
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        val i = address / GENERATOR_STRIDE
+        if i >= 6 then return Err(AccessError.Unmapped)
+        val g = self.generators[i]
+        val value = address % GENERATOR_STRIDE match
+            ticks_reg.PROC0_CTRL_OFFSET ->
+                (if g.enable then ticks_reg.PROC0_CTRL_ENABLE_MASK else 0) | (if g.running() then ticks_reg.PROC0_CTRL_RUNNING_MASK else 0)
+            ticks_reg.PROC0_CYCLES_OFFSET -> g.cycles
+            _ -> g.count
+        Ok(read_lane(value, offset, width))
+    end read
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        val i = address / GENERATOR_STRIDE
+        if i >= 6 then return Err(AccessError.Unmapped)
+        val g = &self.generators[i]
+        val data = replicated(value, width)
+        address % GENERATOR_STRIDE match
+            ticks_reg.PROC0_CTRL_OFFSET ->
+                val ctrl = written(if g.enable then ticks_reg.PROC0_CTRL_ENABLE_MASK else 0, offset, data)
+                g.set(g.cycles, ctrl & ticks_reg.PROC0_CTRL_ENABLE_MASK != 0)
+            ticks_reg.PROC0_CYCLES_OFFSET ->
+                g.set(written(g.cycles, offset, data) & ticks_reg.PROC0_CYCLES_PROC0_CYCLES_MASK, g.enable)
+            // COUNT is read-only.
+            _ -> ()
+        Ok(())
+    end write
+end Ticks
+
+ticks() -> Ticks
+    var state: Ticks
+    state.reset()
+    state
+
+// The RP2350's TIMER is the RP2040's with LOCKED and SOURCE inserted before the interrupt registers,
+// which move up by their size.
+private const INTERRUPTS_MOVED: u32 = timer_reg.INTR_OFFSET - rp2040_timer.INTR_OFFSET
+
+/** TIMER0 or TIMER1: the RP2040's 64-bit microsecond timer with its four alarms, plus LOCKED (once set,
+ * the time registers ignore writes until a reset) and SOURCE (count clk_sys cycles in place of ticks).
+ */
+struct Timer
+    counter: Rp2040Timer
+    locked: bool
+    clk_sys: bool
+
+    reset(*self)
+        self.counter.reset()
+        self.locked = false
+        self.clk_sys = false
+
+    /** The four alarm interrupts as a level each, bit n for ALARMn. */
+    irqs(self) -> u32 = self.counter.irqs()
+
+    /** Advance by `n` of what it counts: ticks, or clk_sys cycles where SOURCE says so. */
+    advance(*self, n: u64) = self.counter.advance(n, 0)
+
+    /** How far the next armed alarm is, in what it counts. */
+    next_alarm(self) -> Option[u64] = self.counter.next_alarm(0)
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        address match
+            timer_reg.LOCKED_OFFSET -> Ok(read_lane(if self.locked then 1 else 0, offset, width))
+            timer_reg.SOURCE_OFFSET -> Ok(read_lane(if self.clk_sys then 1 else 0, offset, width))
+            _ -> self.counter.read(moved(offset), width)
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val data = replicated(value, width)
+        offset & 0xFFC match
+            timer_reg.LOCKED_OFFSET ->
+                if written(if self.locked then 1 else 0, offset, data) & timer_reg.LOCKED_LOCKED_MASK != 0 then self.locked = true
+                Ok(())
+            timer_reg.SOURCE_OFFSET ->
+                self.clk_sys = written(if self.clk_sys then 1 else 0, offset, data) & timer_reg.SOURCE_CLK_SYS_MASK != 0
+                Ok(())
+            timer_reg.TIMEHW_OFFSET | timer_reg.TIMELW_OFFSET -> if self.locked then Ok(()) else self.counter.write(offset, width, value)
+            _ -> self.counter.write(moved(offset), width, value)
+end Timer
+
+// An RP2350 timer offset as the RP2040's timer has the register.
+private moved(offset: u32) -> u32 = if offset & 0xFFC >= timer_reg.INTR_OFFSET then offset - INTERRUPTS_MOVED else offset
+
+timer() -> Timer
+    var state: Timer
+    state.reset()
+    state
+
+/** The watchdog's registers: CTRL, LOAD, REASON and SCRATCH0–7. The counter does not count down, so a
+ * watchdog that is never fed never resets the chip; REASON reads 0, a power-on start. Its tick is
+ * TICKS' `Watchdog` generator.
+ */
+struct Watchdog
+    ctrl: u32
+    scratch: [8]u32
+
+    reset(*self)
+        // CTRL powers up with the three pause bits set.
+        self.ctrl = watchdog_reg.CTRL_PAUSE_DBG1_MASK | watchdog_reg.CTRL_PAUSE_DBG0_MASK | watchdog_reg.CTRL_PAUSE_JTAG_MASK
+        for i in 0..<8 do self.scratch[i] = 0
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        if address >= watchdog_reg.SCRATCH0_OFFSET && address <= watchdog_reg.SCRATCH7_OFFSET
+            return Ok(read_lane(self.scratch[(address - watchdog_reg.SCRATCH0_OFFSET) >> 2], offset, width))
+        val value = address match
+            watchdog_reg.CTRL_OFFSET -> self.ctrl
+            watchdog_reg.LOAD_OFFSET | watchdog_reg.REASON_OFFSET -> 0
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        val data = replicated(value, width)
+        if address >= watchdog_reg.SCRATCH0_OFFSET && address <= watchdog_reg.SCRATCH7_OFFSET
+            val i = (address - watchdog_reg.SCRATCH0_OFFSET) >> 2
+            self.scratch[i] = written(self.scratch[i], offset, data)
+            return Ok(())
+        address match
+            // TRIGGER asks for a reset the model does not make; it reads back 0.
+            watchdog_reg.CTRL_OFFSET -> self.ctrl = written(self.ctrl, offset, data) & ~watchdog_reg.CTRL_TRIGGER_MASK
+            watchdog_reg.LOAD_OFFSET | watchdog_reg.REASON_OFFSET -> ()
+            _ -> return Err(AccessError.Unmapped)
+        Ok(())
+end Watchdog
+
+watchdog() -> Watchdog
+    var state: Watchdog
+    state.reset()
+    state
