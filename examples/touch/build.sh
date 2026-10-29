@@ -43,7 +43,7 @@ libc=$($ARM_CC -mcpu="$cpu" -mthumb -mfpu="$fpu" -mfloat-abi=hard -print-file-na
 libm=$($ARM_CC -mcpu="$cpu" -mthumb -mfpu="$fpu" -mfloat-abi=hard -print-file-name=libm.a)
 libgcc=$($ARM_CC -mcpu="$cpu" -mthumb -mfpu="$fpu" -mfloat-abi=hard -print-libgcc-file-name)
 include_root=$(dirname "$($ARM_CC -print-file-name=libc.a)")/../include
-sysl build-c $feature_args --target "$target" -O2 --include-path "$include_root" -DNDEBUG -o "$build_dir/demo.a" .
+sysl build-c $feature_args --target "$target" -O2 --lib ../shared --include-path "$include_root" -DNDEBUG -o "$build_dir/demo.a" .
 "$ARM_LD" -z noexecstack --gc-sections --build-id=none --no-warn-rwx-segments -L ../.. -T "$script" \
     --whole-archive "$build_dir/demo.a" --no-whole-archive $extra \
     --start-group "$libm" "$libc" "$libgcc" --end-group -o "$output"
