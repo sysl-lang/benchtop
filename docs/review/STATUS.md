@@ -16,19 +16,19 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#6 | the timing switch checked at decode in three spellings; IT re-dispatch | partly fixed in `35449b8`: `CYCLE_ACCOUNTING` deleted; one spelling (`handler_for`, `fused_handler_for`, `cmp_w_bcond_handler`, `pred_handler` all take the core); `h_pred[K, L, TIMED]` no longer tests the timing switch at run time; left: it still re-selects its inner handler per run — the 16-byte record has no room for a second handler pointer |
 | cores#7 | the RISC-V core is RP2350-specific while claiming to be generic | fixed in `aff3dad`: a `Chip` record holds what the integration fixes, `riscv/rp2350.sysl` is the one that names the RP2350 |
 | cores#8 | RISC-V per-instruction cost far from "real-world speed" | partly fixed in `aff3dad`, `6e909be`: cached IRQ line, decoded PMP with a Machine-mode fast path, word RAM access; 1247 → 224 host instructions per guest instruction (bench/README.md); left: a decode cache and the threaded executor v6m has |
-| cores#9 | NVIC banks use three indexing schemes | open |
-| cores#10 | flash write protection is an extra compare on every store | open |
-| cores#11 | sentinel and guard-record arithmetic in place of named concepts | open |
-| cores#12 | `Kind`, `Arch` and the `is_*` predicates overlap | open |
-| cores#13 | `h_dsp` re-checks DSP at run time against a second source of truth | open |
-| cores#14 | duplicated bit utilities and hand-rolled loops the library has | partly fixed in `d435c66` (`t2sem` CLZ is `leading_zeros`); `rbit` is `reverse_bits` (sysl 0.7.9); left: the RISC-V `bitops` loops, the duplicated `sext`/`bits`/`bad`/`st` helpers |
+| cores#9 | NVIC banks use three indexing schemes | fixed in `ff93bb7`: enabled, pending, active and incoming are each one exception-indexed `[NVIC_BANKS]u64` with a summary mask over words 1–7 (`NVIC_BANKS`, `NVIC_MAX_IRQS` named); word 0 is the common path; no splicing; scans use `trailing_zeros`; one memory order for cross-thread delivery; the dead ISER/ISPR arms of `scs_read`/`scs_write` are gone |
+| cores#10 | flash write protection is an extra compare on every store | fixed in `ef0598c`: stores take a RAM-only page (`store_page`), so a flash store misses and `slow_write` faults any access overlapping flash — the straddling 4-byte store included; zero hot-path cost |
+| cores#11 | sentinel and guard-record arithmetic in place of named concepts | fixed in `400e17b`: `NO_CODE`, `NO_RAM`, `GUARD_BYTES`/`GUARD_RECORDS`, `Memory.is_code`; the bank message says "at most seven extra RAM banks" |
+| cores#12 | `Kind`, `Arch` and the `is_*` predicates overlap | fixed in `a92b941`: `model_of` is one indexed load and every predicate reads the catalog's `Arch`; `Model.fpu` is the `Fpu` enum, `fpv5` an explicit field, the table uses named fields; the Kind/core mapping is documented (the kinds are not renamed: ~180 test sites in files other items own) |
+| cores#13 | `h_dsp` re-checks DSP at run time against a second source of truth | fixed in `81b898c`: `instruction_record_cycles` answers 1 on an untimed core, so a timed FP record shared with an untimed peer charges nothing extra; decode goes by `dsp_capable(kind)` (records are shared by cores of a kind on purpose) and `Cpu.dsp` is the one per-core flag both executors check |
+| cores#14 | duplicated bit utilities and hand-rolled loops the library has | partly fixed in `d435c66` (`t2sem` CLZ is `leading_zeros`), `rbit` is `reverse_bits` (sysl 0.7.9), and `b3b4ffc` (v6m: one `bits`, one `bad`); left: the RISC-V `bitops` loops and its `sext`/`cx`/`st` copies, which belong to the RISC-V item |
 | cores#15 | boilerplate handler bodies | fixed in `35449b8`: `h_step[OP, L, TIMED]` and `h_access[OP, L, TIMED]`, whose `match` on the constant `OP` folds, replace ~85 hand-written handlers |
 | cores#16 | RISC-V `execute` mixes decode, validation and commit | fixed in `aff3dad`: one `retire` commit path, faults carry an `Access` instead of a side channel |
-| cores#17 | `Stop.Budget` means "running" | open |
+| cores#17 | `Stop.Budget` means "running" | fixed for v6m in `741e356`: the variant is `Stop.Running`; the RISC-V core's own `Stop` is the RISC-V item's |
 | cores#18 | RISC-V `Model` fields that nothing reads | fixed in `aff3dad`: `model.irqs` sizes the interrupt scan; the chip-fixed fields moved to `Chip` |
 | cores#19 | Python-generated tests addressed by hard-coded record ranges | fixed in `aff3dad`: each vector carries its mnemonic and the harness selects by it, iterating `MODELS` |
-| cores#20 | tests that restate the cost table | open |
-| cores#21 | comments that record history rather than invariants | open |
+| cores#20 | tests that restate the cost table | fixed in `81b898c`: the echo asserts are gone; VADD/VMLA/VDIV.F64 costs are run through both executors, citing the M4 TRM table |
+| cores#21 | comments that record history rather than invariants | fixed in `ff93bb7`, `a92b941`, `81b898c`, `741e356` (Kind, NVIC, timing, switch header, `device_store`) |
 | runtime#1 | no board object: the machine is module globals shared across threads | partly fixed by slices 1–4 (`ce0b959`, `3024687`, `679528a`, `d72cffd`, `a53b6ff`, `9d54348`): memory, devices, scheduler, workers and cores are owned; the cores' configuration, clock and bus cache are `Machine`'s (`bb79bea`); left: the SIO FIFOs and spinlocks, and `virt.machine` (slice 4 part 2) |
 | runtime#2 | devices are a closed enum dispatched by hand, not a trait | open (slice 4 part 2: the `Peripheral` trait) |
 | runtime#3 | four schedulers share one set of globals | fixed by slice 3 (`679528a`): one `Scheduler`; `pump_parallel` and `parallel.sysl` gone; `run_on_threads` and `threaded` split |
