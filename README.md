@@ -213,7 +213,8 @@ one supported model (the core table below) whose peripherals benchtop all emulat
 as raw bytes from address 0. **Ctrl-]** ends benchtop whatever the guest is doing, with exit status
 130. Otherwise the exit status is the one the guest wrote to the console's EXIT register; a guest
 that stops on a breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can
-wake, a fault the core cannot take, or (on an M33) a stack-limit violation gets a message saying
+wake, a fault the core cannot take, (on an M33) a stack-limit violation no fault can be taken for, or
+a Secure-only core asked for Non-secure state gets a message saying
 where, and status 3 for all but the breakpoint. A system reset request (AIRCR) ends it with status 0.
 
 By default, launched guest cores run on separate host threads. **`--deterministic`**

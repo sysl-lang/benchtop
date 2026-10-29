@@ -687,12 +687,14 @@ Architecture Reference Manual (DDI0553), cited by chapter title. Over §2.1's v7
     `cmse_check_address_range`;
   - EXC_RETURN carries the v8-M bits (`S`, `DCRS`, `ES`, and `FType` in bit 4, which skiff reads) with
     Secure values. Code compares these values, so they must be exact;
-  - SecureFault and `SFSR`/`SFAR` exist, so a stray `SG` or a Non-secure transition (`BXNS`,
-    `BLXNS`, an EXC_RETURN or `FNC_RETURN` naming Non-secure) **stops the run with a named
-    diagnostic, "Non-secure state is not modelled"**, rather than doing something plausible;
-  - the Non-secure aliases of the PPB (`PPB_NONSEC_BASE 0xe0020000`) and SIO (`SIO_NONSEC_BASE
-    0xd0020000`, `regs/addressmap.h:106–108`) are mapped and refused with the same diagnostic until
-    something needs them;
+  - SecureFault and `SFSR`/`SFAR` exist, and a Non-secure transition (`BXNS`, `BLXNS`, an
+    EXC_RETURN naming the Non-secure stack or callee-stacked frame, `MRS`/`MSR` of a `_NS` register)
+    **stops the run with a named diagnostic, "Non-secure state is not modelled"**, rather than doing
+    something plausible. `SG` is a NOP in Secure state, as the architecture has it, and an
+    EXC_RETURN whose ES names a Non-secure exception is the UsageFault INVPC (`v6m/t2secure.sysl`);
+  - the Non-secure alias of the PPB (`PPB_NONSEC_BASE 0xe0020000`) is refused by the core with the
+    same diagnostic, and the SIO's (`SIO_NONSEC_BASE 0xd0020000`, `regs/addressmap.h:106–108`) by
+    the chip, until something needs them;
   - ACCESSCTRL (`0x40060000`) is stored. Its reset state grants Secure code everything (datasheet,
     "Security" chapter, "Access control"), which is the state the SDK leaves it in.
 

@@ -5,11 +5,12 @@ module sh.sysl.benchtop.v6m
 // BASEPRI_MAX and FAULTMASK, the stack limits, AIRCR.PRIGROUP, four bits of priority, the system
 // handler priorities and the byte access to them, and the configurable-fault registers.
 //
-// **The faults are stops.** MemManage, BusFault and UsageFault are not taken: an undefined
-// instruction stops the core at `Undefined`, an access where nothing is at `Unmapped`, a division by
-// zero CCR traps and a stack-limit violation at `Fault` and `StackLimit`, as ARMv6-M's HardFaults
-// stop it. SHCSR, CCR and SHPR1 are kept as written, so start-up code that configures them runs; CFSR,
-// HFSR, MMFAR and BFAR read 0, since no fault is ever recorded.
+// **Most faults are stops.** An undefined instruction stops the core at `Undefined`, an access where
+// nothing is at `Unmapped`, and a division by zero CCR traps at `Fault`, as ARMv6-M's HardFaults stop
+// it. The faults that are taken — the stack-limit UsageFault, and on a Secure-only core the INVPC of
+// an EXC_RETURN naming a Non-secure exception — are t2secure.sysl's, and record themselves in CFSR
+// and HFSR. SHCSR's enables and pending bits, CCR and SHPR1 are kept as written; MMFAR and BFAR read
+// 0, since no MemManage or BusFault is ever recorded.
 
 // Cortex-M4 r0p1.
 const M4_CPUID: u32 = 0x410FC241
@@ -70,7 +71,7 @@ prio_mask(cpu: *Cpu) -> u32 = (0xFF << (8 - cpu.priority_bits)) & 0xFF
 byte_wide(a: u32, width: u32) -> bool
     if a & (width - 1) != 0 then return false
 
-    (a >= NVIC_IPR && a < NVIC_IPR + 512) || (a >= SCB_SHPR1 && a < SCB_SHPR3 + 4)
+    (a >= NVIC_IPR && a < NVIC_IPR + 512) || (a >= SCB_SHPR1 && a < SCB_SHPR3 + 4) || (a >= SCB_CFSR && a < SCB_CFSR + 4)
 
 // The `width` bytes at `a` of the word `w` read from its aligned address; and `w` with them replaced.
 @inline
@@ -98,9 +99,13 @@ scs_read8(cpu: *Cpu, a: u32) -> u32
         ICTR -> (cpu.nvic_irqs + 31) / 32 - 1
         ACTLR -> 0
         SCB_CCR -> cpu.ccr
-        SCB_SHPR1 -> u32(cpu.prio[MEM_MANAGE]) | u32(cpu.prio[BUS_FAULT]) << 8 | u32(cpu.prio[USAGE_FAULT]) << 16
-        SCB_SHCSR -> cpu.shcsr | (bit_of(cpu.active[0], SVCALL) << 7) | (bit_of(cpu.active[0], PENDSV) << 10) | (bit_of(cpu.active[0], SYSTICK) << 11) | (bit_of(cpu.pending[0], SVCALL) << 15)
-        SCB_CFSR | SCB_HFSR | SCB_MMFAR | SCB_BFAR -> 0
+        SCB_SHPR1 ->
+            val secure: u32 = if cpu.security then u32(cpu.prio[SECURE_FAULT]) << 24 else 0
+            u32(cpu.prio[MEM_MANAGE]) | u32(cpu.prio[BUS_FAULT]) << 8 | u32(cpu.prio[USAGE_FAULT]) << 16 | secure
+        SCB_SHCSR -> shcsr_value(cpu)
+        SCB_CFSR -> cpu.cfsr
+        SCB_HFSR -> cpu.hfsr
+        SCB_MMFAR | SCB_BFAR -> 0
         // Without the floating-point extension, every CPACR field reads as "no access".
         SCB_CPACR -> cpu.cpacr
         _ ->
@@ -113,6 +118,10 @@ scs_read8(cpu: *Cpu, a: u32) -> u32
                     FP_MVFR1 -> return fp_feature(cpu, 1)
                     FP_MVFR2 -> if fpv5(cpu) then return fp_feature(cpu, 2)
                     _ -> ()
+
+            secure_read(cpu, a) match
+                Some(v) -> return v
+                None -> ()
 
             halt(cpu, Stop.Unmapped, a)
             0
@@ -132,11 +141,13 @@ scs_write8(cpu: *Cpu, a: u32, x: u32)
             cpu.prio[MEM_MANAGE] = u8(x & mask)
             cpu.prio[BUS_FAULT] = u8((x >> 8) & mask)
             cpu.prio[USAGE_FAULT] = u8((x >> 16) & mask)
-        // The enables of the configurable faults, and of the SecureFault the Security Extension would
-        // add: kept, though no fault is taken.
-        SCB_SHCSR -> cpu.shcsr = x & 0x000F0000
-        // Write-one-to-clear registers of faults that are never recorded.
-        SCB_CFSR | SCB_HFSR | SCB_MMFAR | SCB_BFAR -> ()
+            if cpu.security then cpu.prio[SECURE_FAULT] = u8((x >> 24) & mask)
+        SCB_SHCSR -> shcsr_write(cpu, x)
+        // Write one to clear.
+        SCB_CFSR -> cpu.cfsr &= ~x
+        SCB_HFSR -> cpu.hfsr &= ~x
+        // The addresses of faults that are never recorded.
+        SCB_MMFAR | SCB_BFAR -> ()
         // CP10 and CP11, where the core has a unit to give access to, and each coprocessor 0–7 the
         // board puts on its port; the rest read as zero.
         SCB_CPACR ->
@@ -154,7 +165,7 @@ scs_write8(cpu: *Cpu, a: u32, x: u32)
             cpu.fp_ready = false
         FP_FPCAR if cpu.fpu != Fpu.Absent -> cpu.fpcar = x & ~7
         FP_FPDSCR if cpu.fpu != Fpu.Absent -> cpu.fpdscr = x & FPSCR_CONTROLS
-        _ -> halt(cpu, Stop.Unmapped, a)
+        _ -> if !secure_write(cpu, a, x) then halt(cpu, Stop.Unmapped, a)
 
 // ---------------------------------------------------------------------------------------------------
 // The system instructions.

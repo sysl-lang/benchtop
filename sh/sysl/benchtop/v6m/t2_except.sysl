@@ -35,6 +35,7 @@ run_both_thumb2(kind: Kind, code: []const u16, regs: []const u32, nzcv: u32, han
     assert(a.ipsr == b.ipsr && a.control == b.control && a.primask == b.primask && a.sp_other == b.sp_other, "and on the modes")
     assert(a.basepri == b.basepri && a.faultmask == b.faultmask && a.msplim == b.msplim && a.psplim == b.psplim, "and on the masks")
     assert(a.pending == b.pending && a.active == b.active && a.it == b.it, "and on the exceptions")
+    assert(a.cfsr == b.cfsr && a.hfsr == b.hfsr && a.sfsr == b.sfsr && a.transition == b.transition, "and on the fault status")
     for i in 0..<words.len do assert(words[i] == load32(&b, LOW + u32(i) * 4), "and on memory")
 
     b
@@ -337,49 +338,74 @@ t2e_prigroup()
 // ---------------------------------------------------------------------------------------------------
 // The stack limits.
 
-// MSPLIM at 0x1F00.
+// The stack limit's fault handlers: each a BKPT, so a run ends in the handler that took the fault.
+const FAULT_AT: u32 = 0x0400
+const PUSH_R0: u16 = 0xB401
+const SHCSR_USGFAULTENA: u32 = 1 << 18
+const SHCSR_SECUREFAULTENA: u32 = 1 << 19
+
+// MSPLIM at 0x1F00, and a BKPT at FAULT_AT.
 limited(cpu: *Cpu)
     cpu.msplim = 0x1F00
+    store16(cpu, FAULT_AT, BKPT)
 
-// `code` on the main stack at `sp`, MSPLIM at 0x1F00, stopped on its first instruction at `StackLimit`
-// with SP and the memory below it as they were.
-refused(code: []const u16, sp: u32, regs: []const u32) -> bool
+// As `limited`, with the UsageFault enabled.
+limited_usage(cpu: *Cpu)
+    limited(cpu)
+    store32(cpu, SCB_SHCSR, SHCSR_USGFAULTENA)
+
+// `code` on the main stack at `sp`, MSPLIM at 0x1F00, HardFault's handler a BKPT: the first instruction
+// is the UsageFault STKOF, escalated to HardFault since the UsageFault is not enabled, with nothing of
+// it done. The entry stacks its frame, of which only the words at or above the limit where the frame
+// would cross it, SP then left at the limit and the STKOF that derives pending, as HardFault; nothing
+// is ever stored below the limit.
+overflowed(code: []const u16, sp: u32, regs: []const u32) -> bool
     var all: [16]u32
 
     for k in 0..<regs.len do all[k] = regs[k]
     all[13] = sp
 
-    var c = run_both8(code, all[..], 0, [], &limited)
+    var c = run_both8(code, all[..], 0, [[HARD_FAULT, FAULT_AT]], &limited)
+    val frame = (sp - 0x20) & ~4u32
+    val crossed = frame < 0x1F00
 
-    if c.stop != Stop.StackLimit || c.stop_at != 0 || c.pc != 0 || c.r[13] != sp || c.retired != 0
-        print(f"stopped at ${c.stop} 0x${c.stop_at}%x, SP 0x${c.r[13]}%x, after ${c.retired}")
+    if c.stop != Stop.Breakpoint || c.stop_at != FAULT_AT || c.ipsr != HARD_FAULT || c.retired != 0
+        print(f"stopped at ${c.stop} 0x${c.stop_at}%x in ${c.ipsr}, after ${c.retired}")
         return false
 
-    for a in 0x1E00u32..<0x2000
+    if c.r[13] != (if crossed then 0x1F00 else frame) || c.cfsr != CFSR_STKOF || c.hfsr != HFSR_FORCED
+        print(f"SP 0x${c.r[13]}%x, CFSR 0x${c.cfsr}%x, HFSR 0x${c.hfsr}%x")
+        return false
+
+    // The return address is the instruction, where it was stacked.
+    if frame + 0x18 >= 0x1F00 && load32(&c, frame + 0x18) != 0 then return false
+    if ((c.pending[0] >> HARD_FAULT) & 1 != 0) != crossed then return false
+
+    for a in 0x1E00u32..<0x1F00
         if load8(&c, a) != 0 then return false
 
     true
 
-@test("every way of moving SP below MSPLIM stops on the instruction, with nothing stored")
+@test("every way of moving SP below MSPLIM is the UsageFault STKOF on the instruction, escalated to HardFault, nothing stored below the limit")
 t2e_stack_limit()
     val x: u32 = 0xAA
     // push {r0-r7, lr}: 36 bytes from 0x1F10
-    assert(refused([0xB5FF], 0x1F10, [x, x, x, x, x, x, x, x]), "PUSH")
+    assert(overflowed([0xB5FF], 0x1F10, [x, x, x, x, x, x, x, x]), "PUSH")
     // push.w {r4, r8, lr}; stmdb sp!, as PUSH.W is
-    assert(refused([0xE92D, 0x4110], 0x1F08, [x, x, x, x, x]), "PUSH.W")
+    assert(overflowed([0xE92D, 0x4110], 0x1F08, [x, x, x, x, x]), "PUSH.W")
     // str r0, [sp, #-4]!; strd r0, r1, [sp, #-8]!
-    assert(refused([0xF84D, 0x0D04], 0x1F00, [x]), "STR pre-indexed")
-    assert(refused([0xE96D, 0x0102], 0x1F04, [x, x]), "STRD pre-indexed")
+    assert(overflowed([0xF84D, 0x0D04], 0x1F00, [x]), "STR pre-indexed")
+    assert(overflowed([0xE96D, 0x0102], 0x1F04, [x, x]), "STRD pre-indexed")
     // sub sp, #0x20; sub.w sp, sp, #256; subw sp, sp, #4
-    assert(refused([0xB088], 0x1F10, []), "SUB SP")
-    assert(refused([0xF5AD, 0x7D80], 0x1FF0, []), "SUB.W SP")
-    assert(refused([0xF2AD, 0x0D04], 0x1F00, []), "SUBW SP")
+    assert(overflowed([0xB088], 0x1F10, []), "SUB SP")
+    assert(overflowed([0xF5AD, 0x7D80], 0x1FF0, []), "SUB.W SP, the frame clear of the limit")
+    assert(overflowed([0xF2AD, 0x0D04], 0x1F00, []), "SUBW SP")
     // mov sp, r1; mov.w sp, r1; add.w sp, sp, r1 (r1 negative)
-    assert(refused([0x468D], 0x2000, [0, 0x1EFC]), "MOV SP")
-    assert(refused([0xEA4F, 0x0D01], 0x2000, [0, 0x1EFC]), "MOV.W SP")
-    assert(refused([0xEB0D, 0x0D01], 0x1F00, [0, 0xFFFFFFF8]), "ADD.W SP")
+    assert(overflowed([0x468D], 0x2000, [0, 0x1EFC]), "MOV SP")
+    assert(overflowed([0xEA4F, 0x0D01], 0x2000, [0, 0x1EFC]), "MOV.W SP")
+    assert(overflowed([0xEB0D, 0x0D01], 0x1F00, [0, 0xFFFFFFF8]), "ADD.W SP")
 
-@test("SP may come down to MSPLIM exactly, and an SVC whose frame would go below it stops on its return address")
+@test("SP may come down to MSPLIM exactly; an SVC whose frame would cross it takes HardFault instead, a late arrival, SVCall left pending")
 t2e_stack_limit_edge()
     var regs: [16]u32
 
@@ -388,21 +414,123 @@ t2e_stack_limit_edge()
 
     // push {r0-r7, lr} from 0x1F24 ends at 0x1F00
     var c = run_both8([0xB5FF], regs[..], 0, [], &limited)
-    assert(c.stop == Stop.Breakpoint && c.r[13] == 0x1F00 && load32(&c, 0x1F00) == 0xAA, "down to the limit")
+    assert(c.stop == Stop.Breakpoint && c.r[13] == 0x1F00 && load32(&c, 0x1F00) == 0xAA && c.cfsr == 0, "down to the limit")
 
-    // svc #0 with SP at 0x1F10: the frame would start at 0x1EF0
+    // svc #0 with SP at 0x1F10: the frame would start at 0x1EF0. 2: bkpt; 4: SVCall's bkpt.
     regs[13] = 0x1F10
-    c = run_both8([SVC], regs[..], 0, [[SVCALL, 4]], &limited)
-    assert(c.stop == Stop.StackLimit && c.stop_at == 2 && c.ipsr == 0 && load32(&c, 0x1EF0) == 0, "an exception entry")
+    c = run_both8([SVC, BKPT, BKPT], regs[..], 0, [[SVCALL, 4], [HARD_FAULT, FAULT_AT]], &limited)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == HARD_FAULT, "HardFault, of higher priority, arrived late")
+    assert(c.r[13] == 0x1F00 && load32(&c, 0x1F08) == 2 && load32(&c, 0x1EF0) == 0, "SP at the limit, the return address stacked above it")
+    assert((c.pending[0] >> SVCALL) & 1 != 0 && c.cfsr == CFSR_STKOF && c.hfsr == HFSR_FORCED, "SVCall still pending")
+
+    // With the UsageFault enabled at SVCall's priority, the derived fault cannot arrive late: SVCall
+    // runs, the UsageFault pending.
+    c = run_both8([SVC, BKPT, BKPT], regs[..], 0, [[SVCALL, 4], [USAGE_FAULT, FAULT_AT]], &limited_usage)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 4 && c.ipsr == SVCALL && c.r[13] == 0x1F00, "SVCall at the limit")
+    assert((c.pending[0] >> USAGE_FAULT) & 1 != 0 && c.hfsr == 0, "the UsageFault pending, not escalated")
 
 @test("PSPLIM limits the process stack in thread mode, and MSPLIM does not")
 t2e_psplim()
     // msr psp, r2; msr psplim, r3; msr control, r6 (SPSEL); push {r0}
-    val code: []const u16 = [0xF382, 0x8809, 0xF383, 0x880B, 0xF386, 0x8814, 0xB401]
-    var c = run_both8(code, [0xAA, 0, 0x1800, 0x1800, 0, 0, 2], 0, [], &nothing)
-    assert(c.stop == Stop.StackLimit && c.stop_at == 12 && c.r[13] == 0x1800, "PSPLIM")
+    val code: []const u16 = [0xF382, 0x8809, 0xF383, 0x880B, 0xF386, 0x8814, PUSH_R0]
+    var c = run_both8(code, [0xAA, 0, 0x1800, 0x1800, 0, 0, 2], 0, [[HARD_FAULT, FAULT_AT]], &limited)
+    // The frame would cross PSPLIM too: the process stack is left at it, HardFault on the main stack.
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.sp_other == 0x1800 && c.r[13] == 0x2000, "PSPLIM")
+    assert(load32(&c, 0x1800 - 4) == 0 && c.cfsr == CFSR_STKOF, "nothing below it")
     c = run_both8(code, [0xAA, 0, 0x1800, 0x1000, 0, 0, 2], 0, [], &limited)
     assert(c.stop == Stop.Breakpoint && c.r[13] == 0x17FC && load32(&c, 0x17FC) == 0xAA, "MSPLIM above PSP is not PSP's")
+
+// sub sp, #0x80 from 0x1F40, below MSPLIM; 2: bkpt. 4: a UsageFault handler that lifts the limit
+// and returns, so the SUB runs again: movs r0, #0; msr msplim, r0; bx lr.
+val RETRIED: [6]u16 = [0xB0A0, BKPT, 0x2000, 0xF380, 0x880A, BX_LR]
+
+@test("an enabled UsageFault takes STKOF itself, returning to the instruction, which runs again once the handler lifts the limit")
+t2e_stack_limit_usage_fault()
+    var c = run_both8(RETRIED[..], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1F40], 0, [[USAGE_FAULT, 4]], &limited_usage)
+
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 2 && c.ipsr == 0 && c.r[13] == 0x1EC0, "the SUB ran the second time")
+    assert(c.cfsr == CFSR_STKOF && c.hfsr == 0 && c.msplim == 0, "STKOF recorded and sticky, not escalated")
+    // The frame at 0x1F20 held the SUB's address as the return address.
+    assert(load32(&c, 0x1F20 + 0x18) == 0, "returned to the instruction")
+
+@test("STKOF on an instruction of an IT block stacks that instruction's own ITSTATE, and the block goes on under it after the return")
+t2e_stack_limit_in_block()
+    // 0: cmp r0, r0; it eq; subeq sp, #0x80; bkpt. 8: the UsageFault handler logs the stacked xPSR,
+    // lifts the limit and returns: ldr r0, [sp, #28]; stmia r4!, {r0}; movs r0, #0; msr msplim, r0;
+    // bx lr.
+    val code: []const u16 = [0x4280, 0xBF08, 0xB0A0, BKPT, LDR_R0_SP_28, LOG_R0, 0x2000, 0xF380, 0x880A, BX_LR]
+    var c = run_both8(code, [0, 0, 0, 0, LOG, 0, 0, 0, 0, 0, 0, 0, 0, 0x1F40], 0, [[USAGE_FAULT, 8]], &limited_usage)
+
+    // Z and C from the CMP, T, and IT EQ's ITSTATE 0x08: IT[7:2] = 2 in bits 15–10.
+    assert(logged(&c, [0x61000800]), "the stacked xPSR")
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 6 && c.r[13] == 0x1EC0 && c.it == 0, "the SUB ran under the block")
+
+primask_set(cpu: *Cpu)
+    limited_usage(cpu)
+    cpu.primask = 1
+
+basepri_above(cpu: *Cpu)
+    limited_usage(cpu)
+    store32(cpu, SCB_SHPR1, 0x00800000)
+    cpu.basepri = 0x40
+
+@test("an enabled UsageFault escalates to HardFault where PRIMASK or BASEPRI keeps it from preempting")
+t2e_stack_limit_escalates()
+    val regs: [14]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1F40]
+
+    for setup in [&primask_set, &basepri_above]
+        var c = run_both8([0xB0A0], regs[..], 0, [[USAGE_FAULT, 4], [HARD_FAULT, FAULT_AT]], setup)
+
+        assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == HARD_FAULT, "HardFault")
+        assert(c.cfsr == CFSR_STKOF && c.hfsr == HFSR_FORCED && c.r[13] == 0x1F20, "FORCED, the frame above the limit")
+
+limited_faultmask(cpu: *Cpu)
+    limited(cpu)
+    cpu.faultmask = 1
+
+faultmask_ignoring(cpu: *Cpu)
+    limited_faultmask(cpu)
+    store32(cpu, SCB_CCR, 0x400)
+
+ignoring(cpu: *Cpu)
+    limited(cpu)
+    store32(cpu, SCB_CCR, 0x400)
+
+@test("at a negative priority a stack-limit violation is a lockup, a stop with nothing done, unless CCR.STKOFHFNMIGN ignores it")
+t2e_stack_limit_lockup()
+    val regs: [14]u32 = [0xAA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1F00]
+
+    // FAULTMASK: not even HardFault preempts.
+    var c = run_both8([PUSH_R0], regs[..], 0, [[HARD_FAULT, FAULT_AT]], &limited_faultmask)
+    assert(c.stop == Stop.StackLimit && c.stop_at == 0 && c.pc == 0 && c.retired == 0 && c.r[13] == 0x1F00, "locked up on the PUSH")
+    assert(load32(&c, 0x1EFC) == 0 && c.ipsr == 0, "nothing stored, nothing taken")
+
+    // STKOFHFNMIGN at a negative priority: the PUSH goes below the limit.
+    c = run_both8([PUSH_R0], regs[..], 0, [[HARD_FAULT, FAULT_AT]], &faultmask_ignoring)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 2 && c.r[13] == 0x1EFC && load32(&c, 0x1EFC) == 0xAA && c.cfsr == 0, "ignored")
+
+    // STKOFHFNMIGN at thread priority ignores nothing.
+    c = run_both8([PUSH_R0], regs[..], 0, [[HARD_FAULT, FAULT_AT]], &ignoring)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.cfsr == CFSR_STKOF, "taken")
+
+    // A HardFault handler that pushes below the limit: the frame left SP at the limit, so the
+    // handler's own PUSH locks up. 0: push {r0}; 2: bkpt; 4: HardFault: push {r0}.
+    c = run_both8([PUSH_R0, BKPT, PUSH_R0], regs[..], 0, [[HARD_FAULT, 4]], &limited)
+    assert(c.stop == Stop.StackLimit && c.stop_at == 4 && c.ipsr == HARD_FAULT && c.r[13] == 0x1F00, "the handler locked up")
+
+// IRQ 0 pending at priority 0x80, the UsageFault enabled at 0.
+irq_low_usage(cpu: *Cpu)
+    limited_usage(cpu)
+    store32(cpu, NVIC_IPR, 0x80)
+    irq0_pending(cpu)
+
+@test("an interrupt whose frame would cross MSPLIM gives way to the UsageFault it derives, a late arrival, and stays pending")
+t2e_stack_limit_late_arrival()
+    val regs: [14]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1F10]
+    var c = run_both8([BKPT], regs[..], 0, [[USAGE_FAULT, FAULT_AT], [IRQ0, 4]], &irq_low_usage)
+
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == USAGE_FAULT && c.r[13] == 0x1F00, "the UsageFault, at the limit")
+    assert((c.pending[0] >> IRQ0) & 1 != 0 && c.cfsr == CFSR_STKOF && c.hfsr == 0, "IRQ 0 still pending")
 
 // ---------------------------------------------------------------------------------------------------
 // MRS and MSR, and the system control space.

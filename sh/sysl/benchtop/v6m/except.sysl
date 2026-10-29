@@ -245,11 +245,12 @@ running_priority(cpu: *Cpu, masked: bool) -> int
 
     p
 
-// Whether exception `e` is enabled: an IRQ has its bit in the NVIC, a system exception always is.
+// Whether exception `e` is enabled: an IRQ has its bit in the NVIC, a configurable fault its SHCSR
+// enable (kept in `enabled` too), and the other system exceptions always are.
 eligible(cpu: *Cpu, e: u32) -> bool
     if e >= IRQ0 then return irq_enabled(cpu,e - IRQ0)
 
-    (SYSTEM_EXCEPTIONS >> e) & 1 != 0
+    ((SYSTEM_EXCEPTIONS | cpu.enabled[0]) >> e) & 1 != 0
 
 // The pending, enabled exception of highest priority, the lowest number among equals; -1 for none.
 best_pending(cpu: *Cpu) -> int
@@ -306,9 +307,13 @@ set_apsr(cpu: *Cpu, psr: u32)
 // handler the vector table names. Answers whether it was taken: a frame or a vector where nothing is
 // stops the core, with nothing of the exception's state changed and `pc` left for the caller.
 //
-// On ARMv8-M, a frame below the stack's limit is the UsageFault STKOF, which benchtop does not take:
-// the core stops at `StackLimit`, `stop_at` the address the exception would have returned to, nothing
-// stacked. The handler starts outside any IT block, and with the local exclusive monitor clear.
+// On ARMv8-M, a frame below the stack's limit derives the UsageFault STKOF (t2secure.sysl's
+// `derived_overflow`): only the words at or above the limit are stacked, and SP is left at the limit.
+// The derived fault is taken instead where its priority is higher (a late arrival, `e` left pending),
+// and is pending otherwise; where it would be a lockup, the core stops at `StackLimit`, `stop_at` the
+// address the exception would have returned to, nothing stacked. CCR.STKOFHFNMIGN ignores the limit
+// for an exception at a negative priority. The handler starts outside any IT block, and with the
+// local exclusive monitor clear.
 enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     val sp = cpu.r[13]
     // CCR.STKALIGN: configurable on ARMv7-M (fixed at 1 on the M7), RES1 on ARMv8-M.
@@ -319,20 +324,32 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     val size: u32 = if extended then 0x68 else 0x20
     val frame = (sp -% size) & ~align
     val words: [8]u32 = [cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[12], cpu.r[14], ret, xpsr(cpu) | ((if align != 0 then (sp >> 2) & 1 else 0) << 9)]
+    // Every word is stacked at or above `floor`; the new SP is `top`.
+    var floor: u32 = 0
+    var top = frame
+    var derived = -1
+    var to = e
 
-    if !is_v6m(cpu.kind) && frame < sp_limit(cpu)
-        halt(cpu, Stop.StackLimit, ret)
-        return false
+    if !is_v6m(cpu.kind) && frame < sp_limit(cpu) && !overflow_ignored(cpu, group(cpu, priority(cpu, e)))
+        derived = derived_overflow(cpu)
 
-    for k in 0..<8 do write32(cpu, frame +% u32(k) * 4, words[k], n)
+        if derived < 0
+            halt(cpu, Stop.StackLimit, ret)
+            return false
+
+        floor = sp_limit(cpu)
+        top = floor
+        if group(cpu, priority(cpu, u32(derived))) < group(cpu, priority(cpu, e)) then to = u32(derived)
+
+    for k in 0..<8 do if frame +% u32(k) * 4 >= floor then write32(cpu, frame +% u32(k) * 4, words[k], n)
 
     if extended
-        for k in 0..<16 do write32(cpu, frame +% 0x20 +% u32(k) * 4, cpu.s[k], n)
-        write32(cpu, frame +% 0x60, fpscr_now(cpu), n)
-        write32(cpu, frame +% 0x64, 0, n)
+        for k in 0..<16 do if frame +% 0x20 +% u32(k) * 4 >= floor then write32(cpu, frame +% 0x20 +% u32(k) * 4, cpu.s[k], n)
+        if frame +% 0x60 >= floor then write32(cpu, frame +% 0x60, fpscr_now(cpu), n)
+        if frame +% 0x64 >= floor then write32(cpu, frame +% 0x64, 0, n)
         cpu.fpcar = frame +% 0x20
 
-    val at = cpu.vtor + e * 4
+    val at = cpu.vtor + to * 4
     val vector = read32(cpu, at, n)
 
     if cpu.stop != Stop.Running then return false
@@ -344,16 +361,18 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
 
     if on_process_stack(cpu)
         cpu.r[13] = cpu.sp_other
-        cpu.sp_other = frame
+        cpu.sp_other = top
     else
-        cpu.r[13] = frame
+        cpu.r[13] = top
 
-    cpu.ipsr = e
+    cpu.ipsr = to
     // The handler starts with no floating-point context of its own.
     cpu.control &= ~6
     cpu.fp_ready = false
-    set_active(cpu,e,true)
-    set_pending(cpu,e,false)
+    set_active(cpu,to,true)
+    set_pending(cpu,to,false)
+    // The derived fault: taken now where it arrived late, `e` left pending; otherwise pending itself.
+    if derived >= 0 then set_pending(cpu, if to != e then e else u32(derived), true)
     cpu.it = 0
     cpu.excl = false
     cpu.pc = vector & ~1
@@ -362,8 +381,29 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
 
 // The record a `BX` or `POP {pc}` at `from` goes to with `v` off the RAM: in handler mode, an
 // EXC_RETURN value returns from the exception; anything else stops the core at `Unmapped`.
+//
+// On a Secure-only core the EXC_RETURN prefix is bits 31–7, and bits 6 (S), 5 (DCRS) and 0 (ES) are
+// the Security Extension's: ES clear names a Non-secure exception, which is not active, so the return
+// is the UsageFault INVPC, taken from the handler at the return; S clear (to the Non-secure stack) and
+// DCRS clear (callee registers stacked, which only an entry to Non-secure state does) stop the core
+// at `NonSecure`.
 exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
-    if cpu.ipsr == 0 || v >> 5 != 0x07FFFFFF then return insn_at(cpu, v & ~1)
+    if cpu.ipsr == 0 then return insn_at(cpu, v & ~1)
+
+    if cpu.security
+        if v >> 7 != 0x01FFFFFF then return insn_at(cpu, v & ~1)
+        if v & 1 == 0
+            cpu.cfsr |= CFSR_INVPC
+            fault(cpu, USAGE_FAULT, from, Stop.Fault)
+            return stopped_on(cpu, from, n)
+        if v & 0x40 == 0
+            non_secure(cpu, Transition.ReturnNonSecure, from)
+            return stopped_on(cpu, from, n)
+        if v & 0x20 == 0
+            non_secure(cpu, Transition.ReturnCallee, from)
+            return stopped_on(cpu, from, n)
+    else if v >> 5 != 0x07FFFFFF
+        return insn_at(cpu, v & ~1)
 
     val kind = v & 0xF
     // Bit 4 clear: the frame is extended with the floating-point context, which only a core with the
@@ -607,7 +647,11 @@ scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
         _ -> scs_read8(cpu, a)
 
 scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
-    if !is_baseline(cpu.kind) && width != 4 && byte_wide(a, width) then return scs_write(cpu, a & ~3, 4, with_part(scs_read(cpu, a & ~3, 4, n), a, width, x), n)
+    if !is_baseline(cpu.kind) && width != 4 && byte_wide(a, width)
+        // CFSR is write-one-to-clear: the bytes not written clear nothing.
+        val rest = if a & ~3 == SCB_CFSR then 0 else scs_read(cpu, a & ~3, 4, n)
+
+        return scs_write(cpu, a & ~3, 4, with_part(rest, a, width, x), n)
 
     if width != 4 || a & 3 != 0
         halt(cpu, Stop.Unmapped, a)

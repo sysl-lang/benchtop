@@ -210,7 +210,8 @@ trait Bus
     write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
     /** A coprocessor instruction CPACR has let through (coproc.sysl): a read's value, Rt in the low
      * word and Rt2 in the high, 0 for a write; or None where nothing is on its port, which stops the
-     * core at `Undefined`. It may stop the core with `halt`, as an access may.
+     * core at `Undefined`. It may stop the core with `halt`, as an access may; the core then stops on
+     * the instruction, whatever address the halt gave.
      */
     coprocessor(*self, cpu: *Cpu, op: CoprocessorOp, n: u64) -> Option[u64] = None
 
@@ -236,9 +237,42 @@ enum Stop
     // The guest asked for a system reset (AIRCR.SYSRESETREQ); what that does is the board's.
     Reset
     // ARMv8-M Mainline: an instruction or an exception entry would have moved the stack pointer in use
-    // below its limit (MSPLIM or PSPLIM), which is a UsageFault (STKOF) benchtop does not take. `stop_at`
-    // is the instruction, or for an entry the address it would have returned to; nothing was stored.
+    // below its limit (MSPLIM or PSPLIM) where not even HardFault can be taken — at a negative
+    // priority without CCR.STKOFHFNMIGN — which is a lockup. `stop_at` is the instruction, or for an
+    // entry the address it would have returned to; nothing was stored. Where the fault can be taken it
+    // is: the UsageFault STKOF, or HardFault (t2system.sysl).
     StackLimit
+    // A core with the Security Extension, which benchtop runs Secure-only, was asked to go to
+    // Non-secure state, which is not modelled: `Cpu.transition` says how. `stop_at` is the instruction
+    // (for an access to a Non-secure alias, the address); nothing of it was done.
+    NonSecure
+
+/** How a Secure-only core was asked to reach Non-secure state (`Stop.NonSecure`). */
+enum Transition: u8
+    None = 0
+    // `BXNS` to an address with bit 0 clear.
+    Bxns
+    // `BLXNS` to an address with bit 0 clear: a Non-secure function call.
+    Blxns
+    // An EXC_RETURN with S clear: a return to the Non-secure stack and state.
+    ReturnNonSecure
+    // An EXC_RETURN with DCRS clear: only an exception taken from Secure state to Non-secure state
+    // stacks the callee registers that would unstack.
+    ReturnCallee
+    // A load or store to the Non-secure alias of the private peripheral bus (0xE002_0000).
+    PpbAlias
+    // `MRS` or `MSR` of a Non-secure register (`MSP_NS`, `CONTROL_NS`, …).
+    NsRegister
+
+/** What a stop for `Stop.NonSecure` says, as a person reads it. */
+transition_name(t: Transition) -> string = t match
+    None -> "nothing"
+    Bxns -> "BXNS to a Non-secure address"
+    Blxns -> "BLXNS, a call to Non-secure code"
+    ReturnNonSecure -> "an exception return to Non-secure state"
+    ReturnCallee -> "an exception return with the callee registers stacked (DCRS clear)"
+    PpbAlias -> "an access to the Non-secure alias of the private peripheral bus"
+    NsRegister -> "MRS or MSR of a Non-secure register"
 
 // The selected core model; `MODELS` (models.sysl) says what each one is. Four are named after the
 // architecture benchtop first modelled with them: `V6m` is the Cortex-M0+, `V8mMain` the Cortex-M33,
@@ -378,8 +412,8 @@ struct Cpu
     cpacr: u32
     // The coprocessors 0–7 the board puts on the core's port, bit n for CPn: CPACR keeps their fields.
     coprocessors: u32
-    // The board runs the core Secure-only, the reset state of a core with the Security Extension:
-    // `TT` answers for it (thumb2.sysl). The SAU, SecureFault and the Non-secure state are not modelled.
+    // The core has the Security Extension, which the board runs Secure-only: the core resets into
+    // Secure state and stays there, so every banked register here is the Secure one (t2secure.sysl).
     security: bool
     fpccr: u32
     fpcar: u32
@@ -404,6 +438,20 @@ struct Cpu
     // How many ticks of the board's clock one tick of this core's takes (1 where the core runs at the
     // chip's clock), as the board configures it; the core itself never reads it.
     divisor: u64
+    // The rest are read only off the hot paths, so they come last, where they move no hot field.
+    //
+    // The SAU, stored: SAU_CTRL, SAU_RNR, and each region's SAU_RBAR and SAU_RLAR. `TT` reads it.
+    sau_ctrl: u32
+    sau_rnr: u32
+    sau_rbar: [SAU_REGIONS]u32
+    sau_rlar: [SAU_REGIONS]u32
+    // The fault status registers benchtop records into (t2secure.sysl): CFSR, HFSR, SFSR and SFAR.
+    cfsr: u32
+    hfsr: u32
+    sfsr: u32
+    sfar: u32
+    // Why the core stopped at `NonSecure`.
+    transition: Transition
 
 const LINE_CODE: u8 = 1
 const LINE_WATCHED: u8 = 2
@@ -472,6 +520,7 @@ clear(cpu: *Cpu, entry: u32)
     cpu.cpacr = 0
     cpu.coprocessors = 0
     cpu.security = false
+    clear_security(cpu)
     cpu.fpccr = FPCCR_RESET
     cpu.fpcar = 0
     cpu.fpdscr = 0
@@ -756,7 +805,7 @@ store_page(cpu: *Cpu, a: u32, width: u32) -> usize = if cpu.mem.ram_range(a, wid
 
 // The slow path of a read, `width` bytes at `a`.
 slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
-    if a >= SCS && a < SCS_END then return scs_read(cpu, a, width, n)
+    if a >= SCS && a < PPB_NS_END then return ppb_read(cpu, a, width, n)
 
     cpu.bus.read(cpu, a, width, n)
 
@@ -765,9 +814,28 @@ slow_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
         halt(cpu, Stop.Fault, a)
         return
 
-    if a >= SCS && a < SCS_END
-        scs_write(cpu, a, width, x, n)
+    if a >= SCS && a < PPB_NS_END
+        ppb_write(cpu, a, width, x, n)
         return
+
+    cpu.bus.write(cpu, a, width, x, n)
+
+// The part of the private peripheral bus the core answers itself: the system control space, and on a
+// Secure-only core the bus's Non-secure alias, refused by name. The rest between them is the board's.
+// Kept out of the slow paths above so that they stay small enough for the accesses' fast paths to
+// take them in.
+ppb_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if a < SCS_END then return scs_read(cpu, a, width, n)
+
+    if cpu.security && a >= PPB_NS
+        non_secure(cpu, Transition.PpbAlias, a)
+        return 0
+
+    cpu.bus.read(cpu, a, width, n)
+
+ppb_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if a < SCS_END then return scs_write(cpu, a, width, x, n)
+    if cpu.security && a >= PPB_NS then return non_secure(cpu, Transition.PpbAlias, a)
 
     cpu.bus.write(cpu, a, width, x, n)
 
