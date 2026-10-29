@@ -1,5 +1,8 @@
 module sh.sysl.benchtop.peripheral.adc
 
+import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.timing.NEVER
+
 // An ideal, deterministic virtual ADC register model. Analogue sources are integer
 // microvolts; a conversion latches its input at START, completes on guest time, and
 // quantizes to the nearest 12-bit code, saturating at either endpoint.
@@ -13,25 +16,23 @@ struct Adc
     error: bool
     result: u32
     sampled: u32
-    due: u64
+    done_at: u64
     mask: u32
     pending: u32
+    /** The analogue input: the level in microvolts on a channel, None where nothing drives it. Set
+     * once by whoever puts the converter on a board; a reset keeps it.
+     */
+    input: &Fn(u32) -> Option[u32]
 
-adc(reference_uv: u32 = 3300000, cycles: u64 = 32) -> Adc
+/** An input with nothing on any channel. */
+private val no_input: &Fn(u32) -> Option[u32] = channel -> None
+
+private fresh(reference_uv: u32, cycles: u64, input: &Fn(u32) -> Option[u32]) -> Adc =
+    Adc(reference_uv, cycles, 0, false, false, false, false, 0, 0, 0, 0, 0, input)
+
+adc(reference_uv: u32 = 3300000, cycles: u64 = 32, input: &Fn(u32) -> Option[u32] = no_input) -> Adc
     require reference_uv > 0 && cycles > 0, "positive ADC reference and conversion duration"
-    Adc(reference_uv, cycles, 0, false, false, false, false, 0, 0, 0, 0, 0)
-
-reset(a: *Adc)
-    *a = adc(a.reference_uv, a.cycles)
-
-advance(a: *Adc, time: u64)
-    if !a.busy || time < a.due then return
-    a.result = a.sampled
-    a.busy = false
-    a.ready = true
-    a.pending |= 1
-
-irq(a: Adc) -> bool = a.pending & a.mask != 0
+    fresh(reference_uv, cycles, input)
 
 quantize(uv: u32, reference: u32) -> u32
     require reference > 0, "nonzero reference"
@@ -51,41 +52,55 @@ register_offset(name: string) -> Option[u32] = name match
     "CONVERSION_CYCLES" -> Some(32)
     _ -> None
 
-read(a: Adc, offset: u32) -> Option[u32] = offset match
-    0 -> Some(if a.enabled then 1 else 0)
-    4 -> Some(a.channel)
-    8 -> Some((if a.busy then 1 else 0) | (if a.ready then 2 else 0) | (if a.error then 4 else 0))
-    12 -> Some(a.result)
-    16 -> Some(a.mask)
-    20 -> Some(a.pending)
-    24 -> Some(a.reference_uv)
-    28 -> Some(12)
-    32 -> Some(u32(a.cycles))
-    _ -> None
+// Every register is a word; the bus checks the width before it reaches the converter.
+impl Model for Adc
+    read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = offset match
+        0 -> Some(if self.enabled then 1 else 0)
+        4 -> Some(self.channel)
+        8 -> Some((if self.busy then 1 else 0) | (if self.ready then 2 else 0) | (if self.error then 4 else 0))
+        12 -> Some(self.result)
+        16 -> Some(self.mask)
+        20 -> Some(self.pending)
+        24 -> Some(self.reference_uv)
+        28 -> Some(12)
+        32 -> Some(u32(self.cycles))
+        _ -> None
 
-write(a: *Adc, offset: u32, value: u32, uv: u32, connected: bool, time: u64) -> bool
-    advance(a, time)
-    offset match
-        0 ->
-            a.enabled = value & 1 != 0
-            if !a.enabled
-                a.busy = false
-                a.ready = false
-            if value & 2 != 0
-                if !a.enabled || a.busy || !connected
-                    a.error = true
-                    a.pending |= 2
-                else
-                    a.busy = true
-                    a.ready = false
-                    a.sampled = quantize(uv, a.reference_uv)
-                    a.due = time + a.cycles
-        4 -> a.channel = value
-        8 ->
-            if value & 2 != 0 then a.ready = false
-            if value & 4 != 0 then a.error = false
-        16 -> a.mask = value & 3
-        20 -> a.pending &= ~(value & 3)
-        12 | 24 | 28 | 32 -> () // Read-only registers ignore writes.
-        _ -> return false
-    true
+    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool
+        self.advance(time)
+        offset match
+            0 ->
+                self.enabled = value & 1 != 0
+                if !self.enabled
+                    self.busy = false
+                    self.ready = false
+                if value & 2 != 0
+                    val level = (self.input)(self.channel)
+                    if !self.enabled || self.busy || level.is_none()
+                        self.error = true
+                        self.pending |= 2
+                    else
+                        self.busy = true
+                        self.ready = false
+                        self.sampled = quantize(level.unwrap(), self.reference_uv)
+                        self.done_at = time + self.cycles
+            4 -> self.channel = value
+            8 ->
+                if value & 2 != 0 then self.ready = false
+                if value & 4 != 0 then self.error = false
+            16 -> self.mask = value & 3
+            20 -> self.pending &= ~(value & 3)
+            12 | 24 | 28 | 32 -> () // Read-only registers ignore writes.
+            _ -> return false
+        true
+
+    override advance(*self, time: u64)
+        if !self.busy || time < self.done_at then return
+        self.result = self.sampled
+        self.busy = false
+        self.ready = true
+        self.pending |= 1
+
+    override due(*self) -> u64 = if self.busy then self.done_at else NEVER
+    override irq(*self) -> bool = self.pending & self.mask != 0
+    reset(*self) = *self = fresh(self.reference_uv, self.cycles, self.input)

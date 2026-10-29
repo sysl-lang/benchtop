@@ -1,6 +1,7 @@
 module sh.sysl.benchtop.virt
 
 import sh.sysl.benchtop.{Board, Part, Target, pin_parts, part_whole}
+import sh.sysl.benchtop.peripheral.Model
 import sh.sysl.benchtop.peripheral.adc as adc
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.benchtop.v6m.{Cpu, Stop, IRQ0, could_wake, halt, raise, lower_limit}
@@ -99,29 +100,40 @@ private[virt] check_adc(b: Board, mapped: []const Mapped) -> AdcState
         s.analog_driven |= 1u32 << u32(pin)
     AdcState(present, irq, Mutex.new(s))
 
+/** Wire the converter's input to the levels on the pins its channels are on. Called once the devices
+ * are in place; the input is asked only under `live`, while the converter is.
+ */
+private[virt] connect_adc(ds: *Devices)
+    ds.adc.live.with(s -> s.converter.input = channel -> adc_input(s, channel))
+
+// The level on the pin of `channel`, None where it is on no pin or nothing drives that pin.
+private adc_input(s: *AdcLive, channel: u32) -> Option[u32]
+    val pin = if channel < s.channel_count then s.channel_pins[channel] else -1
+    if pin >= 0 && (s.analog_driven & (1u32 << u32(pin))) != 0 then Some(s.analog_uv[pin]) else None
+
 private[virt] boot_adc(d: *AdcState)
     d.live.with(s ->
-        adc.reset(&s.converter)
+        s.converter.reset()
         s.at = 0)
 
 private bring_adc(s: *AdcLive, t: u64)
     if t > s.at then s.at = t
-    adc.advance(&s.converter, s.at)
+    s.converter.advance(s.at)
 
 private[virt] adc_due(d: *AdcState) -> u64
     if !d.present then return NEVER
-    d.live.with(s -> if s.converter.busy then s.converter.due else NEVER)
+    d.live.with(s -> s.converter.due())
 
 private[virt] adc_wake(d: *AdcState, cpu: *Cpu) -> u64
     if !d.present || d.irq < 0 || !could_wake(cpu, IRQ0 + u32(d.irq)) then return NEVER
-    d.live.with(s -> if s.converter.busy && (s.converter.mask & 1) != 0 then s.converter.due else NEVER)
+    d.live.with(s -> if (s.converter.mask & 1) != 0 then s.converter.due() else NEVER)
 
 private[virt] signal_adc(d: *AdcState, cpu: *Cpu)
     if !d.present then return
     val irq = d.irq
     d.live.with(s ->
         bring_adc(s, board_time(cpu, cpu.retired))
-        if irq >= 0 && adc.irq(s.converter) then raise(cpu, u32(irq)))
+        if irq >= 0 && s.converter.irq() then raise(cpu, u32(irq)))
 
 private[virt] adc_read(d: *AdcState, cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || (offset & 3) != 0
@@ -129,7 +141,7 @@ private[virt] adc_read(d: *AdcState, cpu: *Cpu, address: u32, offset: u32, width
         return 0
     d.live.with(s ->
         bring_adc(s, board_time(cpu, n))
-        adc.read(s.converter, offset)) match
+        s.converter.read(offset, width, s.at)) match
         Some(value) -> value
         None ->
             halt(cpu, Stop.Unmapped, address)
@@ -141,11 +153,8 @@ private[virt] adc_write(d: *AdcState, cpu: *Cpu, address: u32, offset: u32, widt
         return
     d.live.with(s ->
         bring_adc(s, board_time(cpu, n))
-        val channel = s.converter.channel
-        val pin = if channel < s.channel_count then s.channel_pins[channel] else -1
-        val connected = pin >= 0 && (s.analog_driven & (1u32 << u32(pin))) != 0
-        if !adc.write(&s.converter, offset, value, if connected then s.analog_uv[pin] else 0, connected, s.at) then halt(cpu, Stop.Unmapped, address)
-        if s.converter.busy then lower_limit(cpu, retirement_limit(cpu,s.converter.due)))
+        if !s.converter.write(offset, width, value, s.at) then halt(cpu, Stop.Unmapped, address)
+        if s.converter.busy then lower_limit(cpu, retirement_limit(cpu,s.converter.due())))
 
 /** The byte offset of the virtual ADC register called `name`. */
 adc_register_offset(name: string) -> Option[u32] = adc.register_offset(name)
@@ -154,4 +163,4 @@ adc_register_offset(name: string) -> Option[u32] = adc.register_offset(name)
 peek_adc(m: *Machine, offset: u32) -> Option[u32]
     val d = &m.devices.adc
     if !d.present then return None
-    d.live.with(s -> adc.read(s.converter, offset))
+    d.live.with(s -> s.converter.read(offset, 4, s.at))
