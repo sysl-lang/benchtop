@@ -16,6 +16,7 @@ struct Machine
     parts: Buf[&Part]         // parts soldered to the board (the Pico 2 W's LED, the DISCO's panel)
     header: Buf[Pin]          // named header pins: the board's only external interface
     clock_hz: u64
+    scheduler: Scheduler      // the board's clock and the threads that run it, until a product owns it
 ```
 
 - **A machine owns its state.** No machine field is reachable as a global. Two machines in one
@@ -92,7 +93,8 @@ enum ProductView
      `pump_board`), in lockstep (`set_threads`) or paced on the workers, and one `pair_cores`
      readies both lockstep modes. `threads` is split into the request (`run_on_threads`) and the
      live state (`threaded`). The desktop's old bounded-batch path (`pump_parallel`) is gone; its
-     tests run on the workers. It is still one module-level `scheduler` until the product exists.
+     tests run on the workers. Each machine owns its scheduler (`Machine.scheduler`, slice 4) until
+     the product exists to own the one its boards share.
    - Done: a device more than one thread reaches keeps what the board fixes (whether the bus has
      it, its IRQs, its clock) and the atomics it publishes for lock-free readers beside a `Mutex`
      that owns everything else: `adc.live`, `rp.live` (taken on every access, whichever thread),
@@ -152,6 +154,14 @@ enum ProductView
      lock. Each core carries its clock's divisor (`Cpu.divisor`), so a core's board time needs no
      machine. Two machines in one process share nothing (`board_two_machines`,
      `machine_devices_are_each_machines`).
+   - Done: the scheduler. `Machine.scheduler` holds the board's clock, the lockstep pairing, the
+     board's lock, the CPU workers and the DSI worker, so `virt` has no module-level mutable state
+     left. The worker controls take the machine (`start_workers(m)`, `pause_workers(m)`,
+     `submit_workers(m, ticks)`, `workers_observe(m)`, ...), as do `set_threads(m)`,
+     `set_quantum(m, n)` and `running_both(m)`; the lockstep internals take the `*Scheduler`. The DSI
+     host reaches its machine's DSI worker through `DsiState.worker`, which `connect_dsi` sets. Two
+     machines run their workers at once in one process (`two_machines_two_schedulers`). When the
+     product exists, it owns the scheduler and its boards share it.
    - Done: RISC-V harts on a board. A chip's devices see a core as a `Processor`
      (`processor/processor.sysl`: its number, its retired count, its interrupt inputs), which
      `v6m.Cpu` and `riscv.Cpu` both implement. The RP2350's devices are core-free models
