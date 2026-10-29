@@ -9,29 +9,38 @@ import sysl.sync.*
 import sysl.threads.Mutex
 import sysl.math.{min,max}
 
-/** The WM8994 codec (`wm8994`) on the I2C bus and the SAI: its model, its name on the board, the SAI
- * block it plays from (the other one records), what it drives (`present` once it drives a speaker or
- * headphones) and whether a microphone feeds it, and the host's gain on each output. `gains`,
- * `hp_gains`, `capture_gains` and `bits` are the model's settings, published for the SAI to read
- * without the I2C lock.
+/** The WM8994 codec (`wm8994`) on the I2C bus and the SAI: its model (which the I2C bus's device for
+ * it holds too, and changes under the bus's lock), whether the board has one, the SAI block it plays from
+ * (the other one records), what it drives (`present` once it drives a speaker or headphones) and
+ * whether a microphone feeds it, the host's gain on each output, and the model's settings, published
+ * for the SAI to read without the I2C lock.
  */
 struct CodecState
-    model: &wm.Codec
-    name: string
+    model: Mutex[&wm.Codec]
+    fitted: bool
     block: usize
     present: bool
     headphones: bool
     speaker_present: bool
     mic: bool
     host_gain: [2]u32
-    capture_gains: [2]u32
-    hp_gains: [2]u32
-    gains: [2]u32
-    bits: u32
+    settings: &sync CodecSettings
     // The microphone frame the SAI is recording, published for its slots to read without a lock.
     input_frame: int
     input: Mutex[CodecInput]
     mix: Mutex[CodecMix]
+
+/** The model's gains and word width, which each write over I2C publishes (`publish_codec`) for the
+ * SAI's slots to read atomically. The I2C device the codec answers holds it with the model, so a
+ * write publishes into the codec it was made to, wherever the machine keeps it.
+ */
+struct CodecSettings
+    capture_gains: [2]u32
+    hp_gains: [2]u32
+    gains: [2]u32
+    bits: u32
+
+private codec_settings() -> &sync CodecSettings = CodecSettings([0,0], [0,0], [0,0], 16)
 
 /** What the host has given the microphone and not yet sent, the newest `MIC_QUEUE` words, and
  * whether enough has arrived to start sending.
@@ -56,24 +65,31 @@ struct CodecMix
     started: bool
 
 /** No codec on the board. */
-codec_state() -> CodecState = CodecState(wm.codec(), "", 0, false, false, false, false, [12,12], [0,0], [0,0], [0,0], 16,
+codec_state() -> CodecState = CodecState(Mutex.new(wm.codec()), false, 0, false, false, false, false, [12,12], codec_settings(),
     0, Mutex.new(CodecInput(inline_ring(), false)), Mutex.new(CodecMix([0.0,0.0], 0, false)))
 
-// Whether `p` is a speaker the codec `c` drives.
-codec_speaker(c: *CodecState, p: Part) -> bool
-    if c.name.is_empty() then return false
+// The name of `b`'s WM8994 codec, "" for none.
+private codec_name(b: Board) -> string
+    for p in b.parts do if part_model(p) == "wm8994" then return p.name
+    ""
+
+// Whether `p` is a speaker `b`'s codec drives.
+codec_speaker(b: Board, p: Part) -> bool
+    val name = codec_name(b)
+    if name.is_empty() then return false
     for wire in p.wires do wire.to match
-        Port(owner,terminal) -> if owner == c.name && terminal == "out" then return true
+        Port(owner,terminal) -> if owner == name && terminal == "out" then return true
         _ -> ()
     false
 
 // The codec `b` puts on the I2C bus, beside the `devices` already there.
 private[virt] check_codec(b: Board, devices: *Buf[i2c.Device]) -> Result[CodecState,string]
     var s = codec_state()
+    val name = codec_name(b)
     for p in b.parts
         if part_model(p) != "wm8994" then continue
-        if !s.name.is_empty() then return Err("one WM8994 codec is currently supported")
-        s.name = p.name
+        if s.fitted then return Err("one WM8994 codec is currently supported")
+        s.fitted = true
         s.block = usize(part_whole(p,"block",0))
         var attached = false
         for wire in p.wires
@@ -94,21 +110,23 @@ private[virt] check_codec(b: Board, devices: *Buf[i2c.Device]) -> Result[CodecSt
         if !attached then return Err("WM8994 requires a stm32-sai controller")
         val address = u8(part_whole(p,"address",0x1a))
         for device in *devices do if device.address == address then return Err("two I2C parts share the same address")
-        val model = s.model
+        val model = wm.codec()
+        s.model = Mutex.new(model)
+        val settings = s.settings
         devices.push(i2c.Device(address,(reading,time) -> wm.start(model,reading),
             (byte,time) ->
                 val ok = wm.write(model,byte)
-                publish_codec()
+                publish_codec(model,settings)
                 ok,
             time -> wm.read(model)))
     for p in b.parts
         val headphone = part_model(p) == "headphones"
         if part_model(p) != "speaker" && !headphone then continue
-        if !headphone && !codec_speaker(&s, p) then continue
+        if !headphone && !codec_speaker(b, p) then continue
         if headphone
             var attached = false
             for wire in p.wires do wire.to match
-                Port(owner,terminal) -> if wire.port == "input" && owner == s.name && terminal == "headphones" then attached = true
+                Port(owner,terminal) -> if wire.port == "input" && owner == name && terminal == "headphones" then attached = true
                 _ -> ()
             if !attached then return Err("headphones input must connect to the WM8994 headphones terminal")
             if s.headphones then return Err("one headphones output is supported per codec")
@@ -122,50 +140,49 @@ private[virt] check_codec(b: Board, devices: *Buf[i2c.Device]) -> Result[CodecSt
         if part_model(source) != "pdm-microphone" then continue
         var used = false
         for part in b.parts
-            if part.name != s.name then continue
+            if part.name != name then continue
             for wire in part.wires do wire.to match
                 Port(owner,terminal) -> if wire.port == "dmic1" && owner == source.name && terminal == "out" then used = true
                 _ -> ()
         if !used then return Err("pdm-microphone must connect to the WM8994 dmic1 terminal")
     Ok(s)
 
-private publish_codec()
-    val s = &machine.devices.codec
-    val gains = wm.speaker_gains(s.model)
-    for i in 0..<2 do atomic_store(&s.gains[i],gains[i],Release)
-    val hp = wm.headphone_gains(s.model)
-    for i in 0..<2 do atomic_store(&s.hp_gains[i],hp[i],Release)
-    val capture = wm.capture_gains(s.model)
-    for i in 0..<2 do atomic_store(&s.capture_gains[i],capture[i],Release)
-    atomic_store(&s.bits,wm.word_bits(s.model),Release)
+private publish_codec(model: &wm.Codec, settings: &sync CodecSettings)
+    val gains = wm.speaker_gains(model)
+    for i in 0..<2 do atomic_store(&settings.gains[i],gains[i],Release)
+    val hp = wm.headphone_gains(model)
+    for i in 0..<2 do atomic_store(&settings.hp_gains[i],hp[i],Release)
+    val capture = wm.capture_gains(model)
+    for i in 0..<2 do atomic_store(&settings.capture_gains[i],capture[i],Release)
+    atomic_store(&settings.bits,wm.word_bits(model),Release)
 
-private[virt] boot_codecs()
-    wm.reset(machine.devices.codec.model)
-    publish_codec()
-    machine.devices.codec.mix.with(m ->
+private[virt] boot_codecs(s: *CodecState)
+    s.model.with(c ->
+        wm.reset(*c)
+        publish_codec(*c,s.settings))
+    s.mix.with(m ->
         m.sums = [0.0,0.0]
         m.started = false)
-    clear_codec_input()
+    clear_codec_input(s)
 
 // Called under the SAI queue lock: integer snapshots only, no codec/I2C lock.
-private[virt] codec_slot_gain(block: usize, slot: u32, slots: u32, bits: u32) -> u32
-    val s = &machine.devices.codec
-    if !s.present || block != s.block || slots != 4 || bits != atomic_load(&s.bits,Acquire) then return 0
+private[virt] codec_slot_gain(s: *CodecState, block: usize, slot: u32, slots: u32, bits: u32) -> u32
+    if !s.present || block != s.block || slots != 4 || bits != atomic_load(&s.settings.bits,Acquire) then return 0
     val channel = usize(slot / 2)
     if channel >= 2 then return 0
     if slot & 1 == 0
-        if s.headphones then u32(u64(atomic_load(&s.hp_gains[channel],Acquire)) * u64(s.host_gain[1]) / 100) else 0
+        if s.headphones then u32(u64(atomic_load(&s.settings.hp_gains[channel],Acquire)) * u64(s.host_gain[1]) / 100) else 0
     else
-        if s.speaker_present then u32(u64(atomic_load(&s.gains[channel],Acquire)) * u64(s.host_gain[0]) / 100) else 0
+        if s.speaker_present then u32(u64(atomic_load(&s.settings.gains[channel],Acquire)) * u64(s.host_gain[0]) / 100) else 0
 
-private[virt] take_codec_sound(channels: u32 = 1) -> Buf[f32]
+private[virt] take_codec_sound(ds: *Devices, channels: u32 = 1) -> Buf[f32]
     require channels == 1 || channels == 2, "mono or stereo output"
     var result: Buf[f32] = buf()
     val into = &result
-    val s = &machine.devices.codec
+    val s = &ds.codec
     val block = s.block
     s.mix.with(m ->
-        val packets = sai_take_packets(block)
+        val packets = sai_take_packets(&ds.audio,block)
         for p in packets
             if p.slot == 0
                 m.sums = [0.0,0.0]
@@ -185,36 +202,34 @@ private[virt] take_codec_sound(channels: u32 = 1) -> Buf[f32]
 
 // Host conversion never runs on a guest CPU worker. The bounded queue holds
 // mono PCM frames; the codec consumes one frame at slot0 and reuses it at slot2.
-private[virt] feed_codec_microphone(samples: []const f32)
-    if !machine.devices.codec.mic then return
+private[virt] feed_codec_microphone(s: *CodecState, samples: []const f32)
+    if !s.mic then return
     var words: Buf[int] = buf()
     for sample in samples
         val clipped = if sample != sample then 0.0f32 else max(-1.0f32,min(1.0f32,sample))
         words.push(int(min(2147483647.0,real(clipped) * 2147483648.0)))
-    machine.devices.codec.input.with(q ->
+    s.input.with(q ->
         for word in words do q.words.overwrite(word))
 
-private[virt] clear_codec_input()
-    val s = &machine.devices.codec
+private[virt] clear_codec_input(s: *CodecState)
     s.input.with(q ->
         q.words.clear()
         q.primed = false
-        atomic_store(&machine.devices.codec.input_frame,0,Release))
+        atomic_store(&s.input_frame,0,Release))
 
-private[virt] codec_input_word(block: usize, slot: u32, slots: u32, bits: u32) -> Option[u32]
-    val s = &machine.devices.codec
+private[virt] codec_input_word(s: *CodecState, block: usize, slot: u32, slots: u32, bits: u32) -> Option[u32]
     if !s.mic || block != 1 - s.block then return None
-    if slots != 4 || bits != atomic_load(&s.bits,Acquire) then return Some(0)
+    if slots != 4 || bits != atomic_load(&s.settings.bits,Acquire) then return Some(0)
     if slot == 0
         s.input.with(q ->
             if !q.primed && q.words.len() >= MIC_PRIME then q.primed = true
-            atomic_store(&machine.devices.codec.input_frame,0,Release)
+            atomic_store(&s.input_frame,0,Release)
             val next = if q.primed then q.words.pop_front() else None
             next match
-                Some(word) -> atomic_store(&machine.devices.codec.input_frame,word,Release)
+                Some(word) -> atomic_store(&s.input_frame,word,Release)
                 None -> q.primed = false)
     if slot != 0 && slot != 2 then return Some(0)
-    val gain = atomic_load(&s.capture_gains[usize(slot / 2)],Acquire)
+    val gain = atomic_load(&s.settings.capture_gains[usize(slot / 2)],Acquire)
     val sample = ((long(atomic_load(&s.input_frame,Acquire)) * long(gain)) >> 16) >> (32 - bits)
     val limit = 1i64 << (bits - 1)
     Some(u32(max(-limit,min(limit - 1,sample))))

@@ -39,7 +39,7 @@ struct PwmLive
 pwm_state() -> PwmState = PwmState(false, 0, 0, 0, Mutex.new(PwmLive(pwm.pwm(), buf(), 0)))
 
 /** How many times the board has been booted; the host's audio starts over each time it changes. */
-sound_epoch() -> u64 = machine.devices.pwm.epoch
+sound_epoch(m: *Machine) -> u64 = m.devices.pwm.epoch
 
 // The PWM and buzzers `b` makes, with the channel on the bus where `mapped` puts it there.
 private[virt] check_pwm(b: Board, mapped: []const Mapped) -> Result[PwmState, string]
@@ -70,8 +70,7 @@ private[virt] check_pwm(b: Board, mapped: []const Mapped) -> Result[PwmState, st
             u64(part_whole(p, "tone", 4000)), audio.synth(hz, 48000, real(part_whole(p, "gain", 12)) / 100.0), false, false))
     Ok(PwmState(present, s.channel.hz, s.buzzers.len(), 0, Mutex.new(s)))
 
-private[virt] boot_sound()
-    val d = &machine.devices.pwm
+private[virt] boot_sound(d: *PwmState)
     d.epoch += 1
     d.live.with(s ->
         pwm.reset(&s.channel)
@@ -98,8 +97,7 @@ private render_sound(s: *PwmLive, present: bool, time: u64)
     s.time = now
 
 /** Called only when a buzzer's own GPIO level/direction changed; display traffic is ignored. */
-private[virt] sound_gpio(levels: u32, driven: u32, changed: u32, time: u64)
-    val d = &machine.devices.pwm
+private[virt] sound_gpio(d: *PwmState, levels: u32, driven: u32, changed: u32, time: u64)
     if d.buzzer_count == 0 then return
     val present = d.present
     d.live.with(s ->
@@ -115,41 +113,41 @@ private[virt] sound_gpio(levels: u32, driven: u32, changed: u32, time: u64)
                 s.buzzers.set(i, b))
 
 /** PWM supplies the selected pad independently of the GPIO output latch and OE register. */
-pwm_pad(time: u64) -> (u32, u32)
-    val d = &machine.devices.pwm
+private[virt] pwm_pad(d: *PwmState, time: u64) -> (u32, u32)
     if !d.present then return (0, 0)
     d.live.with(s ->
         val mask = 1u32 << u32(s.channel.pin)
         if !s.channel.enabled then (0, 0) else (mask, if pwm.level(s.channel, time) then mask else 0))
 
-private[virt] pwm_read(cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
+private[virt] pwm_read(d: *PwmState, cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if width != 4 || (offset & 3) != 0
         halt(cpu, Stop.Fault, address)
         return 0
-    machine.devices.pwm.live.with(s -> pwm.read(s.channel, offset, max(s.time, board_time(cpu, n)))) match
+    d.live.with(s -> pwm.read(s.channel, offset, max(s.time, board_time(cpu, n)))) match
         Some(value) -> value
         None ->
             halt(cpu, Stop.Unmapped, address)
             0
 
-private[virt] pwm_write(cpu: *Cpu, address: u32, offset: u32, width: u32, value: u32, n: u64)
+private[virt] pwm_write(d: *PwmState, cpu: *Cpu, address: u32, offset: u32, width: u32, value: u32, n: u64)
     if width != 4 || (offset & 3) != 0
         halt(cpu, Stop.Fault, address)
         return
-    val present = machine.devices.pwm.present
-    machine.devices.pwm.live.with(s ->
+    val present = d.present
+    d.live.with(s ->
         val time = max(s.time, board_time(cpu, n))
         render_sound(s, present, time)
         if !pwm.write(&s.channel, offset, value, time) then halt(cpu, Stop.Unmapped, address))
 
-sound_available() -> bool
-    val d = &machine.devices
+sound_available(m: *Machine) -> bool
+    val d = &m.devices
     d.pwm.buzzer_count != 0 || d.i2s.speaker || d.i2s.mic || d.codec.present || d.codec.mic
-sound_clock_hz() -> u64 = if machine.devices.i2s.present then machine.devices.i2s.hz else machine.devices.pwm.hz
+sound_clock_hz(m: *Machine) -> u64 = if m.devices.i2s.present then m.devices.i2s.hz else m.devices.pwm.hz
 
-sound_active(name: string) -> bool
-    val present = machine.devices.pwm.present
-    machine.devices.pwm.live.with(s ->
+sound_active(m: *Machine, name: string) -> bool
+    val d = &m.devices.pwm
+    val present = d.present
+    d.live.with(s ->
         val channel = s.channel
         var active = false
         for b in s.buzzers do if b.name == name
@@ -157,7 +155,7 @@ sound_active(name: string) -> bool
             break
         active)
 
-sound_channels() -> int = if machine.devices.codec.headphones then 2 else 1
+sound_channels(m: *Machine) -> int = if m.devices.codec.headphones then 2 else 1
 
 private mix_mono(mixed: *Buf[f32], samples: Buf[f32], channels: u32)
     while mixed.len() < samples.len() * usize(channels) do mixed.push(0.0)
@@ -166,16 +164,17 @@ private mix_mono(mixed: *Buf[f32], samples: Buf[f32], channels: u32)
             val at = i * usize(channels) + channel
             mixed.set(at,max(-1.0f32,min(1.0f32,mixed.at(at) + samples.at(i))))
 
-take_sound(time: u64, channels: u32 = 1) -> Buf[f32]
+take_sound(m: *Machine, time: u64, channels: u32 = 1) -> Buf[f32]
     require channels == 1 || channels == 2, "mono or stereo output"
-    val present = machine.devices.pwm.present
+    val d = &m.devices
+    val present = d.pwm.present
     var mixed: Buf[f32] = buf()
     val into = &mixed
-    machine.devices.pwm.live.with(s ->
+    d.pwm.live.with(s ->
         render_sound(s, present, time)
-        if machine.devices.i2s.present then mix_mono(into,take_digital_sound(time),channels)
-        if machine.devices.codec.present
-            val pcm = take_codec_sound(channels)
+        if d.i2s.present then mix_mono(into,take_digital_sound(&d.i2s,time),channels)
+        if d.codec.present
+            val pcm = take_codec_sound(d,channels)
             while into.len() < pcm.len() do into.push(0.0)
             for i in 0..<pcm.len() do into.set(i,max(-1.0f32,min(1.0f32,into.at(i) + pcm.at(i))))
         for b in s.buzzers

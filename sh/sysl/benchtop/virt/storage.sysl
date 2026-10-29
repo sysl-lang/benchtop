@@ -24,17 +24,15 @@ struct StorageGpio
 /** The STM32 storage path: the SPI controller (`stm32-spi`), the GPIO banks, and the SD card on the
  * SPI or on the SDMMC (`is_native`). What the board fixes is here: `routed` whether the board wires the
  * SPI's bus, `gpio_index` the bank its pins are on, `detect` the bank and pin the card's detect switch
- * pulls low, `has_card` whether a
- * card is in the slot, and `path` the file its image was read from (empty for none). The registers,
- * the banks and the card on the SPI change under `live`; a card on the SDMMC is the SDMMC's
- * (sdmmc.sysl). The card's image is `image`, which the card reaches through its media.
+ * pulls low, and `has_card` whether a card is in the slot. The registers, the banks and the card on
+ * the SPI change under `live`; a card on the SDMMC is the SDMMC's (sdmmc.sysl). The card's image is
+ * `image`, which the card reaches through its media, with the file it was read from.
  */
 struct StorageState
     gpio_index: usize
     detect: Option[(usize,u32)]
     is_native: bool
     has_card: bool
-    path: string
     sck: u32
     tx: u32
     rx: u32
@@ -66,7 +64,7 @@ private const DEFAULT_MISO: u32 = 6
 private const DEFAULT_CS: u32 = 4
 private const AF_SPI1: u32 = 5
 
-storage_state() -> StorageState = StorageState(0, None, false, false, "", DEFAULT_SCK, DEFAULT_MOSI, DEFAULT_MISO,
+storage_state() -> StorageState = StorageState(0, None, false, false, DEFAULT_SCK, DEFAULT_MOSI, DEFAULT_MISO,
     DEFAULT_CS, AF_SPI1, false, false, sd_image_of(buf(), ""), Mutex.new(storage_live()))
 
 /** A sector the image writer is to write to the image file. */
@@ -193,10 +191,10 @@ private bank_pin(l: *StorageLive, name: string) -> Option[(usize,u32)]
 private[virt] gpio_named(l: *StorageLive, name: string) -> Option[usize]
     for i in 0..<l.gpio_count do if l.gpios[i].name == name then return Some(i)
     None
-private[virt] storage_gpio_alternate(bank: string, pin: u32, af: u32) -> bool
-    machine.devices.storage.live.with(l -> gpio_named(l, bank) match
-        Some(i) -> gpio.alternate(l.gpios[i].model,pin,af)
-        None -> false)
+// Whether pin `pin` of the storage path's GPIO bank `bank` (an index among them) is in alternate
+// function `af`.
+private[virt] storage_gpio_alternate(s: *StorageState, bank: usize, pin: u32, af: u32) -> bool
+    s.live.with(l -> bank < l.gpio_count && gpio.alternate(l.gpios[bank].model,pin,af))
 
 // The storage path `b` makes on a chip whose clock is `clock_hz`, with its card's image read, and the
 // card where it is on the SDMMC, which the SDMMC takes.
@@ -286,23 +284,23 @@ private check_storage_into(b: Board, clock_hz: u64, s: *StorageState, l: *Storag
 private load_storage_card(s: *StorageState, l: *StorageLive, p: sh.sysl.benchtop.Part, clock_hz: u64) -> Result[unit,string]
     val sectors = u64(part_whole(p,"sectors",32768))
     if sectors % 1024 != 0 then return Err("SDHC sectors must be a multiple of 1024")
-    s.path = part_text(p,"image","")
+    val path = part_text(p,"image","")
     var bytes: Buf[u8] = buf()
-    if s.path.is_empty()
+    if path.is_empty()
         for i in 0..<usize(sectors * 512) do bytes.push(0)
     else
-        val loaded = fs.read_bytes(s.path) match
+        val loaded = fs.read_bytes(path) match
             Ok(read) -> read
-            Err(_) -> return Err(s"cannot read SD image `${s.path}`; create it with tools/mk-sd-image")
+            Err(_) -> return Err(s"cannot read SD image `$path`; create it with tools/mk-sd-image")
         for byte in loaded do bytes.push(byte)
         if bytes.len() != usize(sectors * 512) then return Err("SD image size must exactly match sectors * 512")
-    s.image = sd_image_of(bytes, s.path)
+    s.image = sd_image_of(bytes, path)
     s.has_card = true
     l.card = Some(sd.card(storage_media(s.image),sectors,part_flag(p,"write-protected",false),max(1,clock_hz / 2000)))
     Ok(())
 
-private[virt] boot_storage()
-    machine.devices.storage.live.with(l ->
+private[virt] boot_storage(s: *StorageState)
+    s.live.with(l ->
         hspi.reset(&l.spi)
         for i in 0..<l.gpio_count do gpio.reset(&l.gpios[i].model)
         l.card match
@@ -319,13 +317,12 @@ private storage_pins(s: *StorageState, l: *StorageLive, sck: bool, mosi: bool, t
             sd.observe(c,selected,sck,mosi,time)
         None -> true
 private bring_storage(s: *StorageState, l: *StorageLive, time: u64)
-    val pins: &Fn(bool,bool,u64) -> bool = (sck,mosi,at) -> storage_pins(s,l,sck,mosi,at)
+    val pins: &sync Fn(bool,bool,u64) -> bool = (sck,mosi,at) -> storage_pins(s,l,sck,mosi,at)
     edge.advance(&l.spi.engine,time,pins)
 
 // Polling SPI advances lazily at MMIO, using timestamped SCK edges. There are
 // no enabled interrupts or DMA requests in this initial register subset.
-private[virt] storage_read(cpu: *Cpu, device: Device, address: u32, offset: u32, width: u32, n: u64) -> u32
-    val s = &machine.devices.storage
+private[virt] storage_read(s: *StorageState, cpu: *Cpu, device: Device, address: u32, offset: u32, width: u32, n: u64) -> u32
     s.live.with(l ->
         bring_storage(s,l,board_time(cpu,n))
         if device == H7Spi then hspi.read(&l.spi,offset,width) else if width == 4 && offset & 3 == 0 then storage_gpio_read(s,l,address - offset,offset) else None) match
@@ -333,8 +330,7 @@ private[virt] storage_read(cpu: *Cpu, device: Device, address: u32, offset: u32,
         None ->
             halt(cpu,Stop.Fault,address)
             0
-private[virt] storage_write(cpu: *Cpu, device: Device, address: u32, offset: u32, width: u32, value: u32, n: u64)
-    val s = &machine.devices.storage
+private[virt] storage_write(s: *StorageState, cpu: *Cpu, device: Device, address: u32, offset: u32, width: u32, value: u32, n: u64)
     val time = board_time(cpu,n)
     val ok = s.live.with(l ->
         bring_storage(s,l,time)
@@ -344,14 +340,14 @@ private[virt] storage_write(cpu: *Cpu, device: Device, address: u32, offset: u32
     if !ok then halt(cpu,Stop.Fault,address)
 
 /** A read-only copy of the SD card's image, as it is now. */
-sd_image() -> &sync Frozen[u8] = machine.devices.storage.image.bytes.with(bytes ->
+sd_image(m: *Machine) -> &sync Frozen[u8] = m.devices.storage.image.bytes.with(bytes ->
     var copy: Buf[u8] = buf()
     copy.extend(bytes.view())
     copy.freeze())
 
 /** Put `bytes` on the SD card, in place of its image, which is as long. */
-sd_seed_image(bytes: []const u8)
-    machine.devices.storage.image.bytes.with(image -> seed(image, bytes))
+sd_seed_image(m: *Machine, bytes: []const u8)
+    m.devices.storage.image.bytes.with(image -> seed(image, bytes))
 
 private seed(image: *Buf[u8], bytes: []const u8)
     require bytes.len == image.len(), "matching SD image length"
@@ -360,10 +356,10 @@ private seed(image: *Buf[u8], bytes: []const u8)
 /** Run `body` on the SD card, on the SPI or on the SDMMC, under the lock of whichever has it, and
  * answer what it answered: for a test or a debugger. The board has a card.
  */
-with_sd_card[R](body: &sd.Card -> R) -> R
-    val s = &machine.devices.storage
+with_sd_card[R](m: *Machine, body: &sd.Card -> R) -> R
+    val s = &m.devices.storage
     if s.is_native
-        machine.devices.sdmmc.live.with(l -> body(l.card.unwrap().card))
+        m.devices.sdmmc.live.with(l -> body(l.card.unwrap().card))
     else
         s.live.with(l -> body(l.card.unwrap()))
 

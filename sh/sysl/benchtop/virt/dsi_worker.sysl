@@ -32,8 +32,9 @@ struct DsiProgress
 
 /** The DSI worker: the host thread that applies the packets the cores' writes send it to the
  * displays, which runs while the CPU workers do (`running`), its queue (`queue`, its packets held in
- * `slots`, whose lock no thread takes), and its progress, which `changed` is notified of. The scheduler
- * owns it, and the worker's thread holds the queue's address, so it is reset in place, never replaced.
+ * `slots`, whose lock no thread takes), its progress, which `changed` is notified of, and the devices
+ * of the machine it serves while it runs. The scheduler owns it, and the worker's thread holds the
+ * queue's address, so it is reset in place, never replaced.
  */
 struct DsiWorker
     slots: Mutex[Buf[DsiPacket]]
@@ -42,13 +43,14 @@ struct DsiWorker
     progress: Mutex[DsiProgress]
     changed: Condvar
     running: bool
+    devices: *Devices
 
 /** A DSI worker not started. */
 dsi_worker() -> DsiWorker
     var slots: Buf[DsiPacket] = buf()
     for i in 0..<DSI_QUEUE_CAPACITY do slots.push(DsiPacket(0,0,0,0,[0;1024]))
     val queue = channel(slots.view())
-    DsiWorker(Mutex.new(slots), queue, None, Mutex.new(DsiProgress(0,0,0,0)), Condvar.new(), false)
+    DsiWorker(Mutex.new(slots), queue, None, Mutex.new(DsiProgress(0,0,0,0)), Condvar.new(), false, null)
 
 struct DsiWorkerStatus
     worker_id: u64
@@ -66,17 +68,18 @@ dsi_worker_status() -> DsiWorkerStatus
 @inline
 private[virt] dsi_async() -> bool = scheduler.dsi.running
 
-private[virt] start_dsi_worker() -> Result[unit,string]
-    if !machine.devices.dsi.present then return Ok(())
+private[virt] start_dsi_worker(ds: *Devices) -> Result[unit,string]
+    if !ds.dsi.present then return Ok(())
     val w = &scheduler.dsi
     w.queue = w.slots.with(slots -> channel(slots.view()))
     w.progress.with(p -> *p = DsiProgress(0,0,0,0))
+    w.devices = ds
     w.running = true
-    machine.devices.dsi.host.with(h -> (*h).defer_reads = true)
+    ds.dsi.host.with(h -> (*h).defer_reads = true)
     w.handle = spawn(&dsi_device_body,w,1 << 20)
     if w.handle.is_none()
         w.running = false
-        machine.devices.dsi.host.with(h -> (*h).defer_reads = false)
+        ds.dsi.host.with(h -> (*h).defer_reads = false)
         return Err("cannot create the DSI device worker")
     val p = w.progress.lock_raw()
     while p.thread_id == 0 do w.changed.wait(&w.progress)
@@ -94,9 +97,10 @@ private[virt] flush_dsi_worker()
         w.progress.unlock_raw()
         // A previously full queue may have held a due hardware command busy.
         // Catch it up to the parked board clock before declaring the barrier.
-        machine.devices.dsi.host.with(h ->
-            advance_dsi(h,scheduler.now)
-            publish_dsi_deadline(h))
+        val s = &w.devices.dsi
+        s.host.with(h ->
+            advance_dsi(s,h,scheduler.now)
+            publish_dsi_deadline(s,h))
         if w.progress.with(p -> p.outstanding == 0) then return
 
 private[virt] stop_dsi_worker()
@@ -107,7 +111,8 @@ private[virt] stop_dsi_worker()
     w.handle.unwrap().join()
     w.handle = None
     w.running = false
-    machine.devices.dsi.host.with(h -> (*h).defer_reads = false)
+    w.devices.dsi.host.with(h -> (*h).defer_reads = false)
+    w.devices = null
     w.progress.with(p -> p.thread_id = 0)
 
 private[virt] dsi_queue_has_room() -> bool = !dsi_async() || scheduler.dsi.queue.len() < DSI_QUEUE_CAPACITY
@@ -132,14 +137,15 @@ private dsi_device_body(w: *DsiWorker)
         val start = monotonic()
         // Freeing a queue slot lets a due hardware command complete. Never
         // hold the queue lock while processing pixels or waiting for the UI.
-        machine.devices.dsi.host.with(h -> publish_dsi_deadline(h))
+        val ds = w.devices
+        ds.dsi.host.with(h -> publish_dsi_deadline(&ds.dsi,h))
         var response: Buf[u8] = buf()
         val into = &response
-        machine.devices.displays.live.with(s -> apply_dsi_packet(s,packet.channel,packet.kind,packet.bytes[..<packet.count],into))
+        ds.displays.live.with(s -> apply_dsi_packet(s,packet.channel,packet.kind,packet.bytes[..<packet.count],into))
         if dsi.is_read(packet.kind)
-            machine.devices.dsi.host.with(h ->
+            ds.dsi.host.with(h ->
                 dsi.complete_read(*h,packet.request,response.view())
-                publish_dsi_deadline(h))
+                publish_dsi_deadline(&ds.dsi,h))
         val spent = u64((monotonic() - start).us)
         w.progress.with(p ->
             p.completed += 1
