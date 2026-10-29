@@ -29,7 +29,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#19 | Python-generated tests addressed by hard-coded record ranges | fixed in `aff3dad`: each vector carries its mnemonic and the harness selects by it, iterating `MODELS` |
 | cores#20 | tests that restate the cost table | open |
 | cores#21 | comments that record history rather than invariants | open |
-| runtime#1 | no board object: the machine is module globals shared across threads | partly fixed by slices 1–4 (`ce0b959`, `3024687`, `679528a`, `d72cffd`, `a53b6ff`, `9d54348`): memory, devices, scheduler, workers and cores are owned; left: the cores' option globals, SIO FIFOs and spinlocks, the bus cache and `virt.machine` (slice 4 part 2) |
+| runtime#1 | no board object: the machine is module globals shared across threads | partly fixed by slices 1–4 (`ce0b959`, `3024687`, `679528a`, `d72cffd`, `a53b6ff`, `9d54348`): memory, devices, scheduler, workers and cores are owned; the cores' configuration, clock and bus cache are `Machine`'s (`bb79bea`); left: the SIO FIFOs and spinlocks, and `virt.machine` (slice 4 part 2) |
 | runtime#2 | devices are a closed enum dispatched by hand, not a trait | open (slice 4 part 2: the `Peripheral` trait) |
 | runtime#3 | four schedulers share one set of globals | fixed by slice 3 (`679528a`): one `Scheduler`; `pump_parallel` and `parallel.sysl` gone; `run_on_threads` and `threaded` split |
 | runtime#4 | locks guard nothing: `Mutex.new(0)` around separate globals | fixed by slice 3 (`679528a`, `d72cffd`, `a53b6ff`): `Mutex[WorkerControl]`, device state in `Mutex[T]`; the one `Mutex[u64]` owns the board clock it guards |
@@ -40,14 +40,14 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | runtime#9 | the DMA bus master is "whichever core last touched audio" | fixed in `0181428`: no `core` global; the requesting thread is passed as `via`, IRQs reach both NVICs through `deliver_audio_irq`, and the device-time rule (one clock that only advances; a lagging core sees the later state) is documented on `AudioLive`. The DMA's RAM stores still go through `device_store` on `via`'s thread, which already invalidates both cores' monitors and code; no separate v6m requester was needed |
 | runtime#10 | conditional locking keyed on a mutable global | fixed by slice 3 (`d72cffd`): `rp.live` is taken on every access, whichever thread |
 | runtime#11 | host workflow reaches into virt globals and duplicates the image layout | open |
-| runtime#12 | per-core configuration as parallel arrays, copy-pasted core setup | open (part of slice 4 part 2: the cores' option globals) |
+| runtime#12 | per-core configuration as parallel arrays, copy-pasted core setup | fixed in `bb79bea`: `Machine.configs: [2]CoreConfig` (kind, timing, priority bits, DSP, `Fpu`, clock divisor), one `configure(c, cfg)` for both cores at boot and launch; `Fpu` is an enum on the core |
 | runtime#13 | generic checker contains part-specific rules | fixed in `3fc81e6` (`PartSpec.rule` and `defaults` beside each part in the registry; `PinOwner` struct) |
 | runtime#14 | boolean-trap positional constructors | fixed in `7c9b59b`: `Workflow` built with named arguments, its five flags are `Phase` + `Request` enums; `library()` uses `peripheral`/`part`/`window`/`param`/`port` builders with named defaults (also `core_options`) |
 | runtime#15 | wall-clock, busy-spinning tests | open |
 | runtime#16 | `start_workers` mutates state before it validates | fixed by slice 3 (`679528a`): the divisor check runs before anything is set |
-| runtime#17 | asymmetric worker entry points (`cpu_worker0(ignored)`) | open |
+| runtime#17 | asymmetric worker entry points (`cpu_worker0(ignored)`) | fixed in `bb79bea`: `leading_worker` and `following_worker` each run the core they are handed; the scheduler's copy of the core pointers (`Lockstep.cores`) is gone, which is what kept core 0's worker from using its argument |
 | runtime#18 | disk-queue backpressure becomes a guest-visible write error | fixed in `0181428`: a full queue blocks the writing core for a slot (host time, no guest time); only a stopped writer refuses. `disk_failed` stays sticky by design: it records a real failed host write, and is cleared at the next `start_disk` |
-| runtime#19 | cache-line padding by hand, sized for the wrong machine | open (`BusCache` still pads to 64) |
+| runtime#19 | cache-line padding by hand, sized for the wrong machine | fixed in `bb79bea`: `@align(HOST_CACHE_LINE) struct BusCache` (128, Apple silicon's line), held in `Machine.bus_cache` |
 | runtime#20 | sysl idiom (redundant suffixes, hand `min`/`max`, qualified calls) | open |
 | runtime#21 | stale or misleading comments, dead paths | partly fixed (slice 3 deleted `parallel.sysl` and its "legacy" comments); the rest open |
 | peripherals#1 | registers are magic offsets and masks; bitfields never used | fixed in `d013662`, `6252927`, `5d04466`: SDMMC, SAI, DSI, DMA, DMAMUX and the STM32 SPI name every offset and field from `sh.sysl.stm32h747` 0.1.1 (SVD-generated, the one definition); WM8994, FT6x06, GT911, DS3231 and the PL022 engine have named constants from their data sheets. Named constants rather than bitfield structs, so the field positions have one source (the generated package) instead of a hand-written second copy |
