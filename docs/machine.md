@@ -11,6 +11,7 @@ struct Machine
     map: MemoryMap            // where the board puts RAM and flash (v6m)
     memory: &Memory           // the storage behind them, which the machine owns
     cores: [2]Cpu             // the chip's cores; each points at `memory` (Cpu.mem)
+    configs: [2]CoreConfig    // what the description makes of each core
     devices: Buf[&Peripheral] // the chip's peripherals on the bus, each owning its state
     parts: Buf[&Part]         // parts soldered to the board (the Pico 2 W's LED, the DISCO's panel)
     header: Buf[Pin]          // named header pins: the board's only external interface
@@ -119,8 +120,13 @@ enum ProductView
      v6m `trait Bus` that `Machine` implements and `boot` and `launch` point at, in place of the
      `io_read`/`io_write` function globals. The trait call costs at most about 1% in host
      instructions on the interpreter and board benches.
-   - Left: the cores' option globals, the SIO FIFOs and spinlocks, the bus cache, the
-     `enum Device` dispatch, and `virt.machine` itself.
+   - Done: the cores' configuration. `Machine.configs: [2]CoreConfig` holds what the description
+     makes of each core (model, instruction timing, NVIC priority bits, DSP, `Fpu`, and its clock's
+     divisor of the chip's), and `Machine.clock_hz` the chip's clock; `boot` and `launch` give a core
+     its configuration with one `configure`. Each core's last bus window is `Machine.bus_cache`, a
+     `BusCache` aligned to `HOST_CACHE_LINE` (128 bytes, Apple silicon's line) so the two cores'
+     threads never write one line.
+   - Left: the SIO FIFOs and spinlocks, the `enum Device` dispatch, and `virt.machine` itself.
    - Left: a RISC-V hart in a board. The hart already reaches devices through its own
      `riscv.Bus` trait off its RAM window; what it waits on is device handlers that take a v6m
      `*Cpu`, and the RP2350 chip layer (GPIO, UART, SIO, ROM), which does not exist yet.

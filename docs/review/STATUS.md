@@ -21,7 +21,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#11 | sentinel and guard-record arithmetic in place of named concepts | open |
 | cores#12 | `Kind`, `Arch` and the `is_*` predicates overlap | open |
 | cores#13 | `h_dsp` re-checks DSP at run time against a second source of truth | open |
-| cores#14 | duplicated bit utilities and hand-rolled loops the library has | partly fixed in `d435c66` (`t2sem` CLZ is `leading_zeros`); left: `rbit` (waits for sysl 0.7.9's `reverse_bits`), the RISC-V `bitops` loops, the duplicated `sext`/`bits`/`bad`/`st` helpers |
+| cores#14 | duplicated bit utilities and hand-rolled loops the library has | partly fixed in `d435c66` (`t2sem` CLZ is `leading_zeros`); `rbit` is `reverse_bits` (sysl 0.7.9); left: the RISC-V `bitops` loops, the duplicated `sext`/`bits`/`bad`/`st` helpers |
 | cores#15 | boilerplate handler bodies | fixed in `35449b8`: `h_step[OP, L, TIMED]` and `h_access[OP, L, TIMED]`, whose `match` on the constant `OP` folds, replace ~85 hand-written handlers |
 | cores#16 | RISC-V `execute` mixes decode, validation and commit | fixed in `aff3dad`: one `retire` commit path, faults carry an `Access` instead of a side channel |
 | cores#17 | `Stop.Budget` means "running" | open |
@@ -29,25 +29,25 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#19 | Python-generated tests addressed by hard-coded record ranges | fixed in `aff3dad`: each vector carries its mnemonic and the harness selects by it, iterating `MODELS` |
 | cores#20 | tests that restate the cost table | open |
 | cores#21 | comments that record history rather than invariants | open |
-| runtime#1 | no board object: the machine is module globals shared across threads | partly fixed by slices 1–4 (`ce0b959`, `3024687`, `679528a`, `d72cffd`, `a53b6ff`, `9d54348`): memory, devices, scheduler, workers and cores are owned; left: the cores' option globals, SIO FIFOs and spinlocks, the bus cache and `virt.machine` (slice 4 part 2) |
+| runtime#1 | no board object: the machine is module globals shared across threads | partly fixed by slices 1–4 (`ce0b959`, `3024687`, `679528a`, `d72cffd`, `a53b6ff`, `9d54348`): memory, devices, scheduler, workers and cores are owned; the cores' configuration, clock and bus cache are `Machine`'s (`bb79bea`); left: the SIO FIFOs and spinlocks, and `virt.machine` (slice 4 part 2) |
 | runtime#2 | devices are a closed enum dispatched by hand, not a trait | open (slice 4 part 2: the `Peripheral` trait) |
 | runtime#3 | four schedulers share one set of globals | fixed by slice 3 (`679528a`): one `Scheduler`; `pump_parallel` and `parallel.sysl` gone; `run_on_threads` and `threaded` split |
 | runtime#4 | locks guard nothing: `Mutex.new(0)` around separate globals | fixed by slice 3 (`679528a`, `d72cffd`, `a53b6ff`): `Mutex[WorkerControl]`, device state in `Mutex[T]`; the one `Mutex[u64]` owns the board clock it guards |
 | runtime#5 | `assemble` mutates globals before it can still fail | fixed by slices 1–2 (`ce0b959`, `3024687`): `plan` checks everything, the apply step cannot fail |
 | runtime#6 | peripheral kinds and window sizes duplicated; one wrong error message | fixed in `3fc81e6` (one `DEVICE_KINDS` table gives the device and its refusal name; sizes from the registry; `controller` read once into the DMA device, which `check_audio` takes from the bus) |
 | runtime#7 | magic register fields where the comments name the field | fixed in `d013662`: `h7` names RCC_GCR (`sh.sysl.stm32h747.rcc`) and BOOT_C1/C2; the SYNCEN, SLOTEN and A/B block layout live in `peripheral/sai` (`synchronous`, `slot_enabled`, `block_index`, `data_register`); DMAMUX request IDs, default clocks and storage pins are named; `dsi.is_read` replaces the worker's kind test |
-| runtime#8 | hand-rolled ring buffers where `Ring` exists | open |
-| runtime#9 | the DMA bus master is "whichever core last touched audio" | open |
+| runtime#8 | hand-rolled ring buffers where `Ring` exists | fixed in `7c9b59b`: `sai_dma` output/input are `Ring`s over their `Buf` storage, the codec microphone queue an `InlineRing`; the two remaining byte loops are `sysl.slices.copy` |
+| runtime#9 | the DMA bus master is "whichever core last touched audio" | fixed in `0181428`: no `core` global; the requesting thread is passed as `via`, IRQs reach both NVICs through `deliver_audio_irq`, and the device-time rule (one clock that only advances; a lagging core sees the later state) is documented on `AudioLive`. The DMA's RAM stores still go through `device_store` on `via`'s thread, which already invalidates both cores' monitors and code; no separate v6m requester was needed |
 | runtime#10 | conditional locking keyed on a mutable global | fixed by slice 3 (`d72cffd`): `rp.live` is taken on every access, whichever thread |
 | runtime#11 | host workflow reaches into virt globals and duplicates the image layout | open |
-| runtime#12 | per-core configuration as parallel arrays, copy-pasted core setup | open (part of slice 4 part 2: the cores' option globals) |
+| runtime#12 | per-core configuration as parallel arrays, copy-pasted core setup | fixed in `bb79bea`: `Machine.configs: [2]CoreConfig` (kind, timing, priority bits, DSP, `Fpu`, clock divisor), one `configure(c, cfg)` for both cores at boot and launch; `Fpu` is an enum on the core |
 | runtime#13 | generic checker contains part-specific rules | fixed in `3fc81e6` (`PartSpec.rule` and `defaults` beside each part in the registry; `PinOwner` struct) |
-| runtime#14 | boolean-trap positional constructors | open |
+| runtime#14 | boolean-trap positional constructors | fixed in `7c9b59b`: `Workflow` built with named arguments, its five flags are `Phase` + `Request` enums; `library()` uses `peripheral`/`part`/`window`/`param`/`port` builders with named defaults (also `core_options`) |
 | runtime#15 | wall-clock, busy-spinning tests | open |
 | runtime#16 | `start_workers` mutates state before it validates | fixed by slice 3 (`679528a`): the divisor check runs before anything is set |
-| runtime#17 | asymmetric worker entry points (`cpu_worker0(ignored)`) | open |
-| runtime#18 | disk-queue backpressure becomes a guest-visible write error | open |
-| runtime#19 | cache-line padding by hand, sized for the wrong machine | open (`BusCache` still pads to 64) |
+| runtime#17 | asymmetric worker entry points (`cpu_worker0(ignored)`) | fixed in `bb79bea`: `leading_worker` and `following_worker` each run the core they are handed; the scheduler's copy of the core pointers (`Lockstep.cores`) is gone, which is what kept core 0's worker from using its argument |
+| runtime#18 | disk-queue backpressure becomes a guest-visible write error | fixed in `0181428`: a full queue blocks the writing core for a slot (host time, no guest time); only a stopped writer refuses. `disk_failed` stays sticky by design: it records a real failed host write, and is cleared at the next `start_disk` |
+| runtime#19 | cache-line padding by hand, sized for the wrong machine | fixed in `bb79bea`: `@align(HOST_CACHE_LINE) struct BusCache` (128, Apple silicon's line), held in `Machine.bus_cache` |
 | runtime#20 | sysl idiom (redundant suffixes, hand `min`/`max`, qualified calls) | open |
 | runtime#21 | stale or misleading comments, dead paths | partly fixed (slice 3 deleted `parallel.sysl` and its "legacy" comments); the rest open |
 | peripherals#1 | registers are magic offsets and masks; bitfields never used | fixed in `d013662`, `6252927`, `5d04466`: SDMMC, SAI, DSI, DMA, DMAMUX and the STM32 SPI name every offset and field from `sh.sysl.stm32h747` 0.1.1 (SVD-generated, the one definition); WM8994, FT6x06, GT911, DS3231 and the PL022 engine have named constants from their data sheets. Named constants rather than bitfield structs, so the field positions have one source (the generated package) instead of a hand-written second copy |
@@ -55,42 +55,42 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | peripherals#3 | the STM32H747 MCU is pasted into three board files | fixed in `3fc81e6` (`mcus/stm32h747.hocon`, every GPIO bank; the three boards say `mcu = stm32h747`; `h747-cores` is a virtual harness chip and says so) |
 | peripherals#4 | MCU facts in board files; pin routing written twice | fixed in `3fc81e6` (GPIO reset modes and each signal's possible pins in the mcu; the board picks under `buses` only, which the SPI/SDMMC read) |
 | peripherals#5 | the board/MCU schema is inconsistent with itself | fixed in `3fc81e6` (kebab-case keys; `wire { }` the one wiring form and bare pins the one board pin form, the others refused; Hazard3 is `mcus/rp2350-hazard3.hocon`) |
-| peripherals#6 | two ownership conventions and three `reset` styles | open |
-| peripherals#7 | five or more hand-rolled ring buffers | open |
-| peripherals#8 | protocol states and reply kinds are bare integers | open |
-| peripherals#9 | a status getter mutates state | open |
-| peripherals#10 | silent truncation of guest time in `i2s.advance` | open |
-| peripherals#11 | undocumented fidelity shortcuts | open |
+| peripherals#6 | two ownership conventions and three `reset` styles | partly fixed in `7c9b59b`: one reset style everywhere but `mipi_dcs` — a single power-on constructor (`fresh`/zeroed `var` + the non-zero fields) that `reset` stores over the live model (sdmmc, sai, wm8994, sd_card, dma, i2c, ssd1306, seven_segment, parts/spi, gt911 `boot`); sd_card's reset now clears the half-received block. Left: `mipi_dcs` (bt-fidelity is splitting it, #17) and the value-vs-`&T` convention, which needs virt's `Mutex[T]` holders and UI snapshots changed |
+| peripherals#7 | five or more hand-rolled ring buffers | fixed in `7c9b59b`: `InlineRing` (sysl 0.7.8, `sysl.container.ring`) in sai, i2s (four), PL022, gt911, sd_card reply, dsi rx. The suspected sysl gap is not one |
+| peripherals#8 | protocol states and reply kinds are bare integers | fixed in `7c9b59b`: `CardState`, `ResponseKind` (WAITRESP values), `Transfer`, SPI `WriteStage`, `wm8994.Stage` |
+| peripherals#9 | a status getter mutates state | fixed in `7c9b59b`: `settle` does Prg→Tran; `status` is pure |
+| peripherals#10 | silent truncation of guest time in `i2s.advance` | fixed in `0181428`: every elapsed period reaches the guest FIFOs, flags and LEVEL (an idle tail in closed form); only the host rings are bounded. `peak` renamed `level`, as the register map documents it |
+| peripherals#11 | undocumented fidelity shortcuts | fixed in `0181428`: the refuse-on-unsupported policy and a divergence table in `docs/peripheral-models.md`; each model's header lists its own; the DS3231 now uses the chip's leap rule (2100 is a leap year) |
 | peripherals#12 | GPIO-level parts assume a 32-pin `u32` level mask | open |
 | peripherals#13 | the SPI SD card re-implements the SPI shifter | open |
-| peripherals#14 | positional constructors with 20 to 40 arguments | open |
-| peripherals#15 | dead or diagnostic-only state inside the models | open |
+| peripherals#14 | positional constructors with 20 to 40 arguments | partly fixed in `7c9b59b`: sdmmc, sd_card, dsi, hd44780, i2s, sai, wm8994, gt911, ssd1306, PL022 write only their non-zero fields. Left: `mipi_dcs` (its `Buf` field has no zero; needs a state split while bt-fidelity reworks the file) |
+| peripherals#15 | dead or diagnostic-only state inside the models | fixed in `7c9b59b`: `DATA_ERRORS`, `data_index`, `data_base`, `data_length` deleted (`transferred` is behaviour: the single-buffer offset); sdmmc and sd_card counters moved to `Stats` |
 | peripherals#16 | `NEVER` defined three times, the literal three more | fixed in `d013662`: one `NEVER` in `sh.sysl.benchtop.timing`, imported by `v6m`, the peripherals and `virt`; the literals in `dsi` and `spi` are gone |
-| peripherals#17 | "MIPI DCS" part carries ST7789 vendor commands | open |
+| peripherals#17 | "MIPI DCS" part carries ST7789 vendor commands | fixed in `0181428`: `mipi_dcs.Controller` (`Dcs`, `St7789`); the DCS core table is shared and the ST7789's vendor table applies only to the SPI ST7789 |
 | peripherals#18 | comments that name development steps, or are stale | open |
-| peripherals#19 | `hd44780` pins are a `[7]int` indexed by position | open |
+| peripherals#19 | `hd44780` pins are a `[7]int` indexed by position | fixed in `7c9b59b`: `Pins { rs, rw: Option[int], e, d: [4]int }`. `seven_segment`'s arrays stay: they are indexed by segment bit and digit, which is what an array is |
 | peripherals#20 | sysl idiom: redundant suffixes, types and parentheses | open |
 | peripherals#21 | 8-bit register pointers wrap through `+= 1` | fixed in `6252927`: FT6x06 (u8), GT911 and WM8994 (u16) wrap their auto-increment explicitly with a mask (sysl 0.7.8 has no `+%`); DS3231's pointer already wraps at 19 |
 | peripherals#22 | tests assert implementation with magic numbers | open |
 | ui-firmware#1 | example sources are not compiled by the gate | fixed in `80b8a2f` (every example firmware source is built in the suite) |
-| ui-firmware#2 | the UI owns emulator control and the board's input model | open |
+| ui-firmware#2 | the UI owns emulator control and the board's input model | fixed in `6e166e1`: `virt.Session` (`virt/session.sysl`) owns restart, advance, pause, workers and stop-to-status, and the parts' controls → pins/voltages (`set_part_input`); instruments read `virt.ram_peek`; `ui/` imports no core module |
 | ui-firmware#3 | duplicate, unreachable `"buzzer"` arm in `draw_part` | fixed in `61cac6f` |
-| ui-firmware#4 | `draw_part` string switch, geometry duplicated in hit-testing | open |
-| ui-firmware#5 | stringly typed session state; notices owned by prefixes | open |
-| ui-firmware#6 | pot state stored twice and synced every frame | open |
-| ui-firmware#7 | `rasterize` clones the desktop by hand-copying fields | open |
-| ui-firmware#8 | a 20-argument positional constructor | open |
+| ui-firmware#4 | `draw_part` string switch, geometry duplicated in hit-testing | fixed in `6e166e1`: `PartLook` (one model-name match in `look_of`) drives drawing, hit-testing and touch; `stick_point`/`stick_position`, `element_label`, `dial_angle` and `virt.POSITION_MAX/CENTRE` are shared; the palette is named in `scene.sysl` |
+| ui-firmware#5 | stringly typed session state; notices owned by prefixes | fixed in `6e166e1`: `virt.RunStatus`, `Notice(NoticeKind, text)`, `Held(key, part)`, `Capture { Free, Joystick, Glass }`; pots and switches are `virt.PartInput`s per part |
+| ui-firmware#6 | pot state stored twice and synced every frame | fixed in `6e166e1`: `State.pots`/`switches` are gone; the knob's signal is the desktop's one copy, the session the model's; drags no longer write state from `paint`; `edit`/`say`/`select_part` do read-modify-set in one call. Pointer handling stays in `BoardView.paint` (`take_pointer`), because syslUI answers pointer queries while a view paints |
+| ui-firmware#7 | `rasterize` clones the desktop by hand-copying fields | fixed in `6e166e1`: `Workbench(d, interactive)` renders the live desktop; a non-interactive paint takes no input and scrolls a copy |
+| ui-firmware#8 | a 20-argument positional constructor | fixed in `6e166e1`: `Desktop`, `State`, `AudioPlayer` built with named arguments; `launch(which, file, LaunchOptions)` via `launch_options(...)` |
 | ui-firmware#9 | hand-written SDL externs where the SDL binding owns the job | fixed in `d435c66` (sdl3 0.3.12: the touch window's size and scale through `sdl3.c`, `current_audio_driver()`, `current_time()`/`date_time()`; no `extern "SDL_` is left in benchtop) |
 | ui-firmware#10 | instrument sources hard-code register maps | open |
 | ui-firmware#11 | example firmware is not readable | open |
 | ui-firmware#12 | startup and vector-table boilerplate copied into every example | open |
 | ui-firmware#13 | redundant casts and suffixes in the examples and the UI | open |
 | ui-firmware#14 | firmware state as dozens of prefixed module globals | open |
-| ui-firmware#15 | clock and budget policy duplicated in a ternary chain | open |
+| ui-firmware#15 | clock and budget policy duplicated in a ternary chain | fixed in `6e166e1`: `virt.pacing_source(touch) -> PacingSource` with named `TOUCH_HZ`/`FALLBACK_HZ`/`FALLBACK_BUDGET`; the frame budget is a `match` on it |
 | ui-firmware#16 | hand-rolled helpers the standard library has | open |
-| ui-firmware#17 | dead code and unused imports | open |
-| ui-firmware#18 | the TFT raster cache grows without bound | open |
-| ui-firmware#19 | display renderers repeat the same scaffold | open |
+| ui-firmware#17 | dead code and unused imports | fixed in `6e166e1`: unused `v6m` imports gone, `board_transform(r)` takes no scene and its comment says what it does, the audio trace flags are `AudioPlayer` fields |
+| ui-firmware#18 | the TFT raster cache grows without bound | fixed in `6e166e1`: `raster_for` keeps one raster per display and replaces it in place on a size change |
+| ui-firmware#19 | display renderers repeat the same scaffold | fixed in `6e166e1`: `draw_module` frames every display, module, control and readout; the I2S and RTC arms are one `Module(caption)`. The captions keep their own positions, which differ per display |
 | ui-firmware#20 | validation duplicated with different bounds | fixed in `3fc81e6` (`plot.MIN_CAPACITY`/`MAX_CAPACITY` are the one bound) |
 | ui-firmware#21 | HOCON parse errors are discarded | fixed in `3fc81e6` (the diagnostic is rendered; `KNOWN_FIELDS` with `sysl.slices.contains`) |
 | ui-firmware#22 | tests in `ui/` that test firmware; hand-computed struct offsets | open |
