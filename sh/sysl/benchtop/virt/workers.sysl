@@ -66,11 +66,12 @@ struct WorkerControl
     pacers: [2]timing.CorePacer
     waited_us: [2]u64
 
-/** The CPU workers' session. `active`, `parallel`, `hz` and `paced` are set while no worker runs and
- * read freely; `interrupt` is atomic; `next_check` is each core's next pacing checkpoint, written and
- * read only by that core's worker, or while both are parked.
+/** The CPU workers' session: the machine whose cores they run, `active`, `parallel`, `hz` and `paced`,
+ * set while no worker runs and read freely; `interrupt` is atomic; `next_check` is each core's next
+ * pacing checkpoint, written and read only by that core's worker, or while both are parked.
  */
 struct Workers
+    machine: *Machine
     active: bool
     parallel: bool
     hz: u64
@@ -87,30 +88,33 @@ private[virt] const WORKER_BATCH: u64 = 250000
 
 private no_core() -> CoreObservation = CoreObservation(0, 0, 0, [0;16], false, Stop.Running, 0)
 
-private[virt] no_workers() -> Workers = Workers(false, true, 0, false, 0, [0, 0], [None, None],
+private[virt] no_workers() -> Workers = Workers(null, false, true, 0, false, 0, [0, 0], [None, None],
     Mutex.new(WorkerControl(WorkerObservation([no_core(), no_core()], false, false, [0, 0]), [0, 0],
         false, true, false, false, 0, 0, 0, 0, 0, false, [timing.CorePacer(0, 0, 0, 0, 0);2], [0, 0])),
     Condvar.new(), Condvar.new())
 
 private capture_core(c: *Cpu) -> CoreObservation = CoreObservation(c.pc,c.retired,board_time(c,c.retired),c.r,c.sleeping,c.stop,0)
 
-private capture_workers(ids: [2]u64) -> WorkerObservation = WorkerObservation(
-    [capture_core(core0()),capture_core(core1())],scheduler.launched,
-    core0().stop == Stop.Running && core1().stop == Stop.Running,ids)
+private capture_workers(m: *Machine, ids: [2]u64) -> WorkerObservation = WorkerObservation(
+    [capture_core(&m.cores[0]),capture_core(&m.cores[1])],scheduler.launched,
+    m.cores[0].stop == Stop.Running && m.cores[1].stop == Stop.Running,ids)
 
 /** Whether the CPU workers are started. */
 workers_active() -> bool = scheduler.workers.active
 
-/** Safe for UI, instruments and host audio without touching a running Cpu. */
-observe_core(k: int) -> CoreObservation
+/** `m`'s core `k` as last observed. Safe for UI, instruments and host audio without touching a
+ * running Cpu.
+ */
+observe_core(m: *Machine, k: int) -> CoreObservation
     require k == 0 || k == 1, "core is 0 or 1"
     val w = &scheduler.workers
-    if !w.active then return capture_core(if k == 0 then core0() else core1())
+    if !w.active then return capture_core(&m.cores[k])
     w.control.with(c -> observed_workers(c).cores[k])
 
-observation_time() -> u64
+/** The later of `m`'s cores' clocks as last observed. */
+observation_time(m: *Machine) -> u64
     val w = &scheduler.workers
-    if !w.active then return max(board_time(core0(),core0().retired),board_time(core1(),core1().retired))
+    if !w.active then return max(board_time(&m.cores[0],m.cores[0].retired),board_time(&m.cores[1],m.cores[1].retired))
     w.control.with(c -> max(c.snap.cores[0].time,c.snap.cores[1].time))
 
 workers_observe() -> WorkerObservation
@@ -127,15 +131,15 @@ workers_waited_us() -> [2]u64
 /** hz=0 supplies deterministic manual budgets for tests. Interactive sessions
  * use their own wall clock; the UI never supplies their instruction budget.
  */
-start_workers(cpu: *Cpu, parallel: bool = true, hz: u64 = 0) -> Result[unit,string]
+start_workers(m: *Machine, parallel: bool = true, hz: u64 = 0) -> Result[unit,string]
     require hz <= 1000000000, "worker clock is at most 1 GHz"
-    require cpu == core0(), "the worker session owns the board core 0"
     require !scheduler.workers.active && !scheduler.threaded, "one board owns the CPU workers"
     val w = &scheduler.workers
     for k in 0..<2
-        val divisor = machine.configs[k].divisor
+        val divisor = m.configs[k].divisor
         if hz != 0 && (hz < divisor || hz % divisor != 0) then
             return Err("worker clock must divide into each configured core clock domain")
+    w.machine = m
     w.parallel = parallel
     w.hz = hz
     w.paced = hz != 0 && parallel
@@ -151,13 +155,13 @@ start_workers(cpu: *Cpu, parallel: bool = true, hz: u64 = 0) -> Result[unit,stri
         c.generation = 0
         c.finished = 0
         c.waited_us = [0, 0]
-        c.snap = capture_workers(c.ids))
+        c.snap = capture_workers(m, c.ids))
     w.active = true
-    w.handles[0] = spawn(&leading_worker,core0(),1 << 20)
+    w.handles[0] = spawn(&leading_worker,m,1 << 20)
     if w.handles[0].is_none()
         w.active = false
         return Err("cannot create the host worker for guest core 0")
-    w.handles[1] = spawn(&following_worker,core1(),1 << 20)
+    w.handles[1] = spawn(&following_worker,m,1 << 20)
     if w.handles[1].is_none()
         w.control.with(c ->
             c.closing = true
@@ -171,7 +175,7 @@ start_workers(cpu: *Cpu, parallel: bool = true, hz: u64 = 0) -> Result[unit,stri
     c.snap.worker_ids = c.ids
     w.control.unlock_raw()
     if parallel
-        start_dsi_worker() match
+        start_dsi_worker(&m.devices) match
             Ok(_) -> ()
             Err(why) ->
                 stop_workers()
@@ -188,7 +192,7 @@ resume_workers()
             if scheduler.workers.paced
                 val at = c.origin_ns / 1000
                 for k in 0..<2
-                    val core = if k == 0 then core0() else core1()
+                    val core = &w.machine.cores[k]
                     val origin = if k == 1 && !scheduler.launched then local_time(core,scheduler.now) else core_ticks(core,core.retired)
                     c.pacers[k] = timing.pacer(scheduler.workers.hz / divisor_of(core),at,origin)
                     scheduler.workers.next_check[k] = c.pacers[k].next_check
@@ -214,14 +218,14 @@ pause_workers()
     w.control.unlock_raw()
     flush_dsi_worker()
 
-/** Call after boot/reset while paused; thread identities and handles survive. */
-rebase_workers()
+/** Call after `m`'s boot/reset while paused; thread identities and handles survive. */
+rebase_workers(m: *Machine)
     val w = &scheduler.workers
     if !w.active then return
     w.control.with(c ->
         assert(c.paused && !c.busy,"reset requires parked CPU workers")
         c.requested = scheduler.now
-        c.snap = capture_workers(c.ids))
+        c.snap = capture_workers(m, c.ids))
 
 step_workers()
     pause_workers()
@@ -269,6 +273,7 @@ stop_workers()
     scheduler.horizon = NEVER
     w.active = false
     w.paced = false
+    w.machine = null
 
 /** The board clock a session paced at `hz` has reached at host time `now_ns`, when it was at
  * `origin_clock` at host time `origin_ns`. Whole seconds and the remainder are scaled apart, so the
@@ -307,9 +312,9 @@ private wall_target(c: *WorkerControl) -> u64
         return now + cap
     due
 
-// The leading worker, which runs core 0 (`cpu`): it takes the control requests, runs batches up to
+// The leading worker, which runs `m`'s core 0: it takes the control requests, runs batches up to
 // their horizon, and hands each paired run to the following worker by bumping `generation`.
-private leading_worker(cpu: *Cpu)
+private leading_worker(m: *Machine)
     val w = &scheduler.workers
     val c = w.control.lock_raw()
     c.ids[0] = current().id
@@ -336,9 +341,9 @@ private leading_worker(cpu: *Cpu)
         val horizon = if w.paced && !stepping then NEVER else now + min(WORKER_BATCH,if stepping then 1 else target - now)
         c.busy = true
         w.control.unlock_raw()
-        execute_worker_batch(cpu,horizon,stepping)
+        execute_worker_batch(m,horizon,stepping)
         w.control.lock_raw()
-        c.snap = capture_workers(c.ids)
+        c.snap = capture_workers(m, c.ids)
         c.busy = false
         if stepping
             c.step_pending = false
@@ -346,9 +351,9 @@ private leading_worker(cpu: *Cpu)
         w.changed.notify_all()
     w.control.unlock_raw()
 
-// The following worker, which runs core 1 (`cpu`): one run of it for each generation the leading
+// The following worker, which runs `m`'s core 1: one run of it for each generation the leading
 // worker starts, reported back through `finished`.
-private following_worker(cpu: *Cpu)
+private following_worker(m: *Machine)
     val w = &scheduler.workers
     val c = w.control.lock_raw()
     c.ids[1] = current().id
@@ -359,65 +364,69 @@ private following_worker(cpu: *Cpu)
         if c.closing then break
         seen = c.generation
         w.control.unlock_raw()
-        run_core(cpu,1)
+        run_core(m,1)
         w.control.lock_raw()
         c.finished = seen
         w.changed.notify_all()
     w.control.unlock_raw()
 
-private execute_worker_batch(cpu: *Cpu, horizon: u64, stepping: bool)
+private execute_worker_batch(m: *Machine, horizon: u64, stepping: bool)
     val s = &scheduler
     val w = &s.workers
+    val cpu = &m.cores[0]
+    val second = &m.cores[1]
     if stepping
         s.threaded = false
         val count = if s.launched then 2 else 1
         for k in 0..<count
-            val c = if k == 0 then cpu else core1()
+            val c = &m.cores[k]
             take_incoming(c)
             refresh(c)
-            signal(c)
+            signal(m,c)
             if c.stop == Stop.Running && board_wake_by(c,board_time(c,c.retired))
                 set_limit(c,c.retired + 1)
                 run_single(c)
         if s.starting
             s.starting = false
-            core1().slept = local_time(core1(),board_time(cpu,cpu.retired))
-        s.now = board_clock(cpu)
-        flush_console()
+            second.slept = local_time(second,board_time(cpu,cpu.retired))
+        s.now = board_clock(m)
+        flush_console(m)
         return
     if !w.parallel
         s.threaded = false
         take_incoming(cpu)
-        take_incoming(core1())
+        take_incoming(second)
         refresh(cpu)
-        refresh(core1())
-        pump_board(cpu,horizon - s.now)
+        refresh(second)
+        pump_board(m,horizon - s.now)
         return
     if !s.launched
-        turn(cpu,horizon)
+        turn(m,cpu,horizon)
         if s.starting
             s.starting = false
             s.now = board_time(cpu,cpu.retired)
-            core1().slept = local_time(core1(),s.now)
-    if s.launched && cpu.stop == Stop.Running && core1().stop == Stop.Running
-        pair_cores(horizon)
+            second.slept = local_time(second,s.now)
+    if s.launched && cpu.stop == Stop.Running && second.stop == Stop.Running
+        pair_cores(m,horizon)
         val job = w.control.with(c ->
             c.snap.launched = scheduler.launched
             c.generation += 1
             scheduler.workers.core1_changed.notify_all()
             c.generation)
-        run_core(cpu,0)
+        run_core(m,0)
         val c = w.control.lock_raw()
         while c.finished != job do w.changed.wait(&w.control)
         w.control.unlock_raw()
     s.horizon = NEVER
     take_incoming(cpu)
-    take_incoming(core1())
-    s.now = board_clock(cpu)
-    flush_console()
+    take_incoming(second)
+    s.now = board_clock(m)
+    flush_console(m)
 
-// The board's clock once a batch has run: the later of the running cores' clocks.
-private board_clock(cpu: *Cpu) -> u64 = max(board_time(cpu,cpu.retired),if scheduler.launched then board_time(core1(),core1().retired) else 0)
+// `m`'s clock once a batch has run: the later of the running cores' clocks.
+private board_clock(m: *Machine) -> u64
+    val (cpu, second) = (&m.cores[0], &m.cores[1])
+    max(board_time(cpu,cpu.retired),if scheduler.launched then board_time(second,second.retired) else 0)
 
 private host_now_ns() -> u64 = u64(monotonic().us) * 1000
 
@@ -474,5 +483,5 @@ private observed_workers(c: *WorkerControl) -> WorkerObservation
     if !scheduler.workers.paced || !c.epoch_ready || c.paused || c.step_pending then return snapshot
     val at = host_now_ns() / 1000
     for k in 0..<(if snapshot.launched then 2 else 1)
-        snapshot.cores[k].late_us = timing.late_us(c.pacers[k],snapshot.cores[k].time / machine.configs[k].divisor,at)
+        snapshot.cores[k].late_us = timing.late_us(c.pacers[k],snapshot.cores[k].time / scheduler.workers.machine.configs[k].divisor,at)
     snapshot

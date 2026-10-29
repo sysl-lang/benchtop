@@ -176,30 +176,26 @@ struct BusCache
 private[virt] no_bus_cache() -> BusCache = BusCache(0xffffffffffffffff)
 
 // Forget each core's last device, for a bus that has changed.
-private[virt] forget_bus_cache()
-    for k in 0..<2 do machine.bus_cache[k] = no_bus_cache()
+private[virt] forget_bus_cache(m: *Machine)
+    for k in 0..<2 do m.bus_cache[k] = no_bus_cache()
 
-// The index in the bus of the window that holds `address`, past `attached` for none.
-private bus_mapping(c: *Cpu, address: u32) -> usize
-    val bus = &machine.devices.bus
-    val cache = &machine.bus_cache[usize(c.core)]
+// The index in `m`'s bus of the window that holds `address`, past `attached` for none.
+private bus_mapping(m: *Machine, c: *Cpu, address: u32) -> usize
+    val bus = &m.devices.bus
+    val cache = &m.bus_cache[usize(c.core)]
     val cached = cache.index
     if cached < bus.attached
-        val m = &bus.mapped[cached]
-        if address >= m.base && address <= m.last then return cached
+        val w = &bus.mapped[cached]
+        if address >= w.base && address <= w.last then return cached
     for i in 0..<bus.attached
-        val m = &bus.mapped[i]
-        if address >= m.base && address <= m.last
+        val w = &bus.mapped[i]
+        if address >= w.base && address <= w.last
             cache.index = i
             return i
     bus.attached
 
-/** How many devices the bus has on it. */
-attached() -> usize = machine.devices.bus.attached
-
-// The IRQ the console raises, and the one the SIO's FIFOs raise; -1 for none.
-private[virt] console_irq() -> int = machine.devices.bus.console_irq
-private[virt] fifo_irq() -> int = machine.devices.bus.fifo_irq
+/** How many devices `m`'s bus has on it. */
+attached(m: *Machine) -> usize = m.devices.bus.attached
 
 /** The debug console (`debug-console`): the guest's input, as a channel the host fills (`typed`, its
  * values held in `slots`, whose lock no thread takes), CTRL, which both cores' threads read without
@@ -231,43 +227,43 @@ console() -> Console
     Console(Mutex.new(slots), typed, 0, Mutex.new(console_live()))
 
 
-// Ready the console with an empty input, its output going to the host, and its interrupt off.
-open_console()
+// Ready `m`'s console with an empty input, its output going to the host, and its interrupt off.
+open_console(m: *Machine)
     pause_workers()
-    val c = &machine.console
+    val c = &m.console
     c.typed = c.slots.with(slots -> channel(slots.view()))
     c.live.with(l -> *l = console_live())
     atomic_store(&c.ctrl, 0, Relaxed)
 
 // Keep the guest's output for `output` rather than writing it to the host.
-capture()
-    machine.console.live.with(l -> l.capturing = true)
+capture(m: *Machine)
+    m.console.live.with(l -> l.capturing = true)
 
 /** Console tail for a long-running visual session. */
-capture_bounded(limit: usize)
-    machine.console.live.with(l ->
+capture_bounded(m: *Machine, limit: usize)
+    m.console.live.with(l ->
         l.capturing = true
         l.capture_limit = max(limit, 128))
 
 /** A read-only copy of everything the guest has written since `capture`. */
-output() -> &sync Frozen[u8] = machine.console.live.with(l ->
+output(m: *Machine) -> &sync Frozen[u8] = m.console.live.with(l ->
     var bytes: Buf[u8] = buf()
     bytes.extend(l.out.view())
     bytes.freeze())
 
 /** Owned copy for a UI reading concurrently with console writes. */
-output_snapshot() -> Buf[u8] = machine.console.live.with(l ->
+output_snapshot(m: *Machine) -> Buf[u8] = m.console.live.with(l ->
     var bytes: Buf[u8] = buf()
     bytes.extend(l.out.view())
     bytes)
 
 /** The console's input, which `type_in` and the input thread send to. */
-input() -> *Channel[u8] = &machine.console.typed
+input(m: *Machine) -> *Channel[u8] = &m.console.typed
 
 // Give the guest `bytes` to read, and then the end of its input.
-type_in(bytes: []const u8)
-    for b in bytes do machine.console.typed.send(b)
-    machine.console.typed.close()
+type_in(m: *Machine, bytes: []const u8)
+    for b in bytes do m.console.typed.send(b)
+    m.console.typed.close()
 
 // The byte that ends benchtop from the keyboard, whatever the guest is doing: Ctrl-], as telnet's.
 const QUIT: u8 = 0x1D
@@ -275,7 +271,7 @@ const QUIT: u8 = 0x1D
 // Copy the host's standard input to the guest, from a thread of its own, until it ends. Ctrl-] is not
 // passed on: it ends benchtop with status 130, as an interrupt would, the terminal put back by the
 // exit hook `sysl.tty.raw` registered.
-listen() -> bool = spawn(&pump, &machine.console.typed).is_some()
+listen(m: *Machine) -> bool = spawn(&pump, &m.console.typed).is_some()
 
 private pump(ch: *Channel[u8])
     var r = stdin()
@@ -291,7 +287,7 @@ private pump(ch: *Channel[u8])
     ch.close()
 
 // Write out what the guest has written, unless it is being captured.
-flush_console() = machine.console.live.with(l -> flush_out(l))
+flush_console(m: *Machine) = m.console.live.with(l -> flush_out(l))
 
 private flush_out(l: *ConsoleLive)
     if l.capturing || l.out.len() == 0 then return
@@ -315,21 +311,18 @@ private status(c: *Console, l: *ConsoleLive) -> u32
 
     0
 
-private[virt] console_status() -> u32
-    val c = &machine.console
-    c.live.with(l -> status(c, l))
+private[virt] console_status(c: *Console) -> u32 = c.live.with(l -> status(c, l))
 
 // The console's half of an access to address `a`, register `o` from its base.
 impl Peripheral for Console
-    override signal(*self, cpu: *Cpu) = if console_raising() then raise(cpu, u32(console_irq()))
+    override signal(*self, m: *Machine, cpu: *Cpu) = if console_raising(m) then raise(cpu, u32(m.devices.bus.console_irq))
 
 impl BusWindow for Console
-    read(*self, cpu: *Cpu, a: u32, o: u32, width: u32, n: u64) -> u32 = console_read(cpu, a, o)
-    write(*self, cpu: *Cpu, a: u32, o: u32, width: u32, x: u32, n: u64) = console_write(cpu, a, o, x)
+    read(*self, m: *Machine, cpu: *Cpu, a: u32, o: u32, width: u32, n: u64) -> u32 = console_read(self, cpu, a, o)
+    write(*self, m: *Machine, cpu: *Cpu, a: u32, o: u32, width: u32, x: u32, n: u64) = console_write(self, cpu, a, o, x)
 
-private console_read(cpu: *Cpu, a: u32, o: u32) -> u32
-    val c = &machine.console
-    if o == CTRL then return console_ctrl()
+private console_read(c: *Console, cpu: *Cpu, a: u32, o: u32) -> u32
+    if o == CTRL then return console_ctrl(c)
     if o != DATA && o != STATUS
         halt(cpu, Stop.Unmapped, a)
         return 0
@@ -343,13 +336,13 @@ private take(c: *Console, l: *ConsoleLive) -> u32
     l.held = -1
     if b < 0 then 0xFFFFFFFF else u32(b)
 
-private console_write(cpu: *Cpu, a: u32, o: u32, x: u32)
+private console_write(c: *Console, cpu: *Cpu, a: u32, o: u32, x: u32)
     o match
-        DATA -> machine.console.live.with(l -> put(l, u8(x & 0xFF)))
+        DATA -> c.live.with(l -> put(l, u8(x & 0xFF)))
         EXIT ->
             cpu.exit_code = x
             halt(cpu, Stop.Exit, a)
-        CTRL -> atomic_store(&machine.console.ctrl, x & RX_INTERRUPT, Relaxed)
+        CTRL -> atomic_store(&c.ctrl, x & RX_INTERRUPT, Relaxed)
         _ -> halt(cpu, Stop.Unmapped, a)
 
 // The guest writes `b`: kept, and written out at a newline or when 4 KB have gathered, or, where the
@@ -363,18 +356,18 @@ private put(l: *ConsoleLive, b: u8)
     if b == 10 || l.out.len() >= 4096 then flush_out(l)
 
 @inline
-private[virt] console_ctrl() -> u32 = atomic_load(&machine.console.ctrl, Relaxed)
+private[virt] console_ctrl(c: *Console) -> u32 = atomic_load(&c.ctrl, Relaxed)
 
-// Whether the console raises its interrupt now: it is enabled and STATUS is not 0.
-private[virt] console_raising() -> bool
-    if console_irq() < 0 || console_ctrl() & RX_INTERRUPT == 0 then return false
+// Whether `m`'s console raises its interrupt now: it is enabled and STATUS is not 0.
+private[virt] console_raising(m: *Machine) -> bool
+    if m.devices.bus.console_irq < 0 || console_ctrl(&m.console) & RX_INTERRUPT == 0 then return false
 
-    console_status() != 0
+    console_status(&m.console) != 0
 
-// The board's RAM as `file` fills it: an ELF file's segments at their load addresses, or, for a file
-// that is not ELF, its bytes from address 0.
-image_of(file: []const u8) -> Result[Buf[u8], string]
-    val map = machine.map
+// `m`'s RAM as `file` fills it: an ELF file's segments at their load addresses, or, for a file that
+// is not ELF, its bytes from address 0.
+image_of(m: *Machine, file: []const u8) -> Result[Buf[u8], string]
+    val map = m.map
     var image: Buf[u8] = buf()
 
     for i in 0..<RAM_BYTES do image.push(0)
@@ -385,7 +378,7 @@ image_of(file: []const u8) -> Result[Buf[u8], string]
             var regions: Buf[elf.Region] = buf()
             regions.push(elf.Region(u64(map.ram_at), image.view()[..<usize(map.ram_size)]))
             for bank in map.banks do regions.push(elf.Region(u64(bank.base),image.view()[usize(bank.offset)..<usize(bank.offset + bank.size)]))
-            if map.flash_size != 0 then regions.push(elf.Region(u64(map.flash_at), image.view()[image_code_offset()..]))
+            if map.flash_size != 0 then regions.push(elf.Region(u64(map.flash_at), image.view()[code_offset(map)..]))
 
             elf.load(e, regions.view()) match
                 Ok(_) -> ()
@@ -394,7 +387,7 @@ image_of(file: []const u8) -> Result[Buf[u8], string]
             val (_, capacity) = code_region(map)
             if file.len > usize(capacity) then
                 return Err(if map.flash_size == 0 then s"larger than the board's ${size_text(capacity)} of RAM" else s"larger than the board's ${size_text(capacity)} of flash")
-            val offset = image_code_offset()
+            val offset = code_offset(map)
             for i in 0..<file.len do image.set(offset + i, file[i])
         Err(why) -> return Err(s"$why")
 
@@ -405,17 +398,19 @@ image_of(file: []const u8) -> Result[Buf[u8], string]
 private code_region(map: MemoryMap) -> (u32, u32) =
     if map.flash_size == 0 then (map.ram_at, map.ram_size) else (map.flash_at, map.flash_size)
 
-/** Where the code begins inside an `image_of` image: the image is the RAM's backing and then the
- * flash's, so on a board with flash the code is past the RAM; on one without, it is at 0. */
-image_code_offset() -> usize = if machine.map.flash_size == 0 then 0 else usize(RAM_BYTES)
+/** Where the code begins inside an `image_of` image of `m`'s: the image is the RAM's backing and then
+ * the flash's, so on a board with flash the code is past the RAM; on one without, it is at 0. */
+image_code_offset(m: *Machine) -> usize = code_offset(m.map)
 
-/** The SP and PC core 0 resets to from `image` (from `image_of`): the vector table's first two
- * words, as every M-profile core reads them. Refused where the board could not run from them: an SP
- * that is unaligned or outside the RAM, or a PC that is not a Thumb address in the code past the two
- * vectors. The PC answered has its Thumb bit. */
-reset_vector(image: []const u8) -> Result[(u32, u32), string]
-    val map = machine.map
-    val offset = image_code_offset()
+private code_offset(map: MemoryMap) -> usize = if map.flash_size == 0 then 0 else usize(RAM_BYTES)
+
+/** The SP and PC core 0 of `m` resets to from `image` (from `image_of`): the vector table's first
+ * two words, as every M-profile core reads them. Refused where the board could not run from them: an
+ * SP that is unaligned or outside the RAM, or a PC that is not a Thumb address in the code past the
+ * two vectors. The PC answered has its Thumb bit. */
+reset_vector(m: *Machine, image: []const u8) -> Result[(u32, u32), string]
+    val map = m.map
+    val offset = code_offset(map)
     if image.len < offset + 8 then return Err("firmware has no reset vectors")
     val sp = word_at(image, offset)
     val pc = word_at(image, offset + 4)
@@ -428,40 +423,41 @@ reset_vector(image: []const u8) -> Result[(u32, u32), string]
 // The little-endian word at `i` of `b`.
 private word_at(b: []const u8, i: usize) -> u32 = u32(b[i]) | (u32(b[i + 1]) << 8) | (u32(b[i + 2]) << 16) | (u32(b[i + 3]) << 24)
 
-// A virtual board with `image` loaded at 0, both cores of the kind the board names, core 0 reset as
-// every M-profile core resets — SP from the vector table's first word, PC from its second — and core
-// 1 waiting in its boot ROM, with the SIO's FIFOs empty, every spinlock free, and the default
-// quantum.
-boot(cpu: *Cpu, image: []const u8)
+// `m` as a virtual board with `image` loaded at 0, both cores of the kind the board names, core 0
+// reset as every M-profile core resets — SP from the vector table's first word, PC from its second —
+// and core 1 waiting in its boot ROM, with the SIO's FIFOs empty, every spinlock free, and the
+// default quantum.
+boot(m: *Machine, image: []const u8)
     pause_workers()
-    cpu.kind = machine.configs[0].kind
-    memory.reset_mapped(cpu, machine.memory, image, machine.map)
-    configure(cpu, machine.configs[0])
-    cpu.vtor = code_region(machine.map).0
+    val cpu = &m.cores[0]
+    cpu.kind = m.configs[0].kind
+    memory.reset_mapped(cpu, m.memory, image, m.map)
+    configure(m, cpu, m.configs[0])
+    cpu.vtor = code_region(m.map).0
     cpu.r[13] = load32(cpu, cpu.vtor)
     cpu.pc = load32(cpu, cpu.vtor + 4) & ~1
 
-    val second = core1()
-    second.kind = machine.configs[1].kind
+    val second = &m.cores[1]
+    second.kind = m.configs[1].kind
     second.core = 1
-    memory.attach_memory(second, machine.memory)
+    memory.attach_memory(second, m.memory)
     clear(second, 0)
-    configure(second, machine.configs[1])
+    configure(m, second, m.configs[1])
     reset_scheduler()
-    for d in every_device(&machine) do d.boot()
-    rebase_workers()
+    for d in every_device(m) do d.boot(m)
+    rebase_workers(m)
 
-// Start core 1 at `entry` with `sp` and `vtor`, as the boot ROM does at the end of the launch
+// Start `m`'s core 1 at `entry` with `sp` and `vtor`, as the boot ROM does at the end of the launch
 // sequence. An entry without its Thumb bit stops core 1 at `Stop.Fault`, there.
-launch(vtor: u32, sp: u32, entry: u32)
-    val second = core1()
-    memory.attach_memory(second, machine.memory)
+launch(m: *Machine, vtor: u32, sp: u32, entry: u32)
+    val second = &m.cores[1]
+    memory.attach_memory(second, m.memory)
     clear(second, entry & ~1)
-    configure(second, machine.configs[1])
+    configure(m, second, m.configs[1])
     second.vtor = vtor
     second.r[13] = sp
-    if cpu_models_differ()
-        memory.pair(core0(),second)
+    if cpu_models_differ(m)
+        memory.pair(&m.cores[0],second)
         scheduler.paired = true
     scheduler.launched = true
     scheduler.starting = true
@@ -470,14 +466,15 @@ launch(vtor: u32, sp: u32, entry: u32)
         second.pc = entry
         halt(second, Stop.Fault, entry)
 
-// Make core `c`, just reset, the core `cfg` describes, on this machine's bus.
-private configure(c: *Cpu, cfg: CoreConfig)
+// Make core `c`, just reset, the core `cfg` describes, on `m`'s bus.
+private configure(m: *Machine, c: *Cpu, cfg: CoreConfig)
     c.kind = cfg.kind
     configure_instruction_timing(c, cfg.timed)
     c.priority_bits = cfg.priority_bits
     c.dsp = cfg.dsp
     c.fpu = cfg.fpu
-    c.bus = &machine
+    c.divisor = cfg.divisor
+    c.bus = m
 
 /** A device's driver: the core that last wrote its registers, as its number plus one, 0 before
  * either has. Only the driver brings the device's events in from its per-slice signal and ends its
@@ -494,9 +491,9 @@ private[virt] drives_device(driver: *u32, c: *Cpu) -> bool
     d == 0 || d == c.core + 1
 
 // A byte of input the board waited for, kept to answer STATUS and DATA; nothing where the input ended.
-private[virt] hold_input(got: Option[u8])
+private[virt] hold_input(c: *Console, got: Option[u8])
     got match
-        Some(b) -> machine.console.live.with(l -> l.held = int(b))
+        Some(b) -> c.live.with(l -> l.held = int(b))
         None -> ()
 
 // What `benchtop run` says when the board's core has stopped: why, and for a stop the guest did not
@@ -513,48 +510,48 @@ stop_message(cpu: *Cpu) -> string = cpu.stop match
     StackLimit -> stopped(cpu, f"a stack-limit violation (a UsageFault benchtop does not take), at 0x${cpu.stop_at}%08x")
 
 private stopped(cpu: *Cpu, why: string) -> string
-    val core = if cpu == core1() then "core 1, " else ""
+    val core = if cpu.core == 1 then "core 1, " else ""
 
     f"the guest stopped at $why (${core}pc 0x${cpu.pc}%08x, ${cpu.retired} instructions)"
 
 // Raise a core's interrupts: the console's while it is enabled and STATUS is not 0, the FIFO's while
 // the core's VLD, WOF or ROE is set, and the timer's alarms' while they are raised at its clock.
-private[virt] signal(cpu: *Cpu)
-    val r = &machine.devices.running
+private[virt] signal(m: *Machine, cpu: *Cpu)
+    val r = &m.devices.running
 
-    for i in 0..<r.count do r.devices[i].signal(cpu)
+    for i in 0..<r.count do r.devices[i].signal(m, cpu)
 
 // Each core's bus is the machine it is part of.
 impl Bus for Machine
-    read(*self, cpu: *Cpu, a: u32, width: u32, n: u64) -> u32 = board_read(cpu, a, width, n)
-    write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64) = board_write(cpu, a, width, x, n)
+    read(*self, cpu: *Cpu, a: u32, width: u32, n: u64) -> u32 = board_read(self, cpu, a, width, n)
+    write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64) = board_write(self, cpu, a, width, x, n)
 
 // The board's half of an access off the RAM, which the core makes through its bus: the device
 // whose window holds the address answers it, with the register's offset from its base. An address
 // in no window stops the core at `Unmapped`. The RAM's own accesses never come here.
-board_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
-    val bus = &machine.devices.bus
-    val i = bus_mapping(cpu,a)
-    if i < bus.attached then return bus.windows[i].read(cpu, a, a - bus.mapped[i].base, width, n)
+board_read(m: *Machine, cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    val bus = &m.devices.bus
+    val i = bus_mapping(m,cpu,a)
+    if i < bus.attached then return bus.windows[i].read(m, cpu, a, a - bus.mapped[i].base, width, n)
 
     halt(cpu, Stop.Unmapped, a)
     0
 
-board_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
-    val bus = &machine.devices.bus
-    val i = bus_mapping(cpu,a)
+board_write(m: *Machine, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    val bus = &m.devices.bus
+    val i = bus_mapping(m,cpu,a)
     if i < bus.attached
-        bus.windows[i].write(cpu, a, a - bus.mapped[i].base, width, x, n)
+        bus.windows[i].write(m, cpu, a, a - bus.mapped[i].base, width, x, n)
         return
 
     halt(cpu, Stop.Unmapped, a)
 
 // The first IRQ the bus gives a device of kind `d`, and whether there is one; -1 where it gave none.
 private[virt] mapped_irq(ds: []const Mapped, d: Device) -> (bool, int)
-    for m in ds do if m.device == d then return (true, m.irqs[0])
+    for w in ds do if w.device == d then return (true, w.irqs[0])
     (false, -1)
 
-private[virt] cpu_models_differ() -> bool
-    val (a, b) = (machine.configs[0], machine.configs[1])
+private[virt] cpu_models_differ(m: *Machine) -> bool
+    val (a, b) = (m.configs[0], m.configs[1])
 
     a.kind != b.kind || a.timed != b.timed
