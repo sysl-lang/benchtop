@@ -1,6 +1,6 @@
 # Pico 2 (Arm) examples
 
-Two unmodified Pico SDK programs that the `pico2` board runs on its Cortex-M33s, and that
+Pico SDK programs that the `pico2` board runs on its Cortex-M33s, and that
 `chip/arm_tests.sysl` runs end to end:
 
 | program | what it does | what the test asserts |
@@ -10,6 +10,10 @@ Two unmodified Pico SDK programs that the `pico2` board runs on its Cortex-M33s,
 | `hello_serial_flash`, `blink_flash` (and `hello_serial_flash.uf2`) | the same two built as flash images, the SDK's default | the same output, run in place from flash (`chip/xip_tests.sysl`) |
 | `qmi_flash.c` | reads the flash's JEDEC and unique IDs, erases a sector 1 MB in and programs a page through QMI direct mode from SRAM, then reads it back through the cached, uncached and untranslated windows, the streaming FIFO and direct mode, and pins two XIP cache lines as SRAM | each `ok` line, `PASSED`, and the flash's bytes |
 | `xip_sram.c` | the whole program in the XIP cache's 16 KB (`xip_ram`), as the SDK's `pico_xip_sram_test` | `main` and the stack at 0x13ffc000 on, five lines 100 ms apart, `PASSED` |
+| `stack_limit.c` | MSPLIM 1 KB below SP, then a 2 KB frame: the UsageFault STKOF in its own handler, which lifts the limit so the `SUB` runs again | its report: one fault, CFSR's STKOF, the faulting PC in `deep` |
+| `tt.c` | ACLE's `cmse_TT`/`TTT`/`TTA`/`TTAT` of SRAM and the PPB, before and after two SAU regions (built with `-mcmse`) | each answer's word |
+| `rcp.c` | every `hardware/rcp.h` function and macro, both forms, passing; then a corrupted canary | its lines on UART0, then core 0 stopped at `Fault` with `rcp_canary_check` named |
+| `gpioc.c` | every `hardware/gpio_coproc.h` function, each compared with its SIO equivalent | `87 checks, 0 mismatches` and the final OUT and OE |
 
 ```sh
 ./benchtop run --board pico2 examples/pico2/hello_serial.elf

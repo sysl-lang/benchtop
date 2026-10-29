@@ -22,9 +22,15 @@ function(benchtop_program target source type)
 endfunction()
 
 # RAM images: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
-foreach(prog hello_serial blink)
+foreach(prog hello_serial blink rcp gpioc stack_limit tt)
     benchtop_program(${prog} ${prog}.c no_flash)
 endforeach()
+
+# rcp.c uses the redundancy coprocessor's header directly.
+target_link_libraries(rcp hardware_rcp)
+target_link_libraries(stack_limit hardware_exception)
+# ACLE's TTA and TTAT intrinsics are only declared for code built for the Security Extension.
+target_compile_options(tt PRIVATE -mcmse)
 
 # Flash images, the SDK's default: the ELF's segments are written into the flash behind XIP_BASE.
 foreach(prog hello_serial blink)

@@ -1,0 +1,218 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.v6m.{CoprocessorKind, CoprocessorOp}
+
+// The redundancy coprocessor (rcp.sysl), one instruction at a time against `hardware/rcp.h`'s
+// description of each: what it answers or allows, and the fault, by name, where its check fails.
+// The executors and the SDK's own programs are arm_tests.sysl's.
+
+private const MASK: u32 = 0x12345678
+
+// An RCP MCR or MRC with all its fields; `second` is the `…2` form, without the random delay.
+private insn(kind: CoprocessorKind, opc1: u32, crn: u32, crm: u32, opc2: u32, low: u32, second: bool = false) -> CoprocessorOp =
+    CoprocessorOp(kind, 7, opc1, opc2, crn, crm, low, 0, second)
+
+// An RCP MCRR.
+private pair(opc1: u32, crm: u32, low: u32, high: u32, second: bool = false) -> CoprocessorOp =
+    CoprocessorOp(CoprocessorKind.WritePair, 7, opc1, 0, 0, crm, low, high, second)
+
+private status() -> CoprocessorOp = insn(CoprocessorKind.Read, 1, 0, 0, 0, 0)
+private canary_get(tag: u32, second: bool = false) -> CoprocessorOp = insn(CoprocessorKind.Read, 0, tag >> 4, tag & 15, 1, 0, second)
+private canary_check(tag: u32, x: u32, second: bool = false) -> CoprocessorOp = insn(CoprocessorKind.Write, 0, tag >> 4, tag & 15, 1, x, second)
+private count_set(n: u32) -> CoprocessorOp = insn(CoprocessorKind.Write, 4, n >> 4, n & 15, 0, 0)
+private count_check(n: u32) -> CoprocessorOp = insn(CoprocessorKind.Write, 5, n >> 4, n & 15, 1, 0)
+private random(second: bool = true) -> CoprocessorOp = insn(CoprocessorKind.Read, 2, 0, 0, 0, 0, second)
+
+// A chip with both salts set: core 0's 0x0123456789abcdef, core 1's its complement.
+private salted() -> Rp2350
+    var c = rp2350()
+    c.coprocessor(0, pair(8, 0, 0x89abcdef, 0x01234567)).unwrap().unwrap()
+    c.coprocessor(0, pair(8, 1, 0x76543210, 0xfedcba98)).unwrap().unwrap()
+    c
+
+// Core `core` runs `op`: "" where it completes, or the RCP's fault, which must be one.
+private outcome(c: *Rp2350, core: u32, op: CoprocessorOp) -> string = c.coprocessor(core, op).unwrap() match
+    Ok(_) -> ""
+    Err(e) ->
+        assert(e.fault, s"a refusal where a fault was due: ${e.why}")
+        e.why
+
+private value(c: *Rp2350, core: u32, op: CoprocessorOp) -> u64 = c.coprocessor(core, op).unwrap().unwrap()
+
+@test("before a core's salt is set, every RCP instruction but the salts and the status faults, naming itself; each salt is written once, by either core")
+rcp_salts()
+    var c = rp2350()
+    assert(value(&c, 0, status()) == u64(RCP_FALSE) && value(&c, 1, status()) == u64(RCP_FALSE))
+    assert(value(&c, 0, insn(CoprocessorKind.Read, 1, 0, 0, 0, 0, true)) == u64(RCP_FALSE), "the nodelay status")
+    val early = outcome(&c, 0, insn(CoprocessorKind.Write, 2, 0, 0, 0, RCP_TRUE))
+    assert(early == "the RCP faults: core 0 ran rcp_btrue before its salt was set", early)
+    assert(outcome(&c, 1, canary_get(1)) == "the RCP faults: core 1 ran rcp_canary_get before its salt was set")
+    assert(outcome(&c, 0, random()).contains("rcp_random_byte before its salt"))
+    assert(outcome(&c, 0, count_set(1)).contains("rcp_count_set before its salt"))
+    // Core 0 sets its own salt, and core 1's (as crt0 does), with the nodelay form.
+    assert(outcome(&c, 0, pair(8, 0, 1, 2)) == "")
+    assert(value(&c, 0, status()) == u64(RCP_TRUE) && value(&c, 1, status()) == u64(RCP_FALSE), "each core its own salt")
+    assert(outcome(&c, 1, insn(CoprocessorKind.Write, 2, 0, 0, 0, RCP_TRUE)).contains("core 1 ran rcp_btrue before"), "core 1 is still unsalted")
+    assert(outcome(&c, 0, pair(8, 1, 3, 4, true)) == "")
+    assert(value(&c, 1, status()) == u64(RCP_TRUE) && c.rcp.salt[0] == 0x0000000200000001 && c.rcp.salt[1] == 0x0000000400000003)
+    val again = outcome(&c, 1, pair(8, 0, 5, 6))
+    assert(again == "the RCP faults: core 1 ran rcp_salt_core0, and core 0's salt is already set: each salt is written once", again)
+    assert(outcome(&c, 0, pair(8, 1, 5, 6, true)).contains("rcp_salt_core1, and core 1's salt is already set"))
+    assert(c.rcp.salt[0] == 0x0000000200000001, "a refused salt changes nothing")
+
+@test("a canary is the same for the same core, salt and tag, delayed or not, and differs with each; a check passes only on it")
+rcp_canaries()
+    var c = salted()
+    val a = value(&c, 0, canary_get(0x5a))
+    assert(a == value(&c, 0, canary_get(0x5a, true)), "the nodelay form reads the same value")
+    assert(a != value(&c, 0, canary_get(0x5b)) && a != value(&c, 0, canary_get(0xa5)), "another tag, another value")
+    assert(a != value(&c, 1, canary_get(0x5a)), "another core's salt, another value")
+    var d = rp2350()
+    d.coprocessor(0, pair(8, 0, 0x89abcdef, 0x01234568)).unwrap().unwrap()
+    assert(a != value(&d, 0, canary_get(0x5a)), "one bit of salt changes it")
+    // Every tag: distinct values.
+    var seen = 0u32
+    for tag in 0..<256
+        val x = u32(value(&c, 0, canary_get(tag)))
+        assert(outcome(&c, 0, canary_check(tag, x)) == "" && outcome(&c, 0, canary_check(tag, x, true)) == "")
+        if x == u32(a) then seen += 1
+    assert(seen == 1, "0x5a's canary is no other tag's")
+    val wrong = outcome(&c, 0, canary_check(0x5a, u32(a) ^ 1))
+    assert(wrong.starts_with("the RCP faults: core 0's rcp_canary_check(90) was given 0x") && wrong.ends_with(", not the canary for tag 90"), wrong)
+    assert(outcome(&c, 1, canary_check(0x5a, u32(a))).contains("core 1's rcp_canary_check(90)"), "core 0's canary is not core 1's")
+
+@test("each boolean and integer check passes on what it asserts and faults, naming itself and its operands, on what it does not")
+rcp_checks()
+    val t = RCP_TRUE
+    val f = RCP_FALSE
+    val w = CoprocessorKind.Write
+    // [opc1, opc2] of each single-operand MCR, then a passing and a failing operand.
+    for second in [false, true]
+        var c = salted()
+        for case in [[1u32, 0, t, 0x1234], [1, 0, f, 0], [2, 0, t, f], [3, 1, f, t]]
+            assert(outcome(&c, 0, insn(w, case[0], 0, 0, case[1], case[2], second)) == "", s"MCR #${case[0]} passes ${case[2]}")
+            assert(outcome(&c, 0, insn(w, case[0], 0, 0, case[1], case[3], second)) != "", s"MCR #${case[0]} fails ${case[3]}")
+        // [opc1, CRm] of each MCRR, a passing pair, then a failing one.
+        for case in [[0u32, 8, t, f, t, 0], [0, 8, f, f, 0xa500a501, f], [1, 0, t, t, t, f], [2, 0, f, t, f, f], [2, 0, t, f, t, 0x1234],
+                [3, 8, f ^ MASK, MASK, 0, 0], [4, 0, t ^ MASK, MASK, f ^ MASK, MASK], [5, 8, f ^ MASK, MASK, t ^ MASK, MASK],
+                [6, 8, 1234, 1234 ^ RCP_INTXOR, 1234, 1234], [7, 0, MASK, MASK, MASK, MASK + 1]]
+            assert(outcome(&c, 0, pair(case[0], case[1], case[2], case[3], second)) == "", s"MCRR #${case[0]} passes")
+            assert(outcome(&c, 0, pair(case[0], case[1], case[4], case[5], second)) != "", s"MCRR #${case[0]} fails")
+    // The messages: one operand, and two.
+    var c = salted()
+    val one = outcome(&c, 0, insn(w, 2, 0, 0, 0, f))
+    assert(one == "the RCP faults: core 0's rcp_btrue(0x00c300c3) is not true", one)
+    assert(outcome(&c, 0, insn(w, 3, 0, 0, 1, t)) == "the RCP faults: core 0's rcp_bfalse(0xa500a500) is not false")
+    assert(outcome(&c, 0, insn(w, 1, 0, 0, 0, 7)) == "the RCP faults: core 0's rcp_bvalid(0x00000007) is not a valid boolean")
+    val two = outcome(&c, 1, pair(1, 0, t, f))
+    assert(two == "the RCP faults: core 1's rcp_b2and(0xa500a500, 0x00c300c3) are not both true", two)
+    for case in [(0u32, 8u32, "rcp_b2valid(0xa500a500, 0x00000001) are not both valid booleans"), (2, 0, "rcp_b2or(0xa500a500, 0x00000001) are not valid booleans with one true"),
+            (3, 8, "rcp_bxorvalid(0xa500a500, 0x00000001) XOR to no valid boolean"), (4, 0, "rcp_bxortrue(0xa500a500, 0x00000001) do not XOR to true"),
+            (5, 8, "rcp_bxorfalse(0xa500a500, 0x00000001) do not XOR to false"), (6, 8, "rcp_ivalid(0xa500a500, 0x00000001) do not XOR to 0x96009600"),
+            (7, 0, "rcp_iequal(0xa500a500, 0x00000001) are not equal")]
+        val got = outcome(&c, 0, pair(case.0, case.1, t, 1))
+        assert(got == s"the RCP faults: core 0's ${case.2}", got)
+
+@test("the sequence counter: set, then checked and stepped, eight bits wide and one per core; a wrong count faults with the counter's value")
+rcp_count()
+    var c = salted()
+    assert(outcome(&c, 0, count_set(0x42)) == "" && outcome(&c, 0, count_check(0x42)) == "" && outcome(&c, 0, count_check(0x43)) == "")
+    val wrong = outcome(&c, 0, count_check(0x43))
+    assert(wrong == "the RCP faults: core 0's rcp_count_check(67) found the sequence counter at 68", wrong)
+    assert(outcome(&c, 1, count_check(0)) == "", "core 1's counter is its own, at 0")
+    assert(outcome(&c, 0, count_set(0xff)) == "" && outcome(&c, 0, count_check(0xff)) == "" && outcome(&c, 0, count_check(0)) == "", "it wraps")
+    assert(outcome(&c, 0, insn(CoprocessorKind.Write, 5, 0, 1, 1, 0, true)) == "", "the nodelay check")
+    assert(outcome(&c, 0, insn(CoprocessorKind.Write, 4, 0, 9, 0, 0, true)) == "" && c.rcp.count[0] == 9, "the nodelay set")
+
+@test("the random byte comes from the salt's top 24 bits; each delayed instruction steps the same PRNG once, a nodelay one not at all")
+rcp_random()
+    var a = salted()
+    var b = salted()
+    val first = value(&a, 0, random())
+    assert(first < 256 && first == value(&b, 0, random()), "the same salt, the same sequence")
+    assert(value(&a, 0, random(false)) == value(&b, 0, random()), "MRC and MRC2 each step once")
+    // A nodelay check leaves the sequence alone; a delayed one draws a step from it.
+    outcome(&a, 0, insn(CoprocessorKind.Write, 2, 0, 0, 0, RCP_TRUE, true))
+    assert(value(&a, 0, random()) == value(&b, 0, random()))
+    outcome(&a, 0, insn(CoprocessorKind.Write, 2, 0, 0, 0, RCP_TRUE))
+    value(&b, 0, random())
+    assert(value(&a, 0, random()) == value(&b, 0, random()), "the delay took one step")
+    // Each core's PRNG is its own salt's.
+    var c = salted()
+    var d = salted()
+    value(&c, 1, random())
+    assert(value(&c, 0, random()) == value(&d, 0, random()), "core 1's reads leave core 0's sequence alone")
+    // Only the top 24 bits seed it.
+    var low = rp2350()
+    low.coprocessor(0, pair(8, 0, 0x76543210, 0x01234567)).unwrap().unwrap()
+    var high = rp2350()
+    high.coprocessor(0, pair(8, 0, 0x89abcdef, 0x02234567)).unwrap().unwrap()
+    // (salted() writes core 1's salt from core 0 with the delay, which steps core 0's PRNG; these do not.)
+    var e = rp2350()
+    e.coprocessor(0, pair(8, 0, 0x89abcdef, 0x01234567)).unwrap().unwrap()
+    var f = rp2350()
+    f.coprocessor(0, pair(8, 0, 0x89abcdef, 0x01234567)).unwrap().unwrap()
+    assert(same_sequence(&e, &low), "bits 0–39 do not")
+    assert(!same_sequence(&f, &high), "the top bits do")
+
+// Eight random bytes from core 0 of each: the same ones.
+private same_sequence(a: *Rp2350, b: *Rp2350) -> bool
+    var same = true
+    for _ in 0..<8 do if value(a, 0, random()) != value(b, 0, random()) then same = false
+    same
+
+@test("rcp_panic faults; an encoding outside the RCP's instruction set is refused by name, not faulted")
+rcp_panic_and_outside()
+    var c = salted()
+    assert(outcome(&c, 0, insn(CoprocessorKind.Data, 0, 0, 0, 1, 0)) == "the RCP faults: core 0 ran rcp_panic")
+    // A boolean check with the CRm or opc2 of another, an MRRC, a salt for a third core, a CDP with opc2 0.
+    for op in [pair(1, 8, RCP_TRUE, RCP_TRUE), pair(0, 0, RCP_TRUE, RCP_TRUE), insn(CoprocessorKind.Write, 3, 0, 0, 0, RCP_FALSE),
+            insn(CoprocessorKind.Write, 2, 0, 1, 0, RCP_TRUE), CoprocessorOp(CoprocessorKind.ReadPair, 7, 0, 0, 0, 0, 0, 0, false),
+            pair(8, 2, 0, 0), pair(9, 0, 0, 0), insn(CoprocessorKind.Data, 0, 0, 0, 0, 0), insn(CoprocessorKind.Read, 3, 0, 0, 0, 0)]
+        val e = c.coprocessor(0, op).unwrap().unwrap_err()
+        assert(!e.fault && e.why.ends_with("is not a redundancy (RCP) coprocessor instruction benchtop runs"), e.why)
+    val named = c.coprocessor(0, pair(1, 8, 0, 0)).unwrap().unwrap_err().why
+    assert(named == "MCRR p7, #1, c0, c8, #0 is not a redundancy (RCP) coprocessor instruction benchtop runs", named)
+    // A refused encoding before the salt is still a refusal, not the salt's fault.
+    var fresh = rp2350()
+    assert(!fresh.coprocessor(0, pair(9, 0, 0, 0)).unwrap().unwrap_err().fault)
+    // rcp_panic on core 1, and the nodelay form of a CDP is the same instruction.
+    assert(outcome(&c, 1, insn(CoprocessorKind.Data, 0, 0, 0, 1, 0, true)) == "the RCP faults: core 1 ran rcp_panic")
+
+@test("the edges: a salt of 0 is a salt, a chip reset forgets every salt, counter and PRNG, and the counter starts at 0 on both cores")
+rcp_edges()
+    var c = rp2350()
+    assert(outcome(&c, 0, pair(8, 0, 0, 0)) == "" && value(&c, 0, status()) == u64(RCP_TRUE), "a zero salt")
+    // A zero salt's PRNG still moves.
+    val first = value(&c, 0, random())
+    var moved = false
+    for _ in 0..<8 do if value(&c, 0, random()) != first then moved = true
+    assert(moved, "the PRNG is not stuck at a zero seed")
+    var d = salted()
+    assert(outcome(&d, 0, count_check(0)) == "" && outcome(&d, 1, count_check(0)) == "", "both counters at 0 after the salt")
+    outcome(&d, 0, count_set(0x80))
+    d.reset()
+    assert(value(&d, 0, status()) == u64(RCP_FALSE) && value(&d, 1, status()) == u64(RCP_FALSE), "reset forgets the salts")
+    assert(d.rcp.count[0] == 0 && d.rcp.random[0] == 0 && d.rcp.salt[1] == 0)
+    assert(outcome(&d, 0, pair(8, 0, 1, 2)) == "", "a salt may be written again after a reset")
+    // The canary's tag edges, 0 and 255, on both cores.
+    var e = salted()
+    for core in [0u32, 1]
+        for tag in [0u32, 255]
+            val x = u32(value(&e, core, canary_get(tag)))
+            assert(outcome(&e, core, canary_check(tag, x)) == "" && outcome(&e, core, canary_check(tag, ~x)) != "")
+    assert(value(&e, 0, canary_get(0)) != value(&e, 0, canary_get(255)))
+
+@test("a delayed salt write by a salted core steps that core's PRNG, not the written core's; a nodelay one steps nothing")
+rcp_salt_delay()
+    var a = rp2350()
+    var b = rp2350()
+    a.coprocessor(0, pair(8, 0, 0x89abcdef, 0x01234567)).unwrap().unwrap()
+    b.coprocessor(0, pair(8, 0, 0x89abcdef, 0x01234567)).unwrap().unwrap()
+    a.coprocessor(0, pair(8, 1, 1, 2)).unwrap().unwrap()
+    b.coprocessor(0, pair(8, 1, 1, 2, true)).unwrap().unwrap()
+    val stepped = b.rcp.random[0]
+    value(&b, 0, random())
+    assert(a.rcp.random[0] == b.rcp.random[0] && stepped != a.rcp.random[0], "the delay on core 0 took a step")
+    assert(a.rcp.random[1] == b.rcp.random[1] && a.rcp.random[1] == 0, "core 1's PRNG starts at its salt's top 24 bits")

@@ -1,0 +1,354 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// The Security Extension on a Secure-only M33 (t2secure.sysl), against the ARMv8-M ARM (DDI0553: "TT,
+// TTT, TTA, TTAT", "SecurityCheck", "ExceptionReturn", the SAU and SCB register descriptions) and the
+// register layout `regs/m33.h` gives (M33_SAU_*, M33_SFSR_*, M33_SHCSR_*): the SAU and SFSR/SFAR as
+// registers, CFSR and HFSR, SHCSR's SecureFault bits, TT's every form over the SAU, the ways to
+// Non-secure state each stopped by name, SG, and the EXC_RETURN bits. Every guest case runs under
+// both executors (`run_both8`), which must agree.
+
+// The core with the Security Extension, as the Pico 2 board makes its M33s.
+secure(cpu: *Cpu)
+    cpu.security = true
+
+// An M33 reset with the extension, for the register-level cases.
+secure_core() -> Cpu
+    var c: Cpu
+
+    c.kind = Kind.V8mMain
+    reset(&c, test_memory, [], 0)
+    c.security = true
+    c
+
+// An access to `a` stopped the core at `Unmapped` there; the stop is cleared for the next.
+refused_at(c: *Cpu, a: u32) -> bool
+    val ok = c.stop == Stop.Unmapped && c.stop_at == a
+    c.stop = Stop.Running
+    ok
+
+// ---------------------------------------------------------------------------------------------------
+// The registers.
+
+@test("the SAU's registers: reset values, SAU_TYPE read-only at eight regions, the fields each keeps, a bank per region, and SAU_RNR past the last refused")
+sec_sau_registers()
+    var c = secure_core()
+
+    assert(load32(&c, SAU_CTRL) == 0 && load32(&c, SAU_TYPE) == 8 && load32(&c, SAU_RNR) == 0, "reset")
+    assert(load32(&c, SAU_RBAR) == 0 && load32(&c, SAU_RLAR) == 0 && load32(&c, SCB_SFSR) == 0 && load32(&c, SCB_SFAR) == 0, "reset")
+    store32(&c, SAU_CTRL, 0xFFFFFFFF)
+    assert(load32(&c, SAU_CTRL) == 3, "ENABLE and ALLNS")
+    store32(&c, SAU_TYPE, 0)
+    assert(load32(&c, SAU_TYPE) == 8 && c.stop == Stop.Running, "SAU_TYPE ignores a write")
+    store32(&c, SAU_RNR, 7)
+    store32(&c, SAU_RBAR, 0xFFFFFFFF)
+    store32(&c, SAU_RLAR, 0xFFFFFFFF)
+    assert(load32(&c, SAU_RBAR) == 0xFFFFFFE0 && load32(&c, SAU_RLAR) == 0xFFFFFFE3, "BADDR; LADDR, NSC and ENABLE")
+    store32(&c, SAU_RNR, 0)
+    assert(load32(&c, SAU_RBAR) == 0 && load32(&c, SAU_RLAR) == 0, "region 0 its own")
+    store32(&c, SAU_RNR, 0x1FF)
+    assert(load32(&c, SAU_RNR) == 0xFF, "SAU_RNR keeps eight bits")
+    store32(&c, SAU_RNR, 8)
+    load32(&c, SAU_RBAR)
+    assert(refused_at(&c, SAU_RBAR), "no region 8 to read")
+    store32(&c, SAU_RLAR, 1)
+    assert(refused_at(&c, SAU_RLAR), "nor to write")
+    // A reset clears them all.
+    reset(&c, test_memory, [], 0)
+    c.security = true
+    assert(load32(&c, SAU_CTRL) == 0 && c.sau_rbar[7] == 0 && c.sau_rlar[7] == 0, "cleared")
+
+@test("SFSR is write-one-to-clear over its eight bits, SFAR is stored; a core without the extension has neither, nor the SAU")
+sec_sfsr_sfar()
+    var c = secure_core()
+
+    c.sfsr = 0xFF
+    store32(&c, SCB_SFSR, 0x05)
+    assert(load32(&c, SCB_SFSR) == 0xFA, "INVEP and INVER cleared")
+    store32(&c, SCB_SFSR, 0xFFFFFF00)
+    assert(load32(&c, SCB_SFSR) == 0xFA, "bits above 7 clear nothing")
+    store32(&c, SCB_SFAR, 0x12345678)
+    assert(load32(&c, SCB_SFAR) == 0x12345678)
+
+    var p: Cpu
+    p.kind = Kind.V8mMain
+    reset(&p, test_memory, [], 0)
+    for a in [SAU_CTRL, SAU_TYPE, SAU_RNR, SAU_RBAR, SAU_RLAR, SCB_SFSR, SCB_SFAR]
+        load32(&p, a)
+        assert(refused_at(&p, a), f"0x${a}%x without the extension")
+        store32(&p, a, 0)
+        assert(refused_at(&p, a), f"0x${a}%x written without the extension")
+
+@test("CFSR and HFSR hold what was recorded, are write-one-to-clear, and CFSR answers a byte or a halfword without clearing the rest")
+sec_cfsr_hfsr()
+    var c = secure_core()
+
+    assert(load32(&c, SCB_CFSR) == 0 && load32(&c, SCB_HFSR) == 0, "reset")
+    c.cfsr = CFSR_STKOF | CFSR_INVPC
+    c.hfsr = HFSR_FORCED
+    assert(load32(&c, SCB_CFSR) == 0x00140000 && load16(&c, SCB_CFSR + 2) == 0x14 && load8(&c, SCB_CFSR + 2) == 0x14, "UFSR")
+    assert(load8(&c, SCB_CFSR) == 0 && load8(&c, SCB_CFSR + 3) == 0, "MMFSR and the top byte")
+    store8(&c, SCB_CFSR + 2, 0x10)
+    assert(c.cfsr == CFSR_INVPC, "a byte clears only its own ones")
+    store16(&c, SCB_CFSR + 2, 0)
+    assert(c.cfsr == CFSR_INVPC, "zeros clear nothing")
+    store32(&c, SCB_CFSR, 0xFFFFFFFF)
+    assert(c.cfsr == 0, "all cleared")
+    store32(&c, SCB_HFSR, 0)
+    assert(c.hfsr == HFSR_FORCED, "HFSR: zero clears nothing")
+    store32(&c, SCB_HFSR, HFSR_FORCED)
+    assert(c.hfsr == 0 && c.stop == Stop.Running, "FORCED cleared")
+    load16(&c, SCB_HFSR)
+    assert(refused_at(&c, SCB_HFSR), "HFSR is a word register")
+
+@test("SHCSR: SECUREFAULTENA kept only with the extension, the pending bits set and cleared, the active bits read-only; SHPR1's top byte is SecureFault's")
+sec_shcsr_shpr1()
+    var c = secure_core()
+
+    store32(&c, SCB_SHCSR, 0xFFFFF03F)
+    // Every enable, and UsageFault, MemManage, BusFault, SVCall and SecureFault pending; nothing active.
+    assert(load32(&c, SCB_SHCSR) == 0x001FF000, f"0x${load32(&c, SCB_SHCSR)}%x")
+    assert(c.pending[0] == (1u64 << 4) | (1u64 << 5) | (1u64 << 6) | (1u64 << SECURE_FAULT) | (1u64 << SVCALL), "pending")
+    assert(c.enabled[0] == 0xF0, "the four faults eligible")
+    store32(&c, SCB_SHCSR, 0)
+    assert(load32(&c, SCB_SHCSR) == 0 && c.pending[0] == 0 && c.enabled[0] == 0, "cleared")
+    store32(&c, SCB_SHPR1, 0xFFFFFFFF)
+    assert(load32(&c, SCB_SHPR1) == 0xF0F0F0F0 && c.prio[SECURE_FAULT] == 0xF0, "four bits each, SecureFault's too")
+    store8(&c, SCB_SHPR1 + 3, 0x50)
+    assert(load8(&c, SCB_SHPR1 + 3) == 0x50, "a byte")
+
+    var p: Cpu
+    p.kind = Kind.V8mMain
+    reset(&p, test_memory, [], 0)
+    store32(&p, SCB_SHCSR, 0x001FF000)
+    assert(load32(&p, SCB_SHCSR) == 0x0007F000 && (p.pending[0] >> SECURE_FAULT) & 1 == 0, "no SecureFault without the extension")
+    store32(&p, SCB_SHPR1, 0xFFFFFFFF)
+    assert(load32(&p, SCB_SHPR1) == 0x00F0F0F0, "nor its priority")
+
+// SecureFault enabled and pended through SHCSR, and a BKPT at FAULT_AT.
+secure_fault_pended(cpu: *Cpu)
+    secure(cpu)
+    store16(cpu, FAULT_AT, BKPT)
+    store32(cpu, SCB_SHCSR, SHCSR_SECUREFAULTENA | (1 << 20))
+
+secure_fault_disabled(cpu: *Cpu)
+    secure(cpu)
+    store32(cpu, SCB_SHCSR, 1 << 20)
+
+@test("SecureFault pended through SHCSR is taken when enabled, SECUREFAULTACT reading set, and stays pending while disabled")
+sec_secure_fault()
+    var c = run_both8([BKPT], [], 0, [[SECURE_FAULT, FAULT_AT]], &secure_fault_pended)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == SECURE_FAULT, "taken")
+    assert(load32(&c, SCB_SHCSR) == SHCSR_SECUREFAULTENA | (1 << 4), "SECUREFAULTENA and SECUREFAULTACT")
+
+    c = run_both8([BKPT], [], 0, [[SECURE_FAULT, FAULT_AT]], &secure_fault_disabled)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 0 && c.ipsr == 0, "not taken")
+    assert(load32(&c, SCB_SHCSR) == 1 << 20, "SECUREFAULTPENDED")
+
+// ---------------------------------------------------------------------------------------------------
+// TT.
+
+// tt r0, r1; log; ttt; log; tta; log; ttat; log — each of `addr`, from a core `setup` makes.
+tt_all(addr: u32, setup: Setup) -> Cpu
+    val code: []const u16 = [0xE841, 0xF000, LOG_R0, 0xE841, 0xF040, LOG_R0, 0xE841, 0xF080, LOG_R0, 0xE841, 0xF0C0, LOG_R0]
+
+    run_both8(code, [0, addr, 0, 0, LOG], 0, [], setup)
+
+// Each of TT, TTT, TTA and TTAT answered `want`.
+answers(addr: u32, setup: Setup, want: u32) -> bool
+    var c = tt_all(addr, setup)
+
+    logged(&c, [want, want, want, want])
+
+const TT_S: u32 = 1 << 22
+const TT_RW: u32 = (1 << 18) | (1 << 19)
+const TT_NS_RW: u32 = TT_RW | (1 << 20) | (1 << 21)
+const TT_SRVALID: u32 = 1 << 17
+
+all_ns(cpu: *Cpu)
+    secure(cpu)
+    store32(cpu, SAU_CTRL, 2)
+
+// SAU region `k`, `base` to `limit` (RLAR's NSC and ENABLE in `flags`).
+region(cpu: *Cpu, k: u32, base: u32, limit: u32, flags: u32)
+    store32(cpu, SAU_RNR, k)
+    store32(cpu, SAU_RBAR, base)
+    store32(cpu, SAU_RLAR, limit | flags)
+
+// Region 3, 0x1000–0x1FFF, Non-secure, the SAU enabled with ALLNS set (which then counts for nothing).
+one_region(cpu: *Cpu)
+    secure(cpu)
+    region(cpu, 3, 0x1003, 0x1FE0, 1)
+    store32(cpu, SAU_CTRL, 3)
+
+nsc_region(cpu: *Cpu)
+    secure(cpu)
+    region(cpu, 7, 0x1000, 0x1FE0, 3)
+    store32(cpu, SAU_CTRL, 1)
+
+overlapping(cpu: *Cpu)
+    one_region(cpu)
+    region(cpu, 0, 0x1800, 0x2FE0, 1)
+
+disabled_region(cpu: *Cpu)
+    secure(cpu)
+    region(cpu, 3, 0x1000, 0x1FE0, 0)
+    store32(cpu, SAU_CTRL, 1)
+
+@test("TT at reset: every address Secure, read and write at both privileges, but the private peripheral bus unprivileged")
+sec_tt_reset()
+    assert(answers(0x20000000, &secure, TT_S | TT_RW), "SRAM")
+    assert(answers(0xFFFFFFFC, &secure, TT_S | TT_RW), "the top")
+    var c = tt_all(0xE000ED00, &secure)
+    assert(logged(&c, [TT_S | TT_RW, TT_S, TT_S | TT_RW, TT_S]), "the PPB: TTT and TTAT neither read nor write")
+
+@test("TT with ALLNS and the SAU disabled: every address Non-secure, NSR and NSRW set, but the exempt private peripheral bus")
+sec_tt_allns()
+    assert(answers(0x20000000, &all_ns, TT_NS_RW), "SRAM")
+    assert(answers(0, &all_ns, TT_NS_RW), "address 0")
+    var c = tt_all(0xE000ED00, &all_ns)
+    assert(logged(&c, [TT_S | TT_RW, TT_S, TT_S | TT_RW, TT_S]), "the PPB stays Secure")
+
+@test("TT with the SAU enabled: an enabled region's ends inclusive, its number and SRVALID; NSC is Secure; overlaps and disabled regions name none; ALLNS counts for nothing")
+sec_tt_regions()
+    val in3 = TT_NS_RW | TT_SRVALID | (3 << 8)
+
+    assert(answers(0x1000, &one_region, in3), "the base, its low bits dropped")
+    assert(answers(0x1FFF, &one_region, in3), "the last byte")
+    assert(answers(0x0FFF, &one_region, TT_S | TT_RW), "below")
+    assert(answers(0x2000, &one_region, TT_S | TT_RW), "above, not Non-secure for ALLNS")
+    assert(answers(0x1800, &nsc_region, TT_S | TT_RW | TT_SRVALID | (7 << 8)), "Non-secure callable is Secure, region 7")
+    assert(answers(0x1900, &overlapping, TT_S | TT_RW), "two regions: Secure, none valid")
+    assert(answers(0x2800, &overlapping, TT_NS_RW | TT_SRVALID), "region 0 alone")
+    assert(answers(0x1800, &disabled_region, TT_S | TT_RW), "a disabled region")
+
+@test("TT from unprivileged thread mode answers no permissions; TTA asks the Non-secure domain, privileged, and TTAT its unprivileged view")
+sec_tt_unprivileged()
+    // msr control, r6 (nPRIV); then the four forms.
+    val code: []const u16 = [0xF386, 0x8814, 0xE841, 0xF000, LOG_R0, 0xE841, 0xF040, LOG_R0, 0xE841, 0xF080, LOG_R0, 0xE841, 0xF0C0, LOG_R0]
+    var c = run_both8(code, [0, 0x20000000, 0, 0, LOG, 0, 1], 0, [], &secure)
+    assert(logged(&c, [TT_S, TT_S, TT_S | TT_RW, TT_S | TT_RW]), "SRAM")
+    c = run_both8(code, [0, 0xE000E010, 0, 0, LOG, 0, 1], 0, [], &secure)
+    assert(logged(&c, [TT_S, TT_S, TT_S | TT_RW, TT_S]), "the PPB")
+
+@test("TT's register operands: Rd SP or PC and Rn PC are undefined; TT reads SP as Rn; without the extension TT is undefined")
+sec_tt_operands()
+    var c = run_both8([0xE841, 0xFD00], [], 0, [], &secure)
+    assert(c.stop == Stop.Undefined && c.stop_at == 0, "Rd SP")
+    c = run_both8([0xE841, 0xFF00], [], 0, [], &secure)
+    assert(c.stop == Stop.Undefined, "Rd PC")
+    c = run_both8([0xE84F, 0xF000], [], 0, [], &secure)
+    assert(c.stop == Stop.Undefined, "Rn PC")
+    // tt r0, sp; log
+    c = run_both8([0xE84D, 0xF000, LOG_R0], [0, 0, 0, 0, LOG], 0, [], &secure)
+    assert(logged(&c, [TT_S | TT_RW]), "Rn SP")
+    assert(undefined8([0xE841, 0xF0C0]), "TTAT without the extension")
+
+// ---------------------------------------------------------------------------------------------------
+// The ways to Non-secure state, and SG.
+
+// The instruction at `at` stopped the core at `NonSecure` there, for `t`.
+stopped_ns(c: *Cpu, t: Transition, at: u32) -> bool
+    c.stop == Stop.NonSecure && c.stop_at == at && c.pc == at && c.transition == t
+
+@test("BXNS and BLXNS to an address with bit 0 clear stop at NonSecure by name; with bit 0 set they are BX and BLX")
+sec_bxns()
+    // bxns r1; bkpt; 4: bkpt
+    var c = run_both8([0x470C, BKPT, BKPT], [0, 8], 0, [], &secure)
+    assert(stopped_ns(&c, Transition.Bxns, 0) && c.r[14] == 0 && c.retired == 0, "BXNS to Non-secure")
+    c = run_both8([0x478C, BKPT, BKPT], [0, 8], 0, [], &secure)
+    assert(stopped_ns(&c, Transition.Blxns, 0) && c.r[14] == 0 && c.retired == 0, "BLXNS to Non-secure: LR untouched")
+    c = run_both8([0x470C, BKPT, BKPT], [0, 5], 0, [], &secure)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 4 && c.retired == 1 && c.r[14] == 0, "BXNS to Secure")
+    c = run_both8([0x478C, BKPT, BKPT], [0, 5], 0, [], &secure)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 4 && c.r[14] == 3, "BLXNS to Secure links")
+    // bxns pc, and bits 2–0 not 0b100
+    c = run_both8([0x477C], [], 0, [], &secure)
+    assert(c.stop == Stop.Undefined, "BXNS PC")
+    c = run_both8([0x470D], [], 0, [], &secure)
+    assert(c.stop == Stop.Undefined, "bits 2-0 0b101")
+    assert(undefined8([0x478C]), "BLXNS without the extension")
+
+@test("BXNS in an IT block: skipped where the condition fails, stopped by name where it holds")
+sec_bxns_in_block()
+    // cmp r0, r0; it ne / it eq; bxns r1; bkpt
+    var c = run_both8([0x4280, 0xBF18, 0x470C, BKPT], [0, 8], 0, [], &secure)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 6, "skipped")
+    c = run_both8([0x4280, 0xBF08, 0x470C, BKPT], [0, 8], 0, [], &secure)
+    assert(stopped_ns(&c, Transition.Bxns, 4), "taken")
+
+@test("SG in Secure state is a NOP; inside an IT block, and on a core without the extension, it is undefined")
+sec_sg()
+    var c = run_both8([0xE97F, 0xE97F], [], 0, [], &secure)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 4 && c.retired == 1, "a NOP")
+    c = run_both8([0x4280, 0xBF08, 0xE97F, 0xE97F], [], 0, [], &secure)
+    assert(c.stop == Stop.Undefined && c.stop_at == 4, "in a block")
+    assert(undefined8([0xE97F, 0xE97F]), "without the extension")
+
+@test("MRS and MSR of a Non-secure register stop at NonSecure by name; a SYSm that names none, or an MSR mask but 2, is undefined")
+sec_ns_registers()
+    // mrs r0, msp_ns; mrs r0, sp_ns; msr control_ns, r0; msr psplim_ns, r0
+    val refused: [4][2]u16 = [[0xF3EF, 0x8088], [0xF3EF, 0x8098], [0xF380, 0x8894], [0xF380, 0x888B]]
+    for code in refused
+        var c = run_both8(code[..], [], 0, [], &secure)
+        assert(stopped_ns(&c, Transition.NsRegister, 0) && c.retired == 0, f"0x${code[1]}%x")
+    // mrs r0, 0x99 (none); mrs r0, 0x84 (IEPSR has no _NS); msr msp_ns, r0 with mask 1
+    val undefined: [3][2]u16 = [[0xF3EF, 0x8099], [0xF3EF, 0x8084], [0xF380, 0x8488]]
+    for code in undefined
+        var c = run_both8(code[..], [], 0, [], &secure)
+        assert(c.stop == Stop.Undefined, f"0x${code[1]}%x")
+    assert(undefined8([0xF3EF, 0x8088]), "MSP_NS without the extension")
+
+@test("an access to the PPB's Non-secure alias stops at NonSecure by name, at the address, across the alias's 64 KB and not past it")
+sec_ppb_alias()
+    // ldr r0, [r1]; str r0, [r1]
+    for a in [0xE0020000u32, 0xE002ED00, 0xE002FFFC]
+        var c = run_both8([0x6808], [0, a], 0, [], &secure)
+        assert(c.stop == Stop.NonSecure && c.stop_at == a && c.transition == Transition.PpbAlias && c.pc == 0, f"load 0x${a}%x")
+        c = run_both8([0x6008], [0, a], 0, [], &secure)
+        assert(c.stop == Stop.NonSecure && c.stop_at == a, f"store 0x${a}%x")
+    for a in [0xE001FFFCu32, 0xE0030000]
+        var c = run_both8([0x6808], [0, a], 0, [], &secure)
+        assert(c.stop == Stop.Unmapped && c.stop_at == a, f"0x${a}%x is not the alias")
+    var c = run_both8([0x6808], [0, 0xE002ED00], 0, [], &nothing)
+    assert(c.stop == Stop.Unmapped, "without the extension, nothing is there")
+
+// ---------------------------------------------------------------------------------------------------
+// EXC_RETURN.
+
+// 0: svc; 2: bkpt; 4: SVCall: bx r5.
+returned(value: u32, setup: Setup) -> Cpu
+    run_both8([SVC, BKPT, 0x4728], [0, 0, 0, 0, 0, value], 0, [[SVCALL, 4], [HARD_FAULT, FAULT_AT], [USAGE_FAULT, FAULT_AT]], setup)
+
+secure_handlers(cpu: *Cpu)
+    secure(cpu)
+    store16(cpu, FAULT_AT, BKPT)
+
+// The UsageFault enabled, and SVCall below it.
+secure_usage(cpu: *Cpu)
+    secure_handlers(cpu)
+    store32(cpu, SCB_SHCSR, SHCSR_USGFAULTENA)
+    store32(cpu, SCB_SHPR2, 0x80000000)
+
+@test("an EXC_RETURN with S or DCRS clear stops at NonSecure by name on the return; one with the Secure bits returns")
+sec_exc_return_ns()
+    var c = returned(0xFFFFFFB9, &secure_handlers)
+    assert(stopped_ns(&c, Transition.ReturnNonSecure, 4) && c.ipsr == SVCALL, "S clear")
+    c = returned(0xFFFFFFD9, &secure_handlers)
+    assert(stopped_ns(&c, Transition.ReturnCallee, 4), "DCRS clear")
+    c = returned(0xFFFFFFF9, &secure_handlers)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 2 && c.ipsr == 0, "returned")
+    // Without the extension those bits are no EXC_RETURN: a jump off the RAM.
+    c = returned(0xFFFFFFB9, &nothing)
+    assert(c.stop == Stop.Unmapped && c.stop_at == 0xFFFFFFB8, "an ordinary branch")
+
+@test("an EXC_RETURN with ES clear is the UsageFault INVPC, from the handler at the return: escalated to HardFault, or taken where enabled and preempting")
+sec_exc_return_invpc()
+    var c = returned(0xFFFFFFF8, &secure_handlers)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == HARD_FAULT, "HardFault")
+    assert(c.cfsr == CFSR_INVPC && c.hfsr == HFSR_FORCED && c.r[13] == 0x1FC0 && load32(&c, 0x1FC0 + 0x18) == 4, "INVPC, FORCED, the return its address")
+    // HardFault and SVCall both active.
+    assert(load32(&c, SCB_SHCSR) & ((1 << 2) | (1 << 7)) == (1 << 2) | (1 << 7), "HARDFAULTACT and SVCALLACT")
+    c = returned(0xFFFFFFF8, &secure_usage)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == USAGE_FAULT && c.hfsr == 0 && c.cfsr == CFSR_INVPC, "the UsageFault itself")
+    assert(load32(&c, SCB_SHCSR) & (1 << 3) != 0, "USGFAULTACT")

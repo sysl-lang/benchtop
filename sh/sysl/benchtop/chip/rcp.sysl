@@ -1,0 +1,214 @@
+module sh.sysl.benchtop.chip
+
+import sh.sysl.benchtop.v6m.{CoprocessorKind, CoprocessorOp}
+import sysl.fmt.hex
+
+// CP7, the redundancy coprocessor (RCP; datasheet 3.6.3), in full: every instruction the SDK's
+// `hardware/rcp.h` emits, with its `…2` form, for each core against that core's own state.
+//
+// - **Salts**: each core's 64-bit salt is written once (`rcp_salt_core0`, `rcp_salt_core1`, either
+//   core may write either); a second write is an RCP fault. `rcp_canary_status` answers whether the
+//   issuing core's salt is set. Every other instruction issued before that is an RCP fault.
+// - **Canaries**: `rcp_canary_get(tag)` answers a 32-bit value of the core's salt and the 8-bit tag
+//   (CRn:CRm), and `rcp_canary_check` faults unless it is given that value for that tag. The datasheet
+//   does not publish the function; benchtop's is its own keyed mix (`canary`), so a value differs per
+//   salt, per tag and per core as the hardware's does, and only the values themselves differ from a
+//   chip's.
+// - **Booleans and integers**: true is 0xa500a500 and false 0x00c300c3; each check faults unless its
+//   operands are what it asserts (`check`).
+// - **The sequence counter**: one 8-bit counter per core, set by `rcp_count_set` and checked, then
+//   incremented, by `rcp_count_check`.
+// - **Random delays**: each instruction without the `2` suffix waits up to 127 cycles chosen by the
+//   core's PRNG. benchtop waits **no time**, so timing stays deterministic, but steps the PRNG as the
+//   delay would, so `rcp_random_byte` reads the sequence a chip's does under the same instructions. The
+//   PRNG starts from the salt's top 24 bits; its recurrence is not published, and benchtop's is a full-
+//   period 24-bit congruential one.
+// - **Faults**: a failed check, `rcp_panic`, or an instruction before the salt, stalls the core on the
+//   coprocessor port for good on the chip (an interrupt that abandons the stalled instruction raises
+//   NMI instead, into a core that can never complete an RCP instruction again). benchtop stops the core
+//   at `Fault` on the instruction, with the failed check named, rather than modelling the stall.
+//
+// An encoding outside the RCP's instruction set is refused by name: the datasheet does not say what
+// the RCP does with one.
+
+/** The RCP's state for each core: its salt and whether it is set, its sequence counter, and its
+ * 24-bit PRNG.
+ */
+struct Rcp
+    salt: [2]u64
+    salted: [2]bool
+    count: [2]u8
+    random: [2]u32
+
+rcp() -> Rcp = Rcp([0, 0], [false, false], [0, 0], [0, 0])
+
+/** The RCP's encodings of true and false, and the parity an integer check XORs with. */
+const RCP_TRUE: u32 = 0xa500a500
+const RCP_FALSE: u32 = 0x00c300c3
+const RCP_INTXOR: u32 = 0x96009600
+
+/** Why the chip did not complete a coprocessor instruction: the RCP's fault (`fault`), which stops the
+ * core at `Fault`; or an instruction benchtop does not run, refused by name.
+ */
+struct CoprocessorStop
+    why: string
+    fault: bool
+
+refusal(why: string) -> CoprocessorStop = CoprocessorStop(why, false)
+
+/** The RCP's instructions, each named after the `hardware/rcp.h` function or macro that emits it. */
+enum RcpInsn
+    Salt
+    CanaryGet
+    CanaryCheck
+    CanaryStatus
+    BValid
+    BTrue
+    BFalse
+    B2Valid
+    B2And
+    B2Or
+    BXorValid
+    BXorTrue
+    BXorFalse
+    IValid
+    IEqual
+    RandomByte
+    CountSet
+    CountCheck
+    Panic
+
+// Which RCP instruction `op` is, as `hardware/rcp.h` encodes each.
+rcp_insn(op: CoprocessorOp) -> Option[RcpInsn]
+    val zero = op.crn == 0 && op.crm == 0
+    op.kind match
+        Write ->
+            if op.opc1 == 0 && op.opc2 == 1 then return Some(RcpInsn.CanaryCheck)
+            if op.opc1 == 1 && zero && op.opc2 == 0 then return Some(RcpInsn.BValid)
+            if op.opc1 == 2 && zero && op.opc2 == 0 then return Some(RcpInsn.BTrue)
+            if op.opc1 == 3 && zero && op.opc2 == 1 then return Some(RcpInsn.BFalse)
+            if op.opc1 == 4 && op.opc2 == 0 then return Some(RcpInsn.CountSet)
+            if op.opc1 == 5 && op.opc2 == 1 then return Some(RcpInsn.CountCheck)
+            None
+        Read ->
+            if op.opc1 == 0 && op.opc2 == 1 then return Some(RcpInsn.CanaryGet)
+            if op.opc1 == 1 && zero && op.opc2 == 0 then return Some(RcpInsn.CanaryStatus)
+            if op.opc1 == 2 && zero && op.opc2 == 0 then return Some(RcpInsn.RandomByte)
+            None
+        WritePair ->
+            // opc1 0–7 each with the one CRm the header gives it; 8 the salts, CRm the core.
+            if op.opc1 == 8 then return if op.crm < 2 then Some(RcpInsn.Salt) else None
+            // opc1 0–7 each with the one CRm the header gives it: c8 for 0, 3, 5 and 6, c0 for the rest.
+            if op.opc1 > 8 || op.crm != (if 0x69 & (1 << op.opc1) != 0 then 8u32 else 0) then return None
+            val check = op.opc1 match
+                0 -> RcpInsn.B2Valid
+                1 -> RcpInsn.B2And
+                2 -> RcpInsn.B2Or
+                3 -> RcpInsn.BXorValid
+                4 -> RcpInsn.BXorTrue
+                5 -> RcpInsn.BXorFalse
+                6 -> RcpInsn.IValid
+                _ -> RcpInsn.IEqual
+            Some(check)
+        ReadPair -> None
+        Data -> if op.opc1 == 0 && zero && op.opc2 == 1 then Some(RcpInsn.Panic) else None
+end rcp_insn
+
+// The name the SDK gives instruction `i`.
+private rcp_name(i: RcpInsn, op: CoprocessorOp) -> string = i match
+    Salt -> if op.crm == 0 then "rcp_salt_core0" else "rcp_salt_core1"
+    CanaryGet -> "rcp_canary_get"
+    CanaryCheck -> "rcp_canary_check"
+    CanaryStatus -> "rcp_canary_status"
+    BValid -> "rcp_bvalid"
+    BTrue -> "rcp_btrue"
+    BFalse -> "rcp_bfalse"
+    B2Valid -> "rcp_b2valid"
+    B2And -> "rcp_b2and"
+    B2Or -> "rcp_b2or"
+    BXorValid -> "rcp_bxorvalid"
+    BXorTrue -> "rcp_bxortrue"
+    BXorFalse -> "rcp_bxorfalse"
+    IValid -> "rcp_ivalid"
+    IEqual -> "rcp_iequal"
+    RandomByte -> "rcp_random_byte"
+    CountSet -> "rcp_count_set"
+    CountCheck -> "rcp_count_check"
+    Panic -> "rcp_panic"
+
+impl Rcp
+    /** Core `core`'s RCP instruction `op`: a read's value, 0 for the rest; or the RCP's fault, or a
+     * refusal of an encoding outside its instruction set.
+     */
+    run(*self, core: u32, op: CoprocessorOp) -> Result[u64, CoprocessorStop]
+        val i = rcp_insn(op) match
+            Some(i) -> i
+            None -> return Err(refusal(unknown("redundancy (RCP)", op)))
+        val name = rcp_name(i, op)
+        val k = usize(core)
+        if i != RcpInsn.Salt && i != RcpInsn.CanaryStatus && !self.salted[k]
+            return Err(fault(s"core $core ran $name before its salt was set"))
+        // The random delay draws from the PRNG; rcp_random_byte has none and steps it once itself.
+        if !op.second && i != RcpInsn.RandomByte && self.salted[k] then self.step(k)
+        val tag = (op.crn << 4) | op.crm
+        i match
+            Salt ->
+                val to = usize(op.crm)
+                if self.salted[to] then return Err(fault(s"core $core ran $name, and core ${op.crm}'s salt is already set: each salt is written once"))
+                self.salt[to] = u64(op.low) | (u64(op.high) << 32)
+                self.salted[to] = true
+                self.random[to] = op.high >> 8
+            CanaryGet -> return Ok(u64(canary(self.salt[k], tag)))
+            CanaryCheck ->
+                val want = canary(self.salt[k], tag)
+                if op.low != want then return Err(fault(s"core $core's $name($tag) was given ${word(op.low)}, not the canary for tag $tag"))
+            CanaryStatus -> return Ok(u64(if self.salted[k] then RCP_TRUE else RCP_FALSE))
+            RandomByte -> return Ok(u64(self.step(k)))
+            CountSet -> self.count[k] = u8(tag)
+            CountCheck ->
+                if u32(self.count[k]) != tag then return Err(fault(s"core $core's $name($tag) found the sequence counter at ${self.count[k]}"))
+                self.count[k] +%= 1
+            Panic -> return Err(fault(s"core $core ran $name"))
+            _ -> check(i, op.low, op.high).map_err(e -> fault(s"core $core's $name$e"))?
+        Ok(0)
+    end run
+
+    // Step core `k`'s PRNG and answer its new top byte.
+    private step(*self, k: usize) -> u8
+        self.random[k] = ((self.random[k] *% 0xFD43FD) +% 0xC39EC3) & 0xFFFFFF
+        u8(self.random[k] >> 16)
+end Rcp
+
+// A boolean or integer check of `a` and `b`: Ok where it holds, else the operands as a person reads
+// them, with what was wrong.
+private check(i: RcpInsn, a: u32, b: u32) -> Result[unit, string]
+    val valid = (a == RCP_TRUE || a == RCP_FALSE) && (b == RCP_TRUE || b == RCP_FALSE)
+    val x = a ^ b
+    val ok, why = i match
+        BValid -> (a == RCP_TRUE || a == RCP_FALSE, "is not a valid boolean")
+        BTrue -> (a == RCP_TRUE, "is not true")
+        BFalse -> (a == RCP_FALSE, "is not false")
+        B2Valid -> (valid, "are not both valid booleans")
+        B2And -> (a == RCP_TRUE && b == RCP_TRUE, "are not both true")
+        B2Or -> (valid && (a == RCP_TRUE || b == RCP_TRUE), "are not valid booleans with one true")
+        BXorValid -> (x == RCP_TRUE || x == RCP_FALSE, "XOR to no valid boolean")
+        BXorTrue -> (x == RCP_TRUE, "do not XOR to true")
+        BXorFalse -> (x == RCP_FALSE, "do not XOR to false")
+        IValid -> (x == RCP_INTXOR, "do not XOR to 0x96009600")
+        IEqual -> (a == b, "are not equal")
+        _ -> (true, "")
+    if ok then return Ok(())
+    val single = i == RcpInsn.BValid || i == RcpInsn.BTrue || i == RcpInsn.BFalse
+    Err(if single then s"(${word(a)}) ${why}" else s"(${word(a)}, ${word(b)}) ${why}")
+
+// A canary of `salt` and `tag`, which the datasheet does not specify: the salt keyed by the tag, then
+// SplitMix64's finaliser, so every bit of both reaches every bit of the value.
+private canary(salt: u64, tag: u32) -> u32
+    var z = salt ^ (u64(tag + 1) *% 0x9E3779B97F4A7C15)
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB
+    u32.wrap(z ^ (z >> 31))
+
+private fault(why: string) -> CoprocessorStop = CoprocessorStop(s"the RCP faults: $why", true)
+
+private word(x: u32) -> string = s"0x${hex(x, 8)}"
