@@ -4,7 +4,8 @@ import sysl.raw.ptr_cast
 
 // Little-endian RV32 interpreter. The caller gives a hart a window of RAM, at an address it chooses,
 // and a bus for every other address; a board puts its devices on the bus, and the chip's
-// integration facts in a `Chip`. No decoder cache, so self-modifying code is immediately visible.
+// integration facts in a `Chip`. `run` is the reference interpreter: it decodes every step, with no
+// cache. `run_threaded` (threaded.sysl) runs the same steps through a decode cache.
 // Unsupported encodings and accesses stop before retirement, with PC and destination preserved.
 // Spec: https://docs.riscv.org/reference/isa/v20260120/unpriv/rv32.html
 
@@ -70,8 +71,19 @@ struct Cpu
     sleep_kind: u32
     halt_faults: bool
     halt_breakpoint: bool
+    // The encoding the interpreter last fetched; the threaded executor's own records do not set it.
     instruction: u32
+    // The decode cache `run_threaded` uses (`use_code_cache`): its records, one per halfword of the
+    // RAM window and one past it, `dec` the first of them or null while there is none; the marks of
+    // the 64-byte lines holding decoded code; and the retired count at which the cache hands back.
+    code: []Insn
+    code_lines: []u8
+    dec: *Insn
+    limit: u64
 
+/** Reset the hart onto `ram` at `base`, starting at `entry`. A decode cache it has stays, forgotten,
+ * where it still covers the new window; otherwise the hart has none.
+ */
 reset(cpu: *Cpu, model: Model, chip: Chip, ram: []u8, base: u32, entry: u32)
     if cpu.peer != null then unpair(cpu)
     cpu.model = model
@@ -86,6 +98,7 @@ reset(cpu: *Cpu, model: Model, chip: Chip, ram: []u8, base: u32, entry: u32)
     cpu.ram = ram
     cpu.base = base
     cpu.bus = &nothing_attached
+    if cpu.dec != null && !covers(cpu, cpu.code, cpu.code_lines) then detach_code(cpu)
     reset_machine(cpu)
 
 /** Stop the hart at `at` for `why`: what a bus does with an access it cannot answer. */
@@ -121,7 +134,7 @@ private[riscv] window(cpu: *Cpu, address: u32, width: u32) -> i64
     i64(offset)
 
 @inline
-private ram_load(cpu: *Cpu, offset: usize, width: u32) -> u32
+private[riscv] ram_load(cpu: *Cpu, offset: usize, width: u32) -> u32
     val at = usize(&cpu.ram[offset])
     width match
         4 ->
@@ -133,7 +146,7 @@ private ram_load(cpu: *Cpu, offset: usize, width: u32) -> u32
         _ -> u32(cpu.ram[offset])
 
 @inline
-private ram_store(cpu: *Cpu, offset: usize, width: u32, value: u32)
+private[riscv] ram_store(cpu: *Cpu, offset: usize, width: u32, value: u32)
     val at = usize(&cpu.ram[offset])
     width match
         4 ->
@@ -169,6 +182,7 @@ private[riscv] store(cpu: *Cpu, address: u32, width: u32, value: u32)
     val offset = window(cpu, address, width)
     if offset >= 0
         ram_store(cpu, usize(offset), width, value)
+        code_written(cpu, u32(offset), width)
         return
     cpu.fault_access = Access.Store
     cpu.bus.write(cpu, address, width, value, cpu.retired)
@@ -181,14 +195,22 @@ external_write(cpu: *Cpu, address: u32, width: u32, value: u32) -> bool
     val own = cpu.reserved && reservation_tag(cpu, address) == cpu.reservation
     ram_store(cpu, usize(offset), width, value)
     invalidate(cpu, address, width)
+    code_written(cpu, u32(offset), width)
     if own
         cpu.reserved = false
         notify_unblock(cpu)
     true
 
-private sext(value: u32, bits: u32) -> u32 = u32(i32(value << (32 - bits)) >> (32 - bits))
+private[riscv] sext(value: u32, bits: u32) -> u32 = u32(i32(value << (32 - bits)) >> (32 - bits))
 
-private branch(op: u32, a: u32, b: u32) -> bool = op match
+// The offsets JAL, a branch and a store carry, sign-extended.
+private[riscv] jal_offset(insn: u32) -> u32 =
+    sext(((insn >> 31) << 20) | (((insn >> 12) & 255) << 12) | (((insn >> 20) & 1) << 11) | (((insn >> 21) & 1023) << 1), 21)
+private[riscv] branch_offset(insn: u32) -> u32 =
+    sext(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11) | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)
+private[riscv] store_offset(insn: u32) -> u32 = sext(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
+
+private[riscv] branch(op: u32, a: u32, b: u32) -> bool = op match
     0 -> a == b
     1 -> a != b
     4 -> i32(a) < i32(b)
@@ -286,9 +308,8 @@ private execute(cpu: *Cpu, insn: u32, length: u32)
         0x37 -> result = insn & 0xFFFFF000
         0x17 -> result = cpu.pc + (insn & 0xFFFFF000)
         0x6F ->
-            val offset = sext(((insn >> 31) << 20) | (((insn >> 12) & 255) << 12) | (((insn >> 20) & 1) << 11) | (((insn >> 21) & 1023) << 1), 21)
             result = next
-            target = cpu.pc + offset
+            target = cpu.pc + jal_offset(insn)
         0x67 ->
             valid = op == 0
             result = next
@@ -296,8 +317,7 @@ private execute(cpu: *Cpu, insn: u32, length: u32)
         0x63 ->
             put = false
             valid = op != 2 && op != 3
-            val offset = sext(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11) | (((insn >> 25) & 63) << 5) | (((insn >> 8) & 15) << 1), 13)
-            if valid && branch(op, a, b) then target = cpu.pc + offset
+            if valid && branch(op, a, b) then target = cpu.pc + branch_offset(insn)
         0x03 ->
             valid = op == 0 || op == 1 || op == 2 || op == 4 || op == 5
             if valid
@@ -306,8 +326,7 @@ private execute(cpu: *Cpu, insn: u32, length: u32)
         0x23 ->
             put = false
             valid = op <= 2
-            val offset = sext(((insn >> 25) << 5) | ((insn >> 7) & 31), 12)
-            if valid then store(cpu, a + offset, 1u32 << op, b)
+            if valid then store(cpu, a + store_offset(insn), 1u32 << op, b)
         0x0B ->
             valid = has(cpu.model, EXT_H3BEXTM) && (insn & 0xE2000000) == 0 && (op == 0 || op == 4)
             if valid
@@ -346,68 +365,80 @@ private execute(cpu: *Cpu, insn: u32, length: u32)
 
 // Shared base/M ALU semantics are unchanged; extensions only add validated encodings.
 private alu_operation(cpu: *Cpu, insn: u32, a: u32, b: u32) -> Option[u32]
+    val immediate = (insn & 127) == 0x13
+    alu_key(cpu, insn) match
+        Some(k) -> Some(alu_apply(k, a, if immediate then sext(insn >> 20, 12) else b))
+        None -> None
+
+// The base or M operation an OP or OP-IMM encoding is, as a key for `alu_apply`: funct3, plus 8 for
+// SUB and SRA(I), plus 16 for M; None where it is neither (it may still be a bit-manipulation one).
+private[riscv] alu_key(cpu: *Cpu, insn: u32) -> Option[u32]
     val op = (insn >> 12) & 7
     val top = insn >> 25
-    val imm = sext(insn >> 20, 12)
-    var valid = true
-    var result: u32 = 0
     val immediate = (insn & 127) == 0x13
-    val rhs = if immediate then imm else b
-    val shift = rhs & 31
-    if !immediate && top == 1
-        valid = has(cpu.model, EXT_M)
-        if valid then result = multiply(op, a, b)
-    else
-        valid = immediate || top == 0 || (top == 32 && (op == 0 || op == 5))
-        op match
-            0 -> result = if !immediate && top == 32 then a - rhs else a + rhs
-            1 ->
-                if immediate then valid = top == 0
-                result = a << shift
-            2 -> result = if i32(a) < i32(rhs) then 1 else 0
-            3 -> result = if a < rhs then 1 else 0
-            4 -> result = a ^ rhs
-            5 ->
-                if immediate then valid = top == 0 || top == 32
-                result = if top == 32 then u32(i32(a) >> shift) else a >> shift
-            6 -> result = a | rhs
-            7 -> result = a & rhs
-            _ -> ()
-    if valid then Some(result) else None
+    if !immediate && top == 1 then return if has(cpu.model, EXT_M) then Some(16 | op) else None
+    val valid = op match
+        0 -> immediate || top == 0 || top == 32
+        1 -> top == 0
+        5 -> top == 0 || top == 32
+        _ -> immediate || top == 0
+    if !valid then return None
+    Some(op | (if top == 32 && (op == 5 || !immediate) then 8 else 0))
+
+// The operation `alu_key` names, on `a` and the second operand `b` (rs2 or the immediate).
+@inline
+private[riscv] alu_apply(k: u32, a: u32, b: u32) -> u32
+    if k >= 16 then return multiply(k & 7, a, b)
+    val shift = b & 31
+    k match
+        0 -> a + b
+        8 -> a - b
+        1 -> a << shift
+        2 -> if i32(a) < i32(b) then 1 else 0
+        3 -> if a < b then 1 else 0
+        4 -> a ^ b
+        5 -> a >> shift
+        13 -> u32(i32(a) >> shift)
+        6 -> a | b
+        _ -> a & b
 
 /** Run up to `budget` steps: an instruction, or an interrupt taken in its place. A hart that has
  * stopped stays stopped; one asleep wakes when an enabled interrupt is pending, or, after
  * h3.block, on an event.
  */
 run(cpu: *Cpu, budget: u64)
-    if budget == 0 then return
-    if cpu.stop == Stop.Sleep
-        if pending_bits(cpu) & cpu.cs.mie == 0 && !(cpu.sleep_kind == SLEEP_BLOCK && cpu.event) then return
-        if cpu.sleep_kind == SLEEP_BLOCK then cpu.event = false
-        cpu.stop = Stop.Budget
-    if cpu.stop != Stop.Budget then return
-    if !has(cpu.model, EXT_PRIV)
-        // No CSRs, no counters, no traps: a stop ends the run.
-        var left = budget
-        while left != 0 && cpu.stop == Stop.Budget
-            left -= 1
-            step(cpu)
-        return
+    if !wake(cpu, budget) then return
+    // Without the privileged architecture there are no CSRs, no counters, no traps: a stop ends the run.
+    val privileged = has(cpu.model, EXT_PRIV)
     var left = budget
     while left != 0 && cpu.stop == Stop.Budget
         left -= 1
-        val s = &cpu.cs
-        if (s.inhibit & INHIBIT_CY) == 0 then s.cycle += 1
-        // The interrupt test is two loads and an AND: the external line is cached when it changes.
-        if (s.mip | s.meip) & s.mie != 0 && take_interrupt(cpu) then continue
-        val before = cpu.retired
-        val counting = (s.inhibit & INHIBIT_IR) == 0
-        s.wrote_instret = false
-        step(cpu)
-        if cpu.retired != before && counting && !s.wrote_instret then s.instret += 1
-        if cpu.stop != Stop.Budget then resolve_fault(cpu)
+        if privileged then step_privileged(cpu) else step(cpu)
 
-private step(cpu: *Cpu)
+// Whether a run of `budget` may take a step: a hart asleep wakes as `run` says; a stopped one stays.
+private[riscv] wake(cpu: *Cpu, budget: u64) -> bool
+    if budget == 0 then return false
+    if cpu.stop == Stop.Sleep
+        if pending_bits(cpu) & cpu.cs.mie == 0 && !(cpu.sleep_kind == SLEEP_BLOCK && cpu.event) then return false
+        if cpu.sleep_kind == SLEEP_BLOCK then cpu.event = false
+        cpu.stop = Stop.Budget
+    cpu.stop == Stop.Budget
+
+// One step of a hart with the privileged architecture: the cycle count, an interrupt taken in place
+// of an instruction, or an instruction, counted, with a fault it takes turned into its trap.
+private[riscv] step_privileged(cpu: *Cpu)
+    val s = &cpu.cs
+    if (s.inhibit & INHIBIT_CY) == 0 then s.cycle += 1
+    // The interrupt test is two loads and an AND: the external line is cached when it changes.
+    if (s.mip | s.meip) & s.mie != 0 && take_interrupt(cpu) then return
+    val before = cpu.retired
+    val counting = (s.inhibit & INHIBIT_IR) == 0
+    s.wrote_instret = false
+    step(cpu)
+    if cpu.retired != before && counting && !s.wrote_instret then s.instret += 1
+    if cpu.stop != Stop.Budget then resolve_fault(cpu)
+
+private[riscv] step(cpu: *Cpu)
     val pc = cpu.pc
     if (pc & ialign_mask(cpu)) != 0
         fault(cpu, Stop.Misaligned, pc, Access.Fetch)

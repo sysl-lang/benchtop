@@ -1,0 +1,273 @@
+module sh.sysl.benchtop.riscv
+@tests
+
+// The threaded executor against the interpreter it must agree with, step for step, and its decode
+// cache against code that changes under it.
+
+private val CMP_KERNEL_I = embed("../../../../examples/riscv/kernel-rv32i.bin")
+private val CMP_KERNEL_IM = embed("../../../../examples/riscv/kernel-rv32im.bin")
+private val CMP_KERNEL_IC = embed("../../../../examples/riscv/kernel-rv32ic.bin")
+private val CMP_KERNEL_IMC = embed("../../../../examples/riscv/kernel-rv32imc.bin")
+private val CMP_KERNEL_H3 = embed("../../../../examples/riscv/kernel-hazard3.bin")
+
+private var kernel_ram_a: [1048576]u8
+private var kernel_ram_b: [1048576]u8
+private var kernel_records: [524289]Insn
+private var kernel_lines: [16384]u8
+
+// The two harts' architectural state is the same, as far as an instruction or a trap can tell.
+private same(a: *Cpu, b: *Cpu, context: string)
+    for i in 0..<32 do assert(a.r[i] == b.r[i], s"$context: x$i = ${a.r[i]} interpreted, ${b.r[i]} threaded")
+    assert(a.pc == b.pc && a.retired == b.retired, s"$context: pc ${a.pc} / ${b.pc}, retired ${a.retired} / ${b.retired}")
+    assert(a.stop == b.stop && a.stop_at == b.stop_at, s"$context: ${a.stop} at ${a.stop_at} / ${b.stop} at ${b.stop_at}")
+    assert(a.cs.cycle == b.cs.cycle && a.cs.instret == b.cs.instret, s"$context: cycle ${a.cs.cycle} / ${b.cs.cycle}, instret ${a.cs.instret} / ${b.cs.instret}")
+    assert(a.cs.mstatus == b.cs.mstatus && a.cs.mepc == b.cs.mepc && a.cs.mcause == b.cs.mcause, context)
+    assert(a.cs.mie == b.cs.mie && a.cs.privilege == b.cs.privilege, context)
+
+private same_ram(a: []u8, b: []u8, context: string)
+    for i in 0..<a.len do assert(a[i] == b[i], s"$context: byte $i = ${a[i]} interpreted, ${b[i]} threaded")
+
+// Whether the record for `address` holds a decoded instruction the cache runs itself.
+private cached(cpu: *Cpu, address: u32) -> bool
+    val h = cpu.code[usize((address - cpu.base) >> 1)].h
+    h != &h_decode && h != &h_leave
+
+private put_halfwords(ram: []u8, code: []const u16)
+    for i in 0..<code.len
+        ram[2 * i] = u8(code[i])
+        ram[2 * i + 1] = u8(code[i] >> 8)
+
+private put_words(ram: []u8, code: []const u32)
+    for i in 0..<code.len do instruction_put_word(ram, 4 * i, code[i], 4)
+
+@test("the threaded executor runs every profile's compiled kernel step for step as the interpreter does")
+threaded_matches_interpreter_on_kernels()
+    val images: [][]const u8 = [CMP_KERNEL_I, CMP_KERNEL_IM, CMP_KERNEL_IC, CMP_KERNEL_IMC, CMP_KERNEL_H3]
+    val budgets: [6]u64 = [1, 2, 7, 100, 1, 1000]
+    var a: Cpu
+    var b: Cpu
+    for i in 0..<5
+        val model = MODELS[i]
+        for j in 0..<kernel_ram_a.len
+            kernel_ram_a[j] = 0
+            kernel_ram_b[j] = 0
+        for j in 0..<images[i].len
+            kernel_ram_a[j] = images[i][j]
+            kernel_ram_b[j] = images[i][j]
+        reset(&a, model, chip_of(model), kernel_ram_a, 0, 0)
+        reset(&b, model, chip_of(model), kernel_ram_b, 0, 0)
+        assert(use_code_cache(&b, kernel_records, kernel_lines))
+        a.halt_breakpoint = true
+        b.halt_breakpoint = true
+        var k: usize = 0
+        while a.stop == Stop.Budget && a.retired < 200000
+            val budget = budgets[k % budgets.len]
+            run(&a, budget)
+            run_threaded(&b, budget)
+            k += 1
+            same(&a, &b, s"${model.name}, run $k of $budget")
+        assert(a.stop == Stop.Breakpoint && b.r[10] == 3132271724, model.name)
+        same_ram(kernel_ram_a, kernel_ram_b, model.name)
+        // The cache did the work: the entry is a record it runs itself.
+        assert(cached(&b, 0), model.name)
+
+// start: mtvec = handler; counters on; MTIE; MIE; then forty times round a loop that ECALLs (the
+// handler counts it in a2 and steps over it), reads mcycle and minstret, and stores mcycle. A timer
+// interrupt raised between runs is taken once (a5); its handler masks it. Mixed 16- and 32-bit code,
+// 32-bit instructions at odd halfwords among them.
+private val TRAP_PROGRAM: [49]u16 = [
+    0x0297, 0x0000, 0x8293, 0x03c2, 0x9073, 0x3052, 0x1073, 0x3200,
+    0x0313, 0x0800, 0x1073, 0x3043, 0x6073, 0x3004, 0x4501, 0x0593,
+    0x0280, 0x050d, 0x0073, 0x0000, 0x26f3, 0xb000, 0x2773, 0xb020,
+    0x2023, 0x20d0, 0x15fd, 0xf5f5, 0x9002, 0x0001, 0x23f3, 0x3420,
+    0xca63, 0x0003, 0x2e73, 0x3410, 0x0e11, 0x1073, 0x341e, 0x0605,
+    0x0073, 0x3020, 0x0e93, 0x0800, 0xb073, 0x304e, 0x0785, 0x0073,
+    0x3020]
+
+@test("traps, counters read by CSR and an interrupt raised between runs match the interpreter under the threaded executor")
+threaded_matches_interpreter_on_traps()
+    var ram_a: [1024]u8
+    var ram_b: [1024]u8
+    var records: [513]Insn
+    var lines: [16]u8
+    var a: Cpu
+    var b: Cpu
+    val model = model_named("hazard3").unwrap()
+    for cpu in [&a, &b]
+        reset(cpu, model, RP2350, if cpu == &a then ram_a else ram_b, 0, 0)
+        cpu.halt_breakpoint = true
+    assert(use_code_cache(&b, records, lines))
+    put_halfwords(ram_a, TRAP_PROGRAM)
+    put_halfwords(ram_b, TRAP_PROGRAM)
+    val budgets: [5]u64 = [1, 3, 2, 5, 8]
+    var k: usize = 0
+    while a.stop == Stop.Budget && k < 5000
+        if k == 12
+            interrupt_inputs(&a, false, true)
+            interrupt_inputs(&b, false, true)
+        val budget = budgets[k % budgets.len]
+        run(&a, budget)
+        run_threaded(&b, budget)
+        k += 1
+        same(&a, &b, s"run $k of $budget")
+    assert(a.stop == Stop.Breakpoint && a.r[10] == 120 && a.r[12] == 40 && a.r[15] == 1, s"${a.stop}, a0 = ${a.r[10]}, a2 = ${a.r[12]}, a5 = ${a.r[15]}")
+    assert(a.cs.cycle != 0 && a.cs.instret != 0)
+    same_ram(ram_a, ram_b, "trap program")
+    assert(cached(&b, 0x22))
+
+// 0: li a0,0  4: li a1,0  8: lui t0  12: addi t0 (t0 = addi a0,a0,16)  16: addi a0,a0,1  20: bnez a1,40
+// 24: li a1,1  28: li t1,16  32: sw t0,0(t1)  36: j 16  40: ebreak
+private val SMC_PROGRAM: [11]u32 = [
+    0x00000513, 0x00000593, 0x010502b7, 0x51328293, 0x00150513, 0x00059a63,
+    0x00100593, 0x01000313, 0x00532023, 0xfedff06f, 0x00100073]
+
+@test("a store over a decoded instruction runs the new one the next time through, under both executors")
+threaded_self_modifying_code()
+    var ram: [64]u8
+    var records: [33]Insn
+    var lines: [1]u8
+    var cpu: Cpu
+    for name in ["rv32i", "hazard3"]
+        for threaded in [false, true]
+            val model = model_named(name).unwrap()
+            reset(&cpu, model, chip_of(model), ram, 0, 0)
+            assert(use_code_cache(&cpu, records, lines))
+            cpu.halt_breakpoint = true
+            for i in 0..<ram.len do ram[i] = 0
+            put_words(ram, SMC_PROGRAM)
+            if threaded then run_threaded(&cpu, 1000) else run(&cpu, 1000)
+            assert(cpu.stop == Stop.Breakpoint && cpu.pc == 40, s"$name: ${cpu.stop} at ${cpu.pc}")
+            assert(cpu.r[10] == 17, s"$name, threaded $threaded: a0 = ${cpu.r[10]}: the old addi ran again")
+
+@test("a store beside decoded code leaves it decoded, and a store over code forgets only what it overlaps")
+threaded_forget_range()
+    var ram: [256]u8
+    var records: [129]Insn
+    var lines: [4]u8
+    var cpu: Cpu
+    reset(&cpu, model_named("rv32i").unwrap(), BARE, ram, 0, 0)
+    assert(use_code_cache(&cpu, records, lines))
+    cpu.halt_breakpoint = true
+    // addi a0,a0,1 three times, then ebreak.
+    put_words(ram, [0x00150513u32, 0x00150513, 0x00150513, 0x00100073])
+    run_threaded(&cpu, 100)
+    assert(cpu.stop == Stop.Breakpoint && cpu.r[10] == 3)
+    for at in [0u32, 4, 8] do assert(cached(&cpu, at), s"$at")
+
+    // In the code's line but past it, and in another line: nothing forgotten.
+    write(&cpu, 0x20, 4, 7)
+    write(&cpu, 0x80, 4, 7)
+    for at in [0u32, 4, 8] do assert(cached(&cpu, at), s"$at after stores to data")
+
+    // The upper halfword of the instruction at 4: it alone.
+    write(&cpu, 6, 2, 0x0015)
+    assert(cached(&cpu, 0) && !cached(&cpu, 4) && cached(&cpu, 8))
+
+    // A byte at 0: the instruction there alone.
+    write(&cpu, 0, 1, 0x13)
+    assert(!cached(&cpu, 0) && cached(&cpu, 8))
+
+@test("code loaded over decoded code by another master, by reset or by the host runs as loaded")
+threaded_fresh_code()
+    var ram: [64]u8
+    var records: [33]Insn
+    var lines: [1]u8
+    var cpu: Cpu
+    val model = model_named("rv32i").unwrap()
+    val first: [2]u32 = [0x00500513, 0x00100073] // li a0,5; ebreak
+    val second: [2]u32 = [0x00700513, 0x00100073] // li a0,7; ebreak
+    val third: [2]u32 = [0x00900513, 0x00100073] // li a0,9; ebreak
+
+    reset(&cpu, model, BARE, ram, 0, 0)
+    assert(use_code_cache(&cpu, records, lines))
+    cpu.halt_breakpoint = true
+    put_words(ram, first)
+    run_threaded(&cpu, 10)
+    assert(cpu.stop == Stop.Breakpoint && cpu.r[10] == 5 && cached(&cpu, 0))
+
+    // A DMA or a debugger writes the next program.
+    assert(external_write(&cpu, 0, 4, second[0]))
+    cpu.pc = 0
+    cpu.stop = Stop.Budget
+    run_threaded(&cpu, 10)
+    assert(cpu.r[10] == 7, s"a0 = ${cpu.r[10]} after a load by another master")
+
+    // The host writes the RAM itself, then resets the hart onto it: reset keeps the cache, forgotten.
+    put_words(ram, third)
+    reset(&cpu, model, BARE, ram, 0, 0)
+    assert(cpu.dec != null)
+    cpu.halt_breakpoint = true
+    run_threaded(&cpu, 10)
+    assert(cpu.r[10] == 9, s"a0 = ${cpu.r[10]} after a reset")
+
+    // Without a reset, the host says what it did.
+    put_words(ram, first)
+    forget_code(&cpu)
+    cpu.pc = 0
+    cpu.stop = Stop.Budget
+    run_threaded(&cpu, 10)
+    assert(cpu.r[10] == 5, s"a0 = ${cpu.r[10]} after forget_code")
+
+    // A window the cache does not cover leaves the hart with none, and run_threaded is run.
+    var bigger: [128]u8
+    reset(&cpu, model, BARE, bigger, 0, 0)
+    assert(cpu.dec == null)
+    assert(!use_code_cache(&cpu, records, lines) && cpu.dec == null)
+
+@test("a store by the paired hart forgets the other's decoded code")
+threaded_pair_store()
+    var ram: [64]u8
+    var records_a: [33]Insn
+    var lines_a: [1]u8
+    var a: Cpu
+    var b: Cpu
+    val model = model_named("hazard3").unwrap()
+    reset(&a, model, RP2350, ram, 0, 0)
+    reset(&b, model, RP2350, ram, 0, 0)
+    assert(pair(&a, &b))
+    assert(use_code_cache(&a, records_a, lines_a))
+    a.halt_breakpoint = true
+    for i in 0..<ram.len do ram[i] = 0
+    put_words(ram, [0x00500513u32, 0x00100073])
+    run_threaded(&a, 10)
+    assert(a.stop == Stop.Breakpoint && a.r[10] == 5 && cached(&a, 0))
+    write(&b, 0, 4, 0x00700513)
+    assert(!cached(&a, 0))
+    a.pc = 0
+    a.stop = Stop.Budget
+    run_threaded(&a, 10)
+    assert(a.r[10] == 7, s"a0 = ${a.r[10]}")
+    unpair(&a)
+
+// 0..28: c.nop  30: addi a0,a0,1 (32-bit, across the 32-byte PMP granule at 32)  34: c.j 0
+private val PMP_PROGRAM: [18]u16 = [
+    0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001,
+    0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0001, 0x0513, 0x0015, 0xbff9]
+
+@test("a 32-bit fetch across a PMP region's edge faults in Machine mode under both executors, also after it was decoded")
+threaded_pmp_edge()
+    var ram_a: [64]u8
+    var ram_b: [64]u8
+    var records: [33]Insn
+    var lines: [1]u8
+    var a: Cpu
+    var b: Cpu
+    val model = model_named("hazard3").unwrap()
+    reset(&a, model, RP2350, ram_a, 0, 0)
+    reset(&b, model, RP2350, ram_b, 0, 0)
+    assert(use_code_cache(&b, records, lines))
+    for cpu in [&a, &b]
+        cpu.halt_faults = true
+        put_halfwords(cpu.ram, PMP_PROGRAM)
+    run(&a, 40)
+    run_threaded(&b, 40)
+    same(&a, &b, "before the region")
+    assert(a.stop == Stop.Budget && a.r[10] == 2 && cached(&b, 30))
+    // A 32-byte NAPOT region at 32, RWX and not locked: the fetch at 30 matches it only in part.
+    for cpu in [&a, &b]
+        assert(csr_access(cpu, 0x3B0, 1, 32 >> 2, false, true).is_some())
+        assert(csr_access(cpu, 0x3A0, 1, 0x1F, false, true).is_some())
+    run(&a, 40)
+    run_threaded(&b, 40)
+    same(&a, &b, "with the region")
+    assert(a.stop == Stop.AccessFault && a.stop_at == 30, s"${a.stop} at ${a.stop_at}")
