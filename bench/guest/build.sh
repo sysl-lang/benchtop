@@ -3,6 +3,7 @@
 #   kernel.bin    the one-core workload `benchtop bench` runs from address 0, for the M0+
 #   kernel33.bin  the same C for the M33 (`benchtop bench --core cortex-m33`), without the DSP
 #                 extension, which benchtop's M33 leaves out
+#   it33.bin      a loop that is mostly IT blocks (it.s; it.c computes its answer), for the M33
 #   dual.elf      the two-core workload `benchtop bench-board` runs on the virtual board, and
 #   dual33.elf    the same for `virt33` (`benchtop bench-board --board virt33`)
 #   kernel-rv.bin the one-core workload for the Hazard3 RISC-V core
@@ -16,6 +17,10 @@ arm-none-eabi-objcopy -O binary kernel.elf kernel.bin
 arm-none-eabi-gcc -mcpu=cortex-m33+nodsp -mthumb -mfloat-abi=soft -O2 -ffreestanding -nostdlib \
     -Wl,--no-warn-rwx-segments -T link.ld start.s kernel.c -o kernel33.elf
 arm-none-eabi-objcopy -O binary kernel33.elf kernel33.bin
+
+arm-none-eabi-gcc -mcpu=cortex-m33+nodsp -mthumb -mfloat-abi=soft -ffreestanding -nostdlib \
+    -Wl,--no-warn-rwx-segments -T link.ld start.s it.s -o it33.elf
+arm-none-eabi-objcopy -O binary it33.elf it33.bin
 
 virt=../../examples/virt
 

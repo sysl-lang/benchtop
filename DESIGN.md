@@ -786,10 +786,18 @@ executes without the FP, Security and MPU extensions; integer DSP is optional vi
 - **IT blocks are decoded with their IT, and the fast path never looks at ITSTATE.** Decoding an `IT`
   decodes the up to four instructions it governs at once, each into its own record with the handler
   `h_pred[K, L]`, its condition K and its length L in records compiled in; that handler runs the
-  record's own handler (looked up from its `op`) or skips it. A 16-bit data-processing instruction,
+  instruction's own handler or skips it. The instruction's handler is chosen once, when the block is
+  decoded, and kept in a table beside the records (`Memory.predicated`, one entry per record, read
+  only for a record of a block), since the 16-byte record has no room for a second handler and growing
+  every record for the few in blocks would cost every instruction. A 16-bit data-processing instruction,
   which sets no flags inside a block, is decoded as the form that does not (`ItAlu`, or the plain
   `AddImm`, `LoadConst`, `MovHi`). ITSTATE is `cpu.it`, set by `IT` and advanced by `h_pred` alone, so
-  it is right wherever the core can stop or take an exception and costs nothing outside a block. The
+  it costs nothing outside a block. `h_pred` steps it before its instruction runs, and keeps the
+  instruction's own ITSTATE and the retired count it ran at beside it (`it_own`, `it_at`); a run that
+  ends with that instruction not retired — stopped on it by a fault, a breakpoint or an access nothing
+  answers — puts its own ITSTATE back (`end_run`; `stopped_on` for an `SVC` or a return that cannot
+  be taken, which the core stops on but counts retired), since the architecture reports, and an exception
+  taken there would stack, the ITSTATE of the instruction stopped on. The
   `match` loop does not read the baked condition: it keeps ITSTATE as the architecture does and tests
   each instruction against it, so it checks the baking.
   - **A branch into the middle of a block** is UNPREDICTABLE. ITSTATE is 0 there, and both executors

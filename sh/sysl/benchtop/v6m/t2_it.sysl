@@ -164,3 +164,133 @@ t2t_branch_into()
     // comes in at 4 with ITSTATE 0, Z still clear, and runs both instructions there.
     assert(c.stop == Stop.Breakpoint && c.stop_at == 10, "stopped at the breakpoint")
     assert(c.r[1] == 0 && c.r[2] == 1 && c.r[3] == 2, "the second pass ran unconditionally")
+
+// ---------------------------------------------------------------------------------------------------
+// The handler an instruction of a block runs, chosen when the block is decoded.
+
+// 32-bit instructions, one from each family the decoder gives a handler made for its operation
+// (`handler_at`), each setting rK to 1: add.w r0, r0, #1; orr.w r1, r1, #1; add.w r2, r2, r7, r7 = 1;
+// ldr.w r3, [r6], r6 the address of a 1.
+val WIDE: [4][2]u16 = [[0xF100, 0x0001], [0xF041, 0x0101], [0xEB02, 0x0207], [0xF8D6, 0x3000]]
+
+// Run a prepared machine again from 0 as `again` does, its cycle count cleared too.
+again_timed(cpu: *Cpu, nzcv: u32, exec: Exec)
+    cpu.extra_cycles = 0
+    again(cpu, nzcv, exec)
+
+// A block of `len` of `WIDE` on `cond`, under both executors on every flag combination, timed or not:
+// each instruction runs exactly when its condition holds, and the executors agree on the cycles, so
+// the threaded one ran the handler made for the core's timing.
+wide_block_holds(cond: u32, len: u32, thens: u32, timed: bool) -> bool
+    var a: Cpu
+    var b: Cpu
+    var code: [9]u16
+
+    code[0] = it_of(cond, len, thens)
+    for k in 0..<len
+        code[1 + 2 * k] = WIDE[k][0]
+        code[2 + 2 * k] = WIDE[k][1]
+
+    a.kind = Kind.V8mMain
+    b.kind = Kind.V8mMain
+    prepare(&a, code[0..(2 * len)], [0, 0, 0, 0, 0, 0, LOW, 1], 0, [[LOW, 1]])
+    prepare(&b, code[0..(2 * len)], [0, 0, 0, 0, 0, 0, LOW, 1], 0, [[LOW, 1]])
+    configure_instruction_timing(&a, timed)
+    configure_instruction_timing(&b, timed)
+
+    for nzcv in 0u32..<16
+        if nzcv & 0xC == 0xC then continue
+
+        again_timed(&a, nzcv, &run_match)
+        again_timed(&b, nzcv, &run_threaded)
+
+        val holds = cond_ref(cond, nzcv)
+
+        for c in [&a, &b]
+            if c.stop != Stop.Breakpoint || c.stop_at != 2 + 4 * len || c.retired != u64(1 + len) || flags(c) != nzcv || c.it != 0
+                print(f"IT 0x${code[0]}%04x on ${nzcv}%04b: stopped at 0x${c.stop_at}%x after ${c.retired}")
+                return false
+
+            for k in 0u32..<len
+                val runs = if k == 0 || (thens >> (k - 1)) & 1 == 1 then holds else !holds
+
+                if c.r[k] != (if runs then 1 else 0)
+                    print(f"IT 0x${code[0]}%04x on ${nzcv}%04b: wide instruction ${k + 1} ${if runs then "should run" else "should not"}")
+                    return false
+
+        if cycles(&a) != cycles(&b)
+            print(f"IT 0x${code[0]}%04x on ${nzcv}%04b, timed ${timed}: ${cycles(&a)} cycles under match, ${cycles(&b)} threaded")
+            return false
+
+    true
+
+@test("blocks of every length of 32-bit instructions of every handler family, timed or not, run as their conditions say")
+t2t_wide_families()
+    for timed in [false, true]
+        for cond in 0u32..<15
+            for len in 1u32..<5
+                for thens in 0u32..<(1 << (len - 1))
+                    if cond == 14 && thens != (1 << (len - 1)) - 1 then continue
+
+                    assert(wide_block_holds(cond, len, thens, timed), s"cond $cond, length $len, thens $thens")
+
+@test("paired cores keep the handlers of their own records of a block: one timed, the other not")
+t2t_paired_predicated()
+    val mem = memory()
+    var a: Cpu
+    var b: Cpu
+
+    a.kind = Kind.V8mMain
+    b.kind = Kind.V8mMain
+    reset(&a, mem, [], 0)
+    // cmp r0, r0; it eq; ldreq r1, [r5]; bkpt
+    val code: [4]u16 = [0x4280, 0xBF08, 0x6829, 0xBE00]
+    for i in 0..<code.len do store16(&a, u32(i) * 2, code[i])
+    store32(&a, 0x100, 7)
+    attach_memory(&b, mem)
+    clear(&b, 0)
+    pair(&a, &b)
+    assert(a.predicated == &mem.predicated[0] && b.predicated == &mem.predicated_own[0], "each core's own table")
+    configure_instruction_timing(&a, true)
+
+    // Each decodes the block into its own records; then the first runs from its records again.
+    for c in [&a, &b, &a]
+        c.r[5] = 0x100
+        again_timed(c, 0, &run_threaded)
+        assert(c.stop == Stop.Breakpoint && c.r[1] == 7 && c.retired == 3, "the load ran")
+
+    assert(cycles(&a) == 4 && cycles(&b) == 3, s"timed ${cycles(&a)}, untimed ${cycles(&b)}")
+    unpair(&a, &b)
+    assert(b.predicated == &mem.predicated[0], "shared again")
+
+// ---------------------------------------------------------------------------------------------------
+// A compiler-shaped loop of IT blocks: bench/guest/it.s, whose answer it.c computes.
+
+val it33 = embed("../../../../bench/guest/it33.bin")
+
+// it.c's answer for two rounds.
+const IT_2: u32 = 4114396997
+
+// The IT guest, its round count patched to 2, timed or not, to its breakpoint.
+it33_run(cpu: *Cpu, exec: Exec, timed: bool)
+    cpu.kind = Kind.V8mMain
+    reset(cpu, test_memory, it33, 0)
+    configure_instruction_timing(cpu, timed)
+    store32(cpu, 0x10, 2)
+
+    while cpu.stop == Stop.Running
+        cpu.limit = cpu.retired + 1000
+        exec(cpu)
+
+@test("the IT guest gives the host's answer under both executors, timed or not, in as many instructions and cycles")
+t2t_it_guest()
+    for timed in [false, true]
+        var a: Cpu
+        var b: Cpu
+
+        it33_run(&a, &run_match, timed)
+        it33_run(&b, &run_threaded, timed)
+        assert(a.stop == Stop.Breakpoint && b.stop == Stop.Breakpoint, "stopped at the breakpoint")
+        assert(a.r[0] == IT_2 && b.r[0] == IT_2, f"r0 is 0x${a.r[0]}%x and 0x${b.r[0]}%x, not 0x${IT_2}%x")
+        assert(a.retired == b.retired && cycles(&a) == cycles(&b), s"retired ${a.retired} and ${b.retired}")
+        assert(a.retired > 500000, "most of the loop runs inside blocks")

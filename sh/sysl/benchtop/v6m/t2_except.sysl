@@ -88,6 +88,179 @@ masked_irq0(cpu: *Cpu)
     irq0_pending(cpu)
     cpu.primask = 1
 
+@test("an interrupt taken inside a block whose handler runs blocks of its own resumes the block under its own ITSTATE")
+t2e_irq_in_block_nested()
+    // PRIMASK set and IRQ 0 pending. 0: cmp r0, r0; itttt eq; msreq primask, r5 (r5 = 0);
+    // addeq r1, #1; addeq r2, #1; addeq r3, #1; 14: bkpt. 16: the handler: cmp r0, #1 (r0 = 0, so
+    // not EQ); ite eq; addeq r6, #1; addne r7, #1; it ne; addne r7, #1; logs the stacked xPSR; bx lr.
+    val code: []const u16 = [0x4280, 0xBF01, 0xF385, 0x8810, 0x3101, 0x3201, 0x3301, BKPT,
+        0x2801, 0xBF0C, 0x3601, 0x3701, 0xBF18, 0x3701, LOG_XPSR[0], LOG_XPSR[1], LOG_XPSR[2]]
+    var c = run_both8(code, [0, 0, 0, 0, LOG], 0, [[IRQ0, 16]], &masked_irq0)
+
+    // ITTTT EQ is 0x01, and after the MSR 0x02: IT[1:0] = 2 in bits 26–25, IT[7:2] = 0 in 15–10.
+    assert(logged(&c, [0x65000000]), "the stacked xPSR")
+    assert(c.r[6] == 0 && c.r[7] == 2, "the handler's own blocks ran on its own flags")
+    assert(c.r[1] == 1 && c.r[2] == 1 && c.r[3] == 1 && c.it == 0, "the rest of the interrupted block")
+
+@test("an SVC inside a block that escalates to HardFault stacks the ITSTATE after it, and the block resumes under it")
+t2e_fault_in_block()
+    // 0: cpsid i; cmp r0, r0; itte eq; svceq #0, which PRIMASK escalates; addeq r1, #1; addne r2, #1;
+    // 12: bkpt. 14: HardFault: logs the stacked xPSR, then mrs r0, ipsr, logged; bx lr.
+    val code: []const u16 = [CPSID, 0x4280, 0xBF06, SVC, 0x3101, 0x3201, BKPT, LDR_R0_SP_28, LOG_R0, MRS, 0x8005, LOG_R0, BX_LR]
+    var c = run_both8(code, [0, 0, 0, 0, LOG], 0, [[3, 14]], &nothing)
+
+    assert(logged(&c, [0x61000C00, 3]), "the stacked xPSR, from HardFault")
+    assert(c.r[1] == 1 && c.r[2] == 0 && c.it == 0 && c.stop == Stop.Breakpoint && c.retired == 11, "the block went on as it was")
+
+// cmp r0, r0; itte eq; then `access` (ldreq r3, [r1] or streq r3, [r1]), nothing at r1; addeq r2, #1;
+// addne r2, #1. Under both executors, which must agree on ITSTATE as on everything else.
+stop_in_block(access: u16) -> Cpu
+    val c = execute8([0x4280, 0xBF06, access, 0x3201, 0x3201], [0, 0x50000000], 0, [])
+
+    assert(c.stop == Stop.Unmapped && c.stop_at == 0x50000000, s"${c.stop}")
+    assert(c.pc == 4 && c.retired == 2 && c.r[2] == 0, f"stopped at 0x${c.pc}%x after ${c.retired}")
+    c
+
+@test("an access that stops the core inside a block stops on it, with nothing after it in the block run")
+t2e_stop_in_block()
+    for access in [0x680Bu16, 0x600B] do stop_in_block(access)
+
+@test("a core stopped on an instruction inside a block holds that instruction's own ITSTATE")
+t2e_stop_in_block_itstate()
+    // ITTE EQ: the access's own ITSTATE is 0x06, the next instruction's 0x0C.
+    for access in [0x680Bu16, 0x600B]
+        val c = stop_in_block(access)
+
+        assert(c.it == 0x06, f"ITSTATE 0x${c.it}%02x")
+
+// cmp r0, r0; itttt eq, whose four instructions' ITSTATEs are 0x01, 0x02, 0x04 and 0x08; each of them
+// addeq r2, #1 but the `k`-th, `stopper`; 12: bkpt; 14: a handler logging the xPSR it stacked. r1
+// points at nothing and r4 at the log.
+const ITTTT_EQ: u16 = 0xBF01
+
+block_with(stopper: u16, k: u32) -> [10]u16
+    var code: [10]u16 = [0x4280, ITTTT_EQ, 0x3201, 0x3201, 0x3201, 0x3201, BKPT, LOG_XPSR[0], LOG_XPSR[1], LOG_XPSR[2]]
+
+    code[2 + k] = stopper
+    code
+
+// `code` on an M33 under `exec`, timed or not, run to its stop; with `resume`, run on it and set
+// running again where it stopped — as a debugger goes on from a breakpoint — and run to the next stop.
+stop_run(exec: Exec, code: []const u16, timed: bool, setup: Setup, resume: Setup) -> Cpu
+    var c: Cpu
+
+    c.kind = Kind.V8mMain
+    machine(&c, code, [0, 0x50000000, 0, 0, LOG], 0, [[IRQ0, 14]], setup)
+    configure_instruction_timing(&c, timed)
+    finish(&c, exec)
+    if resume != null
+        resume(&c)
+        c.stop = Stop.Running
+        finish(&c, exec)
+    c
+
+// `stop_run` under both executors, which must agree on the stop, ITSTATE, the registers, the cycles
+// and what the handler logged; answers the threaded machine.
+stops_alike(code: []const u16, timed: bool, setup: Setup, resume: Setup) -> Cpu
+    var a = stop_run(&run_match, code, timed, setup, resume)
+    var log: [4]u32
+
+    for i in 0..<log.len do log[i] = load32(&a, LOG + u32(i) * 4)
+
+    var b = stop_run(&run_threaded, code, timed, setup, resume)
+
+    for i in 0..<16 do assert(a.r[i] == b.r[i], s"the executors agree on r$i")
+    assert(a.stop == b.stop && a.stop_at == b.stop_at && a.retired == b.retired && a.pc == b.pc, "and on the stop")
+    assert(a.it == b.it && a.ipsr == b.ipsr && cycles(&a) == cycles(&b), f"and on ITSTATE (0x${a.it}%02x, 0x${b.it}%02x) and the cycles")
+    for i in 0..<log.len do assert(log[i] == load32(&b, LOG + u32(i) * 4), "and on the log")
+    b
+
+// The xPSR an exception stacks at the stop: Z, C and T from the CMP, and ITSTATE `it`.
+xpsr_with(it: u32) -> u32 = 0x61000000 | ((it & 3) << 25) | ((it >> 2) << 10)
+
+@test("a core stopped on any instruction of a block — an access nothing answers, a breakpoint, an undefined one — holds its own ITSTATE, under both executors, timed or not")
+t2e_stop_itstate_every_position()
+    // ldr r3, [r1]; str r3, [r1]; bkpt; udf #0.
+    val stoppers: []const u16 = [0x680B, 0x600B, BKPT, 0xDE00]
+    val stops = [Stop.Unmapped, Stop.Unmapped, Stop.Breakpoint, Stop.Undefined]
+
+    for s in 0..<stoppers.len
+        for k in 0u32..<4
+            for timed in [false, true]
+                val c = stops_alike(block_with(stoppers[s], k)[0..<6], timed, &nothing, null)
+                val at = 4 + 2 * k
+
+                assert(c.stop == stops[s] && c.stop_at == (if s < 2 then 0x50000000 else at), f"stopper ${s} at ${k}: ${c.stop} at 0x${c.stop_at}%x")
+                assert(c.pc == at && c.retired == u64(2 + k) && c.r[2] == k, f"stopper ${s} at ${k}: pc 0x${c.pc}%x after ${c.retired}")
+                assert(c.it == 1 << k, f"stopper ${s} at ${k}, timed ${timed}: ITSTATE 0x${c.it}%02x")
+
+enable_irq0(cpu: *Cpu) = store32(cpu, NVIC_ISER, 1)
+
+pend_irq0(cpu: *Cpu) = store32(cpu, NVIC_ISPR, 1)
+
+@test("an interrupt taken where the core stopped on a breakpoint in a block stacks the breakpoint's own ITSTATE, and the return runs it again under it")
+t2e_stop_itstate_resumed()
+    for k in 0u32..<4
+        for timed in [false, true]
+            var c = stops_alike(block_with(BKPT, k), timed, &enable_irq0, &pend_irq0)
+
+            assert(logged(&c, [xpsr_with(1 << k)]), f"at ${k}, timed ${timed}: the stacked xPSR")
+            assert(c.stop == Stop.Breakpoint && c.pc == 4 + 2 * k && c.it == 1 << k && c.ipsr == 0, f"at ${k}: back on the breakpoint, ITSTATE 0x${c.it}%02x")
+            assert(c.r[2] == k, "the instructions before it ran once")
+
+@test("a run whose budget ends between the instructions of a block holds the next one's ITSTATE, and one ending at a block's last branch holds 0")
+t2e_budget_itstate()
+    // Stepped one instruction at a time by the `match` executor: after the IT and each instruction of
+    // the block, ITSTATE is the next one's.
+    for timed in [false, true]
+        var c: Cpu
+
+        c.kind = Kind.V8mMain
+        prepare(&c, block_with(0x3201, 0)[0..<6], [], 0, [])
+        configure_instruction_timing(&c, timed)
+        run_single(&c)
+        run_single(&c)
+        for k in 0u32..<5
+            assert(c.retired == u64(2 + k) && c.pc == 4 + 2 * k, f"step ${k}: pc 0x${c.pc}%x")
+            assert(c.it == (if k < 4 then 1 << k else 0), f"step ${k}, timed ${timed}: ITSTATE 0x${c.it}%02x")
+            run_single(&c)
+
+    // cmp r0, r0; it eq; b.n 8 (beq, the block's last); addeq r2, #1; 8: bkpt. The budget ends at the
+    // branch, which retired: ITSTATE 0 under both executors.
+    val code: []const u16 = [0x4280, 0xBF08, 0xE000, 0x3201]
+
+    for timed in [false, true]
+        for exec in [&run_match, &run_threaded]
+            var c: Cpu
+
+            c.kind = Kind.V8mMain
+            prepare(&c, code, [], 0, [])
+            configure_instruction_timing(&c, timed)
+            c.limit = 1
+            exec(&c)
+            assert(c.stop == Stop.Running && c.pc == 8 && c.retired == 3 && c.it == 0, f"timed ${timed}: pc 0x${c.pc}%x after ${c.retired}, ITSTATE 0x${c.it}%02x")
+
+no_escalation(cpu: *Cpu)
+    cpu.faultmask = 1
+
+// In a handler, about to return with an EXC_RETURN that names no return.
+bad_return(cpu: *Cpu)
+    cpu.ipsr = 3
+    cpu.r[14] = 0xFFFFFFF0
+
+@test("an SVC in a block that neither SVCall nor HardFault can take, and a return in one that names no return, stop the core on them with their own ITSTATE")
+t2e_fault_stop_itstate()
+    for timed in [false, true]
+        for k in 0u32..<4
+            val c = stops_alike(block_with(SVC, k)[0..<6], timed, &no_escalation, null)
+
+            assert(c.stop == Stop.Fault && c.pc == 4 + 2 * k && c.it == 1 << k, f"SVC at ${k}, timed ${timed}: ${c.stop} at 0x${c.pc}%x, ITSTATE 0x${c.it}%02x")
+
+        // bxeq lr, a block's last instruction.
+        val c = stops_alike(block_with(BX_LR, 3)[0..<6], timed, &bad_return, null)
+
+        assert(c.stop == Stop.Fault && c.pc == 10 && c.it == 0x08, f"BX, timed ${timed}: ${c.stop} at 0x${c.pc}%x, ITSTATE 0x${c.it}%02x")
+
 @test("the exclusive monitor is clear after an exception, so a STREX across one fails")
 t2e_monitor_across()
     // ldrex r0, [r1]; svc #0; strex r2, r0, [r1]; bkpt; 10: bx lr
