@@ -46,11 +46,22 @@ import sysl.sync.*
 // The guest's RAM, from address 0. Code and data share it, as they do on an M0+ running from SRAM.
 const RAM_BYTES: u32 = 1024 * 1024
 const FLASH_BYTES: u32 = 4 * 1024 * 1024
-const FLASH_OFFSET: u32 = RAM_BYTES + 2 // Guard record prevents RAM fall-through into flash.
+// The code offsets (`code_offset`) of the RAM backing, then of the flash. One record's halfword sits
+// between them, so a run falling off the RAM's last record meets a guard rather than the flash's first.
+const FLASH_OFFSET: u32 = RAM_BYTES + 2
 const MEMORY_BYTES: u32 = FLASH_OFFSET + FLASH_BYTES
+// The code offset of an address that holds no code: the one record past every other, the
+// undecodable one.
+const NO_CODE: u32 = MEMORY_BYTES
+// The offset in the RAM backing of an address in no RAM bank.
+const NO_RAM: u32 = RAM_BYTES
+// How far past the end of each RAM bank its guard records reach, in bytes of the backing, and how
+// many records that is: a run falling off a bank's end meets these and is sent to the guest address
+// it ran on to.
+const GUARD_BYTES: u32 = 4096
+const GUARD_RECORDS: u32 = GUARD_BYTES / 2
 
-// RAM banks share the existing backing/code/monitor arrays. Guard pages in
-// backing space redirect threaded fall-through to the correct guest address.
+// RAM banks share the one backing, its code lines and monitors, each at its own offset.
 struct RamBank
     base: u32
     size: u32
@@ -109,12 +120,12 @@ struct Memory
         for i in 0..<self.extra_ram_count
             val b = self.extra_ram[i]
             if a >= b.base && u64(a) + u64(width) <= u64(b.base) + u64(b.size) then return b.offset + a - b.base
-        RAM_BYTES
+        NO_RAM
 
     @inline
     ram_range(*self, a: u32, width: u32) -> bool
         if a >= self.ram_base && u64(a) + u64(width) <= u64(self.ram_base) + u64(self.ram_size) then return true
-        self.extra_ram_offset(a, width) < RAM_BYTES
+        self.extra_ram_offset(a, width) != NO_RAM
 
     @inline
     flash_range(*self, a: u32, width: u32) -> bool =
@@ -129,15 +140,21 @@ struct Memory
         if a >= self.ram_base && u64(a) + 2 <= u64(self.ram_base) + u64(self.ram_size) then return a - self.ram_base
         if self.flash_range(a, 2) then return FLASH_OFFSET + a - self.flash_base
         val offset = self.extra_ram_offset(a, 2)
-        if offset < RAM_BYTES then offset else MEMORY_BYTES
+        if offset != NO_RAM then offset else NO_CODE
 
+    // Whether the halfword at `a` can hold code: whether it has a code offset.
+    @inline
+    is_code(*self, a: u32) -> bool = self.code_offset(a) != NO_CODE
+
+    // The guest address of code offset `offset`; one in a bank's guard records answers the address
+    // a run falling into them had reached.
     @inline
     code_address(*self, offset: u32) -> u32
         if offset >= FLASH_OFFSET then return self.flash_base + offset - FLASH_OFFSET
-        if offset < self.ram_size + 4096 then return self.ram_base + offset
+        if offset < self.ram_size + GUARD_BYTES then return self.ram_base + offset
         for i in 0..<self.extra_ram_count
             val b = self.extra_ram[i]
-            if offset >= b.offset && offset < b.offset + b.size + 4096 then return b.base + offset - b.offset
+            if offset >= b.offset && offset < b.offset + b.size + GUARD_BYTES then return b.base + offset - b.offset
         self.ram_base + offset
 
     install_ram_guards(*self, records: *Insn)
@@ -145,7 +162,7 @@ struct Memory
         for k in 0..self.extra_ram_count
             val end = if k == 0 then self.ram_size else self.extra_ram[k - 1].offset + self.extra_ram[k - 1].size
             val address = if k == 0 then self.ram_base + self.ram_size else self.extra_ram[k - 1].base + self.extra_ram[k - 1].size
-            for i in 0u32..<2048
+            for i in 0..<GUARD_RECORDS
                 if end + i * 2 > RAM_BYTES then break
                 records[(end >> 1) + i] = Insn(&h_ram_boundary, address + i * 2, Op.Undecoded, 0, 0, 0)
 end Memory
@@ -369,7 +386,7 @@ reset(cpu: *Cpu, mem: &Memory, image: []const u8, entry: u32)
         mem.line_stores[0][i] = 0
         mem.line_stores[1][i] = 0
     for i in 0..(RAM_BYTES >> 1) do mem.decoded[i] = undecoded()
-    mem.decoded[MEMORY_BYTES >> 1] = undecoded()
+    mem.decoded[NO_CODE >> 1] = undecoded()
 
     attach_memory(cpu, mem)
     clear(cpu, entry)
@@ -433,7 +450,7 @@ pair(first: *Cpu, second: *Cpu)
 
     for i in 0..(RAM_BYTES >> 1) do mem.decoded_own[i] = undecoded()
     for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + mem.flash_size) >> 1) do mem.decoded_own[i] = undecoded()
-    mem.decoded_own[MEMORY_BYTES >> 1] = undecoded()
+    mem.decoded_own[NO_CODE >> 1] = undecoded()
 
     mem.install_ram_guards(&mem.decoded_own[0])
     second.dec = &mem.decoded_own[0]
@@ -471,11 +488,11 @@ lower_limit(cpu: *Cpu, n: u64)
 @inline
 insn_at(cpu: *Cpu, a: u32) -> *Insn
     val offset = cpu.mem.code_offset(a)
-    if offset < MEMORY_BYTES then return &cpu.dec[offset >> 1]
+    if offset != NO_CODE then return &cpu.dec[offset >> 1]
 
     if cpu.stop == Stop.Budget then cpu.pc = a
     halt(cpu, Stop.Unmapped, a)
-    &cpu.dec[MEMORY_BYTES >> 1]
+    &cpu.dec[NO_CODE >> 1]
 
 // Stop the core for `why` at `at`, unless it has already stopped. A taken branch then comes back at
 // once, since the budget is gone, and leaves `pc` alone: whatever stops the core says where.
@@ -938,7 +955,7 @@ ror_reg(cpu: *Cpu, x: u32, by: u32) -> u32
  * physically adjacent banks before assigning backing offsets.
  */
 reset_mapped(cpu: *Cpu, mem: &Memory, image: []const u8, map: MemoryMap)
-    require map.banks.len() <= 7, "at most eight RAM banks"
+    require map.banks.len() <= 7, "at most seven extra RAM banks"
     require map.ram_size <= RAM_BYTES && map.flash_size <= FLASH_BYTES, "the map fits the backing"
     require map.flash_size == 0 || image.len >= usize(RAM_BYTES + map.flash_size), "the image holds the flash"
     reset(cpu, mem, if image.len > usize(RAM_BYTES) then image[..<usize(RAM_BYTES)] else image, 0)
