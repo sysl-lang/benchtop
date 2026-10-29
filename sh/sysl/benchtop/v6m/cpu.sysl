@@ -99,6 +99,9 @@ struct Memory
     flash_size: u32
     extra_ram: [7]RamBank
     extra_ram_count: usize
+    // Bit k for each of the other regions that is read-only to the guest (`read_only`): a boot ROM,
+    // read on the fast path and executed like RAM, whose stores take the slow path to the bus.
+    read_only_banks: u32
     ram: [1048576]u8
     flash: [4194304]u8
     // One entry per 4 KB page of the 4 GB address space (`PAGES`).
@@ -137,6 +140,20 @@ struct Memory
     ram_range(*self, a: u32, width: u32) -> bool
         if a >= self.ram_base && u64(a) + u64(width) <= u64(self.ram_base) + u64(self.ram_size) then return true
         self.extra_ram_offset(a, width) != NO_RAM
+
+    // Whether a store may write the `width` bytes at `a` in place: RAM, and no read-only region.
+    @inline
+    ram_store_range(*self, a: u32, width: u32) -> bool
+        if a >= self.ram_base && u64(a) + u64(width) <= u64(self.ram_base) + u64(self.ram_size) then return true
+        self.extra_store_range(a, width)
+
+    @noinline
+    @cold
+    extra_store_range(*self, a: u32, width: u32) -> bool
+        for i in 0..<self.extra_ram_count
+            val b = self.extra_ram[i]
+            if a >= b.base && u64(a) + u64(width) <= u64(b.base) + u64(b.size) then return self.read_only_banks & (1u32 << u32(i)) == 0
+        false
 
     @inline
     flash_range(*self, a: u32, width: u32) -> bool =
@@ -182,7 +199,7 @@ end Memory
  * Its count is atomic, since a machine's cores run on threads of their own.
  */
 memory() -> &sync Memory =
-    Memory(0, RAM_BYTES, 0x10000000, 0, [RamBank(0, 0, 0); 7], 0, [0; 1048576], [0; 4194304], [0; 1048576], [0; 16384],
+    Memory(0, RAM_BYTES, 0x10000000, 0, [RamBank(0, 0, 0); 7], 0, 0, [0; 1048576], [0; 4194304], [0; 1048576], [0; 16384],
         [[0; 16384]; 2], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442],
         [null; 2621442], [null; 2621442])
 
@@ -414,6 +431,7 @@ reset(cpu: *Cpu, mem: &sync Memory, image: []const u8, entry: u32)
     mem.ram_base = 0
     mem.ram_size = RAM_BYTES
     mem.extra_ram_count = 0
+    mem.read_only_banks = 0
     mem.flash_size = 0
     for i in 0..<mem.ram.len do mem.ram[i] = 0
     for i in 0..<image.len do mem.ram[i] = image[i]
@@ -627,6 +645,15 @@ stored(cpu: *Cpu, address: u32, width: u32)
 
     if mark != 0 then touched(cpu, a, width, mark)
 
+/** A store the bus made on `cpu`'s behalf into its RAM at `address`, through no page (a board serving
+ * a region it keeps off the fast path): the same bookkeeping as a store of the core's own.
+ */
+bus_stored(cpu: *Cpu, address: u32, width: u32)
+    val a = cpu.mem.ram_offset(address, width)
+    if a == NO_RAM then return
+    val mark = atomic_load(&cpu.lines[a >> LINE_SHIFT], Relaxed)
+    if mark != 0 then touched(cpu, a, width, mark)
+
 @noinline
 @cold
 private touched(cpu: *Cpu, a: u32, width: u32, mark: u8)
@@ -749,10 +776,11 @@ page_of(cpu: *Cpu, a: u32) -> usize = cpu.pages[a >> PAGE_SHIFT]
 page_for(cpu: *Cpu, a: u32, width: u32) -> usize = if cpu.mem.ram_range(a, width) || cpu.mem.flash_range(a, width) then page_of(cpu, a) else 0
 
 // The page a store of `width` bytes at `a` may write through: RAM only. Flash is read-only to the
-// guest, so a store that touches it finds no page and takes the slow path, which faults it; the fast
-// path pays nothing for the protection.
+// guest, so a store that touches it finds no page and takes the slow path, which faults it; a store
+// to a read-only RAM region takes it to the bus. The fast path pays nothing for the protection: the
+// first region's test is the same, and the others' is made off it.
 @inline
-store_page(cpu: *Cpu, a: u32, width: u32) -> usize = if cpu.mem.ram_range(a, width) then page_of(cpu, a) else 0
+store_page(cpu: *Cpu, a: u32, width: u32) -> usize = if cpu.mem.ram_store_range(a, width) then page_of(cpu, a) else 0
 
 // The slow path of a read, `width` bytes at `a`.
 slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
@@ -1020,6 +1048,25 @@ reset_mapped(cpu: *Cpu, mem: &sync Memory, image: []const u8, map: MemoryMap)
     for i in 0..<mem.flash_size do mem.flash[i] = image[usize(RAM_BYTES + i)]
     for p in 0..<(mem.flash_size >> PAGE_SHIFT) do mem.page_table[(mem.flash_base >> PAGE_SHIFT) + p] = usize(&mem.flash[p << PAGE_SHIFT])
     for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + mem.flash_size) >> 1) do mem.decoded[i] = undecoded()
+
+/** Make the map's other RAM region at `base` read-only to the guest: still read and executed on the
+ * fast path, while a store to it goes to the bus (`Bus.write`), which says why it is refused.
+ */
+read_only(mem: &sync Memory, base: u32)
+    for i in 0..<mem.extra_ram_count do if mem.extra_ram[i].base == base then mem.read_only_banks |= 1u32 << u32(i)
+
+/** `length` bytes of flash from `offset` have been changed by something other than a core's store (a
+ * flash device being programmed or erased): every record decoded from them, and every record that
+ * reads them (from 16 bytes before, for an IT block's, to 18 after), decodes again when control next
+ * reaches it, on either core. Called between instructions, or from a bus access, as `forget` is.
+ */
+flash_changed(mem: &sync Memory, offset: u32, length: u32)
+    if length == 0 || offset >= mem.flash_size then return
+    val from = if offset >= 16 then offset - 16 else 0
+    val end = if u64(offset) + u64(length) + 18 < u64(mem.flash_size) then offset + length + 18 else mem.flash_size
+    for i in ((FLASH_OFFSET + from) >> 1)..<((FLASH_OFFSET + end + 1) >> 1)
+        mem.decoded[i] = undecoded()
+        mem.decoded_own[i] = undecoded()
 
 /** A DMA/device bus write made on this core's host thread, to RAM only: it never enters MMIO or
  * faults the CPU, and answers whether it was made. The store's own bookkeeping invalidates decoded
