@@ -64,8 +64,8 @@ day. An L is split before it is handed out (§6).
 | Cortex-M33 ×2: integer Thumb-2, DSP, FPv5-SP | 3.7 Cortex-M33 | full | The ISA, DSP and FPv5-SP (`v6m/models.sysl:47`, DESIGN.md §2.9), both cores on `chip.Rp2350` through `chip.ArmBoard`, core 1 launched by the ROM protocol into its VTOR, SP and PC. | `v6m` t2/fp/dsp tests on `virt33`; `chip/arm_tests.sysl` | — | — |
 | M33 NVIC, SCB, SysTick | 3.7 / 3.2 Interrupts | partial | The NVIC (52 lines, 4 priority bits), SCB and SysTick are generic (`v6m/except.sysl:8`). The lines the chip raises reach the NVIC through `Processor` (TIMER0/1 alarms drive the SDK's `sleep_ms`). | `v6m/nvic_tests`, `priority_tests`, `chip/arm_tests.sysl` | grows with each block | — |
 | M33 MPU (PMSAv8, 8 regions per state) | 3.7 | missing | No MPU on any v6m core (no `RLAR`/`RASR` anywhere in `v6m/`). | — | M | — |
-| M33 stack limits (MSPLIM/PSPLIM) | 3.7 | partial | The registers are stored. A push below the limit stops the run instead of taking a UsageFault (`v6m/cpu.sysl:228`, `t2_except.sysl:190`). | `t2_except` tests | S | — |
-| TrustZone, Secure-only minimum (SAU stored, TT*, SecureFault, NS transitions refused) | 3.7, 10 Security | partial | On a core the board runs Secure-only (`Cpu.security`, the Arm board's), `TT`, `TTT`, `TTA` and `TTAT` answer Secure, R and RW for every address, as with the SAU and both MPUs disabled: what `rom_func_lookup` reads (item 1). The SAU is not stored, there is no SecureFault, and `SG`, `BXNS` and `BLXNS` are undefined. | `v6m/coproc_tests.sysl` (TT); `t2_except.sysl:309–315` (undefined elsewhere) | M | — |
+| M33 stack limits (MSPLIM/PSPLIM) | 3.7 | full | Every SP write below the limit is the UsageFault STKOF, recorded in CFSR and taken where SHCSR enables it and it preempts, else HardFault (HFSR.FORCED), else a lockup stop; exception stacking that crosses the limit stacks only above it, leaves SP at it and derives the fault (late arrival or pending); `CCR.STKOFHFNMIGN` at negative priority (`v6m/t2secure.sysl`, item 2). | `t2_except.sysl` stack-limit tests; `examples/pico2/stack_limit.c` in `chip/arm_tests.sysl` | — | — |
+| TrustZone, Secure-only minimum (SAU stored, TT*, SecureFault, NS transitions refused) | 3.7, 10 Security | full | Secure reset state; SAU_CTRL/TYPE/RNR/RBAR/RLAR stored (8 regions); `TT`/`TTT`/`TTA`/`TTAT` answer from the SAU (no IDAU, no MPU modelled: IREGION and MREGION never valid); SecureFault's enable, priority, SFSR (W1C) and SFAR, pended through SHCSR; `SG` a NOP; `BXNS`/`BLXNS` to Non-secure, EXC_RETURN with S or DCRS clear, `MRS`/`MSR` of `_NS` registers and the PPB's NS alias stop at `NonSecure`, named; EXC_RETURN with ES clear is UsageFault INVPC (item 2). Not detected: INVTRAN (executing from SAU-Non-secure memory). | `v6m/t2secure_tests.sysl`; `examples/pico2/tt.c` in `chip/arm_tests.sysl` | — | — |
 | TrustZone, Non-secure state | 3.7, 10 Security | missing | Both worlds' banked state, IDAU, secure gateways and the NS aliases of PPB and SIO. | — | L | Secure-only |
 | M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | partial | `MCR`, `MRC`, `MCRR`, `MRRC`, `CDP` and their `…2` forms reach the board through `Bus.coprocessor`, gated by CPACR, which keeps the fields of the ports the board fills (`v6m/coproc.sysl`). **GPIOC is full**: every instruction is its SIO equivalent (`chip/coprocessors.sysl`). **RCP**: the salt status and the two salts only. **DCP**: the `RCMP` read `runtime_init` makes only. Every other RCP and DCP instruction is refused by name. | `v6m/coproc_tests.sysl`, `chip/arm_tests.sysl` | M (RCP rest), M (DCP) | — |
 | Hazard3 ×2 (RV32IMAC + Zb*/Zc*/Zcmp, PMP, Xh3pmpm, Xh3power) | 3.8 Hazard3 | full | `riscv/rp2350.sysl:6–22` and `riscv/HAZARD3-COVERAGE.md`. | `riscv/hazard3_*_tests`, `chip/tests.sysl:18` | — | — |
@@ -309,7 +309,7 @@ that must land first. Items with no shared "after" run in parallel.
 | # | item | size | after |
 |---|---|---|---|
 | 1 | **Arm Pico 2 board**: an `ArmBoard` beside `RiscvBoard` running two M33s on `chip.Rp2350`. It covers ELF-to-SRAM debugger entry, the core-1 ROM launch into VTOR, SP and PC, and the 52 IRQ lines into the NVIC through `Processor`. A hand-written M33 twin of `examples/pico2-riscv/blink` is its test. It also clones and builds `pico-examples`, and records the refusal census of `hello_serial` and `blink` (`no_flash` builds) in its report. | M | — |
-| 2 | **M33 Secure-only security minimum** (DESIGN.md §2.7): Secure reset state, SAU stored, `TT*`, SecureFault with SFSR/SFAR, NS transitions stopped by name, and STKOF taken as a UsageFault. | M | — |
+| 2 | **done** — **M33 Secure-only security minimum** (DESIGN.md §2.7): Secure reset state, SAU stored, `TT*`, SecureFault with SFSR/SFAR, NS transitions stopped by name, and STKOF taken as a UsageFault. | M | — |
 | 3 | **RCP (CP7) and GPIO coprocessor (CP0)** on a coprocessor port the chip supplies. | M | 1 |
 | 4 | **XIP flash and QMI**: one flash image behind the 0x1000_0000 aliases, the cache, cache-as-SRAM, XIP_CTRL, QMI stored with direct mode, and the loader writing an ELF's PT_LOAD and a UF2 into flash. `pico_xip_sram_test` is its oracle. | M | 1 |
 | 5 | **Start-up register blocks**: PSM (FRCE_OFF and DONE), ROSC with RANDOMBIT, BOOTRAM, SYSINFO, SYSCFG, the POWMAN/VREG store, ACCESSCTRL stored, and CLOCKS FC0 measuring the tree. Every refusal in item 1's census is either answered here or named. | M | 1 |
@@ -374,3 +374,38 @@ the RCP and MSPLIM itself and vectors through its own table.
 
 Nothing else was refused: RESETS, CLOCKS, XOSC, the PLLs, TICKS, TIMER0, the SIO (spinlocks, GPIO),
 IO_BANK0, PADS_BANK0, UART0 and the NVIC took every access the two programs make as they were.
+
+### Item 2, done: the M33's Secure-only minimum
+
+`v6m/t2secure.sysl`, on a core with `Cpu.security` (the Arm board's), against the ARMv8-M ARM and
+`regs/m33.h`:
+
+- **Secure state only.** Every banked register is the Secure copy and every exception targets
+  Secure state. `SG` is a NOP, as it is in Secure state.
+- **The SAU** (`SAU_CTRL`, `SAU_TYPE` = 8, `SAU_RNR`, `SAU_RBAR`, `SAU_RLAR`) is stored; `SAU_RNR`
+  past region 7 makes a region access a refusal. **SFSR** (write one to clear) and **SFAR** are
+  stored, and so, now, are **CFSR** and **HFSR**: what benchtop records into them reads back, byte and
+  halfword access to CFSR included.
+- **`TT`, `TTT`, `TTA`, `TTAT`** answer from the SAU when they run: S, SRVALID and SREGION (an
+  address in exactly one enabled region is Non-secure, or Secure where the region is NSC; the PPB is
+  exempt), and R, RW, NSR and NSRW from the default memory map (no MPU is modelled; the PPB is not
+  accessible unprivileged), only where privileged or `A`. No IDAU: IRVALID is never set.
+- **Faults taken.** STKOF from any SP write below MSPLIM/PSPLIM, and INVPC from an EXC_RETURN with ES
+  clear, are recorded in CFSR and taken: the UsageFault where SHCSR enables it and its priority
+  preempts, HardFault with FORCED where not, and a lockup stop (`StackLimit`, `Fault`) where not even
+  HardFault preempts. An exception entry whose frame crosses the limit stacks only above it, leaves
+  SP at the limit and derives STKOF, taken at once where it outranks the exception (that one left
+  pending) and pending otherwise. `CCR.STKOFHFNMIGN` ignores the limit at negative priority.
+  SecureFault has its enable, its SHPR1 priority and its SHCSR active and pending bits; software
+  pends it through SHCSR.
+- **Refused by name** (`Stop.NonSecure`, `Cpu.transition`, "Non-secure state is not modelled"):
+  `BXNS` and `BLXNS` to an address with bit 0 clear, an EXC_RETURN with S or DCRS clear, `MRS`/`MSR`
+  of a `_NS` register, and any access to the PPB's Non-secure alias (0xE002_0000–0xE002_FFFF).
+- **Still not modelled:** SecureFault INVTRAN (Secure code executing from memory the SAU marks
+  Non-secure runs), the IDAU, and the MPU (item 31 and later).
+
+`examples/pico2/stack_limit.c` sets MSPLIM 1 KB below SP and calls a function with a 2 KB frame: its
+`sub.w sp` is the UsageFault STKOF in the program's own handler, which lifts the limit and returns,
+and the `SUB` runs again. `examples/pico2/tt.c` prints ACLE's `cmse_TT`/`TTT`/`TTA`/`TTAT` of SRAM and
+the PPB before and after two SAU regions. Both end on a `BKPT`; `chip/arm_tests.sysl` asserts their
+UART0 text.

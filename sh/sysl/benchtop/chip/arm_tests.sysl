@@ -67,6 +67,39 @@ arm_blink()
     // gpio_put went through the GPIO coprocessor into the SIO.
     assert(b.chip.sio.out & (1u64 << 25) != 0 && b.chip.sio.oe & (1u64 << 25) != 0)
 
+private val STACK_LIMIT = embed("../../../../examples/pico2/stack_limit.elf")
+private val ARM_TT = embed("../../../../examples/pico2/tt.elf")
+
+// Run `image` on a Pico 2 until a BKPT ends it, within `ms` of guest time, answering UART0's text.
+private run_to_breakpoint(image: []const u8, ms: u64) -> string
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(image).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < ms * MS do end = b.run(TENTH_MS)
+    assert(end == RunEnd.Breakpoint, s"${end} ${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+    from_utf8_lossy(b.console.view())
+
+@test("the SDK's stack_limit: MSPLIM 1 KB below SP, a 2 KB frame is the UsageFault STKOF in its handler, which lifts the limit, and the SUB runs again")
+arm_stack_limit()
+    val text = run_to_breakpoint(STACK_LIMIT, 50)
+    val want = "msplim 1 KB below sp\r\ndeep returned 42 after 1 fault(s)\r\ncfsr 0x00100000 (STKOF set), in deep: yes\r\nmsplim now 0x00000000, cfsr now 0x00000000\r\n"
+    assert(text == want, text)
+
+// One line of tt.c's: the name in ten columns (`name` comes padded), then the four answers.
+private tt_line(name: string, tt: u32, ttt: u32, tta: u32, ttat: u32) -> string =
+    s"$name TT ${hex(tt, 8)} TTT ${hex(ttt, 8)} TTA ${hex(tta, 8)} TTAT ${hex(ttat, 8)}\r\n"
+
+@test("the SDK's tt: ACLE's cmse_TT, TTT, TTA and TTAT of SRAM and the PPB, before and after two SAU regions, one Non-secure and one Non-secure callable")
+arm_tt()
+    val text = run_to_breakpoint(ARM_TT, 50)
+    val ppb = tt_line("ppb       ", 0x004C0000, 0x00400000, 0x004C0000, 0x00400000)
+    val sram = tt_line("sram      ", 0x004C0000, 0x004C0000, 0x004C0000, 0x004C0000)
+    val ns = tt_line("ns        ", 0x003E0000, 0x003E0000, 0x003E0000, 0x003E0000)
+    val nsc = tt_line("nsc       ", 0x004E0500, 0x004E0500, 0x004E0500, 0x004E0500)
+    val secure = tt_line("secure    ", 0x004C0000, 0x004C0000, 0x004C0000, 0x004C0000)
+    val want = s"sau ctrl 0 type 8\r\n$sram$ppb$ns$nsc$secure$ppb"
+    assert(text == want, text)
+
 // Thumb halfwords into SRAM at `at`, for core `k` to run next from there.
 private place(b: &ArmBoard, at: u32, code: []const u16)
     for i in 0..<code.len
@@ -91,6 +124,30 @@ arm_refused_access()
     w.cores[0].r[0] = 0x100
     assert(w.run(1000) == RunEnd.Fault && w.refused.is_empty())
     assert(w.cores[0].stop == Stop.Fault && w.cores[0].stop_at == 0x100 && w.mem.flash[0x100] == 0, "the ROM is read-only")
+
+@test("a way to Non-secure state ends the Arm run with its name, on either core: BXNS on core 0, MRS of MSP_NS on core 1")
+arm_non_secure()
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(ARM_BLINK).unwrap()
+    // bxns r0, r0 an even address; bkpt
+    place(b, 0x20070000, [0x4704, 0xBE00])
+    b.cores[0].pc = 0x20070000
+    b.cores[0].r[0] = 0x20070100
+    assert(b.run(1000) == RunEnd.Fault)
+    assert(b.refused == "core 0 at pc 0x20070000: BXNS to a Non-secure address: Non-secure state is not modelled", b.refused)
+    assert(b.cores[0].stop == Stop.NonSecure && b.cores[0].pc == 0x20070000)
+
+    val s = arm_board(PICO2_ARM_SRAM)
+    s.boot(ARM_BLINK).unwrap()
+    // Core 1: mrs r0, msp_ns. Core 0: wfi, b . (asleep until core 1 ends the run).
+    place(s, 0x20070000, [0xF3EF, 0x8088, 0xBE00])
+    place(s, 0x20070100, [0xBF30, 0xE7FD])
+    s.cores[0].pc = 0x20070100
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070001]
+        s.chip.write(0, sio_reg.BASE + sio_reg.FIFO_WR_OFFSET, 4, x).unwrap()
+        assert(s.chip.read(0, sio_reg.BASE + sio_reg.FIFO_RD_OFFSET, 4).unwrap() == x, "the ROM echoes")
+    assert(s.run(100000) == RunEnd.Fault)
+    assert(s.refused == "core 1 at pc 0x20070000: MRS or MSR of a Non-secure register: Non-secure state is not modelled", s.refused)
 
 @test("core 1 leaves the boot ROM at the entry, stack pointer and VTOR core 0 sends it, and runs on the Arm board")
 arm_core1_launch()

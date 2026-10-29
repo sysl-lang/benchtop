@@ -1,12 +1,14 @@
 # Pico 2 (Arm) examples
 
-Two unmodified Pico SDK programs that the `pico2` board runs on its Cortex-M33s, and that
+Pico SDK programs (the first two unmodified SDK examples) that the `pico2` board runs on its Cortex-M33s, and that
 `chip/arm_tests.sysl` runs end to end:
 
 | program | what it does | what the test asserts |
 |---|---|---|
 | `hello_serial.c` | `stdio_init_all()` on UART0, then `hello, serial N` every 100 ms | the bytes UART0 sends, a line every 100 ms of guest time |
 | `blink.c` | GPIO 25 (the LED) toggled every 250 ms with `sleep_ms` | GPIO 25's level, an edge every 250 ms of guest time |
+| `stack_limit.c` | MSPLIM 1 KB below SP, then a 2 KB frame: the UsageFault STKOF in its own handler, which lifts the limit so the `SUB` runs again | its report: one fault, CFSR's STKOF, the faulting PC in `deep` |
+| `tt.c` | ACLE's `cmse_TT`/`TTT`/`TTA`/`TTAT` of SRAM and the PPB, before and after two SAU regions (built with `-mcmse`) | each answer's word |
 
 ```sh
 ./benchtop run --board pico2 examples/pico2/hello_serial.elf
@@ -14,7 +16,7 @@ Two unmodified Pico SDK programs that the `pico2` board runs on its Cortex-M33s,
 
 ## Building
 
-`build.sh` rebuilds both ELFs, which are committed because the tests embed them:
+`build.sh` rebuilds the ELFs, which are committed because the tests embed them:
 
 ```sh
 sh examples/pico2/build.sh
