@@ -21,7 +21,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#11 | sentinel and guard-record arithmetic in place of named concepts | open |
 | cores#12 | `Kind`, `Arch` and the `is_*` predicates overlap | open |
 | cores#13 | `h_dsp` re-checks DSP at run time against a second source of truth | open |
-| cores#14 | duplicated bit utilities and hand-rolled loops the library has | partly fixed in `d435c66` (`t2sem` CLZ is `leading_zeros`); left: `rbit` (waits for sysl 0.7.9's `reverse_bits`), the RISC-V `bitops` loops, the duplicated `sext`/`bits`/`bad`/`st` helpers |
+| cores#14 | duplicated bit utilities and hand-rolled loops the library has | partly fixed in `d435c66` (`t2sem` CLZ is `leading_zeros`); `rbit` is `reverse_bits` (sysl 0.7.9); left: the RISC-V `bitops` loops, the duplicated `sext`/`bits`/`bad`/`st` helpers |
 | cores#15 | boilerplate handler bodies | fixed in `35449b8`: `h_step[OP, L, TIMED]` and `h_access[OP, L, TIMED]`, whose `match` on the constant `OP` folds, replace ~85 hand-written handlers |
 | cores#16 | RISC-V `execute` mixes decode, validation and commit | fixed in `aff3dad`: one `retire` commit path, faults carry an `Access` instead of a side channel |
 | cores#17 | `Stop.Budget` means "running" | open |
