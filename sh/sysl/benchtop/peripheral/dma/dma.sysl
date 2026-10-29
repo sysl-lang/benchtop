@@ -1,5 +1,6 @@
 module sh.sysl.benchtop.peripheral.dma
 
+import sh.sysl.benchtop.peripheral.Model
 import sh.sysl.stm32h747.dma1 as reg
 
 // STM32 DMA1/DMA2 register banks, eight streams. Direct mode, single transfers,
@@ -49,9 +50,6 @@ const STREAMS_END: u32 = reg.S7FCR_OFFSET + 4
 
 private field(word: u32, mask: u32, shift: u32) -> u32 = (word & mask) >> shift
 
-type BusRead = &Fn(u32,u32) -> Option[u32]
-type BusWrite = &Fn(u32,u32,u32) -> bool
-
 struct Stream
     cr: u32
     ndtr: u32
@@ -75,24 +73,36 @@ private fresh() -> Controller
     c
 
 controller() -> &Controller = fresh()
-reset(c: &Controller) = *c = fresh()
 
 private flag_shift(stream: usize) -> u32 = [0u32,6,16,22][stream % 4]
 
-private status(c: &Controller, high: bool) -> u32
+private status(c: *Controller, high: bool) -> u32
     var value: u32 = 0
     for i in 0usize..<4
         val stream = i + (if high then 4 else 0)
         value |= c.flags[stream] << flag_shift(stream)
     value
 
-irq(c: &Controller, stream: usize) -> bool
-    require stream < 8, "DMA stream index"
-    val cr = c.streams[stream].cr
-    val flags = c.flags[stream]
-    (flags & TRANSFER_ERROR != 0 && cr & reg.S0CR_TEIE_MASK != 0) ||
-        (flags & HALF_TRANSFER != 0 && cr & reg.S0CR_HTIE_MASK != 0) ||
-        (flags & TRANSFER_COMPLETE != 0 && cr & reg.S0CR_TCIE_MASK != 0)
+impl Controller
+    /** Whether `stream`'s interrupt line is high: a flag raised whose enable is set. */
+    stream_irq(*self, stream: usize) -> bool
+        require stream < 8, "DMA stream index"
+        val cr = self.streams[stream].cr
+        val flags = self.flags[stream]
+        (flags & TRANSFER_ERROR != 0 && cr & reg.S0CR_TEIE_MASK != 0) ||
+            (flags & HALF_TRANSFER != 0 && cr & reg.S0CR_HTIE_MASK != 0) ||
+            (flags & TRANSFER_COMPLETE != 0 && cr & reg.S0CR_TCIE_MASK != 0)
+
+// A controller moves a beat only when the board asks it to (`next_beat`, `finish_beat`): it has no
+// clock or events of its own. Every register is a word, which the bus checks; its interrupt line is
+// any stream's.
+impl Model for Controller
+    read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = read_register(self,offset)
+    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool = write_register(self,offset,value)
+    override irq(*self) -> bool
+        for stream in 0usize..<8 do if self.stream_irq(stream) then return true
+        false
+    reset(*self) = *self = fresh()
 
 private valid(s: *Stream, cr: u32) -> bool
     val peripheral = field(cr,reg.S0CR_PSIZE_MASK,reg.S0CR_PSIZE_SHIFT)
@@ -101,7 +111,7 @@ private valid(s: *Stream, cr: u32) -> bool
         field(cr,reg.S0CR_DIR_MASK,reg.S0CR_DIR_SHIFT) < DIR_MEMORY_TO_MEMORY &&
         cr & (reg.S0CR_PFCTRL_MASK | reg.S0CR_PBURST_MASK | reg.S0CR_MBURST_MASK) == 0 && s.fcr & reg.S0FCR_DMDIS_MASK == 0
 
-read(c: &Controller, offset: u32) -> Option[u32]
+private read_register(c: *Controller, offset: u32) -> Option[u32]
     if offset == reg.LISR_OFFSET || offset == reg.HISR_OFFSET then return Some(status(c,offset == reg.HISR_OFFSET))
     if offset == reg.LIFCR_OFFSET || offset == reg.HIFCR_OFFSET then return Some(0)
     if offset < reg.S0CR_OFFSET || offset >= STREAMS_END || offset & 3 != 0 then return None
@@ -116,7 +126,7 @@ read(c: &Controller, offset: u32) -> Option[u32]
         M1AR -> Some(s.m1ar)
         _ -> Some(s.fcr)
 
-write(c: &Controller, offset: u32, value: u32) -> bool
+private write_register(c: *Controller, offset: u32, value: u32) -> bool
     if offset == reg.LISR_OFFSET || offset == reg.HISR_OFFSET then return true
     if offset == reg.LIFCR_OFFSET || offset == reg.HIFCR_OFFSET
         for i in 0usize..<4
@@ -176,19 +186,6 @@ next_beat(c: &Controller, stream: usize) -> Option[Beat]
     // DIR 1, memory to peripheral (2 is refused when the stream is enabled).
     val sending = s.cr & (1 << reg.S0CR_DIR_SHIFT) != 0
     Some(Beat(if sending then memory else peripheral, if sending then peripheral else memory, width))
-
-// Exactly one peripheral request/beat. Bus failure leaves NDTR unchanged and
-// raises TEIF. A caller must gate requests using the peripheral's request line.
-request(c: &Controller, stream: usize, read_bus: BusRead, write_bus: BusWrite) -> bool
-    next_beat(c,stream) match
-        None -> false
-        Some(b) ->
-            var ok = aligned(b)
-            if ok
-                (read_bus)(b.source,b.width) match
-                    Some(value) -> ok = (write_bus)(b.target,b.width,value & width_mask(b.width))
-                    None -> ok = false
-            finish_beat(c,stream,ok)
 
 /** Retire the beat `next_beat` answered for `stream`, which the bus made (`ok`) or failed: a failure
  * leaves NDTR unchanged, raises TEIF and disables the stream. Answers `ok`.

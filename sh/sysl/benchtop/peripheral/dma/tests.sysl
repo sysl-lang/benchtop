@@ -2,12 +2,34 @@ module sh.sysl.benchtop.peripheral.dma
 @tests
 
 import sysl.buf.{Buf,buf}
+import sh.sysl.benchtop.peripheral.Model
 import sh.sysl.benchtop.peripheral.sai as sai
+import sh.sysl.benchtop.timing.NEVER
+
+// A test's bus, as a board's: a read of `width` bytes at an address, and a write of a value.
+type BusRead = &Fn(u32,u32) -> Option[u32]
+type BusWrite = &Fn(u32,u32,u32) -> bool
+
+// Exactly one peripheral request/beat of `stream`, made on the test's bus as a board makes it. Bus
+// failure leaves NDTR unchanged and raises TEIF.
+private request(c: &Controller, stream: usize, read_bus: BusRead, write_bus: BusWrite) -> bool
+    next_beat(c,stream) match
+        None -> false
+        Some(b) ->
+            var ok = aligned(b)
+            if ok
+                (read_bus)(b.source,b.width) match
+                    Some(value) -> ok = (write_bus)(b.target,b.width,value & width_mask(b.width))
+                    None -> ok = false
+            finish_beat(c,stream,ok)
+
+private get(c: &Controller, offset: u32) -> Option[u32] = c.read(offset,4,0)
+private put(c: &Controller, offset: u32, value: u32) -> bool = c.write(offset,4,value,0)
 
 private arm(c: &Controller, stream: usize, count: u32, cr: u32)
     val base = 0x10 + u32(stream) * 24
-    assert(write(c,base + 4,count) && write(c,base + 8,0x40000000))
-    assert(write(c,base + 12,0x20000000) && write(c,base,cr | ENABLE))
+    assert(put(c,base + 4,count) && put(c,base + 8,0x40000000))
+    assert(put(c,base + 12,0x20000000) && put(c,base,cr | ENABLE))
 
 @test("STM32 DMA: all eight stream banks, widths, half/complete IRQ flags and selective W1C")
 dma_streams()
@@ -17,24 +39,37 @@ dma_streams()
     val sink: BusWrite = (address,width,value) ->
         writes.push(value)
         true
-    assert(read(c,0xd0).is_none() && !write(c,0x11,0))
+    assert(get(c,0xd0).is_none() && !put(c,0x11,0))
     for stream in 0usize..<8
         val size = u32(stream % 3)
         val cr = (1 << 6) | (1 << 10) | (size << 11) | (size << 13) | 28
         arm(c,stream,2,cr)
-        assert(request(c,stream,source,sink) && c.streams[stream].ndtr == 1 && irq(c,stream))
+        assert(request(c,stream,source,sink) && c.streams[stream].ndtr == 1 && c.stream_irq(stream))
         val shift = [0u32,6,16,22][stream % 4]
         val status_at: u32 = if stream < 4 then 0 else 4
-        assert(read(c,status_at).unwrap() & (HALF_TRANSFER << shift) != 0)
-        assert(write(c,status_at + 8,HALF_TRANSFER << shift) && !irq(c,stream))
+        assert(get(c,status_at).unwrap() & (HALF_TRANSFER << shift) != 0)
+        assert(put(c,status_at + 8,HALF_TRANSFER << shift) && !c.stream_irq(stream))
         assert(request(c,stream,source,sink) && c.streams[stream].ndtr == 0)
-        assert(c.streams[stream].cr & ENABLE == 0 && irq(c,stream))
+        assert(c.streams[stream].cr & ENABLE == 0 && c.stream_irq(stream))
         assert(!request(c,stream,source,sink))
-        assert(write(c,status_at + 8,0x3d << shift) && !irq(c,stream))
+        assert(put(c,status_at + 8,0x3d << shift) && !c.stream_irq(stream))
         val expected: u32 = if size == 0 then 0x78 elif size == 1 then 0x5678 else 0x12345678
         assert(writes.at(stream * 2) == expected)
-    reset(c)
+    c.reset()
     for stream in 0usize..<8 do assert(c.flags[stream] == 0 && c.streams[stream].fcr == 0x21)
+
+@test("STM32 DMA: the controller's interrupt line is any stream's, and it has no events of its own")
+dma_line()
+    val c = controller()
+    val source: BusRead = (address,width) -> Some(0)
+    val sink: BusWrite = (address,width,value) -> true
+    assert(!c.irq() && c.due() == NEVER)
+    arm(c,5,1,(1 << 6) | (1 << 4) | 4)
+    assert(request(c,5,source,sink))
+    assert(c.stream_irq(5) && !c.stream_irq(4) && c.irq())
+    assert(put(c,0xc,TRANSFER_COMPLETE << 6) && !c.irq())
+    c.advance(1000)
+    assert(c.due() == NEVER, "a controller moves only when asked")
 
 @test("STM32 DMA: circular and double-buffer transfers reload counts, swap targets and protect active registers")
 dma_buffers()
@@ -45,17 +80,17 @@ dma_buffers()
         Some(address)
     val sink: BusWrite = (address,width,value) -> true
     arm(c,0,2,(1 << 6) | (1 << 10) | DOUBLE_BUFFER)
-    assert(write(c,0x20,0x20000100))
-    assert(write(c,0x1c,0x99999999) && c.streams[0].m0ar == 0x20000000)
-    assert(write(c,0x14,99) && c.streams[0].ndtr == 2)
+    assert(put(c,0x20,0x20000100))
+    assert(put(c,0x1c,0x99999999) && c.streams[0].m0ar == 0x20000000)
+    assert(put(c,0x14,99) && c.streams[0].ndtr == 2)
     for i in 0..<2 do assert(request(c,0,source,sink))
     assert(c.streams[0].cr & CURRENT_TARGET != 0 && c.streams[0].ndtr == 2)
-    assert(write(c,0x1c,0x20000200))
+    assert(put(c,0x1c,0x20000200))
     for i in 0..<3 do assert(request(c,0,source,sink))
     assert(addresses.view() == [0x20000000u32,0x20000001,0x20000100,0x20000101,0x20000200][..])
     assert(c.flags[0] & (HALF_TRANSFER | TRANSFER_COMPLETE) == HALF_TRANSFER | TRANSFER_COMPLETE)
-    assert(write(c,0x10,0) && !request(c,0,source,sink))
-    reset(c)
+    assert(put(c,0x10,0) && !request(c,0,source,sink))
+    c.reset()
     arm(c,0,3,(1 << 6) | (1 << 10) | CIRCULAR)
     addresses.clear()
     for i in 0..<6 do assert(request(c,0,source,sink))
@@ -73,16 +108,16 @@ dma_faults()
     assert(request(c,6,source,sink))
     assert(targets.view() == [0x20000000u32][..] && c.streams[6].ndtr == 1)
     assert(!request(c,6,(address,width) -> None,sink))
-    assert(c.streams[6].ndtr == 1 && c.flags[6] & TRANSFER_ERROR != 0 && irq(c,6))
-    assert(write(c,12,TRANSFER_ERROR << 16) && !irq(c,6))
-    reset(c)
+    assert(c.streams[6].ndtr == 1 && c.flags[6] & TRANSFER_ERROR != 0 && c.stream_irq(6))
+    assert(put(c,12,TRANSFER_ERROR << 16) && !c.stream_irq(6))
+    c.reset()
     arm(c,0,1,(1 << 6) | 4)
     assert(!request(c,0,source,(address,width,value) -> false))
     assert(c.streams[0].ndtr == 1 && c.flags[0] == TRANSFER_ERROR)
-    reset(c)
+    c.reset()
     arm(c,0,1,(1 << 6) | (2 << 11) | (2 << 13) | 4)
-    assert(write(c,0x10,0) && write(c,0x1c,0x20000001))
-    assert(write(c,0x10,(1 << 6) | (2 << 11) | (2 << 13) | 5))
+    assert(put(c,0x10,0) && put(c,0x1c,0x20000001))
+    assert(put(c,0x10,(1 << 6) | (2 << 11) | (2 << 13) | 5))
     assert(!request(c,0,source,sink) && c.streams[0].ndtr == 1)
 
 @test("STM32 DMA: a beat is described without effect and retired only by finish_beat")
@@ -101,59 +136,58 @@ dma_beats()
     assert(!finish_beat(c,2,false) && c.streams[2].ndtr == 1 && c.flags[2] & TRANSFER_ERROR != 0)
     assert(c.streams[2].cr & ENABLE == 0 && next_beat(c,2).is_none(),"a failed beat disables the stream")
     // Memory to peripheral, words: the ends swap, and an odd memory address is not aligned.
-    reset(c)
+    c.reset()
     arm(c,0,1,(1 << 6) | (2 << 11) | (2 << 13))
-    assert(write(c,0x10,0) && write(c,0x1c,0x20000001) && write(c,0x10,(1 << 6) | (2 << 11) | (2 << 13) | ENABLE))
+    assert(put(c,0x10,0) && put(c,0x1c,0x20000001) && put(c,0x10,(1 << 6) | (2 << 11) | (2 << 13) | ENABLE))
     val odd = next_beat(c,0).unwrap()
     assert(odd.source == 0x20000001 && odd.target == 0x40000000 && !aligned(odd) && width_mask(4) == 0xffffffff)
 
 @test("STM32 DMA: unsupported transfer modes are rejected before enabling and mux routing is explicit")
 dma_configuration()
     val c = controller()
-    assert(!write(c,0x10,1),"zero count cannot start")
-    assert(write(c,0x14,4))
+    assert(!put(c,0x10,1),"zero count cannot start")
+    assert(put(c,0x14,4))
     for cr in [(2u32 << 6),(1 << 5),(1 << 21),(1 << 11),(3 << 11) | (3 << 13)]
-        assert(!write(c,0x10,cr | ENABLE) && c.streams[0].cr & ENABLE == 0)
-    assert(!write(c,0x24,4),"FIFO mode remains explicit future work")
+        assert(!put(c,0x10,cr | ENABLE) && c.streams[0].cr & ENABLE == 0)
+    assert(!put(c,0x24,4),"FIFO mode remains explicit future work")
     val m = mux()
     assert(!routed(m,9,87) && !routed(m,0,0))
-    assert(write_mux(m,9 * 4,87) && routed(m,9,87) && !routed(m,1,87))
-    assert(write_mux(m,12 * 4,88) && routed(m,12,88))
-    assert(!write_mux(m,9 * 4,87 | (1 << 16)) && read_mux(m,9 * 4) == Some(87))
-    assert(read_mux(m,0x100).is_none() && !write_mux(m,0x100,1))
-    reset_mux(m)
-    assert(!routed(m,9,87))
+    assert(m.write(9 * 4,4,87,0) && routed(m,9,87) && !routed(m,1,87))
+    assert(m.write(12 * 4,4,88,0) && routed(m,12,88))
+    assert(!m.write(9 * 4,4,87 | (1 << 16),0) && m.read(9 * 4,4,0) == Some(87))
+    assert(m.read(0x100,4,0).is_none() && !m.write(0x100,4,1,0))
+    m.reset()
+    assert(!routed(m,9,87) && !routed(m,12,88))
 
 @test("STM32 audio pipeline: DMAMUX routes circular RAM DMA into timed SAI stereo slots without CPU sample writes")
 dma_sai_pipeline()
-    val audio = sai.block()
-    assert(sai.write(audio,8,63 | (31 << 8) | (1 << 16)))
-    assert(sai.write(audio,12,(3 << 16) | (1 << 8) | (2 << 6)))
-    assert(sai.write(audio,4,4))
-    assert(sai.write(audio,0,(4 << 5) | (1 << 20) | sai.ENABLE | sai.DMA_ENABLE))
+    val output: Buf[u32] = buf()
+    val audio: &sai.Block = sai.block(endpoint = (slot,word,time) ->
+        output.push(word)
+        0)
+    assert(audio.write(8,4,63 | (31 << 8) | (1 << 16),0))
+    assert(audio.write(12,4,(3 << 16) | (1 << 8) | (2 << 6),0))
+    assert(audio.write(4,4,4,0))
+    assert(audio.write(0,4,(4 << 5) | (1 << 20) | sai.ENABLE | sai.DMA_ENABLE,0))
     val c = controller()
     val m = mux()
-    assert(write_mux(m,9 * 4,87))
+    assert(m.write(9 * 4,4,87,0))
     val samples: [16]u32 = [0x8000,0x7fff,0,1,2,3,4,5,6,7,8,9,10,11,12,13]
     val read_bus: BusRead = (address,width) ->
         if address < 0x20000000 || address >= 0x20000020 || width != 2 then None
         else Some(samples[usize((address - 0x20000000) / 2)])
     val write_bus: BusWrite = (address,width,value) ->
-        address == 0x40015820 && width == 2 && sai.write(audio,sai.DR,value)
+        address == 0x40015820 && width == 2 && audio.write(sai.DR,4,value,0)
     arm(c,1,16,(1 << 6) | (1 << 10) | (1 << 11) | (1 << 13) | CIRCULAR | 28)
     // Stream 1 PAR: SAI1 base + Block A offset + DR offset.
-    assert(write(c,0x28,0) && write(c,0x30,0x40015820))
-    assert(write(c,0x28,(1 << 6) | (1 << 10) | (1 << 11) | (1 << 13) | CIRCULAR | 29))
-    val output: Buf[u32] = buf()
-    val endpoint: sai.Endpoint = (slot,word,time) ->
-        output.push(word)
-        0
+    assert(put(c,0x28,0) && put(c,0x30,0x40015820))
+    assert(put(c,0x28,(1 << 6) | (1 << 10) | (1 << 11) | (1 << 13) | CIRCULAR | 29))
     for tick in 0..<17
-        while routed(m,9,87) && sai.dma_request(audio) do assert(request(c,1,read_bus,write_bus))
-        if tick < 16 then sai.advance(audio,audio.due,endpoint)
+        while routed(m,9,87) && audio.dma_request() do assert(request(c,1,read_bus,write_bus))
+        if tick < 16 then audio.advance(audio.due())
     assert(output.view() == samples[..])
     assert(audio.time == 80000 && audio.flags == 0 && audio.fifo.len() == 8)
-    assert(c.streams[1].ndtr == 8 && c.flags[1] == HALF_TRANSFER | TRANSFER_COMPLETE && irq(c,1))
+    assert(c.streams[1].ndtr == 8 && c.flags[1] == HALF_TRANSFER | TRANSFER_COMPLETE && c.stream_irq(1))
 
 @test("STM32 DMA: memory and peripheral increments use their respective widths and PINCOS stride")
 dma_increments()
