@@ -67,6 +67,17 @@ cycles are a range and the host instructions are not):
 Thumb-2 says the same in 12% fewer instructions, and each costs about what an M0+ instruction does,
 so a round takes about as long on either. The M0+'s count is the same as before the M33 existed.
 
+`it33.bin` (`it.s`) is a loop in which 12 of 27 instructions are inside IT blocks of every length;
+`it.c` computes its answer on the host:
+
+```
+/usr/bin/time -l ./benchtop bench --core cortex-m33 bench/guest/it33.bin 830458893 threaded
+```
+
+On the M5 Pro, sysl 0.7.10, three rounds of 270.0 M guest instructions, the `become` chain retires
+13.58 G host instructions, 16.8 per guest instruction: an instruction in a block costs its condition's
+handler and the one jump to its own, chosen when the block was decoded.
+
 ## The Hazard3
 
 `kernel-rv.bin` is the same `kernel.c` built for RV32IMAC (`start-rv.S` sets the stack, calls `run`
