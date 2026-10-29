@@ -1,6 +1,7 @@
 module sh.sysl.benchtop.peripheral.sdmmc
 
 import sh.sysl.benchtop.parts.sd_card as card
+import sh.sysl.benchtop.peripheral.Model
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.stm32h747.sdmmc1 as reg
 
@@ -106,55 +107,75 @@ struct Host
     payload: [512]u8
     busy_due: u64
     stats: Stats
+    wiring: Wiring
 
-/** A host at reset with the given clocks: every register zero and nothing due. The one place the
- * reset state is written; `host` boxes it and `reset` stores it over a live host.
+/** What the host reaches outside itself, set once by whoever puts it on a board (`connect`). */
+struct Wiring
+    /** The card on its bus, if any. */
+    card: Option[&card.Native]
+    /** Whether the card's lines reach the host on a bus of the given data lanes (1 or 4). */
+    routed: &Fn(u32) -> bool
+    /** The IDMA's RAM: fill the bytes from an address, and store them at one; each answers whether
+     * the whole view was RAM it could reach. They see complete views; no host file is touched here.
+     */
+    read_ram: &Fn(u32,[]u8) -> bool
+    write_ram: &Fn(u32,[]const u8) -> bool
+
+/** No card, every line routed, and no RAM the IDMA can reach. */
+unwired() -> Wiring = Wiring(None, lanes -> true, (address,out) -> false, (address,bytes) -> false)
+
+/** A host at reset with the given clocks and wiring: every register zero and nothing due. The one
+ * place the reset state is written; `host` boxes it and `reset` stores it over a live host.
  */
-private fresh(hz: u64, kernel: u64) -> Host
-    var h: Host
-    h.hz = hz
-    h.kernel = kernel
-    h.command_due = NEVER
-    h.data_due = NEVER
-    h.timeout_due = NEVER
-    h.busy_due = NEVER
-    h
+private fresh(hz: u64, kernel: u64, wiring: Wiring) -> Host
+    var stats: Stats
+    // hz, kernel; POWER, CLKCR, ARGR, CMDR, RESPCMDR, RESP1-4, DTIMER, DLENR, DCTRL, DCNTR, STAR, MASKR,
+    // IDMACTRLR, IDMABASE0R; the clock, command and data deadlines, the latched argument and direction,
+    // the data timeout, IDMABASE1R, IDMABSIZER; the transfer's progress and its block buffer; the
+    // busy deadline.
+    Host(hz, kernel, 0, 0, 0, 0, 0, [0;4], 0, 0, 0, 0, 0, 0, 0, 0,
+        0, NEVER, NEVER, 0, false, NEVER, 0, 0,
+        0, 0, 0, 0, 0, false, [0;512], NEVER, stats, wiring)
 
 host(hz: u64 = 480000000, kernel: u64 = 60000000) -> &Host
     require hz > 0 && kernel > 0 && kernel <= hz, "SDMMC timebase and kernel clock"
-    fresh(hz,kernel)
+    fresh(hz,kernel,unwired())
 
-reset(h: &Host) = *h = fresh(h.hz,h.kernel)
+impl Host
+    /** Wire the host to its card, its routing and the RAM its IDMA moves. */
+    connect(*self, wiring: Wiring) = self.wiring = wiring
+    /** SDMMC_CK, the card clock CLKCR sets. */
+    clock_hz(*self) -> u64 = self.kernel / divisor(self.clock)
+    /** SDMMC_STAR at `time`: the latched flags, the state machines' activity and the card's busy. */
+    status(*self, time: u64) -> u32
+        val busy = self.wiring.card match
+            Some(c) -> card.native_busy(c,time)
+            None -> false
+        self.flags | (if self.command_due != NEVER then reg.STAR_CPSMACT_MASK else 0) |
+            (if self.data_due != NEVER then reg.STAR_DPSMACT_MASK else 0) | reg.STAR_TXFIFOE_MASK | reg.STAR_RXFIFOE_MASK |
+            (if busy then reg.STAR_BUSYD0_MASK else 0)
+
 // The SDMMC_CK divider of a CLKCR word: CLKDIV 0 passes the kernel clock through, n divides it by 2n.
 private divisor(clock: u32) -> u64
     val clkdiv = clock & reg.CLKCR_CLKDIV_MASK
     if clkdiv == 0 then 1 else 2 * u64(clkdiv)
-clock_hz(h: &Host) -> u64 = h.kernel / divisor(h.clock)
 // The data lanes the bus is set to: CLKCR WIDBUS 1 is a 4-bit bus, 0 a 1-bit one.
-private lanes(h: &Host) -> u32 = if (h.clock & reg.CLKCR_WIDBUS_MASK) >> reg.CLKCR_WIDBUS_SHIFT == 1 then 4 else 1
+private lanes(h: *Host) -> u32 = if (h.clock & reg.CLKCR_WIDBUS_MASK) >> reg.CLKCR_WIDBUS_SHIFT == 1 then 4 else 1
 // IDMACTRLR IDMABMODE: the IDMA alternates between two buffers, IDMABACT naming the one in use.
-private double_buffered(h: &Host) -> bool = h.idma & reg.IDMACTRLR_IDMABMODE_MASK != 0
-private ticks(h: &Host, clocks: u64) -> u64
-    val rate = clock_hz(h)
+private double_buffered(h: *Host) -> bool = h.idma & reg.IDMACTRLR_IDMABMODE_MASK != 0
+private ticks(h: *Host, clocks: u64) -> u64
+    val rate = h.clock_hz()
     (clocks * h.hz + rate - 1) / rate
-private retry(h: &Host, time: u64) -> u64 = time + (if h.hz < 10000 then 1u64 else h.hz / 10000)
-irq(h: &Host) -> bool = h.flags & h.mask != 0
-due(h: &Host) -> u64
+private retry(h: *Host, time: u64) -> u64 = time + (if h.hz < 10000 then 1u64 else h.hz / 10000)
+private next_event(h: *Host) -> u64
     var next = if h.command_due < h.data_due then h.command_due else h.data_due
     if h.busy_due < next then next = h.busy_due
     next
-status(h: &Host, c: Option[&card.Native], time: u64) -> u32
-    val busy = c match
-        Some(c) -> card.native_busy(c,time)
-        None -> false
-    h.flags | (if h.command_due != NEVER then reg.STAR_CPSMACT_MASK else 0) |
-        (if h.data_due != NEVER then reg.STAR_DPSMACT_MASK else 0) | reg.STAR_TXFIFOE_MASK | reg.STAR_RXFIFOE_MASK |
-        (if busy then reg.STAR_BUSYD0_MASK else 0)
-private abort_data(h: &Host, c: Option[&card.Native], time: u64, flag: u32)
+private abort_data(h: *Host, time: u64, flag: u32)
     h.flags |= flag
     h.data_due = NEVER
-    if c.is_some() then card.native_abort(c.unwrap(),time)
-private schedule(h: &Host, time: u64)
+    if h.wiring.card.is_some() then card.native_abort(h.wiring.card.unwrap(),time)
+private schedule(h: *Host, time: u64)
     var count = h.block_size - h.block_used
     if count > 32 then count = 32
     if count > h.remaining then count = h.remaining
@@ -164,13 +185,15 @@ private schedule(h: &Host, time: u64)
     val overhead = (if h.block_used == 0 then 8u64 else 0) + (if count == h.block_size - h.block_used then 18u64 else 0)
     h.data_due = time + ticks(h,(u64(count) * 8 + wires - 1) / wires + overhead)
     if h.timeout_due < h.data_due then h.data_due = h.timeout_due
-private finish_command(h: &Host, c: Option[&card.Native], routed: bool, at: u64)
+// Whether a card is on the bus and its lines reach the host at the bus width set.
+private reachable(h: *Host) -> bool = h.wiring.card.is_some() && (h.wiring.routed)(lanes(h))
+private finish_command(h: *Host, reached: bool, at: u64)
     h.command_due = NEVER
     h.stats.commands += 1
-    if c.is_none() || !routed
+    if !reached
         h.flags |= reg.STAR_CTIMEOUT_MASK
         return
-    val native = c.unwrap()
+    val native = h.wiring.card.unwrap()
     val index = h.command & reg.CMDR_CMDINDEX_MASK
     if index == CMD_STOP || h.command & reg.CMDR_CMDSTOP_MASK != 0
         if h.data_due != NEVER then h.flags |= reg.STAR_DABORT_MASK
@@ -197,10 +220,10 @@ private finish_command(h: &Host, c: Option[&card.Native], routed: bool, at: u64)
     if h.data_due != NEVER || h.command & reg.CMDR_CMDTRANS_MASK == 0 || h.idma & reg.IDMACTRLR_IDMAEN_MASK == 0 ||
             to_card != writing || !count_ok || block != length || h.base & 3 != 0 ||
             (double_buffered(h) && (h.buffer_size == 0 || h.base1 & 3 != 0))
-        abort_data(h,c,at,reg.STAR_IDMATE_MASK)
+        abort_data(h,at,reg.STAR_IDMATE_MASK)
         return
     if native.width != lanes(h)
-        abort_data(h,c,at,reg.STAR_DCRCFAIL_MASK)
+        abort_data(h,at,reg.STAR_DCRCFAIL_MASK)
         return
     h.data_write = writing
     h.remaining = total
@@ -214,15 +237,16 @@ private finish_command(h: &Host, c: Option[&card.Native], routed: bool, at: u64)
     if double_buffered(h) then h.stats.double_transfers += 1
     schedule(h,at)
 
-// RAM callbacks validate complete views before accessing memory. Card/media
-// callbacks see sectors; no host filesystem calls execute on CPU workers.
-advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
-        read_ram: &Fn(u32,[]u8) -> bool, write_ram: &Fn(u32,[]const u8) -> bool)
+// The host's events up to `time`. Whether the card is reached is settled once per call: nothing
+// that routes it changes while the host runs.
+private run(h: *Host, time: u64)
     if time < h.at then return
-    while due(h) <= time && due(h) != NEVER
-        val at = due(h)
+    val reached = reachable(h)
+    val c = h.wiring.card
+    while next_event(h) <= time && next_event(h) != NEVER
+        val at = next_event(h)
         if h.command_due == at
-            finish_command(h,c,routed,at)
+            finish_command(h,reached,at)
             continue
         if h.busy_due == at
             if c.is_some() && card.native_busy(c.unwrap(),at) then h.busy_due = retry(h,at)
@@ -232,10 +256,10 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
             continue
         h.data_due = NEVER
         if at >= h.timeout_due
-            abort_data(h,c,at,reg.STAR_DTIMEOUT_MASK)
+            abort_data(h,at,reg.STAR_DTIMEOUT_MASK)
             continue
-        if c.is_none() || !routed
-            abort_data(h,c,at,reg.STAR_DTIMEOUT_MASK)
+        if !reached
+            abort_data(h,at,reg.STAR_DTIMEOUT_MASK)
             continue
         val native = c.unwrap()
         if h.data_write && h.block_used == 0 && card.native_busy(native,at)
@@ -244,19 +268,19 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
             continue
         if !h.data_write && !h.loaded
             if !card.native_read(native,h.payload[..<usize(h.block_size)])
-                abort_data(h,c,at,reg.STAR_DCRCFAIL_MASK)
+                abort_data(h,at,reg.STAR_DCRCFAIL_MASK)
                 continue
             h.loaded = true
         val base = if double_buffered(h) && h.idma & reg.IDMACTRLR_IDMABACT_MASK != 0 then h.base1 else h.base
         val offset = if double_buffered(h) then h.buffer_used else h.transferred
         val address = u64(base) + u64(offset)
         if address + u64(h.chunk) > 0x100000000
-            abort_data(h,c,at,reg.STAR_IDMATE_MASK)
+            abort_data(h,at,reg.STAR_IDMATE_MASK)
             continue
         val piece = h.payload[usize(h.block_used)..<usize(h.block_used + h.chunk)]
-        val moved = if h.data_write then (read_ram)(u32(address),piece) else (write_ram)(u32(address),piece)
+        val moved = if h.data_write then (h.wiring.read_ram)(u32(address),piece) else (h.wiring.write_ram)(u32(address),piece)
         if !moved
-            abort_data(h,c,at,reg.STAR_IDMATE_MASK)
+            abort_data(h,at,reg.STAR_IDMATE_MASK)
             continue
         h.block_used += h.chunk
         h.buffer_used += h.chunk
@@ -270,7 +294,7 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
         if h.block_used == h.block_size
             if h.data_write
                 if !card.native_write(native,h.payload[..<usize(h.block_size)],at)
-                    abort_data(h,c,at,reg.STAR_DCRCFAIL_MASK)
+                    abort_data(h,at,reg.STAR_DCRCFAIL_MASK)
                     continue
                 h.busy_due = if native.card.busy_until > at then native.card.busy_until else retry(h,at)
             else card.native_read_complete(native)
@@ -285,7 +309,7 @@ advance(h: &Host, time: u64, c: Option[&card.Native], routed: bool,
         else schedule(h,at)
     h.at = time
 
-read(h: &Host, offset: u32, c: Option[&card.Native], time: u64) -> Option[u32] = offset match
+private read_register(h: *Host, offset: u32, time: u64) -> Option[u32] = offset match
     reg.POWER_OFFSET -> Some(h.power)
     reg.CLKCR_OFFSET -> Some(h.clock)
     reg.ARGR_OFFSET -> Some(h.arg)
@@ -297,7 +321,7 @@ read(h: &Host, offset: u32, c: Option[&card.Native], time: u64) -> Option[u32] =
     reg.DLENR_OFFSET -> Some(h.length)
     reg.DCTRL_OFFSET -> Some(h.control)
     reg.DCNTR_OFFSET -> Some(h.remaining)
-    reg.STAR_OFFSET -> Some(status(h,c,time))
+    reg.STAR_OFFSET -> Some(h.status(time))
     reg.ICR_OFFSET -> Some(0)
     reg.MASKR_OFFSET -> Some(h.mask)
     reg.ACKTIMER_OFFSET -> Some(0)
@@ -307,7 +331,7 @@ read(h: &Host, offset: u32, c: Option[&card.Native], time: u64) -> Option[u32] =
     reg.IDMABASE1R_OFFSET -> Some(h.base1)
     VERR_OFFSET -> Some(VERR)
     _ -> None
-write(h: &Host, offset: u32, value: u32, time: u64) -> bool
+private write_register(h: *Host, offset: u32, value: u32, time: u64) -> bool
     offset match
         reg.POWER_OFFSET ->
             if value != 0 && value != POWER_ON then return false
@@ -359,3 +383,14 @@ write(h: &Host, offset: u32, value: u32, time: u64) -> bool
             if offset == reg.IDMABASE0R_OFFSET then h.base = value else h.base1 = value
         _ -> return false
     true
+
+// Every register is a word; the bus checks the width before it reaches the host.
+impl Model for Host
+    read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = read_register(self,offset,time)
+    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool = write_register(self,offset,value,time)
+    // RAM callbacks validate complete views before accessing memory. Card/media callbacks see
+    // sectors; no host filesystem calls execute on CPU workers.
+    override advance(*self, time: u64) = run(self,time)
+    override due(*self) -> u64 = next_event(self)
+    override irq(*self) -> bool = self.flags & self.mask != 0
+    reset(*self) = *self = fresh(self.hz,self.kernel,self.wiring)

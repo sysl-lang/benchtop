@@ -1,6 +1,7 @@
 module sh.sysl.benchtop.virt
 
 import sh.sysl.benchtop.{Board,Target,param_named}
+import sh.sysl.benchtop.peripheral.Model
 import sh.sysl.benchtop.peripheral.sdmmc as sdmmc
 import sh.sysl.benchtop.parts.sd_card as card
 import sh.sysl.benchtop.v6m as memory
@@ -15,9 +16,11 @@ struct SdRoute
 
 /** The SDMMC (`stm32-sdmmc`): the IRQ it raises (-1 for none), whether the board wires its bus and
  * the pins its CK, CMD and D0-D3 are routed to, which the board fixes; `next` and `level`, its next
- * event's clock and its interrupt line, published for the cores to read without its lock; and under
- * `live` its host and the card on it. A thread holding `live` may take the storage path's lock (for
- * the GPIO banks), never the other way round.
+ * event's clock and its interrupt line, published for the cores to read without its lock; under
+ * `live` its host, which holds the card on it; and `via`, the core on whose thread the host last ran,
+ * which its IDMA's RAM callbacks reach memory through: set under `live` before the host runs, and read
+ * only by those callbacks while it does. A thread holding `live` may take the storage path's lock
+ * (for the GPIO banks), never the other way round.
  */
 struct SdmmcState
     present: bool
@@ -27,16 +30,26 @@ struct SdmmcState
     wired: bool
     routes: [6]SdRoute
     live: Mutex[SdmmcLive]
+    via: *memory.Cpu
 
-/** The SDMMC's host and the card on it, if any. */
+/** The SDMMC's host, wired to the card on it, if any (`connect_sdmmc`). */
 struct SdmmcLive
     host: &sdmmc.Host
-    card: Option[&card.Native]
 
 private val sd_signal_names: [6]string = ["ck","cmd","d0","d1","d2","d3"]
 
 /** No SDMMC on the bus. */
-sdmmc_state() -> SdmmcState = SdmmcState(false, -1, NEVER, 0, false, [SdRoute(0,0);6], Mutex.new(SdmmcLive(sdmmc.host(), None)))
+sdmmc_state() -> SdmmcState = SdmmcState(false, -1, NEVER, 0, false, [SdRoute(0,0);6], Mutex.new(SdmmcLive(sdmmc.host())), null)
+
+/** Wire the host to its routing and to the RAM its IDMA moves, on the core that runs it. Called once
+ * the devices are in place, since the callbacks hold their address.
+ */
+private[virt] connect_sdmmc(ds: *Devices)
+    val s = &ds.sdmmc
+    s.live.with(l -> l.host.connect(sdmmc.Wiring(l.host.wiring.card,
+        lanes -> sdmmc_routed(ds,lanes),
+        (address,out) -> sdmmc_read_ram(s.via,address,out),
+        (address,bytes) -> sdmmc_write_ram(s.via,address,bytes))))
 
 // The SDMMC `b` makes on a chip whose clock is `clock_hz`, its pins on the banks of `storage`, and
 // `sd`, the card the storage path puts on it, if any.
@@ -74,49 +87,55 @@ private[virt] check_sdmmc(b: Board, clock_hz: u64, storage: *StorageState, sd: O
                             found = true
                         None -> ()
         if !found then return Err("SDMMC requires routed ck/cmd/d0/d1/d2/d3 pins")
-    s.live = Mutex.new(SdmmcLive(sdmmc.host(clock_hz,kernel), sd match
-        Some(c) -> Some(card.native(c))
-        None -> None))
+    val host = sdmmc.host(clock_hz,kernel)
+    sd match
+        Some(c) -> host.wiring.card = Some(card.native(c))
+        None -> ()
+    s.live = Mutex.new(SdmmcLive(host))
     Ok(s)
 
 private[virt] boot_sdmmc(s: *SdmmcState)
     s.live.with(l ->
-        sdmmc.reset(l.host)
-        l.card match
+        l.host.reset()
+        l.host.wiring.card match
             Some(c) -> card.reset_native(c)
             None -> ())
     atomic_store(&s.next,NEVER,Release)
     atomic_store(&s.level,0,Release)
 
-// Whether the card's lines reach the host: each pin the bus width uses in alternate function 12 on
-// the GPIO the storage path holds.
-private sdmmc_routed(ds: *Devices, l: *SdmmcLive) -> bool
+// Whether the card's lines reach the host on a bus of `lanes` data lines: each pin that width uses in
+// alternate function 12 on the GPIO the storage path holds.
+private sdmmc_routed(ds: *Devices, lanes: u32) -> bool
     val s = &ds.sdmmc
     if !s.wired then return false
-    val count = if l.host.clock & 0xc000 == 0x4000 then 6usize else 3usize
+    val count = if lanes == 4 then 6usize else 3usize
     for i in 0..<count
         val route = s.routes[i]
         if !storage_gpio_alternate(&ds.storage,route.gpio,route.pin,12) then return false
     true
+
+// The IDMA's reads and writes of RAM, made on `cpu`'s thread: whole aligned words only.
+private sdmmc_read_ram(cpu: *memory.Cpu, address: u32, out: []u8) -> bool
+    if address & 3 != 0 || out.len & 3 != 0 || !cpu.mem.ram_range(address, u32(out.len)) then return false
+    for i in 0..<(out.len / 4)
+        val at = address + u32(i * 4)
+        val value = memory.host_read(memory.page_for(cpu,at,4),at,4)
+        for j in 0usize..<4 do out[i * 4 + j] = u8(value >> (u32(j) * 8))
+    true
+private sdmmc_write_ram(cpu: *memory.Cpu, address: u32, bytes: []const u8) -> bool
+    if address & 3 != 0 || bytes.len & 3 != 0 || !cpu.mem.ram_range(address, u32(bytes.len)) then return false
+    for i in 0..<(bytes.len / 4)
+        var value: u32 = 0
+        for j in 0usize..<4 do value |= u32(bytes[i * 4 + j]) << (u32(j) * 8)
+        if !memory.device_store(cpu,address + u32(i * 4),4,value) then return false
+    true
+
 private publish_sdmmc(s: *SdmmcState, l: *SdmmcLive)
-    atomic_store(&s.next,sdmmc.due(l.host),Release)
-    atomic_store(&s.level,if sdmmc.irq(l.host) then 1 else 0,Release)
+    atomic_store(&s.next,l.host.due(),Release)
+    atomic_store(&s.level,if l.host.irq() then 1 else 0,Release)
 private bring_sdmmc(ds: *Devices, l: *SdmmcLive, cpu: *memory.Cpu, time: u64)
-    val read_ram: &Fn(u32,[]u8) -> bool = (address,out) ->
-        if address & 3 != 0 || out.len & 3 != 0 || !cpu.mem.ram_range(address, u32(out.len)) then return false
-        for i in 0..<(out.len / 4)
-            val at = address + u32(i * 4)
-            val value = memory.host_read(memory.page_for(cpu,at,4),at,4)
-            for j in 0usize..<4 do out[i * 4 + j] = u8(value >> (u32(j) * 8))
-        true
-    val write_ram: &Fn(u32,[]const u8) -> bool = (address,bytes) ->
-        if address & 3 != 0 || bytes.len & 3 != 0 || !cpu.mem.ram_range(address, u32(bytes.len)) then return false
-        for i in 0..<(bytes.len / 4)
-            var value: u32 = 0
-            for j in 0usize..<4 do value |= u32(bytes[i * 4 + j]) << (u32(j) * 8)
-            if !memory.device_store(cpu,address + u32(i * 4),4,value) then return false
-        true
-    sdmmc.advance(l.host,time,l.card,sdmmc_routed(ds,l),read_ram,write_ram)
+    ds.sdmmc.via = cpu
+    l.host.advance(time)
     publish_sdmmc(&ds.sdmmc,l)
 private[virt] sdmmc_due(s: *SdmmcState) -> u64 = atomic_load(&s.next,Acquire)
 private[virt] sdmmc_wake(s: *SdmmcState, cpu: *memory.Cpu) -> u64
@@ -136,7 +155,7 @@ private[virt] sdmmc_read(ds: *Devices, cpu: *memory.Cpu, address: u32, offset: u
     val time = board_time(cpu,n)
     s.live.with(l ->
         bring_sdmmc(ds,l,cpu,time)
-        sdmmc.read(l.host,offset,l.card,time)) match
+        l.host.read(offset,width,time)) match
         Some(value) -> value
         None ->
             memory.halt(cpu,memory.Stop.Unmapped,address)
@@ -149,7 +168,7 @@ private[virt] sdmmc_write(ds: *Devices, cpu: *memory.Cpu, address: u32, offset: 
     val time = board_time(cpu,n)
     val ok = s.live.with(l ->
         bring_sdmmc(ds,l,cpu,time)
-        val ok = sdmmc.write(l.host,offset,value,time)
+        val ok = l.host.write(offset,width,value,time)
         publish_sdmmc(s,l)
         ok)
     if !ok then memory.halt(cpu,memory.Stop.Fault,address)
