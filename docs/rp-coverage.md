@@ -249,10 +249,28 @@ levels (Rule 4a), beside a register-level test of the model. That is the pattern
 | RP2040 chip layer and ROM | `blink`, `hello_serial`, `divider/hello_divider`, `multicore/hello_multicore`, SDK `pico_divider_test`, `pico_float_test` | ROM float and double functions against host IEEE results; the divider through the bus; FIFO depth 8 |
 | HSTX | `hstx/dvi_out_hstx_encoder` | the shift-register and TMDS output against the datasheet's examples |
 
-## 6. Cut lines — QUESTIONS for the user
+## 6. Cut lines — DECIDED
 
-Each of these is a block, or part of one, that could reasonably be left out. **These are questions for
-the user, not decisions.**
+Each of these is a block, or part of one, that could reasonably be left out. All fourteen are decided:
+
+| | decision |
+|---|---|
+| Q1 | the **real** boot ROM images, with OTP, BOOTRAM, QMI direct mode and the RCP modelled for them |
+| Q2 | the real boot path is built through **IMAGE_DEF**; the debugger entry stays as well |
+| Q3 | **Secure-only**; Non-secure state is not built |
+| Q4 | USB **device** mode only, with the CDC bridge |
+| Q5 | the **GDB stub**; no SW-DP, RESCUE or CoreSight trace |
+| Q6 | GLITCH_DETECTOR and TBMAN are **register stubs** |
+| Q7 | DORMANT and SLEEP are a **time skip** to the next wake event; POWMAN domains are stores |
+| Q8 | analogue stays **ideal and deterministic**; baud rates and PIO timing are **exact** |
+| Q9 | HSTX **later**, once a display part can show it |
+| Q10 | OTP **with ECC** and page locks |
+| Q11 | the RP2350B board **later**; the Pico 2 (RP2350A) now |
+| Q12 | only the errata the **SDK checks for** (RP2350-E2 behind an option) |
+| Q13 | **Arm first**, then RISC-V |
+| Q14 | the RP2040's chip layer comes **right after the RP2350's start-up items**, so each later peripheral is tested on both chips |
+
+The questions as they were asked:
 
 - **Q1. Real boot ROM, or a high-level ROM?** Mapping the real ROM images (`pico-bootrom-rp2040`,
   `pico-bootrom-rp2350`) is faithful. It needs OTP, BOOTRAM, QMI direct mode and the RCP all
