@@ -16,16 +16,20 @@ var sdmmc_dma: [1024]Word
 struct SdByte
     value: volatile u8
 
-sdmmc_command(base: u32, index: u32, arg: u32, response: card_spi.Response, transfer: bool = false) -> Result[[4]u32,sd.Error]
+sdmmc_command(base: u32, index: u8, arg: u32, response: card_spi.Response, transfer: bool = false) -> Result[[4]u32,sd.Error]
     word(base + 0x38).value = 0x1fe00fff
     word(base + 8).value = arg
-    val mode: u32 = if response == card_spi.Response.None then 0 elif response == card_spi.Response.Long then 3 elif response == card_spi.Response.NoCrc then 2 else 1
-    word(base + 12).value = index | (mode << 8) | 4096 | (if transfer then 64u32 else 0) | (if index == 12 then 128u32 else 0)
+    val mode: u32 = response match
+        card_spi.Response.Empty -> 0
+        card_spi.Response.R1 -> 1
+        card_spi.Response.R3 -> 2
+        card_spi.Response.R2 -> 3
+    word(base + 12).value = u32(index) | (mode << 8) | 4096 | (if transfer then 64u32 else 0) | (if index == 12 then 128u32 else 0)
     val start = storage_now()
     for i in 0..<1000000
         val flags = word(base + 0x34).value
         if flags & 4 != 0 then return Err(sd.Error.Timeout(sd.Phase.Response))
-        if flags & 1 != 0 && response != card_spi.Response.NoCrc then return Err(sd.Error.Crc)
+        if flags & 1 != 0 && response != card_spi.Response.R3 then return Err(sd.Error.Host(sd.HostError.CommandCrc))
         if flags & (if mode == 0 then 128u32 else 65u32) != 0
             return Ok([word(base + 0x14).value,word(base + 0x18).value,word(base + 0x1c).value,word(base + 0x20).value])
         if storage_now() - start >= 100000 then return Err(sd.Error.Timeout(sd.Phase.Response))
@@ -38,7 +42,7 @@ sdmmc_cleanup(base: u32)
     word(base + 0x2c).value = 0
     if active then word(base).value = 3
 
-sdmmc_transfer(base: u32, rate: u32, index: u32, arg: u32, count: usize, reading: bool, timeout_us: u32) -> Result[unit,sd.Error]
+sdmmc_transfer(base: u32, rate: u32, index: u8, arg: u32, count: usize, reading: bool, timeout_us: u32) -> Result[unit,sd.Error]
     word(base + 0x2c).value = 0
     word(base + 0x38).value = 0x1fe00fff
     val clocks = (u64(rate) * u64(timeout_us) + 999999) / 1000000
@@ -52,21 +56,23 @@ sdmmc_transfer(base: u32, rate: u32, index: u32, arg: u32, count: usize, reading
     word(base + 0x5c).value = if double then u32(usize(&sdmmc_dma[0]) + half) else 0
     word(base + 0x50).value = if double then 3 else 1
     audio_barrier()
-    val result = sdmmc_command(base,index,arg,card_spi.Response.Short,true)
+    val result = sdmmc_command(base,index,arg,card_spi.Response.R1,true)
     if result.is_err()
         sdmmc_cleanup(base)
         return Err(result.unwrap_err())
-    val status = card_spi.check_status(result.unwrap()[0])
-    if status.is_err()
+    // A card refuses a data command in that command's own R1 (WP_VIOLATION, OUT_OF_RANGE are
+    // response-type bits), and then never enters the data state: without this check the refusal
+    // would surface only as a data timeout.
+    if card_spi.card_status_error(result.unwrap()[0]) is Some(e)
         sdmmc_cleanup(base)
-        return status
+        return Err(e)
     val start = storage_now()
     val blocks = if count < 512 then 1usize else count / 512
     for i in 0..<(1000000 * blocks)
         val flags = word(base + 0x34).value
         if flags & 0x0800003a != 0
             sdmmc_cleanup(base)
-            return Err(if flags & 8 != 0 then sd.Error.Timeout(sd.Phase.ReadToken) elif flags & 2 != 0 then sd.Error.Crc else sd.Error.Bus(sh.sysl.spi.Error.Io))
+            return Err(if flags & 8 != 0 then sd.Error.Timeout(sd.Phase.ReadToken) elif flags & 2 != 0 then sd.Error.Host(sd.HostError.DataCrc) else sd.Error.Host(sd.HostError.Io))
         if flags & 256 != 0
             audio_barrier()
             sdmmc_cleanup(base)
@@ -77,22 +83,22 @@ sdmmc_transfer(base: u32, rate: u32, index: u32, arg: u32, count: usize, reading
 
 impl card_spi.Host for SdmmcHost
     override max_blocks(self) -> usize = 8
-    configure(*self, hz: u32, width: u32) -> Result[unit,sd.Error]
-        if hz == 0 || (width != 1 && width != 4) then return Err(sd.Error.InvalidSettings)
+    configure(*self, hz: u32, width: card_spi.BusWidth) -> Result[unit,sd.Error]
+        if hz == 0 then return Err(sd.Error.InvalidSettings)
         val divider = (60000000u32 + hz * 2 - 1) / (hz * 2)
         if divider == 0 || divider > 1023 then return Err(sd.Error.InvalidSettings)
-        word(self.base + 4).value = divider | (if width == 4 then 0x4000u32 else 0)
+        word(self.base + 4).value = divider | (if width == card_spi.BusWidth.Four then 0x4000u32 else 0)
         word(self.base).value = 3
         self.rate = 60000000 / (divider * 2)
         Ok(())
-    command(*self, index: u32, arg: u32, response: card_spi.Response) -> Result[[4]u32,sd.Error] = sdmmc_command(self.base,index,arg,response)
-    read_data(*self, index: u32, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,sd.Error]
+    command(*self, index: u8, arg: u32, response: card_spi.Response) -> Result[[4]u32,sd.Error] = sdmmc_command(self.base,index,arg,response)
+    read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,sd.Error]
         if out.len != 8 && (out.len == 0 || out.len % 512 != 0 || out.len > 4096) then return Err(sd.Error.BadLength)
         sdmmc_transfer(self.base,self.rate,index,arg,out.len,true,timeout_us)?
         val bytes: *SdByte = ptr_cast(usize(&sdmmc_dma[0]))
         for i in 0..<out.len do out[i] = bytes[i].value
         Ok(())
-    write_data(*self, index: u32, arg: u32, input: []const u8, timeout_us: u32) -> Result[unit,sd.Error]
+    write_data(*self, index: u8, arg: u32, input: []const u8, timeout_us: u32) -> Result[unit,sd.Error]
         if input.len == 0 || input.len % 512 != 0 || input.len > 4096 then return Err(sd.Error.BadLength)
         val bytes: *SdByte = ptr_cast(usize(&sdmmc_dma[0]))
         for i in 0..<input.len do bytes[i].value = input[i]

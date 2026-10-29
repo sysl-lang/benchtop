@@ -1,131 +1,192 @@
 module sh.sysl.benchtop.parts.sd_card
 
+/** The SD card's `CURRENT_STATE` (physical layer spec, card status bits 12:9). */
+enum CardState: u32
+    Idle = 0
+    Ready = 1
+    Ident = 2
+    Stby = 3
+    Tran = 4
+    Data = 5
+    Rcv = 6
+    Prg = 7
+
+/** The response a command answers with. The values are SDMMC's `WAITRESP` encoding, which is how a
+ * host compares the response it waited for with the one it got.
+ */
+enum ResponseKind: u32
+    NoResponse = 0
+    Short = 1
+    ShortNoCrc = 2
+    Long = 3
+
+    /** Whether the response carries no command index of its own (R2, R3), so CMDR reads back 63. */
+    reports_no_index(self) -> bool = self == ShortNoCrc || self == Long
+
+/** The data transfer a command has opened, by the command that opened it. */
+enum Transfer
+    NoTransfer = 0
+    ReadSingle
+    ReadMultiple
+    WriteSingle
+    WriteMultiple
+    ReadScr
+
+    writes(self) -> bool = self == WriteSingle || self == WriteMultiple
+
+    multiple(self) -> bool = self == ReadMultiple || self == WriteMultiple
+
+    /** The bytes in one block of it: the 8-byte SCR, or one sector. */
+    block_length(self) -> u32 = if self == ReadScr then 8 else 512
+
 // Native SD state machine shares the same media, capacity, write protection,
-// programming delay and counters as the SPI endpoint. Response kinds match
-// SDMMC WAITRESP (0 none, 1 short CRC, 2 short without CRC, 3 long CRC).
+// programming delay and counters as the SPI endpoint.
 struct Native
     card: &Card
-    state: u32
+    state: CardState
     rca: u32
     width: u32
     app: bool
-    pending: u32
+    pending: Transfer
     sector: u64
+
+/** A command's answer: whether the card answered at all, the response, and the transfer it opened. */
 struct Reply
     present: bool
-    kind: u32
+    kind: ResponseKind
     words: [4]u32
-    data: u32
-    length: u32
-native(card: &Card) -> &Native = Native(card,0,0x12340000,1,false,0,0)
+    data: Transfer
+
+native(card: &Card) -> &Native = Native(card,Idle,0x12340000,1,false,NoTransfer,0)
+
 reset_native(n: &Native)
-    n.state = 0
+    n.state = Idle
     n.width = 1
     n.app = false
-    n.pending = 0
+    n.pending = NoTransfer
     reset(n.card)
-private status(n: &Native, time: u64) -> u32
-    if n.state == 7 && time >= n.card.busy_until && (n.card.media.ready)() then n.state = 4
-    (n.state << 9) | (if (n.state == 3 || n.state == 4) && (n.card.media.ready)() then 256u32 else 0) |
-        (if (n.card.media.good)() then 0u32 else 1u32 << 20)
-private short(value: u32, data: u32 = 0, length: u32 = 0) -> Reply = Reply(true,1,[value,0,0,0],data,length)
+
+/** Ends programming once the medium has finished: `Prg` becomes `Tran`. The one place time moves
+ * the card's state.
+ */
+private settle(n: &Native, time: u64)
+    if n.state == Prg && time >= n.card.busy_until && (n.card.media.ready)() then n.state = Tran
+
+/** The card status register (R1) as it stands; reading it changes nothing. */
+private status(n: &Native) -> u32
+    val ready = (n.state == Stby || n.state == Tran) && (n.card.media.ready)()
+    (u32(n.state) << 9) | (if ready then 256 else 0) | (if (n.card.media.good)() then 0 else 1 << 20)
+
+private short(value: u32, data: Transfer = NoTransfer) -> Reply = Reply(true,Short,[value,0,0,0],data)
+private absent(kind: ResponseKind) -> Reply = Reply(false,kind,[0;4],NoTransfer)
 private long(bytes: []const u8) -> Reply
     var words: [4]u32 = [0;4]
-    for i in 0usize..<16 do words[i / 4] |= u32(bytes[i]) << (24 - u32(i % 4) * 8)
-    Reply(true,3,words,0,0)
+    for i in 0..<16 do words[i / 4] |= u32(bytes[i]) << (24 - u32(i % 4) * 8)
+    Reply(true,Long,words,NoTransfer)
+
+private opened(index: u32) -> Transfer = index match
+    17 -> ReadSingle
+    18 -> ReadMultiple
+    24 -> WriteSingle
+    25 -> WriteMultiple
+    _ -> ReadScr
 
 native_command(n: &Native, index: u32, arg: u32, time: u64) -> Reply
-    n.card.commands += 1
-    val s = status(n,time)
+    n.card.stats.commands += 1
+    settle(n,time)
+    val s = status(n)
     val app = n.app
     n.app = false
     index match
         0 ->
-            n.state = 0
+            n.state = Idle
             n.width = 1
-            n.pending = 0
-            Reply(true,0,[0;4],0,0)
+            n.pending = NoTransfer
+            Reply(true,NoResponse,[0;4],NoTransfer)
         8 -> short(if arg & 0xf00 == 0x100 then arg & 0xfff else 0)
         55 ->
-            if arg != (if n.state < 2 then 0u32 else n.rca) then return Reply(false,1,[0;4],0,0)
+            if arg != (if n.state == Idle || n.state == Ready then 0 else n.rca) then return absent(Short)
             n.app = true
             short(s | 32)
         41 ->
-            if !app || n.state > 1 then return short(s | (1 << 22))
-            if arg & 0x00ff8000 == 0 then return Reply(true,2,[0x00ff8000,0,0,0],0,0)
-            n.state = 1
-            Reply(true,2,[0xc0ff8000,0,0,0],0,0)
+            if !app || (n.state != Idle && n.state != Ready) then return short(s | 1 << 22)
+            if arg & 0x00ff8000 == 0 then return Reply(true,ShortNoCrc,[0x00ff8000,0,0,0],NoTransfer)
+            n.state = Ready
+            Reply(true,ShortNoCrc,[0xc0ff8000,0,0,0],NoTransfer)
         2 ->
-            if n.state != 1 then return Reply(false,3,[0;4],0,0)
-            n.state = 2
+            if n.state != Ready then return absent(Long)
+            n.state = Ident
             var cid: [16]u8 = [0xfe,0x42,0x54,0x42,0x45,0x4e,0x43,0x48,0x10,0x12,0x34,0x56,0x78,0x01,0xa1,0]
             cid[15] = crc7(cid[..<15])
             long(cid[..])
         3 ->
-            if n.state != 2 then return Reply(false,1,[0;4],0,0)
-            n.state = 3
-            short(n.rca | (3 << 9) | 256)
+            if n.state != Ident then return absent(Short)
+            n.state = Stby
+            short(n.rca | u32(Stby) << 9 | 256)
         9 ->
-            if arg != n.rca || n.state != 3 then return Reply(false,3,[0;4],0,0)
+            if arg != n.rca || n.state != Stby then return absent(Long)
             val bytes = csd(n.card)
             long(bytes[..])
         7 ->
             if arg == 0
-                n.state = 3
-                return Reply(true,0,[0;4],0,0)
-            if arg != n.rca || n.state != 3 then return Reply(false,1,[0;4],0,0)
-            n.state = 4
-            short(status(n,time))
-        13 -> if arg != n.rca then Reply(false,1,[0;4],0,0) else short(s)
+                n.state = Stby
+                return Reply(true,NoResponse,[0;4],NoTransfer)
+            if arg != n.rca || n.state != Stby then return absent(Short)
+            n.state = Tran
+            short(status(n))
+        13 -> if arg != n.rca then absent(Short) else short(s)
         6 ->
-            if !app || n.state != 4 || (arg != 0 && arg != 2) then return short(s | (1 << 22))
+            if !app || n.state != Tran || (arg != 0 && arg != 2) then return short(s | 1 << 22)
             n.width = if arg == 2 then 4 else 1
             short(s)
         12 ->
-            n.pending = 0
-            n.state = if time < n.card.busy_until || !(n.card.media.ready)() then 7 else 4
-            short(status(n,time))
-        23 -> if app && n.state == 4 then short(s) else short(s | (1 << 22))
-        16 -> short(s | (if arg == 512 then 0u32 else 1u32 << 29))
+            n.pending = NoTransfer
+            n.state = if programming(n,time) then Prg else Tran
+            short(status(n))
+        23 -> if app && n.state == Tran then short(s) else short(s | 1 << 22)
+        16 -> short(s | (if arg == 512 then 0 else 1 << 29))
         17 | 18 | 24 | 25 | 51 ->
-            if n.state != 4 || (index == 51 && !app) then return short(s | (1 << 22))
-            if index != 51 && u64(arg) >= n.card.sectors then return short(s | (1 << 31))
-            if (index == 24 || index == 25) && n.card.protected then return short(s | (1 << 26))
-            n.pending = index
+            if n.state != Tran || (index == 51 && !app) then return short(s | 1 << 22)
+            val transfer = opened(index)
+            if transfer != ReadScr && u64(arg) >= n.card.sectors then return short(s | 1 << 31)
+            if transfer.writes() && n.card.protected then return short(s | 1 << 26)
+            n.pending = transfer
             n.sector = u64(arg)
-            n.state = if index == 24 || index == 25 then 6 else 5
-            short(s,index,if index == 51 then 8 else 512)
-        _ -> short(s | (1 << 22))
+            n.state = if transfer.writes() then Rcv else Data
+            short(s,transfer)
+        _ -> short(s | 1 << 22)
+
+private programming(n: &Native, time: u64) -> bool = time < n.card.busy_until || !(n.card.media.ready)()
 
 native_read(n: &Native, out: []u8) -> bool
-    if n.pending == 51 && out.len == 8
+    if n.pending == ReadScr && out.len == 8
         for i in 0..<8 do out[i] = 0
         out[0] = 2
         out[1] = 5
         return true
-    if (n.pending != 17 && n.pending != 18) || out.len != 512 || u64(n.sector) >= n.card.sectors then return false
-    n.card.reads += 1
+    if (n.pending != ReadSingle && n.pending != ReadMultiple) || out.len != 512 || n.sector >= n.card.sectors then return false
+    n.card.stats.reads += 1
     (n.card.media.read)(u32(n.sector),out)
 native_read_complete(n: &Native)
-    if n.pending == 18 then n.sector += 1
+    if n.pending == ReadMultiple then n.sector += 1
     else
-        n.pending = 0
-        n.state = 4
+        n.pending = NoTransfer
+        n.state = Tran
 native_write(n: &Native, bytes: []const u8, time: u64) -> bool
-    if (n.pending != 24 && n.pending != 25) || bytes.len != 512 || n.card.protected || u64(n.sector) >= n.card.sectors then return false
+    if !n.pending.writes() || bytes.len != 512 || n.card.protected || n.sector >= n.card.sectors then return false
     if !(n.card.media.write)(u32(n.sector),bytes) then return false
-    n.card.writes += 1
+    n.card.stats.writes += 1
     n.card.busy_until = time + n.card.program_ticks
-    if n.pending == 25
+    if n.pending == WriteMultiple
         n.sector += 1
-        n.state = 6
+        n.state = Rcv
     else
-        n.pending = 0
-        n.state = 7
+        n.pending = NoTransfer
+        n.state = Prg
     true
 native_abort(n: &Native, time: u64)
-    n.pending = 0
-    n.state = if time < n.card.busy_until || !(n.card.media.ready)() then 7 else 4
+    n.pending = NoTransfer
+    n.state = if programming(n,time) then Prg else Tran
 native_busy(n: &Native, time: u64) -> bool
-    status(n,time)
-    (n.state == 6 || n.state == 7) && (time < n.card.busy_until || !(n.card.media.ready)())
+    settle(n,time)
+    (n.state == Rcv || n.state == Prg) && programming(n,time)

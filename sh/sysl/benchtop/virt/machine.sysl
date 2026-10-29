@@ -3,7 +3,7 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.{Board, ChipForm, Core, Description, Peripheral, ProductForm, Registry, article_of, built_in_shelf, core_option, library, param_named, load, open_description, unemulated_core_option}
 import sh.sysl.benchtop.v6m.{Kind, RAM_BYTES, default_priority_bits, has_fixed_dsp, model_named, model_names}
 import sh.sysl.parsing.{Diagnostic, Source, Span, source}
-import sh.sysl.benchtop.v6m.{Cpu, Memory, MemoryMap, RamBank, memory, ram_only}
+import sh.sysl.benchtop.v6m.{Cpu, Fpu, Memory, MemoryMap, RamBank, memory, ram_only}
 import sysl.buf.{Buf, buf}
 
 // A board description made into the machine benchtop runs.
@@ -73,19 +73,10 @@ end runnable
 assemble(b: Board, reg: Registry) -> Result[unit, string]
     val p = plan(b, reg)?
 
-    board_clock_hz = p.clock_hz
+    machine.clock_hz = p.clock_hz
     machine.map = p.map
     apply_devices(p.devices)
-    core_clock_divisors = p.divisors
-    for k in 0..<2
-        val c = p.cores[k]
-
-        core_instruction_timing[k] = c.timed
-        core_kinds[k] = c.kind
-        core_priority_bits[k] = c.priority_bits
-        core_dsp[k] = c.dsp
-        core_fpu[k] = c.fpu
-
+    machine.configs = p.cores
     Ok(())
 
 /** What a description makes of a machine, decided and checked whole before any of it is set. */
@@ -93,15 +84,22 @@ private struct Plan
     map: MemoryMap
     devices: Devices
     clock_hz: u64
-    divisors: [2]u64
-    cores: [2]CoreSetup
+    cores: [2]CoreConfig
 
-private struct CoreSetup
+/** One core as the description makes it: its model and options, and how many ticks of the chip's
+ * clock one tick of its own takes (`divisor`; 1 where it runs at the chip's clock). `boot` and
+ * `launch` give a core its configuration with `configure`.
+ */
+struct CoreConfig
     kind: Kind
     timed: bool
     priority_bits: u32
     dsp: bool
-    fpu: u32
+    fpu: Fpu
+    divisor: u64
+
+/** A core no description has configured: an ARMv6-M with its default options, at the chip's clock. */
+private[virt] unconfigured() -> CoreConfig = CoreConfig(Kind.V6m, false, 2, false, Fpu.Absent, 1)
 
 /** The machine `b` describes, or why benchtop cannot run it. It sets nothing. */
 private plan(b: Board, reg: Registry) -> Result[Plan, string]
@@ -247,56 +245,49 @@ private plan(b: Board, reg: Registry) -> Result[Plan, string]
     val map = MemoryMap(memory_ram_at, memory_ram_size, memory_flash_at, memory_flash_size, banks)
     val devices = check_devices(b, ds.view(), clock_hz)?
 
-    Ok(Plan(map, devices, clock_hz, divisors, [core_setup(cores.at(0)), core_setup(cores.at(1))]))
+    Ok(Plan(map, devices, clock_hz, [core_config(cores.at(0), divisors[0]), core_config(cores.at(1), divisors[1])]))
 end plan
 
-// A core's kind and options, from a core `plan` has checked.
-private core_setup(core: Core) -> CoreSetup
+// A core's kind and options, from a core `plan` has checked, and its clock's divisor.
+private core_config(core: Core, divisor: u64) -> CoreConfig
     val kind = model_named(core.name).unwrap().kind
     val timed = core_option(core, "instruction-timing") match
         Text(mode) -> mode == "estimated"
         _ -> false
-    val priority_bits = core_option(core, "nvic_priority_bits") match
+    val priority_bits = core_option(core, "nvic-priority-bits") match
         Whole(n) -> u32(n)
         _ -> default_priority_bits(kind)
     val dsp = core_option(core, "dsp") match
         Flag(on) -> on
         _ -> has_fixed_dsp(kind)
-    val fpu: u32 = core_option(core, "fpu") match
-        Text(unit) -> if unit == "dp" then 2 elif unit == "sp" then 1 else 0
-        _ -> 0
+    val fpu = core_option(core, "fpu") match
+        Text(unit) -> if unit == "dp" then Fpu.Double elif unit == "sp" then Fpu.Single else Fpu.Absent
+        _ -> Fpu.Absent
 
-    CoreSetup(kind, timed, priority_bits, dsp, fpu)
+    CoreConfig(kind, timed, priority_bits, dsp, fpu, divisor)
+
+// Each peripheral kind benchtop puts on the cores' bus, and the device it is there. Two kinds may be
+// one device (an I2C controller is `virt-i2c` or `stm32-i2c`); `stm32-dma` is DMA1 or DMA2, as its
+// `controller` says.
+private val DEVICE_KINDS = [
+    ("debug-console", Console), ("virt-sio", Sio), ("rp-resets", Resets), ("rp-timer", Timer),
+    ("rp-watchdog", Watchdog), ("panel-gpio", PanelGpio), ("virt-adc", Adc), ("virt-i2c", I2c),
+    ("stm32-i2c", I2c), ("virt-pwm", Pwm), ("virt-i2s", DigitalAudio), ("pl022", Spi),
+    ("stm32h7-rcc", H7Rcc), ("stm32-spi", H7Spi), ("stm32-gpio", Stm32Gpio), ("stm32-sdmmc", Sdmmc),
+    ("stm32-dsi", Dsi), ("stm32-sai", Sai), ("stm32-dma", Dma1), ("stm32-dmamux", Dmamux)]
 
 // The device on the cores' bus that a peripheral of the description is, or none for a kind benchtop
-// does not put there.
-private device_of(p: Peripheral) -> Option[Device] = p.kind match
-    "stm32-sai" -> Some(Sai)
-    "stm32-dmamux" -> Some(Dmamux)
-    "stm32-dma" ->
-        val controller = param_named(p.params, "controller") match
+// does not put there. A checked `controller` is 1 or 2.
+private device_of(p: Peripheral) -> Option[Device]
+    for (kind, d) in DEVICE_KINDS
+        if kind != p.kind then continue
+        if d != Dma1 then return Some(d)
+        return param_named(p.params, "controller") match
             Some(q) -> q.value match
-                Whole(n) -> n
-                _ -> 1
-            None -> 1
-        Some(if controller == 1 then Dma1 else Dma2)
-    "stm32-dsi" -> Some(Dsi)
-    "stm32h7-rcc" -> Some(H7Rcc)
-    "debug-console" -> Some(Console)
-    "virt-i2s" -> Some(DigitalAudio)
-    "virt-pwm" -> Some(Pwm)
-    "stm32-sdmmc" -> Some(Sdmmc)
-    "stm32-spi" -> Some(H7Spi)
-    "stm32-gpio" -> Some(Stm32Gpio)
-    "pl022" -> Some(Spi)
-    "stm32-i2c" | "virt-i2c" -> Some(I2c)
-    "virt-adc" -> Some(Adc)
-    "panel-gpio" -> Some(PanelGpio)
-    "virt-sio" -> Some(Sio)
-    "rp-resets" -> Some(Resets)
-    "rp-timer" -> Some(Timer)
-    "rp-watchdog" -> Some(Watchdog)
-    _ -> None
+                Whole(2) -> Some(Dma2)
+                _ -> Some(Dma1)
+            None -> Some(Dma1)
+    None
 
 // A device's window on the bus: from `at`, the size the chip gives it, or else the size the
 // registry's peripheral declares. A checked chip names only peripherals the registry has.
@@ -307,27 +298,17 @@ private placed(d: Device, p: Peripheral, at: long, irqs: [8]int, reg: Registry) 
 
     Mapped(d, u32(at), u32(at + size - 1), irqs)
 
-private device_name(d: Device) -> string = d match
-    Pwm -> "`virt-pwm`"
-    DigitalAudio -> "`virt-i2s`"
-    Sai -> "`stm32-sai`"
-    Dma1 -> "`stm32-dma` controller 1"
-    Dma2 -> "`stm32-dma` controller 2"
-    Dmamux -> "`stm32-dmamux`"
-    Dsi -> "`stm32-dsi`"
-    H7Rcc -> "`stm32h7-rcc`"
-    Spi -> "`pl022`"
-    H7Spi -> "`stm32-spi`"
-    Stm32Gpio -> "`stm32-gpio`"
-    Sdmmc -> "`stm32-sdmmc`"
-    I2c -> "I2C controller (`virt-i2c` or `stm32-i2c`)"
-    Adc -> "`virt-adc`"
-    PanelGpio -> "`panel-gpio`"
-    Console -> "`debug-console`"
-    Sio -> "`virt-sio`"
-    Resets -> "`rp-resets`"
-    Timer -> "`rp-timer`"
-    Watchdog -> "`rp-watchdog`"
+// How a refusal names a device: every kind that is it, from `DEVICE_KINDS`.
+private device_name(d: Device) -> string
+    if d == Dma2 then return "`stm32-dma` controller 2"
+
+    var kinds: Buf[string] = buf()
+
+    for (kind, k) in DEVICE_KINDS do if k == d then kinds.push(s"`$kind`")
+
+    val name = if kinds.len() == 1 then kinds.at(0) else s"${kinds.at(0)} or ${kinds.at(1)}"
+
+    if d == Dma1 then s"$name controller 1" else name
 
 private core_names(cores: Buf[Core]) -> string
     var out = ""
@@ -343,8 +324,10 @@ private core_names(cores: Buf[Core]) -> string
 /** One board as benchtop runs it. It holds the board's memory: the map `assemble` planned, which
  * `boot` lays out, and the storage both cores run on, which the machine owns and the cores point at.
  * It holds its devices: the bus and each peripheral's state (devices.sysl). It holds its two cores,
- * each of which reaches the machine back through its `bus`, which `boot` and `launch` point here.
- * docs/machine.md says what joins it next.
+ * each of which reaches the machine back through its `bus`, which `boot` and `launch` point here,
+ * and what the description makes of each (`configs`), with the chip's clock (`clock_hz`, 0 where it
+ * names none). `bus_cache` is each core's last device on the bus. docs/machine.md says what joins it
+ * next.
  */
 struct Machine
     map: MemoryMap
@@ -352,9 +335,12 @@ struct Machine
     devices: Devices
     console: Console
     cores: [2]Cpu
+    configs: [2]CoreConfig
+    clock_hz: u64
+    bus_cache: [2]BusCache
 
 /** The board this process runs, until every entry point is handed its machine. */
-var machine = Machine(ram_only(), memory(), no_devices(), console(), unbooted_cores())
+var machine = Machine(ram_only(), memory(), no_devices(), console(), unbooted_cores(), [unconfigured(); 2], 0, [no_bus_cache(); 2])
 
 // Two cores before any `boot`, every field zero; `boot` gives them their kind, memory and bus.
 private unbooted_cores() -> [2]Cpu
@@ -364,7 +350,8 @@ private unbooted_cores() -> [2]Cpu
 /** Where the board puts its memory, as the last description assembled said. */
 memory_map() -> MemoryMap = machine.map
 
-var board_clock_hz: u64 = 0
+/** The chip's clock; zero means the description uses legacy pacing. */
+clock_hz() -> u64 = machine.clock_hz
 
-/** Zero means the description uses legacy pacing. */
-clock_hz() -> u64 = board_clock_hz
+/** How many ticks of the chip's clock one tick of each core's takes. */
+clock_divisors() -> [2]u64 = [machine.configs[0].divisor, machine.configs[1].divisor]

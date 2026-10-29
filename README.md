@@ -129,7 +129,7 @@ and modify the firmware and for the virtual GPIO register map.
 ## Parts, references and analogue input
 
 `potentiometer` is a built-in part; `virt-adc` is a built-in chip peripheral.
-Part terminals can be assigned directly, using named chip connection points:
+A part's terminals are wired under `wire`, to the board's own pins written bare:
 
 ```hocon
 volume {
@@ -139,16 +139,17 @@ volume {
   low-uv = 0
   high-uv = 3300000
   taper = linear
-  wiper = controller.GP26
+  wire { wiper = GP26 }
 }
 ```
 
 `volume` is the instance identifier and `RV1` its schematic/silkscreen reference.
 References are optional and checked for uniqueness within a board or product's
-own parts. `controller` names the owning chip in the workbench description; GP26
-is declared by that chip and connected to ADC channel 0. Unknown endpoints,
-non-ADC input pins and invalid parameter values are rejected. Legacy `wire { … }`
-blocks remain accepted; descriptions are written back with direct terminal fields.
+own parts. GP26 is declared by the workbench's chip and connected to ADC channel 0.
+Unknown endpoints, non-ADC input pins and invalid parameter values are rejected, and
+so is a terminal written as a parameter (`wiper = GP26`) or a pin qualified by the
+board's own mcu (`controller.GP26`): there is one form, and descriptions are written
+back in it.
 
 The ideal potentiometer supplies integer microvolts, derived from its endpoints
 and position. The ADC latches the voltage at conversion start and completes after
@@ -247,7 +248,7 @@ mcu {
 One RISC-V interpreter serves all four generic ISA profiles. The catalog selects extensions;
 compressed instructions expand into the same RV32I operations, and M adds shared multiply/divide
 operations. The existing reader, checker, registry, diagnostics and description writer are reused.
-Cortex-M options such as `nvic_priority_bits` are rejected on RISC-V cores, and the checker reserves
+Cortex-M options such as `nvic-priority-bits` are rejected on RISC-V cores, and the checker reserves
 the Cortex-M private peripheral bus only where a chip actually has a Cortex-M core.
 
 `bench --core` runs raw RISC-V images from address 0 in 1 MB of RAM, stopping at `EBREAK` and
@@ -275,16 +276,11 @@ sysl build . -o benchtop
 - `Xh3pmpm`: unlocked M-mode region enforcement, with the RP2350's eight configurable
   32-byte-granule NAPOT regions and three hardwired regions.
 
-```hocon
-mcu {
-  name = hazard3-example
-  cores = [hazard3, { core = hazard3 }]
-  peripherals { ram { peripheral = ram, at = 0x20000000, size = 520K } }
-}
-```
+The built-in mcu `rp2350-hazard3` ([mcus/rp2350-hazard3.hocon](mcus/rp2350-hazard3.hocon)) is the
+RP2350 on its two Hazard3 cores:
 
 ```sh
-./benchtop check --mcu examples/riscv/hazard3.hocon
+./benchtop check --mcu rp2350-hazard3
 ./benchtop bench --core hazard3 examples/riscv/kernel-hazard3.bin 3132271724
 ```
 
@@ -422,8 +418,8 @@ omitted options keep their defaults, independently of the other core:
 
 ```hocon
 cores = [
-  { core = cortex-m7, nvic_priority_bits = 3 }
-  { core = cortex-m7, nvic_priority_bits = 8 }
+  { core = cortex-m7, nvic-priority-bits = 3 }
+  { core = cortex-m7, nvic-priority-bits = 8 }
 ]
 ```
 
@@ -434,13 +430,13 @@ their behavior. The defaults describe benchtop's current integer implementations
 |---|---|---|
 | `dsp` | `true` on M4/M7, `false` elsewhere | boolean; always `true` on M4/M7 (ARMv7E-M has it), a choice on M33/M35P/M52/M55/M85 |
 | `fpu` | `none` | `sp` on M4/M33/M35P; `sp`/`dp` on M7/M52/M55/M85; `none` on every model |
-| `mpu_regions` | `0` | 0 on M0/M1; 0/8 on M0+/M3/M4; 0/8/16 on M7; 0/4/8/12/16 on Armv8-M models |
+| `mpu-regions` | `0` | 0 on M0/M1; 0/8 on M0+/M3/M4; 0/8/16 on M7; 0/4/8/12/16 on Armv8-M models |
 | `security` | `none` | `trustzone` on M23/M33/M35P/M52/M55/M85; `none` on every model |
 | `icache` | `false` | boolean; enabling is valid on M7/M35P/M52/M55/M85 |
 | `dcache` | `false` | boolean; enabling is valid on M7/M52/M55/M85 |
-| `nvic_priority_bits` | 2 on M0/M0+/M1/M23, 4 otherwise | 2 on Baseline models; 3–8 on Mainline models |
+| `nvic-priority-bits` | 2 on M0/M0+/M1/M23, 4 otherwise | 2 on Baseline models; 3–8 on Mainline models |
 | `mve` | `none` | `none`/`integer`/`float` on M52/M55/M85 |
-| `low_overhead_loops` | `false` | boolean on M52/M55/M85 |
+| `low-overhead-loops` | `false` | boolean on M52/M55/M85 |
 | `pacbti` | `false` | boolean on M52/M85 |
 
 **Priority width is implemented.** It controls NVIC and system-handler priorities, BASEPRI and

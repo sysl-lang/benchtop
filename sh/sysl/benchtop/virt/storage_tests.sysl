@@ -6,13 +6,48 @@ import sh.sysl.fat as fat
 import sysl.raw.str_cast
 import sysl.text.replace_all
 import sysl.fs
+import sysl.buf.{Buf, buf_filled}
+import sysl.sync.*
+import sysl.threads.spawn
+import sysl.time.{sleep,millis}
+
+// The image writer, started only after the guest has already filled its queue.
+private drain_later(writer: *DiskWriter)
+    sleep(millis(50))
+    disk_body(writer)
+
+@test("SD image: a full host write queue makes the guest wait for a slot, never a failed write")
+host_backpressure()
+    val dir = fs.make_temp_dir("benchtop-backpressure").unwrap()
+    defer fs.remove_dir_all(dir).unwrap()
+    val file = s"$dir/card.img"
+    val bytes = buf_filled(80 * 512, u8(0))
+    fs.write_bytes(file,bytes.view()).unwrap()
+    val image = sd_image_of(bytes,file)
+    val media = storage_media(image)
+    val queued = image.slots.with(s -> s.len())
+    var data: [512]u8 = [0;512]
+    for sector in 0..<queued + 1
+        if sector == queued then image.thread = spawn(&drain_later,&image.writer,1 << 20)
+        data[0] = u8(sector + 1)
+        assert((media.write)(u32(sector),data[..]),s"sector $sector is written, not refused")
+    image.writer.queue.close()
+    image.thread.unwrap().join()
+    assert(atomic_load(&image.writer.failed,Acquire) == 0)
+    val written = fs.read_bytes(file).unwrap()
+    for sector in 0..<queued + 1 do assert(written[sector * 512] == u8(sector + 1),s"sector $sector reached the file")
 
 private val STORAGE_GUEST = embed("../../../../examples/touch/storage-disco.elf")
+
+// The bytes of a 16 MiB card (32768 sectors), which a test's `fat.ram_device` works over and the test
+// keeps alive for as long as the device.
+private[virt] blank_card() -> Buf[u8] = buf_filled(32768 * 512, u8(0))
 
 @test("Discovery SD: flash firmware drives real SDMMC/IDMA, mounts FAT and saves settings without stopping M7 audio")
 firmware_storage()
     val description = str_cast(embed("../../../../boards/stm32h747-sd.hocon"))
-    var disk = fat.ram_device(32768)
+    val storage = blank_card()
+    var disk = fat.ram_device(storage.view())
     fat.format(&disk,Some(fat.FatType.Fat16)).unwrap()
     val dir = fs.make_temp_dir("benchtop-storage").unwrap()
     defer fs.remove_dir_all(dir).unwrap()
@@ -34,8 +69,8 @@ firmware_storage()
     wait_workers()
     pause_workers()
     assert(workers_observe().running,stop_message(core0()))
-    assert(cpu.load32(core0(),status) == 1,s"storage status=${cpu.load32(core0(),status)} commands=${with_sd_card(c -> c.commands)}")
-    assert(machine.devices.sdmmc.live.with(l -> l.card.is_some() && l.card.unwrap().width == 4 && l.host.transfers > 0))
+    assert(cpu.load32(core0(),status) == 1,s"storage status=${cpu.load32(core0(),status)} commands=${with_sd_card(c -> c.stats.commands)}")
+    assert(machine.devices.sdmmc.live.with(l -> l.card.is_some() && l.card.unwrap().width == 4 && l.host.stats.transfers > 0))
     val before = cpu.load32(core0(),frames)
     touch_point("touch",342,332,true)
     submit_workers(20000000)
@@ -45,7 +80,7 @@ firmware_storage()
     wait_workers()
     pause_workers()
     assert(workers_observe().running,stop_message(core1()))
-    assert(cpu.load32(core0(),status) == 2,s"save status=${cpu.load32(core0(),status)} writes=${with_sd_card(c -> c.writes)}")
+    assert(cpu.load32(core0(),status) == 2,s"save status=${cpu.load32(core0(),status)} writes=${with_sd_card(c -> c.stats.writes)}")
     assert(cpu.load32(core0(),frames) > before)
     assert(cpu.load32(core0(),errors) == 0 && cpu.load32(core0(),misses) == 0)
     val persisted = fs.read_bytes(card).unwrap()
@@ -59,7 +94,7 @@ firmware_storage()
     var text: [64]u8 = [0;64]
     val count = volume.read(&file,text[..]).unwrap()
     assert(str_cast(text[..<count]) == "feedback=35\nwet=035\n",str_cast(text[..<count]))
-    assert(with_sd_card(c -> c.reads > 0 && c.writes > 0))
+    assert(with_sd_card(c -> c.stats.reads > 0 && c.stats.writes > 0))
     // A fresh board instance reloads the file that guest firmware saved to disk.
     stop_workers()
     board_from("sd-restart-test.hocon",file_board.bytes).unwrap()
@@ -81,7 +116,8 @@ firmware_storage_load()
         "feedback=00\nwet=000\n", "feedback=86\nwet=063\n", "feedback=57\nwet=101\n",
         "feedback=57\nwet=x63\n", "feedback=57\nwet=063", "feedback=57\nwet=063\nextra"]
     for index in 0..<examples.len
-        var disk = fat.ram_device(32768)
+        val storage = blank_card()
+        var disk = fat.ram_device(storage.view())
         fat.format(&disk,Some(fat.FatType.Fat16)).unwrap()
         var scratch: [512]u8 = [0;512]
         var volume = fat.mount(&disk,scratch[..]).unwrap()

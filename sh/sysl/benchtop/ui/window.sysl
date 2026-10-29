@@ -3,7 +3,6 @@ module sh.sysl.benchtop.ui
 import sh.sysl.sdl3 as sdl
 import sh.sysl.benchtop.virt as virt
 import sh.sysl.benchtop.host as host
-import sh.sysl.benchtop.v6m.{Cpu, Stop}
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_bytes
 import sysl.raw.str_cast
@@ -20,72 +19,63 @@ frame_count(value: string) -> Result[u64, string]
     if n < 1 || n > 100000 then return Err("--frames must be between 1 and 100000")
     Ok(u64(n))
 
-private restart(cpu: *Cpu, image: []const u8, st: *State)
-    virt.pause_workers()
-    virt.open_console()
-    virt.capture_bounded(8192)
-    virt.boot(cpu, image)
-    release_inputs(st)
-    st.paused = false
-    st.stopped = false
-    st.status = "RUNNING"
-    st.notice = ""
-    st.instructions = 0
-    st.pc = cpu.pc
+/** Boot `image` and start the desktop over: nothing held, no notice. */
+private restart(d: &Desktop, image: []const u8)
+    d.session.restart(image)
+    edit(d, st ->
+        release_inputs(st)
+        st.notice = no_notice())
 
-/** One frame's real guest execution. A paused frame advances no guest instructions. */
-advance(s: Scene, st: *State, cpu: *Cpu, step: bool = false, budget: u64 = 20000)
-    sample_inputs(s, *st)
-    if !st.live || st.stopped then return
-    if st.paused && !step
-        st.status = "PAUSED"
-        return
-    let_running(virt.pump_board(cpu,if step then 1 else budget),st,cpu)
-    st.pc = cpu.pc
-    st.instructions = cpu.retired + virt.core1().retired
-    if step then st.paused = true
-    if !st.stopped then st.status = if st.paused then "PAUSED" elif cpu.sleeping then "WAITING" else "RUNNING"
+/** One frame of the guest: the desktop's controls go to the session, which runs the board or
+ * observes its workers. A paused frame advances no guest instructions.
+ */
+advance(d: &Desktop, step: bool = false, budget: u64 = virt.FALLBACK_BUDGET)
+    sample_inputs(d)
+    val session = d.session
+    val was_stopped = session.stopped
+    session.advance(step, budget) match
+        Some(snapshot) -> edit(d, st -> pacing_notice(st, session.paused, snapshot))
+        None -> ()
+    if session.stopped && !was_stopped then say(d, NoticeKind.Stop, session.message)
 
-private advance_background(s: Scene, st: *State, cpu: *Cpu, step: bool)
-    sample_inputs(s,*st)
-    if st.stopped then return
-    if step
-        virt.step_workers()
-        st.paused = true
-    elif st.paused
-        virt.pause_workers()
-    else virt.resume_workers()
-    val snapshot = virt.workers_observe()
-    st.pc = snapshot.cores[0].pc
-    st.instructions = snapshot.cores[0].retired + snapshot.cores[1].retired
-    pacing_notice(st,snapshot)
-    if !snapshot.running then let_running(false,st,cpu)
-    else st.status = if st.paused then "PAUSED" elif snapshot.cores[0].sleeping && (!snapshot.launched || snapshot.cores[1].sleeping) then "WAITING" else "RUNNING"
+/** How `launch` runs: a demo or a firmware file, for how many frames, where its PNG goes, whether
+ * it opens a window, the host build workflow, an instrument file, and whether the cores share one
+ * thread.
+ */
+struct LaunchOptions
+    demo: bool
+    frames: u64
+    screenshot: string
+    headless: bool
+    develop: host.Config
+    instrument_file: string
+    deterministic: bool
 
-private let_running(running: bool, st: *State, cpu: *Cpu)
-    if running then return
-    st.stopped = true
-    st.paused = true
-    val stopped = if cpu.stop != Stop.Budget then cpu else virt.core1()
-    st.status = stopped.stop match
-        Breakpoint -> "BREAKPOINT"
-        Exit -> s"EXIT ${stopped.exit_code}"
-        Reset -> "RESET REQUEST"
-        _ -> "GUEST FAULT"
-    st.notice = virt.stop_message(stopped)
+launch_options(demo: bool = false, frames: u64 = 0, screenshot: string = "", headless: bool = false, develop: host.Config = host.config(), instrument_file: string = "", deterministic: bool = false) -> LaunchOptions =
+    LaunchOptions(demo = demo, frames = frames, screenshot = screenshot, headless = headless, develop = develop, instrument_file = instrument_file, deterministic = deterministic)
+
+/** The instructions one frame gives the guest when the UI thread runs it: the paced share of a
+ * frame's wall time at the session's clock, or a fixed slice for a board with no clock to pace by.
+ */
+private frame_budget(source: virt.PacingSource, pacer: &GuestPacer, dt: real) -> u64 = source match
+    BoardClock(hz) -> pacer.budget(dt, hz)
+    SoundClock(hz) -> audio_budget(dt, hz)
+    TouchClock -> audio_budget(dt, source.hz())
+    Fixed -> virt.FALLBACK_BUDGET
 
 /** Load/check before opening a window. Both modes use the same syslUI tree. */
-launch(which: string, file: string, demo: bool = false, frames: u64 = 0, screenshot: string = "", headless: bool = false, develop: host.Config = host.config(), instrument_file: string = "", deterministic: bool = false) -> Result[int, string]
+launch(which: string, file: string, o: LaunchOptions = launch_options()) -> Result[int, string]
+    val develop = o.develop
     host.validate(develop, file)?
     val s = open_scene(which)?
-    val live = demo || !file.is_empty()
+    val live = o.demo || !file.is_empty()
     var image: Buf[u8] = buf()
     var original: []const u8 = []
     if live
         virt.board_named(which) match
             Err(why) -> return Err(why)
             Ok(_) -> ()
-        val bytes: []const u8 = if demo then DEMO else read_bytes(file) match
+        val bytes: []const u8 = if o.demo then DEMO else read_bytes(file) match
             Ok(bytes) -> bytes
             Err(why) -> if develop.program.is_empty() then return Err(s"$file: $why") else []
         if bytes.len == 0 && develop.program.is_empty() then return Err("firmware is empty")
@@ -96,71 +86,60 @@ launch(which: string, file: string, demo: bool = false, frames: u64 = 0, screens
                     image = i
                     original = bytes
                 Err(why) -> if develop.program.is_empty() then return Err(why)
-    var st = state(live)
-    val cpu = virt.core0()
-    if live && image.len() > 0 then restart(cpu, image.view(), &st)
-    elif live
-        st.stopped = true
-        st.paused = true
-        st.status = "WAITING FOR BUILD"
-    val d = desktop(s, st)
-    d.parallel = !deterministic && !headless
-    if !instrument_file.is_empty() then d.instruments = load_instruments(s, instrument_file)?
-    elif demo then d.instruments = instruments(s, from_utf8_lossy(embed("../../../../instruments/workbench.hocon")))?
+    val d = desktop(s, live)
+    val session = d.session
+    if live && image.len() > 0 then restart(d, image.view())
+    elif live then session.await_build()
+    d.parallel = !o.deterministic && !o.headless
+    if !o.instrument_file.is_empty() then d.instruments = load_instruments(s, o.instrument_file)?
+    elif o.demo then d.instruments = instruments(s, from_utf8_lossy(embed("../../../../instruments/workbench.hocon")))?
     defer close_instruments(d)
     val active = toolkit.signal(image)
     if host.enabled(develop)
         d.workflow = Some(host.open(develop, file, original)?)
         if !develop.program.is_empty() then d.console_tab.set(1)
     defer close_workflow(d)
-    if headless
-        val count = if frames == 0 then 1 else frames
+    if o.headless
+        val count = if o.frames == 0 then 1 else o.frames
         val count_signal = toolkit.signal(0u64)
         for frame in 0u64..<count
-            host_tick(d, cpu, active, true)
-            desktop_tick(d, cpu, active.read().view(), 0, count_signal, "benchtop.png")
-        st = d.current.read()
-        if !screenshot.is_empty() then save_desktop(d, screenshot)?
-        if live && st.status == "GUEST FAULT" then return Err(st.notice)
-        if st.status == "WAITING FOR BUILD" then return Err("no firmware loaded before --frames ended")
+            host_tick(d, active, true)
+            desktop_tick(d, active.read().view(), 0, count_signal, "benchtop.png")
+        if !o.screenshot.is_empty() then save_desktop(d, o.screenshot)?
+        if live && session.status == virt.RunStatus.Fault then return Err(session.message)
+        if session.status == virt.RunStatus.WaitingForBuild then return Err("no firmware loaded before --frames ended")
         d.workflow match
             Some(w) ->
-                if w.building || w.build_requested then return Err("build did not finish before --frames ended")
+                if w.building || w.request == host.Build then return Err("build did not finish before --frames ended")
                 if w.failed then return Err(w.status)
             None -> ()
         return Ok(0)
-    val path = if screenshot.is_empty() then "benchtop.png" else screenshot
+    val path = if o.screenshot.is_empty() then "benchtop.png" else o.screenshot
     val count = toolkit.signal(0u64)
     sdl.set_main_ready()
     val player = audio_player()
     defer close_audio(player)
-    if !player.error.is_empty()
-        var st = d.current.read()
-        st.notice = s"Audio unavailable: ${player.error}"
-        d.current.set(st)
-    if live
-        val hz = if virt.clock_hz() != 0 then virt.clock_hz() elif virt.sound_available() then virt.sound_clock_hz() elif !d.scene.pointers.is_empty() then 12000000u64 else 1200000u64
-        virt.start_workers(cpu,d.parallel,hz)?
-        d.background = true
-    defer virt.stop_workers()
+    if !player.error.is_empty() then say(d, NoticeKind.Audio, s"Audio unavailable: ${player.error}")
+    val touch = !d.scene.pointers.is_empty()
+    if live then session.start(d.parallel, virt.pacing_source(touch).hz())?
+    defer session.stop()
     val rates = cpu_rate_trace()
     val pacing = guest_pacer()
-    driver.run(driver.app(s"Benchtop - ${s.name}", () -> Workbench(d), () -> GROUND,
+    driver.run(driver.app(s"Benchtop - ${s.name}", () -> Workbench(d, true), () -> GROUND,
         width = WIDTH, height = HEIGHT, size = 14,
         on_event = e -> desktop_event(d, e),
         on_frame = dt ->
-            host_tick(d, cpu, active)
-            desktop_tick(d, cpu, active.read().view(), frames, count, path,
-                if d.background then 0u64 elif virt.clock_hz() != 0 then pacing.budget(dt, virt.clock_hz()) else if virt.sound_available() then audio_budget(dt, virt.sound_clock_hz()) else if !d.scene.pointers.is_empty() then audio_budget(dt, 12000000) else 20000)
-            if d.background
+            host_tick(d, active)
+            desktop_tick(d, active.read().view(), o.frames, count, path,
+                if session.background then 0u64 else frame_budget(virt.pacing_source(touch), pacing, dt))
+            if session.background
                 rates match
                     Some(trace) -> trace.sample()
                     None -> ()
             audio_frame(player, d)
             instrument_windows(d)))?
-    if !screenshot.is_empty() then save_desktop(d, screenshot)?
-    val final = d.current.read()
-    if live && final.status == "GUEST FAULT" then return Err(final.notice)
+    if !o.screenshot.is_empty() then save_desktop(d, o.screenshot)?
+    if live && session.status == virt.RunStatus.Fault then return Err(session.message)
     Ok(0)
 
 private close_workflow(d: &Desktop)
@@ -169,56 +148,47 @@ private close_workflow(d: &Desktop)
         None -> ()
 
 /** Poll host work and apply a completed image only between guest slices. */
-private[ui] host_tick(d: &Desktop, cpu: *Cpu, active: &toolkit.Signal[Buf[u8]], wait: bool = false)
+private[ui] host_tick(d: &Desktop, active: &toolkit.Signal[Buf[u8]], wait: bool = false)
     d.workflow match
         Some(w) ->
             host.poll(w, wait)
             host.take_image(w) match
                 Some(image) ->
                     active.set(image)
-                    var st = d.current.read()
-                    restart(cpu, image.view(), &st)
+                    restart(d, image.view())
                     clear_instruments(d)
-                    st.notice = "Firmware reloaded"
-                    d.current.set(st)
+                    say(d, NoticeKind.Reloaded, "Firmware reloaded")
                 None -> ()
         None -> ()
 
-private[ui] desktop_tick(d: &Desktop, cpu: *Cpu, image: []const u8, frames: u64, count: &toolkit.Signal[u64], path: string, budget: u64 = 20000)
-    var st = d.current.read()
-    sync_pots(d, &st)
+private[ui] desktop_tick(d: &Desktop, image: []const u8, frames: u64, count: &toolkit.Signal[u64], path: string, budget: u64 = virt.FALLBACK_BUDGET)
     if d.resetting.read()
-        if image.len > 0 then restart(cpu, image, &st)
+        if image.len > 0 then restart(d, image)
         clear_instruments(d)
         release_touch(d)
         d.resetting.set(false)
     val step = d.stepping.read()
     d.stepping.set(false)
-    if st.live
-        if d.background then advance_background(d.scene,&st,cpu,step)
-        else advance(d.scene, &st, cpu, step, budget)
-    d.current.set(st)
-    if st.live then instrument_tick(d)
+    advance(d, step, budget)
+    if d.session.live then instrument_tick(d)
     if d.saving.read()
         d.saving.set(false)
         save_desktop(d, path) match
-            Ok(_) -> st.notice = s"Saved $path"
-            Err(why) -> st.notice = s"Save failed: $why"
-        d.current.set(st)
+            Ok(_) -> say(d, NoticeKind.Saved, s"Saved $path")
+            Err(why) -> say(d, NoticeKind.SaveFailed, s"Save failed: $why")
     count.set(count.read() + 1)
     if frames != 0 && count.read() >= frames then driver.stop()
 
 /** Leave pointer coordinates and widget events to syslUI's density-aware SDL driver. */
 private desktop_event(d: &Desktop, e: sdl.Event) -> bool
     if instrument_event(d, e) then return true
-    var st = d.current.read()
+    val session = d.session
     e.kind() match
         WindowCloseRequested -> driver.stop()
         WindowFocusLost ->
             release_touch(d)
-            release_inputs(&st)
+            edit(d, st -> release_inputs(st))
             d.pointer_live.set(false)
-            d.current.set(st)
         MouseButtonDown ->
             if e.mouse_button() == sdl.MouseButton.Right
                 d.context_requested.set(true)
@@ -231,22 +201,22 @@ private desktop_event(d: &Desktop, e: sdl.Event) -> bool
         MouseButtonUp ->
             if e.mouse_button() != sdl.MouseButton.Left then return true
             touch_event(d, e, false)
-            st.mouse_part = ""
+            edit(d, st -> st.mouse_part = "")
             d.pointer_live.set(false)
-            d.current.set(st)
         KeyDown | KeyUp ->
             val down = e.kind() == sdl.EventKind.KeyDown
             if down && e.key_repeat() then return true
             val key = canonical_key(e.key_scancode())
+            var st = d.current.read()
             if key_input(d.scene, &st, key, down)
-                d.current.set(st)
+                if session.live then d.current.set(st)
                 return true
             if !down then return false
             key match
                 "escape" -> driver.stop()
                 "space" -> pause(d)
-                "r" -> if st.live then d.resetting.set(true)
-                "n" -> if st.live && !st.stopped then d.stepping.set(true)
+                "r" -> if session.live then d.resetting.set(true)
+                "n" -> if session.live && !session.stopped then d.stepping.set(true)
                 "s" -> d.saving.set(true)
                 "b" -> d.workflow match
                     Some(w) -> host.request_build(w)
@@ -292,17 +262,21 @@ command(args: []string) -> Result[int, string]
     if which.is_empty() then return Err(s"usage: benchtop $cmd <board | file.hocon>" )
     if cmd == "render"
         if screenshot.is_empty() then return Err("usage: benchtop render <board | file.hocon> <output.png>")
-        return launch(which, "", false, 1, screenshot, true, instrument_file = instrument_file)
-    launch(which, "", cmd == "demo", frames, screenshot, headless, instrument_file = instrument_file)
+        return launch(which, "", launch_options(frames = 1, screenshot = screenshot, headless = true, instrument_file = instrument_file))
+    launch(which, "", launch_options(demo = cmd == "demo", frames = frames, screenshot = screenshot, headless = headless, instrument_file = instrument_file))
 
-pacing_notice(st: *State, snapshot: virt.WorkerObservation)
-    val own = st.notice.starts_with("Emulation speed:")
-    if st.paused || !snapshot.running
-        if own then st.notice = ""
+/** Say how far behind real time the slower core is while the session runs, unless another notice
+ * that is not the session's own (a stop, a failure) holds the footer.
+ */
+pacing_notice(st: *State, paused: bool, snapshot: virt.WorkerObservation)
+    val own = st.notice.kind == NoticeKind.Pacing
+    if paused || !snapshot.running
+        if own then st.notice = no_notice()
         return
     val k = if snapshot.launched && snapshot.cores[1].late_us > snapshot.cores[0].late_us then 1 else 0
     val lag = snapshot.cores[k].late_us
     if lag > 5000
-        if st.notice.is_empty() || own || st.notice == "Firmware reloaded" || st.notice.starts_with("Saved ") then
-            st.notice = s"Emulation speed: core $k is ${lag / 1000} ms behind real time"
-    elif own then st.notice = ""
+        val kind = st.notice.kind
+        if st.notice.text.is_empty() || kind == NoticeKind.Pacing || kind == NoticeKind.Reloaded || kind == NoticeKind.Saved then
+            st.notice = Notice(NoticeKind.Pacing, s"Emulation speed: core $k is ${lag / 1000} ms behind real time")
+    elif own then st.notice = no_notice()

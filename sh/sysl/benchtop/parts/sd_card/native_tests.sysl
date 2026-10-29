@@ -1,0 +1,102 @@
+module sh.sysl.benchtop.parts.sd_card
+@tests
+
+private val RCA: u32 = 0x12340000
+
+private quiet_media() -> Media = Media((sector,out) -> true,(sector,bytes) -> true,() -> true,() -> true)
+
+// Brings a card from power-on to `Tran` through the real command sequence.
+private transfer_ready(program_ticks: u64 = 1000) -> &Native
+    val n = native(card(quiet_media(),32768,program_ticks = program_ticks))
+    assert(native_command(n,0,0,0).kind == NoResponse)
+    assert(native_command(n,55,0,0).present)
+    assert(native_command(n,41,0x40ff8000,0).kind == ShortNoCrc)
+    assert(n.state == Ready)
+    assert(native_command(n,2,0,0).kind == Long)
+    assert(n.state == Ident)
+    assert(native_command(n,3,0,0).words[0] == RCA | u32(Stby) << 9 | 256)
+    assert(native_command(n,7,RCA,0).present)
+    assert(n.state == Tran)
+    n
+
+private current_state(r: Reply) -> u32 = (r.words[0] >> 9) & 15
+
+@test("SD native: the command sequence walks Idle, Ready, Ident, Stby and Tran")
+native_bring_up()
+    val n = transfer_ready()
+    assert(n.pending == NoTransfer)
+    assert(current_state(native_command(n,13,RCA,0)) == u32(Tran))
+
+@test("SD native: reading the status does not end programming; time and the medium do")
+native_status_is_pure()
+    val n = transfer_ready(program_ticks = 1000)
+    val opened = native_command(n,24,5,0)
+    assert(opened.data == WriteSingle && n.state == Rcv)
+    var block: [512]u8 = [0;512]
+    assert(native_write(n,block[..],100))
+    assert(n.state == Prg && n.card.busy_until == 1100)
+    assert(current_state(native_command(n,13,RCA,500)) == u32(Prg),"still programming at 500")
+    assert(n.state == Prg,"a status read leaves the card in Prg")
+    assert(current_state(native_command(n,13,RCA,1100)) == u32(Tran),"programming has ended at 1100")
+    assert(n.state == Tran)
+
+@test("SD native: native_busy settles Prg into Tran once the time has passed")
+native_busy_settles()
+    val n = transfer_ready(program_ticks = 1000)
+    native_command(n,24,5,0)
+    var block: [512]u8 = [0;512]
+    assert(native_write(n,block[..],0))
+    assert(native_busy(n,999))
+    assert(n.state == Prg)
+    assert(!native_busy(n,1000))
+    assert(n.state == Tran)
+
+@test("SD native: CMD12 during programming leaves Prg, and after it Tran")
+native_stop_during_busy()
+    val n = transfer_ready(program_ticks = 1000)
+    native_command(n,25,5,0)
+    var block: [512]u8 = [0;512]
+    assert(native_write(n,block[..],0))
+    assert(n.state == Rcv && n.pending == WriteMultiple && n.sector == 6)
+    native_command(n,12,0,10)
+    assert(n.state == Prg && n.pending == NoTransfer)
+    native_command(n,12,0,2000)
+    assert(n.state == Tran)
+
+@test("SD native: abort ends a transfer in Prg while programming and in Tran otherwise")
+native_abort_paths()
+    val n = transfer_ready(program_ticks = 1000)
+    native_command(n,18,0,0)
+    assert(n.state == Data && n.pending == ReadMultiple)
+    native_abort(n,0)
+    assert(n.state == Tran && n.pending == NoTransfer)
+    native_command(n,24,5,0)
+    var block: [512]u8 = [0;512]
+    assert(native_write(n,block[..],0))
+    native_command(n,25,6,1)
+    native_abort(n,1)
+    assert(n.state == Prg && n.pending == NoTransfer)
+
+@test("SD native: each data command opens its own transfer with its block length")
+native_transfers()
+    val n = transfer_ready()
+    assert(native_command(n,17,1,0).data == ReadSingle && n.state == Data)
+    native_abort(n,0)
+    assert(native_command(n,18,1,0).data == ReadMultiple)
+    native_abort(n,0)
+    assert(native_command(n,55,RCA,0).present)
+    val scr = native_command(n,51,0,0)
+    assert(scr.data == ReadScr && scr.data.block_length() == 8)
+    native_abort(n,0)
+    assert(native_command(n,17,32768,0).data == NoTransfer,"out of range opens nothing")
+    assert(native_command(n,17,32768,0).words[0] & 1 << 31 != 0)
+    n.card.protected = true
+    assert(native_command(n,24,1,0).data == NoTransfer,"a protected card opens no write")
+    assert(ReadSingle.block_length() == 512 && !ReadSingle.writes() && !ReadSingle.multiple())
+    assert(WriteMultiple.writes() && WriteMultiple.multiple())
+
+@test("SD native: R2 and R3 report no command index; R1 does")
+native_response_kinds()
+    assert(Long.reports_no_index() && ShortNoCrc.reports_no_index())
+    assert(!Short.reports_no_index() && !NoResponse.reports_no_index())
+    assert(u32(NoResponse) == 0 && u32(Short) == 1 && u32(ShortNoCrc) == 2 && u32(Long) == 3)

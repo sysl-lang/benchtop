@@ -1,7 +1,7 @@
 module sh.sysl.benchtop.ui
 
 import sh.sysl.benchtop.*
-import sh.sysl.benchtop.virt.{part_pin, panel_levels, panel_drive_mask, panel_inputs, set_analog_pin, pot_voltage, terminal_pin}
+import sh.sysl.benchtop.virt as virt
 import sh.sysl.parsing.Span
 import sysl.buf.{Buf, buf}
 
@@ -12,6 +12,47 @@ const MUTED: u32 = 0x8DA3BA
 const ACCENT: u32 = 0x60E5B6
 const EDGE: u32 = 0x283D54
 const CARD: u32 = 0x121F2E
+const GROUND: u32 = 0x0D1420
+const WARN: u32 = 0xE9BD72
+const FAIL: u32 = 0xF25468
+const CONSOLE_INK: u32 = 0xB6DCC9
+const STATUS_FILL: u32 = 0x192E30
+const SECONDARY: u32 = 0xA7B8CA
+const ON_FILL: u32 = 0x102C24
+const PANEL: u32 = 0x192C3B
+const PCB_EDGE: u32 = 0x487160
+const ICON_FILL: u32 = 0x193B40
+
+// The parts' own colours: the surfaces, bezels and knobs of the controls and modules on a board.
+const SURFACE: u32 = 0x17232E
+const BEZEL: u32 = 0x507386
+const WELL: u32 = 0x0C1C29
+const KNOB: u32 = 0x38586B
+const CONE: u32 = 0x314957
+const BUZZER_BODY: u32 = 0x1A222B
+const BUZZER_RIM: u32 = 0x657889
+const BUZZER_SLOT: u32 = 0x070C12
+const LED_SOCKET: u32 = 0x21353D
+const GLINT: u32 = 0xE8FFF5
+const KEY_BODY: u32 = 0x13232D
+const KEY_IDLE: u32 = 0x536D7E
+const KEY_RIM: u32 = 0x7B92A3
+const GLASS: u32 = 0x080F17
+const GLASS_RIM: u32 = 0x445A6C
+const UNKNOWN_PART: u32 = 0x34475A
+const SEGMENT_FILL: u32 = 0x100D13
+const SEGMENT_RIM: u32 = 0x51303A
+const TFT_FILL: u32 = 0x172C3D
+const TFT_RIM: u32 = 0x638399
+const OLED_FILL: u32 = 0x152C42
+const OLED_RIM: u32 = 0x557E9A
+const OLED_GLASS: u32 = 0x020A12
+const OLED_PIXEL: u32 = 0x9BE9FF
+const LCD_FILL: u32 = 0x183F36
+const LCD_RIM: u32 = 0x668C6F
+const LCD_GLASS: u32 = 0xA5BE63
+const LCD_DOT_ON: u32 = 0x253A21
+const LCD_DOT_OFF: u32 = 0x9BB65D
 
 struct Scene
     name: string
@@ -23,21 +64,38 @@ struct Scene
     pointers: Buf[PointerBinding]
     peripherals: Buf[Peripheral]
 
+/** Who put a notice in the footer, so that one owner never clears another's. */
+enum NoticeKind
+    Empty
+    Stop
+    Reloaded
+    Saved
+    SaveFailed
+    Pacing
+    Audio
+    Instrument
+
+struct Notice
+    kind: NoticeKind
+    text: string
+
+private[ui] no_notice() -> Notice = Notice(NoticeKind.Empty, "")
+
+/** A key held down, and the part it is bound to. */
+struct Held derives Eq
+    key: string
+    part: string
+
+/** The desktop's view state: what is selected, and what the mouse and keyboard are holding. The run
+ * state and the parts' controls belong to the session (`virt.Session`).
+ */
 struct State
-    live: bool
-    paused: bool
-    stopped: bool
-    status: string
-    pc: u32
-    instructions: u64
     selected: string
     mouse_part: string
-    held: Buf[string]
-    notice: string
-    pots: Buf[(string, int)]
-    switches: Buf[(string, bool)]
+    held: Buf[Held]
+    notice: Notice
 
-state(live: bool) -> State = State(live, false, false, if live then "RUNNING" else "LAYOUT PREVIEW", 0, 0, "", "", buf(), "", buf(), buf())
+state() -> State = State(selected = "", mouse_part = "", held = buf(), notice = no_notice())
 
 open_scene(which: string) -> Result[Scene, string]
     val src = open_description(built_in_shelf(), which, "", Span(0, 0)) match
@@ -57,7 +115,9 @@ scene(d: Description) -> Result[Scene, string]
         cores += c.name
     Ok(Scene(b.name, b.chip.name, cores, b.view, Scope(b.parts, buf()), b.keys, b.pointers, b.chip.peripherals))
 
-/** Fit any window size with letterboxing; the same transform is used for pointer input. */
+/** A scale and an origin. The board is drawn at scale 1 from its panel's corner (`board_transform`),
+ * and the same transform maps pointer input back to the board; `fit` letterboxes a size into another.
+ */
 struct Transform
     scale: f32
     x: f32
@@ -86,93 +146,37 @@ private[ui] look(e: Element, key: string, fallback: string) -> string
             _ -> fallback
         None -> fallback
 
-private[ui] lit(st: State, p: Part, chip: string = "") -> bool
-    val pin = part_pin(p, chip)
-    if !st.live || pin < 0 || (panel_drive_mask() & (1u32 << u32(pin))) == 0 then return false
-    val high = (panel_levels() & (1u32 << u32(pin))) != 0
-    if param(p, "active", "high") == "low" then !high else high
-
 release_inputs(st: *State)
     st.mouse_part = ""
     st.held.clear()
 
-/** Key names are the description's canonical names (lower-case, e.g. "1", "up"). */
+/** Key names are the description's canonical names (lower-case, e.g. "1", "up"). A key held is
+ * remembered with its part, so two keys bound to the same part stay independent.
+ */
 key_input(s: Scene, st: *State, key: string, down: bool) -> bool
     var matched = false
     for binding in s.keys
         if binding.key != key then continue
         matched = true
-        if !st.live then continue
-        val token = s"$key:${binding.part}"
-        // Store key identity, so two keys bound to the same part remain independent.
+        val held = Held(key, binding.part)
         var index: usize = 0
-        var found = false
-        while index < st.held.len()
-            if st.held.at(index) == token
-                found = true
-                break
-            index += 1
-        if down && !found then st.held.push(token)
+        while index < st.held.len() && st.held.at(index) != held do index += 1
+        val found = index < st.held.len()
+        if down && !found then st.held.push(held)
         if !down && found then st.held.remove(index)
     matched
 
-// Keyboard tokens keep the key prefix; resolve them only when sampling part state.
-private[ui] pressed(s: Scene, st: State, name: string) -> bool
+/** Whether the mouse or a key is holding the named part down. */
+private[ui] pressed(st: State, name: string) -> bool
     if st.mouse_part == name then return true
-    for binding in s.keys
-        if binding.part != name then continue
-        for token in st.held do if token == s"${binding.key}:$name" then return true
+    for held in st.held do if held.part == name then return true
     false
 
-sample_inputs(s: Scene, st: State)
-    if !st.live then return
-    var levels: u32 = 0xFFFFFFFF
-    for p in s.scope.parts
-        if p.kind != "button" && p.kind != "switch" then continue
-        val pin = part_pin(p, s.chip)
-        if pin < 0 then continue
-        val closed = if p.kind == "switch" then switch_closed(st,p) else pressed(s,st,p.name)
-        val high = if param(p, "active", "low") == "low" then !closed else closed
-        if high then levels |= 1u32 << u32(pin) else levels &= ~(1u32 << u32(pin))
-    panel_inputs(levels)
-    for p in s.scope.parts
-        if p.kind == "joystick"
-            for axis in ["x", "y"]
-                val pin = terminal_pin(p,axis,s.chip)
-                if pin >= 0 then set_analog_pin(pin,pot_voltage(p,axis_position(st,s"${p.name}.$axis")))
-        if p.kind != "potentiometer" then continue
-        val pin = part_pin(p, s.chip)
-        if pin >= 0 then set_analog_pin(pin, pot_voltage(p, pot_position(st, p)))
+/** Report every button's state to the session: pressed while the mouse or a bound key holds it. */
+private[ui] press_inputs(s: Scene, st: State, session: &virt.Session)
+    for p in s.scope.parts do if p.kind == "button" then session.set_part_input(p.name, virt.PartInput.Pressed(pressed(st, p.name)))
 
 private[ui] target(t: Target) -> string = t match
     Pin(name) -> name
     Bus(name) -> name
     Port(p, port) -> s"$p.$port"
-
-private[ui] pot_position(st: State, p: Part) -> int
-    for entry in st.pots do if entry.0 == p.name then return entry.1
-    int(part_whole(p, "position", 50)) * 100
-
-private[ui] set_pot(st: *State, name: string, value: int)
-    val position = if value < 0 then 0 elif value > 10000 then 10000 else value
-    for i in 0..<st.pots.len()
-        if st.pots.at(i).0 == name
-            st.pots.set(i, (name, position))
-            return
-    st.pots.push((name, position))
-
-private[ui] axis_position(st: State, name: string) -> int
-    for entry in st.pots do if entry.0 == name then return entry.1
-    5000
-
-private[ui] switch_closed(st: State, p: Part) -> bool
-    for entry in st.switches do if entry.0 == p.name then return entry.1
-    part_flag(p,"closed",false)
-
-private[ui] toggle_switch(st: *State, p: Part)
-    val closed = !switch_closed(*st,p)
-    for i in 0..<st.switches.len()
-        if st.switches.at(i).0 == p.name
-            st.switches.set(i,(p.name,closed))
-            return
-    st.switches.push((p.name,closed))

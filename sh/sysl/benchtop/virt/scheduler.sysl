@@ -38,8 +38,9 @@ module sh.sysl.benchtop.virt
 // store posts the lines it writes to the other core; the FIFOs are single-producer single-consumer
 // rings; a spinlock is an atomic test-and-set; and the console is under its lock.
 
-import sh.sysl.benchtop.v6m.{has_incoming, Cpu, Stop, IRQ0, NEVER, could_wake, cut, halt, pair, poke, raise, refresh, run_single, run_threaded, set_limit, take_incoming, unpair}
+import sh.sysl.benchtop.v6m.{has_incoming, Cpu, Stop, IRQ0, could_wake, cut, halt, pair, poke, raise, refresh, run_single, run_threaded, set_limit, take_incoming, unpair}
 import sh.sysl.benchtop.timing as timing
+import sh.sysl.benchtop.timing.NEVER
 import sysl.math.{min, max}
 import sysl.sync.*
 import sysl.threads.{Condvar, Mutex, Thread, spawn}
@@ -64,7 +65,6 @@ const HOLD_SPINS = 4000
  * written with atomic accesses; a core sets its own `dozing` and `holding` only under `Scheduler.board`.
  */
 struct Lockstep
-    cores: [2]*Cpu
     // Each core's clock as of its last run, for the other.
     clocks: [2]u64
     // 1 while a core's thread is blocked asleep, and the clock its SysTick wakes it at, `NEVER` for none.
@@ -106,7 +106,7 @@ struct Scheduler
     dsi: DsiWorker
 
 var scheduler = Scheduler(0, QUANTUM, ALONE, false, false, false, false, false, NEVER, false,
-    Lockstep([&machine.cores[0], &machine.cores[1]],[0, 0], [0, 0], [NEVER, NEVER], [0, 0], [0, 0], 0),
+    Lockstep([0, 0], [0, 0], [NEVER, NEVER], [0, 0], [0, 0], 0),
     Mutex.new(0), Condvar.new(), no_workers(), dsi_worker())
 
 /** Every scheduler field as at power-on, keeping the CPU workers' threads where they run. */
@@ -128,6 +128,9 @@ core0() -> *Cpu = &machine.cores[0]
 
 // The machine's core 1.
 core1() -> *Cpu = &machine.cores[1]
+
+// The machine's core k.
+private[virt] core_at(k: int) -> *Cpu = &machine.cores[k]
 
 // Whether core 1 has been launched.
 running_both() -> bool = scheduler.launched
@@ -274,7 +277,7 @@ private run_threads(cpu: *Cpu) -> *Cpu
     while !s.launched
         if !round(cpu) then return answer(cpu)
 
-    pair_cores(cpu, NEVER)
+    pair_cores(NEVER)
 
     spawn(&core1_body, core1(), CORE1_STACK) match
         Some(t) ->
@@ -291,22 +294,22 @@ private run_threads(cpu: *Cpu) -> *Cpu
 /** Ready both cores, from the board's clock, to run at once until `horizon` (`NEVER` for no end): no
  * core asleep or held back, each core's clock published, and the cores' records paired.
  */
-private[virt] pair_cores(cpu: *Cpu, horizon: u64)
+private[virt] pair_cores(horizon: u64)
     val s = &scheduler
     val l = &s.lockstep
-    l.cores[0] = cpu
-    l.cores[1] = core1()
     for k in 0..<2
+        val c = core_at(k)
+
         atomic_store(&l.dozing[k], 0, SeqCst)
         atomic_store(&l.wake_at[k], NEVER, SeqCst)
         atomic_store(&l.holding[k], 0, SeqCst)
-        atomic_store(&l.clocks[k], board_time(l.cores[k], l.cores[k].retired), SeqCst)
+        atomic_store(&l.clocks[k], board_time(c, c.retired), SeqCst)
     atomic_store(&l.ended, 0, SeqCst)
     s.board.with(floor -> *floor = scheduler.now)
     s.starting = false
     s.horizon = horizon
     if !s.paired
-        pair(cpu, core1())
+        pair(core0(), core1())
         s.paired = true
     s.threaded = true
 
@@ -348,7 +351,7 @@ private[virt] run_core(cpu: *Cpu, k: int)
 
         if cpu.stop != Stop.Budget
             atomic_store(&l.ended, 1, SeqCst)
-            cut(l.cores[o])
+            cut(core_at(o))
             nudge()
             wake_worker_checkpoints()
             return
@@ -412,7 +415,7 @@ private[virt] nudge()
 /** Raise IRQ `irq` in core k from the other core's thread, and wake it where it sleeps. */
 private[virt] wake_core(k: int, irq: u32)
     val l = &scheduler.lockstep
-    poke(l.cores[k], irq)
+    poke(core_at(k), irq)
     if atomic_load(&l.dozing[k], SeqCst) != 0 then nudge()
 
 // Core k is asleep, with nothing to wake it at its own clock: block its thread until something does,
@@ -485,7 +488,7 @@ private both_asleep(cpu: *Cpu, k: int, floor: *u64) -> bool
     val s = &scheduler
     val l = &s.lockstep
     val o = 1 - k
-    val other = l.cores[o]
+    val other = core_at(o)
 
     // Woken already, and yet to run.
     if has_incoming(other)

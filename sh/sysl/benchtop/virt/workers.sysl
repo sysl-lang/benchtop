@@ -4,7 +4,8 @@ module sh.sysl.benchtop.virt
 // resume, step and reset, and tests with bounded budgets. They run the board through the scheduler's
 // turns and lockstep (`scheduler.sysl`), paced against the host's clock where the session has one.
 
-import sh.sysl.benchtop.v6m.{Cpu, Stop, NEVER, refresh, take_incoming, set_limit, run_single, clock as core_ticks}
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.benchtop.v6m.{Cpu, Stop, refresh, take_incoming, set_limit, run_single, clock as core_ticks}
 import sysl.threads.{Thread, Mutex, Condvar, spawn, current}
 import sysl.time.monotonic
 import sh.sysl.benchtop.timing as timing
@@ -118,7 +119,8 @@ start_workers(cpu: *Cpu, parallel: bool = true, hz: u64 = 0) -> Result[unit,stri
     require !scheduler.workers.active && !scheduler.threaded, "one board owns the CPU workers"
     val w = &scheduler.workers
     for k in 0..<2
-        if hz != 0 && (hz < core_clock_divisors[k] || hz % core_clock_divisors[k] != 0) then
+        val divisor = machine.configs[k].divisor
+        if hz != 0 && (hz < divisor || hz % divisor != 0) then
             return Err("worker clock must divide into each configured core clock domain")
     w.parallel = parallel
     w.hz = hz
@@ -137,11 +139,11 @@ start_workers(cpu: *Cpu, parallel: bool = true, hz: u64 = 0) -> Result[unit,stri
         c.waited_us = [0, 0]
         c.snap = capture_workers(c.ids))
     w.active = true
-    w.handles[0] = spawn(&cpu_worker0,core0(),1 << 20)
+    w.handles[0] = spawn(&leading_worker,core0(),1 << 20)
     if w.handles[0].is_none()
         w.active = false
         return Err("cannot create the host worker for guest core 0")
-    w.handles[1] = spawn(&cpu_worker1,core1(),1 << 20)
+    w.handles[1] = spawn(&following_worker,core1(),1 << 20)
     if w.handles[1].is_none()
         w.control.with(c ->
             c.closing = true
@@ -174,7 +176,7 @@ resume_workers()
                 for k in 0..<2
                     val core = if k == 0 then core0() else core1()
                     val origin = if k == 1 && !scheduler.launched then local_time(core,scheduler.now) else core_ticks(core,core.retired)
-                    c.pacers[k] = timing.pacer(scheduler.workers.hz / core_clock_divisors[k],at,origin)
+                    c.pacers[k] = timing.pacer(scheduler.workers.hz / divisor_of(core),at,origin)
                     scheduler.workers.next_check[k] = c.pacers[k].next_check
                 c.epoch_ready = true
             atomic_store(&scheduler.workers.interrupt,0,Release)
@@ -267,8 +269,9 @@ private wall_target(c: *WorkerControl) -> u64
         return now + cap
     due
 
-private cpu_worker0(ignored: *Cpu)
-    val cpu = core0()
+// The leading worker, which runs core 0 (`cpu`): it takes the control requests, runs batches up to
+// their horizon, and hands each paired run to the following worker by bumping `generation`.
+private leading_worker(cpu: *Cpu)
     val w = &scheduler.workers
     val c = w.control.lock_raw()
     c.ids[0] = current().id
@@ -307,7 +310,9 @@ private cpu_worker0(ignored: *Cpu)
         w.changed.notify_all()
     w.control.unlock_raw()
 
-private cpu_worker1(cpu: *Cpu)
+// The following worker, which runs core 1 (`cpu`): one run of it for each generation the leading
+// worker starts, reported back through `finished`.
+private following_worker(cpu: *Cpu)
     val w = &scheduler.workers
     val c = w.control.lock_raw()
     c.ids[1] = current().id
@@ -359,7 +364,7 @@ private execute_worker_batch(cpu: *Cpu, horizon: u64, stepping: bool)
             s.now = board_time(cpu,cpu.retired)
             core1().slept = local_time(core1(),s.now)
     if s.launched && cpu.stop == Stop.Budget && core1().stop == Stop.Budget
-        pair_cores(cpu,horizon)
+        pair_cores(horizon)
         val job = w.control.with(c ->
             c.snap.launched = scheduler.launched
             c.generation += 1
@@ -391,7 +396,7 @@ private[virt] worker_run_interrupted() -> bool
 private[virt] worker_clock_limit(c: *Cpu) -> u64
     val w = &scheduler.workers
     if !w.active || !w.paced then return NEVER
-    w.next_check[c.core] * core_clock_divisors[c.core]
+    w.next_check[c.core] * divisor_of(c)
 
 private[virt] worker_checkpoint(cpu: *Cpu) -> bool
     val w = &scheduler.workers
@@ -433,5 +438,5 @@ private observed_workers(c: *WorkerControl) -> WorkerObservation
     if !scheduler.workers.paced || !c.epoch_ready || c.paused || c.step_pending then return snapshot
     val at = host_now_ns() / 1000
     for k in 0..<(if snapshot.launched then 2 else 1)
-        snapshot.cores[k].late_us = timing.late_us(c.pacers[k],snapshot.cores[k].time / core_clock_divisors[k],at)
+        snapshot.cores[k].late_us = timing.late_us(c.pacers[k],snapshot.cores[k].time / machine.configs[k].divisor,at)
     snapshot

@@ -12,13 +12,23 @@ module sh.sysl.benchtop.realtime
 // a paced core had left.
 
 import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.v6m as v6m
 import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.elf as elf
 import sysl.math.{min,max,tau,Float}
 import sysl.time.{monotonic,sleep,millis}
 import sysl.posix.time.cpu_time
 
+/** A word written into the guest's memory at an ELF symbol after the image is loaded and before
+ * either core runs, as a debugger would: how a firmware is told which variant of itself to run.
+ */
+struct Poke
+    symbol: string
+    value: u32
+
 /** How to run: the measured guest seconds after `warmup` guest seconds of boot, paced against the
- * host's clock as the desktop runs (or as fast as the host can), and the parts the desktop drives.
+ * host's clock as the desktop runs (or as fast as the host can), the parts the desktop drives, and a
+ * word to set before the cores start.
  */
 struct Options
     seconds: u64
@@ -26,8 +36,9 @@ struct Options
     paced: bool
     display: string
     touch: string
+    poke: Option[Poke]
 
-options() -> Options = Options(10, 1, true, "screen", "touch")
+options() -> Options = Options(10, 1, true, "screen", "touch", None)
 
 /** One core over the measured window: guest time (in board ticks), instructions, the host time its
  * worker waited for the host's clock, and how far it trailed real time when the window closed.
@@ -60,6 +71,14 @@ struct Run
 
     /** The share of the window core `k`'s worker spent running rather than waiting for the clock. */
     busy(self, k: int) -> real = 1.0 - real(min(self.cores[k].waited_us, self.wall_us)) / real(self.wall_us)
+
+    /** The guest MHz core `k` ran at over the window: its rated clock times `speed`. */
+    mhz(self, k: int) -> real = real(self.cores[k].ticks) / real(self.divisors[k]) / real(self.wall_us)
+
+    /** The guest MHz core `k`'s worker could have sustained had it never waited: what it ran at over
+     * the share of the window it was busy. Unpaced, it never waits, and this is what it ran at.
+     */
+    capacity_mhz(self, k: int) -> real = self.mhz(k) / max(self.busy(k), 0.000001)
 
 // Where the window starts or ends: the workers' published state and the host's counters.
 private struct Mark
@@ -97,6 +116,13 @@ run(which: string, file: []const u8, o: Options) -> Result[Run,string]
     virt.open_console()
     virt.capture_bounded(8192)
     virt.boot(cpu, image.view())
+    o.poke match
+        Some(p) ->
+            val symbol = elf.read(file).map_err(e -> s"--set needs an ELF image: $e")?.symbol_named(p.symbol).map_err(e -> s"$e")?
+            symbol match
+                Some(s) -> v6m.store32(cpu, u32(s.value), p.value)
+                None -> return Err(s"the image has no symbol ${p.symbol}")
+        None -> ()
     virt.start_workers(cpu, true, if o.paced then hz else 0)?
     val start = o.warmup * hz
     val end = (o.warmup + o.seconds) * hz
@@ -119,7 +145,7 @@ run(which: string, file: []const u8, o: Options) -> Result[Run,string]
     virt.stop_workers()
     if !failed.is_empty() then return Err(s"the guest stopped: $failed")
     val from = first.unwrap()
-    Ok(Run(hz, virt.core_clock_divisors, launched, o.paced, u64(last.wall_us - from.wall_us),
+    Ok(Run(hz, virt.clock_divisors(), launched, o.paced, u64(last.wall_us - from.wall_us),
         [core_run(from, last, 0), core_run(from, last, 1)],
         last.dsi.completed - from.dsi.completed, last.dsi.busy_us - from.dsi.busy_us,
         last.sound_frames - from.sound_frames, u64(virt.sound_channels()), last.mic_frames - from.mic_frames,

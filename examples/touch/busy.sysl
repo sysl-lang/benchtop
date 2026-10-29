@@ -1,0 +1,166 @@
+#if feature_busy
+import sysl.math.Float
+
+// The busy-M7 variant of the microphone firmware. The M4 draws exactly as it does there; the M7
+// filters the microphone through a 255-tap FIR in its audio interrupts and, between them, never
+// sleeps: it runs the kernels that cost an emulator the most -- memory traffic across three regions,
+// double precision, data-dependent branches and peripheral polls -- so a slowdown in any of them
+// shows as the M7 falling behind real time.
+
+// Built for the M7 alone (`m7-double/`): the M4 has no double-precision unit.
+extern busy_double_round() -> u32
+
+// Which kernel the M7 runs between interrupts. It lives in D2 SRAM outside .data and .bss, so
+// start-up leaves it as it was: a debugger -- or `benchtop realtime --set busy_kernel=N` -- writes it
+// before the cores start. 1 memory, 2 double precision, 3 branches, 4 peripheral polls, 5 none (the
+// M7 sleeps between the audio interrupts); 0, or anything else, runs one round of each in turn.
+@export("busy_kernel")
+@section(".audio_delay")
+var busy_kernel: Word
+
+// Rounds each kernel has finished, and a value folded from their results so none is dead code.
+@export("busy_rounds")
+var busy_rounds: [5]Word
+@export("busy_check")
+var busy_check: Word
+@export("audio_dsp_peak_cycles")
+var audio_dsp_peak_cycles: Word
+@export("audio_dsp_cycles")
+var audio_dsp_cycles: Word
+
+// A linear-phase low-pass at 1 kHz. The history is written twice, 255 apart, so the newest 255
+// samples are always one contiguous run.
+var busy_taps: [255]f32
+var busy_history: [510]f32
+var busy_at: usize = 0
+
+// 112 KiB in D2 SRAM, 8 KiB in AXI SRAM and a table in flash: the memory kernel touches all three.
+@section(".audio_delay")
+var busy_far: [28672]u32
+var busy_near: [2048]u32
+val busy_salt: [16]u32 = [0x9e3779b9,0x7f4a7c15,0xf39cc060,0x5ced2b29,0x1b873593,0xcc9e2d51,0x85ebca6b,0xc2b2ae35,
+    0x27d4eb2f,0x165667b1,0xd3a2646c,0xfd7046c5,0xb55a4f09,0x9e3779b1,0x61c88647,0x2545f491]
+var busy_block: usize = 0
+var busy_stride_at: usize = 0
+var busy_seed: u32 = 2463534242
+
+// Kept a call: inlined, its floating-point registers would be saved on entry to audio_initialize,
+// before that has turned the FPU on.
+@noinline
+busy_initialize()
+    // Windowed sinc (Hamming), normalised to unity gain at DC.
+    val cutoff: f32 = 1000.0 / 48000.0
+    var sum: f32 = 0.0
+    for k in 0..<255
+        val n = f32(int(k) - 127)
+        val ideal = if k == 127 then 2.0 * cutoff else (6.2831855 * cutoff * n).sin() / (3.1415927 * n)
+        busy_taps[k] = ideal * (0.54 - 0.46 * (6.2831855 * f32(k) / 254.0).cos())
+        sum += busy_taps[k]
+    for k in 0..<255 do busy_taps[k] /= sum
+    for i in 0..<510 do busy_history[i] = 0.0
+    for i in 0..<2048 do busy_near[i] = 0
+    for i in 0..<28672 do busy_far[i] = u32(i)
+    word(0xe000e014).value = 0xffffff
+    word(0xe000e018).value = 0
+    word(0xe000e010).value = 5 // M7 local cycle timer, no interrupt.
+
+/** One microphone sample through the filter; the effect picks dry, low-passed or the rest. */
+busy_filter(input: f32) -> f32
+    busy_history[busy_at] = input
+    busy_history[busy_at + 255] = input
+    busy_at = if busy_at == 254 then 0 else busy_at + 1
+    val window = busy_history[busy_at..<busy_at + 255]
+    var low: f32 = 0.0
+    for k in 0..<255 do low += busy_taps[k] * window[k]
+    if audio_effect == 1 then low elif audio_effect == 2 then window[127] - low else input
+
+// A sequential pass over one 8 KiB block of the far buffer, mixed with the near buffer and the flash
+// table, then 2048 words a little over 16 KiB apart, wrapping round all of it.
+busy_memory() -> u32
+    val base = busy_block * 2048
+    busy_block = if busy_block == 13 then 0 else busy_block + 1
+    var seen: u32 = 0
+    for i in 0..<2048
+        var v = busy_far[base + i] ^ busy_near[i] ^ busy_salt[i & 15]
+        v ^= v << 13
+        v ^= v >> 17
+        v ^= v << 5
+        busy_far[base + i] = v
+        busy_near[i] = v >> 3
+        seen ^= v
+    var j = busy_stride_at
+    for _ in 0..<2048
+        seen ^= busy_far[j]
+        busy_far[j] = seen
+        j += 4099
+        if j >= 28672 then j -= 28672
+    busy_stride_at = j
+    seen
+
+// Branches no predictor can learn: an insertion sort of 32 random words, then 512 more taken one of
+// eight ways by their low bits.
+busy_branches() -> u32
+    var x = busy_seed
+    var sorted: [32]u32 = [0; 32]
+    for i in 0..<32
+        x ^= x << 13
+        x ^= x >> 17
+        x ^= x << 5
+        var k = i
+        while k > 0 && sorted[k - 1] > x
+            sorted[k] = sorted[k - 1]
+            k -= 1
+        sorted[k] = x
+    var seen = sorted[16]
+    for _ in 0..<512
+        x ^= x << 13
+        x ^= x >> 17
+        x ^= x << 5
+        x & 7 match
+            0 -> seen ^= x
+            1 | 2 -> seen ^= x >> 28
+            3 -> seen = if x > 0x80000000 then seen ^ x else seen >> 1
+            4 -> seen = (seen << 3) | (seen >> 29)
+            5 -> if seen & 1 != 0 then seen ^= 0xa5a5a5a5
+            _ -> seen ^= x << 4
+    busy_seed = x
+    seen
+
+// The polls a driver makes -- the DSI host's FIFO status, the SAI's status, both DMA streams' counts
+// and the cycle counter -- with a little work between each round of them.
+busy_peripherals() -> u32
+    var seen: u32 = 0
+    for _ in 0..<16
+        seen ^= word(0x50000074).value
+        seen ^= word(0x40015818).value
+        seen ^= word(0x4002042c).value
+        seen ^= word(0x40020474).value
+        seen ^= word(0xe000e018).value
+        for k in 0..<16 do seen = (seen << 1) ^ (seen >> 31) ^ u32(k)
+    seen
+
+/** The M7's work between audio interrupts, for ever. */
+busy_run() -> never
+    var check: u32 = 0
+    loop
+        val kernel = busy_kernel.value
+        val every = kernel == 0 || kernel > 5
+        if every || kernel == 1
+            check ^= busy_memory()
+            busy_rounds[0].value += 1
+        if every || kernel == 2
+            check ^= busy_double_round()
+            busy_rounds[1].value += 1
+        if every || kernel == 3
+            check ^= busy_branches()
+            busy_rounds[2].value += 1
+        if every || kernel == 4
+            check ^= busy_peripherals()
+            busy_rounds[3].value += 1
+        if kernel == 5
+            asm
+                [thumb] "wfi"
+                [aarch64, x86_64, riscv64, riscv32, wasm32, craft] unavailable "Cortex-M firmware"
+            busy_rounds[4].value += 1
+        busy_check.value = check
+#endif

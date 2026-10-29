@@ -190,6 +190,29 @@ and VOLUME for gain. M7 processes the completed receive half into the free trans
 half on DMA IRQ60, while M4 draws the meter and handles touch. The generated sine
 example is retained as `audio-disco.elf` (`build.sh audio`).
 
+## A busy M7
+
+```sh
+./examples/touch/build.sh busy
+./benchtop run --window --board stm32h747-disco examples/touch/busy-disco.elf
+```
+
+`busy-disco.elf` is the microphone firmware with an M7 that never sleeps: the guard
+that `benchtop realtime` keeps the M7 at real time when it has work to do (see
+[bench](../../bench/README.md#real-time-on-the-stm32h747i-disco)). The M4 draws as in
+`mic-disco.elf`. The M7 filters the microphone through a 255-tap FIR low-pass at
+1 kHz in its DMA interrupts (CHANGE EFFECT: dry, low-pass, high-pass) and, between
+them, runs the kernels that cost the emulator most (`busy.sysl`): memory traffic
+across D2 SRAM, AXI SRAM and flash, sequential and strided; double precision
+(multiply-add, divide, square root, with single precision beside it); branches no
+predictor learns; and the polls a driver makes of the DSI host, the SAI, the DMA
+streams and the cycle counter. The M4 has no double-precision unit, so that kernel
+is its own project, `examples/touch-m7-double`, built for `thumbv7em-freestanding-dp`
+and linked in. The word `busy_kernel` picks one kernel alone (1 memory, 2 double,
+3 branches, 4 polls, 5 none: the M7 sleeps between interrupts; 0 or anything else,
+all of them in turn); it sits outside `.data` and `.bss`, so a debugger, or
+`benchtop realtime --set busy_kernel=N`, writes it before the cores start.
+
 ## Stereo headphone delay
 
 ```sh
