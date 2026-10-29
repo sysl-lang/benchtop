@@ -9,7 +9,7 @@ project(benchtop_pico2 C CXX ASM)
 
 pico_sdk_init()
 
-foreach(prog hello_serial blink stack_limit tt)
+foreach(prog hello_serial blink rcp gpioc stack_limit tt)
     add_executable(${prog} ${prog}.c)
     target_link_libraries(${prog} pico_stdlib)
     # A RAM image: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
@@ -21,6 +21,8 @@ foreach(prog hello_serial blink stack_limit tt)
     pico_enable_stdio_usb(${prog} 0)
 endforeach()
 
+# rcp.c uses the redundancy coprocessor's header directly.
+target_link_libraries(rcp hardware_rcp)
 target_link_libraries(stack_limit hardware_exception)
 # ACLE's TTA and TTAT intrinsics are only declared for code built for the Security Extension.
 target_compile_options(tt PRIVATE -mcmse)

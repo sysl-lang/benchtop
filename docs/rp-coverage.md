@@ -67,7 +67,7 @@ day. An L is split before it is handed out (§6).
 | M33 stack limits (MSPLIM/PSPLIM) | 3.7 | full | Every SP write below the limit is the UsageFault STKOF, recorded in CFSR and taken where SHCSR enables it and it preempts, else HardFault (HFSR.FORCED), else a lockup stop; exception stacking that crosses the limit stacks only above it, leaves SP at it and derives the fault (late arrival or pending); `CCR.STKOFHFNMIGN` at negative priority (`v6m/t2secure.sysl`, item 2). | `t2_except.sysl` stack-limit tests; `examples/pico2/stack_limit.c` in `chip/arm_tests.sysl` | — | — |
 | TrustZone, Secure-only minimum (SAU stored, TT*, SecureFault, NS transitions refused) | 3.7, 10 Security | full | Secure reset state; SAU_CTRL/TYPE/RNR/RBAR/RLAR stored (8 regions); `TT`/`TTT`/`TTA`/`TTAT` answer from the SAU (no IDAU, no MPU modelled: IREGION and MREGION never valid); SecureFault's enable, priority, SFSR (W1C) and SFAR, pended through SHCSR; `SG` a NOP; `BXNS`/`BLXNS` to Non-secure, EXC_RETURN with S or DCRS clear, `MRS`/`MSR` of `_NS` registers and the PPB's NS alias stop at `NonSecure`, named; EXC_RETURN with ES clear is UsageFault INVPC (item 2). Not detected: INVTRAN (executing from SAU-Non-secure memory). | `v6m/t2secure_tests.sysl`; `examples/pico2/tt.c` in `chip/arm_tests.sysl` | — | — |
 | TrustZone, Non-secure state | 3.7, 10 Security | missing | Both worlds' banked state, IDAU, secure gateways and the NS aliases of PPB and SIO. | — | L | Secure-only |
-| M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | partial | `MCR`, `MRC`, `MCRR`, `MRRC`, `CDP` and their `…2` forms reach the board through `Bus.coprocessor`, gated by CPACR, which keeps the fields of the ports the board fills (`v6m/coproc.sysl`). **GPIOC is full**: every instruction is its SIO equivalent (`chip/coprocessors.sysl`). **RCP**: the salt status and the two salts only. **DCP**: the `RCMP` read `runtime_init` makes only. Every other RCP and DCP instruction is refused by name. | `v6m/coproc_tests.sysl`, `chip/arm_tests.sysl` | M (RCP rest), M (DCP) | — |
+| M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | partial | `MCR`, `MRC`, `MCRR`, `MRRC`, `CDP` and their `…2` forms reach the board through `Bus.coprocessor`, gated by CPACR, which keeps the fields of the ports the board fills (`v6m/coproc.sysl`). **GPIOC is full**: every instruction of `gpio_coproc.h` is its SIO equivalent (`chip/coprocessors.sysl`). **RCP is full** (item 3): salts, canaries, boolean and integer checks, the sequence counter, the random byte and `rcp_panic`, each core its own state; a failed check stops the core at `Fault` with the check named (`chip/rcp.sysl`). **DCP**: the `RCMP` read `runtime_init` makes only; every other DCP instruction, and any encoding outside a coprocessor's set, is refused by name. | `v6m/coproc_tests.sysl`, `chip/rcp_tests.sysl`, `chip/arm_tests.sysl` (`rcp.elf`, `gpioc.elf`) | M (DCP) | — |
 | Hazard3 ×2 (RV32IMAC + Zb*/Zc*/Zcmp, PMP, Xh3pmpm, Xh3power) | 3.8 Hazard3 | full | `riscv/rp2350.sysl:6–22` and `riscv/HAZARD3-COVERAGE.md`. | `riscv/hazard3_*_tests`, `chip/tests.sysl:18` | — | — |
 | Hazard3 interrupt controller (Xh3irq) | 3.8 | full | MEIEA, MEIPA, MEINEXT and MEICONTEXT (`riscv/csr.sysl:34–42`). Only the lines `signal` drives ever pend (see "Interrupt routing"). | `riscv/hazard3_tests` | — | — |
 | Architecture switching (ARCHSEL, both pairs) | 3.9 Architecture switching | missing | The board fixes the cores (`boards/pico2-riscv.hocon` against `pico2`). | — | S | Arm board, boot path |
@@ -309,8 +309,8 @@ that must land first. Items with no shared "after" run in parallel.
 | # | item | size | after |
 |---|---|---|---|
 | 1 | **Arm Pico 2 board**: an `ArmBoard` beside `RiscvBoard` running two M33s on `chip.Rp2350`. It covers ELF-to-SRAM debugger entry, the core-1 ROM launch into VTOR, SP and PC, and the 52 IRQ lines into the NVIC through `Processor`. A hand-written M33 twin of `examples/pico2-riscv/blink` is its test. It also clones and builds `pico-examples`, and records the refusal census of `hello_serial` and `blink` (`no_flash` builds) in its report. | M | — |
-| 2 | **done** — **M33 Secure-only security minimum** (DESIGN.md §2.7): Secure reset state, SAU stored, `TT*`, SecureFault with SFSR/SFAR, NS transitions stopped by name, and STKOF taken as a UsageFault. | M | — |
-| 3 | **RCP (CP7) and GPIO coprocessor (CP0)** on a coprocessor port the chip supplies. | M | 1 |
+| 2 | **M33 Secure-only security minimum** (DESIGN.md §2.7): Secure reset state, SAU stored, `TT*`, SecureFault with SFSR/SFAR, NS transitions stopped by name, and STKOF taken as a UsageFault. **Done** (below). | M | — |
+| 3 | **RCP (CP7) and GPIO coprocessor (CP0)** on a coprocessor port the chip supplies. **Done** (below). | M | 1 |
 | 4 | **XIP flash and QMI**: one flash image behind the 0x1000_0000 aliases, the cache, cache-as-SRAM, XIP_CTRL, QMI stored with direct mode, and the loader writing an ELF's PT_LOAD and a UF2 into flash. `pico_xip_sram_test` is its oracle. | M | 1 |
 | 5 | **Start-up register blocks**: PSM (FRCE_OFF and DONE), ROSC with RANDOMBIT, BOOTRAM, SYSINFO, SYSCFG, the POWMAN/VREG store, ACCESSCTRL stored, and CLOCKS FC0 measuring the tree. Every refusal in item 1's census is either answered here or named. | M | 1 |
 | 6 | **Boot ROM function table**: the shape follows Q1; with an HLE ROM, the lookup table plus the functions `runtime_init` and stdio reach. It is split in two if Q1 chooses the real ROM. | L | 4, 5 |
@@ -361,8 +361,8 @@ the RCP and MSPLIM itself and vectors through its own table.
 | # | where | the access | refused as | handler now | item it belongs to |
 |---|---|---|---|---|---|
 | 1 | `crt0.S` `_entry_point` | CPACR ← CP7 full access | CP0–7 fields read as zero | CPACR keeps the fields of the coprocessors the board puts on the port (`v6m/t2system.sysl`, `Cpu.coprocessors`) | 3 |
-| 2 | `crt0.S` | `mrc p7, #1, APSR_nzcv, c0, c0, #0`, the RCP salt status | undefined instruction | the coprocessor interface (`v6m/coproc.sysl`); the RCP answers this core's salt status as RCP true/false (`chip/coprocessors.sysl`) | 3 (minimum) |
-| 3 | `crt0.S` | `mcrr p7, #8, r0, r0, c0` and `…, c1`, the salts | undefined instruction | the RCP stores each core's salt once; a second set is an RCP fault, refused by name | 3 (minimum) |
+| 2 | `crt0.S` | `mrc p7, #1, APSR_nzcv, c0, c0, #0`, the RCP salt status | undefined instruction | the coprocessor interface (`v6m/coproc.sysl`); the RCP answers this core's salt status as RCP true/false (`chip/rcp.sysl`) | 3 (done) |
+| 3 | `crt0.S` | `mcrr p7, #8, r0, r0, c0` and `…, c1`, the salts | undefined instruction | the RCP stores each core's salt once; a second set is an RCP fault, which stops the core at `Fault`, named | 3 (done) |
 | 4 | `runtime_init_usb_power_down` | USBCTRL SIE_CTRL read and SET-alias write, 0x5011004C | not on the bus | `UsbCtrl`, SIE_CTRL stored (`peripheral/rp2350/startup.sysl`) | 20 (minimum) |
 | 5 | `runtime_init_boot_locks_reset` | BOOTRAM BOOTLOCK0–7 writes, 0x400E080C–0x400E0828 | not on the bus | `BootRam`, the whole block | 5 |
 | 6 | `runtime_init_bootrom_locking_enable` | BOOTLOCK7 read (claim) | not on the bus | `BootRam` | 5 |
@@ -409,3 +409,38 @@ IO_BANK0, PADS_BANK0, UART0 and the NVIC took every access the two programs make
 and the `SUB` runs again. `examples/pico2/tt.c` prints ACLE's `cmse_TT`/`TTT`/`TTA`/`TTAT` of SRAM and
 the PPB before and after two SAU regions. Both end on a `BKPT`; `chip/arm_tests.sysl` asserts their
 UART0 text.
+
+### Item 3, done: the redundancy coprocessor and the GPIO coprocessor
+
+**The RCP (`chip/rcp.sysl`) runs every instruction `hardware/rcp.h` emits**, each in its delayed and
+`…2` (nodelay) form, for each core against that core's own salt, sequence counter and PRNG:
+`rcp_salt_core0`/`1` (either core writes either, once), `rcp_canary_status`, `rcp_canary_get` and
+`rcp_canary_check`, `rcp_bvalid`, `rcp_btrue`, `rcp_bfalse`, `rcp_b2valid`, `rcp_b2and`, `rcp_b2or`,
+`rcp_bxorvalid`, `rcp_bxortrue`, `rcp_bxorfalse`, `rcp_ivalid`, `rcp_iequal`, `rcp_random_byte`,
+`rcp_count_set`, `rcp_count_check` and `rcp_panic`.
+
+- **Faults.** A failed check, `rcp_panic`, a second salt, and any instruction but the salts and the
+  status before the issuing core's salt is set are RCP faults. On the chip the core stalls on the
+  coprocessor port for good (NMI if an interrupt abandons the stalled instruction). benchtop stops the
+  core at `Fault` **on the instruction**, and the run's reason names the check and its operands, e.g.
+  `core 0 at pc 0x20000310: the RCP faults: core 0's rcp_canary_check(90) was given 0x…, not the
+  canary for tag 90`. The stall-then-NMI itself is not modelled: the core never runs again either way.
+- **Random delays take no time**, so runs stay deterministic; each delayed instruction still steps
+  the issuing core's PRNG once, as the delay draws from it, so `rcp_random_byte` reads the sequence
+  the same instructions give on a chip.
+- **What the datasheet does not publish** is benchtop's own: the canary function (a SplitMix64 mix
+  of salt and tag) and the PRNG's recurrence (a full-period 24-bit congruential one seeded from the
+  salt's top 24 bits). Only the values differ from a chip's; every equality and inequality a program
+  can observe holds.
+- **Refused by name**: an encoding outside the RCP's set (a check with another's CRm or opc2, an
+  `MRRC`, a third salt), since the datasheet does not say what the RCP does with one.
+
+**The GPIO coprocessor** was checked against every one of `gpio_coproc.h`'s 63 functions by
+`examples/pico2/gpioc.c`, which compares each with the SIO write or read the header documents it as
+(87 checks, 0 mismatches). GPIO 48–63 reach the SIO's high word, whose bits 16–31 (QSPI and USB pads)
+the SIO model does not hold; that is the SIO's, not the coprocessor's.
+
+**A coprocessor stop is on the instruction** under both executors (`v6m/coproc.sysl`), refusal or
+fault. Tests: `chip/rcp_tests.sysl` (each instruction, its fault message, the edges), the executor
+tests and the two SDK programs in `chip/arm_tests.sysl`: `rcp.elf` runs every `rcp_*` function in
+both forms clean, then corrupts a canary and stops at `Fault` with the check named.

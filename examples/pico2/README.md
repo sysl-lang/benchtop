@@ -1,6 +1,6 @@
 # Pico 2 (Arm) examples
 
-Pico SDK programs (the first two unmodified SDK examples) that the `pico2` board runs on its Cortex-M33s, and that
+Pico SDK programs that the `pico2` board runs on its Cortex-M33s, and that
 `chip/arm_tests.sysl` runs end to end:
 
 | program | what it does | what the test asserts |
@@ -9,6 +9,8 @@ Pico SDK programs (the first two unmodified SDK examples) that the `pico2` board
 | `blink.c` | GPIO 25 (the LED) toggled every 250 ms with `sleep_ms` | GPIO 25's level, an edge every 250 ms of guest time |
 | `stack_limit.c` | MSPLIM 1 KB below SP, then a 2 KB frame: the UsageFault STKOF in its own handler, which lifts the limit so the `SUB` runs again | its report: one fault, CFSR's STKOF, the faulting PC in `deep` |
 | `tt.c` | ACLE's `cmse_TT`/`TTT`/`TTA`/`TTAT` of SRAM and the PPB, before and after two SAU regions (built with `-mcmse`) | each answer's word |
+| `rcp.c` | every `hardware/rcp.h` function and macro, both forms, passing; then a corrupted canary | its lines on UART0, then core 0 stopped at `Fault` with `rcp_canary_check` named |
+| `gpioc.c` | every `hardware/gpio_coproc.h` function, each compared with its SIO equivalent | `87 checks, 0 mismatches` and the final OUT and OE |
 
 ```sh
 ./benchtop run --board pico2 examples/pico2/hello_serial.elf
