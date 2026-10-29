@@ -1,0 +1,225 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.clocks as reg
+import sh.sysl.rp2350.pll_sys as pll_reg
+import sh.sysl.rp2350.xosc as xosc_reg
+
+// The clock sources and the clock generators (datasheet, "Clocks", "Crystal oscillator (XOSC)",
+// "PLL"): as far as a start-up sequence needs, and the frequencies the chip runs its devices at.
+// Every condition a start-up polls becomes true when silicon would report it: XOSC's STABLE after its
+// start-up delay, a PLL's LOCK once it is powered with a feedback divisor, and each glitchless mux's
+// SELECTED as soon as CTRL names the source.
+
+/** What each clock source runs at, in Hz, 0 where it is stopped. */
+struct Sources
+    rosc: u64
+    xosc: u64
+    lposc: u64
+    pll_sys: u64
+    pll_usb: u64
+
+// CLOCKS is a file of words, from CLK_GPOUT0_CTRL to INTS.
+private const CLOCK_WORDS: usize = usize(reg.INTS_OFFSET / 4 + 1)
+
+/** CLOCKS: every generator's CTRL and DIV, stored as written. CLK_REF and CLK_SYS have glitchless
+ * muxes, and their SELECTED reads one-hot the source CTRL names; every other generator's SELECTED
+ * reads 1, as the datasheet says of a generator without one. The frequency counter and the
+ * resus are stored, not run.
+ */
+struct Clocks
+    words: [CLOCK_WORDS]u32
+
+    reset(*self)
+        for i in 0..<CLOCK_WORDS do self.words[i] = 0
+        // Each DIV powers up dividing by one.
+        for div in [reg.CLK_GPOUT0_DIV_OFFSET, reg.CLK_GPOUT1_DIV_OFFSET, reg.CLK_GPOUT2_DIV_OFFSET, reg.CLK_GPOUT3_DIV_OFFSET,
+                reg.CLK_REF_DIV_OFFSET, reg.CLK_SYS_DIV_OFFSET, reg.CLK_PERI_DIV_OFFSET, reg.CLK_HSTX_DIV_OFFSET,
+                reg.CLK_USB_DIV_OFFSET, reg.CLK_ADC_DIV_OFFSET]
+            self.words[usize(div / 4)] = 1 << reg.CLK_SYS_DIV_INT_SHIFT
+
+    private word(self, offset: u32) -> u32 = self.words[usize(offset / 4)]
+
+    /** clk_ref's frequency from `s`: its source over DIV.INT (0 divides by 256). */
+    ref_hz(self, s: Sources) -> u64
+        val ctrl = self.word(reg.CLK_REF_CTRL_OFFSET)
+        val source = (ctrl & reg.CLK_REF_CTRL_SRC_MASK) match
+            reg.CLK_REF_CTRL_SRC_ROSC_CLKSRC_PH -> s.rosc
+            reg.CLK_REF_CTRL_SRC_XOSC_CLKSRC -> s.xosc
+            reg.CLK_REF_CTRL_SRC_LPOSC_CLKSRC -> s.lposc
+            _ -> if (ctrl & reg.CLK_REF_CTRL_AUXSRC_MASK) >> reg.CLK_REF_CTRL_AUXSRC_SHIFT == reg.CLK_REF_CTRL_AUXSRC_CLKSRC_PLL_USB then s.pll_usb else 0
+        val divisor = (self.word(reg.CLK_REF_DIV_OFFSET) & reg.CLK_REF_DIV_INT_MASK) >> reg.CLK_REF_DIV_INT_SHIFT
+        source / u64(if divisor == 0 then 256 else divisor)
+
+    /** clk_sys's frequency from `s`: clk_ref, or the aux mux's source, over DIV's 16.16 divisor (an INT
+     * of 0 divides by 65536).
+     */
+    sys_hz(self, s: Sources) -> u64
+        val ctrl = self.word(reg.CLK_SYS_CTRL_OFFSET)
+        val aux = (ctrl & reg.CLK_SYS_CTRL_AUXSRC_MASK) >> reg.CLK_SYS_CTRL_AUXSRC_SHIFT match
+            reg.CLK_SYS_CTRL_AUXSRC_CLKSRC_PLL_SYS -> s.pll_sys
+            reg.CLK_SYS_CTRL_AUXSRC_CLKSRC_PLL_USB -> s.pll_usb
+            reg.CLK_SYS_CTRL_AUXSRC_ROSC_CLKSRC -> s.rosc
+            reg.CLK_SYS_CTRL_AUXSRC_XOSC_CLKSRC -> s.xosc
+            _ -> 0
+        val source = if ctrl & reg.CLK_SYS_CTRL_SRC_MASK == reg.CLK_SYS_CTRL_SRC_CLK_REF then self.ref_hz(s) else aux
+        val div = self.word(reg.CLK_SYS_DIV_OFFSET)
+        var whole = u64(div >> reg.CLK_SYS_DIV_INT_SHIFT)
+        if whole == 0 then whole = 65536
+        (source << 16) / ((whole << 16) + u64(div & reg.CLK_SYS_DIV_FRAC_MASK))
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        if address > reg.INTS_OFFSET then return Err(AccessError.Unmapped)
+        val value = address match
+            reg.CLK_REF_SELECTED_OFFSET -> 1 << (self.word(reg.CLK_REF_CTRL_OFFSET) & reg.CLK_REF_CTRL_SRC_MASK)
+            reg.CLK_SYS_SELECTED_OFFSET -> 1 << (self.word(reg.CLK_SYS_CTRL_OFFSET) & reg.CLK_SYS_CTRL_SRC_MASK)
+            reg.CLK_GPOUT0_SELECTED_OFFSET | reg.CLK_GPOUT1_SELECTED_OFFSET | reg.CLK_GPOUT2_SELECTED_OFFSET | reg.CLK_GPOUT3_SELECTED_OFFSET -> 1
+            reg.CLK_PERI_SELECTED_OFFSET | reg.CLK_HSTX_SELECTED_OFFSET | reg.CLK_USB_SELECTED_OFFSET | reg.CLK_ADC_SELECTED_OFFSET -> 1
+            _ -> self.word(address)
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        if address > reg.INTS_OFFSET then return Err(AccessError.Unmapped)
+        val i = usize(address / 4)
+        self.words[i] = written(self.words[i], offset, replicated(value, width))
+        Ok(())
+end Clocks
+
+clocks() -> Clocks
+    var state: Clocks
+    state.reset()
+    state
+
+/** XOSC: off at power-on. Enabled, it is STABLE once STARTUP.DELAY × 256 of its own cycles have passed
+ * (× 4 more with X4).
+ */
+struct Xosc
+    ctrl: u32
+    startup: u32
+    dormant: u32
+    count: u32
+    // Its own cycles until STABLE while it starts; 0 once stable or while off.
+    starting: u64
+    on: bool
+
+    reset(*self)
+        self.ctrl = 0
+        self.startup = 0
+        self.dormant = 0
+        self.count = 0
+        self.starting = 0
+        self.on = false
+
+    /** Whether it runs and has settled: what STATUS.STABLE says. */
+    stable(self) -> bool = self.on && self.starting == 0
+
+    /** `cycles` of its own clock pass. */
+    advance(*self, cycles: u64)
+        if !self.on then return
+        self.starting = if cycles >= self.starting then 0 else self.starting - cycles
+        self.count = if u64(self.count) > cycles then self.count - u32(cycles) else 0
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val value = offset & 0xFFC match
+            xosc_reg.CTRL_OFFSET -> self.ctrl
+            xosc_reg.STATUS_OFFSET ->
+                val stable = if self.stable() then xosc_reg.STATUS_STABLE_MASK else 0
+                val enabled = if self.on then xosc_reg.STATUS_ENABLED_MASK else 0
+                stable | enabled | (self.ctrl & xosc_reg.STATUS_FREQ_RANGE_MASK)
+            xosc_reg.DORMANT_OFFSET -> self.dormant
+            xosc_reg.STARTUP_OFFSET -> self.startup
+            xosc_reg.COUNT_OFFSET -> self.count
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val data = replicated(value, width)
+        offset & 0xFFC match
+            xosc_reg.CTRL_OFFSET ->
+                self.ctrl = written(self.ctrl, offset, data)
+                val enable = (self.ctrl & xosc_reg.CTRL_ENABLE_MASK) >> xosc_reg.CTRL_ENABLE_SHIFT
+                if enable == xosc_reg.CTRL_ENABLE_ENABLE && !self.on
+                    self.on = true
+                    val delay = u64(self.startup & xosc_reg.STARTUP_DELAY_MASK) * 256
+                    self.starting = if self.startup & xosc_reg.STARTUP_X4_MASK != 0 then delay * 4 else delay
+                elif enable == xosc_reg.CTRL_ENABLE_DISABLE
+                    self.on = false
+                    self.starting = 0
+            xosc_reg.STATUS_OFFSET -> ()
+            xosc_reg.DORMANT_OFFSET -> self.dormant = written(self.dormant, offset, data)
+            xosc_reg.STARTUP_OFFSET -> self.startup = written(self.startup, offset, data)
+            xosc_reg.COUNT_OFFSET -> self.count = written(self.count, offset, data) & 0xFFFF
+            _ -> return Err(AccessError.Unmapped)
+        Ok(())
+end Xosc
+
+xosc() -> Xosc
+    var state: Xosc
+    state.reset()
+    state
+
+// A PLL's four power-down bits.
+private const POWER_BITS: u32 = pll_reg.PWR_VCOPD_MASK | pll_reg.PWR_POSTDIVPD_MASK | pll_reg.PWR_DSMPD_MASK | pll_reg.PWR_PD_MASK
+
+/** PLL_SYS or PLL_USB: powered down at power-on. It reports LOCK as soon as it is powered (PD and
+ * VCOPD clear) with a feedback divisor; its output is the reference over REFDIV, times FBDIV, over the
+ * two post dividers, while the post dividers are powered.
+ */
+struct Pll
+    cs: u32
+    pwr: u32
+    fbdiv: u32
+    prim: u32
+
+    reset(*self)
+        // REFDIV 1; everything powered down; both post dividers 7.
+        self.cs = 1
+        self.pwr = POWER_BITS
+        self.fbdiv = 0
+        self.prim = pll_reg.PRIM_POSTDIV1_MASK | pll_reg.PRIM_POSTDIV2_MASK
+
+    locked(self) -> bool =
+        self.pwr & (pll_reg.PWR_PD_MASK | pll_reg.PWR_VCOPD_MASK) == 0 && self.fbdiv != 0 && self.cs & pll_reg.CS_REFDIV_MASK != 0
+
+    /** Its output from a reference of `ref_hz`, 0 while it is not locked or its post dividers are off. */
+    hz(self, ref_hz: u64) -> u64
+        if !self.locked() || self.pwr & pll_reg.PWR_POSTDIVPD_MASK != 0 then return 0
+        val one = (self.prim & pll_reg.PRIM_POSTDIV1_MASK) >> pll_reg.PRIM_POSTDIV1_SHIFT
+        val two = (self.prim & pll_reg.PRIM_POSTDIV2_MASK) >> pll_reg.PRIM_POSTDIV2_SHIFT
+        if one == 0 || two == 0 then return 0
+        ref_hz / u64(self.cs & pll_reg.CS_REFDIV_MASK) * u64(self.fbdiv) / u64(one * two)
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val value = offset & 0xFFC match
+            pll_reg.CS_OFFSET -> (self.cs & ~pll_reg.CS_LOCK_MASK) | (if self.locked() then pll_reg.CS_LOCK_MASK else 0)
+            pll_reg.PWR_OFFSET -> self.pwr
+            pll_reg.FBDIV_INT_OFFSET -> self.fbdiv
+            pll_reg.PRIM_OFFSET -> self.prim
+            pll_reg.INTR_OFFSET | pll_reg.INTE_OFFSET | pll_reg.INTF_OFFSET | pll_reg.INTS_OFFSET -> 0
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val data = replicated(value, width)
+        offset & 0xFFC match
+            pll_reg.CS_OFFSET -> self.cs = written(self.cs, offset, data) & (pll_reg.CS_BYPASS_MASK | pll_reg.CS_REFDIV_MASK)
+            pll_reg.PWR_OFFSET -> self.pwr = written(self.pwr, offset, data) & POWER_BITS
+            pll_reg.FBDIV_INT_OFFSET -> self.fbdiv = written(self.fbdiv, offset, data) & pll_reg.FBDIV_INT_FBDIV_INT_MASK
+            pll_reg.PRIM_OFFSET -> self.prim = written(self.prim, offset, data) & (pll_reg.PRIM_POSTDIV1_MASK | pll_reg.PRIM_POSTDIV2_MASK)
+            pll_reg.INTR_OFFSET | pll_reg.INTE_OFFSET | pll_reg.INTF_OFFSET | pll_reg.INTS_OFFSET -> ()
+            _ -> return Err(AccessError.Unmapped)
+        Ok(())
+end Pll
+
+pll() -> Pll
+    var state: Pll
+    state.reset()
+    state

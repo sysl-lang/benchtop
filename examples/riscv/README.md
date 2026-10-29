@@ -25,8 +25,8 @@ sysl test . --filter RV32
 `chip.hocon` demonstrates core names in the shared description format. It is not a
 runnable board. Bare ISA profiles have no interrupt controller; the built-in mcu
 `rp2350-hazard3` (`mcus/rp2350-hazard3.hocon`) uses the executable Hazard3 profile, whose
-core-local interrupt controller is implemented. Neither supplies RP2350 devices or a firmware
-boot protocol.
+core-local interrupt controller is implemented. The board `pico2-riscv` runs that mcu with the
+RP2350's devices and boot protocol: `examples/pico2-riscv/blink.elf` is its example.
 
 Every implemented mnemonic also has a named instruction unit test and a row in
 [the coverage matrix](../../sh/sysl/benchtop/riscv/COVERAGE.md). The independent Python

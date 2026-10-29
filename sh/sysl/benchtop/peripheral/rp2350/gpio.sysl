@@ -1,0 +1,131 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
+
+// IO_BANK0 and PADS_BANK0 (datasheet, "GPIO", "Pads"): which function drives each of the 48 GPIOs,
+// with the overrides, and the pads that let a pin drive at all. **Pads come up isolated on the
+// RP2350**: a pad with ISO set does not drive, whatever its function asks, and IE clear reads its input
+// as 0. The bank's interrupt registers are refused; GPIO interrupts are not modelled yet.
+
+/** GPIOs in bank 0. */
+const GPIO_COUNT: u32 = 48
+
+// GPIOn_STATUS and GPIOn_CTRL repeat every 8 bytes; the pads' GPIOn every 4, after VOLTAGE_SELECT.
+private const IO_STRIDE: u32 = io.GPIO1_STATUS_OFFSET - io.GPIO0_STATUS_OFFSET
+private const PAD_STRIDE: u32 = pads.GPIO1_OFFSET - pads.GPIO0_OFFSET
+
+/** What a function drives a pin with: an output level and an output enable. */
+struct Drive
+    out: bool
+    oe: bool
+
+/** What a pin does: whether its pad drives, the level on it, and what the pad reads back. */
+struct Pin
+    drives: bool
+    level: bool
+    input: bool
+
+struct IoBank0
+    ctrl: [GPIO_COUNT]u32
+
+    reset(*self)
+        for i in 0..<GPIO_COUNT do self.ctrl[i] = io.GPIO0_CTRL_FUNCSEL_NULL
+
+    /** The function selected on GPIO `n` (`FUNCSEL`; SIO is 5, NULL 31). */
+    function(self, n: u32) -> u32 = self.ctrl[n] & io.GPIO0_CTRL_FUNCSEL_MASK
+
+    /** GPIO `n`'s output and enable after CTRL's overrides of what its function drives. */
+    after_overrides(self, n: u32, d: Drive) -> Drive
+        val ctrl = self.ctrl[n]
+        val out = (ctrl & io.GPIO0_CTRL_OUTOVER_MASK) >> io.GPIO0_CTRL_OUTOVER_SHIFT match
+            io.GPIO0_CTRL_OUTOVER_INVERT -> !d.out
+            io.GPIO0_CTRL_OUTOVER_LOW -> false
+            io.GPIO0_CTRL_OUTOVER_HIGH -> true
+            _ -> d.out
+        val oe = (ctrl & io.GPIO0_CTRL_OEOVER_MASK) >> io.GPIO0_CTRL_OEOVER_SHIFT match
+            io.GPIO0_CTRL_OEOVER_INVERT -> !d.oe
+            io.GPIO0_CTRL_OEOVER_DISABLE -> false
+            io.GPIO0_CTRL_OEOVER_ENABLE -> true
+            _ -> d.oe
+        Drive(out, oe)
+
+    /** A register read; `pins` is what each GPIO is doing now, for GPIOn_STATUS. */
+    read(*self, offset: u32, width: u32, pins: [GPIO_COUNT]Pin, drives: [GPIO_COUNT]Drive) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        val n = address / IO_STRIDE
+        if n >= GPIO_COUNT then return Err(AccessError.Unmapped)
+        if address % IO_STRIDE == io.GPIO0_CTRL_OFFSET then return Ok(read_lane(self.ctrl[n], offset, width))
+        val d = drives[n]
+        val out = if d.out then io.GPIO0_STATUS_OUTTOPAD_MASK else 0
+        val oe = if d.oe then io.GPIO0_STATUS_OETOPAD_MASK else 0
+        val input = if pins[n].input then io.GPIO0_STATUS_INFROMPAD_MASK else 0
+        Ok(read_lane(out | oe | input, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        val n = address / IO_STRIDE
+        if n >= GPIO_COUNT then return Err(AccessError.Unmapped)
+        // GPIOn_STATUS is read-only.
+        if address % IO_STRIDE == io.GPIO0_CTRL_OFFSET then self.ctrl[n] = written(self.ctrl[n], offset, replicated(value, width))
+        Ok(())
+end IoBank0
+
+io_bank0() -> IoBank0
+    var state: IoBank0
+    state.reset()
+    state
+
+/** A GPIO pad at power-on: isolated, input disabled, 4 mA, pull-down, Schmitt trigger. */
+const PAD_RESET: u32 = pads.GPIO0_ISO_MASK | (pads.GPIO0_DRIVE_4MA << pads.GPIO0_DRIVE_SHIFT) | pads.GPIO0_PDE_MASK | pads.GPIO0_SCHMITT_MASK
+
+struct Pads
+    voltage: u32
+    // GPIO 0–47, then SWCLK and SWD.
+    pads: [GPIO_COUNT + 2]u32
+
+    reset(*self)
+        self.voltage = 0
+        for i in 0..<(GPIO_COUNT + 2) do self.pads[i] = PAD_RESET
+
+    /** What GPIO `n`'s pad does with `d`, given `outside`: the level something off the chip drives
+     * onto it, if anything. A pad drives while its output is enabled and it is neither isolated nor
+     * output-disabled; an undriven pin follows its pulls (pull-up wins a tie, as a weak keeper).
+     */
+    pin(self, n: u32, d: Drive, outside: Option[bool]) -> Pin
+        val p = self.pads[n]
+        val drives = d.oe && p & (pads.GPIO0_ISO_MASK | pads.GPIO0_OD_MASK) == 0
+        val level = if drives then d.out else outside match
+            Some(v) -> v
+            None -> p & pads.GPIO0_PUE_MASK != 0
+        val input = level && p & pads.GPIO0_IE_MASK != 0 && p & pads.GPIO0_ISO_MASK == 0
+        Pin(drives, level, input)
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        if address == pads.VOLTAGE_SELECT_OFFSET then return Ok(read_lane(self.voltage, offset, width))
+        val i = (address - pads.GPIO0_OFFSET) / PAD_STRIDE
+        if i >= GPIO_COUNT + 2 then return Err(AccessError.Unmapped)
+        Ok(read_lane(self.pads[i], offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        val data = replicated(value, width)
+        if address == pads.VOLTAGE_SELECT_OFFSET
+            self.voltage = written(self.voltage, offset, data) & pads.VOLTAGE_SELECT_VOLTAGE_SELECT_MASK
+            return Ok(())
+        val i = (address - pads.GPIO0_OFFSET) / PAD_STRIDE
+        if i >= GPIO_COUNT + 2 then return Err(AccessError.Unmapped)
+        self.pads[i] = written(self.pads[i], offset, data) & ((pads.GPIO0_ISO_MASK << 1) - 1)
+        Ok(())
+end Pads
+
+pads_bank0() -> Pads
+    var state: Pads
+    state.reset()
+    state

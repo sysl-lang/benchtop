@@ -1,0 +1,354 @@
+module sh.sysl.benchtop.chip
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Resets}
+import sh.sysl.benchtop.peripheral.rp2350 as rp
+import sh.sysl.benchtop.peripheral.rp2350.{Clocks, Drive, GPIO_COUNT, IoBank0, Pads, Pin, Pll, Sio, Sources, Tick, Ticks, Timer, Uart, Watchdog, Xosc}
+import sh.sysl.benchtop.processor.Processor
+import sh.sysl.rp2350.clocks as clocks_reg
+import sh.sysl.rp2350.io_bank0 as io_reg
+import sh.sysl.rp2350.pads_bank0 as pads_reg
+import sh.sysl.rp2350.pll_sys as pll_sys_reg
+import sh.sysl.rp2350.pll_usb as pll_usb_reg
+import sh.sysl.rp2350.resets as resets_reg
+import sh.sysl.rp2350.sio as sio_reg
+import sh.sysl.rp2350.ticks as ticks_reg
+import sh.sysl.rp2350.timer0 as timer0_reg
+import sh.sysl.rp2350.timer1 as timer1_reg
+import sh.sysl.rp2350.uart0 as uart0_reg
+import sh.sysl.rp2350.uart1 as uart1_reg
+import sh.sysl.rp2350.watchdog as watchdog_reg
+import sh.sysl.rp2350.xosc as xosc_reg
+import sysl.fmt.hex
+import sysl.math.min
+
+// The RP2350 as its cores see it, whichever cores they are (DESIGN.md §9): the devices on the bus at
+// the addresses `sh.sysl.rp2350` generates from the SVD, one clock tree, and the interrupt lines each
+// raises in a core. It knows a core only as a `Processor`: which core made an access (the SIO's view
+// and CPUID), and the interrupt inputs `signal` drives. A board puts the chip's memory and cores
+// around it (`RiscvBoard`).
+//
+// **Time is clk_sys cycles** (`now`). `advance` turns them into clk_ref cycles, which TICKS divides
+// into the 1 µs ticks TIMER0, TIMER1 and MTIME count, and into the crystal's own cycles while XOSC
+// starts. Each frequency is the clock tree's: clk_ref and clk_sys follow CLOCKS, XOSC and the PLLs.
+//
+// **Core 1 waits in the boot ROM** (§9.2, §9.6): the chip runs the ROM's side of the launch protocol
+// on the SIO FIFOs, echoing each word, until `0, 0, 1, vector table, stack pointer, entry` has
+// arrived in order, and then hands the three values to the board (`take_launch`). The ROM's contents
+// are not modelled, so a read of the ROM is refused by name.
+
+/** The Pico 2's crystal. */
+const XOSC_HZ: u64 = 12000000
+/** The ring oscillator's nominal frequency, which clk_ref runs from at power-on. */
+const ROSC_HZ: u64 = 11000000
+/** The low-power oscillator. */
+const LPOSC_HZ: u64 = 32768
+
+// Interrupt numbers (datasheet, "Interrupts"; the SDK's `intctrl.h`).
+const TIMER0_IRQ_0: u32 = 0
+const TIMER1_IRQ_0: u32 = 4
+const SIO_IRQ_FIFO: u32 = 25
+const UART0_IRQ: u32 = 33
+const UART1_IRQ: u32 = 34
+
+// Each APB device's window: its registers and their XOR, SET and CLR aliases.
+private const WINDOW: u32 = 0x4000
+
+/** The devices on the chip's bus. */
+enum Block
+    Resets = 0
+    Clocks
+    Xosc
+    PllSys
+    PllUsb
+    Ticks
+    Timer0
+    Timer1
+    Watchdog
+    IoBank0
+    PadsBank0
+    Uart0
+    Uart1
+    Sio
+
+/** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
+struct Placed
+    block: Block
+    base: u32
+    name: string
+    reset: u32
+
+/** Every block the chip runs, with the SVD's base addresses. */
+val BLOCKS: [14]Placed = [
+    Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
+    Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
+    Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
+    Placed(Block.PllSys, pll_sys_reg.BASE, "PLL_SYS", resets_reg.RESET_PLL_SYS_MASK),
+    Placed(Block.PllUsb, pll_usb_reg.BASE, "PLL_USB", resets_reg.RESET_PLL_USB_MASK),
+    Placed(Block.Ticks, ticks_reg.BASE, "TICKS", 0),
+    Placed(Block.Timer0, timer0_reg.BASE, "TIMER0", resets_reg.RESET_TIMER0_MASK),
+    Placed(Block.Timer1, timer1_reg.BASE, "TIMER1", resets_reg.RESET_TIMER1_MASK),
+    Placed(Block.Watchdog, watchdog_reg.BASE, "WATCHDOG", 0),
+    Placed(Block.IoBank0, io_reg.BASE, "IO_BANK0", resets_reg.RESET_IO_BANK0_MASK),
+    Placed(Block.PadsBank0, pads_reg.BASE, "PADS_BANK0", resets_reg.RESET_PADS_BANK0_MASK),
+    Placed(Block.Uart0, uart0_reg.BASE, "UART0", resets_reg.RESET_UART0_MASK),
+    Placed(Block.Uart1, uart1_reg.BASE, "UART1", resets_reg.RESET_UART1_MASK),
+    Placed(Block.Sio, sio_reg.BASE, "SIO", 0),
+]
+
+/** The block whose window holds `a`, with the offset into it. */
+block_at(a: u32) -> Option[(Placed, u32)]
+    for p in BLOCKS do if a >= p.base && a - p.base < WINDOW then return Some((p, a - p.base))
+    None
+
+/** The values core 1's boot ROM launches it with. */
+struct Launch
+    vector_table: u32
+    stack_pointer: u32
+    entry: u32
+
+// The boot ROM's side of the launch protocol for core 1: how many words of the sequence have arrived
+// in order, the last three's values, and whether core 1 is still in the ROM.
+struct RomWait
+    waiting: bool
+    step: u32
+    words: [3]u32
+    launched: Option[Launch]
+
+struct Rp2350
+    resets: Resets
+    clocks: Clocks
+    xosc: Xosc
+    pll_sys: Pll
+    pll_usb: Pll
+    ticks: Ticks
+    timers: [2]Timer
+    watchdog: Watchdog
+    sio: Sio
+    io: IoBank0
+    pads: Pads
+    uarts: [2]Uart
+    rom: RomWait
+    // clk_sys cycles since power-on, and the remainders carried into the next clk_ref and crystal
+    // cycle.
+    now: u64
+    ref_rest: u64
+    xosc_rest: u64
+
+    /** Power-on, with core 1 in the boot ROM. */
+    reset(*self)
+        val fresh = rp2350()
+        *self = fresh
+
+    /** What each clock source runs at now; the PLLs take the crystal as their reference. */
+    sources(self) -> Sources
+        val xosc = if self.xosc.stable() then XOSC_HZ else 0
+        Sources(ROSC_HZ, xosc, LPOSC_HZ, self.pll_sys.hz(xosc), self.pll_usb.hz(xosc))
+
+    sys_hz(self) -> u64 = self.clocks.sys_hz(self.sources())
+    ref_hz(self) -> u64 = self.clocks.ref_hz(self.sources())
+
+    /** `cycles` of clk_sys pass: every clock the devices count advances with them. */
+    advance(*self, cycles: u64)
+        if cycles == 0 then return
+        val sys = self.sys_hz()
+        self.now += cycles
+        if sys == 0 then return
+        self.ref_rest += cycles * self.ref_hz()
+        val ref_cycles = self.ref_rest / sys
+        self.ref_rest %= sys
+        if self.xosc.on
+            self.xosc_rest += cycles * XOSC_HZ
+            self.xosc.advance(self.xosc_rest / sys)
+            self.xosc_rest %= sys
+        val made = self.ticks.advance(ref_cycles)
+        for i in 0..<2
+            val t = &self.timers[i]
+            t.advance(if t.clk_sys then cycles else made[usize(Tick.Timer0) + i])
+        self.sio.advance_mtime(if self.sio.mtime_full_speed() then cycles else made[usize(Tick.Riscv)])
+    end advance
+
+    /** Bring the devices to clk_sys cycle `t`, where they are behind it. */
+    catch_up(*self, t: u64) = if t > self.now then self.advance(t - self.now)
+
+    /** The clk_sys cycles until the next device event that could wake a core: an alarm or MTIMECMP. */
+    next_event(self) -> Option[u64]
+        var due: Option[u64] = None
+        for i in 0..<2
+            val t = self.timers[i]
+            t.next_alarm() match
+                Some(n) -> due = earliest(due, if t.clk_sys then Some(n) else self.ticks_to_cycles(if i == 0 then Tick.Timer0 else Tick.Timer1, n))
+                None -> ()
+        for k in 0u32..<2
+            self.sio.mtime_due(k) match
+                Some(n) -> due = earliest(due, if self.sio.mtime_full_speed() then Some(n) else self.ticks_to_cycles(Tick.Riscv, n))
+                None -> ()
+        due
+
+    // The clk_sys cycles until generator `g`'s `n`th tick from now, rounded up; None while it is
+    // stopped.
+    private ticks_to_cycles(self, g: Tick, n: u64) -> Option[u64]
+        val sys = self.sys_hz()
+        val ref_hz = self.ref_hz()
+        if ref_hz == 0 then return None
+        self.ticks.generator(g).cycles_to(n).map(c -> (c * sys + ref_hz - 1) / ref_hz)
+
+    /** A read of `width` bytes at `a` by core `core`: the value, or why the chip refuses it. */
+    read(*self, core: u32, a: u32, width: u32) -> Result[u32, string]
+        val (p, o) = self.placed(a)?
+        val got = p.block match
+            Resets -> self.resets.read(o, width)
+            Clocks -> self.clocks.read(o, width)
+            Xosc -> self.xosc.read(o, width)
+            PllSys -> self.pll_sys.read(o, width)
+            PllUsb -> self.pll_usb.read(o, width)
+            Ticks -> self.ticks.read(o, width)
+            Timer0 -> self.timers[0].read(o, width)
+            Timer1 -> self.timers[1].read(o, width)
+            Watchdog -> self.watchdog.read(o, width)
+            IoBank0 -> self.io.read(o, width, self.pins(), self.drives())
+            PadsBank0 -> self.pads.read(o, width)
+            Uart0 -> self.uarts[0].read(o, width)
+            Uart1 -> self.uarts[1].read(o, width)
+            Sio -> self.sio.read(core, o, width, self.inputs())
+        got.map_err(e -> refusal(p, o, e))
+
+    /** A write of `width` bytes at `a` by core `core`, or why the chip refuses it. */
+    write(*self, core: u32, a: u32, width: u32, x: u32) -> Result[unit, string]
+        val (p, o) = self.placed(a)?
+        val got = p.block match
+            Resets ->
+                val before = self.resets.held
+                val r = self.resets.write(o, width, x)
+                self.reset_blocks(self.resets.held & ~before)
+                // Every released block is ready at once.
+                self.resets.complete(~self.resets.held)
+                r
+            Clocks -> self.clocks.write(o, width, x)
+            Xosc -> self.xosc.write(o, width, x)
+            PllSys -> self.pll_sys.write(o, width, x)
+            PllUsb -> self.pll_usb.write(o, width, x)
+            Ticks -> self.ticks.write(o, width, x)
+            Timer0 -> self.timers[0].write(o, width, x)
+            Timer1 -> self.timers[1].write(o, width, x)
+            Watchdog -> self.watchdog.write(o, width, x)
+            IoBank0 -> self.io.write(o, width, x)
+            PadsBank0 -> self.pads.write(o, width, x)
+            Uart0 -> self.uarts[0].write(o, width, x)
+            Uart1 -> self.uarts[1].write(o, width, x)
+            Sio ->
+                val r = self.sio.write(core, o, width, x)
+                self.rom_step()
+                r
+        got.map_err(e -> refusal(p, o, e))
+
+    // The block an access lands in, refused where none is there, or where RESETS holds it: on silicon
+    // that access hangs the bus.
+    private placed(self, a: u32) -> Result[(Placed, u32), string]
+        val (p, o) = block_at(a) match
+            Some(found) -> found
+            None -> return Err(s"0x${hex(a, 8)} is not on the RP2350's bus as benchtop runs it")
+        if self.resets.held & p.reset != 0 then return Err(s"${p.name} is held in reset (RESETS bit ${p.reset.trailing_zeros()}): release it before touching 0x${hex(a)}")
+        Ok((p, o))
+
+    // Power-on state for each block whose reset has just been asserted.
+    private reset_blocks(*self, asserted: u32)
+        if asserted == 0 then return
+        for p in BLOCKS
+            if p.reset & asserted == 0 then continue
+            p.block match
+                PllSys -> self.pll_sys.reset()
+                PllUsb -> self.pll_usb.reset()
+                Timer0 -> self.timers[0].reset()
+                Timer1 -> self.timers[1].reset()
+                IoBank0 -> self.io.reset()
+                PadsBank0 -> self.pads.reset()
+                Uart0 -> self.uarts[0].reset()
+                Uart1 -> self.uarts[1].reset()
+                _ -> ()
+
+    // The boot ROM's core-1 loop: take each word core 0 sends, drain the FIFO on a 0, echo the word,
+    // and count it into the sequence, restarting where one is out of order.
+    private rom_step(*self)
+        val w = &self.rom
+        val s = &self.sio
+        while w.waiting && !s.fifos[1].empty() && !s.fifos[0].full()
+            val x = s.fifos[1].pop()
+            if x == 0 then while !s.fifos[1].empty() do s.fifos[1].pop()
+            s.fifos[0].push(x)
+            val expected: Option[u32] = if w.step < 2 then Some(0) elif w.step == 2 then Some(1) else None
+            expected match
+                Some(e) -> w.step = if x == e then w.step + 1 elif x == 0 then 1 else 0
+                None ->
+                    w.words[w.step - 3] = x
+                    w.step += 1
+            if w.step == 6
+                w.waiting = false
+                w.launched = Some(Launch(w.words[0], w.words[1], w.words[2]))
+    end rom_step
+
+    /** The launch core 1's boot ROM has completed since the last call, if any. */
+    take_launch(*self) -> Option[Launch]
+        val l = self.rom.launched
+        self.rom.launched = None
+        l
+
+    /** What the function selected on GPIO `n` drives it with, after CTRL's overrides. */
+    drive(self, n: u32) -> Drive
+        val f = self.io.function(n)
+        // A UART's TX idles high and drives; bytes leave at once.
+        val d =
+            if f == io_reg.GPIO0_CTRL_FUNCSEL_SIO_0 then Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
+            elif f == io_reg.GPIO0_CTRL_FUNCSEL_UART0_TX && n % 4 == 0 then Drive(true, true)
+            else Drive(false, false)
+        self.io.after_overrides(n, d)
+
+    /** What GPIO `n` is doing: whether its pad drives, and its level. */
+    pin(self, n: u32) -> Pin = self.pads.pin(n, self.drive(n), None)
+
+    private drives(self) -> [GPIO_COUNT]Drive
+        var all: [GPIO_COUNT]Drive
+        for n in 0..<GPIO_COUNT do all[n] = self.drive(n)
+        all
+
+    private pins(self) -> [GPIO_COUNT]Pin
+        var all: [GPIO_COUNT]Pin
+        for n in 0..<GPIO_COUNT do all[n] = self.pin(n)
+        all
+
+    // GPIO_IN: each pad's input, bit n for GPIO n.
+    private inputs(self) -> u64
+        var bits: u64 = 0
+        for n in 0..<GPIO_COUNT do if self.pin(n).input then bits |= 1u64 << n
+        bits
+
+    /** Drive `p`'s interrupt inputs from the devices' levels. */
+    signal(self, p: *Processor)
+        val k = p.number()
+        for i in 0u32..<2
+            val lines = self.timers[i].irqs()
+            for j in 0u32..<4 do p.interrupt(TIMER0_IRQ_0 + 4 * i + j, lines & (1 << j) != 0)
+        p.interrupt(SIO_IRQ_FIFO, self.sio.fifo_irq(k))
+        p.interrupt(UART0_IRQ, self.uarts[0].irq())
+        p.interrupt(UART1_IRQ, self.uarts[1].irq())
+        p.machine_timer(self.sio.software_irq(k), self.sio.timer_irq(k))
+end Rp2350
+
+/** The chip at power-on, with core 1 in the boot ROM. */
+rp2350() -> Rp2350 =
+    Rp2350(rp.rp2350_resets(), rp.clocks(), rp.xosc(), rp.pll(), rp.pll(), rp.ticks(), [rp.timer(), rp.timer()], rp.watchdog(),
+        rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], RomWait(true, 0, [0; 3], None), 0, 0, 0)
+
+private earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
+    Some(x) -> b match
+        Some(y) -> Some(min(x, y))
+        None -> a
+    None -> b
+
+// Why a block refused an access, as a person reads it.
+private refusal(p: Placed, o: u32, e: AccessError) -> string
+    val what = e match
+        Unmapped -> "is not a register benchtop runs"
+        InvalidWidth -> "is not an access width the block takes"
+        Unaligned -> "is not aligned to its width"
+        UnsupportedAlias -> "cannot be written through an atomic alias"
+    s"${p.name} + 0x${hex(o)} $what"

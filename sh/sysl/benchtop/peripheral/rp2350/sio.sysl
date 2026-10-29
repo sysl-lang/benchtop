@@ -1,0 +1,184 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane}
+import sh.sysl.rp2350.sio as reg
+
+// The RP2350's single-cycle IO block (datasheet, "SIO"): one view per core, chosen by the core the
+// chip says made the access. Modelled: CPUID, the GPIO output and output-enable registers with their
+// SET/CLR/XOR forms (GPIO 0–31 and the high bank's GPIO 32–47), GPIO_IN as the chip's pads report it,
+// the two inter-core FIFOs, the 32 spinlocks, and the Hazard3 cores' software interrupts and RISC-V
+// platform timer (MTIME, and each core's own MTIMECMP). The doorbells, interpolators and TMDS encoder
+// are refused. SIO has no atomic aliases.
+
+/** The inter-core FIFOs are four entries deep on the RP2350. */
+const FIFO_DEPTH: usize = 4
+
+private const MTIME_CTRL_BITS: u32 =
+    reg.MTIME_CTRL_EN_MASK | reg.MTIME_CTRL_FULLSPEED_MASK | reg.MTIME_CTRL_DBGPAUSE_CORE0_MASK | reg.MTIME_CTRL_DBGPAUSE_CORE1_MASK
+
+/** One direction's FIFO. */
+struct Fifo
+    words: [FIFO_DEPTH]u32
+    first: usize
+    count: usize
+
+    full(self) -> bool = self.count == FIFO_DEPTH
+    empty(self) -> bool = self.count == 0
+
+    push(*self, x: u32)
+        self.words[(self.first + self.count) % FIFO_DEPTH] = x
+        self.count += 1
+
+    pop(*self) -> u32
+        val x = self.words[self.first]
+        self.first = (self.first + 1) % FIFO_DEPTH
+        self.count -= 1
+        x
+end Fifo
+
+struct Sio
+    out: u64
+    oe: u64
+    // fifos[k] is the FIFO core k reads; core k writes the other.
+    fifos: [2]Fifo
+    // Each core's sticky WOF and ROE flags, as FIFO_ST has them.
+    errors: [2]u32
+    locks: u32
+    // RISCV_SOFTIRQ: bit k is core k's machine software interrupt.
+    softirq: u32
+    mtime_ctrl: u32
+    mtime: u64
+    mtimecmp: [2]u64
+
+    reset(*self)
+        self.out = 0
+        self.oe = 0
+        for k in 0..<2
+            self.fifos[k] = Fifo([0; FIFO_DEPTH], 0, 0)
+            self.errors[k] = 0
+            self.mtimecmp[k] = ~0u64
+        self.locks = 0
+        self.softirq = 0
+        // MTIME counts at power-on, paused while either core is halted by a debugger.
+        self.mtime_ctrl = reg.MTIME_CTRL_EN_MASK | reg.MTIME_CTRL_DBGPAUSE_CORE0_MASK | reg.MTIME_CTRL_DBGPAUSE_CORE1_MASK
+        self.mtime = 0
+
+    /** Whether core `k`'s FIFO interrupt (SIO_IRQ_FIFO) is raised: a word waits, or an error flag is set. */
+    fifo_irq(self, k: u32) -> bool = !self.fifos[k].empty() || self.errors[k] != 0
+
+    /** Core `k`'s machine software interrupt. */
+    software_irq(self, k: u32) -> bool = self.softirq & (1 << k) != 0
+
+    /** Core `k`'s machine timer interrupt: MTIME has reached its MTIMECMP. */
+    timer_irq(self, k: u32) -> bool = self.mtime >= self.mtimecmp[k]
+
+    /** Whether MTIME counts, and whether it counts clk_sys cycles (FULLSPEED) rather than TICKS' RISC-V
+     * generator.
+     */
+    mtime_counting(self) -> bool = self.mtime_ctrl & reg.MTIME_CTRL_EN_MASK != 0
+    mtime_full_speed(self) -> bool = self.mtime_ctrl & reg.MTIME_CTRL_FULLSPEED_MASK != 0
+
+    /** `n` counts of MTIME's source pass. */
+    advance_mtime(*self, n: u64) = if self.mtime_counting() then self.mtime += n
+
+    /** The counts until core `k`'s timer interrupt, None where it is already raised or MTIME is stopped. */
+    mtime_due(self, k: u32) -> Option[u64]
+        if !self.mtime_counting() || self.timer_irq(k) then return None
+        Some(self.mtimecmp[k] - self.mtime)
+
+    /** A word core `k` reads. `inputs` are the pads' input levels, GPIO 0–47. */
+    read(*self, k: u32, offset: u32, width: u32, inputs: u64) -> Result[u32, AccessError]
+        access(offset, width, false)?
+        val address = offset & 0xFFC
+        if address >= reg.SPINLOCK0_OFFSET && address <= reg.SPINLOCK31_OFFSET
+            // A read claims a free lock and answers its bit, or answers 0 for a held one.
+            val bit = 1u32 << ((address - reg.SPINLOCK0_OFFSET) >> 2)
+            if self.locks & bit != 0 then return Ok(0)
+            self.locks |= bit
+            return Ok(read_lane(bit, offset, width))
+        val value = address match
+            reg.CPUID_OFFSET -> k
+            reg.GPIO_IN_OFFSET -> u32(inputs)
+            reg.GPIO_HI_IN_OFFSET -> u32(inputs >> 32)
+            reg.GPIO_OUT_OFFSET -> u32(self.out)
+            reg.GPIO_HI_OUT_OFFSET -> u32(self.out >> 32)
+            reg.GPIO_OE_OFFSET -> u32(self.oe)
+            reg.GPIO_HI_OE_OFFSET -> u32(self.oe >> 32)
+            // The SET, CLR and XOR forms read 0.
+            reg.GPIO_OUT_SET_OFFSET | reg.GPIO_OUT_CLR_OFFSET | reg.GPIO_OUT_XOR_OFFSET -> 0
+            reg.GPIO_OE_SET_OFFSET | reg.GPIO_OE_CLR_OFFSET | reg.GPIO_OE_XOR_OFFSET -> 0
+            reg.GPIO_HI_OUT_SET_OFFSET | reg.GPIO_HI_OUT_CLR_OFFSET | reg.GPIO_HI_OUT_XOR_OFFSET -> 0
+            reg.GPIO_HI_OE_SET_OFFSET | reg.GPIO_HI_OE_CLR_OFFSET | reg.GPIO_HI_OE_XOR_OFFSET -> 0
+            reg.FIFO_ST_OFFSET -> self.fifo_status(k)
+            reg.FIFO_RD_OFFSET ->
+                val f = &self.fifos[k]
+                if f.empty()
+                    self.errors[k] |= reg.FIFO_ST_ROE_MASK
+                    0
+                else f.pop()
+            reg.SPINLOCK_ST_OFFSET -> self.locks
+            reg.RISCV_SOFTIRQ_OFFSET -> self.softirq
+            reg.MTIME_CTRL_OFFSET -> self.mtime_ctrl
+            reg.MTIME_OFFSET -> u32(self.mtime)
+            reg.MTIMEH_OFFSET -> u32(self.mtime >> 32)
+            reg.MTIMECMP_OFFSET -> u32(self.mtimecmp[k])
+            reg.MTIMECMPH_OFFSET -> u32(self.mtimecmp[k] >> 32)
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+    end read
+
+    /** A word core `k` writes. SIO takes only whole words. */
+    write(*self, k: u32, offset: u32, width: u32, x: u32) -> Result[unit, AccessError]
+        access(offset, width, false)?
+        if width != 4 then return Err(AccessError.InvalidWidth)
+        if offset >= reg.SPINLOCK0_OFFSET && offset <= reg.SPINLOCK31_OFFSET
+            self.locks &= ~(1u32 << ((offset - reg.SPINLOCK0_OFFSET) >> 2))
+            return Ok(())
+        val low = u64(x)
+        val high = u64(x & 0xFFFF) << 32
+        offset match
+            reg.GPIO_OUT_OFFSET -> self.out = (self.out & ~0xFFFFFFFFu64) | low
+            reg.GPIO_OUT_SET_OFFSET -> self.out |= low
+            reg.GPIO_OUT_CLR_OFFSET -> self.out &= ~low
+            reg.GPIO_OUT_XOR_OFFSET -> self.out ^= low
+            reg.GPIO_OE_OFFSET -> self.oe = (self.oe & ~0xFFFFFFFFu64) | low
+            reg.GPIO_OE_SET_OFFSET -> self.oe |= low
+            reg.GPIO_OE_CLR_OFFSET -> self.oe &= ~low
+            reg.GPIO_OE_XOR_OFFSET -> self.oe ^= low
+            reg.GPIO_HI_OUT_OFFSET -> self.out = (self.out & 0xFFFFFFFF) | high
+            reg.GPIO_HI_OUT_SET_OFFSET -> self.out |= high
+            reg.GPIO_HI_OUT_CLR_OFFSET -> self.out &= ~high
+            reg.GPIO_HI_OUT_XOR_OFFSET -> self.out ^= high
+            reg.GPIO_HI_OE_OFFSET -> self.oe = (self.oe & 0xFFFFFFFF) | high
+            reg.GPIO_HI_OE_SET_OFFSET -> self.oe |= high
+            reg.GPIO_HI_OE_CLR_OFFSET -> self.oe &= ~high
+            reg.GPIO_HI_OE_XOR_OFFSET -> self.oe ^= high
+            reg.CPUID_OFFSET | reg.GPIO_IN_OFFSET | reg.GPIO_HI_IN_OFFSET | reg.FIFO_RD_OFFSET | reg.SPINLOCK_ST_OFFSET -> ()
+            // Any write clears the sticky error flags.
+            reg.FIFO_ST_OFFSET -> self.errors[k] = 0
+            reg.FIFO_WR_OFFSET ->
+                val f = &self.fifos[1 - k]
+                if f.full() then self.errors[k] |= reg.FIFO_ST_WOF_MASK else f.push(x)
+            reg.RISCV_SOFTIRQ_OFFSET ->
+                val set = x & (reg.RISCV_SOFTIRQ_CORE0_SET_MASK | reg.RISCV_SOFTIRQ_CORE1_SET_MASK)
+                val clear = (x & (reg.RISCV_SOFTIRQ_CORE0_CLR_MASK | reg.RISCV_SOFTIRQ_CORE1_CLR_MASK)) >> reg.RISCV_SOFTIRQ_CORE0_CLR_SHIFT
+                self.softirq = (self.softirq | set) & ~clear
+            reg.MTIME_CTRL_OFFSET -> self.mtime_ctrl = x & MTIME_CTRL_BITS
+            reg.MTIME_OFFSET -> self.mtime = (self.mtime & ~0xFFFFFFFFu64) | low
+            reg.MTIMEH_OFFSET -> self.mtime = (self.mtime & 0xFFFFFFFF) | (low << 32)
+            reg.MTIMECMP_OFFSET -> self.mtimecmp[k] = (self.mtimecmp[k] & ~0xFFFFFFFFu64) | low
+            reg.MTIMECMPH_OFFSET -> self.mtimecmp[k] = (self.mtimecmp[k] & 0xFFFFFFFF) | (low << 32)
+            _ -> return Err(AccessError.Unmapped)
+        Ok(())
+    end write
+
+    // FIFO_ST as core `k` sees it: VLD where its FIFO holds a word, RDY where the other core's has room,
+    // and its sticky WOF and ROE.
+    private fifo_status(self, k: u32) -> u32 =
+        (if self.fifos[k].empty() then 0 else reg.FIFO_ST_VLD_MASK) | (if self.fifos[1 - k].full() then 0 else reg.FIFO_ST_RDY_MASK) | self.errors[k]
+end Sio
+
+sio() -> Sio
+    var state: Sio
+    state.reset()
+    state

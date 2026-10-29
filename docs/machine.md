@@ -151,8 +151,14 @@ enum ProductView
      lock. Each core carries its clock's divisor (`Cpu.divisor`), so a core's board time needs no
      machine. Two machines in one process share nothing (`board_two_machines`,
      `machine_devices_are_each_machines`).
-   - Left: a RISC-V hart in a board. The hart already reaches devices through its own
-     `riscv.Bus` trait off its RAM window; what it waits on is device handlers that take a v6m
-     `*Cpu`, and the RP2350 chip layer (GPIO, UART, SIO, ROM), which does not exist yet.
+   - Done: RISC-V harts on a board. A chip's devices see a core as a `Processor`
+     (`processor/processor.sysl`: its number, its retired count, its interrupt inputs), which
+     `v6m.Cpu` and `riscv.Cpu` both implement. The RP2350's devices are core-free models
+     (`peripheral/rp2350`) at the SVD's addresses, and `chip.Rp2350` decodes the bus, runs the clock
+     tree and the boot ROM's core-1 launch protocol, and raises interrupts through `Processor`.
+     `chip.RiscvBoard` runs the two Hazard3 harts on it (`boards/pico2-riscv`, `benchtop run`).
+   - Left: the virt devices' handlers still take a v6m `*Cpu`; moving them onto `Processor` is
+     mechanical now `virt.machine` is gone. The RISC-V board is not yet a `Machine` (no window,
+     no workers), and the Arm Pico 2 does not yet run on `chip.Rp2350`.
 5. **Headers and Product.** `Pin` and `header` on boards, product files with wiring, run-time wire
    edits, and the product view.
