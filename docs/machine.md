@@ -9,7 +9,7 @@ the order in which the module-level globals move into them.
 ```sysl
 struct Machine
     map: MemoryMap            // where the board puts RAM and flash (v6m)
-    memory: &Memory           // the storage behind them, which the machine owns
+    memory: &sync Memory      // the storage behind them, which the machine owns
     cores: [2]Cpu             // the chip's cores; each points at `memory` (Cpu.mem)
     configs: [2]CoreConfig    // what the description makes of each core
     devices: Buf[&Peripheral] // the chip's peripherals on the bus, each owning its state
@@ -21,7 +21,7 @@ struct Machine
 - **A machine owns its state.** No machine field is reachable as a global. Two machines in one
   process (two boards in one product, or two tests on one thread) share nothing.
 - **A core is the raw tier.** `Cpu.mem` is a `*Memory`, and the hot paths read it beside `pages`,
-  `lines` and `dec`. The owning `&Memory` is the machine's. A core never outlives its machine.
+  `lines` and `dec`. The owning `&sync Memory` is the machine's. A core never outlives its machine.
 - **State that crosses threads lives in a `Mutex[T]` that owns its data**, for example
   `Mutex[WorkerControl]` holding `paused`, `busy`, `step_pending` and `generation`. Short holds use
   `with`, and `lock_raw` appears only where `Condvar.wait` needs it. A `Mutex.new(0)` beside the
@@ -136,8 +136,21 @@ enum ProductView
      description names a device by; a device that answers several windows from one state (the SAI
      and DMA block, the STM32 SPI and GPIO, the RP2040's resets, timer and watchdog) is reached
      through a small window value that carries it.
-   - Left: `virt.machine` itself. The devices' functions still reach `machine.devices.X` rather
-     than their own `self`, and the entry points do not yet take a `*Machine`.
+   - Done: `virt.machine` itself. `machine()` makes a machine in a box, which its owner holds (a
+     `Session`, `benchtop run`, a test) and hands on as a `*Machine`; every entry point takes one
+     (`board_named(m, ...)`, `boot(m, image)`, `run_board(m)`, `output(m)`, ...), and the threads
+     that run it (the CPU workers, core 1's lockstep thread, the console's input) are handed it. A
+     `Peripheral`'s and a `BusWindow`'s members are handed the machine too: a device keeps its own
+     state in itself and reaches through `m` only what joins it to the rest of the board (the
+     panel's pads, the SDMMC's GPIO, the codec on the I2C bus and the SAI, the other core). The
+     connections a device's model calls out through are set once, when the devices are put in place
+     (`connect_spi`, `connect_dsi`). Since a `*Machine` crosses into those threads, everything it
+     holds is reached with atomic counts or under a lock, which the compiler now checks: the memory
+     is a `&sync Memory`, the map's other RAM regions a frozen buffer, the SPI pins and the DSI sink
+     `&sync Fn`s, the codec's published settings a `&sync CodecSettings` and its model under a
+     lock. Each core carries its clock's divisor (`Cpu.divisor`), so a core's board time needs no
+     machine. Two machines in one process share nothing (`board_two_machines`,
+     `machine_devices_are_each_machines`).
    - Left: a RISC-V hart in a board. The hart already reaches devices through its own
      `riscv.Bus` trait off its RAM window; what it waits on is device handlers that take a v6m
      `*Cpu`, and the RP2350 chip layer (GPIO, UART, SIO, ROM), which does not exist yet.
