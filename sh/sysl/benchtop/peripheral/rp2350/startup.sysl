@@ -1,0 +1,99 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.bootram as bootram_reg
+import sh.sysl.rp2350.usb as usb_reg
+
+// Blocks the SDK's start-up reaches before `main`, each modelled as far as that start-up needs and
+// no further; the rest of each block is refused by name until its own item (docs/rp-coverage.md):
+//
+// - **BOOTRAM** (datasheet 4.3), in full: 1 KB of SRAM, the two write-once registers and the eight
+//   boot locks, which behave as the SIO's spinlocks do. `runtime_init_boot_locks_reset` releases them
+//   and `runtime_init_bootrom_locking_enable` claims lock 7.
+// - **USBCTRL**, SIE_CTRL alone: `runtime_init_usb_power_down` reads it, and where it holds its reset
+//   value sets TRANSCEIVER_PD. The controller itself is rp-coverage item 20.
+
+/** BOOTRAM's SRAM, in words. */
+const BOOTRAM_WORDS: u32 = 256
+
+/** BOOTRAM: its SRAM, WRITE_ONCE0 and 1, and the boot locks, bit n of `unclaimed` for lock n. */
+struct BootRam
+    words: [256]u32
+    once: [2]u32
+    unclaimed: u32
+
+    reset(*self)
+        for i in 0..<BOOTRAM_WORDS do self.words[i] = 0
+        self.once = [0, 0]
+        self.unclaimed = 0xFF
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFF
+        if address < BOOTRAM_WORDS * 4 then return Ok(read_lane(self.words[address >> 2], offset, width))
+        val aligned = address & ~3u32
+        if aligned >= bootram_reg.BOOTLOCK0_OFFSET && aligned <= bootram_reg.BOOTLOCK7_OFFSET
+            // Reading claims: 1 << n where the lock was free, 0 where another holds it.
+            val bit = 1u32 << ((aligned - bootram_reg.BOOTLOCK0_OFFSET) >> 2)
+            val got = self.unclaimed & bit
+            self.unclaimed &= ~bit
+            return Ok(read_lane(got, offset, width))
+        val value =
+            if aligned == bootram_reg.WRITE_ONCE0_OFFSET then self.once[0]
+            elif aligned == bootram_reg.WRITE_ONCE1_OFFSET then self.once[1]
+            elif aligned == bootram_reg.BOOTLOCK_STAT_OFFSET then self.unclaimed
+            else return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFF
+        val data = replicated(value, width)
+        if address < BOOTRAM_WORDS * 4
+            // The SRAM takes the bytes written, whichever alias they come through.
+            val i = address >> 2
+            val lanes: u32 = if width == 4 then 0xFFFFFFFF else ((1u32 << (width * 8)) - 1) << ((address & 3) * 8)
+            self.words[i] = (self.words[i] & ~lanes) | (data & lanes)
+            return Ok(())
+        val aligned = address & ~3u32
+        // A write-once register ORs a write in, through every alias; only a reset clears a bit.
+        if aligned == bootram_reg.WRITE_ONCE0_OFFSET || aligned == bootram_reg.WRITE_ONCE1_OFFSET
+            self.once[(aligned - bootram_reg.WRITE_ONCE0_OFFSET) >> 2] |= data
+            return Ok(())
+        if aligned == bootram_reg.BOOTLOCK_STAT_OFFSET
+            self.unclaimed = written(self.unclaimed, offset, data) & 0xFF
+            return Ok(())
+        // Any write releases the lock.
+        if aligned >= bootram_reg.BOOTLOCK0_OFFSET && aligned <= bootram_reg.BOOTLOCK7_OFFSET
+            self.unclaimed |= 1u32 << ((aligned - bootram_reg.BOOTLOCK0_OFFSET) >> 2)
+            return Ok(())
+        Err(AccessError.Unmapped)
+end BootRam
+
+bootram() -> BootRam
+    var state: BootRam
+    state.reset()
+    state
+
+/** USBCTRL's SIE_CTRL, the one register of the controller the SDK's start-up touches. */
+struct UsbCtrl
+    sie_ctrl: u32
+
+    reset(*self) = self.sie_ctrl = 0
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        if offset & 0xFFC != usb_reg.SIE_CTRL_OFFSET then return Err(AccessError.Unmapped)
+        Ok(read_lane(self.sie_ctrl, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        if offset & 0xFFC != usb_reg.SIE_CTRL_OFFSET then return Err(AccessError.Unmapped)
+        self.sie_ctrl = written(self.sie_ctrl, offset, replicated(value, width))
+        Ok(())
+end UsbCtrl
+
+usb_ctrl() -> UsbCtrl
+    var state: UsbCtrl
+    state.reset()
+    state

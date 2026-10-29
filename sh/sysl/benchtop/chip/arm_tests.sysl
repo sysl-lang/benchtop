@@ -1,0 +1,202 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.{library, load}
+import sh.sysl.benchtop.v6m.{CoprocessorKind, CoprocessorOp, Stop}
+import sh.sysl.parsing.source_of
+import sh.sysl.rp2350.sio as sio_reg
+import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// The Arm Pico 2 (`ArmBoard`): the SDK's own programs end to end (examples/pico2, built by its
+// build.sh), and each piece of the chip they needed on the way — the boot, core 1's launch, the boot
+// ROM, the coprocessors and the plan that picks the board.
+
+private val HELLO_SERIAL = embed("../../../../examples/pico2/hello_serial.elf")
+private val ARM_BLINK = embed("../../../../examples/pico2/blink.elf")
+
+private val PICO2_ARM_SRAM = SramMap(0x20000000, 520 * 1024)
+
+// 0.1 ms of clk_sys at 150 MHz: how finely the end-to-end tests sample.
+private const TENTH_MS: u64 = 15000
+private const MS: u64 = 150000
+
+@test("a Pico 2 on its Cortex-M33s runs the SDK's hello_serial: UART0 prints a numbered line every 100 ms of guest time")
+arm_hello_serial()
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(HELLO_SERIAL).unwrap()
+    var lines: Buf[u64] = buf()
+    var seen: usize = 0
+    while b.chip.now < 360 * MS
+        val end = b.run(TENTH_MS)
+        assert(end == RunEnd.Budget, s"${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+        for i in seen..<b.console.len() do if b.console[i] == u8('\n') then lines.push(b.chip.now)
+        seen = b.console.len()
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == "hello, serial 0\r\nhello, serial 1\r\nhello, serial 2\r\nhello, serial 3\r\n", text)
+    assert(b.chip.sys_hz() == 150000000 && b.chip.ref_hz() == 12000000, "runtime_init clocked the chip from the PLL and the crystal")
+    // stdio_init_all and the first line within the first millisecond; then sleep_ms(100) each time.
+    assert(lines[0] < MS, s"the first line at ${lines[0]}")
+    for k in 1..<lines.len()
+        val gap = lines[k] - lines[k - 1]
+        assert(gap >= 100 * MS && gap <= 100 * MS + 5 * TENTH_MS, s"line $k came ${gap} cycles after the one before")
+    assert(!b.started[1], "core 1 is still in the boot ROM")
+
+@test("a Pico 2 on its Cortex-M33s runs the SDK's blink: GPIO 25 drives the LED and toggles every 250 ms of guest time")
+arm_blink()
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(ARM_BLINK).unwrap()
+    var toggles: Buf[u64] = buf()
+    var level = false
+    while b.chip.now < 1100 * MS
+        val end = b.run(TENTH_MS)
+        assert(end == RunEnd.Budget, s"${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+        val led = b.chip.pin(25)
+        assert(toggles.is_empty() || led.drives, "once set up, GPIO 25 always drives")
+        if led.drives && led.level != level
+            toggles.push(b.chip.now)
+            level = led.level
+    // On at once, then off, on, off, on: five edges in 1.1 s.
+    assert(toggles.len() == 5, s"${toggles.len()} toggles")
+    assert(toggles[0] < MS, s"the first toggle at ${toggles[0]}")
+    for k in 1..<toggles.len()
+        val gap = toggles[k] - toggles[k - 1]
+        assert(gap >= 250 * MS && gap <= 250 * MS + 5 * TENTH_MS, s"toggle $k came ${gap} cycles after the one before")
+    assert(level, "the LED is on after the fifth edge")
+    // gpio_put went through the GPIO coprocessor into the SIO.
+    assert(b.chip.sio.out & (1u64 << 25) != 0 && b.chip.sio.oe & (1u64 << 25) != 0)
+
+// Thumb halfwords into SRAM at `at`, for core `k` to run next from there.
+private place(b: &ArmBoard, at: u32, code: []const u16)
+    for i in 0..<code.len
+        b.mem.ram[at - b.map.base + 2 * u32(i)] = u8(code[i])
+        b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
+
+@test("a refused access ends the Arm run with the chip's reason, at the core's PC; a write to the read-only ROM stops the core at Fault there")
+arm_refused_access()
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(ARM_BLINK).unwrap()
+    // ldr r1, [r0]; bkpt — r0 IO_BANK0's GPIO0_CTRL, still held in reset.
+    place(b, 0x20070000, [0x6801, 0xBE00])
+    b.cores[0].pc = 0x20070000
+    b.cores[0].r[0] = 0x40028004
+    assert(b.run(1000) == RunEnd.Fault)
+    assert(b.refused == "core 0 at pc 0x20070000: IO_BANK0 is held in reset (RESETS bit 6): release it before touching 0x40028004", b.refused)
+    val w = arm_board(PICO2_ARM_SRAM)
+    w.boot(ARM_BLINK).unwrap()
+    // str r1, [r0]
+    place(w, 0x20070000, [0x6001, 0xBE00])
+    w.cores[0].pc = 0x20070000
+    w.cores[0].r[0] = 0x100
+    assert(w.run(1000) == RunEnd.Fault && w.refused.is_empty())
+    assert(w.cores[0].stop == Stop.Fault && w.cores[0].stop_at == 0x100 && w.mem.flash[0x100] == 0, "the ROM is read-only")
+
+@test("core 1 leaves the boot ROM at the entry, stack pointer and VTOR core 0 sends it, and runs on the Arm board")
+arm_core1_launch()
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(ARM_BLINK).unwrap()
+    // Core 1: movs r0, #42; bkpt. Core 0: wfi, b . (asleep until core 1 ends the run).
+    place(b, 0x20070000, [0x202A, 0xBE00])
+    place(b, 0x20070100, [0xBF30, 0xE7FD])
+    b.cores[0].pc = 0x20070100
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070001]
+        b.chip.write(0, sio_reg.BASE + sio_reg.FIFO_WR_OFFSET, 4, x).unwrap()
+        assert(b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_RD_OFFSET, 4).unwrap() == x, "the ROM echoes")
+    assert(b.run(100000) == RunEnd.Breakpoint, s"${b.refused}")
+    val c = &b.cores[1]
+    assert(b.started[1] && c.r[0] == 42 && c.vtor == 0x20000000 && c.r[13] == 0x20080000 && c.stop_at == 0x20070002)
+    assert(c.core == 1 && c.security && c.coprocessors == 0x91 && c.nvic_irqs == 52)
+
+@test("the boot ROM's lookup at 0x16 finds bootrom_state_reset by its code for Secure and Non-secure callers, and answers 0 for another")
+arm_rom_lookup()
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(ARM_BLINK).unwrap()
+    // movs r6, #0x16; ldrh r6, [r6]; then lookup('SR', Arm Secure) into r4, lookup('A', Arm Secure)
+    // into r5, and lookup('SR', RISC-V) into r0; bkpt.
+    place(b, 0x20070000, [0x2616, 0x8836, 0xF245, 0x2053, 0x2104, 0x47B0, 0x4604, 0x2041, 0x2104, 0x47B0, 0x4605,
+        0xF245, 0x2053, 0x2101, 0x47B0, 0xBE00])
+    val c = &b.cores[0]
+    c.pc = 0x20070000
+    c.r[13] = 0x20080000
+    assert(b.run(10000) == RunEnd.Breakpoint, s"${b.refused} ${c.stop} 0x${hex(c.stop_at, 8)}")
+    assert(c.r[4] & 1 == 1 && c.r[4] < 0x8000 && c.r[4] > 0x40, s"state_reset at 0x${hex(c.r[4])}")
+    // 'A' with the same flags: no such function. 'SR' asked for RISC-V: not one either.
+    assert(c.r[5] == 0 && c.r[0] == 0, s"${c.r[5]} ${c.r[0]}")
+    // The magic and the table's address are where the SDK reads them.
+    assert(b.mem.flash[0x10] == u8('M') && b.mem.flash[0x11] == u8('u') && b.mem.flash[0x12] == 2)
+
+private gpioc(kind: CoprocessorKind, opc1: u32, crm: u32, low: u32, high: u32) -> CoprocessorOp = CoprocessorOp(kind, 0, opc1, 0, 0, crm, low, high, false)
+
+@test("the GPIO coprocessor is the SIO's GPIO registers: masks low, high and both, single bits, indexed writes and the reads")
+arm_gpioc()
+    var c = rp2350()
+    val w = CoprocessorKind.Write
+    val p = CoprocessorKind.WritePair
+    c.coprocessor(0, gpioc(w, 0, 0, 0x0F, 0)).unwrap().unwrap()
+    c.coprocessor(0, gpioc(w, 1, 0, 0x03, 0)).unwrap().unwrap()
+    c.coprocessor(0, gpioc(w, 2, 0, 0x100, 0)).unwrap().unwrap()
+    c.coprocessor(0, gpioc(w, 3, 0, 0x04, 0)).unwrap().unwrap()
+    assert(c.sio.out == 0x108, s"put, xor, set, clr: ${c.sio.out}")
+    c.coprocessor(0, gpioc(w, 2, 1, 0x1, 0)).unwrap().unwrap()
+    assert(c.sio.out == 0x1_0000_0108, "the high word")
+    c.coprocessor(0, gpioc(p, 0, 4, 0xF0, 0x2)).unwrap().unwrap()
+    assert(c.sio.oe == 0x2_0000_00F0, "OE, both words at once")
+    // Single bits: put 1 and 0, then xor, set and clr, and conditional forms that do nothing on 0.
+    c.coprocessor(0, gpioc(p, 4, 0, 25, 1)).unwrap().unwrap()
+    assert(c.sio.out & (1u64 << 25) != 0)
+    c.coprocessor(0, gpioc(p, 4, 0, 25, 0)).unwrap().unwrap()
+    assert(c.sio.out & (1u64 << 25) == 0)
+    c.coprocessor(0, gpioc(w, 5, 0, 40, 0)).unwrap().unwrap()
+    c.coprocessor(0, gpioc(w, 6, 4, 25, 0)).unwrap().unwrap()
+    c.coprocessor(0, gpioc(w, 7, 4, 4, 0)).unwrap().unwrap()
+    assert(c.sio.out & (1u64 << 40) != 0 && c.sio.oe & (1u64 << 25) != 0 && c.sio.oe & 0x10 == 0)
+    c.coprocessor(0, gpioc(p, 6, 0, 5, 0)).unwrap().unwrap()
+    assert(c.sio.out & 0x20 == 0, "a conditional set with 0 sets nothing")
+    c.coprocessor(0, gpioc(p, 6, 0, 5, 1)).unwrap().unwrap()
+    assert(c.sio.out & 0x20 != 0)
+    // Indexed: Rt2 picks the register.
+    c.coprocessor(0, gpioc(p, 10, 0, 0x80, 1)).unwrap().unwrap()
+    assert(c.sio.out & (0x80u64 << 32) != 0)
+    // Reads: OUT, OE and IN, alone and as pairs.
+    val r = CoprocessorKind.Read
+    assert(c.coprocessor(0, gpioc(r, 0, 0, 0, 0)).unwrap().unwrap() == c.sio.out & 0xFFFFFFFF)
+    assert(c.coprocessor(0, gpioc(r, 0, 5, 0, 0)).unwrap().unwrap() == c.sio.oe >> 32)
+    assert(c.coprocessor(0, gpioc(CoprocessorKind.ReadPair, 0, 0, 0, 0)).unwrap().unwrap() == c.sio.out)
+    assert(c.coprocessor(0, gpioc(CoprocessorKind.ReadPair, 0, 8, 0, 0)).unwrap().unwrap() == 0, "every pad's input is 0 at power-on")
+    // What the coprocessor does not have is refused by name.
+    val bad = c.coprocessor(0, gpioc(w, 0, 2, 0, 0)).unwrap()
+    assert(bad.unwrap_err().contains("MCR p0, #0, c0, c2, #0 is not a GPIO coprocessor instruction"), bad.unwrap_err())
+    assert(c.coprocessor(0, gpioc(p, 4, 0, 64, 1)).unwrap().unwrap_err().contains("no GPIO 64"))
+    assert(c.coprocessor(0, gpioc(p, 8, 0, 1, 2)).unwrap().is_err(), "index 2 names no register")
+
+private rcp(kind: CoprocessorKind, opc1: u32, crm: u32, low: u32, high: u32) -> CoprocessorOp = CoprocessorOp(kind, 7, opc1, 0, 0, crm, low, high, false)
+
+@test("the RCP answers whether each core's salt is set, takes each salt once, and refuses the rest by name; the DCP answers its RCMP")
+arm_rcp_and_dcp()
+    var c = rp2350()
+    val status = rcp(CoprocessorKind.Read, 1, 0, 0, 0)
+    assert(c.coprocessor(0, status).unwrap().unwrap() == u64(RCP_FALSE) && c.coprocessor(1, status).unwrap().unwrap() == u64(RCP_FALSE))
+    c.coprocessor(0, rcp(CoprocessorKind.WritePair, 8, 0, 1, 2)).unwrap().unwrap()
+    assert(c.coprocessor(0, status).unwrap().unwrap() == u64(RCP_TRUE) && c.coprocessor(1, status).unwrap().unwrap() == u64(RCP_FALSE))
+    c.coprocessor(0, rcp(CoprocessorKind.WritePair, 8, 1, 3, 4)).unwrap().unwrap()
+    assert(c.coprocessor(1, status).unwrap().unwrap() == u64(RCP_TRUE) && c.rcp.salt[1] == 0x0000000400000003)
+    assert(c.coprocessor(0, rcp(CoprocessorKind.WritePair, 8, 0, 1, 2)).unwrap().unwrap_err().contains("already set"))
+    // A canary check is item 3's.
+    val canary = c.coprocessor(0, CoprocessorOp(CoprocessorKind.Write, 7, 0, 1, 1, 2, 0, 0, false)).unwrap()
+    assert(canary.unwrap_err() == "MCR p7, #0, c1, c2, #1 is not a redundancy (RCP) coprocessor instruction benchtop runs", canary.unwrap_err())
+    assert(c.coprocessor(0, CoprocessorOp(CoprocessorKind.Read, 4, 0, 1, 0, 0, 0, 0, false)).unwrap().unwrap() == 0, "RCMP")
+    assert(c.coprocessor(0, CoprocessorOp(CoprocessorKind.WritePair, 4, 1, 0, 0, 0, 0, 0, false)).unwrap().unwrap_err().contains("double-precision (DCP)"))
+    assert(c.coprocessor(0, CoprocessorOp(CoprocessorKind.Write, 1, 0, 0, 0, 0, 0, 0, false)).is_none(), "nothing on CP1")
+
+@test("pico2 is an Arm RP2350 board with the chip's SRAM; pico2-riscv and the Cortex-M boards are not; the Pico 2 W's radio is refused by name")
+arm_plans()
+    val m = arm_named("pico2").unwrap().unwrap()
+    assert(m.base == 0x20000000 && m.size == 520 * 1024)
+    assert(arm_named("pico2-riscv").is_none() && arm_named("virt").is_none() && riscv_named("pico2").is_none())
+    val text = "board { name = b, mcu = rp2350 }"
+    val got = load(source_of("b.hocon", text), library())
+    assert(!got.report.has_errors(), got.report.render(source_of("b.hocon", text)))
+    assert(arm_plan(got.description.board).is_ok())
+    val w = arm_named("pico2w").unwrap()
+    assert(w.unwrap_err().contains("`wifi` is a cyw43439"), w.unwrap_err())

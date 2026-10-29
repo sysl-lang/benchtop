@@ -1,0 +1,110 @@
+module sh.sysl.benchtop.v6m
+
+// The coprocessor interface of an ARMv8-M Mainline core (DDI0553, "Coprocessor instructions"):
+// `MCR`, `MRC`, `MCRR`, `MRRC` and `CDP` for coprocessors 0 to 7, and their `…2` forms. The core
+// decodes each into one `Op.Coproc` record and hands it to the board through `Bus.coprocessor`, since
+// what sits on a coprocessor port is the chip's: the RP2350 puts its GPIO coprocessor on CP0 and its
+// redundancy coprocessor on CP7. Coprocessors 10 and 11 are the floating-point unit (fpu.sysl).
+// `LDC` and `STC` are not decoded, since no coprocessor benchtop runs takes them.
+//
+// **The board says which ports have a coprocessor** (`Cpu.coprocessors`), and only those keep their
+// CPACR field. A port with nothing on it, or one the board then answers `None` for, takes the
+// UsageFault NOCP, which stops the core at `Undefined`, as an undefined instruction does. **CPACR gates
+// each present port** as it gates the FPU: a field reading 0 (or 2), or 1 from unprivileged code, is
+// NOCP too, which stops the core at `Fault` there, as a denied FPU instruction does.
+//
+// The record: a = Rt (CRd for `CDP`), b = Rt2, c = the `CoprocessorKind`, and imm = coprocessor |
+// opc1 << 4 | CRn << 8 | CRm << 12 | opc2 << 16 | 1 << 20 for a `…2` form.
+
+/** What a coprocessor instruction does with the core's registers. */
+enum CoprocessorKind
+    // `MCR`: Rt to the coprocessor.
+    Write = 0
+    // `MRC`: the coprocessor to Rt, or to N, Z, C and V where Rt is 15.
+    Read
+    // `MCRR`: Rt and Rt2 to the coprocessor.
+    WritePair
+    // `MRRC`: the coprocessor to Rt and Rt2.
+    ReadPair
+    // `CDP`: an operation inside the coprocessor; no core register.
+    Data
+
+/** A coprocessor instruction as the board sees it: the coprocessor, the instruction's fields, and for
+ * a write the values of Rt (`low`) and Rt2 (`high`). `second` is the `…2` form, which the RP2350's
+ * RCP runs without its random delay.
+ */
+struct CoprocessorOp
+    kind: CoprocessorKind
+    coprocessor: u32
+    opc1: u32
+    opc2: u32
+    crn: u32
+    crm: u32
+    low: u32
+    high: u32
+    second: bool
+
+// Decode a coprocessor instruction whose coprocessor field is not 10 or 11 into `into`.
+private[v6m] decode_coprocessor(hw1: u32, hw2: u32, into: *Insn) -> Op
+    val cp = bits(hw2, 8, 4)
+    val second = (hw1 >> 12) & 1
+    if cp >= 8 then return Op.Undefined
+    val rt = bits(hw2, 12, 4)
+    if hw1 & 0xEFE0 == 0xEC40
+        // MCRR / MRRC: Rt2 in the first halfword, opc1 four bits wide.
+        val rt2 = hw1 & 0xF
+        val read = bits(hw1, 4, 1) == 1
+        if bad(rt) || bad(rt2) || (read && rt == rt2) then return Op.Undefined
+        val kind = if read then CoprocessorKind.ReadPair else CoprocessorKind.WritePair
+        set(into, rt, rt2, u32(int(kind)), cp | (bits(hw2, 4, 4) << 4) | ((hw2 & 0xF) << 12) | (second << 20))
+        return Op.Coproc
+    if hw1 & 0xEF00 != 0xEE00 then return Op.Undefined
+    val crn = hw1 & 0xF
+    val crm = hw2 & 0xF
+    val opc2 = bits(hw2, 5, 3)
+    if bits(hw2, 4, 1) == 0
+        set(into, rt, 0, u32(int(CoprocessorKind.Data)), cp | (bits(hw1, 4, 4) << 4) | (crn << 8) | (crm << 12) | (opc2 << 16) | (second << 20))
+        return Op.Coproc
+    val read = bits(hw1, 4, 1) == 1
+    // MRC may name the PC, meaning the flags; MCR may not, and neither may name SP.
+    if rt == 13 || (rt == 15 && !read) then return Op.Undefined
+    val kind = if read then CoprocessorKind.Read else CoprocessorKind.Write
+    set(into, rt, 0, u32(int(kind)), cp | (bits(hw1, 5, 3) << 4) | (crn << 8) | (crm << 12) | (opc2 << 16) | (second << 20))
+    Op.Coproc
+end decode_coprocessor
+
+// The instruction at `i`, `n` retired before it: through CPACR to the board. Answers false where it
+// stopped the core, with nothing written.
+x_coproc(cpu: *Cpu, i: *Insn, n: u64) -> bool
+    val cp = i.imm & 0xF
+    if cpu.coprocessors & (1 << cp) == 0
+        halt(cpu, Stop.Undefined, addr_of(cpu, i))
+        return false
+    val access = (cpu.cpacr >> (2 * cp)) & 3
+    val privileged = cpu.ipsr != 0 || cpu.control & 1 == 0
+    if access == 0 || access == 2 || (access == 1 && !privileged)
+        halt(cpu, Stop.Fault, addr_of(cpu, i))
+        return false
+    val c = u32(i.c)
+    val kind =
+        if c == 0 then CoprocessorKind.Write
+        elif c == 1 then CoprocessorKind.Read
+        elif c == 2 then CoprocessorKind.WritePair
+        elif c == 3 then CoprocessorKind.ReadPair
+        else CoprocessorKind.Data
+    val op = CoprocessorOp(kind, cp, (i.imm >> 4) & 0xF, (i.imm >> 16) & 7, (i.imm >> 8) & 0xF, (i.imm >> 12) & 0xF,
+        cpu.r[i.a], cpu.r[i.b], i.imm & (1 << 20) != 0)
+    val got = cpu.bus.coprocessor(cpu, op, n) match
+        Some(x) -> x
+        None ->
+            halt(cpu, Stop.Undefined, addr_of(cpu, i))
+            return false
+    if cpu.stop != Stop.Running then return false
+    kind match
+        Read -> if i.a == 15 then set_apsr(cpu, u32(got) & 0xF0000000) else put(cpu, i.a, u32(got))
+        ReadPair ->
+            put(cpu, i.a, u32(got))
+            put(cpu, i.b, u32(got >> 32))
+        _ -> ()
+    true
+end x_coproc

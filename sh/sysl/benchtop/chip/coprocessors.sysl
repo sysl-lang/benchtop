@@ -1,0 +1,121 @@
+module sh.sysl.benchtop.chip
+
+import sh.sysl.benchtop.v6m.{CoprocessorKind, CoprocessorOp}
+import sh.sysl.rp2350.sio as sio_reg
+import sysl.fmt.hex
+
+// The coprocessors on each Cortex-M33's port (datasheet 3.6, "Cortex-M33 coprocessors"), which an Arm
+// board hands the chip every `MCR`, `MRC`, `MCRR`, `MRRC` and `CDP` for:
+//
+// - **CP0, the GPIO coprocessor** (3.6.1), in full: each instruction is the SIO register write or read
+//   it is documented as equivalent to, made by the core that issued it.
+// - **CP7, the redundancy coprocessor** (3.6.3), the minimum `crt0.S` needs from a debugger entry:
+//   reading whether this core's salt is set, and setting each core's salt once. Every other RCP
+//   instruction is refused by name; the canaries, the boolean and integer checks and the sequence
+//   counter are rp-coverage item 3.
+// - **CP4, the double-precision coprocessor** (3.6.2), the minimum `runtime_init` needs: the `RCMP`
+//   read that clears its engaged flag, answering 0. Every other DCP instruction is refused by name;
+//   the DCP is rp-coverage item 7.
+//
+// Any other coprocessor has nothing on its port, which the core takes as NOCP.
+
+/** The RCP's canary salts, one per core, each set at most once. */
+struct Rcp
+    salt: [2]u64
+    salted: [2]bool
+
+rcp() -> Rcp = Rcp([0, 0], [false, false])
+
+/** The RCP's encodings of true and false. */
+const RCP_TRUE: u32 = 0xa500a500
+const RCP_FALSE: u32 = 0x00c300c3
+
+impl Rp2350
+    /** Core `core`'s coprocessor instruction `op`: a read's value (Rt low, Rt2 high), 0 for a write;
+     * None where nothing is on the port; or why the chip refuses it.
+     */
+    coprocessor(*self, core: u32, op: CoprocessorOp) -> Option[Result[u64, string]] = op.coprocessor match
+        0 -> Some(self.gpioc(core, op))
+        4 -> Some(dcp(op))
+        7 -> Some(self.rcp_op(core, op))
+        _ -> None
+
+    // CP0: OUT, OE and IN through the SIO, by the core that issued the instruction.
+    private gpioc(*self, core: u32, op: CoprocessorOp) -> Result[u64, string]
+        val oe = op.crm & 4 != 0
+        op.kind match
+            Write ->
+                if op.crn != 0 then return Err(unknown("GPIO", op))
+                if op.opc1 < 4 && op.crm & 0xA == 0 then return self.gpio_mask(core, oe, op.crm & 1 != 0, op.opc1, op.low).map(_ -> 0u64)
+                // A single bit, unconditionally: toggle, set or clear.
+                if op.opc1 >= 5 && op.crm & 0xB == 0 then return self.gpio_bit(core, oe, op.opc1 - 4, op.low, true).map(_ -> 0u64)
+                Err(unknown("GPIO", op))
+            WritePair ->
+                if op.crm & 0xB != 0 then return Err(unknown("GPIO", op))
+                if op.opc1 < 4
+                    self.gpio_mask(core, oe, false, op.opc1, op.low)?
+                    return self.gpio_mask(core, oe, true, op.opc1, op.high).map(_ -> 0u64)
+                // A single bit: written with the value, or toggled, set or cleared where it is 1.
+                if op.opc1 == 4 then return self.gpio_bit(core, oe, if op.high != 0 then 2 else 3, op.low, true).map(_ -> 0u64)
+                if op.opc1 < 8 then return self.gpio_bit(core, oe, op.opc1 - 4, op.low, op.high != 0).map(_ -> 0u64)
+                // Indexed: Rt2 picks the low or high register.
+                if op.opc1 < 12 && op.high < 2 then return self.gpio_mask(core, oe, op.high == 1, op.opc1 - 8, op.low).map(_ -> 0u64)
+                Err(unknown("GPIO", op))
+            Read ->
+                if op.crn != 0 || op.opc1 != 0 || op.crm > 9 || op.crm & 6 == 2 || op.crm & 6 == 6 then return Err(unknown("GPIO", op))
+                self.gpio_read(core, op.crm)
+            ReadPair ->
+                if op.opc1 != 0 || (op.crm != 0 && op.crm != 4 && op.crm != 8) then return Err(unknown("GPIO", op))
+                Ok(self.gpio_read(core, op.crm)? | (self.gpio_read(core, op.crm + 1)? << 32))
+            Data -> Err(unknown("GPIO", op))
+    end gpioc
+
+    // GPIOC operation `k` (0 put, 1 xor, 2 set, 3 clr) of `x` on OUT or OE, low or high.
+    private gpio_mask(*self, core: u32, oe: bool, high: bool, k: u32, x: u32) -> Result[unit, string]
+        // The SIO's layout: OUT, SET, CLR, XOR, each low then high, OE's the same 0x20 on.
+        val step: u32 = if k == 0 then 0 elif k == 1 then 0x18 elif k == 2 then 0x08 else 0x10
+        val at = sio_reg.GPIO_OUT_OFFSET + (if oe then 0x20 else 0) + step + (if high then 4 else 0)
+        self.sio.write(core, at, 4, x).map_err(e -> s"the GPIO coprocessor's SIO write at SIO + 0x${hex(at)}: $e")
+
+    // Operation `k` (1 xor, 2 set, 3 clr) on GPIO `pin` alone, where `when` holds.
+    private gpio_bit(*self, core: u32, oe: bool, k: u32, pin: u32, when: bool) -> Result[unit, string]
+        if pin >= 64 then return Err(s"the GPIO coprocessor has no GPIO $pin")
+        if !when then return Ok(())
+        self.gpio_mask(core, oe, pin >= 32, k, 1 << (pin & 31))
+
+    // OUT (CRm 0, 1), OE (4, 5) or IN (8, 9), low or high.
+    private gpio_read(*self, core: u32, crm: u32) -> Result[u64, string]
+        val at =
+            if crm < 2 then sio_reg.GPIO_OUT_OFFSET + 4 * crm
+            elif crm < 6 then sio_reg.GPIO_OE_OFFSET + 4 * (crm - 4)
+            else sio_reg.GPIO_IN_OFFSET + 4 * (crm - 8)
+        self.sio.read(core, at, 4, self.inputs()).map(x -> u64(x)).map_err(e -> s"the GPIO coprocessor's SIO read at SIO + 0x${hex(at)}: $e")
+
+    // CP7: the salt status and the salts.
+    private rcp_op(*self, core: u32, op: CoprocessorOp) -> Result[u64, string]
+        val r = &self.rcp
+        if op.kind == CoprocessorKind.Read && op.opc1 == 1 && op.crn == 0 && op.crm == 0 && op.opc2 == 0
+            return Ok(u64(if r.salted[core] then RCP_TRUE else RCP_FALSE))
+        if op.kind == CoprocessorKind.WritePair && op.opc1 == 8 && op.crm < 2
+            if r.salted[op.crm] then return Err(s"the RCP faults: core ${op.crm}'s salt is already set, and setting it twice is an RCP violation")
+            r.salt[op.crm] = u64(op.low) | (u64(op.high) << 32)
+            r.salted[op.crm] = true
+            return Ok(0)
+        Err(unknown("redundancy (RCP)", op))
+end Rp2350
+
+// CP4: the read that clears the engaged flag.
+private dcp(op: CoprocessorOp) -> Result[u64, string]
+    if op.kind == CoprocessorKind.Read && op.opc1 == 0 && op.crn == 0 && op.crm == 0 && op.opc2 == 1 then return Ok(0)
+    Err(unknown("double-precision (DCP)", op))
+
+// A coprocessor instruction benchtop does not run, as a person reads it.
+private unknown(which: string, op: CoprocessorOp) -> string
+    val name = op.kind match
+        Write -> "MCR"
+        Read -> "MRC"
+        WritePair -> "MCRR"
+        ReadPair -> "MRRC"
+        Data -> "CDP"
+    val two = if op.second then "2" else ""
+    s"$name$two p${op.coprocessor}, #${op.opc1}, c${op.crn}, c${op.crm}, #${op.opc2} is not a ${which} coprocessor instruction benchtop runs"

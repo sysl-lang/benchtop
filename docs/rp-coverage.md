@@ -20,13 +20,14 @@ day. An L is split before it is handed out (§6).
 
 ## 0. Where the two chips stand
 
-- **The RP2350 runs only on its Hazard3 cores.** `chip.Rp2350` (`chip/rp2350.sysl`) decodes 14
-  blocks (`chip/rp2350.sysl:57–95`) and raises 11 interrupt lines (`chip/rp2350.sysl:325–336`).
-  `chip.RiscvBoard` runs two harts on it (`boards/pico2-riscv.hocon`). The image is an ELF loaded into
-  SRAM, and flash is not on the bus (`chip/riscv_board.sysl:13–17`). Every other address is refused by
-  name, the ROM included (`chip/rp2350.sysl:34–37`). **The Arm Pico 2 does not run**
-  (`docs/machine.md:171–173`, `boards/pico2.hocon:1–3`). The M33 core exists in `v6m`, but it does not
-  sit on `chip.Rp2350`.
+- **The RP2350 runs on both pairs of cores.** `chip.Rp2350` (`chip/rp2350.sysl`) decodes 16 blocks
+  and raises 11 interrupt lines. `chip.RiscvBoard` runs two Hazard3 harts on it
+  (`boards/pico2-riscv.hocon`), and `chip.ArmBoard` (`chip/arm_board.sysl`) two Cortex-M33s
+  (`boards/pico2.hocon`), with the M33s' coprocessors on their ports (`chip/coprocessors.sysl`) and a
+  boot ROM of benchtop's own at address 0 (`chip/rom/rom.S`). On both boards the image is an ELF
+  loaded into SRAM, and flash is not on the bus. Every other address is refused by name; on the
+  RISC-V board that includes the ROM. The SDK's `hello_serial` and `blink`, `no_flash` builds, run
+  unmodified on the Arm board (`examples/pico2`, item 1 below).
 - **The RP2040 does not run at all** (`mcus/rp2040.hocon:4`, `peripheral/rp2040/README.md:9–11`).
   Its RESETS, TIMER and watchdog tick generator are library peripherals (`rp-resets`, `rp-timer`,
   `rp-watchdog`). They run on the `virt*` boards through `virt/rp.sysl`, with clk_ref taken to be the
@@ -60,13 +61,13 @@ day. An L is split before it is handed out (§6).
 
 | block | datasheet | status | modelled / not | tested now | est | depends on |
 |---|---|---|---|---|---|---|
-| Cortex-M33 ×2: integer Thumb-2, DSP, FPv5-SP | 3.7 Cortex-M33 | partial | The ISA, DSP and FPv5-SP are built (`v6m/models.sysl:47`, DESIGN.md §2.9). The cores do not sit on `chip.Rp2350`, and there is no Arm board around the chip (`docs/machine.md:171–173`). | `v6m` t2/fp/dsp tests on `virt33` | M (the board) | chip bus, `Processor` |
-| M33 NVIC, SCB, SysTick | 3.7 / 3.2 Interrupts | partial | The NVIC, SCB and SysTick are generic (`v6m/except.sysl:8`, `v6m/cpu.sysl:316`). Of the chip's 52 IRQ lines, none reach an NVIC, because no Arm board exists. | `v6m/nvic_tests`, `priority_tests` | S, with the board | Arm board |
+| Cortex-M33 ×2: integer Thumb-2, DSP, FPv5-SP | 3.7 Cortex-M33 | full | The ISA, DSP and FPv5-SP (`v6m/models.sysl:47`, DESIGN.md §2.9), both cores on `chip.Rp2350` through `chip.ArmBoard`, core 1 launched by the ROM protocol into its VTOR, SP and PC. | `v6m` t2/fp/dsp tests on `virt33`; `chip/arm_tests.sysl` | — | — |
+| M33 NVIC, SCB, SysTick | 3.7 / 3.2 Interrupts | partial | The NVIC (52 lines, 4 priority bits), SCB and SysTick are generic (`v6m/except.sysl:8`). The lines the chip raises reach the NVIC through `Processor` (TIMER0/1 alarms drive the SDK's `sleep_ms`). | `v6m/nvic_tests`, `priority_tests`, `chip/arm_tests.sysl` | grows with each block | — |
 | M33 MPU (PMSAv8, 8 regions per state) | 3.7 | missing | No MPU on any v6m core (no `RLAR`/`RASR` anywhere in `v6m/`). | — | M | — |
 | M33 stack limits (MSPLIM/PSPLIM) | 3.7 | partial | The registers are stored. A push below the limit stops the run instead of taking a UsageFault (`v6m/cpu.sysl:228`, `t2_except.sysl:190`). | `t2_except` tests | S | — |
-| TrustZone, Secure-only minimum (SAU stored, TT*, SecureFault, NS transitions refused) | 3.7, 10 Security | missing | `TT`, `SG`, `BXNS` and `BLXNS` are undefined (`v6m/thumb2.sysl:9–12`). The DESIGN.md §2.7 minimum is not built. | `t2_except.sysl:309–315` asserts they are undefined | M | — |
+| TrustZone, Secure-only minimum (SAU stored, TT*, SecureFault, NS transitions refused) | 3.7, 10 Security | partial | On a core the board runs Secure-only (`Cpu.security`, the Arm board's), `TT`, `TTT`, `TTA` and `TTAT` answer Secure, R and RW for every address, as with the SAU and both MPUs disabled: what `rom_func_lookup` reads (item 1). The SAU is not stored, there is no SecureFault, and `SG`, `BXNS` and `BLXNS` are undefined. | `v6m/coproc_tests.sysl` (TT); `t2_except.sysl:309–315` (undefined elsewhere) | M | — |
 | TrustZone, Non-secure state | 3.7, 10 Security | missing | Both worlds' banked state, IDAU, secure gateways and the NS aliases of PPB and SIO. | — | L | Secure-only |
-| M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | missing | Coprocessor encodings are undefined (`v6m/thumb2.sysl:9–10`). The SDK uses all three by default: `gpio_put` goes through CP0, `pico_double` through the DCP, and `crt0.S` enables the RCP (DESIGN.md §2.7). | — | M (RCP+GPIOC), M (DCP) | Arm board, SIO GPIO |
+| M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | partial | `MCR`, `MRC`, `MCRR`, `MRRC`, `CDP` and their `…2` forms reach the board through `Bus.coprocessor`, gated by CPACR, which keeps the fields of the ports the board fills (`v6m/coproc.sysl`). **GPIOC is full**: every instruction is its SIO equivalent (`chip/coprocessors.sysl`). **RCP**: the salt status and the two salts only. **DCP**: the `RCMP` read `runtime_init` makes only. Every other RCP and DCP instruction is refused by name. | `v6m/coproc_tests.sysl`, `chip/arm_tests.sysl` | M (RCP rest), M (DCP) | — |
 | Hazard3 ×2 (RV32IMAC + Zb*/Zc*/Zcmp, PMP, Xh3pmpm, Xh3power) | 3.8 Hazard3 | full | `riscv/rp2350.sysl:6–22` and `riscv/HAZARD3-COVERAGE.md`. | `riscv/hazard3_*_tests`, `chip/tests.sysl:18` | — | — |
 | Hazard3 interrupt controller (Xh3irq) | 3.8 | full | MEIEA, MEIPA, MEINEXT and MEICONTEXT (`riscv/csr.sysl:34–42`). Only the lines `signal` drives ever pend (see "Interrupt routing"). | `riscv/hazard3_tests` | — | — |
 | Architecture switching (ARCHSEL, both pairs) | 3.9 Architecture switching | missing | The board fixes the cores (`boards/pico2-riscv.hocon` against `pico2`). | — | S | Arm board, boot path |
@@ -79,10 +80,10 @@ day. An L is split before it is handed out (§6).
 | BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | missing | Not decoded. | — | S (counters) | DMA/cores for events |
 | ACCESSCTRL | 10.6 Access control | missing | Not decoded. DESIGN.md §2.7 says to store it, with the reset state granting Secure code everything. | — | S | — |
 | ROM: core-1 launch protocol | 5.3 / 5 Bootrom | partial | The ROM's FIFO echo loop and launch are emulated without ROM code (`chip/rp2350.sysl:271–287`). Core 1 is released by the emulation, not by the real ROM. | `chip/tests.sysl:115` | — | — |
-| ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | missing | A ROM read is refused (`chip/rp2350.sysl:36–37`). The SDK reaches the ROM's table during start-up and for flash, unique ID and reboot. | — | L | XIP/QMI, OTP, BOOTRAM |
+| ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | partial | On the Arm board, benchtop's own ROM (`chip/rom/rom.S`, read-only at 0): the vector table, the magic and the well-known pointers, the Arm lookup, and `bootrom_state_reset` ('SR'), which has no state to reset. Any other code looks up as 0, as the real ROM answers for a code it lacks. On the RISC-V board a ROM read is refused. | `chip/arm_tests.sysl` | L | XIP/QMI, OTP, BOOTRAM |
 | Boot path: IMAGE_DEF, partition tables, UF2, secure-boot flags, signature check | 5 Bootrom, 10 Security | missing | Boot is the debugger entry into SRAM (`chip/riscv_board.sysl:13–17`). DESIGN.md §9.2 option 3. | — | L | ROM, OTP, XIP, SHA-256 |
 | SRAM 0–9 (520 KB) | 4.2 SRAM | full | `mcus/rp2350.hocon:19`. Striping does not matter to a program. | every chip test | — | — |
-| BOOTRAM (with boot locks) | 4.3 Boot RAM | missing | Not decoded. The SDK's `hardware_boot_lock` runs on it. | — | S | — |
+| BOOTRAM (with boot locks) | 4.3 Boot RAM | full | 1 KB of SRAM, WRITE_ONCE0/1 and the eight boot locks with BOOTLOCK_STAT (`peripheral/rp2350/startup.sysl`). | `peripheral/rp2350/startup_tests.sysl` | — | — |
 | XIP: flash window, aliases, cache, cache-as-SRAM, XIP_CTRL, streaming FIFO | 4.4 XIP | missing | "Flash (XIP) is not on this board's bus yet" (`chip/riscv_board.sysl:16`). | — | M | loader |
 | QMI (flash and PSRAM interface; direct mode) | 12.14 QMI | missing | Not decoded. The ROM's flash routines use direct mode. | — | M | XIP |
 | OTP | 13 OTP | missing | Not decoded. It is read for the unique ID and for boot configuration. | — | M (stored array, ROM access); L (ECC, locks, keys) | ROM |
@@ -106,7 +107,7 @@ day. An L is split before it is handed out (§6).
 | ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
 | DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | missing | Not decoded. | — | L (core) + S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
 | PIO0/1/2 | 11 PIO | missing | Not decoded. DESIGN.md §9.7 costs it at 4–6 agent-days. The RP2350 adds a third block, `MOV` to and from the RX FIFO, and the GPIO base (16/48). | — | L (machine) + M (GPIO/DMA/IRQ) | mux, DMA, IRQ, clk_sys |
-| USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | missing | Not decoded. DESIGN.md §7 "Later" costs it. | — | L + M (bridge) | clk_usb, PLL_USB, IRQ |
+| USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | register-stub | SIE_CTRL alone is stored, which `runtime_init_usb_power_down` reads and sets; it is not gated by RESETS, since the SDK reads it before releasing USBCTRL (`peripheral/rp2350/startup.sysl`). Every other register is refused. DESIGN.md §7 "Later" costs the controller. | `peripheral/rp2350/startup_tests.sysl` | L + M (bridge) | clk_usb, PLL_USB, IRQ |
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
 | TIMER0/1 | 12.8 System timers | full | 64-bit counter, latch, 4 alarms, LOCKED, SOURCE (`peripheral/rp2350/timing.sysl:91–145`). | `rp2350/tests.sysl:44`, `chip/tests.sysl:18` | — | — |
 | WATCHDOG | 12.9 Watchdog | partial | CTRL and SCRATCH0–7 are stored. The counter does not count, TRIGGER makes no reset, and REASON reads 0 (`timing.sysl:147–186`). | `rp2350/tests.sysl:70` | M | chip reset path, PSM |
@@ -322,3 +323,36 @@ that must land first. Items with no shared "after" run in parallel.
 | 31 | **Non-secure TrustZone** (per Q3). | L | 2 |
 | 32 | **USB host mode** (per Q4). | L | 20 |
 | 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED). | L | 14 |
+
+### Item 1, done: the Arm Pico 2 and its refusal census
+
+`chip.ArmBoard` runs `examples/pico2/hello_serial.elf` and `blink.elf`, SDK 2.3.0 `no_flash` builds
+for `pico2` / `rp2350-arm-s`, unmodified but for one documented entry setting
+(`examples/pico2/README.md`). `chip/arm_tests.sysl` asserts the UART0 bytes, a line every 100 ms, and
+GPIO 25 toggling every 250 ms of guest time.
+
+**The entry.** An RP2350 RAM image entered by a debugger goes back through the boot ROM by default
+(`PICO_CRT0_DEBUG_ENTRY_RESETS_VIA_BOOTROM`): it writes a RAM-image boot request into the watchdog's
+scratch registers and vectors through the ROM's table at 0, which is the Raspberry Pi ROM's boot path
+(items 6 and 30). The examples are built with it 0, the SDK's other supported entry, so crt0 sets up
+the RCP and MSPLIM itself and vectors through its own table.
+
+**Every access the chip or the core refused on the way to `main`, `hello_serial`'s output and
+`blink`'s LED, in the order the programs make them, and what answers it now:**
+
+| # | where | the access | refused as | handler now | item it belongs to |
+|---|---|---|---|---|---|
+| 1 | `crt0.S` `_entry_point` | CPACR ← CP7 full access | CP0–7 fields read as zero | CPACR keeps the fields of the coprocessors the board puts on the port (`v6m/t2system.sysl`, `Cpu.coprocessors`) | 3 |
+| 2 | `crt0.S` | `mrc p7, #1, APSR_nzcv, c0, c0, #0`, the RCP salt status | undefined instruction | the coprocessor interface (`v6m/coproc.sysl`); the RCP answers this core's salt status as RCP true/false (`chip/coprocessors.sysl`) | 3 (minimum) |
+| 3 | `crt0.S` | `mcrr p7, #8, r0, r0, c0` and `…, c1`, the salts | undefined instruction | the RCP stores each core's salt once; a second set is an RCP fault, refused by name | 3 (minimum) |
+| 4 | `runtime_init_usb_power_down` | USBCTRL SIE_CTRL read and SET-alias write, 0x5011004C | not on the bus | `UsbCtrl`, SIE_CTRL stored (`peripheral/rp2350/startup.sysl`) | 20 (minimum) |
+| 5 | `runtime_init_boot_locks_reset` | BOOTRAM BOOTLOCK0–7 writes, 0x400E080C–0x400E0828 | not on the bus | `BootRam`, the whole block | 5 |
+| 6 | `runtime_init_bootrom_locking_enable` | BOOTLOCK7 read (claim) | not on the bus | `BootRam` | 5 |
+| 7 | `runtime_init_per_core_bootrom_reset` → `rom_func_lookup` | `tt r2, r2` (is the caller Non-secure?) | undefined instruction | `TT*` on a Secure-only core (`v6m/thumb2.sysl`, `Cpu.security`) | 2 (minimum) |
+| 8 | `rom_func_lookup` | ROM halfword at 0x16, then a call into the ROM | not on the bus | benchtop's ROM, read-only at 0 (`chip/rom/rom.S`): the lookup, and `bootrom_state_reset` | 6 (minimum) |
+| 9 | `runtime_init_per_core_enable_coprocessors` | CPACR ← CP0, CP4, CP10 | CP0 and CP4 read as zero | as 1 | 3, 7 |
+| 10 | `runtime_init_per_core_enable_coprocessors` | `mrc p4, #0, r0, c0, c0, #1`, the DCP's RCMP | undefined instruction | the DCP answers this read 0; every other DCP instruction is refused by name | 7 (minimum) |
+| 11 | `blink`: `gpio_init`, `gpio_set_dir`, `gpio_put` | `mcr p0, …` and `mcrr p0, #4, …` | undefined instruction | the GPIO coprocessor, in full: each instruction its SIO write or read | 3 |
+
+Nothing else was refused: RESETS, CLOCKS, XOSC, the PLLs, TICKS, TIMER0, the SIO (spinlocks, GPIO),
+IO_BANK0, PADS_BANK0, UART0 and the NVIC took every access the two programs make as they were.

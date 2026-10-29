@@ -1,0 +1,133 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The coprocessor interface (coproc.sysl) and the Secure-only `TT`, on an M33 under both executors:
+// each encoding reaches the board with its fields, a read lands in Rt, Rt2 or the flags, CPACR and
+// the board's ports gate it, and an encoding outside the interface stays undefined.
+
+// A board that logs every coprocessor instruction, answers `answer` for CP0 and CP7, and has nothing
+// on any other port.
+struct CoprocessorLog
+    ops: Buf[CoprocessorOp]
+    answer: u64
+
+impl Bus for CoprocessorLog
+    read(*self, cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+        halt(cpu, Stop.Unmapped, a)
+        0
+
+    write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64) = halt(cpu, Stop.Unmapped, a)
+
+    override coprocessor(*self, cpu: *Cpu, op: CoprocessorOp, n: u64) -> Option[u64]
+        if op.coprocessor != 0 && op.coprocessor != 7 then return None
+        self.ops.push(op)
+        Some(self.answer)
+
+// `code` on an M33 with CP0 and CP7 on its port and CPACR `cpacr`, under `exec`, against `log`.
+private run_coprocessor(log: *CoprocessorLog, exec: Exec, code: []const u16, regs: []const u32, cpacr: u32) -> Cpu
+    var c: Cpu
+    c.kind = Kind.V8mMain
+    prepare(&c, code, regs, 0, [])
+    c.coprocessors = 0x81
+    c.cpacr = cpacr
+    c.bus = log
+    finish(&c, exec)
+    c
+
+private log() -> CoprocessorLog = CoprocessorLog(buf(), 0)
+
+@test("MCR, MRC, MCRR, MRRC and CDP reach the board with their coprocessor, opcodes, registers and values")
+coprocessor_fields()
+    for exec in [&run_match, &run_threaded]
+        var l = log()
+        l.answer = 0x1111222233334444
+        // mcr p0, #2, r1, c0, c4; mrc p0, #0, r2, c0, c8; mcrr p0, #4, r1, r3, c0; mrrc p0, #0, r4, r5, c4;
+        // cdp p7, #0, c0, c0, c0, #1; mcrr2 p7, #8, r0, r0, c1
+        val code = [0xEE40u16, 0x1014, 0xEE10, 0x2018, 0xEC43, 0x1040, 0xEC55, 0x4004, 0xEE00, 0x0720, 0xFC40, 0x0781]
+        val c = run_coprocessor(&l, exec, code, [7, 25, 0, 1], 0xFFFF)
+        assert(c.stop == Stop.Breakpoint && c.retired == 6, s"stop ${c.stop} at ${c.stop_at}")
+        assert(l.ops.len() == 6)
+        val w = l.ops[0]
+        assert(w.kind == CoprocessorKind.Write && w.coprocessor == 0 && w.opc1 == 2 && w.crn == 0 && w.crm == 4 && w.opc2 == 0 && w.low == 25 && !w.second)
+        val r = l.ops[1]
+        assert(r.kind == CoprocessorKind.Read && r.crm == 8 && c.r[2] == 0x33334444, "MRC takes the low word")
+        val p = l.ops[2]
+        assert(p.kind == CoprocessorKind.WritePair && p.opc1 == 4 && p.crm == 0 && p.low == 25 && p.high == 1, "MCRR: Rt low, Rt2 high")
+        val q = l.ops[3]
+        assert(q.kind == CoprocessorKind.ReadPair && q.crm == 4 && c.r[4] == 0x33334444 && c.r[5] == 0x11112222, "MRRC: Rt low, Rt2 high")
+        val d = l.ops[4]
+        assert(d.kind == CoprocessorKind.Data && d.coprocessor == 7 && d.opc1 == 0 && d.opc2 == 1)
+        val s = l.ops[5]
+        assert(s.kind == CoprocessorKind.WritePair && s.coprocessor == 7 && s.opc1 == 8 && s.crm == 1 && s.low == 7 && s.second, "MCRR2 is the second form")
+
+@test("MRC to the PC writes N, Z, C and V from the value's top four bits")
+coprocessor_flags()
+    for exec in [&run_match, &run_threaded]
+        for answer in [0xA500A500u64, 0x00C300C3, 0x60000000]
+            var l = log()
+            l.answer = answer
+            // mrc p7, #1, APSR_nzcv, c0, c0, #0
+            var c = run_coprocessor(&l, exec, [0xEE30, 0xF710], [], 0xC000)
+            assert(c.stop == Stop.Breakpoint && flags(&c) == u32(answer >> 28) & 0xF, s"flags ${flags(&c)} for ${answer}")
+
+@test("CPACR gates each port: a denied one stops at Fault and a privileged-only one runs privileged; an empty port is undefined, as is what the interface does not cover")
+coprocessor_gating()
+    for exec in [&run_match, &run_threaded]
+        // mcr p0, #0, r1, c0, c0
+        val mcr = [0xEE00u16, 0x1010]
+        var l = log()
+        var c = run_coprocessor(&l, exec, mcr, [], 0)
+        assert(c.stop == Stop.Fault && c.stop_at == 0 && c.retired == 0 && l.ops.is_empty(), "CP0 denied")
+        c = run_coprocessor(&l, exec, mcr, [], 2)
+        assert(c.stop == Stop.Fault && l.ops.is_empty(), "the reserved value denies")
+        c = run_coprocessor(&l, exec, mcr, [], 1)
+        assert(c.stop == Stop.Breakpoint && l.ops.len() == 1, "privileged access from privileged Thread mode")
+        // mcr p4, #0, r1, c0, c0: CP4 is not on this core's port.
+        c = run_coprocessor(&l, exec, [0xEE00, 0x1410], [], 0xFFFF)
+        assert(c.stop == Stop.Undefined && c.stop_at == 0 && l.ops.len() == 1, "absent port")
+        // mcr p8: no coprocessor 8 on ARMv8-M; mcr p0 with Rt = PC; ldc p0.
+        for code in [[0xEE00u16, 0x1810], [0xEE00, 0xF010], [0xED90, 0x0000]]
+            c = run_coprocessor(&l, exec, code, [], 0xFFFF)
+            assert(c.stop == Stop.Undefined && c.stop_at == 0, s"${code[0]} ${code[1]}")
+
+@test("a coprocessor instruction is undefined on a core with no coprocessors, and where the board's bus has no coprocessor method")
+coprocessor_none()
+    for exec in [&run_match, &run_threaded]
+        for ports in [0u32, 1]
+            var c: Cpu
+            c.kind = Kind.V8mMain
+            prepare(&c, [0xEE00, 0x1010], [], 0, [])
+            c.coprocessors = ports
+            c.cpacr = 0xFFFF
+            finish(&c, exec)
+            assert(c.stop == Stop.Undefined && c.stop_at == 0, s"ports $ports")
+
+@test("CPACR keeps the fields of the coprocessors on the port and of the FPU, and reads the rest as zero")
+cpacr_fields()
+    var c: Cpu
+    c.kind = Kind.V8mMain
+    prepare(&c, [], [], 0, [])
+    c.coprocessors = 0x91
+    store32(&c, 0xE000ED88, 0xFFFFFFFF)
+    assert(load32(&c, 0xE000ED88) == 0x0000C303, s"${load32(&c, 0xE000ED88)}")
+    c.fpu = Fpu.Single
+    store32(&c, 0xE000ED88, 0xFFFFFFFF)
+    assert(load32(&c, 0xE000ED88) == 0x00F0C303)
+
+@test("TT on a Secure-only core answers Secure, readable and writable, every form and address; on a core without it, undefined")
+tt_secure_only()
+    for exec in [&run_match, &run_threaded]
+        // tt r1, r2; ttt r3, r2; tta r4, r0; ttat r5, r0
+        val code = [0xE842u16, 0xF100, 0xE842, 0xF340, 0xE840, 0xF480, 0xE840, 0xF5C0]
+        var c: Cpu
+        c.kind = Kind.V8mMain
+        prepare(&c, code, [0x20000000, 0, 0x10], 0, [])
+        c.security = true
+        finish(&c, exec)
+        assert(c.stop == Stop.Breakpoint && c.retired == 4)
+        for k in 1..<6 do if k != 2 then assert(c.r[k] == 0x004C0000, s"r$k ${c.r[k]}")
+        prepare(&c, code, [], 0, [])
+        finish(&c, exec)
+        assert(c.stop == Stop.Undefined && c.stop_at == 0, "without the Security Extension")
