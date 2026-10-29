@@ -70,11 +70,13 @@ so a round takes about as long on either. The M0+'s count is the same as before 
 ## The Hazard3
 
 `kernel-rv.bin` is the same `kernel.c` built for RV32IMAC (`start-rv.S` sets the stack, calls `run`
-and ends with `EBREAK`), and `benchtop bench --core hazard3` runs it on the RISC-V interpreter,
-which has no decode cache and no threaded executor:
+and ends with `EBREAK`), and `benchtop bench --core hazard3` runs it on the RISC-V threaded
+executor (`riscv/threaded.sysl`), or with `interpret` after the expected value on the reference
+interpreter, which decodes every step:
 
 ```
 /usr/bin/time -l ./benchtop bench --core hazard3 bench/guest/kernel-rv.bin 1380735027
+/usr/bin/time -l ./benchtop bench --core hazard3 bench/guest/kernel-rv.bin 1380735027 interpret
 ```
 
 On the M5 Pro, sysl 0.7.8, three rounds of 429.3 M guest instructions:
@@ -82,10 +84,13 @@ On the M5 Pro, sysl 0.7.8, three rounds of 429.3 M guest instructions:
 | | host instructions | per guest instruction | MIPS |
 |---|---|---|---|
 | a priority scan of every interrupt and of every PMP region per access, byte-wise RAM | 1606.0 G | 1247 | ~16 |
-| now: a cached interrupt line, decoded PMP with a Machine-mode fast path, word RAM access | **289.0 G** | **224** | **~104** |
+| the interpreter (`interpret`): a cached interrupt line, decoded PMP with a Machine-mode fast path, word RAM access | 288.9 G | 224 | ~125 |
+| now: a decode cache and a threaded executor | **29.05 G** | **22.6** | **~790** |
 
-That is still about fifteen times the ARM cores' cost per instruction; the rest is the decode on
-every step.
+The threaded executor's handlers run only in Machine mode with no PMP region binding it and no
+interrupt due, and every one checks the budget, so it stops exactly where the interpreter does;
+CSRs, system instructions, atomics and Zcmp go through the interpreter one step at a time. The M0+
+threaded line is unchanged by it (42.00 G before, 41.99 G after).
 
 ## Two cores
 

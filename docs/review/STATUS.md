@@ -15,7 +15,7 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | cores#5 | `TIMED`, `V8`, `SINGLE` are `const u32` used as booleans | fixed in `35449b8` (`const …: bool`; FP's precision `D` left a `u32`) |
 | cores#6 | the timing switch checked at decode in three spellings; IT re-dispatch | partly fixed in `35449b8`: `CYCLE_ACCOUNTING` deleted; one spelling (`handler_for`, `fused_handler_for`, `cmp_w_bcond_handler`, `pred_handler` all take the core); `h_pred[K, L, TIMED]` no longer tests the timing switch at run time; left: it still re-selects its inner handler per run — the 16-byte record has no room for a second handler pointer |
 | cores#7 | the RISC-V core is RP2350-specific while claiming to be generic | fixed in `aff3dad`: a `Chip` record holds what the integration fixes, `riscv/rp2350.sysl` is the one that names the RP2350 |
-| cores#8 | RISC-V per-instruction cost far from "real-world speed" | partly fixed in `aff3dad`, `6e909be`: cached IRQ line, decoded PMP with a Machine-mode fast path, word RAM access; 1247 → 224 host instructions per guest instruction (bench/README.md); left: a decode cache and the threaded executor v6m has |
+| cores#8 | RISC-V per-instruction cost far from "real-world speed" | fixed in `aff3dad`, `6e909be`, `565ec06`: cached IRQ line, decoded PMP with a Machine-mode fast path, word RAM access, then a decode cache and threaded executor (`riscv/threaded.sysl`, `run` kept as the reference); 1247 → 224 → 22.6 host instructions per guest instruction (bench/README.md) |
 | cores#9 | NVIC banks use three indexing schemes | open |
 | cores#10 | flash write protection is an extra compare on every store | open |
 | cores#11 | sentinel and guard-record arithmetic in place of named concepts | open |
