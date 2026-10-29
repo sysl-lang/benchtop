@@ -29,6 +29,28 @@ integration. Its PWM and byte-level I²C register adapters are explicitly virtua
 and reusable; the DS3231 is a separate slave model behind I²C device callbacks.
 See [audio and RTC](audio-and-rtc.md) for the implemented boundaries.
 
+## One shape for every register model
+
+The register models under `peripheral/` for the STM32H747 and the virtual workbench (the SDMMC, SAI,
+DMA and DMAMUX, DSI host, STM32 SPI and GPIO, PL022, ADC, PWM, I²S and I²C controllers) implement one
+trait, `peripheral.Model` (`peripheral/model.sysl`): `read(offset, width, time)` answering `None`
+where no register answers, `write(offset, width, value, time)` answering `false` for a write the
+model refuses, `advance(time)` bringing its own work up to a time, `due()` the time of its next event
+(`NEVER` for none), `irq()` its interrupt line, and `reset()`. Width checks that fault the access
+stay with the board's glue; a model takes the width it is given.
+
+What a model reaches outside itself is a connection it holds, set once when the board puts it in
+place (`virt.attach` calls each device's `connect_…`) and kept by a reset, never passed on each
+call: the SDMMC host's card, its routing check and the RAM its IDMA moves (`sdmmc.Wiring`); the
+ADC's analogue input; the PL022's pins; each SAI block's serial line; the DSI host's sink; the GPIO
+bank's levels the board holds its pins at; the I²C controller's devices. A callback that must reach
+the core whose thread runs the device (the SDMMC's RAM) reads it from the device, which records it
+under the device's lock before the model runs.
+
+The RP2040 and RP2350 models (`peripheral/rp2040`, `peripheral/rp2350`) keep a shape of their own,
+which `chip.Rp2350` and `virt.rp` drive: an `AccessError` that says why an access failed, and clocks
+advanced in cycles of their own domain.
+
 ## Unsupported writes are refused, not ignored
 
 Every chip peripheral model follows one policy for a write it cannot honour — a reserved

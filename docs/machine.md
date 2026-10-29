@@ -144,7 +144,8 @@ enum ProductView
      state in itself and reaches through `m` only what joins it to the rest of the board (the
      panel's pads, the SDMMC's GPIO, the codec on the I2C bus and the SAI, the other core). The
      connections a device's model calls out through are set once, when the devices are put in place
-     (`connect_spi`, `connect_dsi`). Since a `*Machine` crosses into those threads, everything it
+     (`connect_spi`, `connect_dsi`, and the rest `attach` calls), and the models themselves share one
+     `peripheral.Model` trait (docs/peripheral-models.md). Since a `*Machine` crosses into those threads, everything it
      holds is reached with atomic counts or under a lock, which the compiler now checks: the memory
      is a `&sync Memory`, the map's other RAM regions a frozen buffer, the SPI pins and the DSI sink
      `&sync Fn`s, the codec's published settings a `&sync CodecSettings` and its model under a
