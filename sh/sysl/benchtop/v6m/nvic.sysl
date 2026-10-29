@@ -2,96 +2,139 @@ module sh.sysl.benchtop.v6m
 
 import sysl.sync.*
 
-// ARM NVIC banked register model, up to the selected model's implemented IRQs.
-// Low words remain in their original fields. Cold extra banks are visited only
-// when their summary bits say that something is pending, active or incoming.
+// The ARM NVIC's banked registers, up to the selected model's implemented IRQs.
+//
+// Every set the core keeps — enabled, pending, active, and incoming from another core's thread — is
+// one bit per exception number in `NVIC_BANKS` words of 64, so IRQ k is bit `IRQ0 + k` of all four
+// and no two of them need lining up. A system exception has no enable bit, so its bit in `enabled` is
+// 0. Word 0 (the system exceptions and IRQs 0–47) is the common case and is read directly; for each
+// word above it, a summary mask (`pending_banks`, `active_banks`, `incoming_banks`) has bit w set
+// while word w is non-zero, so a scan visits only the words that hold something.
+const NVIC_BANKS: usize = 8
+// The most external interrupt lines any model has; they fit `NVIC_BANKS` words after the system
+// exceptions.
+const NVIC_MAX_IRQS: u32 = 480
 const NVIC_IABR: u32 = 0xe000e300
+
+// Exception `e`'s word in a set, and its bit in that word.
+@inline
+nvic_word(e: u32) -> usize = usize(e >> 6)
+
+@inline
+nvic_bit(e: u32) -> u64 = 1u64 << (e & 63)
 
 irq_enabled(c: *Cpu, irq: u32) -> bool
     if irq >= c.nvic_irqs then return false
-    val word = if irq < 32 then c.enabled else c.enabled_extra[usize(irq / 32 - 1)]
-    word & (1u32 << (irq & 31)) != 0
+    val e = IRQ0 + irq
+    c.enabled[nvic_word(e)] & nvic_bit(e) != 0
 
 exception_pending(c: *Cpu, e: u32) -> bool
     if e >= c.nvic_irqs + IRQ0 then return false
-    val word = if e < 64 then c.pending else c.pending_extra[usize(e / 64 - 1)]
-    word & (1u64 << (e & 63)) != 0
+    c.pending[nvic_word(e)] & nvic_bit(e) != 0
 
 exception_active(c: *Cpu, e: u32) -> bool
     if e >= c.nvic_irqs + IRQ0 then return false
-    val word = if e < 64 then c.active else c.active_extra[usize(e / 64 - 1)]
-    word & (1u64 << (e & 63)) != 0
+    c.active[nvic_word(e)] & nvic_bit(e) != 0
 
 set_pending(c: *Cpu, e: u32, on: bool)
     if e >= c.nvic_irqs + IRQ0 then return
-    val bit = 1u64 << (e & 63)
-    if e < 64
-        if on then c.pending |= bit else c.pending &= ~bit
-    else
-        val bank = usize(e / 64 - 1)
-        if on then c.pending_extra[bank] |= bit else c.pending_extra[bank] &= ~bit
-        if c.pending_extra[bank] != 0 then c.pending_banks |= 1u32 << u32(bank)
-        else c.pending_banks &= ~(1u32 << u32(bank))
+    val w = nvic_word(e)
+    change(&c.pending[0], w, nvic_bit(e), on)
+    if w != 0 then c.pending_banks = summary(&c.pending[0])
 
 set_active(c: *Cpu, e: u32, on: bool)
     if e >= c.nvic_irqs + IRQ0 then return
-    val bit = 1u64 << (e & 63)
-    if e < 64
-        if on then c.active |= bit else c.active &= ~bit
-    else
-        val bank = usize(e / 64 - 1)
-        if on then c.active_extra[bank] |= bit else c.active_extra[bank] &= ~bit
-        if c.active_extra[bank] != 0 then c.active_banks |= 1u32 << u32(bank)
-        else c.active_banks &= ~(1u32 << u32(bank))
+    val w = nvic_word(e)
+    change(&c.active[0], w, nvic_bit(e), on)
+    if w != 0 then c.active_banks = summary(&c.active[0])
+
+// Set or clear `bits` in word `w` of the set `words`.
+@inline
+private change(words: *u64, w: usize, bits: u64, on: bool)
+    if on then words[w] |= bits else words[w] &= ~bits
+
+// The summary mask of the set `words`: bit w for each word above word 0 that is non-zero.
+private summary(words: *u64) -> u32
+    var banks: u32 = 0
+    for w in 1..<NVIC_BANKS do if words[w] != 0 then banks |= 1u32 << u32(w)
+    banks
 
 take_extra_incoming(c: *Cpu)
-    val banks = atomic_swap(&c.incoming_banks,0,Acquire)
-    for bank in 0usize..<7
-        if banks & (1u32 << u32(bank)) == 0 then continue
-        val bits = atomic_swap(&c.incoming_extra[bank],0,Acquire)
-        c.pending_extra[bank] |= bits
-        if c.pending_extra[bank] != 0 then c.pending_banks |= 1u32 << u32(bank)
+    var banks = atomic_swap(&c.incoming_banks,0,Acquire)
+    while banks != 0
+        val w = usize(banks.trailing_zeros())
+        c.pending[w] |= atomic_swap(&c.incoming[w],0,Acquire)
+        banks &= banks - 1
+    c.pending_banks = summary(&c.pending[0])
+
+// The highest group priority, the lowest number, of `p` and of the exceptions set in `bits`, word `w`
+// of a set.
+@inline
+active_group(c: *Cpu, bits: u64, w: u32, p: int) -> int
+    var rest = bits
+    var result = p
+    while rest != 0
+        val g = group(c,priority(c,(w << 6) + rest.trailing_zeros()))
+        if g < result then result = g
+        rest &= rest - 1
+    result
+
+// The exception of highest priority, the lowest number among equals, of `best` (an exception number,
+// or -1 for none) and of those set in `bits`, word `w` of a set. Words are visited in order, so the
+// lowest number still wins among equals across them.
+@inline
+best_of(c: *Cpu, bits: u64, w: u32, best: int) -> int
+    var rest = bits
+    var result = best
+    while rest != 0
+        val e = (w << 6) + rest.trailing_zeros()
+        if result < 0 || priority(c,e) < priority(c,u32(result)) then result = int(e)
+        rest &= rest - 1
+    result
 
 extra_running_priority(c: *Cpu, current: int) -> int
     var result = current
-    for bank in 0usize..<7
-        if c.active_banks & (1u32 << u32(bank)) == 0 then continue
-        var bits = c.active_extra[bank]
-        var e = u32(bank + 1) * 64
-        while bits != 0
-            if bits & 1 != 0 then result = if group(c,priority(c,e)) < result then group(c,priority(c,e)) else result
-            bits >>= 1
-            e += 1
+    var banks = c.active_banks
+    while banks != 0
+        val w = banks.trailing_zeros()
+        result = active_group(c,c.active[usize(w)],w,result)
+        banks &= banks - 1
     result
 
 extra_best_pending(c: *Cpu, current: int) -> int
     var best = current
-    for bank in 0usize..<7
-        if c.pending_banks & (1u32 << u32(bank)) == 0 then continue
-        // Exception banks start sixteen bits before their IRQ enable banks.
-        // Mask disabled sources before scanning, just as the low-bank path does.
-        val index = bank * 2
-        val allowed = (u64(c.enabled_extra[index]) >> 16) | (u64(c.enabled_extra[index + 1]) << 16) | (u64(c.enabled_extra[index + 2] & 65535) << 48)
-        var bits = c.pending_extra[bank] & allowed
-        var e = u32(bank + 1) * 64
-        while bits != 0
-            if bits & 1 != 0 && eligible(c,e) && (best < 0 || priority(c,e) < priority(c,u32(best))) then best = int(e)
-            bits >>= 1
-            e += 1
+    var banks = c.pending_banks
+    while banks != 0
+        val w = banks.trailing_zeros()
+        best = best_of(c,c.pending[usize(w)] & c.enabled[usize(w)],w,best)
+        banks &= banks - 1
     best
 
+// The implemented IRQs of register bank `bank` (IRQs 32·bank up), as a mask.
 private bank_mask(c: *Cpu, bank: u32) -> u32
     val first = bank * 32
     if first >= c.nvic_irqs then return 0
     val count = c.nvic_irqs - first
     if count >= 32 then 0xffffffff else (1u32 << count) - 1
 
-private bank_bits(c: *Cpu, bank: u32, active: bool) -> u32
-    var bits: u32 = 0
-    for k in 0u32..<32
-        val e = IRQ0 + bank * 32 + k
-        if (if active then exception_active(c,e) else exception_pending(c,e)) then bits |= 1u32 << k
-    bits
+// Register bank `bank`'s 32 bits of the set `words`. They start at exception `IRQ0 + 32·bank`, which
+// is bit 16 or bit 48 of a word, so a bank at bit 48 runs on into the next word. The bank holds at
+// least one implemented IRQ, so that word exists.
+private bank_word(words: *u64, bank: u32) -> u32
+    val e = IRQ0 + bank * 32
+    val w = nvic_word(e)
+    val s = e & 63
+    var bits = words[w] >> s
+    if s > 32 then bits |= words[w + 1] << (64 - s)
+    u32(bits & 0xffffffff)
+
+// Set or clear `bits` of register bank `bank` in the set `words`.
+private bank_change(words: *u64, bank: u32, bits: u32, on: bool)
+    val e = IRQ0 + bank * 32
+    val w = nvic_word(e)
+    val s = e & 63
+    change(words,w,u64(bits) << s,on)
+    if s > 32 then change(words,w + 1,u64(bits) >> (64 - s),on)
 
 private nvic_bank(c: *Cpu, address: u32) -> int
     if address < NVIC_ISER || address >= NVIC_IABR + 64 || address & 3 != 0 then return -1
@@ -113,9 +156,10 @@ nvic_read(c: *Cpu, address: u32) -> Option[u32]
     if encoded < 0 then return None
     val group = u32(encoded) / 16
     val bank = u32(encoded) % 16
-    var value = bank_bits(c,bank,group == 4)
-    if group < 2 then value = if bank == 0 then c.enabled else c.enabled_extra[usize(bank - 1)]
-    Some(value & bank_mask(c,bank))
+    val mask = bank_mask(c,bank)
+    if mask == 0 then return Some(0)
+    val words = if group < 2 then &c.enabled[0] elif group < 4 then &c.pending[0] else &c.active[0]
+    Some(bank_word(words,bank) & mask)
 
 nvic_write(c: *Cpu, address: u32, value: u32) -> bool
     if address >= NVIC_IPR && address < NVIC_IPR + 512 && (!is_v6m(c.kind) || address < NVIC_IPR + 32)
@@ -128,14 +172,13 @@ nvic_write(c: *Cpu, address: u32, value: u32) -> bool
     val group = u32(encoded) / 16
     val bank = u32(encoded) % 16
     val bits = value & bank_mask(c,bank)
-    if group < 2
-        val word = if bank == 0 then &c.enabled else &c.enabled_extra[usize(bank - 1)]
-        if group == 0 then word[0] |= bits else word[0] &= ~bits
+    if bits == 0 then return true
+    if group < 2 then bank_change(&c.enabled[0],bank,bits,group == 0)
     elif group < 4
-        for k in 0u32..<32
-            if bits & (1u32 << k) != 0 then set_pending(c,IRQ0 + bank * 32 + k,group == 2)
+        bank_change(&c.pending[0],bank,bits,group == 2)
+        c.pending_banks = summary(&c.pending[0])
     // IABR is read-only.
     true
 
 @inline
-has_incoming(c: *Cpu) -> bool = atomic_load(&c.incoming,Relaxed) != 0 || atomic_load(&c.incoming_banks,Relaxed) != 0
+has_incoming(c: *Cpu) -> bool = atomic_load(&c.incoming[0],Relaxed) != 0 || atomic_load(&c.incoming_banks,Relaxed) != 0

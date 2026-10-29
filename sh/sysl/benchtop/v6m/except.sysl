@@ -76,19 +76,15 @@ clear_exceptions(cpu: *Cpu)
     cpu.ipsr = 0
     cpu.primask = 0
     cpu.vtor = 0
-    cpu.pending = 0
-    cpu.active = 0
-    cpu.enabled = 0
-    cpu.nvic_irqs = u32(model_of(cpu.kind).irqs)
+    for w in 0..<NVIC_BANKS
+        cpu.pending[w] = 0
+        cpu.active[w] = 0
+        cpu.enabled[w] = 0
+        cpu.incoming[w] = 0
     cpu.pending_banks = 0
     cpu.active_banks = 0
-    cpu.incoming = 0
     cpu.incoming_banks = 0
-    for k in 0..<15 do cpu.enabled_extra[k] = 0
-    for k in 0..<7
-        cpu.pending_extra[k] = 0
-        cpu.active_extra[k] = 0
-        cpu.incoming_extra[k] = 0
+    cpu.nvic_irqs = u32(model_of(cpu.kind).irqs)
     cpu.priority_bits = default_priority_bits(cpu.kind)
     for e in 0..<cpu.prio.len do cpu.prio[e] = 0
     cpu.sleeping = false
@@ -139,7 +135,7 @@ clock(cpu: *Cpu, n: u64) -> u64 = executed_cycles(cpu,n) + cpu.slept
 // Make the run come back at its next taken branch, so the next one's `begin_run` looks again.
 @inline
 recheck(cpu: *Cpu)
-    if cpu.pending != 0 || cpu.pending_banks != 0 then set_limit(cpu, 0)
+    if cpu.pending[0] != 0 || cpu.pending_banks != 0 then set_limit(cpu, 0)
 
 // Raise IRQ `irq`, from a device: it is pending until it is taken or cleared.
 raise(cpu: *Cpu, irq: u32)
@@ -153,11 +149,9 @@ raise(cpu: *Cpu, irq: u32)
 poke(cpu: *Cpu, irq: u32)
     if irq >= cpu.nvic_irqs then return
     val e = IRQ0 + irq
-    if e < 64 then atomic_or(&cpu.incoming, u64(1) << e, SeqCst)
-    else
-        val bank = usize(e / 64 - 1)
-        atomic_or(&cpu.incoming_extra[bank],u64(1) << (e & 63),SeqCst)
-        atomic_or(&cpu.incoming_banks,1u32 << u32(bank),Release)
+    val w = nvic_word(e)
+    atomic_or(&cpu.incoming[w], nvic_bit(e), SeqCst)
+    if w != 0 then atomic_or(&cpu.incoming_banks, 1u32 << u32(w), SeqCst)
     cut(cpu)
 
 /** Make `cpu`'s run come back at its next taken branch, from any thread. */
@@ -168,7 +162,7 @@ cut(cpu: *Cpu) = atomic_store(&cpu.limit, 0, SeqCst)
  */
 @inline
 take_incoming(cpu: *Cpu)
-    if atomic_load(&cpu.incoming, Relaxed) != 0 then cpu.pending |= atomic_swap(&cpu.incoming, 0, Acquire)
+    if atomic_load(&cpu.incoming[0], Relaxed) != 0 then cpu.pending[0] |= atomic_swap(&cpu.incoming[0], 0, Acquire)
     if atomic_load(&cpu.incoming_banks,Relaxed) != 0 then take_extra_incoming(cpu)
 
 // A sleeping core wakes when an exception is pending that would preempt if PRIMASK were clear; one
@@ -233,14 +227,7 @@ group(cpu: *Cpu, p: int) -> int = if p < 0 then p else p & ~((2 << int(cpu.prigr
 // BASEPRI and FAULTMASK, and by PRIMASK when `masked` (ARMv8-M ARM, `ExecutionPriority`). The two
 // ARMv8-M masks are 0 on ARMv6-M.
 running_priority(cpu: *Cpu, masked: bool) -> int
-    var p = BASE_PRIORITY
-    var rest = cpu.active
-    var e: u32 = 0
-
-    while rest != 0
-        if rest & 1 != 0 && group(cpu, priority(cpu, e)) < p then p = group(cpu, priority(cpu, e))
-        rest >>= 1
-        e += 1
+    var p = active_group(cpu, cpu.active[0], 0, BASE_PRIORITY)
 
     if cpu.active_banks != 0 then p = extra_running_priority(cpu,p)
 
@@ -258,16 +245,7 @@ eligible(cpu: *Cpu, e: u32) -> bool
 
 // The pending, enabled exception of highest priority, the lowest number among equals; -1 for none.
 best_pending(cpu: *Cpu) -> int
-    var best = -1
-    var allow = SYSTEM_EXCEPTIONS | (u64(cpu.enabled) << IRQ0)
-    if cpu.pending >> 48 != 0 then allow |= u64(cpu.enabled_extra[0] & 65535) << 48
-    var rest = cpu.pending & allow
-    var e: u32 = 0
-
-    while rest != 0
-        if rest & 1 != 0 && (best < 0 || priority(cpu, e) < priority(cpu, u32(best))) then best = int(e)
-        rest >>= 1
-        e += 1
+    var best = best_of(cpu, cpu.pending[0] & (SYSTEM_EXCEPTIONS | cpu.enabled[0]), 0, -1)
 
     if cpu.pending_banks != 0 then best = extra_best_pending(cpu,best)
     best
@@ -542,7 +520,7 @@ tick(cpu: *Cpu, now: u64)
     if cpu.tick_ctrl & TICK_ENABLE == 0 || now < cpu.tick_zero then return
 
     cpu.tick_flag = true
-    if cpu.tick_ctrl & TICK_INT != 0 then cpu.pending |= u64(1) << SYSTICK
+    if cpu.tick_ctrl & TICK_INT != 0 then cpu.pending[0] |= u64(1) << SYSTICK
 
     if cpu.tick_reload == 0
         cpu.tick_last = cpu.tick_zero
@@ -600,16 +578,15 @@ scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
         SYST_CVR -> tick_now(cpu, now)
         // No reference clock, and no calibration value.
         SYST_CALIB -> 0xC0000000
-        NVIC_ISER | NVIC_ICER -> cpu.enabled
-        NVIC_ISPR | NVIC_ICPR -> u32(cpu.pending >> IRQ0)
         // The selected core's identification register.
         SCB_CPUID -> cpuid_of(cpu.kind)
         SCB_ICSR ->
             val best = best_pending(cpu)
             val vectpending: u32 = if best < 0 then 0 else u32(best)
-            val irq: u32 = if cpu.pending >> IRQ0 != 0 || cpu.pending_banks != 0 then 1 << 22 else 0
+            val low = cpu.pending[0]
+            val irq: u32 = if low >> IRQ0 != 0 || cpu.pending_banks != 0 then 1 << 22 else 0
 
-            (bit_of(cpu.pending, NMI) << 31) | (bit_of(cpu.pending, PENDSV) << 28) | (bit_of(cpu.pending, SYSTICK) << 26) | irq | (vectpending << 12) | cpu.ipsr
+            (bit_of(low, NMI) << 31) | (bit_of(low, PENDSV) << 28) | (bit_of(low, SYSTICK) << 26) | irq | (vectpending << 12) | cpu.ipsr
         SCB_VTOR -> if cpu.kind == Kind.M0 || cpu.kind == Kind.M1 then 0 else cpu.vtor
         // VECTKEYSTAT, little-endian.
         SCB_AIRCR -> 0xFA050000 | (cpu.prigroup << 8)
@@ -646,16 +623,12 @@ scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
             cpu.tick_value = 0
             cpu.tick_flag = false
             if cpu.tick_ctrl & TICK_ENABLE != 0 then tick_start(cpu, now)
-        NVIC_ISER -> cpu.enabled |= x
-        NVIC_ICER -> cpu.enabled &= ~x
-        NVIC_ISPR -> cpu.pending |= u64(x) << IRQ0
-        NVIC_ICPR -> cpu.pending &= ~(u64(x) << IRQ0)
         SCB_ICSR ->
-            if (x >> 31) & 1 != 0 then cpu.pending |= u64(1) << NMI
-            if (x >> 28) & 1 != 0 then cpu.pending |= u64(1) << PENDSV
-            if (x >> 27) & 1 != 0 then cpu.pending &= ~(u64(1) << PENDSV)
-            if (x >> 26) & 1 != 0 then cpu.pending |= u64(1) << SYSTICK
-            if (x >> 25) & 1 != 0 then cpu.pending &= ~(u64(1) << SYSTICK)
+            if (x >> 31) & 1 != 0 then cpu.pending[0] |= u64(1) << NMI
+            if (x >> 28) & 1 != 0 then cpu.pending[0] |= u64(1) << PENDSV
+            if (x >> 27) & 1 != 0 then cpu.pending[0] &= ~(u64(1) << PENDSV)
+            if (x >> 26) & 1 != 0 then cpu.pending[0] |= u64(1) << SYSTICK
+            if (x >> 25) & 1 != 0 then cpu.pending[0] &= ~(u64(1) << SYSTICK)
         SCB_VTOR -> if cpu.kind != Kind.M0 && cpu.kind != Kind.M1 then cpu.vtor = x & ~0xFF
         // SYSRESETREQ, under the key: the board decides what a reset is.
         SCB_AIRCR ->
