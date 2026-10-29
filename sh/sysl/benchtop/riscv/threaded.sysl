@@ -1,0 +1,323 @@
+module sh.sysl.benchtop.riscv
+
+// The threaded executor: a decode cache with one record per halfword of the RAM window, each carrying
+// its handler's address, and handlers that end by `become`-ing the next record's. A stretch of
+// instructions the cache does is one native frame, with the machine, the record and the retired count
+// in registers.
+//
+// It runs exactly the steps `run` runs, and stops where `run` stops with the same state:
+// - **The cache's handlers keep an invariant that is checked where they are entered** (`fast_ready`):
+//   the hart is in Machine mode with no PMP region binding it (or has no privileged architecture), no
+//   interrupt is due, and the PC is an aligned address in the RAM window. No handler can change any of
+//   that, so none tests it.
+// - **Everything else is the interpreter's.** A record the cache does not do (a CSR, a system
+//   instruction, an atomic, Zcmp, an access off the RAM window or misaligned) hands its PC back, and
+//   the driver runs that one step through the interpreter's own `step_privileged` or `step`, then
+//   enters the cache again. Faults, traps, interrupts and sleep happen only there.
+// - **The budget is exact**: each record checks the retired count against `limit`, so a budget of one
+//   runs one instruction, as `run` does.
+// - **The counters** advance by what the cache retired when it hands back. Their inhibit bits change
+//   only in an interpreted step, so the sum is what counting each step would have given.
+//
+// A store over decoded code (by this hart, its pair, or another master through `external_write`)
+// forgets the records it covers, so code that writes code runs the new instruction the next time
+// control reaches it. A host that writes the RAM window itself calls `forget_code`.
+
+type Handler = *extern(*Cpu, *Insn, u64) -> unit
+
+/** A decoded instruction: its handler; an immediate, a constant result, or a target's record index;
+ * its registers; and its length in records (halfwords).
+ */
+struct Insn
+    h: Handler
+    imm: u32
+    rd: u5
+    rs1: u5
+    rs2: u5
+    step: u8
+
+// A store into a 64-byte line marked as holding decoded code forgets the records it covers.
+const CODE_LINE_SHIFT: u32 = 6
+
+/** The records a decode cache over `bytes` of RAM takes: one per halfword, and one past the end. */
+code_records(bytes: usize) -> usize = bytes / 2 + 1
+
+/** The line marks a decode cache over `bytes` of RAM takes. */
+code_lines(bytes: usize) -> usize = (bytes + 63) >> CODE_LINE_SHIFT
+
+/** Give the hart a decode cache for `run_threaded`, its storage sized by `code_records` and
+ * `code_lines` for its RAM window; false, leaving it none, where either is too small.
+ */
+use_code_cache(cpu: *Cpu, records: []Insn, lines: []u8) -> bool
+    if !covers(cpu, records, lines)
+        detach_code(cpu)
+        return false
+    cpu.code = records
+    cpu.code_lines = lines
+    cpu.dec = &records[0]
+    forget_code(cpu)
+    true
+
+private[riscv] covers(cpu: *Cpu, records: []Insn, lines: []u8) -> bool =
+    records.len >= code_records(cpu.ram.len) && lines.len >= code_lines(cpu.ram.len)
+
+private[riscv] detach_code(cpu: *Cpu)
+    cpu.code = cpu.code[0..<0]
+    cpu.code_lines = cpu.code_lines[0..<0]
+    cpu.dec = null
+
+/** Forget every decoded record: what a host does after writing the RAM window behind the hart. */
+forget_code(cpu: *Cpu)
+    if cpu.dec == null then return
+    for i in 0..<cpu.code.len do cpu.code[i] = Insn(&h_decode, 0, 0, 0, 0, 1)
+    for i in 0..<cpu.code_lines.len do cpu.code_lines[i] = 0
+
+// A store of `width` bytes at RAM offset `offset`: the records it overlaps are forgotten, here and in
+// the pair, which shares the RAM.
+private[riscv] code_written(cpu: *Cpu, offset: u32, width: u32)
+    forget_range(cpu, offset, width)
+    if cpu.peer != null then forget_range(cpu.peer, offset, width)
+
+@inline
+private forget_range(cpu: *Cpu, offset: u32, width: u32)
+    if cpu.dec == null then return
+    // A 32-bit instruction a halfword before the store overlaps it too.
+    val first = usize(if offset >= 2 then offset - 2 else 0)
+    val last = usize(offset + width - 1)
+    if (cpu.code_lines[first >> CODE_LINE_SHIFT] | cpu.code_lines[last >> CODE_LINE_SHIFT]) == 0 then return
+    for i in (first >> 1)..<((last >> 1) + 1) do cpu.code[i].h = &h_decode
+
+/** Run up to `budget` steps exactly as `run` does, through the decode cache where the hart has one
+ * (`use_code_cache`), else through `run`.
+ */
+run_threaded(cpu: *Cpu, budget: u64)
+    if cpu.dec == null
+        run(cpu, budget)
+        return
+    if !wake(cpu, budget) then return
+    val privileged = has(cpu.model, EXT_PRIV)
+    var left = budget
+    while left != 0 && cpu.stop == Stop.Budget
+        if fast_ready(cpu)
+            val before = cpu.retired
+            cpu.limit = before + (if left < ~before then left else ~before)
+            val ip = &cpu.dec[usize((cpu.pc - cpu.base) >> 1)]
+            val f = ip.h
+            f(cpu, ip, before)
+            val done = cpu.retired - before
+            if privileged then counted(cpu, done)
+            left -= done
+            if left == 0 then return
+        left -= 1
+        if privileged then step_privileged(cpu) else step(cpu)
+
+// Whether the cache's handlers may run from `cpu.pc`: see the top of the file.
+private fast_ready(cpu: *Cpu) -> bool
+    val offset = cpu.pc - cpu.base
+    if (cpu.pc & ialign_mask(cpu)) != 0 || u64(offset) + 2 > u64(cpu.ram.len) then return false
+    if !has(cpu.model, EXT_PRIV) then return true
+    val s = &cpu.cs
+    if s.privilege != PRIV_MACHINE || s.pmp_binds_machine then return false
+    // MPRV makes loads and stores take MPP's privilege.
+    if (s.mstatus & MSTATUS_MPRV) != 0 && ((s.mstatus >> 11) & 3) != PRIV_MACHINE then return false
+    !interrupt_due(cpu)
+
+// `done` instructions retired by the cache, each a step: the counters move as `step_privileged` would
+// have moved them.
+private counted(cpu: *Cpu, done: u64)
+    val s = &cpu.cs
+    if (s.inhibit & INHIBIT_CY) == 0 then s.cycle += done
+    if (s.inhibit & INHIBIT_IR) == 0 then s.instret += done
+
+// ---------------------------------------------------------------------------------------------------
+// Handlers. Each retires its instruction and goes on to the next record, or hands back with nothing
+// done where the interpreter has to run it.
+
+@inline
+private address_of(cpu: *Cpu, ip: *Insn) -> u32 = cpu.base + (u32(ip - cpu.dec) << 1)
+
+@inline
+private after(ip: *Insn) -> *Insn = &ip[usize(ip.step)]
+
+@inline
+private record_of(cpu: *Cpu, index: u32) -> *Insn = &cpu.dec[usize(index)]
+
+// The instruction at `ip` is the interpreter's (or the budget is spent): hand back with the PC on it.
+@inline
+private leave(cpu: *Cpu, ip: *Insn, n: u64)
+    cpu.pc = address_of(cpu, ip)
+    cpu.retired = n
+
+// Go on to the record `ip`, with `n` retired, unless that spends the budget.
+@inline
+private go(cpu: *Cpu, ip: *Insn, n: u64)
+    if n >= cpu.limit
+        leave(cpu, ip, n)
+        return
+    val f = ip.h
+    become f(cpu, ip, n)
+
+h_leave(cpu: *Cpu, ip: *Insn, n: u64) = leave(cpu, ip, n)
+
+h_decode(cpu: *Cpu, ip: *Insn, n: u64)
+    decode(cpu, ip)
+    val f = ip.h
+    become f(cpu, ip, n)
+
+h_nop(cpu: *Cpu, ip: *Insn, n: u64)
+    become go(cpu, after(ip), n + 1)
+
+// LUI, AUIPC, C.LI, C.LUI: a constant, the PC folded in at decode.
+h_constant(cpu: *Cpu, ip: *Insn, n: u64)
+    cpu.r[ip.rd] = ip.imm
+    become go(cpu, after(ip), n + 1)
+
+// A base or M operation `K` (`alu_key`), on rs2 or, with `IMMEDIATE`, the immediate.
+h_alu[const K: u32, const IMMEDIATE: bool](cpu: *Cpu, ip: *Insn, n: u64)
+    cpu.r[ip.rd] = alu_apply(K, cpu.r[ip.rs1], if IMMEDIATE then ip.imm else cpu.r[ip.rs2])
+    become go(cpu, after(ip), n + 1)
+
+// A bit-manipulation operation; the record's immediate is its encoding.
+h_bit(cpu: *Cpu, ip: *Insn, n: u64)
+    cpu.r[ip.rd] = bit_operation(ip.imm, cpu.r[ip.rs1], cpu.r[ip.rs2]).unwrap()
+    become go(cpu, after(ip), n + 1)
+
+// JAL to a target decoded as aligned and in the window; its record index is the immediate.
+h_jal[const LINK: bool](cpu: *Cpu, ip: *Insn, n: u64)
+    if LINK then cpu.r[ip.rd] = address_of(cpu, ip) + (u32(ip.step) << 1)
+    become go(cpu, record_of(cpu, ip.imm), n + 1)
+
+h_jalr[const LINK: bool](cpu: *Cpu, ip: *Insn, n: u64)
+    val target = (cpu.r[ip.rs1] + ip.imm) & ~1u32
+    val offset = target - cpu.base
+    if (target & ialign_mask(cpu)) != 0 || usize(offset) >= cpu.ram.len
+        leave(cpu, ip, n)
+        return
+    if LINK then cpu.r[ip.rd] = address_of(cpu, ip) + (u32(ip.step) << 1)
+    become go(cpu, record_of(cpu, offset >> 1), n + 1)
+
+h_branch[const K: u32](cpu: *Cpu, ip: *Insn, n: u64)
+    if branch(K, cpu.r[ip.rs1], cpu.r[ip.rs2]) then become go(cpu, record_of(cpu, ip.imm), n + 1)
+    become go(cpu, after(ip), n + 1)
+
+// A load of funct3 `K` from the RAM window; off it, or misaligned, it is the interpreter's.
+h_load[const K: u32](cpu: *Cpu, ip: *Insn, n: u64)
+    val width = 1u32 << (K & 3)
+    val address = cpu.r[ip.rs1] + ip.imm
+    val offset = address - cpu.base
+    if (address & (width - 1)) != 0 || u64(offset) + u64(width) > u64(cpu.ram.len)
+        leave(cpu, ip, n)
+        return
+    val value = ram_load(cpu, usize(offset), width)
+    cpu.r[ip.rd] = if K < 2 then sext(value, 8u32 << K) else value
+    become go(cpu, after(ip), n + 1)
+
+h_store[const K: u32](cpu: *Cpu, ip: *Insn, n: u64)
+    val width = 1u32 << K
+    val address = cpu.r[ip.rs1] + ip.imm
+    val offset = address - cpu.base
+    if (address & (width - 1)) != 0 || u64(offset) + u64(width) > u64(cpu.ram.len)
+        leave(cpu, ip, n)
+        return
+    val next = after(ip)
+    invalidate(cpu, address, width)
+    ram_store(cpu, usize(offset), width, cpu.r[ip.rs2])
+    code_written(cpu, offset, width)
+    become go(cpu, next, n + 1)
+
+// ---------------------------------------------------------------------------------------------------
+// The decoder: the record at `ip` gets the handler for the instruction there, or `h_leave`.
+
+private decode(cpu: *Cpu, ip: *Insn)
+    ip.h = &h_leave
+    ip.step = 1
+    val offset = u32(ip - cpu.dec) << 1
+    if usize(offset) + 2 > cpu.ram.len then return
+    cpu.code_lines[usize(offset >> CODE_LINE_SHIFT)] = 1
+    if usize(offset) + 4 <= cpu.ram.len then cpu.code_lines[usize((offset + 2) >> CODE_LINE_SHIFT)] = 1
+    val pc = cpu.base + offset
+    val lo = ram_load(cpu, usize(offset), 2)
+    var insn = lo
+    if (lo & 3) != 3
+        if !has(cpu.model, EXT_C) || (has(cpu.model, EXT_ZC) && zcmp_encoding(lo)) then return
+        insn = decompress(lo)
+        if insn == 0 && has(cpu.model, EXT_ZC) then insn = decompress_extra(lo)
+        if insn == 0 then return
+    else
+        if usize(offset) + 4 > cpu.ram.len then return
+        // A fetch across an 8-byte block can meet a PMP region's edge, which faults even in Machine mode.
+        if (pc & 7) == 6 && !pmp_allows(cpu, pc, 4, Access.Fetch) then return
+        insn = lo | (ram_load(cpu, usize(offset) + 2, 2) << 16)
+        ip.step = 2
+    classify(cpu, ip, insn, pc)
+
+// The handler for the canonical (expanded) instruction `insn` at `pc`, with the validity `execute`
+// gives it; anything it leaves out stays the interpreter's.
+private classify(cpu: *Cpu, ip: *Insn, insn: u32, pc: u32)
+    val rd = (insn >> 7) & 31
+    val op = (insn >> 12) & 7
+    val imm = sext(insn >> 20, 12)
+    ip.rd = u5(rd)
+    ip.rs1 = u5((insn >> 15) & 31)
+    ip.rs2 = u5((insn >> 20) & 31)
+    if (insn == H3_BLOCK || insn == H3_UNBLOCK) && has(cpu.model, EXT_H3POWER) then return
+    (insn & 127) match
+        0x37 -> constant(ip, rd, insn & 0xFFFFF000)
+        0x17 -> constant(ip, rd, pc + (insn & 0xFFFFF000))
+        0x6F -> if target(cpu, ip, pc + jal_offset(insn)) then ip.h = if rd != 0 then &h_jal[true] else &h_jal[false]
+        0x67 ->
+            if op != 0 then return
+            ip.imm = imm
+            ip.h = if rd != 0 then &h_jalr[true] else &h_jalr[false]
+        0x63 -> if op != 2 && op != 3 && target(cpu, ip, pc + branch_offset(insn)) then ip.h = branch_handler(op)
+        0x03 ->
+            if rd == 0 || op == 3 || op > 5 then return
+            ip.imm = imm
+            ip.h = load_handler(op)
+        0x23 ->
+            if op > 2 then return
+            ip.imm = store_offset(insn)
+            ip.h = store_handler(op)
+        0x13 | 0x33 ->
+            alu_key(cpu, insn) match
+                Some(k) ->
+                    ip.imm = imm
+                    ip.h = if rd == 0 then &h_nop else alu_handler(k, (insn & 127) == 0x13)
+                None ->
+                    if !has(cpu.model, EXT_B) || bit_operation(insn, 0, 0).is_none() then return
+                    ip.imm = insn
+                    ip.h = if rd == 0 then &h_nop else &h_bit
+        0x0F -> if op == 0 || (op == 1 && has(cpu.model, EXT_IFENCE)) then ip.h = &h_nop
+        _ -> ()
+
+private constant(ip: *Insn, rd: u32, value: u32)
+    ip.imm = value
+    ip.h = if rd == 0 then &h_nop else &h_constant
+
+// A jump target's record index into the immediate, where it is aligned and in the window; else the
+// jump stays the interpreter's, which faults it.
+private target(cpu: *Cpu, ip: *Insn, to: u32) -> bool
+    val offset = to - cpu.base
+    if (to & ialign_mask(cpu)) != 0 || usize(offset) >= cpu.ram.len then return false
+    ip.imm = offset >> 1
+    true
+
+private alu_handler(k: u32, immediate: bool) -> Handler
+    for const c in 0..<24
+        if k == c then return if immediate then &h_alu[c, true] else &h_alu[c, false]
+    &h_leave
+
+private branch_handler(op: u32) -> Handler
+    for const c in 0..<8
+        if op == c then return &h_branch[c]
+    &h_leave
+
+private load_handler(op: u32) -> Handler
+    for const c in 0..<6
+        if op == c then return &h_load[c]
+    &h_leave
+
+private store_handler(op: u32) -> Handler
+    for const c in 0..<3
+        if op == c then return &h_store[c]
+    &h_leave
