@@ -28,18 +28,27 @@ struct AudioState
     irq_levels: u32
     live: Mutex[AudioLive]
 
-/** The SAI's blocks, the DMA controllers and the DMAMUX; `core`, the core whose access is being
- * served (its number rather than a borrowed MMIO callback pointer); and, per block, the frames
- * played so far, the packets played and not yet taken by the host, and the words the host has given
- * it to record (`debug_input` once a test has fed it directly). Each queue keeps the newest values;
+/** The SAI's blocks, the DMA controllers and the DMAMUX; and, per block, the frames played so far,
+ * the packets played and not yet taken by the host, and the words the host has given it to record
+ * (`debug_input` once a test has fed it directly). Each queue keeps the newest values;
  * `output_slots` and `input_slots` are the storage the rings lay over, empty where the bus has no
  * SAI to fill them.
+ *
+ * **The DMA is a bus master of its own, not either core.** Its reads and writes of RAM go to the
+ * memory both cores share, and a store it makes invalidates both cores' exclusive reservations and
+ * decoded code (`memory.device_store`); its interrupt lines reach both cores' NVICs. What a core
+ * contributes is only the host thread the work runs on — `via` below, passed down explicitly — and
+ * nothing the DMA does depends on which core that is.
+ *
+ * **Device time.** The SAI and DMA run at one clock that never goes backwards: each access first
+ * brings them to the accessing core's time. The two cores run loosely coupled, so a core that lags
+ * the other sees the devices as of the other's later time — exactly as it sees RAM the other wrote —
+ * and its own earlier time never rewinds them (`bring_audio` advances only).
  */
 struct AudioLive
     blocks: [2]&sai.Block
     units: [2]&dma.Controller
     mux: &dma.Mux
-    core: u32
     frame_number: [2]u64
     output: [2]Ring[SaiPacket]
     input: [2]Ring[u32]
@@ -72,7 +81,7 @@ private audio_live(hz: u64 = 480000000, kernel: u64 = 12288000, sai_present: boo
     val output_slots = [slots(packets,SaiPacket(0,0,0,0,0,0)),slots(packets,SaiPacket(0,0,0,0,0,0))]
     val input_slots = [slots(words,0u32),slots(words,0u32)]
     AudioLive(blocks = [sai.block(hz,kernel),sai.block(hz,kernel)], units = [dma.controller(),dma.controller()],
-        mux = dma.mux(), core = 0, frame_number = [0,0],
+        mux = dma.mux(), frame_number = [0,0],
         output = [ring(output_slots[0].view()),ring(output_slots[1].view())],
         input = [ring(input_slots[0].view()),ring(input_slots[1].view())], debug_input = [false,false],
         output_slots = output_slots, input_slots = input_slots)
@@ -85,8 +94,6 @@ private const DMAMUX_SAI1_B: u32 = 88
 /** No SAI, DMA or DMAMUX on the bus. */
 audio_state() -> AudioState =
     AudioState(false, [false,false], false, 0, [DMAMUX_SAI1_A,DMAMUX_SAI1_B], [-1;17], NEVER, 0, Mutex.new(audio_live()))
-
-private audio_cpu(s: *AudioLive) -> *Cpu = if s.core == 0 then core0() else core1()
 
 // The SAI and DMA `b` makes on a chip whose clock is `clock_hz`, with the DMA controllers where
 // `mapped` puts them: which controller each is was read once, into its device.
@@ -126,7 +133,6 @@ private[virt] boot_sai_dma()
             sai.reset(s.blocks[i])
             dma.reset(s.units[i])
         dma.reset_mux(s.mux)
-        s.core = 0
         s.frame_number = [0,0]
         s.debug_input = [false,false]
         for i in 0..<2
@@ -171,22 +177,24 @@ private data_block(address: u32) -> int
     if !d.sai_present then return -1
     if address == d.sai_at + sai.data_register(0) then 0 elif address == d.sai_at + sai.data_register(1) then 1 else -1
 
-private audio_bus_read(s: *AudioLive, address: u32, width: u32) -> Option[u32]
+// The DMA's own reads and writes: the SAI's data registers, or the RAM both cores share, reached on
+// `via`'s thread.
+private audio_bus_read(s: *AudioLive, via: *Cpu, address: u32, width: u32) -> Option[u32]
     val block = data_block(address)
     if block >= 0 then return sai.read(s.blocks[block],sai.DR)
-    val page = memory.page_for(audio_cpu(s),address,width)
+    val page = memory.page_for(via,address,width)
     if page == 0 then None else Some(memory.host_read(page,address,width))
 
-private audio_bus_write(s: *AudioLive, address: u32, width: u32, value: u32) -> bool
+private audio_bus_write(s: *AudioLive, via: *Cpu, address: u32, width: u32, value: u32) -> bool
     val block = data_block(address)
     if block >= 0 then return sai.write(s.blocks[block],sai.DR,value)
-    memory.device_store(audio_cpu(s),address,width,value)
+    memory.device_store(via,address,width,value)
 
-private service_audio_dma(s: *AudioLive)
+private service_audio_dma(s: *AudioLive, via: *Cpu)
     val d = &machine.devices.audio
     if !d.mux_present || !d.sai_present then return
-    val read_bus: dma.BusRead = (address,width) -> audio_bus_read(s,address,width)
-    val write_bus: dma.BusWrite = (address,width,value) -> audio_bus_write(s,address,width,value)
+    val read_bus: dma.BusRead = (address,width) -> audio_bus_read(s,via,address,width)
+    val write_bus: dma.BusWrite = (address,width,value) -> audio_bus_write(s,via,address,width,value)
     for unit in 0usize..<2
         if !d.dma_present[unit] then continue
         for stream in 0usize..<8
@@ -223,7 +231,13 @@ private audio_slot(s: *AudioLive, block: usize, slot: u32, word: u32, time: u64)
     // callback. Its DMA is serviced immediately afterwards by bring_audio.
     input
 
-private publish_audio(s: *AudioLive)
+// An interrupt line reaches both cores' NVICs: `via`'s own directly, the other's from this thread.
+private deliver_audio_irq(via: *Cpu, irq: u32)
+    memory.raise(via,irq)
+    memory.cut(via)
+    if scheduler.launched then memory.poke(if via.core == 0 then core1() else core0(),irq)
+
+private publish_audio(s: *AudioLive, via: *Cpu)
     val d = &machine.devices.audio
     val due = if s.blocks[0].due < s.blocks[1].due then s.blocks[0].due else s.blocks[1].due
     atomic_store(&d.next,if d.sai_present then due else NEVER,Release)
@@ -235,15 +249,10 @@ private publish_audio(s: *AudioLive)
     val rising = levels & ~atomic_swap(&d.irq_levels,levels,AcqRel)
     for k in 0usize..<17
         if rising & (1u32 << u32(k)) == 0 || d.irq_routes[k] < 0 then continue
-        val irq = u32(d.irq_routes[k])
-        val own = audio_cpu(s)
-        memory.raise(own,irq)
-        memory.cut(own)
-        if scheduler.launched then memory.poke(if s.core == 0 then core1() else core0(),irq)
+        deliver_audio_irq(via,u32(d.irq_routes[k]))
 
 private bring_audio(s: *AudioLive, c: *Cpu, time: u64)
-    s.core = c.core
-    service_audio_dma(s)
+    service_audio_dma(s,c)
     val endpoint_a: sai.Endpoint = (slot,word,at) -> audio_slot(s,0,slot,word,at)
     val endpoint_b: sai.Endpoint = (slot,word,at) -> audio_slot(s,1,slot,word,at)
     loop
@@ -255,10 +264,10 @@ private bring_audio(s: *AudioLive, c: *Cpu, time: u64)
         // interval, so batching cannot create artificial FIFO underruns.
         if first <= second then sai.advance(s.blocks[0],due,endpoint_a)
         else sai.advance(s.blocks[1],due,endpoint_b)
-        service_audio_dma(s)
+        service_audio_dma(s,c)
     for b in s.blocks
         if time > b.time then b.time = time
-    publish_audio(s)
+    publish_audio(s,c)
 
 private[virt] sai_dma_due() -> u64 = atomic_load(&machine.devices.audio.next,Acquire)
 
@@ -326,8 +335,8 @@ private[virt] sai_dma_read(c: *Cpu, device: Device, address: u32, offset: u32, w
         bring_audio(s,c,board_time(c,n))
         val result = audio_register_read(s,device,offset)
         // Reading RX DR may release space; always publish the resulting request state.
-        service_audio_dma(s)
-        publish_audio(s)
+        service_audio_dma(s,c)
+        publish_audio(s,c)
         result)
     result match
         Some(value) -> if width == 4 then value else value & ((1u32 << (width * 8)) - 1)
@@ -343,7 +352,7 @@ private[virt] sai_dma_write(c: *Cpu, device: Device, address: u32, offset: u32, 
         bring_audio(s,c,board_time(c,n))
         val word = if width == 4 then value else value & ((1u32 << (width * 8)) - 1)
         if !audio_register_write(s,device,offset,word) then halt(c,Stop.Fault,address)
-        service_audio_dma(s)
-        publish_audio(s))
+        service_audio_dma(s,c)
+        publish_audio(s,c))
     val due = sai_dma_due()
     if due != NEVER then lower_limit(c,retirement_limit(c,due))

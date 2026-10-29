@@ -23,7 +23,8 @@ struct Controller
     rx: InlineRing[u32, FIFO]
     input: InlineRing[u32, HISTORY]
     output: InlineRing[f32, HISTORY]
-    peak: u32
+    /** LEVEL: the magnitude of the latest received sample (not a held peak). */
+    level: u32
 
 controller(hz: u64 = 12000000) -> Controller
     require hz >= RATE && hz <= 1000000000, "valid digital audio clock"
@@ -40,26 +41,49 @@ feed(c: *Controller, samples: []const f32)
         val signed = int(min(8388607.0, real(clipped) * 8388608.0))
         c.input.overwrite(u32(signed) << 8)
 
-/** One rational guest clock drives playback and capture, independent of UI frame size. */
+/** One rational guest clock drives playback and capture, independent of UI frame size and of
+ * how long the host waited between calls: every elapsed sample period is applied to the guest's
+ * FIFOs, flags and level, however many there are. Only the host-side history rings are bounded,
+ * and they keep the newest `HISTORY` frames.
+ */
 advance(c: *Controller, time: u64)
     if time <= c.time then return
-    val elapsed = time - c.time
-    val ticks = elapsed * RATE + c.phase
-    val count = min(ticks / c.hz, u64(HISTORY))
+    val ticks = (time - c.time) * RATE + c.phase
+    val count = ticks / c.hz
     c.phase = ticks % c.hz
     c.time = time
-    for i in 0..<count
-        var value: u32 = 0
-        if (c.ctrl & 1) != 0
-            c.tx.pop_front() match
-                Some(word) -> value = word
-                None -> c.flags |= 4
-        c.output.overwrite(f32(real(int(value & 0xFFFFFF00)) / 2147483648.0))
-        val input = c.input.pop_front().unwrap_or(0)
-        if (c.ctrl & 2) == 0 then continue
-        val signed = int(input)
-        c.peak = u32(if signed < 0 then -long(signed) else long(signed))
-        if !c.rx.push_back(input) then c.flags |= 8
+    var done: u64 = 0
+    while done < count
+        if c.tx.is_empty() && c.input.is_empty()
+            idle(c, count - done)
+            return
+        period(c)
+        done += 1
+
+private receive(c: *Controller, input: u32)
+    val signed = int(input)
+    c.level = u32(if signed < 0 then -long(signed) else long(signed))
+    if !c.rx.push_back(input) then c.flags |= 8
+
+private period(c: *Controller)
+    var value: u32 = 0
+    if (c.ctrl & 1) != 0
+        c.tx.pop_front() match
+            Some(word) -> value = word
+            None -> c.flags |= 4
+    c.output.overwrite(f32(real(int(value & 0xFFFFFF00)) / 2147483648.0))
+    val input = c.input.pop_front().unwrap_or(0)
+    if (c.ctrl & 2) != 0 then receive(c, input)
+
+/** `n` periods with nothing queued in either direction, in closed form: every one transmits and
+ * receives silence, so the result is the same as `n` calls of `period` at a bounded cost.
+ */
+private idle(c: *Controller, n: u64)
+    if (c.ctrl & 1) != 0 then c.flags |= 4
+    for i in 0..<min(n, u64(HISTORY)) do c.output.overwrite(0.0)
+    if (c.ctrl & 2) == 0 then return
+    c.level = 0
+    for i in 0..<min(n, u64(FIFO - c.rx.len()) + 1) do receive(c, 0)
 
 read(c: *Controller, offset: u32) -> Option[u32] = offset match
     0 -> Some(c.ctrl)
@@ -73,7 +97,7 @@ read(c: *Controller, offset: u32) -> Option[u32] = offset match
     16 -> Some(u32(RATE))
     20 -> Some(u32(FIFO - c.tx.len()))
     24 -> Some(u32(c.rx.len()))
-    28 -> Some(c.peak)
+    28 -> Some(c.level)
     _ -> None
 
 write(c: *Controller, offset: u32, value: u32) -> bool
