@@ -403,9 +403,12 @@ BOOTRAM is 1 KB, WRITE_ONCE0/1 and BOOTLOCK0-7 with BOOTLOCK_STAT. The new block
   CFGRESET and the lock being per core are assumptions from the register descriptions, since the SDK headers
   do not state them.
 - **CLOCKS FC0**: a write of FC0_SRC measures at once. RESULT = source Hz x FC0_REF_KHZ x 32 / clk_ref Hz
-  (kHz with 5 fractional bits); PASS/FAIL/SLOW/FAST compare the whole kHz with MIN and MAX; a stopped
-  source, a stopped clk_ref or a source with no model (GPIN0/1, OTP's clock, the DFT tap) leaves WAITING
-  set for ever, as a dead clock does on silicon, so a poll for DONE spins. clk_peri, clk_usb, clk_adc and
+  (kHz with 5 fractional bits); PASS/FAIL/SLOW/FAST compare the whole kHz with MIN and MAX. A stopped
+  source or a stopped clk_ref finishes at once with DONE, DIED and FAIL (SLOW too where MIN_KHZ is above
+  0) and a RESULT of 0, rather than WAITING for ever: that is an assumption, since the headers only say
+  DIED is "test clock stopped during test". A source with no model (GPIN0/1, OTP's clock, the DFT tap, a
+  value past 0x10) is refused at the FC0_SRC write by name, `CLOCKS FC0_SRC = 6 is not modelled: ...`, and
+  FC0_SRC keeps its old value. clk_peri, clk_usb, clk_adc and
   clk_hstx are computed from AUXSRC, DIV and ENABLE/KILL.
 
 `examples/pico2/clock_report.c` prints `clock_get_hz` against `frequency_count_khz` for the six

@@ -1,6 +1,7 @@
 module sh.sysl.benchtop.chip
 @tests
 
+import sh.sysl.benchtop.riscv as rv
 import sh.sysl.rp2350.accessctrl as ac
 import sh.sysl.rp2350.clocks as clk
 import sh.sysl.rp2350.powman as pm
@@ -15,10 +16,13 @@ import sysl.text.from_utf8_lossy
 // The start-up register blocks on the chip's bus: PSM, ROSC, SYSINFO, SYSCFG, POWMAN, ACCESSCTRL and
 // CLOCKS' frequency counter, with what they do to the cores and the clock tree.
 
+private val BLINK_RV = embed("../../../../examples/pico2-riscv/blink.elf")
 private val HELLO = embed("../../../../examples/pico2/hello_serial.elf")
 private val SRAM = SramMap(0x20000000, 520 * 1024)
 
 private const PW: u32 = 0x5AFE0000
+// FC0_STATUS of a counter whose source never ran: DONE, DIED and FAIL.
+private const DEAD: u32 = 0x10010010
 
 // Thumb halfwords into SRAM at `at`.
 private place(b: &ArmBoard, at: u32, code: []const u16)
@@ -144,7 +148,7 @@ chip_fc0_measures_the_tree()
     wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_CLK_SYS)
     assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x11 && rd(&c, fc + clk.FC0_RESULT_OFFSET) == 11000 * 32, "clk_sys is the ring")
     wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_XOSC_CLKSRC)
-    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x1000, "the crystal is off")
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == DEAD, "the crystal is off: DONE, DIED, FAIL")
     // Start the crystal (STARTUP.DELAY 1, ENABLE), let it settle, and count it against the ring.
     wr(&c, xr.BASE + xr.STARTUP_OFFSET, 1)
     wr(&c, xr.BASE + xr.CTRL_OFFSET, xr.CTRL_ENABLE_ENABLE << xr.CTRL_ENABLE_SHIFT)
@@ -224,3 +228,64 @@ arm_clock_report()
         s"rosc_random ${hex(bits, 8)}\r\nvreg vsel 11\r\ndone\r\n"
     assert(text == expected, text)
     assert(b.chip.powman.vreg_vsel() == 11 && b.chip.powman.unlocked(), "vreg_set_voltage unlocked the regulator")
+
+@test("FC0_SRC naming a source the model cannot count is refused by name and leaves the counter as it was; a dead modelled clock finishes DIED")
+chip_fc0_unmodelled_sources()
+    var c = rp2350()
+    val fc = clk.BASE
+    wr(&c, fc + clk.FC0_REF_KHZ_OFFSET, 11000)
+    wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_ROSC_CLKSRC)
+    val result = rd(&c, fc + clk.FC0_RESULT_OFFSET)
+    assert(result == 11000 * 32 && rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x11)
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, clk.FC0_SRC_FC0_SRC_CLKSRC_GPIN0).unwrap_err() == "CLOCKS FC0_SRC = 6 is not modelled: clksrc_gpin0 has no pin driving it")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, clk.FC0_SRC_FC0_SRC_CLKSRC_GPIN1).unwrap_err() == "CLOCKS FC0_SRC = 7 is not modelled: clksrc_gpin1 has no pin driving it")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, clk.FC0_SRC_FC0_SRC_OTP_CLK2FC).unwrap_err() == "CLOCKS FC0_SRC = 15 is not modelled: otp_clk2fc: OTP is not modelled")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, clk.FC0_SRC_FC0_SRC_PLL_USB_CLKSRC_PRIMARY_DFT).unwrap_err() == "CLOCKS FC0_SRC = 16 is not modelled: pll_usb_clksrc_primary_dft is a test tap")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, 0x11).unwrap_err() == "CLOCKS FC0_SRC = 17 is not modelled: it is not a source")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET + 0x2000, 4, 0x80).unwrap_err() == "CLOCKS FC0_SRC = 131 is not modelled: it is not a source", "through an alias too")
+    assert(rd(&c, fc + clk.FC0_SRC_OFFSET) == clk.FC0_SRC_FC0_SRC_ROSC_CLKSRC && rd(&c, fc + clk.FC0_RESULT_OFFSET) == result, "the counter is untouched")
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x11)
+    // NULL and the last real source are accepted.
+    wr(&c, fc + clk.FC0_SRC_OFFSET, 0)
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0)
+    // A modelled clock that is stopped (the crystal, never started) is a finished count, not a hang.
+    wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_XOSC_CLKSRC)
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == DEAD && rd(&c, fc + clk.FC0_RESULT_OFFSET) == 0)
+
+// Hazard3 instruction words into SRAM at `at`, for a hart to run next from there.
+private put(b: &RiscvBoard, at: u32, code: []const u32)
+    for i in 0..<code.len
+        for j in 0..<4 do b.sram.set(usize(at - 0x20000000) + 4 * i + usize(j), u8.wrap(code[i] >> (8 * u32(j))))
+
+@test("on the RISC-V board too, FRCE_OFF on PROC1 stops hart 1, its release answers hart 0 with a 0, and hart 1 launches again")
+riscv_core1_reset_and_relaunch()
+    val b = riscv_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(BLINK_RV).unwrap()
+    // Hart 1 first spins (j .); after the reset its second image sets a0 and stops. Hart 0: wfi; j .
+    put(b, 0x20070000, [0x0000006F])
+    put(b, 0x20070200, [0x02A00513, 0x00100073])
+    put(b, 0x20070100, [0x10500073, 0x0000006F])
+    b.harts[0].pc = 0x20070100
+    rv.forget_code(&b.harts[0])
+    val fifo_wr = sio_reg.BASE + sio_reg.FIFO_WR_OFFSET
+    val fifo_rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
+    val fifo_st = sio_reg.BASE + sio_reg.FIFO_ST_OFFSET
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070000]
+        b.chip.write(0, fifo_wr, 4, x).unwrap()
+        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x)
+    b.run(20000)
+    assert(b.started[1], "hart 1 runs its spin")
+    b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x2000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    b.chip.write(0, fifo_wr, 4, 0x1234).unwrap()
+    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "no echo while held")
+    b.run(1000)
+    assert(!b.started[1], "hart 1 is stopped")
+    b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x3000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    assert(b.chip.read(0, fifo_rd, 4).unwrap() == 0 && b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "exactly one 0")
+    b.run(1000)
+    assert(!b.started[1], "back in the boot ROM")
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070200]
+        b.chip.write(0, fifo_wr, 4, x).unwrap()
+        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x, "the ROM answers the launch again")
+    assert(b.run(100000) == RunEnd.Breakpoint, b.refused)
+    assert(b.started[1] && b.harts[1].r[10] == 42, "the second image ran on hart 1")
