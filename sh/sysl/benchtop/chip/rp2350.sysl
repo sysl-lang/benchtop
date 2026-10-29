@@ -2,17 +2,23 @@ module sh.sysl.benchtop.chip
 
 import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Resets}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
-import sh.sysl.benchtop.peripheral.rp2350.{BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, Pads, Pin, Pll, Sio, Sources, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xosc}
+import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, Pads, Pin, Pll, Powman, Psm, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xosc, psm_stage_name}
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.rp2350.accessctrl as accessctrl_reg
 import sh.sysl.rp2350.bootram as bootram_reg
 import sh.sysl.rp2350.clocks as clocks_reg
 import sh.sysl.rp2350.io_bank0 as io_reg
 import sh.sysl.rp2350.pads_bank0 as pads_reg
 import sh.sysl.rp2350.pll_sys as pll_sys_reg
 import sh.sysl.rp2350.pll_usb as pll_usb_reg
+import sh.sysl.rp2350.powman as powman_reg
+import sh.sysl.rp2350.psm as psm_reg
 import sh.sysl.rp2350.resets as resets_reg
+import sh.sysl.rp2350.rosc as rosc_reg
 import sh.sysl.rp2350.sio as sio_reg
+import sh.sysl.rp2350.syscfg as syscfg_reg
+import sh.sysl.rp2350.sysinfo as sysinfo_reg
 import sh.sysl.rp2350.ticks as ticks_reg
 import sh.sysl.rp2350.timer0 as timer0_reg
 import sh.sysl.rp2350.timer1 as timer1_reg
@@ -50,6 +56,8 @@ const LPOSC_HZ: u64 = 32768
 const TIMER0_IRQ_0: u32 = 0
 const TIMER1_IRQ_0: u32 = 4
 const SIO_IRQ_FIFO: u32 = 25
+const POWMAN_IRQ_POW: u32 = 44
+const POWMAN_IRQ_TIMER: u32 = 45
 const UART0_IRQ: u32 = 33
 const UART1_IRQ: u32 = 34
 
@@ -74,6 +82,12 @@ enum Block
     Sio
     BootRam
     UsbCtrl
+    Psm
+    Rosc
+    SysInfo
+    SysCfg
+    Powman
+    AccessCtrl
 
 /** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
 struct Placed
@@ -83,7 +97,7 @@ struct Placed
     reset: u32
 
 /** Every block the chip runs, with the SVD's base addresses. */
-val BLOCKS: [16]Placed = [
+val BLOCKS: [22]Placed = [
     Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
     Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -102,6 +116,12 @@ val BLOCKS: [16]Placed = [
     // Not gated by RESETS: the SDK reads SIE_CTRL before it releases USBCTRL
     // (`runtime_init_usb_power_down`), and benchtop answers it as the block's power-on state.
     Placed(Block.UsbCtrl, usb_reg.BASE, "USBCTRL", 0),
+    Placed(Block.Psm, psm_reg.BASE, "PSM", 0),
+    Placed(Block.Rosc, rosc_reg.BASE, "ROSC", 0),
+    Placed(Block.SysInfo, sysinfo_reg.BASE, "SYSINFO", 0),
+    Placed(Block.SysCfg, syscfg_reg.BASE, "SYSCFG", 0),
+    Placed(Block.Powman, powman_reg.BASE, "POWMAN", 0),
+    Placed(Block.AccessCtrl, accessctrl_reg.BASE, "ACCESSCTRL", 0),
 ]
 
 /** The block whose window holds `a`, with the offset into it. */
@@ -138,13 +158,22 @@ struct Rp2350
     uarts: [2]Uart
     bootram: BootRam
     usb: UsbCtrl
+    psm: Psm
+    rosc: Rosc
+    sysinfo: SysInfo
+    syscfg: SysCfg
+    powman: Powman
+    accessctrl: AccessCtrl
     rom: RomWait
     rcp: Rcp
-    // clk_sys cycles since power-on, and the remainders carried into the next clk_ref and crystal
-    // cycle.
+    // Core 1 has been put in reset by PSM since the board last asked (`take_core1_reset`).
+    core1_reset: bool
+    // clk_sys cycles since power-on, and the remainders carried into the next clk_ref, crystal and
+    // ring-oscillator cycle.
     now: u64
     ref_rest: u64
     xosc_rest: u64
+    rosc_rest: u64
 
     /** Power-on, with core 1 in the boot ROM. */
     reset(*self)
@@ -154,7 +183,7 @@ struct Rp2350
     /** What each clock source runs at now; the PLLs take the crystal as their reference. */
     sources(self) -> Sources
         val xosc = if self.xosc.stable() then XOSC_HZ else 0
-        Sources(ROSC_HZ, xosc, LPOSC_HZ, self.pll_sys.hz(xosc), self.pll_usb.hz(xosc))
+        Sources(self.rosc.hz(ROSC_HZ), xosc, LPOSC_HZ, self.pll_sys.hz(xosc), self.pll_usb.hz(xosc))
 
     sys_hz(self) -> u64 = self.clocks.sys_hz(self.sources())
     ref_hz(self) -> u64 = self.clocks.ref_hz(self.sources())
@@ -172,6 +201,10 @@ struct Rp2350
             self.xosc_rest += cycles * XOSC_HZ
             self.xosc.advance(self.xosc_rest / sys)
             self.xosc_rest %= sys
+        if self.rosc.running()
+            self.rosc_rest += cycles * ROSC_HZ
+            self.rosc.advance(self.rosc_rest / sys)
+            self.rosc_rest %= sys
         val made = self.ticks.advance(ref_cycles)
         for i in 0..<2
             val t = &self.timers[i]
@@ -225,6 +258,12 @@ struct Rp2350
             Sio -> self.sio.read(core, o, width, self.inputs())
             BootRam -> self.bootram.read(o, width)
             UsbCtrl -> self.usb.read(o, width)
+            Psm -> self.psm.read(o, width)
+            Rosc -> self.rosc.read(o, width)
+            SysInfo -> self.sysinfo.read(o, width)
+            SysCfg -> self.syscfg.read(o, width)
+            Powman -> self.powman.read(o, width)
+            AccessCtrl -> self.accessctrl.read(o, width)
         got.map_err(e -> refusal(p, o, e))
 
     /** A write of `width` bytes at `a` by core `core`, or why the chip refuses it. */
@@ -238,7 +277,11 @@ struct Rp2350
                 // Every released block is ready at once.
                 self.resets.complete(~self.resets.held)
                 r
-            Clocks -> self.clocks.write(o, width, x)
+            Clocks ->
+                val r = self.clocks.write(o, width, x)
+                // Writing FC0_SRC starts frequency counter 0 on the tree as it stands.
+                if o & 0xFFC == clocks_reg.FC0_SRC_OFFSET then self.clocks.measure(self.sources())
+                r
             Xosc -> self.xosc.write(o, width, x)
             PllSys -> self.pll_sys.write(o, width, x)
             PllUsb -> self.pll_usb.write(o, width, x)
@@ -256,7 +299,43 @@ struct Rp2350
                 r
             BootRam -> self.bootram.write(o, width, x)
             UsbCtrl -> self.usb.write(o, width, x)
+            Psm ->
+                // Only PROC1 can be held in reset: the stages of the chip's own start-up have no state
+                // to lose here, and holding PROC0 would stop the core that is writing.
+                val before = self.psm
+                val r = self.psm.write(o, width, x)
+                val newly = self.psm.off & ~before.off
+                if newly & ~psm_reg.FRCE_OFF_PROC1_MASK != 0
+                    self.psm = before
+                    return Err(s"PSM FRCE_OFF of ${psm_stage_name(newly & ~psm_reg.FRCE_OFF_PROC1_MASK)} is not modelled: only PROC1 can be forced off")
+                self.core1_held(before.held(), self.psm.held())
+                r
+            Rosc -> self.rosc.write(o, width, x)
+            SysInfo -> self.sysinfo.write(o, width, x)
+            SysCfg -> self.syscfg.write(o, width, x)
+            Powman -> self.powman.write(o, width, x)
+            AccessCtrl -> self.accessctrl.write(core, o, width, x)
         got.map_err(e -> refusal(p, o, e))
+
+    // PROC1 has gone into reset or come out of it, between the stages held `before` and `after`. Going
+    // in stops the core (the board takes it from `take_core1_reset`); coming out puts it back in the boot
+    // ROM, which drains its FIFO, answers core 0 with a 0 and waits for the launch sequence.
+    private core1_held(*self, before: u32, after: u32)
+        val bit = psm_reg.FRCE_OFF_PROC1_MASK
+        if before & bit == 0 && after & bit != 0
+            // Held, core 1 runs no ROM code: words core 0 sends sit in its FIFO unanswered.
+            self.core1_reset = true
+            self.rom = RomWait(false, 0, [0; 3], None)
+        elif before & bit != 0 && after & bit == 0
+            self.rom = RomWait(true, 0, [0; 3], None)
+            while !self.sio.fifos[1].empty() do self.sio.fifos[1].pop()
+            self.sio.fifos[0].push(0)
+
+    /** Whether PSM has put core 1 in reset since the last call; the board stops the core. */
+    take_core1_reset(*self) -> bool
+        val held = self.core1_reset
+        self.core1_reset = false
+        held
 
     // The block an access lands in, refused where none is there, or where RESETS holds it: on silicon
     // that access hangs the bus.
@@ -345,6 +424,8 @@ struct Rp2350
             val lines = self.timers[i].irqs()
             for j in 0u32..<4 do p.interrupt(TIMER0_IRQ_0 + 4 * i + j, lines & (1 << j) != 0)
         p.interrupt(SIO_IRQ_FIFO, self.sio.fifo_irq(k))
+        p.interrupt(POWMAN_IRQ_POW, self.powman.irq_pow())
+        p.interrupt(POWMAN_IRQ_TIMER, self.powman.irq_timer())
         p.interrupt(UART0_IRQ, self.uarts[0].irq())
         p.interrupt(UART1_IRQ, self.uarts[1].irq())
         p.machine_timer(self.sio.software_irq(k), self.sio.timer_irq(k))
@@ -353,7 +434,9 @@ end Rp2350
 /** The chip at power-on, with core 1 in the boot ROM. */
 rp2350() -> Rp2350 =
     Rp2350(rp.rp2350_resets(), rp.clocks(), rp.xosc(), rp.pll(), rp.pll(), rp.ticks(), [rp.timer(), rp.timer()], rp.watchdog(),
-        rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.bootram(), rp.usb_ctrl(), RomWait(true, 0, [0; 3], None), rcp(), 0, 0, 0)
+        rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.bootram(), rp.usb_ctrl(),
+        rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(),
+        RomWait(true, 0, [0; 3], None), rcp(), false, 0, 0, 0, 0)
 
 private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
     Some(x) -> b match

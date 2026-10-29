@@ -9,7 +9,7 @@ project(benchtop_pico2 C CXX ASM)
 
 pico_sdk_init()
 
-foreach(prog hello_serial blink)
+foreach(prog hello_serial blink clock_report)
     add_executable(${prog} ${prog}.c)
     target_link_libraries(${prog} pico_stdlib)
     # A RAM image: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.

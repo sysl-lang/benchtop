@@ -9,6 +9,6 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cmake -S . -B "$work" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$work"
-for prog in hello_serial blink; do
+for prog in hello_serial blink clock_report; do
     cp "$work/$prog.elf" "$prog.elf"
 done

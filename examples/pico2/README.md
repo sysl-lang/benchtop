@@ -7,6 +7,7 @@ Two unmodified Pico SDK programs that the `pico2` board runs on its Cortex-M33s,
 |---|---|---|
 | `hello_serial.c` | `stdio_init_all()` on UART0, then `hello, serial N` every 100 ms | the bytes UART0 sends, a line every 100 ms of guest time |
 | `blink.c` | GPIO 25 (the LED) toggled every 250 ms with `sleep_ms` | GPIO 25's level, an edge every 250 ms of guest time |
+| `clock_report.c` | `clock_get_hz` and `frequency_count_khz` for each clock, SYSINFO's chip id, PSM DONE, 32 ROSC random bits, the regulator | every line printed over UART0 (`chip/startup_tests.sysl`) |
 
 ```sh
 ./benchtop run --board pico2 examples/pico2/hello_serial.elf

@@ -19,19 +19,40 @@ struct Sources
     pll_sys: u64
     pll_usb: u64
 
+// A generator's CTRL.ENABLE and CTRL.KILL, in the same place in every one.
+private const GENERATOR_ENABLE: u32 = 0x800
+private const GENERATOR_KILL: u32 = 0x400
+
+// The frequency counter's MIN and MAX are 25 bits of kHz; its STATUS bits are the datasheet's (FC0_STATUS).
+private const FC0_KHZ_MASK: u32 = 0x1FFFFFF
+private const FC0_PASS: u32 = 0x1
+private const FC0_DONE: u32 = 0x10
+private const FC0_WAITING: u32 = 0x1000
+private const FC0_FAIL: u32 = 0x10000
+private const FC0_SLOW: u32 = 0x100000
+private const FC0_FAST: u32 = 0x1000000
+
 // CLOCKS is a file of words, from CLK_GPOUT0_CTRL to INTS.
 private const CLOCK_WORDS: usize = usize(reg.INTS_OFFSET / 4 + 1)
 
 /** CLOCKS: every generator's CTRL and DIV, stored as written. CLK_REF and CLK_SYS have glitchless
  * muxes, and their SELECTED reads one-hot the source CTRL names; every other generator's SELECTED
- * reads 1, as the datasheet says of a generator without one. The frequency counter and the
- * resus are stored, not run.
+ * reads 1, as the datasheet says of a generator without one. Frequency counter 0 runs (`measure`);
+ * the resus is stored.
  */
 struct Clocks
     words: [CLOCK_WORDS]u32
+    // Frequency counter 0's STATUS and RESULT, as the last write of FC0_SRC left them.
+    fc_status: u32
+    fc_result: u32
 
     reset(*self)
         for i in 0..<CLOCK_WORDS do self.words[i] = 0
+        self.fc_status = 0
+        self.fc_result = 0
+        self.words[usize(reg.FC0_MAX_KHZ_OFFSET / 4)] = FC0_KHZ_MASK
+        self.words[usize(reg.FC0_DELAY_OFFSET / 4)] = 1
+        self.words[usize(reg.FC0_INTERVAL_OFFSET / 4)] = 8
         // Each DIV powers up dividing by one.
         for div in [reg.CLK_GPOUT0_DIV_OFFSET, reg.CLK_GPOUT1_DIV_OFFSET, reg.CLK_GPOUT2_DIV_OFFSET, reg.CLK_GPOUT3_DIV_OFFSET,
                 reg.CLK_REF_DIV_OFFSET, reg.CLK_SYS_DIV_OFFSET, reg.CLK_PERI_DIV_OFFSET, reg.CLK_HSTX_DIV_OFFSET,
@@ -68,11 +89,107 @@ struct Clocks
         if whole == 0 then whole = 65536
         (source << 16) / ((whole << 16) + u64(div & reg.CLK_SYS_DIV_FRAC_MASK))
 
+    // A generator with no glitchless mux (clk_peri, clk_usb, clk_adc, clk_hstx): `source` over the
+    // integer part of DIV, which has `int_bits` bits and divides by 2^int_bits where it holds 0. It
+    // runs while ENABLE is set and KILL is not.
+    private gated_hz(self, ctrl_offset: u32, div_offset: u32, source: u64, int_bits: u32) -> u64
+        val ctrl = self.word(ctrl_offset)
+        if ctrl & GENERATOR_ENABLE == 0 || ctrl & GENERATOR_KILL != 0 then return 0
+        val span: u32 = 1 << int_bits
+        var whole = (self.word(div_offset) >> reg.CLK_SYS_DIV_INT_SHIFT) & (span - 1)
+        if whole == 0 then whole = span
+        source / u64(whole)
+
+    // AUXSRC, bits 7:5 of a generator's CTRL.
+    private aux(self, ctrl_offset: u32) -> u32 = (self.word(ctrl_offset) >> 5) & 7
+
+    /** clk_peri's frequency from `s`: clk_sys, a PLL, the ring or the crystal over a divisor of 1 to 4. */
+    peri_hz(self, s: Sources) -> u64
+        val source = self.aux(reg.CLK_PERI_CTRL_OFFSET) match
+            0 -> self.sys_hz(s)
+            1 -> s.pll_sys
+            2 -> s.pll_usb
+            3 -> s.rosc
+            4 -> s.xosc
+            _ -> 0
+        self.gated_hz(reg.CLK_PERI_CTRL_OFFSET, reg.CLK_PERI_DIV_OFFSET, source, 2)
+
+    /** clk_usb's frequency from `s`: a PLL, the ring or the crystal over a divisor of 1 to 16. */
+    usb_hz(self, s: Sources) -> u64
+        self.gated_hz(reg.CLK_USB_CTRL_OFFSET, reg.CLK_USB_DIV_OFFSET, self.usb_adc_source(reg.CLK_USB_CTRL_OFFSET, s), 4)
+
+    /** clk_adc's frequency from `s`; its mux is clk_usb's. */
+    adc_hz(self, s: Sources) -> u64
+        self.gated_hz(reg.CLK_ADC_CTRL_OFFSET, reg.CLK_ADC_DIV_OFFSET, self.usb_adc_source(reg.CLK_ADC_CTRL_OFFSET, s), 4)
+
+    private usb_adc_source(self, ctrl_offset: u32, s: Sources) -> u64 = self.aux(ctrl_offset) match
+        0 -> s.pll_usb
+        1 -> s.pll_sys
+        2 -> s.rosc
+        3 -> s.xosc
+        _ -> 0
+
+    /** clk_hstx's frequency from `s`: clk_sys or a PLL over a divisor of 1 to 4. */
+    hstx_hz(self, s: Sources) -> u64
+        val source = self.aux(reg.CLK_HSTX_CTRL_OFFSET) match
+            0 -> self.sys_hz(s)
+            1 -> s.pll_sys
+            2 -> s.pll_usb
+            _ -> 0
+        self.gated_hz(reg.CLK_HSTX_CTRL_OFFSET, reg.CLK_HSTX_DIV_OFFSET, source, 2)
+
+    // The frequency in Hz of frequency counter 0's source `src`, 0 for a clock that is stopped, a pin no
+    // one drives (GPIN0 and GPIN1) or a source benchtop does not model (OTP's).
+    private fc_source_hz(self, src: u32, s: Sources) -> u64 = src match
+        reg.FC0_SRC_FC0_SRC_PLL_SYS_CLKSRC_PRIMARY -> s.pll_sys
+        reg.FC0_SRC_FC0_SRC_PLL_USB_CLKSRC_PRIMARY -> s.pll_usb
+        reg.FC0_SRC_FC0_SRC_ROSC_CLKSRC | reg.FC0_SRC_FC0_SRC_ROSC_CLKSRC_PH -> s.rosc
+        reg.FC0_SRC_FC0_SRC_XOSC_CLKSRC -> s.xosc
+        reg.FC0_SRC_FC0_SRC_CLK_REF -> self.ref_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_SYS -> self.sys_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_PERI -> self.peri_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_USB -> self.usb_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_ADC -> self.adc_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_HSTX -> self.hstx_hz(s)
+        reg.FC0_SRC_FC0_SRC_LPOSC_CLKSRC -> s.lposc
+        _ -> 0
+
+    /** A write of FC0_SRC has started frequency counter 0, which measures its source against clk_ref
+     * and finishes at once. RESULT is the source's frequency over clk_ref's, times FC0_REF_KHZ, in
+     * kHz with five fractional bits: the source is exact, so a FC0_REF_KHZ that is not clk_ref's own
+     * scales the answer as it would on silicon, and one left at 0 reads 0. PASS holds where the whole
+     * kHz lies in MIN_KHZ..MAX_KHZ, else FAIL, with SLOW or FAST for the side it missed on. A source
+     * that has no clock (stopped, or clk_ref itself stopped) leaves the counter WAITING for ever, as
+     * it does on silicon, which makes a poll for DONE spin. A source of 0 (NULL) stops the counter.
+     */
+    measure(*self, s: Sources)
+        self.fc_result = 0
+        self.fc_status = 0
+        val src = self.word(reg.FC0_SRC_OFFSET) & reg.FC0_SRC_FC0_SRC_MASK
+        if src == reg.FC0_SRC_FC0_SRC_NULL then return
+        val tested = self.fc_source_hz(src, s)
+        val reference = self.ref_hz(s)
+        if tested == 0 || reference == 0
+            self.fc_status = FC0_WAITING
+            return
+        val fixed = tested * u64(self.word(reg.FC0_REF_KHZ_OFFSET)) * 32 / reference
+        self.fc_result = u32(fixed & 0x3FFFFFFF)
+        val khz = u32((fixed >> 5) & 0x1FFFFFF)
+        val slow = khz < self.word(reg.FC0_MIN_KHZ_OFFSET)
+        val fast = khz > self.word(reg.FC0_MAX_KHZ_OFFSET)
+        var status = FC0_DONE
+        if slow then status |= FC0_SLOW
+        if fast then status |= FC0_FAST
+        status |= if slow || fast then FC0_FAIL else FC0_PASS
+        self.fc_status = status
+
     read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
         access(offset, width, true)?
         val address = offset & 0xFFC
         if address > reg.INTS_OFFSET then return Err(AccessError.Unmapped)
         val value = address match
+            reg.FC0_STATUS_OFFSET -> self.fc_status
+            reg.FC0_RESULT_OFFSET -> self.fc_result
             reg.CLK_REF_SELECTED_OFFSET -> 1 << (self.word(reg.CLK_REF_CTRL_OFFSET) & reg.CLK_REF_CTRL_SRC_MASK)
             reg.CLK_SYS_SELECTED_OFFSET -> 1 << (self.word(reg.CLK_SYS_CTRL_OFFSET) & reg.CLK_SYS_CTRL_SRC_MASK)
             reg.CLK_GPOUT0_SELECTED_OFFSET | reg.CLK_GPOUT1_SELECTED_OFFSET | reg.CLK_GPOUT2_SELECTED_OFFSET | reg.CLK_GPOUT3_SELECTED_OFFSET -> 1
@@ -85,7 +202,16 @@ struct Clocks
         val address = offset & 0xFFC
         if address > reg.INTS_OFFSET then return Err(AccessError.Unmapped)
         val i = usize(address / 4)
-        self.words[i] = written(self.words[i], offset, replicated(value, width))
+        // The counter's two result registers are read-only.
+        if address == reg.FC0_STATUS_OFFSET || address == reg.FC0_RESULT_OFFSET then return Ok(())
+        val next = written(self.words[i], offset, replicated(value, width))
+        self.words[i] = address match
+            reg.FC0_REF_KHZ_OFFSET -> next & 0xFFFFF
+            reg.FC0_MIN_KHZ_OFFSET | reg.FC0_MAX_KHZ_OFFSET -> next & FC0_KHZ_MASK
+            reg.FC0_DELAY_OFFSET -> next & 7
+            reg.FC0_INTERVAL_OFFSET -> next & 0xF
+            reg.FC0_SRC_OFFSET -> next & reg.FC0_SRC_FC0_SRC_MASK
+            _ -> next
         Ok(())
 end Clocks
 
