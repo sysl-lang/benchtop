@@ -1,6 +1,7 @@
 module sh.sysl.benchtop.virt
 
 import sh.sysl.benchtop.{Board, Target}
+import sh.sysl.benchtop.peripheral.Model
 import sh.sysl.benchtop.peripheral.spi as spi
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.benchtop.v6m.{Cpu, Stop, IRQ0, halt, raise, could_wake, lower_limit}
@@ -9,7 +10,7 @@ import sysl.threads.Mutex
 
 /** The PL022 (`pl022`): whether the bus has it, the IRQ it raises (-1 for none) and the GPIOs its
  * SCK, TX and RX are routed to, which the board fixes; the pads it drives, which `mask` selects and
- * `output` sets, published for lock-free readers; and the controller.
+ * `output` sets, published for lock-free readers; and the controller, wired to the pads.
  *
  * The controller's lock is also the one the panel GPIO's writes take, so a guest's CS, DC and OE
  * changes and the serial edges around them stay in order.
@@ -23,20 +24,15 @@ struct SpiState
     mask: u32
     output: u32
     serial: Mutex[spi.Controller]
-    enabled_pins: &sync Fn(bool,bool,u64) -> bool
-    disabled_pins: &sync Fn(bool,bool,u64) -> bool
 
 /** No PL022 on the bus. */
-spi_state() -> SpiState = SpiState(false, -1, -1, -1, -1, 0, 0, Mutex.new(spi.controller()), no_pins, no_pins)
+spi_state() -> SpiState = SpiState(false, -1, -1, -1, -1, 0, 0, Mutex.new(spi.controller()))
 
-private val no_pins: &sync Fn(bool,bool,u64) -> bool = (sck,mosi,time) -> false
-
-/** Wire the controller's pins to the machine's: its pads and the panel's RX level, as enabled or
- * disabled. Called once the devices are in place, since the pins hold their address.
+/** Wire the controller's pins to the machine's: its pads and the panel's RX level. Called once the
+ * devices are in place, since the pins hold their address.
  */
 private[virt] connect_spi(ds: *Devices)
-    ds.spi.enabled_pins = (sck,mosi,time) -> spi_drive(ds,true,sck,mosi,time)
-    ds.spi.disabled_pins = (sck,mosi,time) -> spi_drive(ds,false,sck,mosi,time)
+    ds.spi.serial.with(c -> c.pins = (enabled,sck,mosi,time) -> spi_drive(ds,enabled,sck,mosi,time))
 
 /** Select a board-routed signal, or the sole permitted pin in a simple MCU. */
 private spi_pin(b: Board, name: string, signal: string) -> int
@@ -66,7 +62,7 @@ private[virt] check_spi(b: Board) -> Result[SpiState,string]
     Ok(s)
 
 private[virt] boot_spi(s: *SpiState)
-    s.serial.with(c -> spi.reset(c))
+    s.serial.with(c -> c.reset())
     atomic_store(&s.mask,0,Relaxed)
     atomic_store(&s.output,0,Relaxed)
 
@@ -85,30 +81,31 @@ private spi_drive(ds: *Devices, enabled: bool, sck: bool, mosi: bool, time: u64)
 
 /** Under the controller's lock, which the panel GPIO's accesses take too. */
 private[virt] bring_spi(s: *SpiState, c: *spi.Controller, time: u64)
-    if s.present then spi.advance(c,time,if spi.enabled(*c) then s.enabled_pins else s.disabled_pins)
+    if s.present then c.advance(time)
 
 private[virt] spi_due(s: *SpiState) -> u64
     if !s.present then return NEVER
-    s.serial.with(c -> spi.due(*c).unwrap_or(NEVER))
+    s.serial.with(c -> c.due())
 
 private[virt] spi_wake(s: *SpiState, cpu: *Cpu) -> u64
     if !s.present || s.irq < 0 || !could_wake(cpu,IRQ0 + u32(s.irq)) then return NEVER
-    s.serial.with(c -> if c.mask != 0 then spi.due(*c).unwrap_or(NEVER) else NEVER)
+    s.serial.with(c -> if c.mask != 0 then c.due() else NEVER)
 
 private[virt] signal_spi(s: *SpiState, cpu: *Cpu)
     if !s.present then return
     val irq = s.irq
     s.serial.with(c ->
         bring_spi(s,c,board_time(cpu,cpu.retired))
-        if irq >= 0 && spi.irq(*c) then raise(cpu,u32(irq)))
+        if irq >= 0 && c.irq() then raise(cpu,u32(irq)))
 
 private[virt] spi_read(s: *SpiState, cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if (width != 2 && width != 4) || (offset & (width - 1)) != 0 || (offset & 3) != 0
         halt(cpu,Stop.Fault,address)
         return 0
     s.serial.with(c ->
-        bring_spi(s,c,board_time(cpu,n))
-        spi.read(c,offset)) match
+        val time = board_time(cpu,n)
+        bring_spi(s,c,time)
+        c.read(offset,width,time)) match
         Some(value) -> value
         None ->
             halt(cpu,Stop.Unmapped,address)
@@ -121,11 +118,9 @@ private[virt] spi_write(s: *SpiState, cpu: *Cpu, address: u32, offset: u32, widt
     val time = board_time(cpu,n)
     s.serial.with(c ->
         bring_spi(s,c,time)
-        if !spi.write(c,offset,value)
+        if !c.write(offset,width,value,time)
             halt(cpu,Stop.Fault,address)
         else
-            val pins = if spi.enabled(*c) then s.enabled_pins else s.disabled_pins
-            pins(c.sck,c.mosi,time)
-            spi.due(*c) match
-                Some(due) -> lower_limit(cpu,retirement_limit(cpu,due))
-                None -> ())
+            spi.drive(c,time)
+            val due = c.due()
+            if due != NEVER then lower_limit(cpu,retirement_limit(cpu,due)))

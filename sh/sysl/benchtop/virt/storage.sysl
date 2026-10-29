@@ -1,6 +1,7 @@
 module sh.sysl.benchtop.virt
 
 import sh.sysl.benchtop.{Board,Target,param_named,part_model,part_whole,part_text,part_flag}
+import sh.sysl.benchtop.peripheral.Model
 import sh.sysl.benchtop.peripheral.stm32_spi as hspi
 import sh.sysl.benchtop.peripheral.stm32_gpio as gpio
 import sh.sysl.benchtop.peripheral.spi as edge
@@ -299,10 +300,27 @@ private load_storage_card(s: *StorageState, l: *StorageLive, p: sh.sysl.benchtop
     l.card = Some(sd.card(storage_media(s.image),sectors,part_flag(p,"write-protected",false),max(1,clock_hz / 2000)))
     Ok(())
 
+/** Wire the storage path: the SPI's pins to the card on them, and each GPIO bank to the levels the
+ * board holds its pins at (the card's detect switch pulls its pin low where a card is in; the SPI's
+ * idle MISO reads high on its own bank). Called once the devices are in place; the pins are driven
+ * only under `live`, while the SPI is.
+ */
+private[virt] connect_storage(ds: *Devices)
+    val s = &ds.storage
+    s.live.with(l ->
+        l.spi.engine.pins = (enabled,sck,mosi,at) -> storage_pins(s,l,sck,mosi,at)
+        for i in 0..<l.gpio_count
+            var low: u32 = 0
+            s.detect match
+                Some((bank,pin)) -> if bank == i && s.has_card then low = 1u32 << pin
+                None -> ()
+            val high = if s.routed && i == s.gpio_index && !s.is_native then 1u32 << s.rx else 0
+            gpio.hold(&l.gpios[i].model,low,high))
+
 private[virt] boot_storage(s: *StorageState)
     s.live.with(l ->
-        hspi.reset(&l.spi)
-        for i in 0..<l.gpio_count do gpio.reset(&l.gpios[i].model)
+        l.spi.reset()
+        for i in 0..<l.gpio_count do l.gpios[i].model.reset()
         l.card match
             Some(c) -> sd.reset(c)
             None -> ())
@@ -316,16 +334,13 @@ private storage_pins(s: *StorageState, l: *StorageLive, sck: bool, mosi: bool, t
             val selected = routed && gpio.output_enabled(bank,s.cs) && !gpio.output_high(bank,s.cs)
             sd.observe(c,selected,sck,mosi,time)
         None -> true
-private bring_storage(s: *StorageState, l: *StorageLive, time: u64)
-    val pins: &sync Fn(bool,bool,u64) -> bool = (sck,mosi,at) -> storage_pins(s,l,sck,mosi,at)
-    edge.advance(&l.spi.engine,time,pins)
-
 // Polling SPI advances lazily at MMIO, using timestamped SCK edges. There are
 // no enabled interrupts or DMA requests in this initial register subset.
 private[virt] storage_read(s: *StorageState, cpu: *Cpu, device: Device, address: u32, offset: u32, width: u32, n: u64) -> u32
+    val time = board_time(cpu,n)
     s.live.with(l ->
-        bring_storage(s,l,board_time(cpu,n))
-        if device == H7Spi then hspi.read(&l.spi,offset,width) else if width == 4 && offset & 3 == 0 then storage_gpio_read(s,l,address - offset,offset) else None) match
+        l.spi.advance(time)
+        if device == H7Spi then l.spi.read(offset,width,time) else if width == 4 && offset & 3 == 0 then storage_gpio_read(l,address - offset,offset,time) else None) match
         Some(value) -> value
         None ->
             halt(cpu,Stop.Fault,address)
@@ -333,9 +348,9 @@ private[virt] storage_read(s: *StorageState, cpu: *Cpu, device: Device, address:
 private[virt] storage_write(s: *StorageState, cpu: *Cpu, device: Device, address: u32, offset: u32, width: u32, value: u32, n: u64)
     val time = board_time(cpu,n)
     val ok = s.live.with(l ->
-        bring_storage(s,l,time)
-        val ok = if device == H7Spi then hspi.write(&l.spi,offset,width,value) else width == 4 && offset & 3 == 0 && storage_gpio_write(l,address - offset,offset,value)
-        storage_pins(s,l,l.spi.engine.sck,l.spi.engine.mosi,time)
+        l.spi.advance(time)
+        val ok = if device == H7Spi then l.spi.write(offset,width,value,time) else width == 4 && offset & 3 == 0 && storage_gpio_write(l,address - offset,offset,value,time)
+        edge.drive(&l.spi.engine,time)
         ok)
     if !ok then halt(cpu,Stop.Fault,address)
 
@@ -363,21 +378,11 @@ with_sd_card[R](m: *Machine, body: &sd.Card -> R) -> R
     else
         s.live.with(l -> body(l.card.unwrap()))
 
-private storage_gpio_read(s: *StorageState, l: *StorageLive, base: u32, offset: u32) -> Option[u32]
+private storage_gpio_read(l: *StorageLive, base: u32, offset: u32, time: u64) -> Option[u32]
     for i in 0..<l.gpio_count
-        val b = l.gpios[i]
-        if b.base != base then continue
-        var input = b.model.output
-        for pin in 0u32..<16
-            if (b.model.pull >> (pin * 2)) & 3 == 1 then input |= 1u32 << pin
-        s.detect match
-            Some((bank,pin)) -> if bank == i && s.has_card then input &= ~(1u32 << pin)
-            None -> ()
-        // The SPI's idle MISO reads high on its own bank.
-        if s.routed && i == s.gpio_index && !s.is_native then input |= 1u32 << s.rx
-        return gpio.read(b.model,offset,input)
+        if l.gpios[i].base == base then return l.gpios[i].model.read(offset,4,time)
     None
-private storage_gpio_write(l: *StorageLive, base: u32, offset: u32, value: u32) -> bool
+private storage_gpio_write(l: *StorageLive, base: u32, offset: u32, value: u32, time: u64) -> bool
     for i in 0..<l.gpio_count
-        if l.gpios[i].base == base then return gpio.write(&l.gpios[i].model,offset,value)
+        if l.gpios[i].base == base then return l.gpios[i].model.write(offset,4,value,time)
     false

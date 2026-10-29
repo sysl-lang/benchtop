@@ -1,6 +1,7 @@
 module sh.sysl.benchtop.peripheral.spi
 
 import sysl.container.ring.InlineRing
+import sh.sysl.benchtop.peripheral.Model
 import sh.sysl.benchtop.timing.NEVER
 import sysl.math.min
 
@@ -17,10 +18,19 @@ const CR0_SPH: u32 = 1 << 7
 const CR1_LBM: u32 = 1
 const CR1_SSE: u32 = 1 << 1
 
+/** The controller's pins: given whether the port is enabled and the SCK and MOSI levels it puts on
+ * them at a time, answer the level on MISO.
+ */
+type Pins = &Fn(bool,bool,bool,u64) -> bool
+
+/** Pins wired to nothing: MISO reads low. */
+private val no_pins: Pins = (enabled,sck,mosi,time) -> false
+
 /** PL022 master in Motorola SPI modes 0..3, 4..16 bits, with eight-entry
- * transmit/receive FIFOs. Time is in input-clock ticks. Each callback observes
+ * transmit/receive FIFOs. Time is in input-clock ticks. Each call of `pins` observes
  * an actual SCK/MOSI transition and returns MISO. No framebuffer shortcuts.
- * The FIFOs hold `capacity` entries, which the storage bounds at `MAX_FIFO`.
+ * The FIFOs hold `capacity` entries, which the storage bounds at `MAX_FIFO`. `pins` is set once by
+ * whoever puts the controller on a board, and a reset keeps it.
  */
 struct Controller
     cr0: u32
@@ -41,141 +51,151 @@ struct Controller
     sck: bool
     mosi: bool
     capacity: usize
+    pins: Pins
 
-controller(capacity: usize = 8) -> Controller
+private fresh(capacity: usize, pins: Pins) -> Controller
+    var empty: InlineRing[u16, MAX_FIFO]
+    // Every register zero, both FIFOs empty and nothing on the wire.
+    Controller(0, 0, 0, 0, 0, empty, empty, false, 0, 0, 0, 0, 0, 0, false, false, false, capacity, pins)
+
+controller(capacity: usize = 8, pins: Pins = no_pins) -> Controller
     require capacity > 0 && capacity <= MAX_FIFO && capacity & (capacity - 1) == 0, "power-of-two SPI FIFO capacity"
-    var c: Controller
-    c.capacity = capacity
-    c
+    fresh(capacity, pins)
 
-reset(c: *Controller) = *c = controller(c.capacity)
-
-enabled(c: Controller) -> bool = c.cr1 & CR1_SSE != 0
-private bits(c: Controller) -> u32 = (c.cr0 & CR0_DSS_MASK) + 1
-private half(c: Controller) -> u64 = u64(c.cpsr) * u64((c.cr0 >> 8 & 255) + 1) / 2
-private polarity(c: Controller) -> bool = c.cr0 & CR0_SPO != 0
-private phase(c: Controller) -> bool = c.cr0 & CR0_SPH != 0
+enabled(c: *Controller) -> bool = c.cr1 & CR1_SSE != 0
+private bits(c: *Controller) -> u32 = (c.cr0 & CR0_DSS_MASK) + 1
+private half(c: *Controller) -> u64 = u64(c.cpsr) * u64((c.cr0 >> 8 & 255) + 1) / 2
+private polarity(c: *Controller) -> bool = c.cr0 & CR0_SPO != 0
+private phase(c: *Controller) -> bool = c.cr0 & CR0_SPH != 0
 
 kick(c: *Controller) = start(c,c.time)
 
+/** Put the controller's SCK and MOSI on its pins at `time`, answering MISO. */
+drive(c: *Controller, time: u64) -> bool = (c.pins)(enabled(c), c.sck, c.mosi, time)
+
 private start(c: *Controller, time: u64)
-    if c.shifting || !enabled(*c) then return
+    if c.shifting || !enabled(c) then return
     c.word = c.tx.pop_front() match
         Some(word) -> word
         None -> return
     c.received = 0
     c.edges = 0
     c.shifting = true
-    c.sck = polarity(*c)
-    if !phase(*c) then c.mosi = u32(c.word) & (1 << (bits(*c) - 1)) != 0
-    c.next = time + half(*c)
+    c.sck = polarity(c)
+    if !phase(c) then c.mosi = u32(c.word) & (1 << (bits(c) - 1)) != 0
+    c.next = time + half(c)
 
 /** Internal edges are advanced lazily at MMIO/pin accesses or word completion.
  * A delayed call emits the same timestamped edges as many small calls.
  */
-advance(c: *Controller, time: u64, pins: &sync Fn(bool,bool,u64) -> bool)
+private run(c: *Controller, time: u64)
     if time < c.time then return
     while c.shifting && c.next <= time
         val at = c.next
         val leading = c.edges & 1 == 0
         val bit = c.edges / 2
-        c.sck = if leading then !polarity(*c) else polarity(*c)
-        if phase(*c) && leading
-            c.mosi = u32(c.word) & (1 << (bits(*c) - 1 - bit)) != 0
-        val input = (pins)(c.sck, c.mosi, at)
-        if leading != phase(*c)
+        c.sck = if leading then !polarity(c) else polarity(c)
+        if phase(c) && leading
+            c.mosi = u32(c.word) & (1 << (bits(c) - 1 - bit)) != 0
+        val input = drive(c, at)
+        if leading != phase(c)
             val sampled = if c.cr1 & CR1_LBM != 0 then c.mosi else input
             c.received = c.received << 1 | (if sampled then 1 else 0)
         c.edges += 1
-        c.next = at + half(*c)
-        if c.edges == 2 * bits(*c)
+        c.next = at + half(c)
+        if c.edges == 2 * bits(c)
             if c.rx.len() == c.capacity then c.overrun = true
             else c.rx.push_back(c.received)
-            c.timeout = at + 64 * half(*c)
+            c.timeout = at + 64 * half(c)
             c.shifting = false
             start(c, at)
-            if c.shifting then (pins)(c.sck, c.mosi, at)
-        elif !phase(*c) && !leading
-            c.mosi = u32(c.word) & (1 << (bits(*c) - 1 - c.edges / 2)) != 0
-            (pins)(c.sck, c.mosi, at)
+            if c.shifting then drive(c, at)
+        elif !phase(c) && !leading
+            c.mosi = u32(c.word) & (1 << (bits(c) - 1 - c.edges / 2)) != 0
+            drive(c, at)
     c.time = time
 
-status(c: Controller) -> u32 =
+status(c: *Controller) -> u32 =
     (if c.tx.is_empty() then 1 else 0) |
     (if c.tx.len() < c.capacity then 2 else 0) |
     (if c.rx.is_empty() then 0 else 4) |
     (if c.rx.len() == c.capacity then 8 else 0) |
     (if c.shifting || !c.tx.is_empty() then 16 else 0)
 
-raw_irq(c: Controller) -> u32 =
+raw_irq(c: *Controller) -> u32 =
     (if c.overrun then 1 else 0) |
     (if !c.rx.is_empty() && c.timeout <= c.time then 2 else 0) |
     (if c.rx.len() >= 4 then 4 else 0) |
     (if c.tx.len() <= 4 then 8 else 0)
 
-irq(c: Controller) -> bool = raw_irq(c) & c.mask != 0
+// Registers answer at any width the bus lets through; the clock is the controller's own, which
+// `advance` brings up before an access.
+impl Model for Controller
+    read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = offset match
+        0 -> Some(self.cr0)
+        4 -> Some(self.cr1)
+        8 -> self.rx.pop_front() match
+            Some(word) ->
+                self.timeout = self.time + 64 * half(self)
+                Some(u32(word))
+            None -> Some(0)
+        12 -> Some(status(self))
+        16 -> Some(self.cpsr)
+        20 -> Some(self.mask)
+        24 -> Some(raw_irq(self))
+        28 -> Some(raw_irq(self) & self.mask)
+        32 -> Some(0)
+        36 -> Some(self.dma)
+        0xFE0 -> Some(0x22)
+        0xFE4 -> Some(0x10)
+        0xFE8 -> Some(0x04)
+        0xFEC -> Some(0)
+        0xFF0 -> Some(0x0D)
+        0xFF4 -> Some(0xF0)
+        0xFF8 -> Some(0x05)
+        0xFFC -> Some(0xB1)
+        _ -> None
 
-/** The next externally visible FIFO/interrupt change, not every internal edge. */
-due(c: Controller) -> Option[u64]
-    val word = if c.shifting then c.next + u64(2 * bits(c) - c.edges - 1) * half(c) else NEVER
-    val timeout = if !c.rx.is_empty() && c.mask & 2 != 0 && c.timeout > c.time then c.timeout else NEVER
-    val next = min(word, timeout)
-    if next == NEVER then None else Some(next)
+    /** Advance before accessing registers. Unsupported frame formats/slave mode are
+     * refused; filling a full TX FIFO drops the write, as hardware does.
+     */
+    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool
+        offset match
+            0 ->
+                if enabled(self) || value & ~0xffff != 0 then return false
+                self.cr0 = value
+                self.sck = polarity(self)
+            4 ->
+                if value & ~11 != 0 then return false
+                if value & 2 != 0 && (bits(self) < 4 || self.cr0 & 48 != 0 || self.cpsr < 2 || self.cpsr > 254 || self.cpsr & 1 != 0) then return false
+                self.cr1 = value
+                if !enabled(self)
+                    self.shifting = false
+                    self.sck = polarity(self)
+                else start(self, self.time)
+            8 ->
+                if self.tx.len() < self.capacity
+                    self.tx.push_back(u16(value & 65535))
+                    start(self, self.time)
+            12 | 24 | 28 -> ()
+            16 ->
+                if enabled(self) || value < 2 || value > 254 || value & 1 != 0 then return false
+                self.cpsr = value
+            20 -> self.mask = value & 15
+            32 ->
+                if value & 1 != 0 then self.overrun = false
+                if value & 2 != 0 then self.timeout = self.time + 64 * half(self)
+            36 -> self.dma = value & 3
+            _ -> return false
+        true
 
-read(c: *Controller, offset: u32) -> Option[u32] = offset match
-    0 -> Some(c.cr0)
-    4 -> Some(c.cr1)
-    8 -> c.rx.pop_front() match
-        Some(word) ->
-            c.timeout = c.time + 64 * half(*c)
-            Some(u32(word))
-        None -> Some(0)
-    12 -> Some(status(*c))
-    16 -> Some(c.cpsr)
-    20 -> Some(c.mask)
-    24 -> Some(raw_irq(*c))
-    28 -> Some(raw_irq(*c) & c.mask)
-    32 -> Some(0)
-    36 -> Some(c.dma)
-    0xFE0 -> Some(0x22)
-    0xFE4 -> Some(0x10)
-    0xFE8 -> Some(0x04)
-    0xFEC -> Some(0)
-    0xFF0 -> Some(0x0D)
-    0xFF4 -> Some(0xF0)
-    0xFF8 -> Some(0x05)
-    0xFFC -> Some(0xB1)
-    _ -> None
+    override advance(*self, time: u64) = run(self, time)
 
-/** Advance before accessing registers. Unsupported frame formats/slave mode are
- * refused; filling a full TX FIFO drops the write, as hardware does.
- */
-write(c: *Controller, offset: u32, value: u32) -> bool
-    offset match
-        0 ->
-            if enabled(*c) || value & ~0xffff != 0 then return false
-            c.cr0 = value
-            c.sck = polarity(*c)
-        4 ->
-            if value & ~11 != 0 then return false
-            if value & 2 != 0 && (bits(*c) < 4 || c.cr0 & 48 != 0 || c.cpsr < 2 || c.cpsr > 254 || c.cpsr & 1 != 0) then return false
-            c.cr1 = value
-            if !enabled(*c)
-                c.shifting = false
-                c.sck = polarity(*c)
-            else start(c, c.time)
-        8 ->
-            if c.tx.len() < c.capacity
-                c.tx.push_back(u16(value & 65535))
-                start(c, c.time)
-        12 | 24 | 28 -> ()
-        16 ->
-            if enabled(*c) || value < 2 || value > 254 || (value & 1) != 0 then return false
-            c.cpsr = value
-        20 -> c.mask = value & 15
-        32 ->
-            if (value & 1) != 0 then c.overrun = false
-            if (value & 2) != 0 then c.timeout = c.time + 64 * half(*c)
-        36 -> c.dma = value & 3
-        _ -> return false
-    true
+    /** The next externally visible FIFO/interrupt change, not every internal edge. */
+    override due(*self) -> u64
+        val word = if self.shifting then self.next + u64(2 * bits(self) - self.edges - 1) * half(self) else NEVER
+        val timeout = if !self.rx.is_empty() && self.mask & 2 != 0 && self.timeout > self.time then self.timeout else NEVER
+        min(word, timeout)
+
+    override irq(*self) -> bool = raw_irq(self) & self.mask != 0
+    reset(*self) = *self = fresh(self.capacity, self.pins)
