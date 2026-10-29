@@ -6,22 +6,22 @@ model imports a CPU module, uses global device state, starts a host thread, or r
 
 RESETS, TIMER and the watchdog are library peripherals (`rp-resets`, `rp-timer`, `rp-watchdog`),
 placed by `mcus/rp2040.hocon` and run by `sh.sysl.benchtop.virt` (`virt/rp.sysl`) on any runnable
-board whose chip places them. The rp2040 chip itself does not run yet: its ROM and SIO are not
-modelled, and the divider waits for the SIO. GPIO/pads, UART, clock generators, the watchdog
+board whose mcu places them. The `rp2040` mcu itself does not run: its ROM and SIO are not
+modelled, and the divider is used only where an SIO is. GPIO/pads, UART, clock generators, the watchdog
 counter, DMA, SPI, I2C, PWM, PIO, USB, interpolators, flash and boot ROM are separate work.
 
-## Chip integration contract
+## Machine integration contract
 
 Construct with `resets()`, `timer()`, `watchdog()` and `divider()`, or explicitly call `reset()` on
 fresh storage. All register methods take a relative offset, a transfer width in bytes (1, 2 or 4),
 and, for writes, the value. Reads return `Result[u32, AccessError]`; writes return
-`Result[unit, AccessError]`. The chip maps addresses, routes errors to its fault/diagnostic policy,
+`Result[unit, AccessError]`. The machine maps addresses, routes errors to its fault/diagnostic policy,
 and serializes shared peripheral access across CPU threads. Reset and clock delivery must use the
 same serialization. There are no internal locks and copying a struct copies its complete device
 state.
 
 - **RESETS:** one shared `Resets` instance. `held` is the 25-bit reset-output mask; `watchdog` is
-  WDSEL. After a RESET write, the chip applies asserted resets to connected devices, releases the
+  WDSEL. After a RESET write, the machine applies asserted resets to connected devices, releases the
   others and calls `complete(bits)` when those devices are ready. RESET_DONE stays low until that
   handshake; writing a reset bit clears its done bit. benchtop's board completes every released
   device at once.
@@ -32,7 +32,7 @@ state.
   CYCLES.
 - **TIMER:** one shared `Timer`. Supply the watchdog's ticks with `advance(ticks, halted)`, where
   `halted` bit 0/1 indicates the debug-halted state of each processor. No tick delivery means no
-  counter progress. The chip must split clock advancement at writes or debug-state changes.
+  counter progress. The machine must split clock advancement at writes or debug-state changes.
   `irqs()` is a four-bit level output, normally routed to RP2040 IRQs 0–3 on both processors.
   `next_alarm(halted)` returns an optional distance in input ticks, allowing a scheduler to advance
   while the CPUs sleep. It does not claim that the tick source is running, or that an interrupt is
@@ -43,7 +43,7 @@ state.
   when ready. Every operand write restarts eight clocks; result writes cancel pending work.
   Read the remainder before the quotient when preserving DIRTY for SDK context-save logic.
 
-The peripheral methods do not assert CPU pending bits themselves. In particular, the chip must
+The peripheral methods do not assert CPU pending bits themselves. In particular, the machine must
 resample level IRQs at scheduling/exception boundaries as well as after register writes.
 `virt/rp_tests.sysl` runs guests against RESETS, TIMER and the watchdog on a board, one thread and
 two; `v6m/rp2040_peripheral_tests.sysl` supplies a test-only bus for the dividers.
