@@ -3,6 +3,7 @@ module sh.sysl.benchtop.peripheral.dsi
 import sysl.buf.{Buf,buf}
 import sysl.container.ring.InlineRing
 import sysl.math.min
+import sh.sysl.benchtop.peripheral.Model
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.stm32h747.dsihost as reg
 
@@ -42,7 +43,7 @@ const TWO_LANES: u32 = 1
 // The regulator and the PLL both on: what DSI_WISR's RRS and PLLLS report.
 const WRPCR_RUNNING: u32 = reg.DSI_WRPCR_REGEN_MASK | reg.DSI_WRPCR_PLLEN_MASK
 private field(word: u32, mask: u32, shift: u32) -> u32 = (word & mask) >> shift
-private register(h: &Host, offset: u32) -> u32 = h.regs[offset / 4]
+private register(h: *Host, offset: u32) -> u32 = h.regs[offset / 4]
 
 /** STM32 DSI command-mode host. Packets cross a timed link before the attached
  * endpoint receives them. Endpoints are independent of MCU addresses and GPIO.
@@ -64,39 +65,45 @@ struct Host
     packet_count: usize
     header: u32
     busy: bool
-    due: u64
+    arrives: u64
     time: u64
     rx: InlineRing[u8, 1024]
     max_return: usize
     defer_reads: bool
     response_pending: bool
     request_id: u64
-
-host(hz: u64, reference_hz: u64 = 25000000) -> &Host
-    require hz > 0 && hz <= 1000000000 && reference_hz > 0 && reference_hz <= 1000000000, "bounded DSI clock rates"
-    var h: Host
-    h.hz = hz
-    h.reference_hz = reference_hz
-    h.max_return = 1
-    h.regs[reg.DSI_MCR_OFFSET / 4] = reg.DSI_MCR_CMDM_MASK
-    h
-
-/** Replaces the receive FIFO's contents with a read response, cut at the maximum return size. */
-private receive(h: &Host, response: []const u8)
-    h.rx.clear()
-    for i in 0..<min(response.len,h.max_return) do h.rx.push_back(response[i])
+    /** Where the link's packets go, set once by whoever puts the host on a board; a reset keeps it. */
+    sink: Endpoint
 
 /** Callback arguments are VC, packet data type, exact unpadded payload, and the host's request
  * number, which a deferred read's completion names. Read-request responses are raw device bytes. A
- * sink never sees host memory. A host's sink is set once and reached from every thread that drives
- * the host, so its count is atomic.
+ * sink never sees host memory.
  */
-type Endpoint = &sync Fn(u32,u32,[]const u8,u64) -> Buf[u8]
+type Endpoint = &Fn(u32,u32,[]const u8,u64) -> Buf[u8]
 
-advance(h: &Host, time: u64, endpoint: Endpoint)
+/** A sink with nothing on the link: every packet is dropped and a read answers nothing. */
+val no_sink: Endpoint = (vc,kind,bytes,request) -> buf()
+
+// A host at reset: command mode, a maximum return size of one byte, and nothing on the link.
+private fresh(hz: u64, reference_hz: u64, sink: Endpoint) -> Host
+    var regs: [269]u32 = [0;269]
+    regs[reg.DSI_MCR_OFFSET / 4] = reg.DSI_MCR_CMDM_MASK
+    var rx: InlineRing[u8, 1024]
+    Host(hz, reference_hz, 0, regs, [0;1024], 0, [0;1024], 0, 0, false, 0, 0, rx, 1, false, false, 0, sink)
+
+host(hz: u64, reference_hz: u64 = 25000000, sink: Endpoint = no_sink) -> &Host
+    require hz > 0 && hz <= 1000000000 && reference_hz > 0 && reference_hz <= 1000000000, "bounded DSI clock rates"
+    fresh(hz,reference_hz,sink)
+
+/** Replaces the receive FIFO's contents with a read response, cut at the maximum return size. */
+private receive(h: *Host, response: []const u8)
+    h.rx.clear()
+    for i in 0..<min(response.len,h.max_return) do h.rx.push_back(response[i])
+
+private run(h: *Host, time: u64)
     if time <= h.time then return
     h.time = time
-    if !h.busy || h.response_pending || time < h.due then return
+    if !h.busy || h.response_pending || time < h.arrives then return
     val kind = h.header & reg.DSI_GHCR_DT_MASK
     if kind == SET_MAXIMUM_RETURN_SIZE
         h.max_return = usize(word_count(h.header))
@@ -104,14 +111,14 @@ advance(h: &Host, time: u64, endpoint: Endpoint)
         val reading = is_read(kind)
         if reading && h.defer_reads
             h.response_pending = true
-            h.due = NEVER
+            h.arrives = NEVER
         val channel = field(h.header,reg.DSI_GHCR_VCID_MASK,reg.DSI_GHCR_VCID_SHIFT)
-        val response = endpoint(channel,kind,h.packet[..<h.packet_count],h.request_id)
+        val response = (h.sink)(channel,kind,h.packet[..<h.packet_count],h.request_id)
         if reading && h.defer_reads then return
         if reading then receive(h,response.view())
     h.busy = false
 
-private ready(h: &Host) -> bool =
+private ready(h: *Host) -> bool =
     register(h,reg.DSI_CR_OFFSET) & reg.DSI_CR_EN_MASK != 0 && register(h,reg.DSI_MCR_OFFSET) & reg.DSI_MCR_CMDM_MASK != 0 &&
     register(h,reg.DSI_PCTLR_OFFSET) & PCTLR_ENABLED == PCTLR_ENABLED &&
     register(h,reg.DSI_WCR_OFFSET) & reg.DSI_WCR_DSIEN_MASK != 0 &&
@@ -127,7 +134,7 @@ private configured(offset: u32) -> bool = offset match
     reg.DSI_WPCR1_OFFSET | reg.DSI_WPCR2_OFFSET | reg.DSI_WPCR3_OFFSET | reg.DSI_WPCR4_OFFSET | reg.DSI_WRPCR_OFFSET -> true
     _ -> false
 
-read(h: &Host, offset: u32) -> Option[u32]
+private read_register(h: *Host, offset: u32) -> Option[u32]
     if offset & 3 != 0 then return None
     if configured(offset) then return Some(h.regs[offset / 4])
     offset match
@@ -159,7 +166,7 @@ read(h: &Host, offset: u32) -> Option[u32]
 /** False means an unsupported or invalid operation; the bus adapter must report
  * it, rather than silently complete a mode it does not implement.
  */
-write(h: &Host, offset: u32, value: u32) -> bool
+private write_register(h: *Host, offset: u32, value: u32) -> bool
     if offset & 3 != 0 then return false
     if configured(offset)
         if offset == reg.DSI_WRPCR_OFFSET && value & reg.DSI_WRPCR_PLLEN_MASK != 0
@@ -218,15 +225,31 @@ write(h: &Host, offset: u32, value: u32) -> bool
     h.busy = true
     val bytes = if is_long(kind) then u64(size) + 6 else 4u64
     val rate = h.lane_rate * u64((register(h,reg.DSI_PCONFR_OFFSET) & reg.DSI_PCONFR_NL_MASK) + 1)
-    h.due = h.time + (bytes * 8 * h.hz + rate - 1) / rate
+    h.arrives = h.time + (bytes * 8 * h.hz + rate - 1) / rate
     true
 
-/** Complete a deferred read on the device worker. A cancelled/reset request
- * cannot populate a newer transaction's receive FIFO.
- */
-complete_read(h: &Host, request_id: u64, response: []const u8) -> bool
-    if !h.busy || !h.response_pending || h.request_id != request_id then return false
-    receive(h,response)
-    h.response_pending = false
-    h.busy = false
-    true
+impl Host
+    /** Complete a deferred read on the device worker. A cancelled/reset request
+     * cannot populate a newer transaction's receive FIFO.
+     */
+    complete_read(*self, request_id: u64, response: []const u8) -> bool
+        if !self.busy || !self.response_pending || self.request_id != request_id then return false
+        receive(self,response)
+        self.response_pending = false
+        self.busy = false
+        true
+
+// Every register is a word at a word offset; the bus checks the width before it reaches the host.
+// False from `write` means an unsupported or invalid operation, which the bus adapter must report
+// rather than silently complete a mode the host does not implement.
+impl Model for Host
+    read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = read_register(self,offset)
+    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool = write_register(self,offset,value)
+    /** The packet in flight reaches the sink once its last byte is on the far end of the link. */
+    override advance(*self, time: u64) = run(self,time)
+    /** When the packet in flight arrives; NEVER while none is, or while a deferred read is pending. */
+    override due(*self) -> u64 = if self.busy then self.arrives else NEVER
+    reset(*self)
+        val deferred = self.defer_reads
+        *self = fresh(self.hz,self.reference_hz,self.sink)
+        self.defer_reads = deferred
