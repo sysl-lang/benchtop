@@ -2,9 +2,11 @@ module sh.sysl.benchtop.virt
 @tests
 
 import sh.sysl.benchtop.v6m as cpu
+import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.elf as elf
-import sysl.text.replace_all
+import sysl.text.{Search, replace_all}
 import sysl.raw.str_cast
+import sysl.buf.{Buf,buf}
 
 private val AUDIO_IRQ_GUEST = embed("../../../../examples/sai-dma/demo.elf")
 
@@ -28,7 +30,7 @@ sai_dma_guest_irq()
         val output = sai_take_output(0)
         assert(output.len() == 16)
         for i in 0usize..<16 do assert(output.at(i) == u32(0x8000 + i * 128))
-        assert(sai_dma_due() == cpu.NEVER && core0().pending_banks == 0)
+        assert(sai_dma_due() == NEVER && core0().pending_banks == 0)
         cpu.poke(core0(),239)
         boot(core0(),image_of(AUDIO_IRQ_GUEST).unwrap().view())
         cpu.take_incoming(core0())
@@ -47,10 +49,25 @@ private audio_setup()
         board_write(c,base + 4,4,4,0)
         board_write(c,base,4,(4 << 5) | (1 << 20),0)
 
-@test("SAI DMA board: synchronized capture and playback transfer RAM atomically without taking the display lock")
-sai_dma_full_duplex()
+@test("SAI DMA board: the DMA is its own bus master, so the core whose thread carries it changes nothing")
+sai_dma_master_is_not_a_core()
     audio_setup()
-    val c = core0()
+    full_duplex(core0())
+    val m4 = core1()
+    // The M4 runs at half the M7's clock: 40000 of its cycles are the M7's 80000.
+    val flags = board_read(m4,0x40020404,4,40000)
+    assert(flags & 32 != 0,"capture completes when the M4's access brings the devices forward")
+    for i in 0u32..<16 do assert(cpu.load16(core0(),0x24002000 + i * 2) == i + 1,"the M7 sees the DMA's stores")
+    for i in 0u32..<16 do assert(cpu.load16(m4,0x24002000 + i * 2) == i + 1,"the M4 sees the DMA's stores")
+    val output = sai_take_output(0)
+    assert(output.len() >= 16,s"played ${output.len()} words")
+    for i in 0usize..<output.len() do assert(output.at(i) == u32(i % 16 + 100),"the circular buffer plays in order")
+    assert(cpu.exception_pending(m4,76),"IRQ60 reaches the M4's NVIC")
+    signal_sai_dma(core0())
+    assert(cpu.exception_pending(core0(),76),"IRQ60 reaches the M7's NVIC too")
+
+// Capture on SAI1 B (DMA2 stream4) synchronous to playback on SAI1 A (DMA2 stream1), set up by `c`.
+private full_duplex(c: *cpu.Cpu)
     for i in 0u32..<16 do cpu.store16(c,0x24001000 + i * 2,u16(i + 100))
     sai_feed_input(1,[1u32,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
     // Capture block B is synchronous to A. DMA2 stream4, DMAMUX channel12.
@@ -69,6 +86,12 @@ sai_dma_full_duplex()
     board_write(c,0x40020434,4,0x24001000,0)
     board_write(c,0x40020428,4,1 | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 11) | (1 << 13),0)
     board_write(c,0x40015804,4,(4 << 5) | (1 << 20) | (1 << 16) | (1 << 17),0)
+
+@test("SAI DMA board: synchronized capture and playback transfer RAM atomically without taking the display lock")
+sai_dma_full_duplex()
+    audio_setup()
+    val c = core0()
+    full_duplex(c)
     machine.devices.displays.live.lock_raw()
     val flags = board_read(c,0x40020404,4,80000)
     machine.devices.displays.live.unlock_raw()
@@ -79,6 +102,94 @@ sai_dma_full_duplex()
     assert(output.len() == 16)
     for i in 0usize..<16 do assert(output.at(i) == u32(i + 100))
     assert(board_read(c,0x40015838,4,80000) & 1 == 0,"synchronous capture must not overrun")
+
+// The full-duplex setup above, then the status registers a driver polls read every `stride`
+// instructions up to 80000: each poll's values, then the captured words and the played ones.
+private polled_duplex(stride: u64, reader: u32 = 0) -> Buf[u32]
+    audio_setup()
+    val c = core0()
+    val r = if reader == 1 then core1() else core0()
+    // Both cores' clocks read the same at the same retirement count, so a poll at n is the same instant.
+    r.extra_cycles = c.extra_cycles
+    r.slept = c.slept
+    for i in 0u32..<16 do cpu.store16(c,0x24001000 + i * 2,u16(i + 100))
+    sai_feed_input(1,[1u32,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16])
+    board_write(c,0x40015828,4,0,0)
+    board_write(c,0x40020830,4,88,0)
+    board_write(c,0x40020474,4,16,0)
+    board_write(c,0x40020478,4,0x40015840,0)
+    board_write(c,0x4002047c,4,0x24002000,0)
+    board_write(c,0x40020470,4,1 | 16 | (1 << 10) | (1 << 11) | (1 << 13),0)
+    board_write(c,0x40015824,4,(4 << 5) | 3 | (1 << 10) | (1 << 16) | (1 << 17),0)
+    board_write(c,0x40020824,4,87,0)
+    board_write(c,0x4002042c,4,16,0)
+    board_write(c,0x40020430,4,0x40015820,0)
+    board_write(c,0x40020434,4,0x24001000,0)
+    board_write(c,0x40020428,4,1 | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 11) | (1 << 13),0)
+    board_write(c,0x40015804,4,(4 << 5) | (1 << 20) | (1 << 16) | (1 << 17),0)
+    var seen: Buf[u32] = buf()
+    var n: u64 = stride
+    while n <= 80000
+        for register in [0x40015818u32,0x40015838,0x40020400,0x40020404,0x4002042c,0x40020474]
+            val value = board_read(r,register,4,n)
+            if n % 1400 == 0 then seen.push(value)
+        n += stride
+    board_read(r,0x40020404,4,80000)
+    for i in 0u32..<16 do seen.push(cpu.load16(c,0x24002000 + i * 2))
+    for word in sai_take_output(0) do seen.push(word)
+    assert(r.stop == cpu.Stop.Budget,stop_message(r))
+    seen
+
+@test("SAI DMA board: status polls between slots answer the state at their time and change nothing the audio does")
+sai_dma_polls()
+    // A poll every 7 instructions mostly falls between two slots and answers from the state the last
+    // access left; one every 1400 brings the devices up each time. At every 1400th instruction the two
+    // must read the same, and the words moved must be the same.
+    val dense = polled_duplex(7)
+    val sparse = polled_duplex(1400)
+    assert(dense.len() == sparse.len() && dense.len() == 57 * 6 + 32,f"${dense.len()} and ${sparse.len()} values")
+    for i in 0..<dense.len() do assert(dense.at(i) == sparse.at(i),f"poll value $i")
+    for i in 0u32..<16 do assert(dense.at(57 * 6 + usize(i)) == i + 1 && dense.at(57 * 6 + 16 + usize(i)) == i + 100)
+
+@test("device driver: a core that did not write the audio reads SAI and DMA status, NDTR and moved words as of its own time")
+sai_dma_cross_core_reads()
+    // Core 0 configures and starts the audio, so it is the driver and core 1's slices do not end at
+    // the audio's slots. Core 1 then polls SAI SR, DMA ISR and NDTR (dense, mostly between slots, and
+    // sparse) and reads the words moved. Its values are the ones recorded (as an FNV-1a checksum) from
+    // the build in which every core brings the audio's events in, so a non-driver read catches the
+    // devices up to its own time exactly as before.
+    val dense = polled_duplex(7,1)
+    assert(drives_device(&machine.devices.audio.driver,core0()) && !drives_device(&machine.devices.audio.driver,core1()))
+    val sparse = polled_duplex(1400,1)
+    assert(dense.len() == 57 * 6 + 48 && sparse.len() == dense.len(),f"${dense.len()} ${sparse.len()}")
+    for i in 0..<dense.len() do assert(dense.at(i) == sparse.at(i),f"poll value $i")
+    var h: u64 = 1469598103934665603
+    for i in 0..<dense.len()
+        h = (h ^ u64(dense.at(i))) * 1099511628211
+    assert(h == 9127129273412427210,f"core 1 polls checksum $h")
+
+@test("device driver: the core that last wrote a device brings its events in; before any write both do")
+device_driver()
+    // A boot numbers the cores.
+    audio_setup()
+    var driver: u32 = 0
+    assert(drives_device(&driver,core0()) && drives_device(&driver,core1()))
+    claim_device(&driver,core1())
+    assert(!drives_device(&driver,core0()) && drives_device(&driver,core1()))
+    claim_device(&driver,core0())
+    assert(drives_device(&driver,core0()) && !drives_device(&driver,core1()))
+    // The audio: core 0 configured and starts block A, so its slots end core 0's slices only.
+    val c = core0()
+    board_write(c,0x40015820,2,123,0)
+    board_write(c,0x40015804,4,(4 << 5) | (1 << 20) | (1 << 16),0)
+    assert(sai_dma_due() != NEVER && sai_dma_due_for(c) == sai_dma_due() && sai_dma_due_for(core1()) == NEVER)
+    assert(device_due(core1()) > sai_dma_due())
+    // A reset forgets the driver.
+    boot(c,image_of([]).unwrap().view())
+    val audio = &machine.devices.audio.driver
+    assert(drives_device(audio,c) && drives_device(audio,core1()))
+    board_write(core1(),0x40015814,4,1,0)
+    assert(!drives_device(audio,c) && drives_device(audio,core1()))
 
 @test("SAI DMA board: invalid DMA buffers raise transfer-error IRQ without faulting the CPU; MMIO widths are checked")
 sai_dma_bus_errors()
@@ -101,9 +212,36 @@ sai_dma_bus_errors()
     board_write(c,0x4002042c,2,1,0)
     assert(c.stop == cpu.Stop.Fault)
 
+/** `board`, an H7 board on `mcu = stm32h747`, with that mcu written out in it, for a test to change
+ * the chip.
+ */
+h7_written_out(board: string) -> string
+    val chip = str_cast(embed("../../../../mcus/stm32h747.hocon"))
+    val at = chip.index_of("mcu {").unwrap()
+    replace_all(board, "mcu = stm32h747", chip[at..])
+
+@test("an H7 board on the stm32h747 mcu runs as one with that mcu written out")
+h7_mcu_written_out()
+    val board = str_cast(embed("../../../../boards/stm32h747-disco.hocon"))
+    assert(board_from("named.hocon", board.bytes).is_ok())
+    val named = attached()
+    assert(board_from("inline.hocon", h7_written_out(board).bytes).is_ok())
+    assert(attached() == named && named == 19, s"$named devices")
+    // Every GPIO bank is on the bus with its datasheet reset mode: A and B keep their debug pins.
+    boot(core0(),image_of([]).unwrap().view())
+    assert(board_read(core0(),0x58020000,4,0) == 0xabffffff && board_read(core0(),0x58020400,4,0) == 0xfffffebf)
+    assert(board_read(core0(),0x58020800,4,0) == 0xffffffff && board_read(core0(),0x58022800,4,0) == 0xffffffff)
+    // The board picks each signal's pin among those the mcu lists, and only there.
+    assert(board_from("pick.hocon", replace_all(board, "sda = PD13, scl = PD12", "sda = PB7, scl = PB6").bytes).is_ok())
+    assert(board_from("cannot.hocon", replace_all(board, "sda = PD13", "sda = PA0").bytes).is_err())
+    // The SPI's pins come from the board's `buses`, all on one bank.
+    val spi = replace_all(str_cast(embed("../../../../boards/stm32h747-spi-sd.hocon")),"target/disco-sd.img","")
+    assert(board_from("spi.hocon", spi.bytes).is_ok())
+    assert(board_from("split.hocon", replace_all(spi, "sck = PA5", "sck = PB3").bytes).unwrap_err().contains("SPI signals must share one GPIO bank"))
+
 @test("SAI DMA board: addresses, controller identities and request IDs are description parameters")
 sai_dma_parameters()
-    val original = str_cast(embed("../../../../boards/stm32h747-disco.hocon"))
+    val original = h7_written_out(str_cast(embed("../../../../boards/stm32h747-disco.hocon")))
     val moved = replace_all(replace_all(replace_all(original,"0x40015800","0x41000000"),"request-a = 87","request-a = 91"),"kernel-clock-hz = 12288000","kernel-clock-hz = 12288000, request-a = 91, request-b = 92")
     assert(board_from("moved.hocon",moved.bytes).is_ok())
     boot(core0(),image_of([]).unwrap().view())
@@ -112,7 +250,7 @@ sai_dma_parameters()
     assert(board_from("duplicate.hocon",replace_all(original,"kernel-clock-hz = 12288000","kernel-clock-hz = 12288000, request-a = 87, request-b = 87").bytes).is_err())
     assert(board_named("virt").is_ok())
     boot(core0(),image_of([]).unwrap().view())
-    assert(sai_dma_due() == cpu.NEVER && sai_take_output(0).is_empty())
+    assert(sai_dma_due() == NEVER && sai_take_output(0).is_empty())
 
 @test("SAI DMA board: SAI underrun routes IRQ87 and clears through the real CLRFR register")
 sai_underrun_irq()
@@ -128,8 +266,8 @@ sai_underrun_irq()
 
 @test("SAI DMA board: DMA1 and DMA2 register banks remain independent and controller identities select mux channel ranges")
 sai_dma_instances()
-    val original = str_cast(embed("../../../../boards/stm32h747-disco.hocon"))
-    val both = replace_all(original,"      dma2 {","      dma1 { peripheral = stm32-dma, controller = 1, at = 0x40020000, irq = [11,12,13,14,15,16,17,47] }\n      dma2 {")
+    val original = h7_written_out(str_cast(embed("../../../../boards/stm32h747-disco.hocon")))
+    val both = replace_all(original,"    dma2     {","    dma1 { peripheral = stm32-dma, controller = 1, at = 0x40020000, irq = [11,12,13,14,15,16,17,47] }\n    dma2     {")
     assert(board_from("both-dmas.hocon",both.bytes).is_ok())
     boot(core0(),image_of([]).unwrap().view())
     board_write(core0(),0x4002002c,4,5,0)

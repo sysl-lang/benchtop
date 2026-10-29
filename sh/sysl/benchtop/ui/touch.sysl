@@ -3,56 +3,55 @@ module sh.sysl.benchtop.ui
 import sh.sysl.ui as ui
 import sh.sysl.ui_sdl as driver
 import sh.sysl.sdl3 as sdl
-import sh.sysl.benchtop.{ShowPart, part_model, part_whole}
+import sh.sysl.sdl3.c as native
+import sh.sysl.benchtop.{ShowPart, part_whole}
 import sh.sysl.benchtop.virt as virt
 import sysl.math.{min, max}
 
-// Borrowed SDL window handles; no ownership of the main driver window is taken.
-extern "SDL_GetWindowFromID" touch_window(id: u32) -> *u8
-extern "SDL_GetWindowSize" touch_window_size(window: *u8, w: *int, h: *int) -> bool
-extern "SDL_GetWindowSizeInPixels" touch_pixel_size(window: *u8, w: *int, h: *int) -> bool
-extern "SDL_GetWindowDisplayScale" touch_window_scale(window: *u8) -> f32
+/** What a drag that began on the board holds: nothing, a joystick, or a touch screen's glass (by
+ * its view element).
+ */
+enum Capture derives Eq
+    Free
+    Joystick(part: string)
+    Glass(element: string)
 
 private[ui] release_touch(d: &Desktop)
     virt.release_touches()
-    for p in d.scene.scope.parts
-        if p.kind != "joystick" then continue
-        for control in d.pots
-            if control.name == s"${p.name}.x" || control.name == s"${p.name}.y" then control.position.set(5000)
-    d.touch_capture.set("")
+    for p in d.scene.scope.parts do if look_of(p) == PartLook.Stick then d.session.set_part_input(p.name, virt.PartInput.Axes(virt.POSITION_CENTRE, virt.POSITION_CENTRE))
+    d.touch_capture.set(Capture.Free)
 
 /** Pointer capture keeps drags continuous, including release outside the glass.
  * The bezel never generates touches. Event handling also preserves fast clicks
  * whose down and up arrive before the next paint.
  */
 private[ui] pointer_touch(d: &Desktop, x: int, y: int, down: bool, begin: bool = false)
-    val st = d.current.read()
-    if !st.live || st.paused || st.stopped || !down
+    val session = d.session
+    if !session.live || session.paused || session.stopped || !down
         release_touch(d)
         return
-    if begin && d.board_rect.read().holds(x,y)
-        d.scene.scope.find(part_at(d.scene,d.board_rect.read(),x,y)) match
+    val board = d.board_rect.read()
+    if begin && board.holds(x,y)
+        d.scene.scope.find(part_at(d.scene,board,x,y)) match
             Some(p) ->
-                if p.kind == "switch"
-                    var changed = st
-                    toggle_switch(&changed,p)
-                    d.current.set(changed)
-                    sample_inputs(d.scene,changed)
+                if look_of(p) == PartLook.Toggle
+                    session.toggle(p.name)
+                    session.apply_inputs()
                     return
             None -> ()
-    val transform = board_transform(d.scene, d.board_rect.read())
+    val transform = board_transform(board)
     for element in d.scene.view.elements
         element.shows match
             ShowPart(name) -> d.scene.scope.find(name) match
                 Some(p) ->
-                    if p.kind != "joystick" then continue
+                    if look_of(p) != PartLook.Stick then continue
                     val (ex,ey,ew,eh) = coords(transform,element)
-                    val token = s"joystick:$name"
-                    if d.touch_capture.read().is_empty() && begin && d.board_rect.read().holds(x,y) && ui.Rect(ex,ey,ew,eh).holds(x,y) then d.touch_capture.set(token)
-                    if d.touch_capture.read() != token then continue
-                    for control in d.pots
-                        if control.name == s"$name.x" then control.position.set(max(0,min(10000,(x - ex - 20) * 10000 / max(1,ew - 40))))
-                        if control.name == s"$name.y" then control.position.set(max(0,min(10000,(y - ey - 20) * 10000 / max(1,eh - 40))))
+                    val box = ui.Rect(ex,ey,ew,eh)
+                    val held = Capture.Joystick(name)
+                    if d.touch_capture.read() == Capture.Free && begin && board.holds(x,y) && box.holds(x,y) then d.touch_capture.set(held)
+                    if d.touch_capture.read() != held then continue
+                    val (ax, ay) = stick_position(box, x, y)
+                    session.set_part_input(p.name, virt.PartInput.Axes(ax, ay))
                     return
                 None -> ()
             _ -> ()
@@ -62,16 +61,17 @@ private[ui] pointer_touch(d: &Desktop, x: int, y: int, down: bool, begin: bool =
             element.shows match
                 ShowPart(name) -> d.scene.scope.find(name) match
                     Some(part) ->
-                        if part_model(part) != "st7789" && part_model(part) != "mipi-dcs-display" then continue
+                        if look_of(part) != PartLook.Tft then continue
                         val (ex, ey, ew, eh) = coords(transform, element)
                         val density = d.pixel_scale.read()
                         val frame = native_tft_frame(ui.Rect(ex,ey,ew,eh),part,density)
                         val screen = tft_screen(frame,part,density)
                         if screen.w <= 0 || screen.h <= 0 then continue
-                        if d.touch_capture.read().is_empty()
-                            if !begin || !d.board_rect.read().holds(x,y) || !screen.holds(x, y) then continue
-                            d.touch_capture.set(element.name)
-                        if d.touch_capture.read() != element.name then continue
+                        val held = Capture.Glass(element.name)
+                        if d.touch_capture.read() == Capture.Free
+                            if !begin || !board.holds(x,y) || !screen.holds(x, y) then continue
+                            d.touch_capture.set(held)
+                        if d.touch_capture.read() != held then continue
                         d.scene.scope.find(binding.part) match
                             Some(touch) ->
                                 val (width, height) = virt.touch_dimensions(binding.part).unwrap_or((int(part_whole(touch, "width", 240)), int(part_whole(touch, "height", 240))))
@@ -83,12 +83,14 @@ private[ui] pointer_touch(d: &Desktop, x: int, y: int, down: bool, begin: bool =
                 _ -> ()
 
 private[ui] touch_event(d: &Desktop, e: sdl.Event, down: bool, begin: bool = false)
-    val window = touch_window(e.window_id())
+    // Only the event's window id is held here, so its size and scale are read through the borrowed
+    // handle; a `sdl.Window` would own (and destroy) the driver's window.
+    val window = native.get_window_from_id(e.window_id())
     if window == null then return
-    var ww: int = 0
-    var wh: int = 0
-    var pw: int = 0
-    var ph: int = 0
-    if !touch_window_size(window, &ww, &wh) || !touch_pixel_size(window, &pw, &ph) then return
-    val scale = driver.point_scale(ww, pw, driver.scale_of(touch_window_scale(window)))
+    var ww: i32 = 0
+    var wh: i32 = 0
+    var pw: i32 = 0
+    var ph: i32 = 0
+    if !native.get_window_size(window, &ww, &wh) || !native.get_window_size_in_pixels(window, &pw, &ph) then return
+    val scale = driver.point_scale(ww, pw, driver.scale_of(native.get_window_display_scale(window)))
     pointer_touch(d, int(real(e.mouse_x()) * scale), int(real(e.mouse_y()) * scale), down, begin)

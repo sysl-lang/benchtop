@@ -9,6 +9,10 @@ module sh.sysl.benchtop.v6m
 // `run` comes back at the first taken branch at or past `limit`, with `pc` and `retired` saved. A
 // stop (a breakpoint, an undefined instruction) returns at once, from the handler that stops; so does
 // an access that stops the core, from the slow path's branch of its handler.
+//
+// **`TIMED`** on a handler says the core counts cycles (`cpu.instruction_timing`): each handler that
+// can take more than one cycle has an instance that charges them and one that does not, and the
+// decoder gives a record the one its core needs (`handler_for`).
 
 // Run from `cpu.pc` until the budget is spent or the guest stops.
 run_threaded(cpu: *Cpu)
@@ -33,8 +37,8 @@ next(cpu: *Cpu, ip: *Insn, n: u64)
 // A taken branch to the record `to`. It has a handler's shape, so a branch handler `become`s it. A
 // branch that stopped the core (to an address off the RAM, or a fault) has set `pc` already.
 @inline
-jump[const TIMED: u32](cpu: *Cpu, to: *Insn, n: u64)
-    if (if TIMED != 0 then executed_cycles(cpu,n) else n) >= limit_of(cpu)
+jump[const TIMED: bool](cpu: *Cpu, to: *Insn, n: u64)
+    if (if TIMED then executed_cycles(cpu,n) else n) >= limit_of(cpu)
         if cpu.stop == Stop.Budget then cpu.pc = addr_of(cpu, to)
         cpu.retired = n
         return
@@ -42,7 +46,7 @@ jump[const TIMED: u32](cpu: *Cpu, to: *Insn, n: u64)
     become next(cpu, to, n)
 
 h_ram_boundary(cpu: *Cpu, ip: *Insn, n: u64)
-    become jump[1](cpu,insn_at(cpu,ip.imm),n)
+    become jump[true](cpu,insn_at(cpu,ip.imm),n)
 
 h_decode(cpu: *Cpu, ip: *Insn, n: u64)
     decode(cpu, addr_of(cpu, ip), ip)
@@ -53,503 +57,362 @@ h_undefined(cpu: *Cpu, ip: *Insn, n: u64) = stop_here(cpu, ip, n, Stop.Undefined
 
 h_outside(cpu: *Cpu, ip: *Insn, n: u64) = stop_here(cpu, ip, n, Stop.Unmapped)
 
-h_leave[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_leave[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     if !holds(cpu, ip.c) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
     leave(cpu, ip, n)
 
 h_bkpt(cpu: *Cpu, ip: *Insn, n: u64) = stop_here(cpu, ip, n, Stop.Breakpoint)
 
-h_nop(cpu: *Cpu, ip: *Insn, n: u64)
-    become next(cpu, &ip[1], n + 1)
-
 // The system instructions: each is a point where the budget is checked, as a taken branch to the
 // instruction after it. A barrier is also the host's (`barrier`).
-h_barrier[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_barrier[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     barrier(cpu)
     become jump[TIMED](cpu, &ip[2], n + 1)
 
-h_svc[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_svc[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     become jump[TIMED](cpu, svc(cpu, ip, n), n + 1)
 
-h_cps[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_cps[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     cps(cpu, ip)
     become jump[TIMED](cpu, &ip[1], n + 1)
 
-h_mrs[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_mrs[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     mrs(cpu, ip)
     become next(cpu, &ip[2], retire_timed[TIMED](cpu, ip, n))
 
-h_msr[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_msr[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     msr(cpu, ip)
     become jump[TIMED](cpu, &ip[2], retire_timed[TIMED](cpu, ip, n))
 
-h_wfi[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_wfi[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     wfi(cpu)
     become jump[TIMED](cpu, &ip[1], n + 1)
 
-h_lsl_imm(cpu: *Cpu, ip: *Insn, n: u64)
-    x_lsl_imm(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
+// ---------------------------------------------------------------------------------------------------
+// The two shapes most operations share, each one generic handler with the operation `OP` a constant
+// and `L` its records (1 for a 16-bit instruction, 2 for a 32-bit one): the body's `match` on `OP`
+// folds to the operation's one call, so each instance is that call and the jump to the next record.
+// It charges cycles only where the core counts them and some core can take more than one (`costed`).
 
-h_lsr_imm(cpu: *Cpu, ip: *Insn, n: u64)
-    x_lsr_imm(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
+// An operation that cannot stop the core.
+h_step[const OP: Op, const L: u32, const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
+    OP match
+        Nop | NopW -> ()
+        It -> cpu.it = ip.imm
+        ItAlu -> x_it_alu(cpu, ip)
+        LslImm -> x_lsl_imm(cpu, ip)
+        LsrImm -> x_lsr_imm(cpu, ip)
+        AsrImm -> x_asr_imm(cpu, ip)
+        AddsReg -> x_adds_reg(cpu, ip)
+        SubsReg -> x_subs_reg(cpu, ip)
+        AddsImm -> x_adds_imm(cpu, ip)
+        SubsImm -> x_subs_imm(cpu, ip)
+        MovsReg -> x_movs_reg(cpu, ip)
+        MovsImm -> x_movs_imm(cpu, ip)
+        CmpImm -> x_cmp_imm(cpu, ip)
+        Ands -> x_ands(cpu, ip)
+        Eors -> x_eors(cpu, ip)
+        LslsReg -> x_lsls_reg(cpu, ip)
+        LsrsReg -> x_lsrs_reg(cpu, ip)
+        AsrsReg -> x_asrs_reg(cpu, ip)
+        Adcs -> x_adcs(cpu, ip)
+        Sbcs -> x_sbcs(cpu, ip)
+        Rors -> x_rors(cpu, ip)
+        Tst -> x_tst(cpu, ip)
+        Negs -> x_negs(cpu, ip)
+        CmpReg -> x_cmp_reg(cpu, ip)
+        Cmn -> x_cmn(cpu, ip)
+        Orrs -> x_orrs(cpu, ip)
+        Muls -> x_muls(cpu, ip)
+        Bics -> x_bics(cpu, ip)
+        Mvns -> x_mvns(cpu, ip)
+        AddHi -> x_add_hi(cpu, ip)
+        MovHi -> x_mov_hi(cpu, ip)
+        AddImm -> x_add_imm(cpu, ip)
+        LoadConst -> x_load_const(cpu, ip)
+        Sxth -> x_sxth(cpu, ip)
+        Sxtb -> x_sxtb(cpu, ip)
+        Uxth -> x_uxth(cpu, ip)
+        Uxtb -> x_uxtb(cpu, ip)
+        Rev -> x_rev(cpu, ip)
+        Rev16 -> x_rev16(cpu, ip)
+        Revsh -> x_revsh(cpu, ip)
+        ShiftReg -> x_shift_reg(cpu, ip)
+        Movt -> x_movt(cpu, ip)
+        Bfi -> x_bfi(cpu, ip)
+        Bfc -> x_bfc(cpu, ip)
+        Ubfx -> x_ubfx(cpu, ip)
+        Sbfx -> x_sbfx(cpu, ip)
+        MulW -> x_mul_w(cpu, ip)
+        Ssat -> x_ssat(cpu, ip)
+        Usat -> x_usat(cpu, ip)
+        Csel -> x_csel(cpu, ip)
+        Clrex -> x_clrex(cpu)
+        Mla -> x_mla(cpu, ip)
+        Mls -> x_mls(cpu, ip)
+        Umull -> x_umull(cpu, ip)
+        Smull -> x_smull(cpu, ip)
+        Umlal -> x_umlal(cpu, ip)
+        Smlal -> x_smlal(cpu, ip)
+        _ -> trap()
 
-h_asr_imm(cpu: *Cpu, ip: *Insn, n: u64)
-    x_asr_imm(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
+    become next(cpu, &ip[L], retire_timed[TIMED && costed(OP)](cpu, ip, n))
 
-h_adds_reg(cpu: *Cpu, ip: *Insn, n: u64)
-    x_adds_reg(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
+// An operation whose access may stop the core, which then stops on the instruction with nothing after
+// it run.
+h_access[const OP: Op, const L: u32, const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
+    val done = OP match
+        LdrLit -> x_ldr_lit(cpu, ip, n)
+        StrReg -> x_str_reg(cpu, ip, n)
+        StrhReg -> x_strh_reg(cpu, ip, n)
+        StrbReg -> x_strb_reg(cpu, ip, n)
+        LdrsbReg -> x_ldrsb_reg(cpu, ip, n)
+        LdrReg -> x_ldr_reg(cpu, ip, n)
+        LdrhReg -> x_ldrh_reg(cpu, ip, n)
+        LdrbReg -> x_ldrb_reg(cpu, ip, n)
+        LdrshReg -> x_ldrsh_reg(cpu, ip, n)
+        StrImm -> x_str_imm(cpu, ip, n)
+        LdrImm -> x_ldr_imm(cpu, ip, n)
+        StrbImm -> x_strb_imm(cpu, ip, n)
+        LdrbImm -> x_ldrb_imm(cpu, ip, n)
+        StrhImm -> x_strh_imm(cpu, ip, n)
+        LdrhImm -> x_ldrh_imm(cpu, ip, n)
+        Push -> x_push(cpu, ip, n)
+        Pop -> x_pop(cpu, ip, n)
+        Stm -> x_stm(cpu, ip, n)
+        Ldm -> x_ldm(cpu, ip, n)
+        PushL -> x_push_l(cpu, ip, n)
+        SpImm | SpImmW -> x_sp_imm(cpu, ip)
+        SpReg -> x_sp_reg(cpu, ip)
+        SpRegW -> x_sp_reg_w(cpu, ip)
+        LdLit -> x_ld_lit(cpu, ip, n)
+        Ldrd -> x_ldrd(cpu, ip, n)
+        Strd -> x_strd(cpu, ip, n)
+        LdrdLit -> x_ldrd_lit(cpu, ip, n)
+        LdmW -> x_ldm_w(cpu, ip, n)
+        StmW -> x_stm_w(cpu, ip, n)
+        Ldrex -> x_ldrex(cpu, ip, n)
+        Strex -> x_strex(cpu, ip, n)
+        Lda -> x_lda(cpu, ip, n)
+        Stl -> x_stl(cpu, ip, n)
+        Udiv -> x_udiv(cpu, ip)
+        Sdiv -> x_sdiv(cpu, ip)
+        _ -> trap()
 
-h_subs_reg(cpu: *Cpu, ip: *Insn, n: u64)
-    x_subs_reg(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_adds_imm(cpu: *Cpu, ip: *Insn, n: u64)
-    x_adds_imm(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_subs_imm(cpu: *Cpu, ip: *Insn, n: u64)
-    x_subs_imm(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_movs_reg(cpu: *Cpu, ip: *Insn, n: u64)
-    x_movs_reg(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_movs_imm(cpu: *Cpu, ip: *Insn, n: u64)
-    x_movs_imm(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_cmp_imm(cpu: *Cpu, ip: *Insn, n: u64)
-    x_cmp_imm(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_ands(cpu: *Cpu, ip: *Insn, n: u64)
-    x_ands(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_eors(cpu: *Cpu, ip: *Insn, n: u64)
-    x_eors(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_lsls_reg(cpu: *Cpu, ip: *Insn, n: u64)
-    x_lsls_reg(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_lsrs_reg(cpu: *Cpu, ip: *Insn, n: u64)
-    x_lsrs_reg(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_asrs_reg(cpu: *Cpu, ip: *Insn, n: u64)
-    x_asrs_reg(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_adcs(cpu: *Cpu, ip: *Insn, n: u64)
-    x_adcs(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_sbcs(cpu: *Cpu, ip: *Insn, n: u64)
-    x_sbcs(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_rors(cpu: *Cpu, ip: *Insn, n: u64)
-    x_rors(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_tst(cpu: *Cpu, ip: *Insn, n: u64)
-    x_tst(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_negs(cpu: *Cpu, ip: *Insn, n: u64)
-    x_negs(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_cmp_reg(cpu: *Cpu, ip: *Insn, n: u64)
-    x_cmp_reg(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_cmn(cpu: *Cpu, ip: *Insn, n: u64)
-    x_cmn(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_orrs(cpu: *Cpu, ip: *Insn, n: u64)
-    x_orrs(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_muls(cpu: *Cpu, ip: *Insn, n: u64)
-    x_muls(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_bics(cpu: *Cpu, ip: *Insn, n: u64)
-    x_bics(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_mvns(cpu: *Cpu, ip: *Insn, n: u64)
-    x_mvns(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_add_hi(cpu: *Cpu, ip: *Insn, n: u64)
-    x_add_hi(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_mov_hi(cpu: *Cpu, ip: *Insn, n: u64)
-    x_mov_hi(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_add_imm(cpu: *Cpu, ip: *Insn, n: u64)
-    x_add_imm(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_load_const(cpu: *Cpu, ip: *Insn, n: u64)
-    x_load_const(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-// The loads and stores: an access that stops the core leaves the handler on its slow path, the core
-// stopped on the instruction, and nothing after it run.
-h_ldr_lit[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldr_lit(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_str_reg[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_str_reg(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_strh_reg[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_strh_reg(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_strb_reg[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_strb_reg(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_ldrsb_reg[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldrsb_reg(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_ldr_reg[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldr_reg(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_ldrh_reg[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldrh_reg(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_ldrb_reg[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldrb_reg(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_ldrsh_reg[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldrsh_reg(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_str_imm[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_str_imm(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_ldr_imm[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldr_imm(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_strb_imm[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_strb_imm(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_ldrb_imm[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldrb_imm(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_strh_imm[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_strh_imm(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_ldrh_imm[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldrh_imm(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_sxth(cpu: *Cpu, ip: *Insn, n: u64)
-    x_sxth(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_sxtb(cpu: *Cpu, ip: *Insn, n: u64)
-    x_sxtb(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_uxth(cpu: *Cpu, ip: *Insn, n: u64)
-    x_uxth(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_uxtb(cpu: *Cpu, ip: *Insn, n: u64)
-    x_uxtb(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_rev(cpu: *Cpu, ip: *Insn, n: u64)
-    x_rev(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_rev16(cpu: *Cpu, ip: *Insn, n: u64)
-    x_rev16(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_revsh(cpu: *Cpu, ip: *Insn, n: u64)
-    x_revsh(cpu, ip)
-    become next(cpu, &ip[1], n + 1)
-
-h_push[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_push(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_pop[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_pop(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_stm[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_stm(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
-    stop_access(cpu, ip, n)
-
-h_ldm[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
-    if x_ldm(cpu, ip, n) then become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
+    if done then become next(cpu, &ip[L], retire_timed[TIMED && costed(OP)](cpu, ip, n))
     stop_access(cpu, ip, n)
 
 // ---------------------------------------------------------------------------------------------------
 // Branches. `POP {pc}` and `BX` are the two that return from an exception, in `branch_to`'s slow path.
 
-h_pop_pc[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_pop_pc[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     x_pop_pc(cpu, ip, n) match
         Some(target) -> become jump[TIMED](cpu, branch_to(cpu, target, ip, n), retire_timed[TIMED](cpu, ip, n))
         None -> stop_access(cpu, ip, n)
 
-h_mov_pc[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_mov_pc[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     become jump[TIMED](cpu, insn_at(cpu, (cpu.r[ip.b] + ip.imm) & ~1), n + 1)
 
-h_bx[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_bx[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     become jump[TIMED](cpu, branch_to(cpu, cpu.r[ip.b], ip, n), retire_timed[TIMED](cpu, ip, n))
 
-h_blx[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_blx[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     val to = insn_at(cpu, cpu.r[ip.b] & ~1)
 
     cpu.r[14] = (addr_of(cpu, ip) + 2) | 1
 
     become jump[TIMED](cpu, to, retire_timed[TIMED](cpu, ip, n))
 
-h_b[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_b[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     become jump[TIMED](cpu, target_of(ip), retire_timed[TIMED](cpu, ip, n))
 
-h_bl[const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_bl[const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     cpu.r[14] = (addr_of(cpu, ip) + 4) | 1
 
     become jump[TIMED](cpu, target_of(ip), retire_timed[TIMED](cpu, ip, n))
 
 // A conditional branch, with its condition a value parameter: each of the fourteen is its own handler
 // with the test compiled in.
-h_bcond[const K: u32, const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_bcond[const K: u32, const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     if holds(cpu, K) then become jump[TIMED](cpu, target_of(ip), retire_timed[TIMED](cpu, ip, n))
     become next(cpu, &ip[1], retire_timed[TIMED](cpu, ip, n))
 
 // A compare and the conditional branch after it, as `fuse` pairs them: the flags are set exactly as
 // the compare sets them, the target is the branch record's, and the pair retires two instructions.
-h_cmp_imm_bcond[const K: u32, const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_cmp_imm_bcond[const K: u32, const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     x_cmp_imm(cpu, ip)
     if holds(cpu, K) then become jump[TIMED](cpu, target_of(&ip[1]), retire_timed[TIMED](cpu, &ip[1], n + 1))
     become next(cpu, &ip[2], retire_timed[TIMED](cpu, &ip[1], n + 1))
 
-h_cmp_reg_bcond[const K: u32, const TIMED: u32](cpu: *Cpu, ip: *Insn, n: u64)
+h_cmp_reg_bcond[const K: u32, const TIMED: bool](cpu: *Cpu, ip: *Insn, n: u64)
     x_cmp_reg(cpu, ip)
     if holds(cpu, K) then become jump[TIMED](cpu, target_of(&ip[1]), retire_timed[TIMED](cpu, &ip[1], n + 1))
     become next(cpu, &ip[2], retire_timed[TIMED](cpu, &ip[1], n + 1))
 
-// The fused handler for a compare `op` followed by a branch on `cond`.
-fused_handler_of_timing[const TIMED: u32](op: Op, cond: u32) -> Handler
-    if op == Op.CmpImm
-        return cond match
-            0 -> &h_cmp_imm_bcond[0, TIMED]
-            1 -> &h_cmp_imm_bcond[1, TIMED]
-            2 -> &h_cmp_imm_bcond[2, TIMED]
-            3 -> &h_cmp_imm_bcond[3, TIMED]
-            4 -> &h_cmp_imm_bcond[4, TIMED]
-            5 -> &h_cmp_imm_bcond[5, TIMED]
-            6 -> &h_cmp_imm_bcond[6, TIMED]
-            7 -> &h_cmp_imm_bcond[7, TIMED]
-            8 -> &h_cmp_imm_bcond[8, TIMED]
-            9 -> &h_cmp_imm_bcond[9, TIMED]
-            10 -> &h_cmp_imm_bcond[10, TIMED]
-            11 -> &h_cmp_imm_bcond[11, TIMED]
-            12 -> &h_cmp_imm_bcond[12, TIMED]
-            _ -> &h_cmp_imm_bcond[13, TIMED]
+// ---------------------------------------------------------------------------------------------------
+// Choosing a record's handler.
 
-    cond match
-        0 -> &h_cmp_reg_bcond[0, TIMED]
-        1 -> &h_cmp_reg_bcond[1, TIMED]
-        2 -> &h_cmp_reg_bcond[2, TIMED]
-        3 -> &h_cmp_reg_bcond[3, TIMED]
-        4 -> &h_cmp_reg_bcond[4, TIMED]
-        5 -> &h_cmp_reg_bcond[5, TIMED]
-        6 -> &h_cmp_reg_bcond[6, TIMED]
-        7 -> &h_cmp_reg_bcond[7, TIMED]
-        8 -> &h_cmp_reg_bcond[8, TIMED]
-        9 -> &h_cmp_reg_bcond[9, TIMED]
-        10 -> &h_cmp_reg_bcond[10, TIMED]
-        11 -> &h_cmp_reg_bcond[11, TIMED]
-        12 -> &h_cmp_reg_bcond[12, TIMED]
-        _ -> &h_cmp_reg_bcond[13, TIMED]
+// The handler a decoded record runs on `cpu`: the one made for its operation where its case is a
+// family (`handler_at`), timed where the core counts cycles. The one place the decoder asks.
+handler_for(cpu: *Cpu, ip: *Insn) -> Handler =
+    if cpu.instruction_timing then handler_at[true](ip) else handler_at[false](ip)
 
-// The handler for each case.
-handler_of_timing[const TIMED: u32](op: Op) -> Handler = op match
-    Undecoded -> &h_decode
-    Undefined -> &h_undefined
-    Outside -> &h_outside
-    Leave -> &h_leave[TIMED]
-    Bkpt -> &h_bkpt
-    Nop -> &h_nop
-    Barrier -> &h_barrier[TIMED]
-    Svc -> &h_svc[TIMED]
-    Cps -> &h_cps[TIMED]
-    Mrs -> &h_mrs[TIMED]
-    Msr -> &h_msr[TIMED]
-    Wfi -> &h_wfi[TIMED]
-    LslImm -> &h_lsl_imm
-    LsrImm -> &h_lsr_imm
-    AsrImm -> &h_asr_imm
-    AddsReg -> &h_adds_reg
-    SubsReg -> &h_subs_reg
-    AddsImm -> &h_adds_imm
-    SubsImm -> &h_subs_imm
-    MovsReg -> &h_movs_reg
-    MovsImm -> &h_movs_imm
-    CmpImm -> &h_cmp_imm
-    Ands -> &h_ands
-    Eors -> &h_eors
-    LslsReg -> &h_lsls_reg
-    LsrsReg -> &h_lsrs_reg
-    AsrsReg -> &h_asrs_reg
-    Adcs -> &h_adcs
-    Sbcs -> &h_sbcs
-    Rors -> &h_rors
-    Tst -> &h_tst
-    Negs -> &h_negs
-    CmpReg -> &h_cmp_reg
-    Cmn -> &h_cmn
-    Orrs -> &h_orrs
-    Muls -> &h_muls
-    Bics -> &h_bics
-    Mvns -> &h_mvns
-    AddHi -> &h_add_hi
-    MovHi -> &h_mov_hi
-    AddImm -> &h_add_imm
-    LoadConst -> &h_load_const
-    LdrLit -> &h_ldr_lit[TIMED]
-    MovPc | AddPc -> &h_mov_pc[TIMED]
-    Bx -> &h_bx[TIMED]
-    Blx -> &h_blx[TIMED]
-    B -> &h_b[TIMED]
-    Bl -> &h_bl[TIMED]
-    Beq -> &h_bcond[0, TIMED]
-    Bne -> &h_bcond[1, TIMED]
-    Bcs -> &h_bcond[2, TIMED]
-    Bcc -> &h_bcond[3, TIMED]
-    Bmi -> &h_bcond[4, TIMED]
-    Bpl -> &h_bcond[5, TIMED]
-    Bvs -> &h_bcond[6, TIMED]
-    Bvc -> &h_bcond[7, TIMED]
-    Bhi -> &h_bcond[8, TIMED]
-    Bls -> &h_bcond[9, TIMED]
-    Bge -> &h_bcond[10, TIMED]
-    Blt -> &h_bcond[11, TIMED]
-    Bgt -> &h_bcond[12, TIMED]
-    Ble -> &h_bcond[13, TIMED]
-    StrReg -> &h_str_reg[TIMED]
-    StrhReg -> &h_strh_reg[TIMED]
-    StrbReg -> &h_strb_reg[TIMED]
-    LdrsbReg -> &h_ldrsb_reg[TIMED]
-    LdrReg -> &h_ldr_reg[TIMED]
-    LdrhReg -> &h_ldrh_reg[TIMED]
-    LdrbReg -> &h_ldrb_reg[TIMED]
-    LdrshReg -> &h_ldrsh_reg[TIMED]
-    StrImm -> &h_str_imm[TIMED]
-    LdrImm -> &h_ldr_imm[TIMED]
-    StrbImm -> &h_strb_imm[TIMED]
-    LdrbImm -> &h_ldrb_imm[TIMED]
-    StrhImm -> &h_strh_imm[TIMED]
-    LdrhImm -> &h_ldrh_imm[TIMED]
-    Sxth -> &h_sxth
-    Sxtb -> &h_sxtb
-    Uxth -> &h_uxth
-    Uxtb -> &h_uxtb
-    Rev -> &h_rev
-    Rev16 -> &h_rev16
-    Revsh -> &h_revsh
-    Push -> &h_push[TIMED]
-    Pop -> &h_pop[TIMED]
-    PopPc -> &h_pop_pc[TIMED]
-    Stm -> &h_stm[TIMED]
-    Ldm -> &h_ldm[TIMED]
-    It -> &h_it
-    Cbz -> &h_cbz[TIMED]
-    Cbnz -> &h_cbnz[TIMED]
-    ItAlu -> &h_it_alu
-    PushL -> &h_push_l[TIMED]
-    SpImm -> &h_sp_imm
-    SpReg -> &h_sp_reg
-    DpImm -> &h_dp_imm_any
-    LogicImm -> &h_logic_imm_any
-    LogicImmC -> &h_logic_imm_c_any
-    DpReg -> &h_dp_reg_any
-    ShiftReg -> &h_shift_reg
-    Csel -> &h_csel
-    Dsp -> &h_dsp
-    FpData -> &h_fp_any[TIMED]
-    FpLdr -> &h_fp_ldr[TIMED]
-    FpLdrLit -> &h_fp_ldr_lit[TIMED]
-    FpMulti -> &h_fp_multi[TIMED]
-    FpMove -> &h_fp_move[TIMED]
-    Movt -> &h_movt
-    Bfi -> &h_bfi
-    Bfc -> &h_bfc
-    Ubfx -> &h_ubfx
-    Sbfx -> &h_sbfx
-    BitOp -> &h_bit_op_any
-    Extend -> &h_extend_any
-    MulW -> &h_mul_w
-    Mla -> &h_mla[TIMED]
-    Mls -> &h_mls[TIMED]
-    Umull -> &h_umull[TIMED]
-    Smull -> &h_smull[TIMED]
-    Umlal -> &h_umlal[TIMED]
-    Smlal -> &h_smlal[TIMED]
-    Udiv -> &h_udiv[TIMED]
-    Sdiv -> &h_sdiv[TIMED]
-    Ssat -> &h_ssat
-    Usat -> &h_usat
-    LdImm -> &h_ld_imm_any[TIMED]
-    LdWb -> &h_ld_wb_any[TIMED]
-    LdReg -> &h_ld_reg_any[TIMED]
-    LdLit -> &h_ld_lit[TIMED]
-    LdPc -> &h_ld_pc[TIMED]
-    Ldrd -> &h_ldrd[TIMED]
-    Strd -> &h_strd[TIMED]
-    LdrdLit -> &h_ldrd_lit[TIMED]
-    LdmW -> &h_ldm_w[TIMED]
-    StmW -> &h_stm_w[TIMED]
-    LdmPc -> &h_ldm_pc[TIMED]
-    Ldrex -> &h_ldrex[TIMED]
-    Strex -> &h_strex[TIMED]
-    Clrex -> &h_clrex
-    Lda -> &h_lda[TIMED]
-    Stl -> &h_stl[TIMED]
-    Tbb -> &h_tbb[TIMED]
-    Tbh -> &h_tbh[TIMED]
-    BcondW -> &h_bcond_w_any[TIMED]
-    LeaveW -> &h_leave_w[TIMED]
-    Mrs8 -> &h_mrs8[TIMED]
-    Msr8 -> &h_msr8[TIMED]
-    Cps8 -> &h_cps8[TIMED]
-    NopW -> &h_nop_w
-    WfiW -> &h_wfi_w[TIMED]
-    SpImmW -> &h_sp_imm_w
-    SpRegW -> &h_sp_reg_w
+// The fused handler for a compare `op` followed by a branch on `cond` (`fuse`).
+fused_handler_for(cpu: *Cpu, op: Op, cond: u32) -> Handler =
+    if cpu.instruction_timing then fused_handler_of[true](op, cond) else fused_handler_of[false](op, cond)
 
-// Unit handlers have no cycle-accounting branch in their instruction paths.
-handler_of(op: Op) -> Handler = handler_of_timing[0](op)
-fused_handler_of(op: Op, cond: u32) -> Handler = fused_handler_of_timing[0](op,cond)
+private fused_handler_of[const TIMED: bool](op: Op, cond: u32) -> Handler
+    for const k in 0..<13
+        if cond == k then return if op == Op.CmpImm then &h_cmp_imm_bcond[k, TIMED] else &h_cmp_reg_bcond[k, TIMED]
+
+    if op == Op.CmpImm then &h_cmp_imm_bcond[13, TIMED] else &h_cmp_reg_bcond[13, TIMED]
+
+// The handler for operation `op` alone, reading any family's operation from the record.
+handler_of[const TIMED: bool](op: Op) -> Handler
+    op match
+        Nop -> &h_step[Op.Nop, 1, TIMED]
+        It -> &h_step[Op.It, 1, TIMED]
+        ItAlu -> &h_step[Op.ItAlu, 1, TIMED]
+        LslImm -> &h_step[Op.LslImm, 1, TIMED]
+        LsrImm -> &h_step[Op.LsrImm, 1, TIMED]
+        AsrImm -> &h_step[Op.AsrImm, 1, TIMED]
+        AddsReg -> &h_step[Op.AddsReg, 1, TIMED]
+        SubsReg -> &h_step[Op.SubsReg, 1, TIMED]
+        AddsImm -> &h_step[Op.AddsImm, 1, TIMED]
+        SubsImm -> &h_step[Op.SubsImm, 1, TIMED]
+        MovsReg -> &h_step[Op.MovsReg, 1, TIMED]
+        MovsImm -> &h_step[Op.MovsImm, 1, TIMED]
+        CmpImm -> &h_step[Op.CmpImm, 1, TIMED]
+        Ands -> &h_step[Op.Ands, 1, TIMED]
+        Eors -> &h_step[Op.Eors, 1, TIMED]
+        LslsReg -> &h_step[Op.LslsReg, 1, TIMED]
+        LsrsReg -> &h_step[Op.LsrsReg, 1, TIMED]
+        AsrsReg -> &h_step[Op.AsrsReg, 1, TIMED]
+        Adcs -> &h_step[Op.Adcs, 1, TIMED]
+        Sbcs -> &h_step[Op.Sbcs, 1, TIMED]
+        Rors -> &h_step[Op.Rors, 1, TIMED]
+        Tst -> &h_step[Op.Tst, 1, TIMED]
+        Negs -> &h_step[Op.Negs, 1, TIMED]
+        CmpReg -> &h_step[Op.CmpReg, 1, TIMED]
+        Cmn -> &h_step[Op.Cmn, 1, TIMED]
+        Orrs -> &h_step[Op.Orrs, 1, TIMED]
+        Muls -> &h_step[Op.Muls, 1, TIMED]
+        Bics -> &h_step[Op.Bics, 1, TIMED]
+        Mvns -> &h_step[Op.Mvns, 1, TIMED]
+        AddHi -> &h_step[Op.AddHi, 1, TIMED]
+        MovHi -> &h_step[Op.MovHi, 1, TIMED]
+        AddImm -> &h_step[Op.AddImm, 1, TIMED]
+        LoadConst -> &h_step[Op.LoadConst, 1, TIMED]
+        Sxth -> &h_step[Op.Sxth, 1, TIMED]
+        Sxtb -> &h_step[Op.Sxtb, 1, TIMED]
+        Uxth -> &h_step[Op.Uxth, 1, TIMED]
+        Uxtb -> &h_step[Op.Uxtb, 1, TIMED]
+        Rev -> &h_step[Op.Rev, 1, TIMED]
+        Rev16 -> &h_step[Op.Rev16, 1, TIMED]
+        Revsh -> &h_step[Op.Revsh, 1, TIMED]
+        NopW -> &h_step[Op.NopW, 2, TIMED]
+        ShiftReg -> &h_step[Op.ShiftReg, 2, TIMED]
+        Movt -> &h_step[Op.Movt, 2, TIMED]
+        Bfi -> &h_step[Op.Bfi, 2, TIMED]
+        Bfc -> &h_step[Op.Bfc, 2, TIMED]
+        Ubfx -> &h_step[Op.Ubfx, 2, TIMED]
+        Sbfx -> &h_step[Op.Sbfx, 2, TIMED]
+        MulW -> &h_step[Op.MulW, 2, TIMED]
+        Ssat -> &h_step[Op.Ssat, 2, TIMED]
+        Usat -> &h_step[Op.Usat, 2, TIMED]
+        Csel -> &h_step[Op.Csel, 2, TIMED]
+        Clrex -> &h_step[Op.Clrex, 2, TIMED]
+        Mla -> &h_step[Op.Mla, 2, TIMED]
+        Mls -> &h_step[Op.Mls, 2, TIMED]
+        Umull -> &h_step[Op.Umull, 2, TIMED]
+        Smull -> &h_step[Op.Smull, 2, TIMED]
+        Umlal -> &h_step[Op.Umlal, 2, TIMED]
+        Smlal -> &h_step[Op.Smlal, 2, TIMED]
+        LdrLit -> &h_access[Op.LdrLit, 1, TIMED]
+        StrReg -> &h_access[Op.StrReg, 1, TIMED]
+        StrhReg -> &h_access[Op.StrhReg, 1, TIMED]
+        StrbReg -> &h_access[Op.StrbReg, 1, TIMED]
+        LdrsbReg -> &h_access[Op.LdrsbReg, 1, TIMED]
+        LdrReg -> &h_access[Op.LdrReg, 1, TIMED]
+        LdrhReg -> &h_access[Op.LdrhReg, 1, TIMED]
+        LdrbReg -> &h_access[Op.LdrbReg, 1, TIMED]
+        LdrshReg -> &h_access[Op.LdrshReg, 1, TIMED]
+        StrImm -> &h_access[Op.StrImm, 1, TIMED]
+        LdrImm -> &h_access[Op.LdrImm, 1, TIMED]
+        StrbImm -> &h_access[Op.StrbImm, 1, TIMED]
+        LdrbImm -> &h_access[Op.LdrbImm, 1, TIMED]
+        StrhImm -> &h_access[Op.StrhImm, 1, TIMED]
+        LdrhImm -> &h_access[Op.LdrhImm, 1, TIMED]
+        Push -> &h_access[Op.Push, 1, TIMED]
+        Pop -> &h_access[Op.Pop, 1, TIMED]
+        Stm -> &h_access[Op.Stm, 1, TIMED]
+        Ldm -> &h_access[Op.Ldm, 1, TIMED]
+        PushL -> &h_access[Op.PushL, 1, TIMED]
+        SpImm -> &h_access[Op.SpImm, 1, TIMED]
+        SpReg -> &h_access[Op.SpReg, 1, TIMED]
+        LdLit -> &h_access[Op.LdLit, 2, TIMED]
+        Ldrd -> &h_access[Op.Ldrd, 2, TIMED]
+        Strd -> &h_access[Op.Strd, 2, TIMED]
+        LdrdLit -> &h_access[Op.LdrdLit, 2, TIMED]
+        LdmW -> &h_access[Op.LdmW, 2, TIMED]
+        StmW -> &h_access[Op.StmW, 2, TIMED]
+        Ldrex -> &h_access[Op.Ldrex, 2, TIMED]
+        Strex -> &h_access[Op.Strex, 2, TIMED]
+        Lda -> &h_access[Op.Lda, 2, TIMED]
+        Stl -> &h_access[Op.Stl, 2, TIMED]
+        Udiv -> &h_access[Op.Udiv, 2, TIMED]
+        Sdiv -> &h_access[Op.Sdiv, 2, TIMED]
+        SpImmW -> &h_access[Op.SpImmW, 2, TIMED]
+        SpRegW -> &h_access[Op.SpRegW, 2, TIMED]
+        Undecoded -> &h_decode
+        Undefined -> &h_undefined
+        Outside -> &h_outside
+        Leave -> &h_leave[TIMED]
+        Bkpt -> &h_bkpt
+        Barrier -> &h_barrier[TIMED]
+        Svc -> &h_svc[TIMED]
+        Cps -> &h_cps[TIMED]
+        Mrs -> &h_mrs[TIMED]
+        Msr -> &h_msr[TIMED]
+        Wfi -> &h_wfi[TIMED]
+        MovPc | AddPc -> &h_mov_pc[TIMED]
+        Bx -> &h_bx[TIMED]
+        Blx -> &h_blx[TIMED]
+        B -> &h_b[TIMED]
+        Bl -> &h_bl[TIMED]
+        Beq | Bne | Bcs | Bcc | Bmi | Bpl | Bvs | Bvc | Bhi | Bls | Bge | Blt | Bgt | Ble -> bcond_handler[TIMED](u32(u8(op) - u8(Op.Beq)))
+        PopPc -> &h_pop_pc[TIMED]
+        Cbz -> &h_cbz[TIMED]
+        Cbnz -> &h_cbnz[TIMED]
+        DpImm -> &h_dp_imm_any
+        LogicImm -> &h_logic_imm_any
+        LogicImmC -> &h_logic_imm_c_any
+        DpReg -> &h_dp_reg_any
+        Dsp -> &h_dsp
+        FpData -> &h_fp_any[TIMED]
+        FpLdr -> &h_fp_ldr[TIMED]
+        FpLdrLit -> &h_fp_ldr_lit[TIMED]
+        FpMulti -> &h_fp_multi[TIMED]
+        FpMove -> &h_fp_move[TIMED]
+        BitOp -> &h_bit_op_any
+        Extend -> &h_extend_any
+        LdImm -> &h_ld_imm_any[TIMED]
+        LdWb -> &h_ld_wb_any[TIMED]
+        LdReg -> &h_ld_reg_any[TIMED]
+        LdPc -> &h_ld_pc[TIMED]
+        LdmPc -> &h_ldm_pc[TIMED]
+        Tbb -> &h_tbb[TIMED]
+        Tbh -> &h_tbh[TIMED]
+        BcondW -> &h_bcond_w_any[TIMED]
+        LeaveW -> &h_leave_w[TIMED]
+        Mrs8 -> &h_mrs8[TIMED]
+        Msr8 -> &h_msr8[TIMED]
+        Cps8 -> &h_cps8[TIMED]
+        WfiW -> &h_wfi_w[TIMED]
+
+// The `B<cond>` handler for condition `k` (0..13).
+private bcond_handler[const TIMED: bool](k: u32) -> Handler
+    for const c in 0..<13
+        if k == c then return &h_bcond[c, TIMED]
+
+    &h_bcond[13, TIMED]

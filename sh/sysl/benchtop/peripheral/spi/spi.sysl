@@ -1,8 +1,25 @@
 module sh.sysl.benchtop.peripheral.spi
 
+import sysl.container.ring.InlineRing
+import sh.sysl.benchtop.timing.NEVER
+
+/** The most FIFO entries a controller may be configured with. */
+const MAX_FIFO: usize = 64
+
+// PL022 SSPCR0: DSS, the data size less one (7 for eight bits); SPO, the clock's idle level; SPH,
+// sampling on the second edge.
+const CR0_DSS_MASK: u32 = 15
+const CR0_DSS_8BIT: u32 = 7
+const CR0_SPO: u32 = 1 << 6
+const CR0_SPH: u32 = 1 << 7
+// PL022 SSPCR1: LBM loops the output back; SSE enables the port.
+const CR1_LBM: u32 = 1
+const CR1_SSE: u32 = 1 << 1
+
 /** PL022 master in Motorola SPI modes 0..3, 4..16 bits, with eight-entry
  * transmit/receive FIFOs. Time is in input-clock ticks. Each callback observes
  * an actual SCK/MOSI transition and returns MISO. No framebuffer shortcuts.
+ * The FIFOs hold `capacity` entries, which the storage bounds at `MAX_FIFO`.
  */
 struct Controller
     cr0: u32
@@ -10,12 +27,8 @@ struct Controller
     cpsr: u32
     mask: u32
     dma: u32
-    tx: [64]u16
-    tx_head: usize
-    tx_count: usize
-    rx: [64]u16
-    rx_head: usize
-    rx_count: usize
+    tx: InlineRing[u16, MAX_FIFO]
+    rx: InlineRing[u16, MAX_FIFO]
     shifting: bool
     word: u16
     received: u16
@@ -29,24 +42,26 @@ struct Controller
     capacity: usize
 
 controller(capacity: usize = 8) -> Controller
-    require capacity > 0 && capacity <= 64 && capacity & (capacity - 1) == 0, "power-of-two SPI FIFO capacity"
-    Controller(0,0,0,0,0,[0;64],0,0,[0;64],0,0,false,0,0,0,0,0,0,false,false,false,capacity)
+    require capacity > 0 && capacity <= MAX_FIFO && capacity & (capacity - 1) == 0, "power-of-two SPI FIFO capacity"
+    var c: Controller
+    c.capacity = capacity
+    c
 
 reset(c: *Controller) = *c = controller(c.capacity)
 
-enabled(c: Controller) -> bool = (c.cr1 & 2) != 0
-private bits(c: Controller) -> u32 = (c.cr0 & 15) + 1
+enabled(c: Controller) -> bool = (c.cr1 & CR1_SSE) != 0
+private bits(c: Controller) -> u32 = (c.cr0 & CR0_DSS_MASK) + 1
 private half(c: Controller) -> u64 = u64(c.cpsr) * u64(((c.cr0 >> 8) & 255) + 1) / 2
-private polarity(c: Controller) -> bool = (c.cr0 & 64) != 0
-private phase(c: Controller) -> bool = (c.cr0 & 128) != 0
+private polarity(c: Controller) -> bool = (c.cr0 & CR0_SPO) != 0
+private phase(c: Controller) -> bool = (c.cr0 & CR0_SPH) != 0
 
 kick(c: *Controller) = start(c,c.time)
 
 private start(c: *Controller, time: u64)
-    if c.shifting || !enabled(*c) || c.tx_count == 0 then return
-    c.word = c.tx[c.tx_head]
-    c.tx_head = (c.tx_head + 1) & (c.capacity - 1)
-    c.tx_count -= 1
+    if c.shifting || !enabled(*c) then return
+    c.word = c.tx.pop_front() match
+        Some(word) -> word
+        None -> return
     c.received = 0
     c.edges = 0
     c.shifting = true
@@ -68,14 +83,12 @@ advance(c: *Controller, time: u64, pins: &Fn(bool,bool,u64) -> bool)
             c.mosi = (u32(c.word) & (1u32 << (bits(*c) - 1 - bit))) != 0
         val input = (pins)(c.sck, c.mosi, at)
         if leading != phase(*c)
-            c.received = (c.received << 1) | (if (c.cr1 & 1) != 0 then (if c.mosi then 1u16 else 0u16) else if input then 1u16 else 0u16)
+            c.received = (c.received << 1) | (if (c.cr1 & CR1_LBM) != 0 then (if c.mosi then 1u16 else 0u16) else if input then 1u16 else 0u16)
         c.edges += 1
         c.next = at + half(*c)
         if c.edges == 2 * bits(*c)
-            if c.rx_count == c.capacity then c.overrun = true
-            else
-                c.rx[(c.rx_head + c.rx_count) & (c.capacity - 1)] = c.received
-                c.rx_count += 1
+            if c.rx.len() == c.capacity then c.overrun = true
+            else c.rx.push_back(c.received)
             c.timeout = at + 64 * half(*c)
             c.shifting = false
             start(c, at)
@@ -86,38 +99,35 @@ advance(c: *Controller, time: u64, pins: &Fn(bool,bool,u64) -> bool)
     c.time = time
 
 status(c: Controller) -> u32 =
-    (if c.tx_count == 0 then 1u32 else 0u32) |
-    (if c.tx_count < c.capacity then 2u32 else 0u32) |
-    (if c.rx_count > 0 then 4u32 else 0u32) |
-    (if c.rx_count == c.capacity then 8u32 else 0u32) |
-    (if c.shifting || c.tx_count != 0 then 16u32 else 0u32)
+    (if c.tx.is_empty() then 1u32 else 0u32) |
+    (if c.tx.len() < c.capacity then 2u32 else 0u32) |
+    (if c.rx.is_empty() then 0u32 else 4u32) |
+    (if c.rx.len() == c.capacity then 8u32 else 0u32) |
+    (if c.shifting || !c.tx.is_empty() then 16u32 else 0u32)
 
 raw_irq(c: Controller) -> u32 =
     (if c.overrun then 1u32 else 0u32) |
-    (if c.rx_count > 0 && c.timeout <= c.time then 2u32 else 0u32) |
-    (if c.rx_count >= 4 then 4u32 else 0u32) |
-    (if c.tx_count <= 4 then 8u32 else 0u32)
+    (if !c.rx.is_empty() && c.timeout <= c.time then 2u32 else 0u32) |
+    (if c.rx.len() >= 4 then 4u32 else 0u32) |
+    (if c.tx.len() <= 4 then 8u32 else 0u32)
 
 irq(c: Controller) -> bool = (raw_irq(c) & c.mask) != 0
 
 /** The next externally visible FIFO/interrupt change, not every internal edge. */
 due(c: Controller) -> Option[u64]
-    val word = if c.shifting then c.next + u64(2 * bits(c) - c.edges - 1) * half(c) else 0xFFFFFFFFFFFFFFFFu64
-    val timeout = if c.rx_count > 0 && (c.mask & 2) != 0 && c.timeout > c.time then c.timeout else 0xFFFFFFFFFFFFFFFFu64
+    val word = if c.shifting then c.next + u64(2 * bits(c) - c.edges - 1) * half(c) else NEVER
+    val timeout = if !c.rx.is_empty() && (c.mask & 2) != 0 && c.timeout > c.time then c.timeout else NEVER
     val next = if word < timeout then word else timeout
-    if next == 0xFFFFFFFFFFFFFFFFu64 then None else Some(next)
+    if next == NEVER then None else Some(next)
 
 read(c: *Controller, offset: u32) -> Option[u32] = offset match
     0 -> Some(c.cr0)
     4 -> Some(c.cr1)
-    8 ->
-        var value: u32 = 0
-        if c.rx_count > 0
-            value = u32(c.rx[c.rx_head])
-            c.rx_head = (c.rx_head + 1) & (c.capacity - 1)
-            c.rx_count -= 1
+    8 -> c.rx.pop_front() match
+        Some(word) ->
             c.timeout = c.time + 64 * half(*c)
-        Some(value)
+            Some(u32(word))
+        None -> Some(0)
     12 -> Some(status(*c))
     16 -> Some(c.cpsr)
     20 -> Some(c.mask)
@@ -153,9 +163,8 @@ write(c: *Controller, offset: u32, value: u32) -> bool
                 c.sck = polarity(*c)
             else start(c, c.time)
         8 ->
-            if c.tx_count < c.capacity
-                c.tx[(c.tx_head + c.tx_count) & (c.capacity - 1)] = u16(value & 65535)
-                c.tx_count += 1
+            if c.tx.len() < c.capacity
+                c.tx.push_back(u16(value & 65535))
                 start(c, c.time)
         12 | 24 | 28 -> ()
         16 ->

@@ -1,5 +1,7 @@
 module sh.sysl.benchtop.parts.sd_card
 
+import sysl.container.ring.InlineRing
+
 // SPI-mode SDHC protocol endpoint. Storage callbacks see whole 512-byte sectors;
 // no filesystem, MCU register addresses or host files are part of this model.
 struct Media
@@ -8,11 +10,18 @@ struct Media
     ready: &Fn() -> bool
     good: &Fn() -> bool
 
-struct Card
-    media: Media
-    sectors: u64
-    protected: bool
-    program_ticks: u64
+/** Where an SPI-mode CMD24 is: no write in progress, waiting for the 0xFE start token, or collecting
+ * the 512 data bytes and their CRC.
+ */
+enum WriteStage
+    NoWrite = 0
+    StartToken
+    Block
+
+/** The SPI-mode link: everything a reset returns to its power-on value. A zeroed `Spi` is the
+ * power-on state except for the two fields `spi_idle` sets.
+ */
+struct Spi
     selected: bool
     high: bool
     clocks: u32
@@ -22,45 +31,50 @@ struct Card
     next_byte: bool
     frame: [6]u8
     frame_count: usize
-    reply: [520]u8
-    reply_at: usize
-    reply_count: usize
+    reply: InlineRing[u8, 520]
     data: [514]u8
     data_count: usize
-    write_stage: u32
+    write_stage: WriteStage
     write_sector: u32
     idle: bool
     app: bool
     crc: bool
-    busy_until: u64
+
+private spi_idle() -> Spi
+    var s: Spi
+    s.output = 0xff
+    s.idle = true
+    s
+
+/** What the card has done, for tests and instruments; nothing in the protocol reads it. */
+struct Stats
     commands: u64
     reads: u64
     writes: u64
 
+/** One card: its medium and configuration, the SPI link, and `busy_until`, the end of the
+ * programming time after a write, which the SPI and native (SDMMC) halves share.
+ */
+struct Card
+    media: Media
+    sectors: u64
+    protected: bool
+    program_ticks: u64
+    spi: Spi
+    busy_until: u64
+    stats: Stats
+
 card(media: Media, sectors: u64, protected: bool = false, program_ticks: u64 = 240000) -> &Card
     require sectors >= 1024 && sectors <= 4294967296 && sectors % 1024 == 0, "CSD v2 capacity in 1024-sector units"
-    val c: &Card = Card(media,sectors,protected,program_ticks,false,false,0,0,0,0xff,false,[0;6],0,[0;520],0,0,[0;514],0,0,0,true,false,false,0,0,0,0)
-    c
+    Card(media,sectors,protected,program_ticks,spi_idle(),0,Stats(0,0,0))
 
+/** Power-cycles the card: the link, the programming time and the counters start again; the medium
+ * and the configuration are kept.
+ */
 reset(c: &Card)
-    c.selected = false
-    c.high = false
-    c.clocks = 0
-    c.bits = 0
-    c.input = 0
-    c.output = 0xff
-    c.next_byte = false
-    c.frame_count = 0
-    c.reply_at = 0
-    c.reply_count = 0
-    c.write_stage = 0
-    c.idle = true
-    c.app = false
-    c.crc = false
+    c.spi = spi_idle()
     c.busy_until = 0
-    c.commands = 0
-    c.reads = 0
-    c.writes = 0
+    c.stats = Stats(0,0,0)
 
 private[sd_card] crc7(bytes: []const u8) -> u8
     var rem: u16 = 0
@@ -78,10 +92,7 @@ private crc16(bytes: []const u8) -> u16
         crc ^= u16(byte) << 8
         for bit in 0..<8 do crc = if crc & 0x8000 != 0 then (crc << 1) ^ 0x1021 else crc << 1
     crc
-private push(c: &Card, byte: u8)
-    assert(c.reply_count < c.reply.len,"bounded SD response")
-    c.reply[c.reply_count] = byte
-    c.reply_count += 1
+private push(c: &Card, byte: u8) = assert(c.spi.reply.push_back(byte),"bounded SD response")
 private response(c: &Card, status: u8)
     push(c,0xff)
     push(c,status)
@@ -92,12 +103,9 @@ private packet(c: &Card, bytes: []const u8)
     val crc = crc16(bytes)
     push(c,u8(crc >> 8))
     push(c,u8(crc))
-private take(c: &Card, time: u64) -> u8
-    if c.reply_at < c.reply_count
-        val value = c.reply[c.reply_at]
-        c.reply_at += 1
-        return value
-    if time < c.busy_until || !(c.media.ready)() then 0 else 0xff
+private take(c: &Card, time: u64) -> u8 = c.spi.reply.pop_front() match
+    Some(value) -> value
+    None -> if time < c.busy_until || !(c.media.ready)() then 0 else 0xff
 private[sd_card] csd(c: &Card) -> [16]u8
     var bytes: [16]u8 = [0;16]
     bytes[0] = 0x40
@@ -116,22 +124,22 @@ private[sd_card] csd(c: &Card) -> [16]u8
     bytes
 
 private command(c: &Card)
-    c.commands += 1
-    c.reply_at = 0
-    c.reply_count = 0
-    val index = c.frame[0] & 63
-    val arg = (u32(c.frame[1]) << 24) | (u32(c.frame[2]) << 16) | (u32(c.frame[3]) << 8) | u32(c.frame[4])
-    val idle: u8 = if c.idle then 1 else 0
-    if (c.crc || index == 0 || index == 8) && c.frame[5] != crc7(c.frame[..<5])
+    c.stats.commands += 1
+    c.spi.reply.clear()
+    val frame = c.spi.frame
+    val index = frame[0] & 63
+    val arg = (u32(frame[1]) << 24) | (u32(frame[2]) << 16) | (u32(frame[3]) << 8) | u32(frame[4])
+    val idle: u8 = if c.spi.idle then 1 else 0
+    if (c.spi.crc || index == 0 || index == 8) && frame[5] != crc7(frame[..<5])
         response(c,idle | 8)
         return
-    val app = c.app
-    c.app = false
+    val app = c.spi.app
+    c.spi.app = false
     index match
         0 ->
-            if c.clocks < 74 then return
-            c.idle = true
-            c.crc = false
+            if c.spi.clocks < 74 then return
+            c.spi.idle = true
+            c.spi.crc = false
             response(c,1)
         8 ->
             if arg & 0xf00 != 0x100
@@ -143,24 +151,24 @@ private command(c: &Card)
                 push(c,1)
                 push(c,u8(arg))
         55 ->
-            c.app = true
+            c.spi.app = true
             response(c,idle)
         41 ->
             if !app then response(c,idle | 4)
             else
-                if arg & 0x40000000 != 0 then c.idle = false
-                response(c,if c.idle then 1 else 0)
+                if arg & 0x40000000 != 0 then c.spi.idle = false
+                response(c,if c.spi.idle then 1 else 0)
         58 ->
             response(c,idle)
-            push(c,if c.idle then 0 else 0xc0)
+            push(c,if c.spi.idle then 0 else 0xc0)
             push(c,0xff)
             push(c,0x80)
             push(c,0)
         59 ->
-            c.crc = arg & 1 != 0
+            c.spi.crc = arg & 1 != 0
             response(c,idle)
         9 ->
-            if c.idle then response(c,1)
+            if c.spi.idle then response(c,1)
             else
                 response(c,0)
                 val bytes = csd(c)
@@ -170,78 +178,78 @@ private command(c: &Card)
             push(c,if (c.media.good)() then 0 else 0x20)
         16 -> response(c,if arg == 512 then idle else idle | 64)
         17 | 24 ->
-            if c.idle then response(c,1)
+            if c.spi.idle then response(c,1)
             elif u64(arg) >= c.sectors then response(c,0x20)
             elif index == 24 && c.protected then response(c,0x40)
             else
                 response(c,0)
                 if index == 17
-                    c.reads += 1
-                    if (c.media.read)(arg,c.data[..<512]) then packet(c,c.data[..<512])
+                    c.stats.reads += 1
+                    if (c.media.read)(arg,c.spi.data[..<512]) then packet(c,c.spi.data[..<512])
                     else push(c,0x01)
                 else
-                    c.write_sector = arg
-                    c.write_stage = 1
+                    c.spi.write_sector = arg
+                    c.spi.write_stage = StartToken
         _ -> response(c,idle | 4)
 
 private byte(c: &Card, value: u8, time: u64)
-    if c.write_stage == 1
-        if value == 0xfe
-            c.write_stage = 2
-            c.data_count = 0
-        return
-    if c.write_stage == 2
-        c.data[c.data_count] = value
-        c.data_count += 1
-        if c.data_count == 514
-            c.write_stage = 0
-            c.reply_at = 0
-            c.reply_count = 0
-            val crc = (u16(c.data[512]) << 8) | u16(c.data[513])
-            if c.crc && crc != crc16(c.data[..<512]) then push(c,0x0b)
-            elif !(c.media.write)(c.write_sector,c.data[..<512]) then push(c,0x0d)
-            else
-                c.writes += 1
-                push(c,5)
-                c.busy_until = time + c.program_ticks
-        return
-    if c.frame_count == 0 && value & 0xc0 != 0x40 then return
-    c.frame[c.frame_count] = value
-    c.frame_count += 1
-    if c.frame_count == 6
-        c.frame_count = 0
-        command(c)
+    c.spi.write_stage match
+        StartToken ->
+            if value == 0xfe
+                c.spi.write_stage = Block
+                c.spi.data_count = 0
+        Block ->
+            c.spi.data[c.spi.data_count] = value
+            c.spi.data_count += 1
+            if c.spi.data_count == 514 then block_received(c,time)
+        NoWrite ->
+            if c.spi.frame_count == 0 && value & 0xc0 != 0x40 then return
+            c.spi.frame[c.spi.frame_count] = value
+            c.spi.frame_count += 1
+            if c.spi.frame_count == 6
+                c.spi.frame_count = 0
+                command(c)
+
+private block_received(c: &Card, time: u64)
+    c.spi.write_stage = NoWrite
+    c.spi.reply.clear()
+    val crc = (u16(c.spi.data[512]) << 8) | u16(c.spi.data[513])
+    if c.spi.crc && crc != crc16(c.spi.data[..<512]) then push(c,0x0b)
+    elif !(c.media.write)(c.spi.write_sector,c.spi.data[..<512]) then push(c,0x0d)
+    else
+        c.stats.writes += 1
+        push(c,5)
+        c.busy_until = time + c.program_ticks
 
 // Mode 0: data is sampled on rising edges; the next response byte is loaded
 // only on the following falling edge, preserving the eighth sample bit.
 observe(c: &Card, selected: bool, sck: bool, mosi: bool, time: u64) -> bool
-    val rising = sck && !c.high
-    val falling = !sck && c.high
-    c.high = sck
+    val rising = sck && !c.spi.high
+    val falling = !sck && c.spi.high
+    c.spi.high = sck
     if !selected
-        if rising && c.clocks < 80 then c.clocks += 1
-        c.selected = false
-        c.bits = 0
-        c.frame_count = 0
-        c.write_stage = 0
-        c.reply_at = 0
-        c.reply_count = 0
-        c.output = 0xff
-        c.next_byte = false
+        if rising && c.spi.clocks < 80 then c.spi.clocks += 1
+        c.spi.selected = false
+        c.spi.bits = 0
+        c.spi.frame_count = 0
+        c.spi.write_stage = NoWrite
+        c.spi.reply.clear()
+        c.spi.output = 0xff
+        c.spi.next_byte = false
         return true
-    if !c.selected
-        c.selected = true
-        c.output = take(c,time)
-    val result = c.output & (0x80u8 >> c.bits) != 0
+    if !c.spi.selected
+        c.spi.selected = true
+        c.spi.output = take(c,time)
+    val result = c.spi.output & (0x80u8 >> c.spi.bits) != 0
     if rising
-        c.input = (c.input << 1) | (if mosi then 1 else 0)
-        c.bits += 1
-        if c.bits == 8
-            byte(c,c.input,time)
-            c.bits = 0
-            c.input = 0
-            c.next_byte = true
-    elif falling && c.next_byte
-        c.output = take(c,time)
-        c.next_byte = false
+        c.spi.input = (c.spi.input << 1) | (if mosi then 1 else 0)
+        c.spi.bits += 1
+        if c.spi.bits == 8
+            byte(c,c.spi.input,time)
+            c.spi.bits = 0
+            c.spi.input = 0
+            c.spi.next_byte = true
+    elif falling && c.spi.next_byte
+        c.spi.output = take(c,time)
+        c.spi.next_byte = false
     result

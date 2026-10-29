@@ -1,5 +1,50 @@
 module sh.sysl.benchtop.parts.ds3231
 
+// The DS3231's registers (Maxim's data sheet, figure 1, "Timekeeping Registers").
+const SECONDS: u8 = 0x00
+const MINUTES: u8 = 0x01
+const HOURS: u8 = 0x02
+const DAY: u8 = 0x03
+const DATE: u8 = 0x04
+const MONTH: u8 = 0x05
+const YEAR: u8 = 0x06
+const ALARM1: int = 0x07
+const ALARM2: int = 0x0b
+const CONTROL: u8 = 0x0e
+const STATUS: u8 = 0x0f
+const AGING: u8 = 0x10
+const TEMP_MSB: u8 = 0x11
+const TEMP_LSB: u8 = 0x12
+const REGISTER_COUNT: u8 = 19
+// The time and date registers, which a START latches as one snapshot.
+const TIME_BYTES: u8 = 7
+
+// The hours register: bit 6 selects the 12-hour clock, in which bit 5 is PM.
+const HOUR_12: u8 = 0x40
+const HOUR_PM: u8 = 0x20
+// The month register's century bit.
+const CENTURY: u8 = 0x80
+// An alarm register's mask bit (AxMn): set, the field matches every value. The day/date register's
+// DY/DT bit picks the day of the week over the date.
+const ALARM_MASK: u8 = 0x80
+const ALARM_DAY: u8 = 0x40
+
+// CONTROL: CONV starts a temperature conversion, INTCN routes the alarms to INT/SQW, A2IE and A1IE
+// enable them. It resets to RS2 | RS1 | INTCN.
+const CONTROL_CONV: u8 = 0x20
+const CONTROL_INTCN: u8 = 0x04
+const CONTROL_ALARMS: u8 = 0x03
+const CONTROL_RESET: u8 = 0x1c
+// STATUS: OSF, EN32KHZ, BSY while converting, and the alarm flags A2F and A1F. It resets to OSF |
+// EN32KHZ. A write can only clear OSF and the alarm flags.
+const STATUS_OSF: u8 = 0x80
+const STATUS_EN32KHZ: u8 = 0x08
+const STATUS_BSY: u8 = 0x04
+const STATUS_A2F: u8 = 0x02
+const STATUS_A1F: u8 = 0x01
+const STATUS_CLEARABLE: u8 = STATUS_OSF | STATUS_A2F | STATUS_A1F
+const STATUS_RESET: u8 = STATUS_OSF | STATUS_EN32KHZ
+
 /** DS3231 registers and I2C state, independent of the MCU and any firmware driver. */
 struct Rtc
     registers: [19]u8
@@ -18,37 +63,41 @@ unbcd(n: u8) -> int = int(n >> 4) * 10 + int(n & 15)
 rtc(hz: u64 = 12000000, year: int = 2026, month: int = 1, day: int = 1, temperature: int = 100) -> &Rtc
     require hz > 0 && year >= 2000 && year <= 2199 && month >= 1 && month <= 12 && day >= 1 && day <= days(year, month), "valid RTC epoch"
     var registers: [19]u8 = [0; 19]
-    registers[3] = 1 // Day-of-week numbering is user-defined by this device.
-    registers[4] = bcd(day)
-    registers[5] = bcd(month) | (if year >= 2100 then 128 else 0)
-    registers[6] = bcd(year % 100)
-    registers[14] = 0x1C
-    registers[15] = 0x88
+    registers[DAY] = 1 // Day-of-week numbering is user-defined by this device.
+    registers[DATE] = bcd(day)
+    registers[MONTH] = bcd(month) | (if year >= 2100 then CENTURY else 0)
+    registers[YEAR] = bcd(year % 100)
+    registers[CONTROL] = CONTROL_RESET
+    registers[STATUS] = STATUS_RESET
     val r: &Rtc = Rtc(registers, [0; 7], 0, true, hz, 0, 0, temperature, 0)
     temperature_registers(r)
     latch(r)
     r
 
+/** Days in `month` as the DS3231 counts them: its leap-year rule is "the two-digit year is a multiple
+ * of four" (datasheet: "leap-year compensation valid up to 2100"), so it gives 2100 a 29 February the
+ * Gregorian calendar does not. The guest sees the chip's calendar, not the true one.
+ */
 days(year: int, month: int) -> int
-    if month == 2 then return if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) then 29 else 28
+    if month == 2 then return if year % 4 == 0 then 29 else 28
     if month == 4 || month == 6 || month == 9 || month == 11 then 30 else 31
 
 private hours(value: u8) -> int
-    if (value & 64) == 0 then return unbcd(value & 63)
-    unbcd(value & 31) % 12 + (if (value & 32) != 0 then 12 else 0)
+    if (value & HOUR_12) == 0 then return unbcd(value & 63)
+    unbcd(value & 31) % 12 + (if (value & HOUR_PM) != 0 then 12 else 0)
 
 private encode_hour(value: int, mode: u8) -> u8
-    if (mode & 64) == 0 then return bcd(value)
-    64 | (if value >= 12 then 32 else 0) | bcd(if value % 12 == 0 then 12 else value % 12)
+    if (mode & HOUR_12) == 0 then return bcd(value)
+    HOUR_12 | (if value >= 12 then HOUR_PM else 0) | bcd(if value % 12 == 0 then 12 else value % 12)
 
 private temperature_registers(r: &Rtc)
     // Quarter-degree temperature, including negative values, as the chip's signed 10-bit result.
     val raw = u16(i16(r.temperature * 64))
-    r.registers[17] = u8(raw >> 8)
-    r.registers[18] = u8(raw & 0xC0)
+    r.registers[TEMP_MSB] = u8(raw >> 8)
+    r.registers[TEMP_LSB] = u8(raw & 0xC0)
 
 private latch(r: &Rtc)
-    for i in 0..<7 do r.latched[i] = r.registers[i]
+    for i in 0..<TIME_BYTES do r.latched[i] = r.registers[i]
 
 /** An MCU reset rebases guest cycles but leaves this battery-backed part's registers intact. */
 rebase(r: &Rtc, time: u64)
@@ -68,24 +117,24 @@ advance(r: &Rtc, time: u64)
         tick(r)
     if r.conversion_due != 0 && time >= r.conversion_due
         r.conversion_due = 0
-        r.registers[14] &= ~32u8
-        r.registers[15] &= ~4u8
+        r.registers[CONTROL] &= ~CONTROL_CONV
+        r.registers[STATUS] &= ~STATUS_BSY
         temperature_registers(r)
 
 private tick(r: &Rtc)
-    var sec = unbcd(r.registers[0]) + 1
+    var sec = unbcd(r.registers[SECONDS]) + 1
     if sec == 60
         sec = 0
-        var minute = unbcd(r.registers[1]) + 1
+        var minute = unbcd(r.registers[MINUTES]) + 1
         if minute == 60
             minute = 0
-            var hour = hours(r.registers[2]) + 1
+            var hour = hours(r.registers[HOURS]) + 1
             if hour == 24
                 hour = 0
-                r.registers[3] = if r.registers[3] == 7 then 1 else r.registers[3] + 1
-                var day = unbcd(r.registers[4]) + 1
-                var month = unbcd(r.registers[5] & 31)
-                var year = 2000 + unbcd(r.registers[6]) + (if (r.registers[5] & 128) != 0 then 100 else 0)
+                r.registers[DAY] = if r.registers[DAY] == 7 then 1 else r.registers[DAY] + 1
+                var day = unbcd(r.registers[DATE]) + 1
+                var month = unbcd(r.registers[MONTH] & 31)
+                var year = 2000 + unbcd(r.registers[YEAR]) + (if (r.registers[MONTH] & CENTURY) != 0 then 100 else 0)
                 if day > days(year, month)
                     day = 1
                     month += 1
@@ -93,32 +142,33 @@ private tick(r: &Rtc)
                         month = 1
                         year += 1
                         if year == 2200 then year = 2000
-                    r.registers[5] = bcd(month) | (if year >= 2100 then 128 else 0)
-                    r.registers[6] = bcd(year % 100)
-                r.registers[4] = bcd(day)
-            r.registers[2] = encode_hour(hour, r.registers[2])
-        r.registers[1] = bcd(minute)
-    r.registers[0] = bcd(sec)
-    if alarm(r, 7, true) then r.registers[15] |= 1
-    if sec == 0 && alarm(r, 11, false) then r.registers[15] |= 2
+                    r.registers[MONTH] = bcd(month) | (if year >= 2100 then CENTURY else 0)
+                    r.registers[YEAR] = bcd(year % 100)
+                r.registers[DATE] = bcd(day)
+            r.registers[HOURS] = encode_hour(hour, r.registers[HOURS])
+        r.registers[MINUTES] = bcd(minute)
+    r.registers[SECONDS] = bcd(sec)
+    if alarm(r, ALARM1, true) then r.registers[STATUS] |= STATUS_A1F
+    if sec == 0 && alarm(r, ALARM2, false) then r.registers[STATUS] |= STATUS_A2F
 
 private alarm(r: &Rtc, base: int, seconds: bool) -> bool
     var at = base
     if seconds
         val s = r.registers[at]
-        if (s & 128) == 0 && (s & 127) != r.registers[0] then return false
+        if (s & ALARM_MASK) == 0 && (s & 127) != r.registers[SECONDS] then return false
         at += 1
     val m = r.registers[at]
     val h = r.registers[at + 1]
     val d = r.registers[at + 2]
-    if (m & 128) == 0 && (m & 127) != r.registers[1] then return false
-    if (h & 128) == 0 && hours(h & 127) != hours(r.registers[2]) then return false
-    if (d & 128) == 0
-        val actual = if (d & 64) != 0 then r.registers[3] else r.registers[4]
+    if (m & ALARM_MASK) == 0 && (m & 127) != r.registers[MINUTES] then return false
+    if (h & ALARM_MASK) == 0 && hours(h & 127) != hours(r.registers[HOURS]) then return false
+    if (d & ALARM_MASK) == 0
+        val actual = if (d & ALARM_DAY) != 0 then r.registers[DAY] else r.registers[DATE]
         if (d & 63) != actual then return false
     true
 
-interrupt(r: &Rtc) -> bool = (r.registers[14] & 4) != 0 && (r.registers[14] & r.registers[15] & 3) != 0
+interrupt(r: &Rtc) -> bool =
+    (r.registers[CONTROL] & CONTROL_INTCN) != 0 && (r.registers[CONTROL] & r.registers[STATUS] & CONTROL_ALARMS) != 0
 
 start(r: &Rtc, reading: bool, time: u64)
     advance(r, time)
@@ -128,50 +178,50 @@ start(r: &Rtc, reading: bool, time: u64)
 write(r: &Rtc, byte: u8, time: u64) -> bool
     advance(r, time)
     if r.expecting_pointer
-        r.pointer = byte % 19
+        r.pointer = byte % REGISTER_COUNT
         r.expecting_pointer = false
         return true
     val at = r.pointer
     var value = byte
     var valid = true
-    if at == 0 || at == 1
+    if at == SECONDS || at == MINUTES
         value &= 127
         valid = (value & 15) <= 9 && unbcd(value) <= 59
-    elif at == 2
+    elif at == HOURS
         value &= 127
-        val n = unbcd(value & (if (value & 64) != 0 then 31 else 63))
-        valid = (value & 15) <= 9 && (if (value & 64) != 0 then n >= 1 && n <= 12 else n <= 23)
-    elif at == 3
+        val n = unbcd(value & (if (value & HOUR_12) != 0 then 31 else 63))
+        valid = (value & 15) <= 9 && (if (value & HOUR_12) != 0 then n >= 1 && n <= 12 else n <= 23)
+    elif at == DAY
         value &= 7
         valid = value >= 1 && value <= 7
-    elif at == 4
+    elif at == DATE
         value &= 63
         valid = (value & 15) <= 9 && unbcd(value) >= 1 && unbcd(value) <= 31
-    elif at == 5
-        value &= 159
+    elif at == MONTH
+        value &= CENTURY | 31
         valid = (value & 15) <= 9 && unbcd(value & 31) >= 1 && unbcd(value & 31) <= 12
-    elif at == 6
+    elif at == YEAR
         valid = (value & 15) <= 9 && (value >> 4) <= 9
-    if at < 14 || at == 16
+    if at < CONTROL || at == AGING
         if valid then r.registers[at] = value
-        if at == 0 then r.remainder = 0
-    elif at == 14
-        r.registers[14] = value
-        if (value & 32) != 0
-            r.registers[15] |= 4
+        if at == SECONDS then r.remainder = 0
+    elif at == CONTROL
+        r.registers[CONTROL] = value
+        if (value & CONTROL_CONV) != 0
+            r.registers[STATUS] |= STATUS_BSY
             r.conversion_due = time + r.hz / 5 + 1
-    elif at == 15
-        val old = r.registers[15]
-        r.registers[15] = (old & value & 0x83) | (value & 8) | (old & 4)
+    elif at == STATUS
+        val old = r.registers[STATUS]
+        r.registers[STATUS] = (old & value & STATUS_CLEARABLE) | (value & STATUS_EN32KHZ) | (old & STATUS_BSY)
     // Temperature result is read-only.
-    r.pointer = (at + 1) % 19
+    r.pointer = (at + 1) % REGISTER_COUNT
     if r.pointer == 0 then latch(r)
     true
 
 read(r: &Rtc, time: u64) -> u8
     advance(r, time)
     val at = r.pointer
-    val value = if at < 7 then r.latched[at] else r.registers[at]
-    r.pointer = (at + 1) % 19
+    val value = if at < TIME_BYTES then r.latched[at] else r.registers[at]
+    r.pointer = (at + 1) % REGISTER_COUNT
     if r.pointer == 0 then latch(r)
     value

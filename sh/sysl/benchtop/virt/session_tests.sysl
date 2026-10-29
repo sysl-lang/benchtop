@@ -1,0 +1,112 @@
+module sh.sysl.benchtop.virt
+@tests
+
+import sh.sysl.benchtop.v6m.Stop
+import sysl.sync.*
+
+private val WORKBENCH_GUEST = embed("../../../../examples/visual/demo.elf")
+
+private workbench_session(live: bool = true) -> &Session
+    val b = board_named("workbench").unwrap()
+    session(b.parts, b.chip.name, live)
+
+@test("session: every run status has its desktop label, and an exit code is part of the status")
+ses_labels()
+    for (status, label) in [(RunStatus.Preview, "LAYOUT PREVIEW"), (RunStatus.Running, "RUNNING"), (RunStatus.Paused, "PAUSED"),
+        (RunStatus.Waiting, "WAITING"), (RunStatus.WaitingForBuild, "WAITING FOR BUILD"), (RunStatus.Breakpoint, "BREAKPOINT"),
+        (RunStatus.Exit(3), "EXIT 3"), (RunStatus.ResetRequest, "RESET REQUEST"), (RunStatus.Fault, "GUEST FAULT")]
+        assert(status.label() == label, label)
+    assert(RunStatus.Exit(3) == RunStatus.Exit(3) && RunStatus.Exit(3) != RunStatus.Exit(4) && RunStatus.Exit(0) != RunStatus.Fault)
+
+@test("session: controls start at rest, positions are held to their travel, and unknown parts are ignored")
+ses_inputs()
+    val s = workbench_session()
+    assert(s.part_input("button1") == PartInput.Pressed(false) && s.position("volume") == 5000)
+    assert(s.part_input("heartbeat") == PartInput.Inert && s.part_input("nothing") == PartInput.Inert)
+    assert(s.axes("volume") == (POSITION_CENTRE, POSITION_CENTRE) && !s.closed("button1") && !s.pressed("volume"))
+    s.set_part_input("volume", PartInput.Position(12000))
+    assert(s.position("volume") == POSITION_MAX)
+    s.set_part_input("volume", PartInput.Position(-5))
+    assert(s.position("volume") == 0)
+    s.set_part_input("volume", PartInput.Axes(-1, 20000))
+    assert(s.axes("volume") == (0, POSITION_MAX))
+    s.set_part_input("nothing", PartInput.Pressed(true))
+    assert(s.part_input("nothing") == PartInput.Inert)
+    s.set_part_input("button1", PartInput.Pressed(true))
+    s.set_part_input("button2", PartInput.Pressed(true))
+    s.release_buttons()
+    assert(!s.pressed("button1") && !s.pressed("button2"))
+
+@test("session: a button's active level and a knob's voltage reach the board only while live")
+ses_apply()
+    val s = workbench_session()
+    open_console()
+    capture()
+    boot(core0(), image_of(WORKBENCH_GUEST).unwrap().view())
+    s.apply_inputs()
+    assert((panel_levels() & (3 << 8)) == (3 << 8) && analog_level(26) == 1650000)
+    s.set_part_input("button1", PartInput.Pressed(true))
+    s.set_part_input("volume", PartInput.Position(POSITION_MAX))
+    s.apply_inputs()
+    assert((panel_levels() & (3 << 8)) == (2 << 8) && analog_level(26) == 3300000)
+    val preview = session(s.parts, s.chip, false)
+    preview.set_part_input("volume", PartInput.Position(0))
+    preview.apply_inputs()
+    assert(analog_level(26) == 3300000 && preview.status == RunStatus.Preview)
+
+@test("session: a stopped core becomes the session's status and message, and a stopped session stays put")
+ses_stops()
+    for (stop, code, status) in [(Stop.Exit, 3u32, RunStatus.Exit(3)), (Stop.Breakpoint, 0u32, RunStatus.Breakpoint),
+        (Stop.Reset, 0u32, RunStatus.ResetRequest), (Stop.Unmapped, 0u32, RunStatus.Fault), (Stop.Fault, 0u32, RunStatus.Fault)]
+        val s = workbench_session()
+        s.restart(image_of(WORKBENCH_GUEST).unwrap().view())
+        assert(s.status == RunStatus.Running && !s.stopped && s.message.is_empty())
+        core0().stop = stop
+        core0().exit_code = code
+        s.advance(budget = 0)
+        assert(s.stopped && s.paused && s.status == status && s.message == stop_message(core0()), status.label())
+        val retired = core0().retired
+        s.advance()
+        assert(core0().retired == retired && s.status == status)
+        s.pause()
+        assert(s.paused)
+    val s = workbench_session()
+    s.await_build()
+    assert(s.stopped && s.status == RunStatus.WaitingForBuild)
+
+@test("session: pause holds the cores, step runs one instruction, and a preview never runs")
+ses_run()
+    val s = workbench_session()
+    s.restart(image_of(WORKBENCH_GUEST).unwrap().view())
+    assert(s.advance().is_none() && s.instructions > 0 && s.status != RunStatus.Paused)
+    s.pause()
+    val retired = core0().retired
+    s.advance()
+    assert(core0().retired == retired && s.status == RunStatus.Paused)
+    s.advance(true)
+    assert(core0().retired == retired + 1 && s.paused && s.pc == core0().pc)
+    s.pause()
+    assert(!s.paused)
+    val preview = workbench_session(false)
+    val before = core0().retired
+    preview.pause()
+    assert(preview.advance().is_none() &&core0().retired == before && !preview.paused)
+
+@test("session: the pacing source follows the board's clock, then its sound, then a touch screen")
+ses_pacing()
+    assert(board_named("workbench").is_ok())
+    assert(pacing_source(false) == PacingSource.SoundClock(12000000) && pacing_source(true) == PacingSource.SoundClock(12000000))
+    assert(board_named("virt").is_ok())
+    assert(pacing_source(true) == PacingSource.TouchClock && pacing_source(false) == PacingSource.Fixed)
+    assert(PacingSource.TouchClock.hz() == TOUCH_HZ && PacingSource.Fixed.hz() == FALLBACK_HZ && PacingSource.BoardClock(7).hz() == 7)
+    assert(board_named("stm32h747-disco").is_ok())
+    assert(pacing_source(false) == PacingSource.BoardClock(clock_hz()) && clock_hz() != 0)
+
+@test("session: RAM observations read little-endian values inside backing RAM and nothing outside it")
+ses_ram_peek()
+    assert(board_named("workbench").is_ok())
+    val mem = machine.memory
+    for (i, b) in [(0usize, 0x78u8), (1, 0x56), (2, 0x34), (3, 0x12)] do atomic_store(&mem.ram[200 + i], b, Relaxed)
+    assert(ram_peek(1, 200) == Some(0x78) && ram_peek(2, 200) == Some(0x5678) && ram_peek(4, 200) == Some(0x12345678))
+    assert(ram_peek(4, ram_size() - 4).is_some() && ram_peek(4, ram_size() - 3) == None && ram_peek(1, ram_size()) == None)
+    assert(ram_peek(5, 0) == None && ram_size() == 1048576)

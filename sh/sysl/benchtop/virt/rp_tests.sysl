@@ -6,6 +6,8 @@ module sh.sysl.benchtop.virt
 // falls due, from WFI or from a running loop.
 
 import sh.sysl.benchtop.v6m.{Cpu, Stop, NVIC_ISER, RAM_BYTES, clock}
+import sh.sysl.benchtop.timing.NEVER
+import sysl.math.min
 import sh.sysl.rp2040.{resets as rs, timer as tm, watchdog as wd}
 
 // RESET's atomic clear alias.
@@ -140,7 +142,8 @@ rp_alarm_wakes_core0()
     val cpu = core0()
     val a = arm()
     val zero: [8]u16 = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], WFI]
-    val h: [4]u16 = [0x2001, str(0, 5, tm.INTR_OFFSET), ldr(4, 5, tm.TIMERAWL_OFFSET), BKPT]
+    // The handler acknowledges with r1, leaving the alarm in r0.
+    val h: [4]u16 = [0x2101, str(1, 5, tm.INTR_OFFSET), ldr(4, 5, tm.TIMERAWL_OFFSET), BKPT]
     val spin: [1]u16 = [0xE7FE]
 
     for parallel in [false, true]
@@ -149,19 +152,66 @@ rp_alarm_wakes_core0()
         val stopped = run_board(cpu)
 
         assert(stopped == cpu && cpu.stop == Stop.Breakpoint && cpu.pc == 0x306, f"${cpu.stop} at 0x${cpu.pc}%08x")
-        // On one thread the alarm is 100 ticks from 0, and core 0 takes it at that tick exactly. On
-        // two, core 1 may run up to the lag bound (4000 clocks) ahead, bringing the shared timer with
-        // it: the alarm is then 100 ticks from where core 1 had it, core 0 wakes at that tick by its
-        // own clock, and its handler reads the timer within the lag bound of its clock.
         val woke = clock(cpu, cpu.retired) / 12
+        val alarm = u64(cpu.r[0])
         val read = u64(cpu.r[4])
         val lag: u64 = 4000 / 12 + 1
 
+        // On one thread the alarm is 100 ticks from 0, and core 0 takes it at that tick exactly.
+        //
+        // On two, the timer keeps the time of the core ahead, and core 1 may be up to the lag bound
+        // (4000 clocks) ahead of core 0. Core 0's write that starts the tick takes effect at the
+        // timer's time, so the timer counts from up to the lag bound after core 0's clock began, and
+        // the alarm is 100 ticks from wherever the timer then reads. What the guest sees holds as on
+        // one thread: the handler never reads the timer earlier than the alarm that fired, and reads
+        // it within the lag bound of it. Core 0's own clock, in ticks, is within the lag bound of the
+        // timer either way: behind it by core 1's lead, ahead of it by the tick's late start.
         if parallel
-            assert(woke >= 100 && woke <= 100 + lag && read >= woke && read <= woke + lag, s"handler $read at tick $woke")
+            assert(alarm >= 100 && read >= alarm && read <= alarm + lag, s"handler $read, alarm $alarm")
+            assert(woke <= read + lag && read <= woke + lag, s"handler $read at tick $woke")
         else
-            assert(read == 100 && woke == 100, s"handler $read at tick $woke")
+            assert(alarm == 100 && read == 100 && woke == 100, s"handler $read, alarm $alarm, at tick $woke")
         assert(core1().stop == Stop.Budget, "core 1 still spinning")
+
+// Core 0 boots `code`, which arms alarm 0 and stops at a breakpoint before it fires; then core 1's
+// clock, 5000 past the alarm, brings the shared timer past it, as core 1's thread does in lockstep.
+// Answers the clock the alarm fired at.
+private fired_by_core1(cpu: *Cpu, code: []const u16) -> u64
+    booted_rp(cpu, rp_board(""), code, ack(), regs())
+    run_board(cpu)
+    assert(cpu.stop == Stop.Breakpoint, f"${cpu.stop} at 0x${cpu.pc}%08x")
+
+    val fires = timer_due()
+
+    assert(fires != NEVER && fires > board_time(cpu, cpu.retired), s"alarm due at $fires")
+    core1().slept = fires + 5000
+    signal_rp(core1())
+    assert(machine.devices.rp.live.with(s -> s.timer.raw == 1 && s.timer.armed == 0), "core 1's clock fired the alarm")
+    cpu.sleeping = true
+    fires
+
+@test("an alarm another core's clock fired wakes a sleeping core at the alarm's clock, not at that core's")
+rp_alarm_fired_elsewhere_wakes_at_its_clock()
+    val cpu = core0()
+    val a = arm()
+    val code: [8]u16 = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], BKPT]
+    val fires = fired_by_core1(cpu, code[..])
+
+    assert(timer_wake(cpu) == fires, s"wakes at ${timer_wake(cpu)}, the alarm fired at $fires")
+    // Asleep until core 1's clock, the core stops at the alarm's, and its interrupt then wakes it.
+    assert(!board_wake_by(cpu, min(core1().slept, timer_wake(cpu))) && board_time(cpu, cpu.retired) == fires, s"clock ${board_time(cpu, cpu.retired)}")
+    signal_rp(cpu)
+    assert(board_wake_by(cpu, board_time(cpu, cpu.retired)) && board_time(cpu, cpu.retired) == fires, "woken at the alarm")
+
+@test("an alarm another core's clock fired, its interrupt not enabled, wakes nothing")
+rp_alarm_fired_elsewhere_not_enabled()
+    val cpu = core0()
+    val a = arm()
+    // Alarm 0's interrupt on, IRQ 0 left off in the NVIC.
+    val code: [7]u16 = [a[0], a[1], a[3], a[4], a[5], a[6], BKPT]
+
+    fired_by_core1(cpu, code[..])
+    assert(timer_wake(cpu) == NEVER, s"wakes at ${timer_wake(cpu)}")
 
 @test("an alarm whose interrupt the core has not enabled cannot wake it, and the board stops asleep")
 rp_alarm_not_enabled()

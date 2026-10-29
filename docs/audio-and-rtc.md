@@ -3,8 +3,8 @@
 Board descriptions can name either a generic model or a real catalog part:
 
 ```hocon
-buzzer { part = PS1240P02BT, ref = BZ1, pin = controller.GP5, gain = 12 }
-rtc { part = DS3231SN, ref = U2, i2c = i2c0, initial-time = host }
+buzzer { part = PS1240P02BT, ref = BZ1, gain = 12, wire { pin = GP5 } }
+rtc { part = DS3231SN, ref = U2, initial-time = host, wire { i2c = i2c0 } }
 ```
 
 The catalog preserves manufacturer and ordering identity separately from behavior.
@@ -74,7 +74,8 @@ simulation is involved. The sysl driver keeps using the normal HD44780 write pro
 ## DS3231 RTC and I²C
 
 The RTC implements its real 7-bit I²C address, `0x68`, time/date BCD registers,
-12/24-hour formats, month and Gregorian leap/century rollover, day-of-week counter,
+12/24-hour formats, month and century rollover, the chip's own leap-year rule (every
+year divisible by four, so 2100 has a 29 February as on the real part), day-of-week counter,
 two alarm masks/flags, control/status, aging storage and a read-only quarter-degree
 temperature result. Forced temperature conversion completes after a modelled
 200 ms. START/repeated START snapshots protect multi-byte time reads from rollover.

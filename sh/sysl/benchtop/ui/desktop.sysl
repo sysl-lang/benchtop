@@ -5,29 +5,28 @@ import sh.sysl.ui_sdl as driver
 import sh.sysl.plutovg as vg
 import sh.sysl.benchtop.virt as virt
 import sh.sysl.benchtop.host as host
-import sh.sysl.benchtop.{Part, Element, part_model, catalog_part}
+import sh.sysl.benchtop.{Part, Element, part_model, catalog_part, part_whole}
 import sysl.buf.{Buf, buf}
 import sysl.text.from_utf8_lossy
-import sysl.math.{min, max, Float}
+import sysl.math.{min, max, Float, pi}
 
-const GROUND: u32 = 0x0D1420
-
-/** UI state stays separate from the guest; syslUI owns layout and input geometry. */
+/** The desktop's view of one session: the scene, the session that runs it (`virt.Session`, which
+ * owns the run state and the parts' controls), and the view state syslUI's widgets read and write.
+ */
 struct Desktop
     scene: Scene
+    session: &virt.Session
     current: &ui.Signal[State]
     stepping: &ui.Signal[bool]
     resetting: &ui.Signal[bool]
     saving: &ui.Signal[bool]
     pointer_live: &ui.Signal[bool]
-    touch_capture: &ui.Signal[string]
+    touch_capture: &ui.Signal[Capture]
     scroll: &ui.Signal[int]
     board_rect: &ui.Signal[ui.Rect]
     pixel_scale: &ui.Signal[real]
     tft_rasters: Buf[TftRaster]
-    background: bool
     parallel: bool
-    interactive: bool
     workflow: Option[&host.Workflow]
     console_tab: &ui.Signal[int]
     pots: Buf[PotControl]
@@ -35,46 +34,55 @@ struct Desktop
     context_requested: &ui.Signal[bool]
     sound_muted: &ui.Signal[bool]
 
+/** A potentiometer's knob and slider: the one place the desktop keeps its position. */
 struct PotControl
     name: string
     position: &ui.Signal[int]
 
-desktop(s: Scene, st: State, interactive: bool = true) -> &Desktop
+/** A desktop over `s`; a `live` one runs firmware, any other previews the layout. */
+desktop(s: Scene, live: bool) -> &Desktop
+    val session = virt.session(s.scope.parts, s.chip, live)
     var pots: Buf[PotControl] = buf()
-    for p in s.scope.parts
-        if p.kind == "potentiometer" then pots.push(PotControl(p.name, ui.signal(pot_position(st, p))))
-        if p.kind == "joystick"
-            for axis in ["x", "y"] do pots.push(PotControl(s"${p.name}.$axis",ui.signal(5000)))
-    Desktop(s, ui.signal(st), ui.signal(false), ui.signal(false), ui.signal(false),
-        ui.signal(false), ui.signal(""), ui.signal(0), ui.signal(ui.Rect(0, 0, 0, 0)), ui.signal(1.0), buf(), false, false, interactive, None, ui.signal(0), pots, buf(), ui.signal(false), ui.signal(false))
+    for p in s.scope.parts do if p.kind == "potentiometer" then pots.push(PotControl(p.name, ui.signal(session.position(p.name))))
+    Desktop(scene = s, session = session, current = ui.signal(state()),
+        stepping = ui.signal(false), resetting = ui.signal(false), saving = ui.signal(false), pointer_live = ui.signal(false),
+        touch_capture = ui.signal(Capture.Free), scroll = ui.signal(0), board_rect = ui.signal(ui.Rect(0, 0, 0, 0)), pixel_scale = ui.signal(1.0),
+        tft_rasters = buf(), parallel = false, workflow = None, console_tab = ui.signal(0), pots = pots, instruments = buf(),
+        context_requested = ui.signal(false), sound_muted = ui.signal(false))
 
-private[ui] sync_pots(d: &Desktop, st: *State)
-    for control in d.pots do set_pot(st, control.name, control.position.read())
+/** Report the desktop's controls to the session: buttons held by the mouse or keyboard, and knobs. */
+private[ui] sample_inputs(d: &Desktop)
+    press_inputs(d.scene, d.current.read(), d.session)
+    for control in d.pots do d.session.set_part_input(control.name, virt.PartInput.Position(control.position.read()))
 
-
-pause(d: &Desktop)
+/** Change the view state in one step. */
+private[ui] edit(d: &Desktop, change: &Fn(*State) -> unit)
     var st = d.current.read()
-    if !st.live || st.stopped then return
-    st.paused = !st.paused
-    if d.background && st.paused then virt.pause_workers()
+    change(&st)
     d.current.set(st)
+
+private[ui] say(d: &Desktop, kind: NoticeKind, text: string) = edit(d, st -> st.notice = Notice(kind, text))
+
+pause(d: &Desktop) = d.session.pause()
 
 private section(title: string, child: &ui.View) -> &ui.View =
     ui.column([ui.text(title).font_size(12).foreground(MUTED), child], 10).padded().panel()
 
-private inspector(d: &Desktop, height: int) -> &ui.View
+private inspector(d: &Desktop, height: int, scroll: &ui.Signal[int]) -> &ui.View
     val s = d.scene
     val st = d.current.read()
+    val session = d.session
+    val live = session.live
     var rows: Buf[&ui.View] = buf()
-    rows.push(ui.text(if st.live then "Live session" else "Layout preview").font_size(20).foreground(ACCENT))
+    rows.push(ui.text(if live then "Live session" else "Layout preview").font_size(20).foreground(ACCENT))
     rows.push(ui.text(s.chip))
     rows.push(ui.text(s.cores).font_size(12).foreground(MUTED))
     rows.push(ui.divider())
-    if st.live
-        rows.push(ui.text(f"PC  0x${st.pc}%08X"))
-        rows.push(ui.text(s"${st.instructions} instructions retired").font_size(12).foreground(MUTED))
+    if live
+        rows.push(ui.text(f"PC  0x${session.pc}%08X"))
+        rows.push(ui.text(s"${session.instructions} instructions retired").font_size(12).foreground(MUTED))
     else
-        rows.push(ui.text("Firmware is not running").foreground(0xE9BD72))
+        rows.push(ui.text("Firmware is not running").foreground(WARN))
         rows.push(ui.text("Real-board peripherals remain unmodelled.").font_size(12))
     for control in d.pots
         val p = s.scope.find(control.name) match
@@ -86,7 +94,7 @@ private inspector(d: &Desktop, height: int) -> &ui.View
         rows.push(ui.text(s"${virt.pot_voltage(p, position)} μV → ${target(p.wires.at(0).to)}").font_size(12).foreground(MUTED))
     d.workflow match
         Some(w) ->
-            rows.push(ui.text(w.status).font_size(13).foreground(if w.failed then 0xF25468 else ACCENT))
+            rows.push(ui.text(w.status).font_size(13).foreground(if w.failed then FAIL else ACCENT))
             rows.push(ui.text(s"${w.builds} builds · ${w.reloads} reloads").font_size(12).foreground(MUTED))
         None -> ()
     rows.push(ui.divider())
@@ -100,20 +108,20 @@ private inspector(d: &Desktop, height: int) -> &ui.View
                 Some(entry) -> rows.push(ui.text(s"${entry.manufacturer} · ${entry.number}").font_size(12).foreground(MUTED))
                 None -> ()
             for wire in p.wires do rows.push(ui.text(s"${wire.port} → ${target(wire.to)}").font_size(13))
-            rows.push(ui.text(if st.live then "Connected to virtual GPIO" else "Description only").font_size(12).foreground(ACCENT))
+            rows.push(ui.text(if live then "Connected to virtual GPIO" else "Description only").font_size(12).foreground(ACCENT))
         None ->
             rows.push(ui.text("Parts & signals").font_size(16))
             for p in s.scope.parts
-                val value = if st.live && p.kind == "led" then (if lit(st, p, s.chip) then "ON" else "OFF") else p.kind
+                val value = if live && p.kind == "led" then (if session.lit(p) then "ON" else "OFF") else p.kind
                 rows.push(ui.row([
                     ui.button(if p.reference.is_empty() then p.name else p.reference, () -> select_part(d, p.name), ui.Role.Secondary, ui.Variant.Soft).frame(170, 32),
-                    ui.text(value).font_size(12).foreground(if st.live && lit(st, p, s.chip) then ACCENT else MUTED)
+                    ui.text(value).font_size(12).foreground(if live && session.lit(p) then ACCENT else MUTED)
                 ], 8))
     val build_log = d.console_tab.read() == 1
-    val transcript: Buf[u8] = if st.live && !build_log then virt.output_snapshot() else buf()
-    val output: []const u8 = if build_log then (if d.workflow.is_some() then d.workflow.unwrap().log.view() else []) elif st.live then transcript.view() else []
+    val transcript: Buf[u8] = if live && !build_log then virt.output_snapshot() else buf()
+    val output: []const u8 = if build_log then (if d.workflow.is_some() then d.workflow.unwrap().log.view() else []) elif live then transcript.view() else []
     var lines: Buf[&ui.View] = buf()
-    if st.live || build_log
+    if live || build_log
         // Bound the displayed tail; the guest's capture is bounded separately.
         var start: usize = output.len
         var count = 0
@@ -133,32 +141,33 @@ private inspector(d: &Desktop, height: int) -> &ui.View
                     var width = 0
                     for ch in line.chars
                         if width == 36
-                            lines.push(ui.text(chunk).font_size(12).foreground(0xB6DCC9))
+                            lines.push(ui.text(chunk).font_size(12).foreground(CONSOLE_INK))
                             chunk = ""
                             width = 0
                         chunk += s"$ch"
                         width += 1
-                    lines.push(ui.text(chunk).font_size(12).foreground(0xB6DCC9))
-                else lines.push(ui.text(line).font_size(12).foreground(0xB6DCC9))
+                    lines.push(ui.text(chunk).font_size(12).foreground(CONSOLE_INK))
+                else lines.push(ui.text(line).font_size(12).foreground(CONSOLE_INK))
                 at = i + 1
         if output.len == 0
             lines.push(ui.text(if build_log then (if d.workflow.is_some() then "No build output yet." else "No build command configured.") else "No guest output.").font_size(12).foreground(MUTED))
     else
         lines.push(ui.text("Open the live firmware demo with:").font_size(12))
         lines.push(ui.text("benchtop demo").foreground(ACCENT))
-    val log_view = section(if build_log then "BUILD OUTPUT" elif st.live then "GUEST CONSOLE" else "TRY LIVE FIRMWARE", ui.column(lines.view(), 5))
-    if st.live || d.workflow.is_some()
+    val log_view = section(if build_log then "BUILD OUTPUT" elif live then "GUEST CONSOLE" else "TRY LIVE FIRMWARE", ui.column(lines.view(), 5))
+    if live || d.workflow.is_some()
         rows.insert(console_at, ui.tabs(["Guest", "Build"], d.console_tab, tab -> log_view))
     else rows.push(log_view)
-    ui.scroll(ui.column(rows.view(), 12), d.scroll, height).padding(16).background(CARD, 12).border(EDGE, 1, 12)
+    ui.scroll(ui.column(rows.view(), 12), scroll, height).padding(16).background(CARD, 12).border(EDGE, 1, 12)
 
-select_part(d: &Desktop, name: string)
-    var st = d.current.read()
-    st.selected = name
-    d.current.set(st)
+select_part(d: &Desktop, name: string) = edit(d, st -> st.selected = name)
 
+/** The whole desktop. An `interactive` one takes pointer input; one rendered to a PNG only paints,
+ * and leaves the live desktop's interaction state (scroll position, pressed parts, density) as it was.
+ */
 struct Workbench
     d: &Desktop
+    interactive: bool
 
 impl ui.View for Workbench
     measure(&self, c: *ui.Canvas, avail: ui.Size) -> ui.Size = avail
@@ -166,15 +175,17 @@ impl ui.View for Workbench
     paint(&self, c: *ui.Canvas, r: ui.Rect)
         val d = self.d
         val st = d.current.read()
+        val session = d.session
+        val live = session.live
         val wordmark: &ui.View = Wordmark()
         val title = ui.row([
             ui.column([wordmark, ui.text(d.scene.name).font_size(13).foreground(MUTED)], 7).flex(),
-            ui.text(st.status).font_size(12).foreground(if st.live then ACCENT else 0xE9BD72).padding(10).background(0x192E30, 8)
+            ui.text(session.status.label()).font_size(12).foreground(if live then ACCENT else WARN).padding(10).background(STATUS_FILL, 8)
         ], 14)
         var actions: Buf[&ui.View] = buf()
-        if st.live
-            if !st.stopped
-                actions.push(ui.button(if st.paused then "Resume" else "Pause", () -> pause(d)))
+        if live
+            if !session.stopped
+                actions.push(ui.button(if session.paused then "Resume" else "Pause", () -> pause(d)))
                 actions.push(ui.button("Step", () -> d.stepping.set(true), ui.Role.Secondary, ui.Variant.Soft))
             actions.push(ui.button("Reset", () -> d.resetting.set(true), ui.Role.Secondary, ui.Variant.Soft))
         d.workflow match
@@ -183,27 +194,29 @@ impl ui.View for Workbench
         for i in d.instruments
             actions.push(ui.button(i.title, () -> i.opening = true, ui.Role.Secondary, ui.Variant.Outline))
         actions.push(ui.button("Save PNG", () -> d.saving.set(true), ui.Role.Secondary, ui.Variant.Outline))
-        if st.live && virt.sound_available() then actions.push(ui.button(if d.sound_muted.read() then "Unmute" else "Mute", () -> d.sound_muted.set(!d.sound_muted.read()), ui.Role.Secondary, ui.Variant.Outline))
+        if live && virt.sound_available() then actions.push(ui.button(if d.sound_muted.read() then "Unmute" else "Mute", () -> d.sound_muted.set(!d.sound_muted.read()), ui.Role.Secondary, ui.Variant.Outline))
+        // A rendering scrolls a copy, so that laying the inspector out again leaves the window's alone.
+        val scroll = if self.interactive then d.scroll else ui.signal(d.scroll.read())
         val room = if r.h > 260 then r.h - 228 else 80
-        val side = inspector(d, if room > 50 then room - 32 else 18)
-        val board_view: &ui.View = BoardView(d)
+        val side = inspector(d, if room > 50 then room - 32 else 18, scroll)
+        val board_view: &ui.View = BoardView(d, self.interactive)
         val board = board_view.padding(18).background(CARD, 12).border(EDGE, 1, 12)
         // A narrow window stacks panels rather than squeezing the PCB into a sliver.
-        val content = if r.w >= 900 then ui.row([board.flex(), side.frame(320, room)], 18) else ui.column([board.frame(r.w - 48, room / 2), inspector(d, room / 2 - 32)], 12)
+        val content = if r.w >= 900 then ui.row([board.flex(), side.frame(320, room)], 18) else ui.column([board.frame(r.w - 48, room / 2), inspector(d, room / 2 - 32, scroll)], 12)
         var joystick_present = false
         for p in d.scene.scope.parts do if p.kind == "joystick" then joystick_present = true
-        val footer = if st.notice.is_empty() then (if st.live then (if joystick_present then "Drag the joystick · Release to centre · Space pause · N step · R reset · S save" elif d.pots.len() > 0 then "Hold 1 for sound · RV1 sets pitch · Press 2 to set RTC · Plot icon opens instrument · Space pause · N step · R reset · S save" else "Hold 1 / 2 or a board button · Space pause · N step · R reset · S save") else "Layout preview · Click a part to inspect its wiring · S save PNG") else st.notice
-        val tree = ui.column([title, ui.row(actions.view(), 10), content.flex(), ui.text(footer).font_size(12).foreground(MUTED)], 18).padding(24).restyle(t -> t with { primary = ACCENT, secondary = 0xA7B8CA, on_fill = 0x102C24, panel = 0x192C3B, edge = EDGE })
+        val footer = if st.notice.text.is_empty() then (if live then (if joystick_present then "Drag the joystick · Release to centre · Space pause · N step · R reset · S save" elif d.pots.len() > 0 then "Hold 1 for sound · RV1 sets pitch · Press 2 to set RTC · Plot icon opens instrument · Space pause · N step · R reset · S save" else "Hold 1 / 2 or a board button · Space pause · N step · R reset · S save") else "Layout preview · Click a part to inspect its wiring · S save PNG") else st.notice.text
+        val tree = ui.column([title, ui.row(actions.view(), 10), content.flex(), ui.text(footer).font_size(12).foreground(MUTED)], 18).padding(24).restyle(t -> t with { primary = ACCENT, secondary = SECONDARY, on_fill = ON_FILL, panel = PANEL, edge = EDGE })
         c.clip(r)
         tree.paint(c, r)
         c.unclip()
 
-board_transform(s: Scene, r: ui.Rect) -> Transform
-    Transform(1.0,f32(r.x),f32(r.y))
+/** The board is drawn at its own scale from the corner of its panel. */
+board_transform(r: ui.Rect) -> Transform = Transform(1.0, f32(r.x), f32(r.y))
 
 part_at(s: Scene, r: ui.Rect, x: int, y: int) -> string
     if !r.holds(x,y) then return ""
-    val t = board_transform(s, r)
+    val t = board_transform(r)
     var i = s.view.elements.len()
     while i > 0
         i -= 1
@@ -213,8 +226,7 @@ part_at(s: Scene, r: ui.Rect, x: int, y: int) -> string
         if !hit && !e.label.is_empty()
             e.shows match
                 ShowPart(name) -> s.scope.find(name) match
-                    Some(p) -> if part_model(p) == "button"
-                        hit = ui.Rect(ex, ey + h + 5, max(w, 100), 22).holds(x, y)
+                    Some(p) -> if look_of(p) == PartLook.Key then hit = element_label(ui.Rect(ex, ey, w, h)).holds(x, y)
                     None -> ()
                 _ -> ()
         if !hit then continue
@@ -230,8 +242,15 @@ private[ui] label(c: *ui.Canvas, r: ui.Rect, value: string, color: u32 = INK, si
     c.pop_font_size()
     c.unink()
 
+/** Where a part's label sits: under it, at least 100 wide. Drawing and hit-testing share it. */
+private[ui] element_label(r: ui.Rect) -> ui.Rect = ui.Rect(r.x, r.bottom() + 5, max(r.w, 100), 22)
+
+/** The board. Pointer input goes through syslUI's canvas, which answers it while the view paints,
+ * so an interactive board reads its presses and knob drags here; one rendered to a PNG does not.
+ */
 struct BoardView
     d: &Desktop
+    interactive: bool
 
 impl ui.View for BoardView
     measure(&self, c: *ui.Canvas, avail: ui.Size) -> ui.Size = avail
@@ -239,47 +258,19 @@ impl ui.View for BoardView
     paint(&self, c: *ui.Canvas, r: ui.Rect)
         val d = self.d
         val s = d.scene
-        var st = d.current.read()
+        val live = d.session.live
         if d.board_rect.read() != r then d.board_rect.set(r)
-        val density = c.pixel_scale()
-        if d.pixel_scale.read() != density then d.pixel_scale.set(density)
-        if d.interactive
-            val (mx, my) = c.pointer()
-            val down = d.pointer_live.read() && c.pressed(r)
-            val (bx, by) = c.press_origin()
-            val under = part_at(s, r, mx, my)
-            val name = if down && r.holds(bx, by) && part_at(s, r, bx, by) == under then under else ""
-            val selected = if down then name elif c.tapped(r) then part_at(s, r, c.tap_point().0, c.tap_point().1) else st.selected
-            var mouse = ""
-            s.scope.find(name) match
-                Some(p) -> if st.live && p.kind == "button" then mouse = name
-                None -> ()
-            if mouse != st.mouse_part || (!selected.is_empty() && selected != st.selected)
-                st.mouse_part = mouse
-                if !selected.is_empty() then st.selected = selected
-                d.current.set(st)
-        if d.interactive && st.live && d.pointer_live.read()
-            val t = board_transform(s, r)
-            for e in s.view.elements
-                e.shows match
-                    ShowPart(name) ->
-                        for control in d.pots
-                            if control.name != name then continue
-                            val (x, y, w, h) = coords(t, e)
-                            val box = ui.Rect(x, y, w, h)
-                            if c.grab(box, 29)
-                                val (mx, my) = c.pointer()
-                                val value = knob_position(box, mx, my, control.position.read())
-                                control.position.set(value)
-                                set_pot(&st, name, value)
-                                d.current.set(st)
-                    _ -> ()
+        if self.interactive
+            val density = c.pixel_scale()
+            if d.pixel_scale.read() != density then d.pixel_scale.set(density)
+            self.take_pointer(c, r)
+        val st = d.current.read()
         c.clip(r)
-        val t = board_transform(s, r)
+        val t = board_transform(r)
         if s.view.width > 0
             val pcb = ui.Rect(int(t.x), int(t.y), int(f32(s.view.width) * t.scale), int(f32(s.view.height) * t.scale))
             c.fill(pcb, parse_color(s.view.background), 8)
-            c.stroke(pcb, 0x487160, 1, 8)
+            c.stroke(pcb, PCB_EDGE, 1, 8)
             for e in s.view.elements
                 val (x, y, w, h) = coords(t, e)
                 val box = ui.Rect(x, y, w, h)
@@ -289,100 +280,183 @@ impl ui.View for BoardView
                         if !e.label.is_empty() then label(c, ui.Rect(x + 5, y + h / 2 - 7, w - 10, 20), e.label, INK, 11)
                     Caption(value) -> label(c, box, value, INK, if h > 20 then 18 else 11)
                     ShowPart(name) -> s.scope.find(name) match
-                        Some(p) -> draw_part(c, s, st, e, p, name, box, &d.tft_rasters)
+                        Some(p) -> draw_part(c, d, st, e, p, name, box)
                         None -> ()
         else
             label(c, ui.Rect(r.x + 24, r.y + r.h / 2 - 30, r.w - 48, 40), s.chip, INK, 25)
             label(c, ui.Rect(r.x + 24, r.y + r.h / 2 + 15, r.w - 48, 30), "No board layout supplied", MUTED, 14)
         c.unclip()
-        part_instruments(d, c, r)
+        part_instruments(d, c, r, self.interactive)
 
-private draw_part(c: *ui.Canvas, s: Scene, st: State, e: Element, p: Part, name: string, r: ui.Rect, rasters: *Buf[TftRaster])
+impl BoardView
+    /** The mouse holds a button while pressed on it, a tap selects a part, and a drag turns a knob. */
+    private take_pointer(&self, c: *ui.Canvas, r: ui.Rect)
+        val d = self.d
+        val s = d.scene
+        val st = d.current.read()
+        val (mx, my) = c.pointer()
+        val down = d.pointer_live.read() && c.pressed(r)
+        val (bx, by) = c.press_origin()
+        val under = part_at(s, r, mx, my)
+        val name = if down && r.holds(bx, by) && part_at(s, r, bx, by) == under then under else ""
+        val selected = if down then name elif c.tapped(r) then part_at(s, r, c.tap_point().0, c.tap_point().1) else st.selected
+        var mouse = ""
+        s.scope.find(name) match
+            Some(p) -> if d.session.live && look_of(p) == PartLook.Key then mouse = name
+            None -> ()
+        if mouse != st.mouse_part || (!selected.is_empty() && selected != st.selected)
+            edit(d, now ->
+                now.mouse_part = mouse
+                if !selected.is_empty() then now.selected = selected)
+        if !d.session.live || !d.pointer_live.read() then return
+        val t = board_transform(r)
+        for e in s.view.elements
+            e.shows match
+                ShowPart(part) ->
+                    for control in d.pots
+                        if control.name != part then continue
+                        val (x, y, w, h) = coords(t, e)
+                        val box = ui.Rect(x, y, w, h)
+                        if c.grab(box, 29)
+                            val (px, py) = c.pointer()
+                            control.position.set(knob_position(box, px, py, control.position.read()))
+                _ -> ()
+
+/** How a part is drawn and touched. `look_of` is the one place a part's model name is read; drawing,
+ * hit-testing and touch all match on the answer.
+ */
+enum PartLook derives Eq
+    Buzzer
+    Speaker
+    Module(caption: string)
+    Tft
+    Oled
+    Lcd
+    Matrix
+    Segments
+    Knob
+    Lamp(gpio: bool)
+    Toggle
+    Key
+    Unemulated
+    Stick
+    Generic
+
+private[ui] look_of(p: Part) -> PartLook = part_model(p) match
+    "buzzer" -> PartLook.Buzzer
+    "speaker" -> PartLook.Speaker
+    "i2s-amplifier" | "i2s-microphone" -> PartLook.Module(p.reference)
+    "ds3231" -> PartLook.Module(s"${p.reference} · RTC / I2C")
+    "st7789" | "mipi-dcs-display" -> PartLook.Tft
+    "ssd1306" -> PartLook.Oled
+    "hd44780" -> PartLook.Lcd
+    "led-matrix-5x5" -> PartLook.Matrix
+    "seven-segment" -> PartLook.Segments
+    "potentiometer" -> PartLook.Knob
+    "led" | "ws2812" -> PartLook.Lamp(p.kind == "led")
+    "switch" -> PartLook.Toggle
+    "button" -> PartLook.Key
+    "st7796" -> PartLook.Unemulated
+    "joystick" -> PartLook.Stick
+    _ -> PartLook.Generic
+
+/** A round control's dial: the angle of `at` (0..POSITION_MAX) on a 270-degree sweep from the
+ * bottom left, clockwise.
+ */
+private dial_angle(at: int) -> real = 0.75 * pi + 1.5 * pi * real(at) / real(virt.POSITION_MAX)
+
+/** Where a joystick's knob is drawn for a position, and the position a point on the joystick asks
+ * for: the knob travels the part's box less a 20-pixel margin on each side.
+ */
+private[ui] stick_point(r: ui.Rect, x: int, y: int) -> (int, int) =
+    (r.x + 20 + x * (r.w - 40) / virt.POSITION_MAX, r.y + 20 + y * (r.h - 40) / virt.POSITION_MAX)
+
+private[ui] stick_position(r: ui.Rect, x: int, y: int) -> (int, int) =
+    (max(0, min(virt.POSITION_MAX, (x - r.x - 20) * virt.POSITION_MAX / max(1, r.w - 40))),
+     max(0, min(virt.POSITION_MAX, (y - r.y - 20) * virt.POSITION_MAX / max(1, r.h - 40))))
+
+/** A module's board: a filled, outlined rectangle. The displays and the I2S/RTC modules share it. */
+private[ui] draw_module(c: *ui.Canvas, r: ui.Rect, fill: u32, edge: u32, radius: int = 5, width: int = 1)
+    c.fill(r, fill, radius)
+    c.stroke(r, edge, width, radius)
+
+/** Draw part `p`, shown on the board as `name`, in `r`. */
+private draw_part(c: *ui.Canvas, d: &Desktop, st: State, e: Element, p: Part, name: string, r: ui.Rect)
+    val session = d.session
+    val live = session.live
     val radius = min(r.w, r.h) / 2
-    part_model(p) match
-        "buzzer" ->
-            val on = st.live && virt.sound_active(name)
-            c.fill(r, 0x1A222B, min(r.w, r.h) / 2)
-            c.stroke(r, if on then ACCENT else 0x657889, 2, min(r.w, r.h) / 2)
+    look_of(p) match
+        Buzzer ->
+            val on = live && virt.sound_active(name)
+            c.fill(r, BUZZER_BODY, radius)
+            c.stroke(r, if on then ACCENT else BUZZER_RIM, 2, radius)
             for i in 0..<3
-                c.fill(ui.Rect(r.x + r.w / 2 - 15 + i * 12, r.y + r.h / 2 - 9, 5, 18), if on then ACCENT else 0x070C12, 2)
+                c.fill(ui.Rect(r.x + r.w / 2 - 15 + i * 12, r.y + r.h / 2 - 9, 5, 18), if on then ACCENT else BUZZER_SLOT, 2)
             label(c, ui.Rect(r.x, r.bottom() + 2, r.w + 35, 16), p.reference, MUTED, 10)
-        "speaker" ->
-            c.fill(r, 0x17232E, min(r.w, r.h) / 2)
-            c.stroke(r, 0x507386, 2, min(r.w, r.h) / 2)
+        Speaker ->
+            draw_module(c, r, SURFACE, BEZEL, radius, 2)
             val cone = ui.Rect(r.x + r.w / 5, r.y + r.h / 5, r.w * 3 / 5, r.h * 3 / 5)
-            c.fill(cone, 0x314957, min(cone.w, cone.h) / 2)
+            c.fill(cone, CONE, min(cone.w, cone.h) / 2)
             label(c, ui.Rect(r.x, r.bottom() + 4, r.w, 18), p.reference, MUTED, 11)
-        "i2s-amplifier" | "i2s-microphone" ->
-            c.fill(r, 0x17232E, 4)
-            c.stroke(r, EDGE, 1, 4)
+        Module(caption) ->
+            draw_module(c, r, SURFACE, EDGE, 4)
             label(c, ui.Rect(r.x + 8, r.y + 8, r.w - 16, 20), p.kind, INK, 12)
-            label(c, ui.Rect(r.x + 8, r.bottom() - 20, r.w - 16, 16), p.reference, MUTED, 10)
-        "ds3231" ->
-            c.fill(r, 0x17232E, 4)
-            c.stroke(r, EDGE, 1, 4)
-            label(c, ui.Rect(r.x + 8, r.y + 8, r.w - 16, 20), p.kind, INK, 12)
-            label(c, ui.Rect(r.x + 8, r.bottom() - 20, r.w - 16, 16), s"${p.reference} · RTC / I2C", MUTED, 10)
-        "st7789" | "mipi-dcs-display" -> draw_tft(c, r, p, name, st.live, rasters)
-        "ssd1306" -> draw_oled(c, r, p, name, st.live)
-        "hd44780" -> draw_lcd(c, r, p, name, st.live)
-        "led-matrix-5x5" ->
-            draw_led_matrix(c, r, p, if st.live then virt.display_brightness(name) else [0; 64])
-        "seven-segment" ->
-            draw_seven_segment(c, r, p, if st.live then virt.display_segments(name) else [0; 8])
+            label(c, ui.Rect(r.x + 8, r.bottom() - 20, r.w - 16, 16), caption, MUTED, 10)
+        Tft -> draw_tft(c, r, p, name, live, &d.tft_rasters)
+        Oled -> draw_oled(c, r, p, name, live)
+        Lcd -> draw_lcd(c, r, p, name, live)
+        Matrix -> draw_led_matrix(c, r, p, if live then virt.display_brightness(name) else [0; 64])
+        Segments ->
+            draw_seven_segment(c, r, p, if live then virt.display_segments(name) else [0; 8])
             if !p.reference.is_empty() then label(c, ui.Rect(r.x, r.bottom() + 3, r.w, 16), p.reference, MUTED, 11)
-        "potentiometer" ->
-            c.fill(r, 0x0C1C29, radius)
-            c.stroke(r, 0x507386, 2, radius)
-            val at = pot_position(st, p)
+        Knob ->
+            draw_module(c, r, WELL, BEZEL, radius, 2)
+            var at = session.position(p.name)
+            for control in d.pots do if control.name == p.name then at = control.position.read()
             for tick in 0..11
-                val angle = 0.75 * PI + 1.5 * PI * real(tick) / 10.0
+                val angle = dial_angle(tick * 1000)
                 val x = r.x + r.w / 2 + int(angle.cos() * real(radius - 4))
                 val y = r.y + r.h / 2 + int(angle.sin() * real(radius - 4))
                 c.fill(ui.Rect(x - 2, y - 2, 4, 4), if tick * 1000 <= at then ACCENT else MUTED, 2)
-            c.fill(ui.Rect(r.x + 10, r.y + 10, max(0, r.w - 20), max(0, r.h - 20)), 0x38586B, radius)
-            val angle = 0.75 * PI + 1.5 * PI * real(at) / 10000.0
+            c.fill(ui.Rect(r.x + 10, r.y + 10, max(0, r.w - 20), max(0, r.h - 20)), KNOB, radius)
+            val angle = dial_angle(at)
             val x = r.x + r.w / 2 + int(angle.cos() * real(radius) * 0.55)
             val y = r.y + r.h / 2 + int(angle.sin() * real(radius) * 0.55)
             c.fill(ui.Rect(x - 3, y - 3, 6, 6), ACCENT, 3)
             label(c, ui.Rect(r.x, r.bottom() + 5, max(r.w, 120), 22), if p.reference.is_empty() then name else p.reference)
-        "led" | "ws2812" ->
+        Lamp(gpio) ->
             val color = parse_color(look(e, "color", param(p, "color", "green")))
-            val on = p.kind == "led" && lit(st, p, s.chip)
+            val on = gpio && session.lit(p)
             val outer = ui.Rect(r.x - 4, r.y - 4, r.w + 8, r.h + 8)
-            c.fill(outer, if on then dim(color) else 0x21353D, radius + 4)
+            c.fill(outer, if on then dim(color) else LED_SOCKET, radius + 4)
             c.fill(r, if on then color else dim(color), radius)
-            if on then c.fill(ui.Rect(r.x + r.w / 4, r.y + r.h / 5, max(2, r.w / 4), max(2, r.h / 4)), 0xE8FFF5, radius)
-        "switch" ->
-            val closed = switch_closed(st,p)
-            c.fill(r,0x13232D,6)
-            c.stroke(r,if closed then ACCENT else MUTED,2,6)
-            val w = max(8,(r.w - 12) / 2)
-            c.fill(ui.Rect(if closed then r.right() - w - 6 else r.x + 6,r.y + 6,w,max(0,r.h - 12)),if closed then ACCENT else 0x536D7E,4)
-        "button" ->
-            val down = st.live && pressed(s, st, name)
-            c.fill(r, 0x13232D, 6)
-            c.stroke(r, if down then ACCENT else 0x7B92A3, 2, 6)
-            c.fill(ui.Rect(r.x + 7, r.y + 7, max(0, r.w - 14), max(0, r.h - 14)), if down then ACCENT else 0x536D7E, radius)
-        "st7796" ->
-            c.fill(r, 0x080F17, 5)
-            c.stroke(r, 0x445A6C, 2, 5)
+            if on then c.fill(ui.Rect(r.x + r.w / 4, r.y + r.h / 5, max(2, r.w / 4), max(2, r.h / 4)), GLINT, radius)
+        Toggle ->
+            val closed = session.closed(p.name)
+            draw_module(c, r, KEY_BODY, if closed then ACCENT else MUTED, 6, 2)
+            val w = max(8, (r.w - 12) / 2)
+            c.fill(ui.Rect(if closed then r.right() - w - 6 else r.x + 6, r.y + 6, w, max(0, r.h - 12)), if closed then ACCENT else KEY_IDLE, 4)
+        Key ->
+            val down = live && pressed(st, name)
+            draw_module(c, r, KEY_BODY, if down then ACCENT else KEY_RIM, 6, 2)
+            c.fill(ui.Rect(r.x + 7, r.y + 7, max(0, r.w - 14), max(0, r.h - 14)), if down then ACCENT else KEY_IDLE, radius)
+        Unemulated ->
+            draw_module(c, r, GLASS, GLASS_RIM, 5, 2)
             label(c, ui.Rect(r.x + 12, r.y + r.h / 2, r.w - 24, 40), "Display not emulated", MUTED, 14)
-        "joystick" ->
-            c.fill(r, 0x0C1C29, min(r.w,r.h) / 2)
-            c.stroke(r, 0x507386, 2, min(r.w,r.h) / 2)
+        Stick ->
+            draw_module(c, r, WELL, BEZEL, radius, 2)
             val cx = r.x + r.w / 2
             val cy = r.y + r.h / 2
-            c.fill(ui.Rect(cx - 1,r.y + 12,2,r.h - 24),EDGE)
-            c.fill(ui.Rect(r.x + 12,cy - 1,r.w - 24,2),EDGE)
-            val x = r.x + 20 + axis_position(st,s"$name.x") * (r.w - 40) / 10000
-            val y = r.y + 20 + axis_position(st,s"$name.y") * (r.h - 40) / 10000
-            c.fill(ui.Rect(x - 16,y - 16,32,32),ACCENT,16)
-        _ ->
-            c.fill(r, 0x34475A, 5)
+            c.fill(ui.Rect(cx - 1, r.y + 12, 2, r.h - 24), EDGE)
+            c.fill(ui.Rect(r.x + 12, cy - 1, r.w - 24, 2), EDGE)
+            val (ax, ay) = session.axes(p.name)
+            val (x, y) = stick_point(r, ax, ay)
+            c.fill(ui.Rect(x - 16, y - 16, 32, 32), ACCENT, 16)
+        Generic ->
+            c.fill(r, UNKNOWN_PART, 5)
             label(c, r, p.kind)
     if st.selected == name then c.stroke(ui.Rect(r.x - 6, r.y - 6, r.w + 12, r.h + 12), ACCENT, 2, 7)
-    if !e.label.is_empty() then label(c, ui.Rect(r.x, r.bottom() + 5, max(r.w, 100), 22), e.label)
+    if !e.label.is_empty() then label(c, element_label(r), e.label)
 
 /** Same syslUI tree and vector backend as the desktop driver, without a window server. */
 rasterize(d: &Desktop, width: int = WIDTH, height: int = HEIGHT) -> Result[&vg.Surface, string]
@@ -400,16 +474,8 @@ rasterize(d: &Desktop, width: int = WIDTH, height: int = HEIGHT) -> Result[&vg.S
         None -> return Err("cannot create desktop canvas")
     var c = ui.pluto_canvas(canvas, face, 14)
     surf.clear(13.0 / 255.0, 20.0 / 255.0, 32.0 / 255.0)
-    val readonly = desktop(d.scene, d.current.read(), false)
-    readonly.scroll.set(d.scroll.read())
-    readonly.tft_rasters = d.tft_rasters
-    readonly.workflow = d.workflow
-    readonly.sound_muted.set(d.sound_muted.read())
-    readonly.instruments = d.instruments
-    readonly.console_tab.set(d.console_tab.read())
-    val tree: &ui.View = Workbench(readonly)
+    val tree: &ui.View = Workbench(d, false)
     ui.render(tree, &c, ui.Rect(0, 0, width, height))
-    d.board_rect.set(readonly.board_rect.read())
     Ok(surf)
 
 save_desktop(d: &Desktop, path: string) -> Result[unit, string]
@@ -417,24 +483,21 @@ save_desktop(d: &Desktop, path: string) -> Result[unit, string]
     if !surf.write_png(path) then return Err(s"cannot write PNG: $path")
     Ok(())
 
-private const PI: real = 3.141592653589793
-
 /** A 270-degree clockwise control with a dead zone at the bottom and stable center clicks. */
 knob_position(r: ui.Rect, x: int, y: int, current: int) -> int
     val dx = real(x - r.x - r.w / 2)
     val dy = real(y - r.y - r.h / 2)
     if dx * dx + dy * dy < 9.0 then return current
     var angle = dy.atan2(dx)
-    if angle < 0.75 * PI then angle += 2.0 * PI
-    if angle > 2.25 * PI then return if angle < 2.5 * PI then 10000 else 0
-    int((angle - 0.75 * PI) * 10000.0 / (1.5 * PI))
+    if angle < 0.75 * pi then angle += 2.0 * pi
+    if angle > 2.25 * pi then return if angle < 2.5 * pi then virt.POSITION_MAX else 0
+    int((angle - 0.75 * pi) * 10000.0 / (1.5 * pi))
 
 /** Segment geometry is independent of ADC values and decimal encoding in the guest. */
 private draw_seven_segment(c: *ui.Canvas, r: ui.Rect, p: Part, masks: [8]u8)
-    val count = int(sh.sysl.benchtop.part_whole(p, "digits", 1))
+    val count = int(part_whole(p, "digits", 1))
     val color = parse_color(param(p, "color", "red"))
-    c.fill(r, 0x100D13, 5)
-    c.stroke(r, 0x51303A, 1, 5)
+    draw_module(c, r, SEGMENT_FILL, SEGMENT_RIM)
     val cell = max(1, (r.w - 12) / count)
     val height = max(4, r.h - 12)
     val width = max(3, cell - 12)
@@ -458,8 +521,7 @@ private draw_seven_segment(c: *ui.Canvas, r: ui.Rect, p: Part, masks: [8]u8)
 /** The same GPIO-derived row masks serve segmented digits and scanned dot matrices. */
 private draw_led_matrix(c: *ui.Canvas, r: ui.Rect, p: Part, levels: [64]u8)
     val color = parse_color(param(p, "color", "red"))
-    c.fill(r, 0x100D13, 5)
-    c.stroke(r, 0x51303A, 1, 5)
+    draw_module(c, r, SEGMENT_FILL, SEGMENT_RIM)
     val cell = max(1, min(r.w - 16, r.h - 16) / 5)
     val size = max(1, cell * 3 / 5)
     val left = r.x + (r.w - cell * 5) / 2

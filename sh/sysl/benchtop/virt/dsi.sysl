@@ -3,23 +3,26 @@ module sh.sysl.benchtop.virt
 import sh.sysl.benchtop.{Board,param_named,part_model,part_whole}
 import sh.sysl.benchtop.peripheral.dsi as dsi
 import sh.sysl.benchtop.parts.mipi_dcs as dcs
-import sh.sysl.benchtop.v6m.{Cpu,Stop,NEVER,halt,lower_limit}
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.benchtop.v6m.{Cpu,Stop,halt,lower_limit}
 import sysl.buf.{Buf,buf}
 import sysl.sync.*
 import sysl.threads.Mutex
 
 /** The DSI host (`stm32-dsi`): whether the bus has it, the clock of its next event, published for the
- * cores to read without the lock, and the packet engine, which both cores and the DSI worker reach.
+ * cores to read without the lock, the core that brings its events in (`claim_device`), and the
+ * packet engine, which both cores and the DSI worker reach.
  */
 struct DsiState
     present: bool
     next: u64
+    driver: u32
     host: Mutex[&dsi.Host]
 
 private val dsi_sink: dsi.Endpoint = (vc,kind,bytes,request) -> dsi_endpoint(vc,kind,bytes,request)
 
 /** No DSI host on the bus. */
-dsi_state() -> DsiState = DsiState(false, NEVER, Mutex.new(dsi.host(480000000)))
+dsi_state() -> DsiState = DsiState(false, NEVER, 0, Mutex.new(dsi.host(480000000)))
 
 // The DSI host `b` makes on a chip whose clock is `clock_hz`, and a check of the panels on it.
 private[virt] check_dsi(b: Board, clock_hz: u64) -> Result[DsiState,string]
@@ -41,7 +44,7 @@ private[virt] check_dsi(b: Board, clock_hz: u64) -> Result[DsiState,string]
         val vc = u32(part_whole(p,"channel",0))
         if channels & (1u32 << vc) != 0 then return Err("two DSI displays share a virtual channel")
         channels |= 1u32 << vc
-    Ok(DsiState(present, NEVER, Mutex.new(dsi.host(if present then clock_hz else 480000000,reference))))
+    Ok(DsiState(present, NEVER, 0, Mutex.new(dsi.host(if present then clock_hz else 480000000,reference))))
 
 private[virt] boot_dsi()
     val s = &machine.devices.dsi
@@ -49,6 +52,7 @@ private[virt] boot_dsi()
         *h = dsi.host((*h).hz,(*h).reference_hz)
         (*h).defer_reads = dsi_async())
     atomic_store(&s.next,NEVER,Release)
+    atomic_store(&s.driver,0,Release)
 
 // CPU-side completion enqueues only; display interpretation runs on its worker.
 private dsi_endpoint(vc: u32, kind: u32, payload: []const u8, request: u64) -> Buf[u8]
@@ -80,7 +84,7 @@ private[virt] apply_dsi_packet(s: *DisplayState, vc: u32, kind: u32, payload: []
 // section. An idle peripheral must not couple guest execution to UI painting.
 private[virt] signal_dsi(c: *Cpu)
     val s = &machine.devices.dsi
-    if !s.present then return
+    if !s.present || !drives_device(&s.driver,c) then return
     val time = board_time(c,c.retired)
     val due = atomic_load(&s.next,Acquire)
     if due == NEVER || time < due then return
@@ -92,6 +96,9 @@ private[virt] dsi_due() -> u64
     val s = &machine.devices.dsi
     if !s.present then return NEVER
     atomic_load(&s.next,Acquire)
+
+// The next event, for the core that brings the DSI host's events in; NEVER for the other.
+private[virt] dsi_due_for(c: *Cpu) -> u64 = if drives_device(&machine.devices.dsi.driver,c) then dsi_due() else NEVER
 
 // Under the host's lock. Publish after every state change, including MMIO-driven completion and
 // reset/cancellation of a queued packet.
@@ -121,6 +128,7 @@ private[virt] dsi_write(c: *Cpu, address: u32, offset: u32, width: u32, value: u
     if width != 4 || offset & 3 != 0
         halt(c,Stop.Fault,address)
         return
+    claim_device(&machine.devices.dsi.driver,c)
     machine.devices.dsi.host.with(h ->
         advance_dsi(h,board_time(c,n))
         if !dsi.write(*h,offset,value) then halt(c,Stop.Fault,address)
