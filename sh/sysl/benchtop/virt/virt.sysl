@@ -69,7 +69,7 @@ module sh.sysl.benchtop.virt
 // unless `capture` asked to keep it, which is what a test reads.
 
 import sh.sysl.benchtop.timing.NEVER
-import sh.sysl.benchtop.v6m.{configure_instruction_timing, Bus, Cpu, Kind, Stop, IRQ0, RAM_BYTES, clear, could_wake, halt, load32, raise, reset, run_single, run_threaded, set_limit}
+import sh.sysl.benchtop.v6m.{configure_instruction_timing, Bus, Cpu, Kind, MemoryMap, Stop, IRQ0, RAM_BYTES, clear, could_wake, halt, load32, raise, reset, run_single, run_threaded, set_limit}
 import sh.sysl.benchtop.v6m as memory
 import sh.sysl.elf as elf
 import sysl.buf.{Buf, buf, Frozen}
@@ -247,7 +247,7 @@ capture()
 capture_bounded(limit: usize)
     machine.console.live.with(l ->
         l.capturing = true
-        l.capture_limit = if limit < 128 then 128 else limit)
+        l.capture_limit = max(limit, 128))
 
 /** A read-only copy of everything the guest has written since `capture`. */
 output() -> &sync Frozen[u8] = machine.console.live.with(l ->
@@ -385,19 +385,48 @@ image_of(file: []const u8) -> Result[Buf[u8], string]
             var regions: Buf[elf.Region] = buf()
             regions.push(elf.Region(u64(map.ram_at), image.view()[..<usize(map.ram_size)]))
             for bank in map.banks do regions.push(elf.Region(u64(bank.base),image.view()[usize(bank.offset)..<usize(bank.offset + bank.size)]))
-            if map.flash_size != 0 then regions.push(elf.Region(u64(map.flash_at), image.view()[usize(RAM_BYTES)..]))
+            if map.flash_size != 0 then regions.push(elf.Region(u64(map.flash_at), image.view()[image_code_offset()..]))
 
             elf.load(e, regions.view()) match
                 Ok(_) -> ()
                 Err(why) -> return Err(s"$why")
         Err(elf.ElfError.NotElf) ->
-            val capacity = if map.flash_size == 0 then map.ram_size else map.flash_size
-            val offset = if map.flash_size == 0 then 0u32 else RAM_BYTES
-            if file.len > usize(capacity) then return Err(if map.flash_size == 0 then "larger than the board's 1 MB of RAM" else "larger than the board's flash")
-            for i in 0..<file.len do image.set(usize(offset) + i, file[i])
+            val (_, capacity) = code_region(map)
+            if file.len > usize(capacity) then
+                return Err(if map.flash_size == 0 then s"larger than the board's ${size_text(capacity)} of RAM" else s"larger than the board's ${size_text(capacity)} of flash")
+            val offset = image_code_offset()
+            for i in 0..<file.len do image.set(offset + i, file[i])
         Err(why) -> return Err(s"$why")
 
     Ok(image)
+
+// Where the code and its vector table are: the flash on a board with flash, the RAM on one without,
+// as (base address, length).
+private code_region(map: MemoryMap) -> (u32, u32) =
+    if map.flash_size == 0 then (map.ram_at, map.ram_size) else (map.flash_at, map.flash_size)
+
+/** Where the code begins inside an `image_of` image: the image is the RAM's backing and then the
+ * flash's, so on a board with flash the code is past the RAM; on one without, it is at 0. */
+image_code_offset() -> usize = if machine.map.flash_size == 0 then 0 else usize(RAM_BYTES)
+
+/** The SP and PC core 0 resets to from `image` (from `image_of`): the vector table's first two
+ * words, as every M-profile core reads them. Refused where the board could not run from them: an SP
+ * that is unaligned or outside the RAM, or a PC that is not a Thumb address in the code past the two
+ * vectors. The PC answered has its Thumb bit. */
+reset_vector(image: []const u8) -> Result[(u32, u32), string]
+    val map = machine.map
+    val offset = image_code_offset()
+    if image.len < offset + 8 then return Err("firmware has no reset vectors")
+    val sp = word_at(image, offset)
+    val pc = word_at(image, offset + 4)
+    val (code_at, code_length) = code_region(map)
+    val sp_fits = sp >= map.ram_at + 8 && u64(sp) <= u64(map.ram_at) + u64(map.ram_size) && sp & 3 == 0
+    val pc_fits = pc & 1 != 0 && pc >= code_at + 9 && u64(pc) < u64(code_at) + u64(code_length)
+    if !sp_fits || !pc_fits then return Err("firmware has invalid virtual-board reset vectors")
+    Ok((sp, pc))
+
+// The little-endian word at `i` of `b`.
+private word_at(b: []const u8, i: usize) -> u32 = u32(b[i]) | (u32(b[i + 1]) << 8) | (u32(b[i + 2]) << 16) | (u32(b[i + 3]) << 24)
 
 // A virtual board with `image` loaded at 0, both cores of the kind the board names, core 0 reset as
 // every M-profile core resets — SP from the vector table's first word, PC from its second — and core
@@ -408,7 +437,7 @@ boot(cpu: *Cpu, image: []const u8)
     cpu.kind = machine.configs[0].kind
     memory.reset_mapped(cpu, machine.memory, image, machine.map)
     configure(cpu, machine.configs[0])
-    cpu.vtor = if machine.map.flash_size == 0 then machine.map.ram_at else machine.map.flash_at
+    cpu.vtor = code_region(machine.map).0
     cpu.r[13] = load32(cpu, cpu.vtor)
     cpu.pc = load32(cpu, cpu.vtor + 4) & ~1
 

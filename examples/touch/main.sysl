@@ -4,60 +4,29 @@ import sh.sysl.imui.plutovg.{PlutoPainter, painter}
 import sh.sysl.plutovg as vg
 #if feature_dsi
 import sh.sysl.stm32h747.dsihost as dsi
+import sh.sysl.stm32h747.i2c4
 #endif
 
-extern __stack_top: u8
+import firmware.*
 
-// Linker-provided load and runtime addresses; startup runs before using any globals.
-extern __data_start: u8
-extern __data_end: u8
-extern __data_load: u8
-extern __bss_start: u8
-extern __bss_end: u8
-
-struct StartupByte
-    value: volatile u8
-
-initialize_memory()
-    val source: *StartupByte = ptr_cast(usize(&__data_load))
-    val data: *StartupByte = ptr_cast(usize(&__data_start))
-    val zero: *StartupByte = ptr_cast(usize(&__bss_start))
-    for i in 0..<(usize(&__data_end) - usize(&__data_start)) do data[i].value = source[i].value
-    for i in 0..<(usize(&__bss_end) - usize(&__bss_start)) do zero[i].value = 0
-
-
-struct Vectors
-    stack: *u8
-    reset: *extern() -> never
-    reserved: [46]u32
+// The STM32H7 interrupt numbers of the DMA streams that serve the SAI.
+const DMA2_STREAM1_IRQ: usize = 57
+const DMA2_STREAM4_IRQ: usize = 60
 
 #if feature_audio
-struct AudioVectors
-    stack: *u8
-    reset: *extern() -> never
-    before_dma: [71]u32
-    dma2_stream1: *extern() -> unit
-    before_capture: [2]u32
-    dma2_stream4: *extern() -> unit
-    rest: [179]u32
 @export("vectors")
 @section(".rodata.vectors")
-val vectors: AudioVectors = AudioVectors(&__m7_stack_top,&m7_start,[0;71],&audio_interrupt,[0;2],&audio_capture_interrupt,[0;179])
+val vectors = vector_table[240](&__m7_stack_top, &m7_start, [(DMA2_STREAM1_IRQ, &audio_interrupt), (DMA2_STREAM4_IRQ, &audio_capture_interrupt)])
+#else
+#if feature_h7_cores
+@export("vectors")
+@section(".rodata.vectors")
+val vectors = vector_table[32](&__m7_stack_top, &m7_start)
 #else
 @export("vectors")
 @section(".rodata.vectors")
-val vectors: Vectors = Vectors(
-#if feature_h7_cores
-    &__m7_stack_top,
-#else
-    &__stack_top,
+val vectors = vector_table[32](&__stack_top, &start)
 #endif
-#if feature_h7_cores
-    &m7_start,
-#else
-    &start,
-#endif
-    [0; 46])
 #endif
 
 #if feature_h7_cores
@@ -65,7 +34,7 @@ extern __m7_stack_top: u8
 
 @export("m4_vectors")
 @section(".rodata.m4_vectors")
-val m4_vectors: Vectors = Vectors(&__stack_top, &start, [0;46])
+val m4_vectors = vector_table[32](&__stack_top, &start)
 
 // Test harness: real RCC_GCR CM4 boot request, with BCM4 disabled in option
 // bytes. Display transport remains the existing virtual SPI/I2C test rig.
@@ -109,17 +78,17 @@ struct I2c
     command: volatile u32
     status: volatile u32
 
-struct AppState
-    count: int
-    enabled: bool
-    level: int
-
-@export("touch_app")
+// The application's state, one exported symbol per field so a test reads each by name.
+@export("touch_count")
+var touch_count: int = 0
+@export("touch_enabled")
 #if feature_audio
-var app = AppState(0, false, 50)
+var touch_enabled: bool = false
 #else
-var app = AppState(0, true, 50)
+var touch_enabled: bool = true
 #endif
+@export("touch_level")
+var touch_level: int = 50
 var pixels: [230400]u8
 var previous: [57600]u16
 var commands_a: [64]Cmd
@@ -165,23 +134,43 @@ spi_bus() -> *Spi = ptr_cast(usize(0x50001000))
 // STM32 DSI host command-mode registers, with 500 Mbit/s on each of two lanes.
 word(at: u32) -> *Word = ptr_cast(usize(at))
 
+// A DSI host register by its offset.
+dsi_register(offset: u32) -> *Word = word(dsi.BASE + offset)
+
+// The DCS data types a generic packet header carries, and the DCS commands the panel is given.
+const DSI_SHORT_WRITE: u32 = 0x05
+const DSI_SHORT_WRITE_PARAMETER: u32 = 0x15
+const DSI_LONG_WRITE: u32 = 0x39
+const DCS_EXIT_SLEEP: u32 = 0x11
+const DCS_DISPLAY_ON: u32 = 0x29
+const DCS_SET_COLUMN: u32 = 0x2a
+const DCS_SET_PAGE: u32 = 0x2b
+const DCS_WRITE_MEMORY: u32 = 0x2c
+const DCS_WRITE_MEMORY_CONTINUE: u32 = 0x3c
+const DCS_SET_PIXEL_FORMAT: u32 = 0x3a
+
 dsi_wait()
-    while word(0x50000074).value & 1 == 0 do ()
+    while dsi_register(dsi.DSI_GPSR_OFFSET).value & dsi.DSI_GPSR_CMDFE_MASK == 0 do ()
 
 dsi_short(command: u32, parameter: u32 = 0, has_parameter: bool = false)
     dsi_wait()
-    word(0x5000006c).value = (if has_parameter then 0x15u32 else 5u32) | (command << 8) | (parameter << 16)
+    val data_type = if has_parameter then DSI_SHORT_WRITE_PARAMETER else DSI_SHORT_WRITE
+    dsi_register(dsi.DSI_GHCR_OFFSET).value = data_type | (command << dsi.DSI_GHCR_WCLSB_SHIFT) | (parameter << dsi.DSI_GHCR_WCMSB_SHIFT)
     dsi_wait()
+
+// Send a long write whose payload is already in the payload FIFO: `count` bytes of it.
+dsi_long_write(count: u32)
+    dsi_register(dsi.DSI_GHCR_OFFSET).value = DSI_LONG_WRITE | (count << dsi.DSI_GHCR_WCLSB_SHIFT)
 
 dsi_window(left: int, top: int, right: int, bottom: int)
     dsi_wait()
-    word(0x50000070).value = 0x2a | (u32(left >> 8) << 8) | (u32(left & 255) << 16) | (u32(right >> 8) << 24)
-    word(0x50000070).value = u32(right & 255)
-    word(0x5000006c).value = 0x39 | (5 << 8)
+    dsi_register(dsi.DSI_GPDR_OFFSET).value = DCS_SET_COLUMN | (u32(left >> 8) << 8) | (u32(left & 255) << 16) | (u32(right >> 8) << 24)
+    dsi_register(dsi.DSI_GPDR_OFFSET).value = u32(right & 255)
+    dsi_long_write(5)
     dsi_wait()
-    word(0x50000070).value = 0x2b | (u32(top >> 8) << 8) | (u32(top & 255) << 16) | (u32(bottom >> 8) << 24)
-    word(0x50000070).value = u32(bottom & 255)
-    word(0x5000006c).value = 0x39 | (5 << 8)
+    dsi_register(dsi.DSI_GPDR_OFFSET).value = DCS_SET_PAGE | (u32(top >> 8) << 8) | (u32(top & 255) << 16) | (u32(bottom >> 8) << 24)
+    dsi_register(dsi.DSI_GPDR_OFFSET).value = u32(bottom & 255)
+    dsi_long_write(5)
     dsi_wait()
 
 dsi_pixels(command: u32, first: int, count: int, blank: bool = false)
@@ -194,43 +183,47 @@ dsi_pixels(command: u32, first: int, count: int, blank: bool = false)
             packed |= byte << shift
             shift += 8
             if shift == 32
-                word(0x50000070).value = packed
+                dsi_register(dsi.DSI_GPDR_OFFSET).value = packed
                 packed = 0
                 shift = 0
-    if shift != 0 then word(0x50000070).value = packed
-    word(0x5000006c).value = 0x39 | (u32(1 + count * 2) << 8)
+    if shift != 0 then dsi_register(dsi.DSI_GPDR_OFFSET).value = packed
+    dsi_long_write(u32(1 + count * 2))
     dsi_wait()
 
 dsi_initialize()
-    word(0x50000430).value = 0x01000000
-    while word(0x5000040c).value & 0x1000 == 0 do ()
-    word(0x50000430).value = 0x01000001 | (100 << 2) | (5 << 11) // 25 MHz / 5 * 100 = 500 MHz.
-    while word(0x5000040c).value & 0x1100 != 0x1100 do ()
-    word(dsi.BASE + dsi.DSI_PCTLR_OFFSET).value = dsi.DSI_PCTLR_DEN_MASK | dsi.DSI_PCTLR_CKE_MASK
-    word(0x500000a4).value = 1
-    word(0x50000034).value = 1
-    word(0x50000008).value = 4
-    word(0x50000400).value = 1
-    word(0x50000404).value = 8
-    word(0x50000004).value = 1
-    dsi_short(0x11)
-    dsi_short(0x3a,0x55,true)
+    dsi_register(dsi.DSI_WRPCR_OFFSET).value = dsi.DSI_WRPCR_REGEN_MASK
+    while dsi_register(dsi.DSI_WISR_OFFSET).value & dsi.DSI_WISR_RRS_MASK == 0 do ()
+    // 25 MHz / 5 * 100 = 500 MHz.
+    dsi_register(dsi.DSI_WRPCR_OFFSET).value = dsi.DSI_WRPCR_REGEN_MASK | dsi.DSI_WRPCR_PLLEN_MASK | (100 << dsi.DSI_WRPCR_NDIV_SHIFT) | (5 << dsi.DSI_WRPCR_IDF_SHIFT)
+    val pll_ready = dsi.DSI_WISR_RRS_MASK | dsi.DSI_WISR_PLLLS_MASK
+    while dsi_register(dsi.DSI_WISR_OFFSET).value & pll_ready != pll_ready do ()
+    dsi_register(dsi.DSI_PCTLR_OFFSET).value = dsi.DSI_PCTLR_DEN_MASK | dsi.DSI_PCTLR_CKE_MASK
+    dsi_register(dsi.DSI_PCONFR_OFFSET).value = 1 // One data lane.
+    dsi_register(dsi.DSI_MCR_OFFSET).value = dsi.DSI_MCR_CMDM_MASK
+    dsi_register(dsi.DSI_CCR_OFFSET).value = 4 << dsi.DSI_CCR_TXECKDIV_SHIFT
+    dsi_register(dsi.DSI_WCFGR_OFFSET).value = dsi.DSI_WCFGR_DSIM_MASK
+    dsi_register(dsi.DSI_WCR_OFFSET).value = dsi.DSI_WCR_DSIEN_MASK
+    dsi_register(dsi.DSI_CR_OFFSET).value = dsi.DSI_CR_EN_MASK
+    dsi_short(DCS_EXIT_SLEEP)
+    dsi_short(DCS_SET_PIXEL_FORMAT, 0x55, true)
     // Initialize the complete physical glass, not just the UI's 240x240 region.
-    dsi_window(0,0,799,479)
-    for i in 0..<1500 do dsi_pixels(if i == 0 then 0x2c else 0x3c,0,256,true)
-    dsi_short(0x29)
+    dsi_window(0, 0, 799, 479)
+    for i in 0..<1500 do dsi_pixels(if i == 0 then DCS_WRITE_MEMORY else DCS_WRITE_MEMORY_CONTINUE, 0, 256, true)
+    dsi_short(DCS_DISPLAY_ON)
 
 // I2C4 polling using STM32 v2 flags and one-byte FT6206 register addresses.
 ft_read(register: u32, bytes: []u32)
-    word(0x58001c1c).value = (1 << 4) | (1 << 5)
-    word(0x58001c04).value = 0x54 | (1 << 16) | (1 << 13)
-    while word(0x58001c18).value & 2 == 0 do ()
-    word(0x58001c28).value = register
-    while word(0x58001c18).value & (1 << 6) == 0 do ()
-    word(0x58001c04).value = 0x54 | (u32(bytes.len) << 16) | (1 << 10) | (1 << 13) | (1 << 25)
+    val status = i2c4.BASE + i2c4.ISR_OFFSET
+    val control = i2c4.BASE + i2c4.CR2_OFFSET
+    word(i2c4.BASE + i2c4.ICR_OFFSET).value = i2c4.ICR_NACKCF_MASK | i2c4.ICR_STOPCF_MASK
+    word(control).value = 0x54 | (1 << 16) | i2c4.CR2_START_MASK
+    while word(status).value & i2c4.ISR_TXIS_MASK == 0 do ()
+    word(i2c4.BASE + i2c4.TXDR_OFFSET).value = register
+    while word(status).value & i2c4.ISR_TC_MASK == 0 do ()
+    word(control).value = 0x54 | (u32(bytes.len) << 16) | i2c4.CR2_RD_WRN_MASK | i2c4.CR2_START_MASK | i2c4.CR2_AUTOEND_MASK
     for i in 0..<bytes.len
-        while word(0x58001c18).value & 4 == 0 do ()
-        bytes[i] = word(0x58001c24).value
+        while word(status).value & i2c4.ISR_RXNE_MASK == 0 do ()
+        bytes[i] = word(i2c4.BASE + i2c4.RXDR_OFFSET).value
 
 poll_focal(last: Input) -> Option[Input]
     var report: [7]u32 = [0;7]
@@ -248,7 +241,7 @@ gpio_spi(gpio: *Gpio, byte: u32, data: bool)
     val base = (gpio.out & 32) | 16 | (if data then 8 else 0)
     gpio.out = base
     for bit in 0..<8
-        val value = base | (if (byte & (128u32 >> u32(bit))) != 0 then 2 else 0)
+        val value = base | (if (byte & (128u32 >> bit)) != 0 then 2 else 0)
         gpio.out = value
         gpio.out = value | 1
         gpio.out = value
@@ -406,11 +399,11 @@ frame[P: Painter](ui: *Ui, painter: *P)
     val button_text = "ADD ONE"
 #endif
     if accent_button(ui, painter, th, Rect(12, 40, 216, 44), button_text)
-        app.count += 1
+        touch_count += 1
 #if feature_microphone
-        if app.count == 3 then app.count = 0
+        if touch_count == 3 then touch_count = 0
 #else
-        if app.count == 10 then app.count = 0
+        if touch_count == 10 then touch_count = 0
 #endif
 #if feature_audio
 #if feature_microphone
@@ -421,27 +414,27 @@ frame[P: Painter](ui: *Ui, painter: *P)
 #else
     val counts: [10]string = ["COUNT 0","COUNT 1","COUNT 2","COUNT 3","COUNT 4","COUNT 5","COUNT 6","COUNT 7","COUNT 8","COUNT 9"]
 #endif
-    label(painter, th, Rect(12, 88, 216, 16), counts[app.count], 0)
+    label(painter, th, Rect(12, 88, 216, 16), counts[touch_count], 0)
 #if feature_audio
 #if feature_microphone
-    toggle(ui, painter, th, Rect(12, 108, 216, 36), "MONITOR", &app.enabled)
+    toggle(ui, painter, th, Rect(12, 108, 216, 36), "MONITOR", &touch_enabled)
 #else
-    toggle(ui, painter, th, Rect(12, 108, 216, 36), "TONE", &app.enabled)
+    toggle(ui, painter, th, Rect(12, 108, 216, 36), "TONE", &touch_enabled)
 #endif
     label(painter, th, Rect(12, 146, 216, 16), "VOLUME", -1)
 #else
-    toggle(ui, painter, th, Rect(12, 108, 216, 36), "POWER", &app.enabled)
+    toggle(ui, painter, th, Rect(12, 108, 216, 36), "POWER", &touch_enabled)
     label(painter, th, Rect(12, 146, 216, 16), "BRIGHTNESS", -1)
 #endif
-    slider(ui, painter, th, Rect(12, 164, 216, 36), &app.level, 0, 100)
+    slider(ui, painter, th, Rect(12, 164, 216, 36), &touch_level, 0, 100)
 #if feature_microphone
     progress(painter, th, Rect(12, 208, 216, 16), int(audio_meter_display), 100)
     label(painter, th, Rect(12, 225, 216, 14), "INPUT LEVEL", 0)
 #else
-    progress(painter, th, Rect(12, 208, 216, 16), app.level, 100)
+    progress(painter, th, Rect(12, 208, 216, 16), touch_level, 100)
 #endif
 #if feature_audio
-    audio_publish_controls(app.enabled,app.level,app.count)
+    audio_publish_controls(touch_enabled, touch_level, touch_count)
 #endif
 
 // Record interaction once, then draw only changed horizontal bands. The command
@@ -463,7 +456,7 @@ draw_frame(ui: *Ui, painter: *PlutoPainter, gpio: *Gpio, input: Input,
 #endif
     profile.render = elapsed(started)
 #if !feature_dsi
-    gpio.out = (gpio.out & ~32u32) | (if app.enabled then 32 else 0)
+    gpio.out = (gpio.out & ~32u32) | (if touch_enabled then 32 else 0)
 #endif
     var next = next_band(mask, 30, screen, 0)
     while next.is_some()
@@ -495,8 +488,8 @@ start() -> never
     val gpio: *Gpio = ptr_cast(usize(0)) // Unused by the DSI transport.
     val bus: *I2c = ptr_cast(usize(0)) // FT6206 uses real I2C4 registers below.
     dsi_initialize()
-    word(0x58001c10).value = 0x10c0ecff
-    word(0x58001c00).value = 1
+    word(i2c4.BASE + i2c4.TIMINGR_OFFSET).value = 0x10c0ecff
+    word(i2c4.BASE + i2c4.CR1_OFFSET).value = i2c4.CR1_PE_MASK
 #else
     val gpio: *Gpio = ptr_cast(usize(0x50000000))
     val bus: *I2c = ptr_cast(usize(0x50000300))
@@ -574,9 +567,9 @@ start() -> never
 #if feature_delay
             val output = audio_output_level.value
             val cpu = (audio_dsp_peak_cycles.value * 100 + 1279999) / 1280000
-            if output != delay_meter_output || cpu != delay_meter_cpu
-                delay_meter_output = output
-                delay_meter_cpu = cpu
+            if output != delay.meter_output || cpu != delay.meter_cpu
+                delay.meter_output = output
+                delay.meter_cpu = cpu
                 redraw = true
 #endif
 #endif

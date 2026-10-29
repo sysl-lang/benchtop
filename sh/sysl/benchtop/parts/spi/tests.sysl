@@ -1,69 +1,131 @@
 module sh.sysl.benchtop.parts.spi
 @tests
 
+import sh.sysl.benchtop.parts.pins.{driven, floating}
+
+// CS, SCK and MOSI all driven: CS active (low) where `selected`.
+private step(r: *Receiver, selected: bool, sck: bool, mosi: bool) -> Option[u8] =
+    observe(r, driven(!selected), driven(sck), driven(mosi))
+
+// One byte clocked in MSB first under CS, after a selecting call: what the receiver completed.
 private send(r: *Receiver, byte: u8) -> Option[u8]
     var result: Option[u8] = None
-    observe(r, 0, 7)
+    step(r, true, false, false)
     for bit in 0..<8
-        val pins: u32 = if (byte & (128u8 >> u32(bit))) != 0 then 4 else 0
-        observe(r, pins, 7)
-        val sampled = observe(r, pins | 2, 7)
+        val mosi = byte >> (7 - bit) & 1 != 0
+        step(r, true, false, mosi)
+        val sampled = step(r, true, true, mosi)
         if sampled.is_some() then result = sampled
-        observe(r, pins, 7)
+        step(r, true, false, mosi)
     result
 
 @test("GPIO SPI: mode-zero MSB-first framing receives every byte and consecutive bytes under one selection")
 bytes()
-    var r = receiver(0, 1, 2)
+    var r = receiver()
     for n in 0..<256
         assert(send(&r, u8(n)) == Some(u8(n)))
-        assert(r.bits == 0 && r.value == 0)
-    observe(&r, 1, 7)
-    assert(!r.selected)
+        assert(r.link.bits == 0 && r.link.input == 0)
+    step(&r, false, false, false)
+    assert(!r.link.selected)
 
 @test("GPIO SPI: deselection and undriven pins abort partial frames, repeated levels do not clock data")
 framing()
-    var r = receiver(0, 1, 2)
-    observe(&r, 0, 7)
-    observe(&r, 6, 7)
-    assert(r.bits == 1)
-    observe(&r, 6, 7)
-    observe(&r, 2, 7)
-    assert(r.bits == 1)
-    observe(&r, 1, 7)
-    assert(r.bits == 0)
-    assert(send(&r, 0xA5) == Some(0xA5u8))
-    observe(&r, 2, 7)
-    observe(&r, 0, 3) // MOSI not driven.
-    assert(r.bits == 0 && !r.selected)
-    observe(&r, 2, 7) // Selecting with clock high does not invent an edge.
-    assert(r.bits == 0)
-    assert(send(&r, 0x5A) == Some(0x5Au8))
+    var r = receiver()
+    step(&r, true, false, false)
+    step(&r, true, true, true)
+    assert(r.link.bits == 1)
+    step(&r, true, true, true)
+    step(&r, true, true, false)
+    assert(r.link.bits == 1, "a level held is no edge")
+    step(&r, false, false, false)
+    assert(r.link.bits == 0, "CS high drops the partial byte")
+    assert(send(&r, 0xA5) == Some(0xA5))
+    step(&r, true, true, false)
+    observe(&r, driven(false), driven(false), floating())
+    assert(r.link.bits == 0 && !r.link.selected, "an undriven MOSI deselects")
+    step(&r, true, true, false)
+    assert(r.link.bits == 0, "selecting with SCK high does not invent an edge")
+    assert(send(&r, 0x5A) == Some(0x5A))
+
+@test("GPIO SPI: an undriven CS or SCK deselects as an undriven MOSI does")
+undriven_terminals()
+    for which in 0..<2
+        var r = receiver()
+        step(&r, true, false, false)
+        step(&r, true, true, true)
+        assert(r.link.bits == 1)
+        val cs = if which == 0 then floating() else driven(false)
+        val sck = if which == 1 then floating() else driven(false)
+        observe(&r, cs, sck, driven(false))
+        assert(!r.link.selected && r.link.bits == 0, s"terminal $which")
+
+@test("SPI shifter: MISO presents the byte MSB first and the next byte loads on the falling edge after the eighth")
+shifter_full_duplex()
+    var s = shifter()
+    assert(miso(s), "released MISO reads high")
+    select(&s, 0b1010_0110)
+    var seen: u8 = 0
+    var received: Option[u8] = None
+    for bit in 0..<8
+        assert(edge(&s, true) == Rising)
+        seen = seen << 1 | (if miso(s) then 1 else 0)
+        val got = sample(&s, (0x3C >> (7 - bit)) & 1 != 0)
+        if bit < 7 then assert(got.is_none()) else received = got
+        assert(edge(&s, false) == Falling)
+        if bit == 7
+            assert(s.reload, "a completed byte asks for the next")
+            load(&s, 0x81)
+    assert(seen == 0b1010_0110, f"0x$seen%02x")
+    assert(received == Some(0x3C))
+    assert(!s.reload && s.output == 0x81 && miso(s), "the next byte's first bit is out")
+
+@test("SPI shifter: the eighth bit is still the old byte's until the falling edge, and a deselect releases MISO")
+shifter_reload_and_deselect()
+    var s = shifter()
+    select(&s, 0x01)
+    for bit in 0..<7
+        edge(&s, true)
+        sample(&s, false)
+        edge(&s, false)
+    edge(&s, true)
+    assert(miso(s), "bit 0 of 0x01 is on MISO for the eighth rising edge")
+    assert(sample(&s, true) == Some(1))
+    assert(s.output == 0x01, "no reload before the falling edge")
+    assert(edge(&s, true) == Steady)
+    select(&s, 0)
+    deselect(&s)
+    assert(!s.selected && s.bits == 0 && s.output == 0xff && !s.reload && miso(s))
+    assert(s.high, "SCK's level survives a deselect, so no edge is invented on reselect")
+    assert(edge(&s, true) == Steady)
 
 private idle(t: Transfer) -> bool = t match
     Idle -> true
     _ -> false
 
-@test("GPIO SPI: four-wire display ports isolate shared clock/data by mcu select and share reset safely")
+// A port's five terminals, all driven.
+private wires(cs: bool, sck: bool, mosi: bool, dc: bool, reset: bool) -> Wires =
+    Wires(driven(cs), driven(sck), driven(mosi), driven(dc), driven(reset))
+
+@test("GPIO SPI: four-wire display ports isolate shared clock/data by select and share reset safely")
 shared_ports()
-    var a = port(0,1,2,3,4)
-    var b = port(5,1,2,6,4)
+    var a = port()
+    var b = port()
     // Reset is active low and is reported once while held.
-    transfer(&a, 0, 127) match
+    transfer(&a, wires(false, false, false, false, false)) match
         Reset -> ()
         _ -> assert(false)
-    assert(idle(transfer(&a, 0, 127)))
-    assert(idle(transfer(&a, 16 | 1 | 32, 127)))
-    assert(idle(transfer(&b, 16 | 1 | 32, 127)))
+    assert(idle(transfer(&a, wires(false, false, false, false, false))))
+    assert(idle(transfer(&a, wires(true, false, false, false, true))))
+    assert(idle(transfer(&b, wires(true, false, false, false, true))))
     for select_a in [true, false]
-        val base: u32 = 16 | (if select_a then 32 | 8 else 1 | 64)
         val value: u8 = if select_a then 0xA5 else 0x5A
         var received = false
         for bit in 0..<8
-            val pins = base | (if (value & (128u8 >> u32(bit))) != 0 then 4 else 0)
-            for levels in [pins, pins | 2, pins]
-                val ta = transfer(&a, levels, 127)
-                val tb = transfer(&b, levels, 127)
+            val mosi = value >> (7 - bit) & 1 != 0
+            for sck in [false, true, false]
+                // A and B share SCK, MOSI and RESET; each has its own CS and D/C.
+                val ta = transfer(&a, wires(!select_a, sck, mosi, select_a, true))
+                val tb = transfer(&b, wires(select_a, sck, mosi, !select_a, true))
                 val active = if select_a then ta else tb
                 assert(idle(if select_a then tb else ta))
                 active match
@@ -73,16 +135,18 @@ shared_ports()
                     Idle -> ()
                     Reset -> assert(false)
         assert(received)
-        transfer(&a, 16 | 1 | 32, 127)
-        transfer(&b, 16 | 1 | 32, 127)
+        transfer(&a, wires(true, false, false, false, true))
+        transfer(&b, wires(true, false, false, false, true))
 
 @test("GPIO SPI: changing DC or losing a driver discards a partial display byte")
 control_framing()
-    var p = port(0,1,2,3,4)
-    transfer(&p, 16, 31)
-    transfer(&p, 16 | 2, 31)
-    assert(p.bus.bits == 1)
-    assert(idle(transfer(&p, 16 | 8, 31)) && p.bus.bits == 0)
-    transfer(&p, 16, 31)
-    transfer(&p, 16 | 2, 31)
-    assert(idle(transfer(&p, 16, 23)) && p.bus.bits == 0)
+    var p = port()
+    transfer(&p, wires(false, false, false, false, true))
+    transfer(&p, wires(false, true, false, false, true))
+    assert(p.bus.link.bits == 1)
+    assert(idle(transfer(&p, wires(false, false, false, true, true))) && p.bus.link.bits == 0)
+    transfer(&p, wires(false, false, false, false, true))
+    transfer(&p, wires(false, true, false, false, true))
+    var lost = wires(false, false, false, false, true)
+    lost.dc = floating()
+    assert(idle(transfer(&p, lost)) && p.bus.link.bits == 0)

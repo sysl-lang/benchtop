@@ -1,6 +1,7 @@
 module sh.sysl.benchtop.parts.sd_card
 
 import sysl.container.ring.InlineRing
+import sh.sysl.benchtop.parts.spi as bus
 
 // SPI-mode SDHC protocol endpoint. Storage callbacks see whole 512-byte sectors;
 // no filesystem, MCU register addresses or host files are part of this model.
@@ -22,13 +23,8 @@ enum WriteStage
  * power-on state except for the two fields `spi_idle` sets.
  */
 struct Spi
-    selected: bool
-    high: bool
+    link: bus.Shifter
     clocks: u32
-    bits: u32
-    input: u8
-    output: u8
-    next_byte: bool
     frame: [6]u8
     frame_count: usize
     reply: InlineRing[u8, 520]
@@ -42,7 +38,7 @@ struct Spi
 
 private spi_idle() -> Spi
     var s: Spi
-    s.output = 0xff
+    s.link = bus.shifter()
     s.idle = true
     s
 
@@ -79,13 +75,13 @@ reset(c: &Card)
 private[sd_card] crc7(bytes: []const u8) -> u8
     var rem: u16 = 0
     for byte in bytes
-        for bit in 0u32..<8
-            rem = (rem << 1) | u16((byte >> (7 - bit)) & 1)
+        for bit in 0..<8
+            rem = rem << 1 | u16(byte >> (7 - bit) & 1)
             if rem & 0x80 != 0 then rem ^= 0x89
     for bit in 0..<7
         rem <<= 1
         if rem & 0x80 != 0 then rem ^= 0x89
-    u8((rem << 1) | 1)
+    u8(rem << 1 | 1)
 private crc16(bytes: []const u8) -> u16
     var crc: u16 = 0
     for byte in bytes
@@ -221,35 +217,26 @@ private block_received(c: &Card, time: u64)
         push(c,5)
         c.busy_until = time + c.program_ticks
 
-// Mode 0: data is sampled on rising edges; the next response byte is loaded
-// only on the following falling edge, preserving the eighth sample bit.
+/** The card's pins are at `selected` (CS active), `sck` and `mosi`: the level it drives on MISO,
+ * as it was before this edge. The card speaks SPI mode 0 through `bus.Shifter`; while deselected it
+ * counts the clocks it is given (CMD0 needs 74) and abandons any command in progress.
+ */
 observe(c: &Card, selected: bool, sck: bool, mosi: bool, time: u64) -> bool
-    val rising = sck && !c.spi.high
-    val falling = !sck && c.spi.high
-    c.spi.high = sck
+    val link = &c.spi.link
+    val clock = bus.edge(link,sck)
     if !selected
-        if rising && c.spi.clocks < 80 then c.spi.clocks += 1
-        c.spi.selected = false
-        c.spi.bits = 0
+        if clock == bus.Rising && c.spi.clocks < 80 then c.spi.clocks += 1
+        bus.deselect(link)
         c.spi.frame_count = 0
         c.spi.write_stage = NoWrite
         c.spi.reply.clear()
-        c.spi.output = 0xff
-        c.spi.next_byte = false
         return true
-    if !c.spi.selected
-        c.spi.selected = true
-        c.spi.output = take(c,time)
-    val result = c.spi.output & (0x80u8 >> c.spi.bits) != 0
-    if rising
-        c.spi.input = (c.spi.input << 1) | (if mosi then 1 else 0)
-        c.spi.bits += 1
-        if c.spi.bits == 8
-            byte(c,c.spi.input,time)
-            c.spi.bits = 0
-            c.spi.input = 0
-            c.spi.next_byte = true
-    elif falling && c.spi.next_byte
-        c.spi.output = take(c,time)
-        c.spi.next_byte = false
+    if !link.selected then bus.select(link,take(c,time))
+    val result = bus.miso(*link)
+    clock match
+        Rising -> bus.sample(link,mosi) match
+            Some(value) -> byte(c,value,time)
+            None -> ()
+        Falling -> if link.reload then bus.load(link,take(c,time))
+        Steady -> ()
     result

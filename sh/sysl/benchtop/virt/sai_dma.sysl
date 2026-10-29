@@ -8,8 +8,12 @@ import sh.sysl.benchtop.v6m.{Cpu,Stop,halt,lower_limit}
 import sh.sysl.benchtop.v6m as memory
 import sysl.buf.{Buf,buf}
 import sysl.container.ring.{Ring,ring}
+import sysl.math.min
 import sysl.threads.Mutex
 import sysl.sync.*
+
+// The audio devices' interrupt lines: the SAI's, then each of the two DMA controllers' eight streams.
+private const IRQ_LINES: usize = 17
 
 /** The SAI (`stm32-sai`), the two DMA controllers (`stm32-dma`) and the DMAMUX (`stm32-dmamux`):
  * which of them the bus has, the SAI's base, the DMA request each of its blocks makes and the IRQ
@@ -24,7 +28,7 @@ struct AudioState
     mux_present: bool
     sai_at: u32
     requests: [2]u32
-    irq_routes: [17]int
+    irq_routes: [IRQ_LINES]int
     next: u64
     irq_levels: u32
     driver: u32
@@ -97,7 +101,7 @@ private const DMAMUX_SAI1_B: u32 = 88
 
 /** No SAI, DMA or DMAMUX on the bus. */
 audio_state() -> AudioState =
-    AudioState(false, [false,false], false, 0, [DMAMUX_SAI1_A,DMAMUX_SAI1_B], [-1;17], NEVER, 0, 0, Mutex.new(audio_live()))
+    AudioState(false, [false,false], false, 0, [DMAMUX_SAI1_A,DMAMUX_SAI1_B], [-1;IRQ_LINES], NEVER, 0, 0, Mutex.new(audio_live()))
 
 // The SAI and DMA `b` makes on a chip whose clock is `clock_hz`, with the DMA controllers where
 // `mapped` puts them: which controller each is was read once, into its device.
@@ -218,10 +222,10 @@ private service_audio_dma(s: *AudioLive, via: *Cpu)
     val d = &machine.devices.audio
     s.settled = true
     if !d.mux_present || !d.sai_present then return
-    for unit in 0usize..<2
+    for unit in 0..<2
         if !d.dma_present[unit] then continue
-        for stream in 0usize..<8
-            for block in 0usize..<2
+        for stream in 0..<8
+            for block in 0..<2
                 if !dma.routed(s.mux,unit * 8 + stream,d.requests[block]) then continue
                 // Bounded even for a misconfigured circular PAR which does not
                 // service the selected FIFO. No bus callbacks recurse into MMIO.
@@ -267,17 +271,23 @@ private publish_audio(s: *AudioLive, via: *Cpu)
     val d = &machine.devices.audio
     atomic_store(&d.next,if d.sai_present then audio_event(s) else NEVER,Release)
     var levels: u32 = if d.sai_present && (sai.irq(s.blocks[0]) || sai.irq(s.blocks[1])) then 1 else 0
-    for unit in 0usize..<2
+    for unit in 0..<2
         if !d.dma_present[unit] then continue
-        for stream in 0usize..<8
-            if dma.irq(s.units[unit],stream) then levels |= 1u32 << u32(1 + unit * 8 + stream)
+        for stream in 0..<8
+            if dma.irq(s.units[unit],stream) then levels |= 1 << u32(1 + unit * 8 + stream)
     val rising = levels & ~atomic_swap(&d.irq_levels,levels,AcqRel)
-    for k in 0usize..<17
-        if rising & (1u32 << u32(k)) == 0 || d.irq_routes[k] < 0 then continue
-        deliver_audio_irq(via,u32(d.irq_routes[k]))
+    for k in 0..<IRQ_LINES
+        routed_irq(d,rising,k) match
+            Some(n) -> deliver_audio_irq(via,n)
+            None -> ()
+
+// The IRQ interrupt line `k` raises where `levels` has it high and the board routes it; None otherwise.
+@inline
+private routed_irq(d: *AudioState, levels: u32, k: usize) -> Option[u32] =
+    if levels & (1 << u32(k)) == 0 || d.irq_routes[k] < 0 then None else Some(u32(d.irq_routes[k]))
 
 // The earlier of the two blocks' next slots (NEVER for none).
-private audio_event(s: *AudioLive) -> u64 = if s.blocks[0].due < s.blocks[1].due then s.blocks[0].due else s.blocks[1].due
+private audio_event(s: *AudioLive) -> u64 = min(s.blocks[0].due, s.blocks[1].due)
 
 private bring_audio(s: *AudioLive, c: *Cpu, time: u64)
     service_audio_dma(s,c)
@@ -294,7 +304,7 @@ private clock_audio(s: *AudioLive, c: *Cpu, time: u64)
     loop
         val first = s.blocks[0].due
         val second = s.blocks[1].due
-        val due = if first < second then first else second
+        val due = min(first, second)
         if due == NEVER || due > time then break
         // Interleave DMA between slots even when a caller advances a large
         // interval, so batching cannot create artificial FIFO underruns.
@@ -308,10 +318,10 @@ private audio_raise_levels(c: *Cpu)
     val d = &machine.devices.audio
     val levels = atomic_load(&d.irq_levels,Acquire)
     if levels == 0 then return
-    for k in 0usize..<17
-        if levels & (1u32 << u32(k)) == 0 || d.irq_routes[k] < 0 then continue
-        val irq = u32(d.irq_routes[k])
-        if !memory.exception_active(c,memory.IRQ0 + irq) then memory.raise(c,irq)
+    for k in 0..<IRQ_LINES
+        routed_irq(d,levels,k) match
+            Some(n) -> if !memory.exception_active(c,memory.IRQ0 + n) then memory.raise(c,n)
+            None -> ()
 
 // The next slot, for the core that brings the slots in; NEVER for the other.
 private[virt] sai_dma_due_for(c: *Cpu) -> u64 = if drives_device(&machine.devices.audio.driver,c) then sai_dma_due() else NEVER
@@ -328,8 +338,10 @@ private[virt] sai_dma_wake(c: *Cpu) -> u64
     val d = &machine.devices.audio
     val levels = atomic_load(&d.irq_levels,Acquire)
     if levels != 0
-        for k in 0usize..<17
-            if levels & (1u32 << u32(k)) != 0 && d.irq_routes[k] >= 0 && memory.could_wake(c,memory.IRQ0 + u32(d.irq_routes[k])) then return board_time(c,c.retired)
+        for k in 0..<IRQ_LINES
+            routed_irq(d,levels,k) match
+                Some(n) -> if memory.could_wake(c,memory.IRQ0 + n) then return board_time(c,c.retired)
+                None -> ()
     sai_dma_due_for(c)
 
 private valid_audio_access(device: Device, offset: u32, width: u32) -> bool

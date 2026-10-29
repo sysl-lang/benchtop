@@ -1,84 +1,131 @@
 module sh.sysl.benchtop.parts.spi
 
-/** Reusable active-low-CS, MSB-first, mode-0 GPIO SPI receiver. */
-struct Receiver
-    cs: int
-    clock: int
-    mosi: int
+import sh.sysl.benchtop.parts.pins.Line
+
+/** A device's mode-0 SPI shift register, MSB first, full duplex: it samples MOSI on SCK's rising
+ * edge, and its MISO is the outgoing byte's next bit. Eight samples make a byte received, and the
+ * byte to send next is loaded on the falling edge after them (`reload`), so the eighth bit the
+ * master samples is still the old byte's. Chip select is the caller's: it calls `deselect` while
+ * CS is inactive and `select` with the first byte to send. Modes 1 to 3 are not modelled, because
+ * no part benchtop has speaks them.
+ */
+struct Shifter
     selected: bool
     high: bool
-    bits: int
-    value: u8
+    bits: u32
+    input: u8
+    output: u8
+    reload: bool
 
-receiver(cs: int, clock: int, mosi: int) -> Receiver
-    require cs >= 0 && cs < 32 && clock >= 0 && clock < 32 && mosi >= 0 && mosi < 32, "SPI GPIOs are 0..31"
-    idle(cs, clock, mosi)
+/** What SCK did since the last call. */
+enum Clock
+    Steady
+    Rising
+    Falling
 
-/** A deselected receiver on these pins, holding no partial byte. */
-private idle(cs: int, clock: int, mosi: int) -> Receiver = Receiver(cs, clock, mosi, false, false, 0, 0)
+/** Deselected, SCK low, sending 0xff (MISO released high). */
+shifter() -> Shifter
+    var s: Shifter
+    s.output = 0xff
+    s
 
-reset(r: *Receiver) = *r = idle(r.cs, r.clock, r.mosi)
+/** SCK is at `sck`: the edge it made. */
+edge(s: *Shifter, sck: bool) -> Clock
+    val was = s.high
+    s.high = sck
+    if sck && !was then Rising elif !sck && was then Falling else Steady
 
-observe(r: *Receiver, levels: u32, driven: u32) -> Option[u8]
-    val cs = 1u32 << u32(r.cs)
-    val clock = 1u32 << u32(r.clock)
-    val data = 1u32 << u32(r.mosi)
-    val required = cs | clock | data
-    if (driven & required) != required || (levels & cs) != 0
-        reset(r)
-        return None
-    val high = (levels & clock) != 0
-    if !r.selected
-        r.selected = true
-        r.high = high
-        return None
-    val rising = high && !r.high
-    r.high = high
-    if !rising then return None
-    r.value = (r.value << 1) | (if (levels & data) != 0 then 1 else 0)
-    r.bits += 1
-    if r.bits != 8 then return None
-    val byte = r.value
-    r.bits = 0
-    r.value = 0
+/** CS went inactive: any part-received byte is dropped and MISO is released. SCK is still tracked. */
+deselect(s: *Shifter)
+    s.selected = false
+    s.bits = 0
+    s.input = 0
+    s.output = 0xff
+    s.reload = false
+
+/** CS went active, with `first` the byte to send. */
+select(s: *Shifter, first: u8)
+    s.selected = true
+    s.output = first
+
+/** The level the device drives on MISO now. */
+miso(s: Shifter) -> bool = s.output >> (7 - s.bits) & 1 != 0
+
+/** A rising edge sampled `mosi`: the byte it completes, if it is the eighth bit. */
+sample(s: *Shifter, mosi: bool) -> Option[u8]
+    s.input = s.input << 1 | (if mosi then 1 else 0)
+    s.bits += 1
+    if s.bits != 8 then return None
+    val byte = s.input
+    s.bits = 0
+    s.input = 0
+    s.reload = true
     Some(byte)
+
+/** The byte to send next, loaded after a byte completed. */
+load(s: *Shifter, byte: u8)
+    s.output = byte
+    s.reload = false
+
+/** A receive-only device on an active-low CS: the bytes a master clocks into it. */
+struct Receiver
+    link: Shifter
+
+receiver() -> Receiver = Receiver(shifter())
+
+reset(r: *Receiver) = *r = receiver()
+
+/** CS, SCK and MOSI are at these lines: the byte this completes, if any. Any of them undriven, or
+ * CS high, deselects; the call that selects only records SCK's level, so an edge must follow it.
+ */
+observe(r: *Receiver, cs: Line, sck: Line, mosi: Line) -> Option[u8]
+    if !cs.driven || !sck.driven || !mosi.driven || cs.high
+        deselect(&r.link)
+        return None
+    val clock = edge(&r.link, sck.high)
+    if !r.link.selected
+        select(&r.link, 0xff)
+        return None
+    if clock != Rising then return None
+    sample(&r.link, mosi.high)
 
 /** Four-wire display framing shared by OLED and TFT controller adapters. */
 struct Port
     bus: Receiver
-    dc: int
-    reset_pin: int
     data: bool
     resetting: bool
+
+/** A display port's five terminals. */
+struct Wires
+    cs: Line
+    sck: Line
+    mosi: Line
+    dc: Line
+    reset: Line
 
 enum Transfer
     Idle
     Reset
     Byte(data: bool, value: u8)
 
-port(cs: int, clock: int, mosi: int, dc: int, reset_pin: int) -> Port
-    require dc >= 0 && dc < 32 && reset_pin >= 0 && reset_pin < 32, "display control GPIOs are 0..31"
-    Port(receiver(cs, clock, mosi), dc, reset_pin, false, false)
+port() -> Port = Port(receiver(), false, false)
 
-restart(p: *Port)
-    reset(&p.bus)
-    p.data = false
-    p.resetting = false
+restart(p: *Port) = *p = port()
 
-transfer(p: *Port, levels: u32, driven: u32) -> Transfer
-    val reset_bit = 1u32 << u32(p.reset_pin)
-    val dc = 1u32 << u32(p.dc)
-    if (driven & reset_bit) == 0 || (levels & reset_bit) == 0
+/** The terminals are at `w`: a reset while RESET is low or undriven, else a byte with the D/C level
+ * it was clocked under. D/C changing in the middle of a byte drops the byte.
+ */
+transfer(p: *Port, w: Wires) -> Transfer
+    if !w.reset.driven || !w.reset.high
         val first = !p.resetting
         p.resetting = true
         reset(&p.bus)
         return if first then Reset else Idle
     p.resetting = false
-    val data = (levels & dc) != 0
-    if (driven & dc) == 0 || (p.bus.bits != 0 && data != p.data)
+    if !w.dc.driven || (p.bus.link.bits != 0 && w.dc.high != p.data)
         reset(&p.bus)
         return Idle
-    if p.bus.bits == 0 then p.data = data
-    observe(&p.bus, levels, driven) match
+    if p.bus.link.bits == 0 then p.data = w.dc.high
+    observe(&p.bus, w.cs, w.sck, w.mosi) match
         Some(byte) -> Byte(p.data, byte)
         None -> Idle

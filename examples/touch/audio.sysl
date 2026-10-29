@@ -1,6 +1,71 @@
 #if feature_audio
+import sh.sysl.stm32h747.sai1
+import sh.sysl.stm32h747.dma2
+import sh.sysl.stm32h747.dmamux1
+import sh.sysl.stm32h747.i2c4
+
 // M7 audio is independent of the M4 UI: a circular SAI DMA buffer, refilled
 // on half/full IRQs, with single-precision interpolation and a click-free ramp.
+
+// DMA2 stream 1 carries SAI1 block A out (transmit); stream 4 carries block B in (capture).
+const TX_FLAGS: u32 = dma2.BASE + dma2.LISR_OFFSET
+const TX_FLAGS_CLEAR: u32 = dma2.BASE + dma2.LIFCR_OFFSET
+const TX_CONTROL: u32 = dma2.BASE + dma2.S1CR_OFFSET
+const TX_REMAINING: u32 = dma2.BASE + dma2.S1NDTR_OFFSET
+const TX_PERIPHERAL: u32 = dma2.BASE + dma2.S1PAR_OFFSET
+const TX_MEMORY: u32 = dma2.BASE + dma2.S1M0AR_OFFSET
+const RX_FLAGS: u32 = dma2.BASE + dma2.HISR_OFFSET
+const RX_CONTROL: u32 = dma2.BASE + dma2.S4CR_OFFSET
+const RX_REMAINING: u32 = dma2.BASE + dma2.S4NDTR_OFFSET
+const RX_PERIPHERAL: u32 = dma2.BASE + dma2.S4PAR_OFFSET
+const RX_MEMORY: u32 = dma2.BASE + dma2.S4M0AR_OFFSET
+// DMAMUX1 channels 9 and 12 are DMA2 streams 1 and 4; the request ids are SAI1 A and SAI1 B.
+const TX_REQUEST: u32 = dmamux1.BASE + dmamux1.DMAMUX1_C9CR_OFFSET
+const RX_REQUEST: u32 = dmamux1.BASE + dmamux1.DMAMUX1_C12CR_OFFSET
+const SAI_A_DATA: u32 = sai1.BASE + sai1.SAI_ADR_OFFSET
+const SAI_B_DATA: u32 = sai1.BASE + sai1.SAI_BDR_OFFSET
+
+// Cortex-M system registers.
+const SCB_CPACR: u32 = 0xe000ed88
+const NVIC_ISER1: u32 = 0xe000e104
+const SYSTICK_CONTROL: u32 = 0xe000e010
+const SYSTICK_RELOAD: u32 = 0xe000e014
+const SYSTICK_VALUE: u32 = 0xe000e018
+// Enable the counter on the processor clock, with no interrupt.
+const SYSTICK_FREE_RUNNING: u32 = 5
+
+// DMA stream flags: one group of six bits per stream, half transfer at 4, transfer complete at 5.
+const DMA_ALL_FLAGS: u32 = 0x3d
+const DMA_ERROR_FLAG: u32 = 8
+const DMA_HALF_FLAG: u32 = 16
+const DMA_FULL_FLAG: u32 = 32
+const DMA_BOTH_FLAGS: u32 = DMA_HALF_FLAG | DMA_FULL_FLAG
+// Stream 1's flags sit at bit 6 of the low flag register.
+const TX_FLAG_SHIFT: u32 = 6
+
+// DMA stream control: enable, the three interrupt enables, and a circular transfer of 16-bit
+// samples with memory increment.
+const DMA_ENABLE: u32 = dma2.S1CR_EN_MASK
+const DMA_INTERRUPTS: u32 = dma2.S1CR_TCIE_MASK | dma2.S1CR_HTIE_MASK | dma2.S1CR_TEIE_MASK
+const DMA_MEMORY_TO_PERIPHERAL: u32 = 1 << 6
+const DMA_STREAM_SETTINGS: u32 = dma2.S1CR_CIRC_MASK | dma2.S1CR_MINC_MASK | (1 << 11) | (1 << 13)
+const DMAMUX_SAI1_A: u32 = 87
+const DMAMUX_SAI1_B: u32 = 88
+// NVIC interrupt-set-enable bits (IRQ 57 and 60, in the second enable register).
+const ENABLE_DMA2_STREAM1_IRQ: u32 = 1 << 25
+const ENABLE_DMA2_STREAM4_IRQ: u32 = 1 << 28
+
+// SAI frame: four 32-bit TDM slots, frame-sync one slot wide, asserted a bit before the first.
+const FRAME_LENGTH: u32 = 127
+const FRAME_SYNC_LENGTH: u32 = 63 << sai1.SAI_AFRCR_FSALL_SHIFT
+const FRAME_SYNC_OFFSET: u32 = sai1.SAI_AFRCR_FSOFF_MASK
+const FRAME_SYNC_PRE: u32 = sai1.SAI_AFRCR_FSDEF_MASK
+// Block A is the master transmitter (16-bit data, no master-clock divider); block B a slave
+// receiver synchronous with A.
+const SAI_A_CONFIGURATION: u32 = (4 << sai1.SAI_ACR1_DS_SHIFT) | (1 << sai1.SAI_ACR1_MCKDIV_SHIFT) | (1 << 27)
+const SAI_B_CONFIGURATION: u32 = (4 << sai1.SAI_BCR1_DS_SHIFT) | 3 | (1 << sai1.SAI_BCR1_SYNCEN_SHIFT)
+const SAI_ENABLE: u32 = sai1.SAI_ACR1_SAIXEN_MASK | sai1.SAI_ACR1_DMAEN_MASK
+
 struct AudioControl
     sequence: volatile u32
     enabled: volatile u32
@@ -20,13 +85,18 @@ var audio_deadline_misses: Word
 @export("audio_ready")
 var audio_ready: Word
 var audio_buffer: [512]u16
-var audio_phase: u32 = 0
-var audio_envelope: f32 = 0.0
-var audio_target: f32 = 0.0
-var audio_step: u32 = 39370534
-var audio_effect: u32 = 0
-var audio_filter: f32 = 0.0
-var audio_peak: f32 = 0.0
+
+// The oscillator, its click-free gain ramp and the microphone path's filter and meter.
+struct Synth
+    phase: u32
+    step: u32
+    envelope: f32
+    target: f32
+    effect: u32
+    filter: f32
+    peak: f32
+
+var synth = Synth(0,39370534,0.0,0.0,0,0.0,0.0)
 @export("audio_input_level")
 var audio_input_level: Word
 @export("audio_capture_irqs")
@@ -35,8 +105,10 @@ struct AudioSample
     value: volatile u16
 var audio_capture_buffer: [512]AudioSample
 
-// One sine cycle, interpolated by fractional phase rather than rounding to
-// table entries. This is firmware data, not samples synthesized by the host.
+// One cycle of cos(2 * pi * i / 256), interpolated by fractional phase rather than rounding to
+// table entries. This is firmware data, not samples synthesized by the host. It is written out as
+// decimal literals, to ten places, because the tests compare the samples the guest produces
+// bit for bit and a table computed by the firmware's libm could differ in the last bit.
 val audio_wave: [256]f32 = [
     0.0000000000,0.0245412285,0.0490676743,0.0735645636,0.0980171403,0.1224106752,0.1467304745,0.1709618888,
     0.1950903220,0.2191012402,0.2429801799,0.2667127575,0.2902846773,0.3136817404,0.3368898534,0.3598950365,
@@ -72,6 +144,8 @@ val audio_wave: [256]f32 = [
     -0.1950903220,-0.1709618888,-0.1467304745,-0.1224106752,-0.0980171403,-0.0735645636,-0.0490676743,-0.0245412285,
 ]
 
+// The phase step per sample of note n is the frequency (440 + 110 * n) Hz, as a share of the 48 kHz
+// sample rate in 32-bit phase units: round(frequency * 2^32 / 48000).
 val audio_steps: [10]u32 = [39370534,49213167,59055800,68898434,78741067,88583700,98426334,108268967,118111601,127954234]
 
 audio_barrier()
@@ -104,30 +178,30 @@ audio_controls()
     audio_barrier()
     if before != audio_control.sequence then return
 #if feature_delay
-    audio_target = if enabled != 0 then 1.0 else 0.0
-    delay_feedback_target = f32(if feedback > 85 then 85 else feedback) * 0.01
-    delay_wet_target = f32(if wet > 100 then 100 else wet) * 0.01
+    synth.target = if enabled != 0 then 1.0 else 0.0
+    delay.feedback_target = f32(if feedback > 85 then 85 else feedback) * 0.01
+    delay.wet_target = f32(if wet > 100 then 100 else wet) * 0.01
 #else
 #if feature_microphone
-    audio_target = if enabled != 0 then f32(if level > 100 then 100 else level) * 0.02 else 0.0
-    audio_effect = if note > 2 then 2 else note
+    synth.target = if enabled != 0 then f32(if level > 100 then 100 else level) * 0.02 else 0.0
+    synth.effect = if note > 2 then 2 else note
 #else
-    audio_target = if enabled != 0 then f32(if level > 100 then 100 else level) * 0.0035 else 0.0
+    synth.target = if enabled != 0 then f32(if level > 100 then 100 else level) * 0.0035 else 0.0
 #endif
 #endif
-    audio_step = audio_steps[usize(if note > 9 then 9 else note)]
+    synth.step = audio_steps[usize(if note > 9 then 9 else note)]
 
 audio_fill(first: usize, last: usize)
     audio_controls()
 #if feature_delay
-    delay_output_peak *= 0.95
-    if delay_output_peak < 0.00001 then delay_output_peak = 0.0
+    delay.output_peak *= 0.95
+    if delay.output_peak < 0.00001 then delay.output_peak = 0.0
 #endif
     var i = first
     var peak: f32 = 0.0
     while i < last
-        audio_envelope += (audio_target - audio_envelope) * 0.002
-        if audio_target == 0.0 && audio_envelope < 0.0000001 then audio_envelope = 0.0
+        synth.envelope += (synth.target - synth.envelope) * 0.002
+        if synth.target == 0.0 && synth.envelope < 0.0000001 then synth.envelope = 0.0
 #if feature_microphone
         // The just-completed RX half is stable until DMA wraps around.
         val left = int(u32(audio_capture_buffer[i].value) << 16) >> 16
@@ -139,8 +213,8 @@ audio_fill(first: usize, last: usize)
         val stereo = delay_frame(f32(left) / 32768.0,f32(right) / 32768.0)
         val output_peak = if stereo[0] < 0.0 then -stereo[0] else stereo[0]
         val output_right = if stereo[1] < 0.0 then -stereo[1] else stereo[1]
-        if output_peak > delay_output_peak then delay_output_peak = output_peak
-        if output_right > delay_output_peak then delay_output_peak = output_right
+        if output_peak > delay.output_peak then delay.output_peak = output_peak
+        if output_right > delay.output_peak then delay.output_peak = output_right
         val value = u16(int(stereo[0] * 32767.0))
         val value_right = u16(int(stereo[1] * 32767.0))
 #else
@@ -148,19 +222,19 @@ audio_fill(first: usize, last: usize)
         val wave = busy_filter(input)
 #else
         // One-pole low-pass at roughly 1 kHz; subtract for the high-pass mode.
-        audio_filter += (input - audio_filter) * 0.122694
-        if input == 0.0 && audio_filter > -0.00000001 && audio_filter < 0.00000001 then audio_filter = 0.0
-        val wave = if audio_effect == 1 then audio_filter elif audio_effect == 2 then input - audio_filter else input
+        synth.filter += (input - synth.filter) * 0.122694
+        if input == 0.0 && synth.filter > -0.00000001 && synth.filter < 0.00000001 then synth.filter = 0.0
+        val wave = if synth.effect == 1 then synth.filter elif synth.effect == 2 then input - synth.filter else input
 #endif
-        val amplified = wave * audio_envelope
+        val amplified = wave * synth.envelope
         val limited = if amplified < -0.95 then -0.95 elif amplified > 0.95 then 0.95 else amplified
         val value = u16(int(limited * 32767.0))
 #endif
 #else
-        val index = usize(audio_phase >> 24)
-        val fraction = f32(audio_phase & 0xffffff) / 16777216.0
+        val index = usize(synth.phase >> 24)
+        val fraction = f32(synth.phase & 0xffffff) / 16777216.0
         val wave = audio_wave[index] + (audio_wave[(index + 1) & 255] - audio_wave[index]) * fraction
-        val value = u16(int(wave * audio_envelope * 32767.0))
+        val value = u16(int(wave * synth.envelope * 32767.0))
 #endif
         audio_buffer[i] = value
 #if feature_delay
@@ -168,91 +242,92 @@ audio_fill(first: usize, last: usize)
 #else
         audio_buffer[i + 1] = value
 #endif
-        audio_phase += audio_step
+        synth.phase += synth.step
         i += 2
 #if feature_storage
     play_audio_half(first,last)
     record_audio_half(first,last)
 #endif
 #if feature_microphone
-    audio_peak *= 0.95
-    if audio_peak < 0.00001 then audio_peak = 0.0
-    if peak > audio_peak then audio_peak = peak
-    audio_input_level.value = u32(audio_peak * 100.0)
+    synth.peak *= 0.95
+    if synth.peak < 0.00001 then synth.peak = 0.0
+    if peak > synth.peak then synth.peak = peak
+    audio_input_level.value = u32(synth.peak * 100.0)
 #if feature_delay
-    audio_output_level.value = u32(delay_output_peak * 100.0)
+    audio_output_level.value = u32(delay.output_peak * 100.0)
 #endif
 #endif
 
 @export("audio_dma_interrupt")
 audio_interrupt()
-    val flags = word(0x40020400).value
-    word(0x40020408).value = flags & (0x3d << 6)
+    val flags = word(TX_FLAGS).value
+    word(TX_FLAGS_CLEAR).value = flags & (DMA_ALL_FLAGS << TX_FLAG_SHIFT)
     audio_irqs.value += 1
-    if flags & (8 << 6) != 0 then audio_errors.value += 1
+    if flags & (DMA_ERROR_FLAG << TX_FLAG_SHIFT) != 0 then audio_errors.value += 1
 #if !feature_microphone
     // Each half must be ready before DMA starts consuming it again.
-    if flags & (48 << 6) == (48 << 6) then audio_deadline_misses.value += 1
-    if flags & (16 << 6) != 0
+    if flags & (DMA_BOTH_FLAGS << TX_FLAG_SHIFT) == (DMA_BOTH_FLAGS << TX_FLAG_SHIFT) then audio_deadline_misses.value += 1
+    if flags & (DMA_HALF_FLAG << TX_FLAG_SHIFT) != 0
         audio_fill(0,256)
-        if word(0x4002042c).value > 256 then audio_deadline_misses.value += 1
-    if flags & (32 << 6) != 0
+        if word(TX_REMAINING).value > 256 then audio_deadline_misses.value += 1
+    if flags & (DMA_FULL_FLAG << TX_FLAG_SHIFT) != 0
         audio_fill(256,512)
-        if word(0x4002042c).value <= 256 then audio_deadline_misses.value += 1
+        if word(TX_REMAINING).value <= 256 then audio_deadline_misses.value += 1
 #endif
 
 audio_refill(first: usize, last: usize)
 #if feature_delay || feature_busy
-    val before = word(0xe000e018).value
+    val before = word(SYSTICK_VALUE).value
 #endif
     audio_fill(first,last)
 #if feature_delay || feature_busy
-    val used = (before - word(0xe000e018).value) & 0xffffff
+    val used = (before - word(SYSTICK_VALUE).value) & 0xffffff
     audio_dsp_cycles.value = used
     if used > audio_dsp_peak_cycles.value then audio_dsp_peak_cycles.value = used
 #endif
 
 audio_capture_interrupt()
 #if feature_microphone
-    val flags = word(0x40020404).value
-    word(0x4002040c).value = flags & 0x3d
+    val flags = word(RX_FLAGS).value
+    word(dma2.BASE + dma2.HIFCR_OFFSET).value = flags & DMA_ALL_FLAGS
     audio_capture_irqs.value += 1
-    if flags & 8 != 0 then audio_errors.value += 1
-    if flags & 48 == 48 then audio_deadline_misses.value += 1
-    if flags & 16 != 0
+    if flags & DMA_ERROR_FLAG != 0 then audio_errors.value += 1
+    if flags & DMA_BOTH_FLAGS == DMA_BOTH_FLAGS then audio_deadline_misses.value += 1
+    if flags & DMA_HALF_FLAG != 0
         audio_refill(0,256)
-        if word(0x40020474).value > 256 || word(0x4002042c).value > 256 then audio_deadline_misses.value += 1
-    if flags & 32 != 0
+        if word(RX_REMAINING).value > 256 || word(TX_REMAINING).value > 256 then audio_deadline_misses.value += 1
+    if flags & DMA_FULL_FLAG != 0
         audio_refill(256,512)
-        if word(0x40020474).value <= 256 || word(0x4002042c).value <= 256 then audio_deadline_misses.value += 1
+        if word(RX_REMAINING).value <= 256 || word(TX_REMAINING).value <= 256 then audio_deadline_misses.value += 1
 #else
     ()
 #endif
 
 audio_i2c_byte(value: u32) -> bool
-    while word(0x58001c18).value & 2 == 0
-        if word(0x58001c18).value & 16 != 0 then return false
-    word(0x58001c28).value = value & 255
+    while word(i2c4.BASE + i2c4.ISR_OFFSET).value & i2c4.ISR_TXIS_MASK == 0
+        if word(i2c4.BASE + i2c4.ISR_OFFSET).value & i2c4.ISR_NACKF_MASK != 0 then return false
+    word(i2c4.BASE + i2c4.TXDR_OFFSET).value = value & 255
     true
 
 audio_codec_write(register: u32, value: u32) -> bool
-    word(0x58001c04).value = (0x1a << 1) | (4 << 16) | (1 << 13) | (1 << 25)
+    // WM8994 at 7-bit address 0x1a: a four-byte write, started now and stopped automatically.
+    word(i2c4.BASE + i2c4.CR2_OFFSET).value = (0x1a << 1) | (4 << 16) | i2c4.CR2_START_MASK | i2c4.CR2_AUTOEND_MASK
     if !audio_i2c_byte(register >> 8) || !audio_i2c_byte(register) || !audio_i2c_byte(value >> 8) || !audio_i2c_byte(value) then return false
-    while word(0x58001c18).value & 32 == 0
-        if word(0x58001c18).value & 16 != 0 then return false
-    word(0x58001c1c).value = 32
+    while word(i2c4.BASE + i2c4.ISR_OFFSET).value & 32 == 0
+        if word(i2c4.BASE + i2c4.ISR_OFFSET).value & i2c4.ISR_NACKF_MASK != 0 then return false
+    word(i2c4.BASE + i2c4.ICR_OFFSET).value = i2c4.ICR_STOPCF_MASK
     true
 
 audio_initialize()
-    word(0xe000ed88).value = 0x00f00000
+    word(SCB_CPACR).value = 0x00f00000
     asm
         [thumb]
             "dsb"
             "isb"
             clobbers "memory"
         [aarch64, x86_64, riscv64, riscv32, wasm32, craft] unavailable "Cortex-M firmware"
-    word(0x58001c10).value = 0x10c0ecff
-    word(0x58001c00).value = 1
+    word(i2c4.BASE + i2c4.TIMINGR_OFFSET).value = 0x10c0ecff
+    word(i2c4.BASE + i2c4.CR1_OFFSET).value = i2c4.CR1_PE_MASK
     // DAC2, AIF1 timeslot1, the actual WM8994 speaker path on Discovery.
     val configuration: [15][2]u32 = [[0,0],[1,0x3003],[3,0x300],[5,0xc0c],[0x200,1],[0x208,0xa],[0x210,0x83],[0x300,0x10],[0x302,0],[0x604,2],[0x605,2],[0x36,0x300],[0x612,0x1c0],[0x613,0x1c0],[0x422,0x10]]
     for item in configuration
@@ -275,43 +350,43 @@ audio_initialize()
 #endif
     audio_fill(0,512)
     // Four 32-bit TDM slots; only speaker slots1 and3 consume FIFO words.
-    word(0x4001580c).value = 127 | (63 << 8) | (1 << 16) | (1 << 18)
+    word(sai1.BASE + sai1.SAI_AFRCR_OFFSET).value = FRAME_LENGTH | FRAME_SYNC_LENGTH | FRAME_SYNC_OFFSET | FRAME_SYNC_PRE
 #if feature_delay
-    word(0x40015810).value = (5 << 16) | (3 << 8) | (2 << 6)
+    word(sai1.BASE + sai1.SAI_ASLOTR_OFFSET).value = (5 << 16) | (3 << 8) | (2 << 6)
 #else
-    word(0x40015810).value = (10 << 16) | (3 << 8) | (2 << 6)
+    word(sai1.BASE + sai1.SAI_ASLOTR_OFFSET).value = (10 << 16) | (3 << 8) | (2 << 6)
 #endif
-    word(0x40015808).value = 4
-    word(0x40015804).value = (4 << 5) | (1 << 20) | (1 << 27)
-    word(0x40020824).value = 87
-    word(0x4002042c).value = 512
-    word(0x40020430).value = 0x40015820
-    word(0x40020434).value = u32(usize(&audio_buffer[0]))
-    word(0xe000e104).value = 1 << 25
+    word(sai1.BASE + sai1.SAI_ACR2_OFFSET).value = 4
+    word(sai1.BASE + sai1.SAI_ACR1_OFFSET).value = SAI_A_CONFIGURATION
+    word(TX_REQUEST).value = DMAMUX_SAI1_A
+    word(TX_REMAINING).value = 512
+    word(TX_PERIPHERAL).value = SAI_A_DATA
+    word(TX_MEMORY).value = u32(usize(&audio_buffer[0]))
+    word(NVIC_ISER1).value = ENABLE_DMA2_STREAM1_IRQ
 #if feature_microphone
     // SAI B follows A's four-slot clock; ADC1 occupies slots0/2.
-    word(0x4001582c).value = 127 | (63 << 8) | (1 << 16) | (1 << 18)
-    word(0x40015830).value = (5 << 16) | (3 << 8) | (2 << 6)
-    word(0x40015828).value = 0
-    word(0x40015824).value = (4 << 5) | 3 | (1 << 10)
-    word(0x40020830).value = 88
-    word(0x40020474).value = 512
-    word(0x40020478).value = 0x40015840
-    word(0x4002047c).value = u32(usize(&audio_capture_buffer[0]))
-    word(0xe000e104).value = 1 << 28
-    word(0x40020470).value = 1 | 28 | (1 << 8) | (1 << 10) | (1 << 11) | (1 << 13)
+    word(sai1.BASE + sai1.SAI_BFRCR_OFFSET).value = FRAME_LENGTH | FRAME_SYNC_LENGTH | FRAME_SYNC_OFFSET | FRAME_SYNC_PRE
+    word(sai1.BASE + sai1.SAI_BSLOTR_OFFSET).value = (5 << 16) | (3 << 8) | (2 << 6)
+    word(sai1.BASE + sai1.SAI_BCR2_OFFSET).value = 0
+    word(sai1.BASE + sai1.SAI_BCR1_OFFSET).value = SAI_B_CONFIGURATION
+    word(RX_REQUEST).value = DMAMUX_SAI1_B
+    word(RX_REMAINING).value = 512
+    word(RX_PERIPHERAL).value = SAI_B_DATA
+    word(RX_MEMORY).value = u32(usize(&audio_capture_buffer[0]))
+    word(NVIC_ISER1).value = ENABLE_DMA2_STREAM4_IRQ
+    word(RX_CONTROL).value = DMA_ENABLE | DMA_INTERRUPTS | DMA_STREAM_SETTINGS
     // RX IRQ refills the matching TX half after it has become free. TX DMA's
     // FIFO prefetch makes its half-transfer happen slightly before RX's.
-    val tx_interrupts: u32 = 4
+    val tx_interrupts: u32 = dma2.S1CR_TEIE_MASK
 #else
-    val tx_interrupts: u32 = 28
+    val tx_interrupts: u32 = DMA_INTERRUPTS
 #endif
-    word(0x40020428).value = 1 | tx_interrupts | (1 << 6) | (1 << 8) | (1 << 10) | (1 << 11) | (1 << 13)
+    word(TX_CONTROL).value = DMA_ENABLE | tx_interrupts | DMA_MEMORY_TO_PERIPHERAL | DMA_STREAM_SETTINGS
     audio_ready.value = 1
 
 audio_start()
 #if feature_microphone
-    word(0x40015824).value = (4 << 5) | 3 | (1 << 10) | (1 << 16) | (1 << 17)
+    word(sai1.BASE + sai1.SAI_BCR1_OFFSET).value = SAI_B_CONFIGURATION | SAI_ENABLE
 #endif
-    word(0x40015804).value = (4 << 5) | (1 << 20) | (1 << 27) | (1 << 16) | (1 << 17)
+    word(sai1.BASE + sai1.SAI_ACR1_OFFSET).value = SAI_A_CONFIGURATION | SAI_ENABLE
 #endif
