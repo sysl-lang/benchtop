@@ -5,9 +5,47 @@ import sh.sysl.benchtop.v6m as cpu
 import sh.sysl.benchtop.timing.NEVER
 import sysl.threads.{current,Mutex,Condvar}
 import sysl.sync.*
-import sysl.time.{monotonic,millis}
+import sysl.time.{monotonic,millis,sleep,Duration}
 import sysl.raw.str_cast
 import sh.sysl.elf as elf
+
+// Whether `done` comes to hold within `limit`, checked every two milliseconds by a test that sleeps
+// between checks rather than spinning a core. Real time only bounds how long a test may wait; what it
+// asserts is the condition, so a loaded host makes it slower, never red.
+private eventually(done: &Fn() -> bool, limit: Duration = millis(20000)) -> bool
+    val deadline = monotonic() + limit
+    loop
+        if (done)() then return true
+        if monotonic() >= deadline then return false
+        sleep(millis(2))
+
+@test("paced clock: a fake host clock advances the board at its rate, exactly, however long the session")
+paced_clock_on_a_fake_clock()
+    assert(paced_clock(0, 0, 0, 2000000) == 0)
+    assert(paced_clock(0, 0, 1000, 2000000) == 2, "a microsecond is two ticks at 2 MHz")
+    assert(paced_clock(500, 7000, 7000 + 1500000000, 2000000) == 500 + 3000000, "from the origin, not from zero")
+    // Ten years at 480 MHz: the whole-second split keeps the product inside 64 bits.
+    val ten_years: u64 = 10 * 365 * 24 * 3600 * 1000000000
+    assert(paced_clock(0, 0, ten_years, 480000000) == ten_years / 1000000000 * 480000000)
+    assert(paced_clock(0, 0, 999999999, 3) == 2, "a part of a second rounds down")
+
+@test("paced clock: the lead cap is a twentieth of a second and never zero")
+pacing_cap_bounds()
+    assert(pacing_cap(2000000) == 100000)
+    assert(pacing_cap(19) == 1 && pacing_cap(1) == 1)
+
+@test("paced clock: the leader runs once a whole quantum is due, and otherwise waits exactly until it is")
+pacing_wait_on_a_fake_clock()
+    // At 2 MHz the quantum is 2000 ticks (a millisecond); a tick is 500 ns.
+    assert(pacing_wait_ns(12000, 10000, 2000000) == 0, "a whole quantum is due")
+    assert(pacing_wait_ns(13000, 10000, 2000000) == 0)
+    assert(pacing_wait_ns(11999, 10000, 2000000) == 500, "one tick short waits one tick")
+    assert(pacing_wait_ns(10000, 10000, 2000000) == 1000000, "nothing due waits a whole quantum")
+    assert(pacing_wait_ns(5000, 10000, 2000000) == 1000000, "a clock ahead of the host waits a whole quantum")
+    // The quantum is at most a batch, at least a tick, and a wait is never zero.
+    assert(pacing_wait_ns(10000 + WORKER_BATCH, 10000, 1000000000000) == 0)
+    assert(pacing_wait_ns(10000, 10000, 1000000000000) >= 1)
+    assert(pacing_wait_ns(0, 0, 999) == 1001002, "a 999 Hz clock's quantum is one tick, rounded up in ns")
 
 @test("CPU workers: distinct persistent host threads, bounded work, pause, step and reset")
 worker_lifecycle()
@@ -28,8 +66,7 @@ worker_lifecycle()
         assert(snapshot.cores[0].retired > 0 && snapshot.cores[1].retired > 0)
     pause_workers()
     val before = workers_observe()
-    val until = monotonic() + millis(5)
-    while monotonic() < until do ()
+    sleep(millis(5))
     assert(workers_observe().cores[0].retired == before.cores[0].retired)
     step_workers()
     val stepped = workers_observe()
@@ -41,7 +78,7 @@ worker_lifecycle()
     wait_workers()
     assert(workers_observe().cores[0].retired > 0 && workers_observe().cores[1].retired == 0)
 
-@test("CPU workers: clock pacing progresses while the UI/caller does unrelated work")
+@test("CPU workers: clock pacing progresses while the UI/caller does unrelated work (the real-time smoke test)")
 worker_autonomous_clock()
     val c = core0()
     started(c,image([(0x100,SPINNER[..]),(0x200,SPINNER[..])]).view())
@@ -50,17 +87,17 @@ worker_autonomous_clock()
     defer stop_workers()
     val beginning = monotonic()
     resume_workers()
-    // No UI ticks, submitted budgets, polling, or joins drive execution here.
-    val until = beginning + millis(60)
-    while monotonic() < until do ()
+    // No UI ticks, submitted budgets, polling, or joins drive execution here: the caller only sleeps.
+    val progressed = eventually(() ->
+        val s = workers_observe()
+        s.cores[0].retired > 1000 && s.cores[1].retired > 1000)
     pause_workers()
     val snapshot = workers_observe()
     val elapsed = monotonic() - beginning
-    assert(snapshot.cores[0].retired > 1000 && snapshot.cores[1].retired > 1000)
+    assert(progressed, "both cores run on their own")
     assert(snapshot.cores[0].time <= u64(elapsed.us) * 2 + 2010,"pacing lead is bounded by one checkpoint plus an instruction boundary")
     val paused = snapshot.cores[0].retired
-    val again = monotonic() + millis(5)
-    while monotonic() < again do ()
+    sleep(millis(5))
     assert(workers_observe().cores[0].retired == paused)
 
 @test("CPU workers: real dual-core firmware keeps FIFO ordering, barriers and spinlock correctness")
@@ -239,12 +276,13 @@ worker_paced_models()
         start_workers(core0(),true,2000000).unwrap()
         val beginning = monotonic()
         resume_workers()
-        val until = beginning + millis(60)
-        while monotonic() < until do ()
+        val progressed = eventually(() ->
+            val s = workers_observe()
+            s.cores[0].retired > 1000 && s.cores[1].retired > 500)
         pause_workers()
         val snapshot = workers_observe()
         val elapsed = (monotonic() - beginning).us
-        assert(snapshot.cores[0].retired > 1000 && snapshot.cores[1].retired > 500)
+        assert(progressed, s"${models.0} and ${models.1} both run")
         assert(snapshot.cores[0].time <= u64(elapsed) * 2 + 2010)
         assert(snapshot.cores[1].time <= u64(elapsed) * 2 + 2010)
         val a = snapshot.cores[0].retired
@@ -266,22 +304,21 @@ worker_paced_sleep()
         start_workers(core0(),true,2000000).unwrap()
         val beginning = monotonic()
         resume_workers()
-        val until = beginning + millis(30)
-        while monotonic() < until do ()
+        val published = eventually(() ->
+            val s = workers_observe()
+            s.cores[1].sleeping && s.cores[1].time > 1000)
         pause_workers()
         val snapshot = workers_observe()
         val elapsed = (monotonic() - beginning).us
+        assert(published,"a sleeping peer publishes its own clock, not only its retired count")
         assert(snapshot.running && snapshot.cores[1].sleeping)
-        assert(snapshot.cores[1].time > 1000,"a sleeping peer publishes its own clock, not only its retired count")
         for c in snapshot.cores do assert(c.time <= u64(elapsed) * 2 + 2010)
         val paused = snapshot.cores[0].time
-        val until_again = monotonic() + millis(5)
-        while monotonic() < until_again do ()
+        sleep(millis(5))
         assert(workers_observe().cores[0].time == paused)
         val resumed = monotonic()
         resume_workers()
-        val end = resumed + millis(10)
-        while monotonic() < end do ()
+        sleep(millis(10))
         pause_workers()
         assert(workers_observe().cores[0].time <= paused + u64((monotonic() - resumed).us) * 2 + 2010,
             "time spent paused is excluded from the next pacing epoch")
@@ -329,21 +366,18 @@ worker_peer_isolation()
     start_workers(core0(),true,2000000).unwrap()
     defer stop_workers()
     resume_workers()
-    val deadline = monotonic() + millis(1000)
-    while monotonic() < deadline && atomic_load(&stalled_entered,Acquire) == 0 do ()
-    val entered = atomic_load(&stalled_entered,Acquire) != 0
+    val entered = eventually(() -> atomic_load(&stalled_entered,Acquire) != 0)
     val before = workers_observe().cores[0].retired
-    val end = monotonic() + millis(40)
-    while monotonic() < end do ()
-    val during = workers_observe()
+    val ran = eventually(() -> workers_observe().cores[0].retired > before + 10000)
+    val late = eventually(() -> workers_observe().cores[1].late_us > 5000)
     stalled_gate.lock_raw()
     atomic_store(&stalled_release,1,Release)
     stalled_changed.notify_all()
     stalled_gate.unlock_raw()
     pause_workers()
     assert(entered,"the second guest must have entered the delayed device")
-    assert(during.cores[0].retired > before + 10000,"the runnable core cannot be held at its peer's clock or a shared job boundary")
-    assert(during.cores[1].late_us > 5000,"a delayed core reports lateness without holding back its peer")
+    assert(ran, "the runnable core cannot be held at its peer's clock or a shared job boundary")
+    assert(late, "a delayed core reports lateness without holding back its peer")
 
 @test("core registers: r0 to r15 name the observed registers, and nothing else does")
 core_register_names()

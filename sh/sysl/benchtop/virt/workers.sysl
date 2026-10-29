@@ -83,7 +83,7 @@ struct Workers
     changed: Condvar
     core1_changed: Condvar
 
-private const WORKER_BATCH: u64 = 250000
+private[virt] const WORKER_BATCH: u64 = 250000
 
 private no_core() -> CoreObservation = CoreObservation(0, 0, 0, [0;16], false, Stop.Budget, 0)
 
@@ -270,13 +270,37 @@ stop_workers()
     w.active = false
     w.paced = false
 
+/** The board clock a session paced at `hz` has reached at host time `now_ns`, when it was at
+ * `origin_clock` at host time `origin_ns`. Whole seconds and the remainder are scaled apart, so the
+ * product cannot overflow however long the session runs. The host clock is a parameter, so the
+ * pacing is tested on a fake one.
+ */
+private[virt] paced_clock(origin_clock: u64, origin_ns: u64, now_ns: u64, hz: u64) -> u64
+    val elapsed = now_ns - origin_ns
+    origin_clock + elapsed / 1000000000 * hz + elapsed % 1000000000 * hz / 1000000000
+
+/** The furthest a paced board's clock may run ahead of where it is: a twentieth of a second, and at
+ * least one tick. Beyond it (the host stalled, or the machine slept) the session re-bases instead
+ * of racing to catch up.
+ */
+private[virt] pacing_cap(hz: u64) -> u64 = max(1, hz / 20)
+
+/** How long the leading worker waits, in host nanoseconds, before a paced board at `now` with the
+ * host's clock at `target` has a whole quantum (a millisecond of board time, at most a batch) to run;
+ * zero when it has one already.
+ */
+private[virt] pacing_wait_ns(target: u64, now: u64, hz: u64) -> u64
+    val quantum = min(WORKER_BATCH, max(1, hz / 1000))
+    if target > now && target - now >= quantum then return 0
+    val missing = if target > now then quantum - (target - now) else quantum
+    max(1, (missing * 1000000000 + hz - 1) / hz)
+
 // The board clock a paced session has reached by the host's clock, under the control lock.
 private wall_target(c: *WorkerControl) -> u64
     val hz = scheduler.workers.hz
     val now = scheduler.now
-    val elapsed = host_now_ns() - c.origin_ns
-    val due = c.origin_clock + (elapsed / 1000000000) * hz + ((elapsed % 1000000000) * hz) / 1000000000
-    val cap = max(1u64,hz / 20)
+    val due = paced_clock(c.origin_clock, c.origin_ns, host_now_ns(), hz)
+    val cap = pacing_cap(hz)
     if due > now && due - now > cap
         c.origin_ns = host_now_ns()
         c.origin_clock = now + cap
@@ -300,10 +324,8 @@ private leading_worker(cpu: *Cpu)
         val now = scheduler.now
         if w.hz != 0 && !w.paced && !stepping
             target = wall_target(c)
-            val quantum = min(WORKER_BATCH,max(1u64,w.hz / 1000))
-            if target <= now || target - now < quantum
-                val missing = if target > now then quantum - (target - now) else quantum
-                val delay = max(1u64,(missing * 1000000000 + w.hz - 1) / w.hz)
+            val delay = pacing_wait_ns(target, now, w.hz)
+            if delay != 0
                 w.changed.wait_for(&w.control,i64(delay))
                 continue
         if !stepping && !w.paced && target <= now
@@ -311,7 +333,7 @@ private leading_worker(cpu: *Cpu)
             continue
         // Each normal worker runs until an explicit control request or stop.
         // No periodic job barrier lets a slow peer stall a faster CPU.
-        val horizon = if w.paced && !stepping then NEVER else now + min(WORKER_BATCH,if stepping then 1u64 else target - now)
+        val horizon = if w.paced && !stepping then NEVER else now + min(WORKER_BATCH,if stepping then 1 else target - now)
         c.busy = true
         w.control.unlock_raw()
         execute_worker_batch(cpu,horizon,stepping)

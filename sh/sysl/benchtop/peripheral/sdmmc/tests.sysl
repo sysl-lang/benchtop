@@ -2,126 +2,200 @@ module sh.sysl.benchtop.peripheral.sdmmc
 @tests
 import sh.sysl.benchtop.parts.sd_card as card
 import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.stm32h747.sdmmc1 as reg
+
+// The registers are written by name, as a driver writes them. The FIFO register has no SVD name.
+private const FIFO_OFFSET: u32 = 0x80
+// DCTRL's DBLOCKSIZE is log2 of the block length: 9 for 512 bytes.
+private const BLOCK_512: u32 = 9 << reg.DCTRL_DBLOCKSIZE_SHIFT
+// The IDMA buffer the tests transfer through.
+private const BUFFER: u32 = 0x24001000
+private const SECTOR: u32 = 3
 
 private struct Seen
     copied: bool
     accepted: bool
     bytes: usize
 
-private model(media: card.Media) -> &card.Native
-    val n = card.native(card.card(media,32768))
-    n.state = card.Tran
-    n.width = 4
-    n
 private val empty_media = card.Media((sector,out) -> true,(sector,bytes) -> true,() -> true,() -> true)
-private setup(h: &Host, reading: bool)
-    assert(write(h,0,3,0))
-    assert(write(h,4,0x4002,0))
-    assert(write(h,36,1000000,0))
-    assert(write(h,40,512,0))
-    assert(write(h,44,0x90 | (if reading then 2u32 else 0),0))
-    assert(write(h,88,0x24001000,0))
-    assert(write(h,80,1,0))
-    assert(write(h,8,3,0))
 private val no_read: &Fn(u32,[]u8) -> bool = (address,bytes) -> false
 private val no_write: &Fn(u32,[]const u8) -> bool = (address,bytes) -> false
+
+// CMDR for command `index`: its response kind (a WAITRESP value), whether it opens a data transfer,
+// and CPSMEN.
+private cmdr(index: u32, response: u32 = RESPONSE_SHORT, data: bool = false) -> u32 =
+    index | response << reg.CMDR_WAITRESP_SHIFT | (if data then reg.CMDR_CMDTRANS_MASK else 0) | reg.CMDR_CPSMEN_MASK
+
+// Sends command `index` with `arg` through the host, runs it to its response, clears the static
+// flags it raised, and answers the response's first word.
+private command(h: &Host, n: &card.Native, index: u32, arg: u32, response: u32 = RESPONSE_SHORT) -> u32
+    assert(write(h,reg.ARGR_OFFSET,arg,h.at))
+    assert(write(h,reg.CMDR_OFFSET,cmdr(index,response),h.at))
+    advance(h,due(h),Some(n),true,no_read,no_write)
+    val word = h.response[0]
+    assert(write(h,reg.ICR_OFFSET,STATIC_FLAGS,h.at))
+    word
+
+// A host and a card on `media` brought from power-on to the transfer state by the commands a driver
+// sends: CMD0, CMD8, ACMD41, CMD2, CMD3, CMD7, and ACMD6 for the four-bit bus where `wide`.
+private ready_card(media: card.Media, wide: bool = true) -> (&card.Native, &Host)
+    val n = card.native(card.card(media,32768))
+    val h = host()
+    assert(write(h,reg.POWER_OFFSET,POWER_ON,0))
+    command(h,n,0,0,RESPONSE_NONE)
+    assert(command(h,n,8,0x1aa) == 0x1aa, "CMD8 echoes the check pattern")
+    command(h,n,55,0)
+    assert(command(h,n,41,0x40ff8000,RESPONSE_SHORT_NO_CRC) == 0xc0ff8000, "ACMD41 reports power-up done")
+    command(h,n,2,0,RESPONSE_LONG)
+    val rca = command(h,n,3,0) & 0xffff0000
+    assert(rca != 0, "CMD3 publishes a relative address")
+    command(h,n,7,rca)
+    if wide
+        command(h,n,55,rca)
+        command(h,n,6,2)
+    assert(n.state == card.Tran)
+    assert(n.width == (if wide then 4 else 1))
+    (n,h)
+
+// The data path for one 512-byte block of sector SECTOR through IDMA at BUFFER, on a four-bit bus
+// at the kernel clock over four.
+private setup(h: &Host, reading: bool)
+    assert(write(h,reg.CLKCR_OFFSET,1 << reg.CLKCR_WIDBUS_SHIFT | 2,h.at))
+    assert(write(h,reg.DTIMER_OFFSET,1000000,h.at))
+    assert(write(h,reg.DLENR_OFFSET,512,h.at))
+    assert(write(h,reg.DCTRL_OFFSET,BLOCK_512 | (if reading then reg.DCTRL_DTDIR_MASK else 0),h.at))
+    assert(write(h,reg.IDMABASE0R_OFFSET,BUFFER,h.at))
+    assert(write(h,reg.IDMACTRLR_OFFSET,reg.IDMACTRLR_IDMAEN_MASK,h.at))
+    assert(write(h,reg.ARGR_OFFSET,SECTOR,h.at))
+
+@test("SDMMC bring-up: the host walks a card from power-on to the transfer state on a four-bit bus")
+bring_up()
+    val (n,h) = ready_card(empty_media)
+    assert(n.rca != 0)
+    assert(h.flags == 0, "every response was clean and its flags cleared")
+    val (narrow,_) = ready_card(empty_media,wide = false)
+    assert(narrow.width == 1, "without ACMD6 the card stays on one bit")
 
 @test("STM32 SDMMC: timed command/data completion, four-bit IDMA receive, register flags and W1C interrupts")
 receive()
     val media = card.Media((sector,out) ->
-        assert(sector == 3)
+        assert(sector == SECTOR)
         for i in 0..<out.len do out[i] = u8(i * 13)
         true,
         (sector,bytes) -> false,() -> true,() -> true)
-    val n = model(media)
-    val h = host()
+    val (n,h) = ready_card(media)
+    val start = h.at
     setup(h,true)
     assert(clock_hz(h) == 15000000)
-    assert(write(h,60,256,0))
-    assert(write(h,12,17 | 64 | 256 | 4096,0))
+    assert(write(h,reg.MASKR_OFFSET,reg.MASKR_DATAENDIE_MASK,start))
+    assert(write(h,reg.CMDR_OFFSET,cmdr(17,data = true),start))
     val command_end = due(h)
     val seen: &Seen = Seen(false,false,0)
     val copy: &Fn(u32,[]const u8) -> bool = (address,bytes) ->
-        assert(address >= 0x24001000 && u64(address) + u64(bytes.len) <= 0x24001200)
-        for i in 0..<bytes.len do assert(bytes[i] == u8((usize(address - 0x24001000) + i) * 13))
+        assert(address >= BUFFER && u64(address) + u64(bytes.len) <= u64(BUFFER) + 512)
+        for i in 0..<bytes.len do assert(bytes[i] == u8((usize(address - BUFFER) + i) * 13))
         seen.bytes += bytes.len
         seen.copied = true
         true
     advance(h,command_end - 1,Some(n),true,no_read,copy)
-    assert(!seen.copied && status(h,Some(n),command_end - 1) & (1 << 13) != 0)
+    assert(!seen.copied)
+    assert(status(h,Some(n),command_end - 1) & reg.STAR_CPSMACT_MASK != 0, "the command is still on the line")
     advance(h,command_end,Some(n),true,no_read,copy)
-    assert(h.response[0] == 0x900 && h.flags & 64 != 0 && h.remaining == 512 && !seen.copied)
+    assert(h.response[0] == 0x900, "R1: READY_FOR_DATA in Tran")
+    assert(h.flags & reg.STAR_CMDREND_MASK != 0)
+    assert(h.remaining == 512)
+    assert(!seen.copied)
     val data_end = due(h)
-    assert(data_end > command_end && !irq(h))
+    assert(data_end > command_end)
+    assert(!irq(h))
     advance(h,data_end - 1,Some(n),true,no_read,copy)
     assert(!seen.copied)
     advance(h,data_end,Some(n),true,no_read,copy)
-    assert(seen.copied && h.remaining == 480 && seen.bytes == 32)
+    assert(seen.copied)
+    assert(h.remaining == 480, "one 32-byte IDMA beat")
+    assert(seen.bytes == 32)
     while h.data_due != NEVER do advance(h,h.data_due,Some(n),true,no_read,copy)
-    assert(seen.copied && seen.bytes == 512 && h.remaining == 0 && h.idma == 1 && irq(h) && n.card.stats.reads == 1)
-    assert(h.flags & 1280 == 1280 && due(h) == NEVER)
-    assert(write(h,56,256, data_end))
-    assert(!irq(h) && h.flags & 1024 != 0)
-    assert(!write(h,40,0x2000000,h.at))
-    assert(!write(h,4,0x8002,data_end),"eight-bit card bus is explicitly unsupported")
-    assert(read(h,0x80,Some(n),data_end).is_none(),"CPU FIFO path is explicitly unsupported")
+    assert(seen.bytes == 512)
+    assert(h.remaining == 0)
+    assert(h.idma == reg.IDMACTRLR_IDMAEN_MASK)
+    assert(irq(h), "DATAEND is unmasked")
+    assert(n.card.stats.reads == 1)
+    assert(h.flags & reg.STAR_DATAEND_MASK != 0)
+    assert(h.flags & reg.STAR_DBCKEND_MASK != 0)
+    assert(due(h) == NEVER)
+    assert(write(h,reg.ICR_OFFSET,reg.ICR_DATAENDC_MASK,data_end))
+    assert(!irq(h), "clearing DATAEND drops the interrupt")
+    assert(h.flags & reg.STAR_DBCKEND_MASK != 0, "and only DATAEND")
+    assert(!write(h,reg.DLENR_OFFSET,0x2000000,h.at), "DATALENGTH is 25 bits")
+    assert(!write(h,reg.CLKCR_OFFSET,2 << reg.CLKCR_WIDBUS_SHIFT | 2,data_end),"eight-bit card bus is explicitly unsupported")
+    assert(read(h,FIFO_OFFSET,Some(n),data_end).is_none(),"CPU FIFO path is explicitly unsupported")
     reset(h)
-    assert(h.power == 0 && h.flags == 0 && due(h) == NEVER)
+    assert(h.power == 0)
+    assert(h.flags == 0)
+    assert(due(h) == NEVER)
 
 @test("STM32 SDMMC: IDMA transmit, programming busy, memory failure, data timeout and absent/routing failures")
 errors()
     val seen: &Seen = Seen(false,false,0)
     val media = card.Media((sector,out) -> false,(sector,bytes) ->
-        assert(sector == 3 && bytes[0] == 91 && bytes[511] == 91)
+        assert(sector == SECTOR && bytes[0] == 91 && bytes[511] == 91)
         seen.accepted = true
         true,() -> true,() -> true)
-    val n = model(media)
-    val h = host()
+    val (n,h) = ready_card(media)
     setup(h,false)
-    assert(write(h,12,24 | 64 | 256 | 4096,0))
-    val read: &Fn(u32,[]u8) -> bool = (address,out) ->
+    assert(write(h,reg.CMDR_OFFSET,cmdr(24,data = true),h.at))
+    val ram: &Fn(u32,[]u8) -> bool = (address,out) ->
         for i in 0..<out.len do out[i] = 91
         true
-    advance(h,due(h),Some(n),true,read,no_write)
-    while h.data_due != NEVER do advance(h,h.data_due,Some(n),true,read,no_write)
+    advance(h,due(h),Some(n),true,ram,no_write)
+    while h.data_due != NEVER do advance(h,h.data_due,Some(n),true,ram,no_write)
     val finish = h.at
-    assert(seen.accepted && n.card.stats.writes == 1 && status(h,Some(n),finish) & (1 << 20) != 0)
+    assert(seen.accepted)
+    assert(n.card.stats.writes == 1)
+    assert(status(h,Some(n),finish) & reg.STAR_BUSYD0_MASK != 0, "the card holds D0 while it programs")
     assert(!card.native_busy(n,finish + n.card.program_ticks))
+    // Each fault and the flag it raises: no IDMA, a one-tick data timer, an IDMA base outside RAM,
+    // a card left on a one-bit bus, and a card not routed to the host.
+    val faults = [("no IDMA",reg.STAR_IDMATE_MASK),("data timeout",reg.STAR_DTIMEOUT_MASK),
+                  ("bad IDMA base",reg.STAR_IDMATE_MASK),("bus width",reg.STAR_DCRCFAIL_MASK),
+                  ("unrouted",reg.STAR_CTIMEOUT_MASK)]
     for fault in 0..<5
-        reset(h)
-        card.reset_native(n)
-        n.state = card.Tran
-        n.width = 4
-        setup(h,true)
-        if fault == 0 then assert(write(h,80,0,0))
-        if fault == 1 then assert(write(h,36,1,0))
-        if fault == 2 then assert(write(h,88,1,0))
-        if fault == 3 then n.width = 1
-        assert(write(h,12,17 | 64 | 256 | 4096,0))
-        advance(h,due(h),Some(n),fault != 4,no_read,no_write)
-        if due(h) != NEVER then advance(h,due(h),Some(n),true,no_read,no_write)
-        val expected: u32 = if fault == 0 || fault == 2 then 1u32 << 27 elif fault == 1 then 8 elif fault == 3 then 2 else 4
-        assert(h.flags & expected != 0,s"fault $fault flags=${h.flags}")
+        val (c,f) = ready_card(media,wide = fault != 3)
+        setup(f,true)
+        if fault == 0 then assert(write(f,reg.IDMACTRLR_OFFSET,0,f.at))
+        if fault == 1 then assert(write(f,reg.DTIMER_OFFSET,1,f.at))
+        if fault == 2 then assert(write(f,reg.IDMABASE0R_OFFSET,1,f.at))
+        assert(write(f,reg.CMDR_OFFSET,cmdr(17,data = true),f.at))
+        advance(f,due(f),Some(c),fault != 4,no_read,no_write)
+        if due(f) != NEVER then advance(f,due(f),Some(c),true,no_read,no_write)
+        val (name,expected) = faults[fault]
+        assert(f.flags & expected != 0,s"$name: flags=${f.flags}")
     reset(h)
-    assert(write(h,0,3,0))
-    assert(write(h,12,8 | 256 | 4096,0))
+    assert(write(h,reg.POWER_OFFSET,POWER_ON,0))
+    assert(write(h,reg.CMDR_OFFSET,cmdr(8),0))
     advance(h,due(h),None,true,no_read,no_write)
-    assert(h.flags & 4 != 0)
+    assert(h.flags & reg.STAR_CTIMEOUT_MASK != 0, "no card answers")
 
 @test("STM32 SDMMC: OCR response has no CRC, commands are latched and power-off aborts pending work")
 commands()
     val n = card.native(card.card(empty_media,32768))
     val h = host()
-    assert(write(h,0,3,0) && write(h,4,75,0))
-    assert(write(h,8,0,0) && write(h,12,55 | 256 | 4096,0))
+    assert(write(h,reg.POWER_OFFSET,POWER_ON,0))
+    assert(write(h,reg.CLKCR_OFFSET,75,0))
+    assert(write(h,reg.ARGR_OFFSET,0,0))
+    assert(write(h,reg.CMDR_OFFSET,cmdr(55),0))
     advance(h,due(h),Some(n),true,no_read,no_write)
-    assert(write(h,56,STATIC_FLAGS,h.at))
-    assert(write(h,8,0x40ff8000,h.at) && write(h,12,41 | 256 | 4096,h.at))
-    assert(write(h,8,0,h.at),"ARG writes cannot change the already latched command")
-    assert(!write(h,12,0,h.at),"active CPSM cannot be replaced")
+    assert(write(h,reg.ICR_OFFSET,STATIC_FLAGS,h.at))
+    assert(write(h,reg.ARGR_OFFSET,0x40ff8000,h.at))
+    assert(write(h,reg.CMDR_OFFSET,cmdr(41),h.at))
+    assert(write(h,reg.ARGR_OFFSET,0,h.at),"ARG writes cannot change the already latched command")
+    assert(!write(h,reg.CMDR_OFFSET,0,h.at),"active CPSM cannot be replaced")
     advance(h,due(h),Some(n),true,no_read,no_write)
-    assert(h.response[0] == 0xc0ff8000 && h.flags & 1 != 0 && n.state == card.Ready)
-    assert(write(h,12,8 | 256 | 4096,h.at))
-    assert(write(h,0,0,h.at))
+    assert(h.response[0] == 0xc0ff8000, "the latched argument reached the card")
+    assert(h.flags & reg.STAR_CCRCFAIL_MASK != 0, "R3 has no CRC, so a short-with-CRC wait flags it")
+    assert(n.state == card.Ready)
+    assert(write(h,reg.CMDR_OFFSET,cmdr(8),h.at))
+    assert(write(h,reg.POWER_OFFSET,0,h.at))
     advance(h,h.at + 1000000,Some(n),true,no_read,no_write)
-    assert(h.flags == 0 && due(h) == NEVER)
+    assert(h.flags == 0)
+    assert(due(h) == NEVER)
