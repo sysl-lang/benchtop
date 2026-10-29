@@ -222,15 +222,35 @@ The M7 alone, unpaced (the cores in lockstep, the M4 drawing as above):
 | 1 memory | 244–279 MHz | 172–197 |
 | 2 double | 263–373 MHz | 49–69 |
 | 3 branches | 140–212 MHz | 89–134 |
-| **4 peripheral polls** | **49–58 MHz** | **38–45** |
+| **4 peripheral polls** (before the quiet reads below) | **49–58 MHz** | **38–45** |
 | 5 none (asleep between interrupts) | 102–153 MHz | 9–14 |
 
-**The peripheral polls are the limit, by a factor of five against every other kernel: an M7 polling
-the SAI and DMA registers runs at about a tenth of real time.** A profile of that run (`sample <pid>
-5 1`) puts two thirds of the M7's thread (1288 of 1939 samples) in `virt.sai_dma_read`: every SAI or DMA register read brings
-the audio up to the core's time (`bring_audio` → `service_audio_dma`, with a `malloc` and a `free` on
-each), publishes it (`publish_audio`, `dma.irq`) and takes the audio lock (`sysl_futex_wait`, about
-5 % of the thread). In the mixed run the polls are a small share of the work, and the profile is
+The polls were the limit, by a factor of five: a profile (`sample <pid> 5 1`) put two thirds of the
+M7's thread in `virt.sai_dma_read`, because every SAI or DMA register read brought the audio up to
+the core's time, serviced the DMA through two freshly allocated bus closures, and published the
+result. A read now answers from the devices' state when no slot falls due by its time and the DMA
+has nothing left to move (`quiet_audio_read`): bringing the devices to that time would only move
+their clocks, so the state the last access published is the state at the read's time, and the
+values read are the same (`sai_dma_polls` checks polls every 7 instructions against polls every
+1400). The DMA's beats are made without callbacks (`dma.next_beat` / `dma.finish_beat`), and the slot
+callbacks are made only when a slot is due. Interleaved with the build before it, unpaced, three
+guest seconds, on a machine loaded by other work (so the MHz move with the load; the host
+instructions retired over the whole run do not):
+
+| kernel | before: M7 MHz, host instructions | after |
+|---|---|---|
+| 4 peripheral polls | 75–76 MHz, 768–784 G | **139–201 MHz, 221–224 G** |
+| 1 memory | 199–520 MHz, 132–144 G | 226–612 MHz, 128–144 G |
+| 2 double | 299–568 MHz, 123–132 G | 265–623 MHz, 124–134 G |
+| 3 branches | 230–390 MHz, 129–145 G | 194–398 MHz, 125–143 G |
+| all, in turn | 297–501 MHz, 134–151 G | 508–591 MHz, 131–134 G |
+
+What the polls still pay is the audio lock: the M4's per-slice `signal_sai_dma` brings the audio in
+whenever its clock passes a slot first, so the two cores' threads meet on the lock (`sysl_futex_wait`
+is most of what is left in `sai_dma_read`), and the DSI status poll meets the M4 on the DSI host's
+lock the same way. Bringing a device in only on the core that drives it removes that, but it moves
+where the other core's slices end, and with them the instruction counts the cores reach by a given
+frame, so it is not done. In the mixed run the polls are a small share of the work, and the profile is
 instead the M7's loads and stores (`h_ld_imm`, `h_ldr_imm`, `h_ld_reg`, `h_fp_ldr` → `fp_words`, and the stores: about
 two fifths of its thread), with 22 % in `run_core`'s per-slice `signal`: `signal_dsi` 13 % and
 `signal_sai_dma` 8 %, on a core that drives neither. The sleeping kernel runs slower than the busy
