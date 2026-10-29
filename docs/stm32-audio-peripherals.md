@@ -88,9 +88,11 @@ Afterward M4 owns that bus for FT6206 touch. SAI emits four 32-bit slots at 48 k
 with 16-bit DAC2 left/right samples in slots 1 and 3. The reusable codec part
 implements 16-bit register addressing/data, readback, software reset, power and
 clock gates, DAC2 routing, mute and latched speaker/digital volume. Unknown
-writes and unsupported sample rates/formats are rejected. The current path is
-48 kHz, codec-slave AIF1 DAC2 speaker playback; DMIC2/analog inputs,
-codec HPF/EQ/DRC, analog settling and complete vendor driver initialization remain future work.
+writes and unsupported sample rates/formats are rejected. The path is
+48 kHz, codec-slave AIF1 DAC2 speaker playback.
+
+Not modelled: DMIC2/analog inputs, codec HPF/EQ/DRC, analog settling and complete vendor
+driver initialization.
 
 The host snapshots integer codec gains with each slot, then converts and mixes
 PCM outside the guest CPU worker. SDL3 sends the mono speaker mix to CoreAudio

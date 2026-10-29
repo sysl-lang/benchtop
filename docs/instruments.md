@@ -39,8 +39,11 @@ rejected before opening the application window.
 ## Numeric sources
 
 The plot model accepts a numeric callback returning a value or a missing sample;
-it has no knowledge of ADCs, parts or CPU architectures. The windowed Cortex-M
-backend binds these read-only names:
+it has no knowledge of ADCs, parts or CPU architectures. The windowed backend
+binds these read-only names. The ADC register names come from the ADC model, and the
+`cpu` names are the Arm core's `r0` through `r15`; a RISC-V core's registers (`x0`
+through `x31`) have no names here, and a board with a different number of cores gets
+none beyond the two:
 
 | Source | Observation |
 | --- | --- |
@@ -55,9 +58,11 @@ backend binds these read-only names:
 
 Chip and peripheral names come from the description: `controller.adc.RESULT` is
 an example, not a reserved ADC name. RAM offsets refer to the emulated backing
-array, not arbitrary bus addresses; bounds are checked during binding. The current
-source binder supports single-board scenes. Product-wide execution and additional
-peripheral providers remain future work.
+array, not arbitrary bus addresses; bounds are checked during binding. The source
+binder supports single-board scenes.
+
+Not modelled: product-wide execution, and observation sources from peripherals other
+than the ADC and the panel GPIO.
 
 Observations happen between deterministic guest execution slices. ADC observation
 does not advance conversion time, acknowledge status, or change interrupts. RAM
