@@ -126,7 +126,18 @@ enum ProductView
      its configuration with one `configure`. Each core's last bus window is `Machine.bus_cache`, a
      `BusCache` aligned to `HOST_CACHE_LINE` (128 bytes, Apple silicon's line) so the two cores'
      threads never write one line.
-   - Left: the SIO FIFOs and spinlocks, the `enum Device` dispatch, and `virt.machine` itself.
+   - Done: the SIO. Its FIFOs, spinlocks and the boot ROM's place in the launch sequence are
+     `Machine.devices.sio` (`virt/sio.sysl`).
+   - Done: the dispatch. Two traits (`virt/peripheral.sysl`): a `Peripheral` (`boot`, `due(cpu)`,
+     `wake(cpu)`, `signal(cpu)`) is a device of the machine's, and a `BusWindow` (`read`, `write`) a
+     window of one on the bus. `attach` points each of the bus's windows at the device that answers
+     it and lists the devices the board has, so an access is one trait call, `boot` a loop over every
+     device, and a slice's deadline a fold over the running ones. `enum Device` remains the kind a
+     description names a device by; a device that answers several windows from one state (the SAI
+     and DMA block, the STM32 SPI and GPIO, the RP2040's resets, timer and watchdog) is reached
+     through a small window value that carries it.
+   - Left: `virt.machine` itself. The devices' functions still reach `machine.devices.X` rather
+     than their own `self`, and the entry points do not yet take a `*Machine`.
    - Left: a RISC-V hart in a board. The hart already reaches devices through its own
      `riscv.Bus` trait off its RAM window; what it waits on is device handlers that take a v6m
      `*Cpu`, and the RP2350 chip layer (GPIO, UART, SIO, ROM), which does not exist yet.
