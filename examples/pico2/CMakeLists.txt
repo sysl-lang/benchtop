@@ -45,3 +45,10 @@ target_link_libraries(qmi_flash hardware_xip_cache)
 benchtop_program(xip_sram xip_sram.c xip_ram)
 pico_minimize_runtime(xip_sram INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
 target_compile_definitions(xip_sram PRIVATE PICO_HEAP_SIZE=0x200)
+
+# A busy loop from XIP_SRAM, and the same loop from SRAM, for measuring the two paths side by side.
+benchtop_program(xip_loop xip_loop.c xip_ram)
+pico_minimize_runtime(xip_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
+target_compile_definitions(xip_loop PRIVATE PICO_HEAP_SIZE=0x200)
+benchtop_program(sram_loop xip_loop.c no_flash)
+pico_minimize_runtime(sram_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)

@@ -19,6 +19,8 @@ private val BLINK_FLASH = embed("../../../../examples/pico2/blink_flash.elf")
 private val QMI_FLASH = embed("../../../../examples/pico2/qmi_flash.elf")
 private val XIP_SRAM_ELF = embed("../../../../examples/pico2/xip_sram.elf")
 private val PLAIN_BLINK = embed("../../../../examples/pico2/blink.elf")
+private val XIP_LOOP = embed("../../../../examples/pico2/xip_loop.elf")
+private val SRAM_LOOP = embed("../../../../examples/pico2/sram_loop.elf")
 
 private val PICO2_SRAM = SramMap(0x20000000, 520 * 1024)
 private const MS_150: u64 = 150000
@@ -273,6 +275,63 @@ xip_uf2_refusals()
     big.set(16, 0xDD)
     big.set(17, 0x01)
     assert(b.boot(big.view()).unwrap_err().contains("477 bytes"))
+
+@test("a flash image's .bss, linked to load in flash and run in SRAM, writes nothing into the flash: the block-end marker after it survives")
+xip_flash_bss_writes_nothing()
+    val b = arm_board(PICO2_SRAM)
+    b.boot(HELLO_FLASH).unwrap()
+    // hello_serial_flash's .flash_end (20 bytes at 0x10003d24, from file offset 0x5d24), then the
+    // .bss whose load address is the same and whose 0x210 bytes are zero only in SRAM.
+    for i in 0..<20 do assert(b.mem.flash[0x3d24 + i] == HELLO_FLASH[0x5d24 + i], s"marker byte $i")
+    assert(b.mem.flash[0x3d24] == 0xD3 && b.mem.flash[0x3d24 + 19] == 0xAB)
+    for i in 20..<0x210 do assert(b.mem.flash[0x3d24 + i] == 0xFF, s"byte $i after the marker is erased flash")
+
+@test("a busy loop in XIP_SRAM runs on the cores' fast path, to the checksum the same loop gives from SRAM")
+xip_sram_loop()
+    var sums: Buf[string] = buf()
+    for k in 0..<2
+        val b = arm_board(PICO2_SRAM)
+        b.boot(if k == 0 then XIP_LOOP else SRAM_LOOP).unwrap()
+        if k == 0 then for p in 0u32..<4 do assert(b.mem.page_table[(XIP_SRAM_BASE >> 12) + p] != 0, s"page $p on the fast path")
+        val text = console_after(b, 10000)
+        assert(text.ends_with("PASSED\r\n"), text)
+        sums.push(text[text.index_of("checksum").unwrap()..])
+    assert(sums.at(0) == "checksum d0a54a76\r\nPASSED\r\n" && sums.at(1) == sums.at(0), s"${sums.at(0)} ${sums.at(1)}")
+
+@test("XIP_SRAM's fast path: both ends of the window, nothing either side of it, a page leaving when one line is unpinned and returning when it is pinned again")
+xip_sram_fast_path_edges()
+    val b = arm_board(PICO2_SRAM)
+    b.boot(PLAIN_BLINK).unwrap()
+    for k in 0u32..<(16384 / 8) do b.chip.xip.maintain(SRAM_OFFSET + k * 8 + 7).unwrap()
+    b.sync_xip()
+    val last = XIP_SRAM_BASE + 16384 - 4
+    for a in [XIP_SRAM_BASE, XIP_SRAM_BASE + 4092, XIP_SRAM_BASE + 4096, last]
+        assert(fast(b, a, 4), s"0x${hex(a, 8)} on the fast path")
+    assert(fast(b, last + 3, 1), "the last byte")
+    for a in [XIP_SRAM_BASE - 4, XIP_SRAM_BASE + 16384, last + 2]
+        assert(!fast(b, a, 4), s"0x${hex(a, 8)} off it")
+    // A store and a load at each end, through the cores' own path, land in the backing.
+    assert(run_code(b, [STR_R2_R3, LDR_R4_R3, BKPT], [0, 0, 0x11223344, XIP_SRAM_BASE, 0, 0]) == RunEnd.Breakpoint, b.refused)
+    assert(b.cores[0].r[4] == 0x11223344 && b.mem.ram[b.sram_at] == 0x44)
+    assert(run_code(b, [STR_R2_R3, LDR_R4_R3, BKPT], [0, 0, 0x55667788, last, 0, 0]) == RunEnd.Breakpoint, b.refused)
+    assert(b.cores[0].r[4] == 0x55667788 && b.mem.ram[b.sram_at + 16383] == 0x55)
+    // Invalidating the last line by address (operation 2) unpins it: its page leaves the fast path
+    // at once, the load is refused by name, and the other pages stay.
+    assert(run_code(b, [STRB_R1_R0, LDR_R4_R3, BKPT], [MAINTENANCE + SRAM_OFFSET + 16384 - 8 + 2, 0, 0, last, 0, 0]) == RunEnd.Fault)
+    assert(b.refused.contains("0x13fffffc is in XIP_SRAM, and no cache line is pinned"), b.refused)
+    assert(!fast(b, last, 4) && fast(b, XIP_SRAM_BASE + 8192, 4))
+    // A line of that page still pinned is reached off the fast path, and its store lands in the backing.
+    assert(run_code(b, [STR_R2_R3, LDR_R4_R3, BKPT], [0, 0, 0x0BADCAFE, last - 8, 0, 0]) == RunEnd.Breakpoint, b.refused)
+    assert(b.cores[0].r[4] == 0x0BADCAFE && b.mem.ram[b.sram_at + 16372] == 0xFE)
+    // Pinning it again puts the page back.
+    assert(run_code(b, [STRB_R1_R0, BKPT], [MAINTENANCE + SRAM_OFFSET + 16384 - 8 + 7, 0, 0, 0, 0, 0]) == RunEnd.Breakpoint, b.refused)
+    assert(fast(b, last, 4), "pinned again, on the fast path")
+
+// Whether core 0 reaches the `width` bytes at `a` on its fast path, its loads and its stores alike.
+private fast(b: &ArmBoard, a: u32, width: u32) -> bool
+    val load = arm.page_for(&b.cores[0], a, width) != 0
+    assert(load == (arm.store_page(&b.cores[0], a, width) != 0), s"0x${hex(a, 8)}: loads and stores agree")
+    load
 
 @test("an ELF segment outside the SRAM, the flash and XIP_SRAM is refused by name")
 xip_elf_outside()
