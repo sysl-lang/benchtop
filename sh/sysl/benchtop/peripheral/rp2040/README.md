@@ -6,9 +6,10 @@ model imports a CPU module, uses global device state, starts a host thread, or r
 
 RESETS, TIMER and the watchdog are library peripherals (`rp-resets`, `rp-timer`, `rp-watchdog`),
 placed by `mcus/rp2040.hocon` and run by `sh.sysl.benchtop.virt` (`virt/rp.sysl`) on any runnable
-board whose mcu places them. The `rp2040` mcu itself does not run: its ROM and SIO are not
-modelled, and the divider is used only where an SIO is. GPIO/pads, UART, clock generators, the watchdog
-counter, DMA, SPI, I2C, PWM, PIO, USB, flash and boot ROM are separate work.
+board whose mcu places them. The `rp2040` mcu itself runs on `chip.Rp2040` (`chip/rp2040.sysl`), which
+places these models beside the RP2350's shared ones (SIO with this divider and interpolator, GPIO and
+pads, UART, the clock generators, PSM) at the RP2040's addresses. DMA, SPI, I2C, PWM, PIO, USB, the SSI
+and flash, and the real boot ROM are separate work (docs/rp-coverage.md §7).
 
 ## Machine integration contract
 

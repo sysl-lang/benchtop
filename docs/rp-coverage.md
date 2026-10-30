@@ -31,11 +31,13 @@ day. An L is split before it is handed out (§6).
   Every other address is refused by name. The SDK's
   `hello_serial` and `blink` run unmodified on the Arm board as `no_flash` and as flash builds
   (`examples/pico2`, items 1 and 4).
-- **The RP2040 does not run at all** (`mcus/rp2040.hocon:4`, `peripheral/rp2040/README.md:9–11`).
-  Its RESETS, TIMER and watchdog tick generator are library peripherals (`rp-resets`, `rp-timer`,
-  `rp-watchdog`). They run on the `virt*` boards through `virt/rp.sysl`, with clk_ref taken to be the
-  core clock because there is no CLOCKS block (`virt/rp.sysl:8–12`). The divider is modelled and is
-  reached only from a test bus (`v6m/rp2040_peripheral_tests.sysl`). `virt-sio` (`virt/sio.sysl`) is
+- **The RP2040 runs on its two Cortex-M0+ cores** (item 22): `chip.Rp2040` (`chip/rp2040.sysl`) on
+  `ArmBoard[Rp2040]`, the `pico` board, over the RP2350's shared models, with a stand-in boot ROM that
+  carries only core 1's launch wait. The SDK's `hello_serial`, `blink` and pico-examples'
+  `hello_multicore` run as `no_flash` images (`examples/pico`). Its RESETS, TIMER and watchdog tick
+  generator are also library peripherals (`rp-resets`, `rp-timer`, `rp-watchdog`) that run on the
+  `virt*` boards through `virt/rp.sysl`, with clk_ref taken to be the core clock because the virtual
+  boards have no CLOCKS block (`virt/rp.sysl:8–12`). `virt-sio` (`virt/sio.sysl`) is
   an RP2040-shaped SIO with FIFOs, spinlocks and CPUID for the virtual boards. `rp-sio`, `pl011`,
   `dw-i2c` and `rp-adc` are accepted by the checker and marked `modelled = false`
   (`registry.sysl:301,318,322,324`).
@@ -127,41 +129,41 @@ day. An L is split before it is handed out (§6).
 
 | block | datasheet | status | modelled / not | tested now | est | depends on |
 |---|---|---|---|---|---|---|
-| Chip layer: bus decode, clock tree, IRQ routing, Pico board | 2.2 Address map | missing | `mcus/rp2040.hocon:4` says "does not run". There is no `chip.Rp2040`. | — | M | — |
-| Cortex-M0+ ×2 | 2.4 Cortex-M0+ | partial | v6m, run on the `virt*` boards (DESIGN.md §2.8). The 8-region MPU (`mcus/rp2040.hocon:9`) is not modelled. | `v6m/*_tests` | S (MPU, PMSAv7 subset) | — |
-| NVIC and SysTick (M0+) | 2.3.2 Interrupts, 2.4 | full | `v6m/except.sysl`, `v6m/nvic.sysl`. 26 IRQ lines once a chip routes them. | `v6m/nvic_tests` | — | chip layer |
-| SIO: CPUID, FIFOs (8-deep), spinlocks, FIFO IRQ | 2.3.1 SIO | partial | `virt-sio` (`virt/sio.sysl:3–40`) for the virtual boards. It has no GPIO registers, and `rp-sio` is `modelled = false` (`registry.sysl:301`). The RP2350 SIO model is the base to parameterise (depth 8, no high bank, no MTIME). | `virt/session_tests`, `virt/machine_tests` | S | chip layer |
-| SIO GPIO (OUT/OE/IN, SET/CLR/XOR) | 2.3.1 SIO | missing | Not on an RP2040 bus. Shared with the RP2350 model. | — | S | IO_BANK0 |
-| SIO hardware divider (per core) | 2.3.1.5 Integer divider | full | `peripheral/rp2040/divider.sysl:5–84`: 8-cycle completion, DIRTY, signed and unsigned. Reached only from a test bus. | `rp2040/tests.sysl`, `v6m/rp2040_peripheral_tests.sysl` | S (wire) | chip layer |
-| SIO interpolators (with the RP2040's blend and clamp modes) | 2.3.1.6 Interpolator | full | `peripheral/rp2040/interp.sysl`, the RP2350's model with SHIFT a logical right shift (item 15). Reached only from tests until the RP2040 chip layer places it. | `rp2040/interp_tests.sysl` (both shifts) | S (wire) | chip layer |
+| Chip layer: bus decode, clock tree, IRQ routing, Pico board | 2.2 Address map | full | `chip.Rp2040` (`chip/rp2040.sysl`) on `ArmBoard[Rp2040]`, the `pico` board (item 22). Every block not on the chip yet is refused by name with its item. | `chip/pico_tests.sysl` | — | — |
+| Cortex-M0+ ×2 | 2.4 Cortex-M0+ | partial | v6m on the Pico, on the instruction timing table (the SDK's divider wait needs it), with WFE and SEV between the cores (item 22). The 8-region MPU (`mcus/rp2040.hocon:9`) is not modelled. | `v6m/*_tests`, `v6m/exceptions.sysl` (WFE/SEV) | S (MPU, PMSAv7 subset) | — |
+| NVIC and SysTick (M0+) | 2.3.2 Interrupts, 2.4 | full | `v6m/except.sysl`, `v6m/nvic.sysl`. 26 IRQ lines; the chip drives TIMER 0–3, IO_IRQ_BANK0 (13), SIO_IRQ_PROC0/1 (15, 16, each into its own core) and UART0/1 (20, 21). | `v6m/nvic_tests`, `chip/pico_tests.sysl` | — | — |
+| SIO: CPUID, FIFOs (8-deep), spinlocks, FIFO IRQ | 2.3.1 SIO | full | The RP2350's `Sio` with its depth a parameter (`sio_rp2040`), at the RP2040's offsets (`Rp2040.sio_read`). | `chip/pico_tests.sysl` | — | — |
+| SIO GPIO (OUT/OE/IN, SET/CLR/XOR) | 2.3.1 SIO | full | GPIO 0–29 at the RP2040's offsets, mapped onto the shared model's. The GPIO_HI bank (the QSPI pins) is refused by name (item 24). | `chip/pico_tests.sysl` | — | — |
+| SIO hardware divider (per core) | 2.3.1.5 Integer divider | full | `peripheral/rp2040/divider.sysl:5–84`: 8-cycle completion, DIRTY, signed and unsigned. Each core's at SIO 0x060–0x078 (item 22). | `rp2040/tests.sysl`, `chip/pico_tests.sysl` (the bus, and the SDK's sequence on a core) | — | — |
+| SIO interpolators (with the RP2040's blend and clamp modes) | 2.3.1.6 Interpolator | full | `peripheral/rp2040/interp.sysl`, the RP2350's model with SHIFT a logical right shift (item 15), each core's pair on the RP2040's SIO (item 22). | `rp2040/interp_tests.sysl` (both shifts) | — | — |
 | Bus fabric, BUSCTRL, performance counters | 2.1 Bus fabric | missing | — | — | S | — |
 | DMA: 12 channels, DREQs, pacing timers, chaining, ring, sniff/CRC | 2.5 DMA | missing | — | — | L (shared with RP2350, which has more channels and security) | DREQs |
-| ROM: contents, float/double/mem tables, `rom_func_lookup`, core-1 launch | 2.8 Bootrom | missing | Not mapped. The RP2040 SDK calls the ROM for float, double, memcpy and memset (DESIGN.md §10.1). | — | L | XIP/SSI for the flash routines |
-| Boot sequence (boot2, CRC check, USB boot) | 2.7 Boot sequence | missing | DESIGN.md §10.1: the debugger entry, boot2 not run. | — | M (debugger entry); L (real path) | ROM, SSI |
-| SRAM (264 KB, striped, plus non-striped aliases at 0x2100_0000) | 2.6.2 SRAM | partial | The 264 KB region is described (`mcus/rp2040.hocon:14`). The aliases are absent, and the chip does not run. | — | S | chip layer |
-| XIP, XIP cache, XIP_CTRL, streaming | 2.6.3 Flash | missing | — | — | M (shared with RP2350 XIP) | loader |
-| SSI (DW_apb_ssi) | 4.10 SSI | missing | — | — | S (store, flash reads work) / M (direct commands) | XIP |
-| VREG_AND_CHIP_RESET | 2.10 Core supply regulator, 2.12 Chip-level reset | missing | — | — | S | — |
-| PSM | 2.13 Power-on state machine | missing | — | — | S (shared) | — |
+| ROM: contents, float/double/mem tables, `rom_func_lookup`, core-1 launch | 2.8 Bootrom | partial | A stand-in of benchtop's own (`chip/rom/rp2040-standin.S`, item 22): the header (magic, version 3, the table pointers) and core 1's launch wait, by the datasheet's protocol. The tables, `rom_table_lookup`, the handlers and core 0's boot path are refused by name; the SDK calls the ROM for float, double, memcpy and memset (DESIGN.md §10.1), so the examples use the compiler's (`examples/pico/README.md`). | `chip/pico_tests.sysl` | L | XIP/SSI for the flash routines |
+| Boot sequence (boot2, CRC check, USB boot) | 2.7 Boot sequence | partial | The debugger entry: an ELF into SRAM, core 0 at its entry, core 1 in the ROM (item 22). Boot2 is not run; a UF2 is refused (it is for the flash). | `chip/pico_tests.sysl` | L (real path) | ROM, SSI |
+| SRAM (264 KB, striped, plus non-striped aliases at 0x2100_0000) | 2.6.2 SRAM | full | 264 KB at 0x2000_0000 on the cores' fast path; the non-striped aliases of banks 0–3 through the bus, word w of bank b at striped word 4w + b (item 22). | `chip/pico_tests.sysl` | — | — |
+| XIP, XIP cache, XIP_CTRL, streaming | 2.6.3 Flash | missing | Refused by name (item 24). | `chip/pico_tests.sysl` | M (shared with RP2350 XIP) | loader |
+| SSI (DW_apb_ssi) | 4.10 SSI | missing | Refused by name (item 24). | `chip/pico_tests.sysl` | S (store, flash reads work) / M (direct commands) | XIP |
+| VREG_AND_CHIP_RESET | 2.10 Core supply regulator, 2.12 Chip-level reset | missing | Refused by name (item 24). | `chip/pico_tests.sysl` | S | — |
+| PSM | 2.13 Power-on state machine | full | The RP2350's `Psm` over 17 stages (`psm_rp2040`). Only PROC1 can be forced off, as on the RP2350; its release starts core 1 in the ROM's wait (item 22). | `chip/pico_tests.sysl` | — | — |
 | RESETS (25 outputs) | 2.14 Subsystem resets | full | `peripheral/rp2040/resets.sysl:7–55` on the `virt*` boards (`virt/rp.sysl:19–24`). | `rp2040/tests.sysl`, `virt/rp_tests.sysl:246,268` | — | — |
-| CLOCKS (no TICKS; clk_rtc instead of clk_hstx) | 2.15 Clocks | missing | `virt/rp.sysl:8–12`: "benchtop models no CLOCKS block". The RP2350 model is the base. | — | S | — |
-| XOSC | 2.16 Crystal oscillator | missing | Shared with the RP2350. | — | S | — |
-| ROSC (RANDOMBIT) | 2.17 Ring oscillator | missing | Shared. | — | S | — |
-| PLL_SYS, PLL_USB | 2.18 PLL | missing | Shared with the RP2350 (same registers). | — | S | — |
-| IO_BANK0, PADS_BANK0 (30 GPIOs, no ISO bit) | 2.19 GPIO | missing | The RP2350 model is the base (DESIGN.md §10.1). | — | S | chip layer |
-| IO_QSPI, PADS_QSPI | 2.19 GPIO | missing | — | — | S | — |
-| GPIO interrupts (PROC0/1, DORMANT_WAKE) | 2.19 GPIO | missing | The model is built and tested at this chip's layout (`GpioIrq`, 30 GPIOs from INTR0 at 0xF0, `rp2350/gpio_irq_tests.sysl`); not on an RP2040 bus yet (item 22). | — | S | chip layer |
-| SYSINFO | 2.20 Sysinfo | missing | `rp2040_chip_version()` and `running_on_fpga()` read it. | — | S | — |
-| SYSCFG | 2.21 Syscfg | missing | — | — | S | — |
-| TBMAN | 2.22 TBMAN | missing | — | — | S | — |
+| CLOCKS (no TICKS; clk_rtc instead of clk_hstx) | 2.15 Clocks | partial | `ClocksRp2040` (`peripheral/rp2350/clocks_rp2040.sysl`, item 22): the RP2040's generators, 24.8 and two-bit dividers, clk_peri with none, FC0 from its source table; the watchdog's TICK makes the 1 µs tick. The resus and GPOUT are stored, as on the RP2350. | `chip/pico_tests.sysl` | — | — |
+| XOSC | 2.16 Crystal oscillator | partial | The RP2350's `Xosc`, COUNT at the RP2040's 0x1C; DORMANT refused by name. | `chip/pico_tests.sysl` | — | — |
+| ROSC (RANDOMBIT) | 2.17 Ring oscillator | full | The RP2350's `Rosc` at the RP2040's offsets (no RANDOM), at a nominal 6.5 MHz (Q8). | `chip/pico_tests.sysl` | — | — |
+| PLL_SYS, PLL_USB | 2.18 PLL | full | The RP2350's `Pll`, without its interrupt registers. | `chip/pico_tests.sysl` (125 MHz from the SDK's start-up) | — | — |
+| IO_BANK0, PADS_BANK0 (30 GPIOs, no ISO bit) | 2.19 GPIO | full | The RP2350's models with a GPIO count, CTRL's overrides at the RP2040's bits, no IRQSUMMARY, pads with no ISO (reset 0x56); the RP2040's function table, each unmodelled function refused by name (item 22). | `chip/pico_tests.sysl` | — | — |
+| IO_QSPI, PADS_QSPI | 2.19 GPIO | missing | Refused by name (item 24). | — | S | — |
+| GPIO interrupts (PROC0/1, DORMANT_WAKE) | 2.19 GPIO | full | `GpioIrq` at 30 GPIOs from INTR0 at 0xF0, IO_IRQ_BANK0 (13) into each core; the dormant wake wakes a dormant ROSC (item 22). | `rp2350/gpio_irq_tests.sysl`, `chip/pico_tests.sysl` | — | — |
+| SYSINFO | 2.20 Sysinfo | full | CHIP_ID 0x20002927 (B2), PLATFORM ASIC, GITREF 0; read-only (item 22). | `chip/pico_tests.sysl` | — | — |
+| SYSCFG | 2.21 Syscfg | missing | Refused by name. | `chip/pico_tests.sysl` | S | — |
+| TBMAN | 2.22 TBMAN | missing | Refused by name (item 28). | — | S | — |
 | PIO0/1 | 3 PIO | missing | The same machine as the RP2350's, with two blocks and no RP2350 additions. | — | (shared) | mux, DMA |
-| USB controller (device and host) | 4.1 USB | missing | The same controller as the RP2350's. | — | (shared) | — |
-| UART0/1 (PL011) | 4.2 UART | missing | `pl011` is `modelled = false` (`registry.sysl:318`). The RP2350 model is reusable (`peripheral/rp2350/uart.sysl`). | — | S (place) | chip layer |
+| USB controller (device and host) | 4.1 USB | missing | The same controller as the RP2350's. SIE_CTRL alone is stored, ungated, for the SDK's `runtime_init_usb_power_down`; every other register is refused by name (item 22). | `chip/pico_tests.sysl` | (shared) | — |
+| UART0/1 (PL011) | 4.2 UART | partial | The RP2350's `Uart`, placed (item 22): frames timed from clk_peri through `next_event`, its TX on the pins through the mux, IRQs 20 and 21. The workbench's wires and frames sent in from outside (`Rp2350.wire`, `line_in`) are not on the RP2040 yet. | `chip/pico_tests.sysl` (hello_serial) | S (wires) | — |
 | I2C0/1 | 4.3 I2C | missing | Shared. | — | (shared) | — |
 | SPI0/1 (PL022) | 4.4 SPI | missing | The model exists (`peripheral/spi/spi.sysl`). | — | S (place) | chip layer |
 | PWM (8 slices) | 4.5 PWM | missing | Shared. | — | (shared) | — |
 | TIMER | 4.6 Timer | full | `peripheral/rp2040/timer.sysl:5–120`: latch, 4 alarms, pause, debug pause. | `rp2040/tests.sysl`, `virt/rp_tests.sysl` (13) | — | — |
-| WATCHDOG | 4.7 Watchdog | partial | The tick generator and the counter shared with the RP2350 (`peripheral/rp2040/watchdog.sysl`), TIME falling two a tick (erratum RP2040-E1): CTRL, LOAD, TRIGGER, REASON, SCRATCH0–7. On the `virt*` boards the reset stops the cores at `Reset`, named, since they have no PSM; the RP2040's chip reset path comes with its chip layer (item 22). | `rp2040/tests.sysl`, `rp2040/watchdog_tests.sysl`, `virt/rp_tests.sysl` | S (reset path) | chip layer |
+| WATCHDOG | 4.7 Watchdog | partial | The tick generator and the counter shared with the RP2350 (`peripheral/rp2040/watchdog.sysl`), TIME falling two a tick (erratum RP2040-E1): CTRL, LOAD, TRIGGER, REASON, SCRATCH0–7. On the `virt*` boards the reset stops the cores at `Reset`, named, since they have no PSM. On the Pico the watchdog firing, by its counter or TRIGGER, ends the run named: the RP2040's reset boots through its ROM's boot path (item 23). | `rp2040/tests.sysl`, `rp2040/watchdog_tests.sysl`, `virt/rp_tests.sysl`, `chip/pico_tests.sysl` | S (reset path) | ROM |
 | RTC | 4.8 RTC | missing | — | — | M | clk_rtc |
 | ADC and temperature sensor | 4.9 ADC | missing | `rp-adc` has `modelled = false`. | — | (shared) | — |
 
@@ -170,7 +172,7 @@ day. An L is split before it is handed out (§6).
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
 | RP2350 | 33 | 8 | 0 | 17 | 58 |
-| RP2040 | 5 | 4 | 0 | 28 | 37 |
+| RP2040 | 15 | 7 | 0 | 15 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
 benchtop's policy for unsupported accesses (`docs/peripheral-models.md:54`). Several items below
