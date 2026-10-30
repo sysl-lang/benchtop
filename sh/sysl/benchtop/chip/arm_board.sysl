@@ -1,8 +1,9 @@
 module sh.sysl.benchtop.chip
 
+import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_SRAM_BASE, XIP_SRAM_BYTES}
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.benchtop.v6m as arm
-import sh.sysl.benchtop.v6m.{CoprocessorOp, Fpu, Kind, MemoryMap, Stop}
+import sh.sysl.benchtop.v6m.{CoprocessorOp, Fpu, Kind, MemoryMap, RamBank, Stop}
 import sh.sysl.elf
 import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
@@ -12,11 +13,21 @@ import sysl.math.min
 // SRAM as the cores' RAM, and the cores reaching every other address, and their coprocessor ports,
 // through the chip. It is `RiscvBoard`'s twin, around the same `Rp2350`.
 //
-// **Boot** is DESIGN.md §9.2's debugger entry, as a probe loads a RAM image (an SDK `no_flash` build):
-// the ELF's segments are written into SRAM, core 0 starts at the ELF entry with the stack pointer at
-// the top of SRAM, and core 1 waits in the boot ROM until core 0 launches it through the SIO FIFOs
-// (§9.6), when it starts at the entry it was sent, with the stack pointer and VTOR it was sent. Flash
-// (XIP) is not on this board's bus yet, so an image is linked to run from SRAM.
+// **Boot** is DESIGN.md §9.2's debugger entry, as a probe loads an image: an ELF's loadable segments
+// are written where their physical addresses say, into SRAM, the 4 MB flash behind XIP_BASE, or the
+// XIP cache's lines at XIP_SRAM_BASE, which are pinned first when an image lands there, as the boot
+// ROM pins them for an image that asks; core 0 starts at the ELF entry with the stack pointer at the
+// top of SRAM. A UF2 is written the same way, block by block; a flash UF2 starts as the boot ROM hands
+// a flash image over (the RCP's salts set, VTOR, SP and PC from the vector table at XIP_BASE) and a
+// RAM one at its first byte. Core 1 waits in the boot ROM until core 0 launches it through the SIO
+// FIFOs (§9.6), when it starts at the entry it was sent, with the stack pointer and VTOR it was sent.
+//
+// **Memory** is on the cores' fast path: SRAM; the flash, read and executed in place from the cached
+// window's first 4 MB (the other windows and the rest of it reach the chip, `Rp2350.read`); the boot
+// ROM, read-only; and the XIP_SRAM page whose every cache line is pinned. The board keeps the map in
+// step with the chip (`sync_xip`): a flash program or erase makes code decoded from it decode again,
+// direct mode takes the flash off the fast path (where memory-mapped access is a bus error), and an
+// XIP_SRAM page with a line unpinned leaves it, so each access there is checked line by line.
 //
 // **The cores are the RP2350's**: ARMv8-M Mainline with the DSP extension and the single-precision
 // FPU, an NVIC of the chip's 52 interrupt lines with four priority bits, and the chip's coprocessors
@@ -35,6 +46,33 @@ const COPROCESSORS: u32 = 0x91
 /** The boot ROM's window at address 0, and benchtop's ROM in it (rom/rom.S). */
 const ROM_BYTES: u32 = 32 * 1024
 private val ROM = embed("rom/rom.bin")
+/** The Pico 2's flash: 4 MB on QSPI chip select 0. */
+const FLASH_BYTES: u32 = 4 * 1024 * 1024
+
+// UF2 (github.com/microsoft/uf2): 512-byte blocks, their magic numbers, the flag that marks a block
+// not for the device's main memory and the one that says a family ID is present, and the families an
+// Arm RP2350 running Secure code takes (the SDK's `boot/uf2.h`).
+private const UF2_BLOCK: usize = 512
+private const UF2_MAGIC_START0: u32 = 0x0A324655
+private const UF2_MAGIC_START1: u32 = 0x9E5D5157
+private const UF2_MAGIC_END: u32 = 0x0AB16F30
+private const UF2_NOT_MAIN_FLASH: u32 = 0x1
+private const UF2_FAMILY_PRESENT: u32 = 0x2000
+private const UF2_PAYLOAD_MAX: u32 = 476
+private const FAMILY_ABSOLUTE: u32 = 0xE48BFF57
+private const FAMILY_DATA: u32 = 0xE48BFF58
+private const FAMILY_RP2350_ARM_S: u32 = 0xE48BFF59
+private const RP2350_E10_BLOCK: u32 = 0x10FFFF00
+
+/** Where an image starts: core 0's PC and SP, the VTOR it starts with, whether the XIP cache's lines
+ * over XIP_SRAM are pinned for it, and whether the boot ROM's hand-off (the RCP's salts) precedes it.
+ */
+struct Start
+    pc: u32
+    sp: u32
+    vtor: u32
+    pin: bool
+    handoff: bool
 
 struct ArmBoard
     chip: Rp2350
@@ -52,36 +90,60 @@ struct ArmBoard
     refused: string
     // Every byte UART0 has sent.
     console: Buf[u8]
+    // Where the boot ROM and XIP_SRAM sit in the RAM backing, after SRAM and each one's guard records.
+    rom_at: u32
+    sram_at: u32
+    // Whether the flash is off the fast path (direct mode), and the XIP block's epoch the XIP_SRAM pages
+    // were last mapped for.
+    direct: bool
+    xip_epoch: u32
 
 /** A board with `map`'s SRAM, powered on, holding no image. */
 arm_board(map: SramMap) -> &ArmBoard
     // Cores before `boot`, every field zero; `boot` resets them.
     var cores: [2]arm.Cpu
-    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf())
+    val rom_at = page_up(map.size) + arm.GUARD_BYTES
+    val sram_at = rom_at + ROM_BYTES + arm.GUARD_BYTES
+    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0)
 
 impl ArmBoard
-    /** Power on with `image` (an ELF) in SRAM: core 0 at its entry, core 1 in the boot ROM. */
+    /** Power on with `image`, an ELF or a UF2, written into SRAM, flash and XIP_SRAM: core 0 at its
+     * entry, core 1 in the boot ROM.
+     */
     boot(*self, image: []const u8) -> Result[unit, string]
-        val e = elf.read(image).map_err(why -> s"$why")?
-        val first = &self.cores[0]
-        first.kind = Kind.V8mMain
-        // The packed image `reset_mapped` lays out: the RAM's backing, empty, then the ROM as read-only
-        // memory at address 0.
+        if self.sram_at + XIP_SRAM_BYTES + arm.GUARD_BYTES > arm.RAM_BYTES then return Err("the SRAM leaves no room for the boot ROM and XIP_SRAM in the cores' memory")
+        // The packed image `reset_mapped` lays out: the RAM backing (SRAM, the ROM, XIP_SRAM), then the
+        // flash, erased. The image is written into it where its addresses say.
         var packed: Buf[u8] = buf()
         for i in 0..<arm.RAM_BYTES do packed.push(0)
-        for i in 0..<ROM_BYTES do packed.push(if i < ROM.len then ROM[i] else 0)
-        arm.reset_mapped(first, self.mem, packed.view(), MemoryMap(self.map.base, self.map.size, 0, ROM_BYTES, arm.no_banks()))
-        // The segments land in a staging copy of the SRAM, which the core's memory then takes byte by
-        // byte: storage behind a `&sync` is not sliced.
-        var staged: Buf[u8] = buf()
-        for i in 0..<self.map.size do staged.push(0)
-        var regions = [elf.Region(u64(self.map.base), staged.view())]
-        val entry = elf.load(e, regions[..]).map_err(why -> s"$why: the image must be linked into the SRAM")?
-        for i in 0..<staged.len() do self.mem.ram[i] = staged[i]
+        for i in 0..<ROM.len do packed.set(usize(self.rom_at) + i, ROM[i])
+        for i in 0..<FLASH_BYTES do packed.push(0xFF)
+        val all = packed.view()
+        var regions = [
+            elf.Region(u64(self.map.base), all[..<usize(self.map.size)]),
+            elf.Region(u64(XIP_BASE), all[usize(arm.RAM_BYTES)..]),
+            elf.Region(u64(XIP_SRAM_BASE), all[usize(self.sram_at)..<usize(self.sram_at + XIP_SRAM_BYTES)]),
+        ]
+        val start = if is_uf2(image) then self.load_uf2(image, regions[..])? else self.load_elf(image, regions[..])?
+        var banks: Buf[RamBank] = buf()
+        banks.push(RamBank(0, ROM_BYTES, self.rom_at))
+        banks.push(RamBank(XIP_SRAM_BASE, XIP_SRAM_BYTES, self.sram_at))
+        val first = &self.cores[0]
+        first.kind = Kind.V8mMain
+        arm.reset_mapped(first, self.mem, packed.view(), MemoryMap(self.map.base, self.map.size, XIP_BASE, FLASH_BYTES, banks.freeze()))
+        arm.read_only(self.mem, 0)
         self.chip.reset()
+        self.chip.flash.connect(&self.mem.flash[0], FLASH_BYTES)
+        if start.pin
+            for k in 0u32..<(XIP_SRAM_BYTES / 8) do self.chip.xip.maintain(XIP_SRAM_BASE - XIP_BASE + k * 8 + 7).unwrap()
+        if start.handoff then self.chip.rcp.salted = [true, true]
+        self.direct = false
+        self.xip_epoch = self.chip.xip.epoch +% 1
+        self.sync_xip()
         self.configure(first, 0)
-        first.pc = u32(entry) & ~1
-        first.r[13] = self.map.base + self.map.size
+        first.pc = start.pc & ~1
+        first.r[13] = start.sp
+        first.vtor = start.vtor
         val second = &self.cores[1]
         second.kind = Kind.V8mMain
         arm.attach_memory(second, self.mem)
@@ -92,8 +154,54 @@ impl ArmBoard
         self.why = ""
         self.refused = ""
         self.console.clear()
-        if entry & 1 == 0 then return Err("the ELF entry is not a Thumb address")
+        if start.pc & 1 == 0 then return Err(s"the entry 0x${hex(start.pc, 8)} is not a Thumb address")
         Ok(())
+    end boot
+
+    // An ELF's loadable segments, each at its physical address: the entry, the stack at SRAM's top, and
+    // the XIP_SRAM lines pinned where a segment lands there.
+    private load_elf(self, image: []const u8, regions: []elf.Region) -> Result[Start, string]
+        val e = elf.read(image).map_err(why -> s"$why")?
+        val entry = elf.load(e, regions).map_err(why -> s"$why: every segment must be in the SRAM, the flash or XIP_SRAM")?
+        var pin = false
+        for s in e.segments().view() do if s.kind == elf.PT_LOAD && s.memsz != 0 && in_xip_sram(s.paddr) then pin = true
+        Ok(Start(u32(entry), self.map.base + self.map.size, 0, pin, false))
+
+    // A UF2's blocks for the main memory, each written at its target address. A flash image starts as
+    // the boot ROM hands one over, through the vector table at XIP_BASE; a RAM image at its first byte.
+    private load_uf2(self, image: []const u8, regions: []elf.Region) -> Result[Start, string]
+        if image.len % UF2_BLOCK != 0 then return Err(s"a UF2 is whole 512-byte blocks, and this one is ${image.len} bytes")
+        var lowest: u32 = 0xFFFFFFFF
+        var pin = false
+        for b in 0..<(image.len / UF2_BLOCK)
+            val block = image[b * UF2_BLOCK..<(b + 1) * UF2_BLOCK]
+            if word(block, 0) != UF2_MAGIC_START0 || word(block, 4) != UF2_MAGIC_START1 || word(block, 508) != UF2_MAGIC_END
+                return Err(s"UF2 block $b: its magic numbers are wrong")
+            val flags = word(block, 8)
+            if flags & UF2_NOT_MAIN_FLASH != 0 then continue
+            if flags & UF2_FAMILY_PRESENT == 0 then return Err(s"UF2 block $b names no family, which the RP2350's boot ROM requires")
+            val family = word(block, 28)
+            if family != FAMILY_RP2350_ARM_S && family != FAMILY_ABSOLUTE && family != FAMILY_DATA
+                return Err(s"UF2 block $b is for family 0x${hex(family, 8)}, not the RP2350's Arm Secure (0xe48bff59), absolute or data families")
+            val target = word(block, 12)
+            val size = word(block, 16)
+            // The block picotool puts first for erratum RP2350-E10 (an absolute-family block at
+            // 0x10ffff00), which only gets the boot ROM past the erratum and is discarded.
+            if family == FAMILY_ABSOLUTE && target == RP2350_E10_BLOCK then continue
+            if size > UF2_PAYLOAD_MAX then return Err(s"UF2 block $b carries $size bytes, more than a block holds")
+            val r = region_holding(regions, target, size) match
+                Some(found) -> found
+                None -> return Err(s"UF2 block $b writes 0x${hex(target, 8)}, which is not in the SRAM, the flash or XIP_SRAM")
+            val at = usize(u64(target) - r.base)
+            for i in 0..<usize(size) do r.bytes[at + i] = block[32 + i]
+            if target < lowest then lowest = target
+            if in_xip_sram(u64(target)) then pin = true
+        if lowest == 0xFFFFFFFF then return Err("the UF2 has no block for the main memory")
+        if lowest >= XIP_BASE && lowest < XIP_BASE + FLASH_BYTES
+            if lowest != XIP_BASE then return Err(s"the UF2 starts at 0x${hex(lowest, 8)}: finding an image elsewhere in flash is the boot ROM's partition search (docs/rp-coverage.md item 30)")
+            val flash = regions[1].bytes
+            return Ok(Start(word(flash, 4), word(flash, 0), XIP_BASE, pin, true))
+        Ok(Start(lowest | 1, self.map.base + self.map.size, 0, pin, false))
 
     // Core `k`, just cleared, made one of the RP2350's on this board's bus.
     private configure(*self, c: *arm.Cpu, k: u32)
@@ -204,11 +312,46 @@ impl ArmBoard
     private refuse(*self, cpu: *arm.Cpu, a: u32, why: string)
         if self.why.is_empty() then self.why = why
         arm.halt(cpu, Stop.Unmapped, a)
+
+    /** Bring the cores' memory map into step with the chip's XIP state: code decoded from flash bytes a
+     * program or erase changed decodes again; the flash leaves the fast path while direct mode is on;
+     * and each XIP_SRAM page is on it while every one of its cache lines is pinned.
+     */
+    sync_xip(*self)
+        loop
+            self.chip.flash.take_changed() match
+                Some((from, length)) -> arm.flash_changed(self.mem, from, length)
+                None -> break
+        val direct = self.chip.qmi.direct_enabled()
+        if direct != self.direct
+            self.direct = direct
+            for p in 0u32..<(FLASH_BYTES >> 12) do self.mem.page_table[(XIP_BASE >> 12) + p] = if direct then 0 else usize(&self.mem.flash[p << 12])
+        if self.chip.xip.epoch == self.xip_epoch then return
+        self.xip_epoch = self.chip.xip.epoch
+        for p in 0u32..<(XIP_SRAM_BYTES >> 12)
+            self.mem.page_table[(XIP_SRAM_BASE >> 12) + p] = if self.chip.xip.sram_page_live(p) then usize(&self.mem.ram[self.sram_at + (p << 12)]) else 0
+
+    // An access to XIP_SRAM off the fast path, in a page not every line of which is pinned: the line's
+    // bytes in the cores' memory where it is pinned, or why the access is a bus error.
+    private sram_line(self, a: u32, width: u32) -> Result[usize, string]
+        if a & (width - 1) != 0 then return Err(s"0x${hex(a, 8)}: an unaligned access to XIP_SRAM")
+        if !self.chip.xip.sram_live(a)
+            return Err(s"0x${hex(a, 8)} is in XIP_SRAM, and no cache line is pinned there with the cache enabled: on silicon the access misses, and the miss is a bus error")
+        Ok(usize(self.sram_at + (a - XIP_SRAM_BASE)))
 end ArmBoard
 
 impl arm.Bus for ArmBoard
     read(*self, cpu: *arm.Cpu, a: u32, width: u32, n: u64) -> u32
         self.chip.catch_up(self.at(cpu, n))
+        if in_xip_sram(u64(a))
+            self.sram_line(a, width) match
+                Ok(at) ->
+                    var v: u32 = 0
+                    for k in 0..<usize(width) do v |= u32(self.mem.ram[at + k]) << u32(8 * k)
+                    return v
+                Err(why) ->
+                    self.refuse(cpu, a, why)
+                    return 0
         self.chip.read(cpu.core, a, width) match
             Ok(v) -> v
             Err(why) ->
@@ -217,7 +360,19 @@ impl arm.Bus for ArmBoard
 
     write(*self, cpu: *arm.Cpu, a: u32, width: u32, x: u32, n: u64)
         self.chip.catch_up(self.at(cpu, n))
-        self.chip.write(cpu.core, a, width, x) match
+        if a < ROM_BYTES
+            self.refuse(cpu, a, s"0x${hex(a, 8)} is in the boot ROM, which is read-only")
+            return
+        if in_xip_sram(u64(a))
+            self.sram_line(a, width) match
+                Ok(at) ->
+                    for k in 0..<usize(width) do self.mem.ram[at + k] = u8.wrap(x >> u32(8 * k))
+                    arm.bus_stored(cpu, a, width)
+                Err(why) -> self.refuse(cpu, a, why)
+            return
+        val r = self.chip.write(cpu.core, a, width, x)
+        if self.chip.take_xip_changed() then self.sync_xip()
+        r match
             Ok(_) -> self.settle()
             Err(why) -> self.refuse(cpu, a, why)
 
@@ -237,3 +392,21 @@ impl arm.Bus for ArmBoard
                 else
                     self.refuse(cpu, 0, e.why)
                 Some(0)
+
+// Whether `a` is in XIP_SRAM, the 16 KB of the XIP cache's lines pinned as SRAM.
+private in_xip_sram(a: u64) -> bool = a >= u64(XIP_SRAM_BASE) && a < u64(XIP_SRAM_BASE) + u64(XIP_SRAM_BYTES)
+
+// The little-endian word at byte `at` of `bytes`.
+private word(bytes: []const u8, at: usize) -> u32 =
+    u32(bytes[at]) | (u32(bytes[at + 1]) << 8) | (u32(bytes[at + 2]) << 16) | (u32(bytes[at + 3]) << 24)
+
+// Whether `image` starts with a UF2 block's first magic number.
+private is_uf2(image: []const u8) -> bool = image.len >= UF2_BLOCK && word(image, 0) == UF2_MAGIC_START0
+
+// The region holding all `size` bytes from `at`.
+private region_holding(regions: []elf.Region, at: u32, size: u32) -> Option[elf.Region]
+    for r in regions do if u64(at) >= r.base && u64(at) + u64(size) <= r.base + u64(r.bytes.len) then return Some(r)
+    None
+
+// `n` rounded up to a whole 4 KB page.
+private page_up(n: u32) -> u32 = (n + 4095) & ~4095u32
