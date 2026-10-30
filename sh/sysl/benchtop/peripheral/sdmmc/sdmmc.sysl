@@ -1,7 +1,7 @@
 module sh.sysl.benchtop.peripheral.sdmmc
 
 import sh.sysl.benchtop.parts.sd_card as card
-import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.peripheral.ContextModel
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.stm32h747.sdmmc1 as reg
 
@@ -73,7 +73,9 @@ const RESPCMD_LONG: u32 = reg.RESPCMDR_RESPCMD_MASK
 // - The data path starts only after an R1 response without error bits (0xfdffe008). The real DPSM
 //   does not inspect the response: where the card answers an error and sends no data, silicon
 //   would start the DPSM and end in a data timeout, while this model never starts it.
-struct Host
+//
+// The IDMA's RAM answers from a context of type C, which every call that can reach it hands it.
+struct Host[C]
     hz: u64
     kernel: u64
     power: u32
@@ -107,27 +109,28 @@ struct Host
     payload: [512]u8
     busy_due: u64
     stats: Stats
-    wiring: Wiring
+    wiring: Wiring[C]
 
 /** What the host reaches outside itself, set once by whoever puts it on a board (`connect`). */
-struct Wiring
+struct Wiring[C]
     /** The card on its bus, if any. */
     card: Option[&card.Native]
     /** Whether the card's lines reach the host on a bus of the given data lanes (1 or 4). */
     routed: &Fn(u32) -> bool
-    /** The IDMA's RAM: fill the bytes from an address, and store them at one; each answers whether
-     * the whole view was RAM it could reach. They see complete views; no host file is touched here.
+    /** The IDMA's RAM, given the context the call that reached it was handed: fill the bytes from an
+     * address, and store them at one; each answers whether the whole view was RAM it could reach.
+     * They see complete views; no host file is touched here.
      */
-    read_ram: &Fn(u32,[]u8) -> bool
-    write_ram: &Fn(u32,[]const u8) -> bool
+    read_ram: &Fn(*C,u32,[]u8) -> bool
+    write_ram: &Fn(*C,u32,[]const u8) -> bool
 
 /** No card, every line routed, and no RAM the IDMA can reach. */
-unwired() -> Wiring = Wiring(None, lanes -> true, (address,out) -> false, (address,bytes) -> false)
+unwired[C]() -> Wiring[C] = Wiring(None, lanes -> true, (ctx,address,out) -> false, (ctx,address,bytes) -> false)
 
 /** A host at reset with the given clocks and wiring: every register zero and nothing due. The one
  * place the reset state is written; `host` boxes it and `reset` stores it over a live host.
  */
-private fresh(hz: u64, kernel: u64, wiring: Wiring) -> Host
+private fresh[C](hz: u64, kernel: u64, wiring: Wiring[C]) -> Host[C]
     var stats: Stats
     // hz, kernel; POWER, CLKCR, ARGR, CMDR, RESPCMDR, RESP1-4, DTIMER, DLENR, DCTRL, DCNTR, STAR, MASKR,
     // IDMACTRLR, IDMABASE0R; the clock, command and data deadlines, the latched argument and direction,
@@ -137,13 +140,13 @@ private fresh(hz: u64, kernel: u64, wiring: Wiring) -> Host
         0, NEVER, NEVER, 0, false, NEVER, 0, 0,
         0, 0, 0, 0, 0, false, [0;512], NEVER, stats, wiring)
 
-host(hz: u64 = 480000000, kernel: u64 = 60000000) -> &Host
+host[C](hz: u64 = 480000000, kernel: u64 = 60000000) -> &Host[C]
     require hz > 0 && kernel > 0 && kernel <= hz, "SDMMC timebase and kernel clock"
     fresh(hz,kernel,unwired())
 
-impl Host
+impl[C] Host[C]
     /** Wire the host to its card, its routing and the RAM its IDMA moves. */
-    connect(*self, wiring: Wiring) = self.wiring = wiring
+    connect(*self, wiring: Wiring[C]) = self.wiring = wiring
     /** SDMMC_CK, the card clock CLKCR sets. */
     clock_hz(*self) -> u64 = self.kernel / divisor(self.clock)
     /** SDMMC_STAR at `time`: the latched flags, the state machines' activity and the card's busy. */
@@ -160,22 +163,22 @@ private divisor(clock: u32) -> u64
     val clkdiv = clock & reg.CLKCR_CLKDIV_MASK
     if clkdiv == 0 then 1 else 2 * u64(clkdiv)
 // The data lanes the bus is set to: CLKCR WIDBUS 1 is a 4-bit bus, 0 a 1-bit one.
-private lanes(h: *Host) -> u32 = if (h.clock & reg.CLKCR_WIDBUS_MASK) >> reg.CLKCR_WIDBUS_SHIFT == 1 then 4 else 1
+private lanes[C](h: *Host[C]) -> u32 = if (h.clock & reg.CLKCR_WIDBUS_MASK) >> reg.CLKCR_WIDBUS_SHIFT == 1 then 4 else 1
 // IDMACTRLR IDMABMODE: the IDMA alternates between two buffers, IDMABACT naming the one in use.
-private double_buffered(h: *Host) -> bool = h.idma & reg.IDMACTRLR_IDMABMODE_MASK != 0
-private ticks(h: *Host, clocks: u64) -> u64
+private double_buffered[C](h: *Host[C]) -> bool = h.idma & reg.IDMACTRLR_IDMABMODE_MASK != 0
+private ticks[C](h: *Host[C], clocks: u64) -> u64
     val rate = h.clock_hz()
     (clocks * h.hz + rate - 1) / rate
-private retry(h: *Host, time: u64) -> u64 = time + (if h.hz < 10000 then 1u64 else h.hz / 10000)
-private next_event(h: *Host) -> u64
+private retry[C](h: *Host[C], time: u64) -> u64 = time + (if h.hz < 10000 then 1u64 else h.hz / 10000)
+private next_event[C](h: *Host[C]) -> u64
     var next = if h.command_due < h.data_due then h.command_due else h.data_due
     if h.busy_due < next then next = h.busy_due
     next
-private abort_data(h: *Host, time: u64, flag: u32)
+private abort_data[C](h: *Host[C], time: u64, flag: u32)
     h.flags |= flag
     h.data_due = NEVER
     if h.wiring.card.is_some() then card.native_abort(h.wiring.card.unwrap(),time)
-private schedule(h: *Host, time: u64)
+private schedule[C](h: *Host[C], time: u64)
     var count = h.block_size - h.block_used
     if count > 32 then count = 32
     if count > h.remaining then count = h.remaining
@@ -186,8 +189,8 @@ private schedule(h: *Host, time: u64)
     h.data_due = time + ticks(h,(u64(count) * 8 + wires - 1) / wires + overhead)
     if h.timeout_due < h.data_due then h.data_due = h.timeout_due
 // Whether a card is on the bus and its lines reach the host at the bus width set.
-private reachable(h: *Host) -> bool = h.wiring.card.is_some() && (h.wiring.routed)(lanes(h))
-private finish_command(h: *Host, reached: bool, at: u64)
+private reachable[C](h: *Host[C]) -> bool = h.wiring.card.is_some() && (h.wiring.routed)(lanes(h))
+private finish_command[C](h: *Host[C], reached: bool, at: u64)
     h.command_due = NEVER
     h.stats.commands += 1
     if !reached
@@ -237,9 +240,9 @@ private finish_command(h: *Host, reached: bool, at: u64)
     if double_buffered(h) then h.stats.double_transfers += 1
     schedule(h,at)
 
-// The host's events up to `time`. Whether the card is reached is settled once per call: nothing
-// that routes it changes while the host runs.
-private run(h: *Host, time: u64)
+// The host's events up to `time`, the IDMA's RAM answering from `ctx`. Whether the card is reached is
+// settled once per call: nothing that routes it changes while the host runs.
+private run[C](h: *Host[C], ctx: *C, time: u64)
     if time < h.at then return
     val reached = reachable(h)
     val c = h.wiring.card
@@ -278,7 +281,7 @@ private run(h: *Host, time: u64)
             abort_data(h,at,reg.STAR_IDMATE_MASK)
             continue
         val piece = h.payload[usize(h.block_used)..<usize(h.block_used + h.chunk)]
-        val moved = if h.data_write then (h.wiring.read_ram)(u32(address),piece) else (h.wiring.write_ram)(u32(address),piece)
+        val moved = if h.data_write then (h.wiring.read_ram)(ctx,u32(address),piece) else (h.wiring.write_ram)(ctx,u32(address),piece)
         if !moved
             abort_data(h,at,reg.STAR_IDMATE_MASK)
             continue
@@ -309,7 +312,7 @@ private run(h: *Host, time: u64)
         else schedule(h,at)
     h.at = time
 
-private read_register(h: *Host, offset: u32, time: u64) -> Option[u32] = offset match
+private read_register[C](h: *Host[C], offset: u32, time: u64) -> Option[u32] = offset match
     reg.POWER_OFFSET -> Some(h.power)
     reg.CLKCR_OFFSET -> Some(h.clock)
     reg.ARGR_OFFSET -> Some(h.arg)
@@ -331,7 +334,7 @@ private read_register(h: *Host, offset: u32, time: u64) -> Option[u32] = offset 
     reg.IDMABASE1R_OFFSET -> Some(h.base1)
     VERR_OFFSET -> Some(VERR)
     _ -> None
-private write_register(h: *Host, offset: u32, value: u32, time: u64) -> bool
+private write_register[C](h: *Host[C], offset: u32, value: u32, time: u64) -> bool
     offset match
         reg.POWER_OFFSET ->
             if value != 0 && value != POWER_ON then return false
@@ -385,12 +388,12 @@ private write_register(h: *Host, offset: u32, value: u32, time: u64) -> bool
     true
 
 // Every register is a word; the bus checks the width before it reaches the host.
-impl Model for Host
+impl[C] ContextModel[C] for Host[C]
     read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = read_register(self,offset,time)
-    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool = write_register(self,offset,value,time)
+    write(*self, ctx: *C, offset: u32, width: u32, value: u32, time: u64) -> bool = write_register(self,offset,value,time)
     // RAM callbacks validate complete views before accessing memory. Card/media callbacks see
     // sectors; no host filesystem calls execute on CPU workers.
-    override advance(*self, time: u64) = run(self,time)
+    override advance(*self, ctx: *C, time: u64) = run(self,ctx,time)
     override due(*self) -> u64 = next_event(self)
     override irq(*self) -> bool = self.flags & self.mask != 0
     reset(*self) = *self = fresh(self.hz,self.kernel,self.wiring)
