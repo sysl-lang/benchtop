@@ -1,0 +1,171 @@
+import sh.sysl.rp2040.io_qspi as ioq
+import sh.sysl.rp2040.pads_qspi as padq
+import sh.sysl.rp2040.sio
+import sh.sysl.rp2040.ssi
+import sh.sysl.rp2040.xip_ctrl as xipc
+
+// The ROM's flash functions, driving the SSI in its serial mode as the SDK's `hardware_flash` expects
+// them to leave it (RP2040 datasheet 2.8.3.1.3, "Flash Access Functions"): `connect_internal_flash`,
+// `flash_exit_xip`, `flash_range_erase`, `flash_range_program`, `flash_flush_cache`,
+// `flash_enter_cmd_xip`. Chip select is forced through IO_QSPI's SS override, which
+// `flash_flush_cache` releases.
+
+// The QSPI pads at reset (the SDK's `pads_qspi.h`): SCLK with its pull-down, the data pins with none,
+// SS pulled up; each with its input enabled, 4 mA and a Schmitt trigger.
+private const PAD_SCLK_RESET: u32 = 0x56
+private const PAD_SD_RESET: u32 = 0x52
+private const PAD_SS_RESET: u32 = 0x5A
+
+// IO_QSPI's six pins' CTRL registers, a pin apart: SCLK, SS, SD0 to SD3.
+private ctrl_of(pin: u32) -> u32 = ioq.BASE + ioq.GPIO_QSPI_SCLK_CTRL_OFFSET + 8 * pin
+private const PIN_SS: u32 = 1
+// The SD pads, a word apart from SD0's.
+private pad_sd(k: u32) -> u32 = padq.BASE + padq.GPIO_QSPI_SD0_OFFSET + 4 * k
+
+// SS's OUTOVER: driven by the SSI, or forced low or high.
+private const OUTOVER_NORMAL: u32 = 0
+private const OUTOVER_LOW: u32 = 2
+private const OUTOVER_HIGH: u32 = 3
+
+/** SS forced low (`false`) or high. */
+cs_force(high: bool)
+    val at = ctrl_of(PIN_SS)
+    val v = rd(at) & ~ioq.GPIO_QSPI_SS_CTRL_OUTOVER_MASK
+    wr(at, v | ((if high then OUTOVER_HIGH else OUTOVER_LOW) << ioq.GPIO_QSPI_SS_CTRL_OUTOVER_SHIFT))
+
+/** SS back to the SSI. */
+cs_release()
+    val at = ctrl_of(PIN_SS)
+    wr(at, (rd(at) & ~ioq.GPIO_QSPI_SS_CTRL_OUTOVER_MASK) | (OUTOVER_NORMAL << ioq.GPIO_QSPI_SS_CTRL_OUTOVER_SHIFT))
+
+/** Whether BOOTSEL is held: the button pulls the flash's chip select low, so with SS's output
+ * disabled the pin reads low while it is pressed (GPIO_HI_IN, QSPI pin 1). The override is restored.
+ */
+bootsel_pressed() -> bool
+    val at = ctrl_of(PIN_SS)
+    val was = rd(at)
+    wr(at, (was & ~ioq.GPIO_QSPI_SS_CTRL_OEOVER_MASK) | (OEOVER_DISABLE << ioq.GPIO_QSPI_SS_CTRL_OEOVER_SHIFT))
+    // Let the pin settle to its pull before reading it.
+    for k in 0..<16 do rd(at)
+    val high = rd(sio.BASE + sio.GPIO_HI_IN_OFFSET) & (1u32 << PIN_SS) != 0
+    wr(at, was)
+    !high
+
+private const OEOVER_DISABLE: u32 = 2
+
+/** One byte each way through the SSI in its serial mode. */
+xfer(out: u32) -> u32
+    wr(ssi.BASE + ssi.DR0_OFFSET, out)
+    while rd(ssi.BASE + ssi.SR_OFFSET) & ssi.SR_RFNE_MASK == 0 do ()
+    rd(ssi.BASE + ssi.DR0_OFFSET) & 0xFF
+
+/** `connect_internal_flash`: the QSPI pads at their reset settings and every QSPI pin on the SSI. */
+connect_internal_flash()
+    for pin in 0u32..<6 do wr(ctrl_of(pin), 0)
+    wr(padq.BASE + padq.GPIO_QSPI_SCLK_OFFSET, PAD_SCLK_RESET)
+    for k in 0u32..<4 do wr(pad_sd(k), PAD_SD_RESET)
+    wr(padq.BASE + padq.GPIO_QSPI_SS_OFFSET, PAD_SS_RESET)
+
+// The SSI in its serial mode: Motorola SPI, 8-bit frames, transmit and receive, the clock divided by
+// 6, slave 0 selected.
+private ssi_serial()
+    wr(ssi.BASE + ssi.SSIENR_OFFSET, 0)
+    wr(ssi.BASE + ssi.BAUDR_OFFSET, 6)
+    wr(ssi.BASE + ssi.CTRLR0_OFFSET, (7 << ssi.CTRLR0_DFS_32_SHIFT) | (ssi.CTRLR0_TMOD_TX_AND_RX << ssi.CTRLR0_TMOD_SHIFT))
+    wr(ssi.BASE + ssi.SER_OFFSET, 1)
+    wr(ssi.BASE + ssi.SSIENR_OFFSET, 1)
+
+// Four bytes clocked out with chip select low, the data pads output-disabled and pulled one way, so
+// that the flash sees the pull's level whatever it was doing.
+private clock_pulled(pull: u32)
+    for k in 0u32..<4 do wr(pad_sd(k), (PAD_SD_RESET & ~(padq.GPIO_QSPI_SD0_PUE_MASK | padq.GPIO_QSPI_SD0_PDE_MASK)) | padq.GPIO_QSPI_SD0_OD_MASK | pull)
+    cs_force(false)
+    for k in 0u32..<4 do xfer(0xFF)
+    cs_force(true)
+
+/** `flash_exit_xip`: the SSI in its serial mode, and the flash taken out of continuous read whatever
+ * mode it is in. With the data pads pulled down, the mode bits a continuous read takes next are 0,
+ * which ends it, and a flash in serial mode reads the 00h instruction as none; then, pulled up, FFh,
+ * the continuous-read reset. The pads are left at their reset settings and SS high, forced.
+ */
+flash_exit_xip()
+    ssi_serial()
+    clock_pulled(padq.GPIO_QSPI_SD0_PDE_MASK)
+    clock_pulled(padq.GPIO_QSPI_SD0_PUE_MASK)
+    for k in 0u32..<4 do wr(pad_sd(k), PAD_SD_RESET)
+
+// One command with chip select held low through it: the instruction, a 24-bit address if `addr` is
+// not None, then `n` bytes out of `out` (when not null) or `n` bytes into `into` (when not null).
+private command(op: u32, addr: Option[u32], out: *u8, into: *u8, n: usize)
+    cs_force(false)
+    xfer(op)
+    addr match
+        Some(a) ->
+            xfer((a >> 16) & 0xFF)
+            xfer((a >> 8) & 0xFF)
+            xfer(a & 0xFF)
+        None -> ()
+    for i in 0..<n
+        val got = xfer(if out == null then 0 else u32(out[i]))
+        if into != null then into[i] = u8.wrap(got)
+    cs_force(true)
+
+// The flash's write enable; and the wait for its BUSY bit to clear after a program or an erase.
+private write_enable() = command(0x06, None, null, null, 0)
+
+private wait_ready()
+    loop
+        cs_force(false)
+        xfer(0x05)
+        val status = xfer(0)
+        cs_force(true)
+        if status & 1 == 0 then return
+
+/** `flash_range_erase`: `count` bytes from `addr`, both multiples of 4 KB; with `block_size` and
+ * `block_cmd` (the SDK passes 64 KB and D8h) a whole aligned block at a time where one fits, else 4 KB
+ * sectors (20h).
+ */
+flash_range_erase(addr: u32, count: usize, block_size: u32, block_cmd: u8)
+    var at = addr
+    var left = u32(count)
+    while left > 0
+        // A block size is a power of two.
+        val big = block_size > 4096 && at & (block_size - 1) == 0 && left >= block_size
+        write_enable()
+        command(if big then u32(block_cmd) else 0x20, Some(at), null, null, 0)
+        wait_ready()
+        val step = if big then block_size else 4096
+        at += step
+        left = if left > step then left - step else 0
+
+/** `flash_range_program`: `count` bytes from `data` to `addr`, both multiples of 256, a page at a time. */
+flash_range_program(addr: u32, data: *u8, count: usize)
+    var done: usize = 0
+    while done < count
+        write_enable()
+        command(0x02, Some(addr + u32(done)), &data[done], null, 256)
+        wait_ready()
+        done += 256
+
+/** `flash_flush_cache`: the XIP cache flushed, and SS back to the SSI. */
+flash_flush_cache()
+    wr(xipc.BASE + xipc.FLUSH_OFFSET, 1)
+    rd(xipc.BASE + xipc.FLUSH_OFFSET)
+    cs_release()
+
+/** `flash_enter_cmd_xip`: the SSI set to read the flash with the plain serial 03h command and a 24-bit
+ * address on each XIP access, which every serial flash supports, slowly.
+ */
+flash_enter_cmd_xip()
+    wr(ssi.BASE + ssi.SSIENR_OFFSET, 0)
+    wr(ssi.BASE + ssi.BAUDR_OFFSET, 6)
+    wr(ssi.BASE + ssi.CTRLR0_OFFSET, (31 << ssi.CTRLR0_DFS_32_SHIFT) | (ssi.CTRLR0_TMOD_EEPROM_READ << ssi.CTRLR0_TMOD_SHIFT))
+    wr(ssi.BASE + ssi.SPI_CTRLR0_OFFSET, (0x03 << ssi.SPI_CTRLR0_XIP_CMD_SHIFT) | (6 << ssi.SPI_CTRLR0_ADDR_L_SHIFT) | (2 << ssi.SPI_CTRLR0_INST_L_SHIFT))
+    wr(ssi.BASE + ssi.CTRLR1_OFFSET, 0)
+    wr(ssi.BASE + ssi.SSIENR_OFFSET, 1)
+    cs_release()
+
+/** `n` bytes from the flash at `addr` into `into`, with the serial 03h read: what the boot path reads
+ * boot2 with.
+ */
+flash_read(addr: u32, into: *u8, n: usize) = command(0x03, Some(addr), null, into, n)

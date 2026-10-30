@@ -1,0 +1,165 @@
+import sh.sysl.rp2040.ppb
+import sh.sysl.rp2040.psm
+import sh.sysl.rp2040.resets
+import sh.sysl.rp2040.sio
+import sh.sysl.rp2040.watchdog as wd
+import sysl.raw.ptr_cast
+
+// What each core does from reset (RP2040 datasheet 2.8.1, "Processor Controlled Boot Sequence", and
+// 2.8.2, "Launching Code On Processor Core 1"), and the ROM's way of refusing by name what benchtop
+// does not model.
+
+/** The stack core 0 starts on, the vector table's: below boot2, which the boot path copies to the top
+ * 256 bytes of SRAM5.
+ */
+const CORE0_STACK: u32 = 0x20041F00
+/** Core 1's stack while it waits in the ROM: the top of USB's DPRAM, where the ROM keeps its own
+ * variables, so that the wait never writes over SRAM a program is using.
+ */
+const CORE1_STACK: u32 = 0x50101000
+/** Where boot2 is copied and run: the top 256 bytes of SRAM5. */
+const BOOT2_AT: u32 = 0x20041F00
+
+/** The ROM's doorbell: a word of the ROM a store to which benchtop's chip refuses by name, with what was
+ * stored saying why (`chip/rp2040.sysl`, `rom_doorbell_refusal`). On silicon, a store to the ROM.
+ */
+const DOORBELL: u32 = 0x3FFC
+/** Rung by the USB boot entered because BOOTSEL is held. */
+const BELL_USB_BOOTSEL: u32 = 1
+/** Rung by the USB boot entered because the flash holds no valid boot2. */
+const BELL_USB_NO_BOOT2: u32 = 2
+/** Rung by the USB boot entered from `reset_usb_boot`'s reboot. */
+const BELL_USB_REQUESTED: u32 = 3
+/** Rung, with a table code in the low 16 bits, by a lookup of a function or datum this ROM leaves out. */
+const BELL_LOOKUP: u32 = 0x10000
+/** Rung, with the entry's offset in the low 16 bits, by a soft float table entry this ROM leaves out. */
+const BELL_FLOAT_ENTRY: u32 = 0x20000
+
+/** Refuse by name: ring the doorbell with `why`, and stop. */
+refuse(why: u32) -> never
+    wr(DOORBELL, why)
+    loop
+        wfe()
+
+/** The USB boot: refused, since the RP2040's USB controller is not modelled. */
+usb_boot(why: u32) -> never = refuse(why)
+
+/** Where `reset_usb_boot`'s watchdog reboot enters the USB boot, at the address `rom.ld` gives it. */
+@section(".text.usb_boot")
+usb_boot_entry() -> never = usb_boot(BELL_USB_REQUESTED)
+
+/** Both cores from reset. Core 1 moves to its own stack and waits to be launched; core 0 boots. */
+@export("rom_reset")
+reset() -> never
+    if rd(sio.BASE + sio.CPUID_OFFSET) != 0 then enter(CORE1_STACK, u32(usize(&core1_wait)))
+    core0_boot()
+
+/** Core 0's boot path: a vector the watchdog's reboot left; else USB boot if BOOTSEL is held; else the
+ * flash taken out of XIP, boot2 read from its first 256 bytes and run if its CRC32 matches, and boot2
+ * enters the image. With no valid boot2, USB boot.
+ */
+@export("rom_core0_boot")
+core0_boot() -> never
+    val pc = rd(wd.BASE + wd.SCRATCH7_OFFSET)
+    if rd(wd.BASE + wd.SCRATCH4_OFFSET) == REBOOT_MAGIC && rd(wd.BASE + wd.SCRATCH5_OFFSET) == pc ^ (0 -% REBOOT_MAGIC)
+        // Taken once: the vector is cleared before it is entered.
+        wr(wd.BASE + wd.SCRATCH4_OFFSET, 0)
+        enter(rd(wd.BASE + wd.SCRATCH6_OFFSET), pc)
+    // The QSPI pins and pads out of reset, which power-on and the watchdog's reset leave them in.
+    val qspi = resets.RESET_IO_QSPI_MASK | resets.RESET_PADS_QSPI_MASK
+    wr(resets.BASE + resets.RESET_OFFSET + ATOMIC_CLEAR, qspi)
+    while rd(resets.BASE + resets.RESET_DONE_OFFSET) & qspi != qspi do ()
+    if bootsel_pressed() then usb_boot(BELL_USB_BOOTSEL)
+    connect_internal_flash()
+    flash_exit_xip()
+    val boot2: *u8 = ptr_cast(usize(BOOT2_AT))
+    flash_read(0, boot2, 256)
+    if crc32_mpeg2(boot2, 252) == rd(BOOT2_AT + 252)
+        cs_release()
+        enter_lr0(BOOT2_AT | 1)
+    usb_boot(BELL_USB_NO_BOOT2)
+
+/** A register's atomic clear alias: a 1 written there clears that bit (RP2040 datasheet 2.1.2). */
+const ATOMIC_CLEAR: u32 = 0x3000
+
+/** The SDK's `watchdog_reboot` magic in SCRATCH4: SCRATCH5 holds PC XOR −magic, SCRATCH6 the stack,
+ * SCRATCH7 the PC.
+ */
+const REBOOT_MAGIC: u32 = 0xB007C0D3
+
+/** The CRC32 boot2 carries in its last word (the SDK's `pad_checksum`): polynomial 04C11DB7h, most
+ * significant bit first, from all ones, not inverted at the end.
+ */
+crc32_mpeg2(p: *u8, n: usize) -> u32
+    var crc: u32 = 0xFFFFFFFF
+    for i in 0..<n
+        crc ^= u32(p[i]) << 24
+        for b in 0..<8
+            crc = if crc & 0x80000000 != 0 then (crc << 1) ^ 0x04C11DB7 else crc << 1
+    crc
+
+/** `reset_usb_boot`: a watchdog reboot whose vector enters the ROM's USB boot. The two masks (the
+ * activity LED's GPIO, the interfaces to leave out) are what that USB boot would read; benchtop
+ * refuses it before it runs.
+ */
+@export("rom_reset_usb_boot")
+reset_usb_boot(gpio_activity_mask: u32, disable_interface_mask: u32) -> never
+    val pc = u32(usize(&usb_boot_entry))
+    wr(wd.BASE + wd.CTRL_OFFSET, 0)
+    wr(wd.BASE + wd.SCRATCH4_OFFSET, REBOOT_MAGIC)
+    wr(wd.BASE + wd.SCRATCH5_OFFSET, pc ^ (0 -% REBOOT_MAGIC))
+    wr(wd.BASE + wd.SCRATCH6_OFFSET, CORE0_STACK)
+    wr(wd.BASE + wd.SCRATCH7_OFFSET, pc)
+    // Everything but the oscillators is reset, as the SDK's `watchdog_enable` selects.
+    wr(psm.BASE + psm.WDSEL_OFFSET, 0x1FFFC)
+    wr(wd.BASE + wd.LOAD_OFFSET, 2)
+    wr(wd.BASE + wd.CTRL_OFFSET, wd.CTRL_ENABLE_MASK)
+    loop
+        ()
+
+// Core 1's side of the launch: a word from core 0, sleeping until one is there; a word to it, sleeping
+// until there is room, then SEV.
+private pop() -> u32
+    while rd(sio.BASE + sio.FIFO_ST_OFFSET) & sio.FIFO_ST_VLD_MASK == 0 do wfe()
+    rd(sio.BASE + sio.FIFO_RD_OFFSET)
+
+private push(v: u32)
+    while rd(sio.BASE + sio.FIFO_ST_OFFSET) & sio.FIFO_ST_RDY_MASK == 0 do wfe()
+    wr(sio.BASE + sio.FIFO_WR_OFFSET, v)
+    sev()
+
+/** Core 1's launch wait. It drains its FIFO and sends core 0 a 0; then core 0 sends 0, 0, 1, the vector
+ * table, the stack pointer and the entry point, and core 1 echoes each. A 0 among the first three keeps
+ * its place; any other word out of place is answered with 0 and the sequence starts again, which core
+ * 0 sees as a wrong echo and restarts. After the entry point's echo, VTOR, MSP and the jump.
+ */
+@export("rom_core1_wait")
+core1_wait() -> never
+    while rd(sio.BASE + sio.FIFO_ST_OFFSET) & sio.FIFO_ST_VLD_MASK != 0 do rd(sio.BASE + sio.FIFO_RD_OFFSET)
+    push(0)
+    var state = 0
+    var vtor: u32 = 0
+    var sp: u32 = 0
+    loop
+        val w = pop()
+        if state < 3
+            val want: u32 = if state == 2 then 1 else 0
+            if w == want
+                push(w)
+                state += 1
+            elif w == 0
+                push(0)
+            else
+                push(0)
+                state = 0
+        else
+            push(w)
+            if state == 3
+                vtor = w
+            elif state == 4
+                sp = w
+            else
+                wr(ppb.BASE + ppb.VTOR_OFFSET, vtor)
+                enter(sp, w)
+            state += 1
+end core1_wait

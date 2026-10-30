@@ -1,0 +1,177 @@
+module sh.sysl.rp2040rom
+
+// The soft float table's binary32 routines, on the integer unit alone: a float is its bits in a
+// `u32`, as the Cortex-M0+ passes it in a core register. The rounding and the denormal flush are
+// `round.sysl`'s.
+
+private exp32(x: u32) -> i32 = i32((x >> 23) & 0xFF)
+private sig32(x: u32) -> u32 = (x & 0x7FFFFF) | 0x800000
+
+/** `a + b`. */
+fadd(a0: u32, b0: u32) -> u32
+    val a = flush32(a0)
+    val b = flush32(b0)
+    if is_nan32(a) then return a | 0x400000
+    if is_nan32(b) then return b | 0x400000
+    val ea = exp32(a)
+    val eb = exp32(b)
+    if ea == 0xFF
+        return if eb == 0xFF && a ^ b == 0x80000000 then F32_QNAN else a
+    if eb == 0xFF then return b
+    if ea == 0 then return if eb == 0 then a & b else b
+    if eb == 0 then return a
+    // x is the larger magnitude.
+    val swap = b & 0x7FFFFFFF > a & 0x7FFFFFFF
+    val x = if swap then b else a
+    val y = if swap then a else b
+    val ex = exp32(x)
+    val sx = sig32(x) << 7
+    val sy = shr_sticky32(sig32(y) << 7, u32(ex - exp32(y)))
+    val sum = if (x ^ y) >> 31 == 0 then sx + sy else sx - sy
+    if sum == 0 then return 0
+    val n = sum.leading_zeros()
+    pack32(x >> 31 != 0, ex + 1 - i32(n), sum << n)
+end fadd
+
+/** `a − b`. */
+fsub(a: u32, b: u32) -> u32 = if is_nan32(b) && !is_nan32(a) then b | 0x400000 else fadd(a, b ^ 0x80000000)
+
+/** `a × b`. */
+fmul(a0: u32, b0: u32) -> u32
+    val a = flush32(a0)
+    val b = flush32(b0)
+    if is_nan32(a) then return a | 0x400000
+    if is_nan32(b) then return b | 0x400000
+    val sign = (a ^ b) & 0x80000000
+    val ea = exp32(a)
+    val eb = exp32(b)
+    if ea == 0xFF || eb == 0xFF
+        return if ea == 0 || eb == 0 then F32_QNAN else sign | 0x7F800000
+    if ea == 0 || eb == 0 then return sign
+    val p = u64(sig32(a)) * u64(sig32(b))
+    val n = p.leading_zeros()
+    val s = p << n
+    val sig = u32(s >> 32) | (if s & 0xFFFFFFFF != 0 then 1 else 0)
+    pack32(sign != 0, ea + eb - 110 - i32(n), sig)
+end fmul
+
+/** `a / b`, by restoring division, one quotient bit a step. */
+fdiv(a0: u32, b0: u32) -> u32
+    val a = flush32(a0)
+    val b = flush32(b0)
+    if is_nan32(a) then return a | 0x400000
+    if is_nan32(b) then return b | 0x400000
+    val sign = (a ^ b) & 0x80000000
+    val ea = exp32(a)
+    val eb = exp32(b)
+    if ea == 0xFF then return if eb == 0xFF then F32_QNAN else sign | 0x7F800000
+    if eb == 0xFF then return sign
+    if eb == 0 then return if ea == 0 then F32_QNAN else sign | 0x7F800000
+    if ea == 0 then return sign
+    val den = u64(sig32(b))
+    val r = u64(sig32(a))
+    val below = r < den
+    val q, rest = divide(if below then r << 1 else r, false, den, 32)
+    pack32(sign != 0, ea - eb + 127 - (if below then 1 else 0), u32(q) | (if rest then 1 else 0))
+end fdiv
+
+/** `steps` bits of the quotient `r / den` by restoring division, one bit a step, and whether a
+ * remainder is left: what the float, double and extended divisions share. `den ≤ r < 2 × den`, so the
+ * first bit is 1; `carry` is a 65th bit of `r`, which an extended significand shifted left has.
+ */
+divide(r0: u64, carry0: bool, den: u64, steps: u32) -> (u64, bool)
+    var r = r0
+    var carry = carry0
+    var q: u64 = 0
+    for k in 0u32..<steps
+        q <<= 1
+        if carry || r >= den
+            r = r -% den
+            q |= 1
+        carry = r >> 63 != 0
+        r <<= 1
+    (q, carry || r != 0)
+
+/** `√a`: −0 answers −0, and any other negative number the default NaN. */
+fsqrt(a0: u32) -> u32
+    val a = flush32(a0)
+    if is_nan32(a) then return a | 0x400000
+    if a & 0x7FFFFFFF == 0 then return a
+    if a >> 31 != 0 then return F32_QNAN
+    val ea = exp32(a)
+    if ea == 0xFF then return a
+    // An even exponent, so that the root of the power of two is exact.
+    var e = ea - 127
+    var m = u64(sig32(a))
+    if e & 1 != 0
+        m <<= 1
+        e -= 1
+    val r, exact = isqrt128(u128(m << 39))
+    pack32(false, 127 + (e >> 1), u32(r) | (if exact then 0 else 1))
+
+/** The integer below `x × 2^n`, toward −∞, saturated (`to_fixed`). */
+float2fixed(x0: u32, n: i32, signed: bool, bits: u32) -> u64
+    val x = flush32(x0)
+    val e = exp32(x)
+    if e == 0 then return 0
+    to_fixed(x >> 31 != 0, u64(sig32(x)), e - 150 + n, e == 0xFF, signed, bits)
+
+/** `float2int`: toward −∞, saturated. */
+float2int(x: u32) -> i32 = i32.wrap(u32.wrap(float2fixed(x, 0, true, 32)))
+/** `float2fix`: `x × 2^n` toward −∞, saturated. */
+float2fix(x: u32, n: i32) -> i32 = i32.wrap(u32.wrap(float2fixed(x, n, true, 32)))
+/** `float2uint`: toward −∞, saturated; a negative number answers 0. */
+float2uint(x: u32) -> u32 = u32.wrap(float2fixed(x, 0, false, 32))
+/** `float2ufix`. */
+float2ufix(x: u32, n: i32) -> u32 = u32.wrap(float2fixed(x, n, false, 32))
+/** `float2int64`. */
+float2int64(x: u32) -> i64 = i64.wrap(float2fixed(x, 0, true, 64))
+/** `float2fix64`. */
+float2fix64(x: u32, n: i32) -> i64 = i64.wrap(float2fixed(x, n, true, 64))
+/** `float2uint64`. */
+float2uint64(x: u32) -> u64 = float2fixed(x, 0, false, 64)
+/** `float2ufix64`. */
+float2ufix64(x: u32, n: i32) -> u64 = float2fixed(x, n, false, 64)
+
+// The magnitude of a signed integer, as a u64.
+private magnitude(v: i64) -> u64 = if v < 0 then 0 -% u64.wrap(v) else u64(v)
+
+/** `int2float`, rounded. */
+int2float(v: i32) -> u32 = from_fixed32(v < 0, magnitude(i64(v)), 0)
+/** `fix2float`: `v × 2^−n`, rounded. */
+fix2float(v: i32, n: i32) -> u32 = from_fixed32(v < 0, magnitude(i64(v)), n)
+/** `uint2float`. */
+uint2float(v: u32) -> u32 = from_fixed32(false, u64(v), 0)
+/** `ufix2float`. */
+ufix2float(v: u32, n: i32) -> u32 = from_fixed32(false, u64(v), n)
+/** `int642float`. */
+int642float(v: i64) -> u32 = from_fixed32(v < 0, magnitude(v), 0)
+/** `fix642float`. */
+fix642float(v: i64, n: i32) -> u32 = from_fixed32(v < 0, magnitude(v), n)
+/** `uint642float`. */
+uint642float(v: u64) -> u32 = from_fixed32(false, v, 0)
+/** `ufix642float`. */
+ufix642float(v: u64, n: i32) -> u32 = from_fixed32(false, v, n)
+
+/** `float2double`: exact, a denormal flushed, a NaN quieted with its payload kept. */
+float2double(x0: u32) -> u64
+    val x = flush32(x0)
+    val sign = u64(x >> 31) << 63
+    val e = exp32(x)
+    val frac = u64(x & 0x7FFFFF) << 29
+    if e == 0 then return sign
+    if e == 0xFF then return sign | 0x7FF0000000000000 | frac | (if frac != 0 then 0x8000000000000 else 0)
+    sign | (u64(e - 127 + 1023) << 52) | frac
+
+/** `fcmp`: −1, 0 or 1 as `a` is below, equal to or above `b`, denormals flushed and −0 equal to +0; a
+ * NaN on either side answers 1.
+ */
+fcmp(a0: u32, b0: u32) -> i32
+    val a = flush32(a0)
+    val b = flush32(b0)
+    if is_nan32(a) || is_nan32(b) then return 1
+    if (a | b) & 0x7FFFFFFF == 0 || a == b then return 0
+    // Sign and magnitude order as unsigned integers do once a negative number's bits are inverted.
+    val ka = if a >> 31 != 0 then ~a else a | 0x80000000
+    val kb = if b >> 31 != 0 then ~b else b | 0x80000000
+    if ka < kb then -1 else 1
