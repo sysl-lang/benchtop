@@ -1,0 +1,151 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.rosc as reg
+
+// ROSC, the ring oscillator (datasheet 8.3), as the SDK and the boot ROM use it. It runs at power-on,
+// which is what clk_ref and clk_sys start from. Every code-protected field (ENABLE, FREQ_RANGE, DORMANT,
+// DIV, the passwords of FREQA, FREQB and PHASE) rejects a wrong code by latching STATUS.BADWRITE and
+// keeping what it had.
+//
+// **Its frequency stays the chip's nominal figure** (docs/rp-coverage.md, cut line Q8: analogue is
+// ideal): FREQ_RANGE, the drive strengths and DIV are stored and read back, and change no frequency.
+// What does change it is ENABLE (stopped when DISABLE) and DORMANT (stopped until WAKE).
+//
+// **RANDOMBIT is a deterministic sequence.** The block has a 32-bit Galois LFSR (taps x^32 + x^22 + x^2 +
+// x + 1) loaded by a write to RANDOM, with the seed 0x3F04B16D at power-on. Each read of RANDOMBIT
+// returns bit 0 of the LFSR and then steps it once, so the nth read after a load of S is bit 0 of the
+// state after n-1 steps from S. While the oscillator is stopped a read returns the current bit without
+// stepping, as a stopped ring would hold its last level. A seed of 0 locks the LFSR at 0, as it would on
+// silicon. RANDOM reads back the LFSR's present state.
+//
+// COUNT counts down at the oscillator's own rate, one per cycle, and stops at 0.
+
+private const ROSC_SEED: u32 = 0x3F04B16D
+private const ROSC_LFSR_TAPS: u32 = 0x80200003
+private val ROSC_FREQ_RANGES: [4]u32 = [0xFA4, 0xFA5, 0xFA6, 0xFA7]
+private const ROSC_FREQA_WRITABLE: u32 = 0x77FF
+private const ROSC_FREQB_WRITABLE: u32 = 0x7777
+private const ROSC_FREQ_PASSWORD: u32 = 0x9696
+private const ROSC_PHASE_PASSWORD: u32 = 0xAA0
+private const ROSC_DIV_PASSWORD: u32 = 0xAA00
+
+struct Rosc
+    // CTRL's two 12-bit fields.
+    enable: u32
+    range: u32
+    freqa: u32
+    freqb: u32
+    phase: u32
+    // DIV as it reads: 0xAA00 and the divisor, 0 meaning 256.
+    div: u32
+    dormant: bool
+    badwrite: bool
+    lfsr: u32
+    count: u32
+
+    reset(*self)
+        self.enable = reg.CTRL_ENABLE_ENABLE
+        self.range = 0xAA0
+        self.freqa = 0
+        self.freqb = 0
+        self.phase = 0x008
+        self.div = 0xAA20
+        self.dormant = false
+        self.badwrite = false
+        self.lfsr = ROSC_SEED
+        self.count = 0
+
+    /** Whether the ring is oscillating. */
+    running(self) -> bool = self.enable == reg.CTRL_ENABLE_ENABLE && !self.dormant
+
+    /** The frequency in Hz: `nominal` while it runs, 0 while it does not. */
+    hz(self, nominal: u64) -> u64 = if self.running() then nominal else 0
+
+    /** `cycles` of the oscillator's own clock pass. */
+    advance(*self, cycles: u64)
+        if !self.running() || self.count == 0 then return
+        self.count = if u64(self.count) > cycles then self.count - u32(cycles) else 0
+
+    private ctrl(self) -> u32 = (self.enable << 12) | self.range
+
+    // One step of the LFSR.
+    private step(*self)
+        val feedback = self.lfsr & 1
+        self.lfsr = self.lfsr >> 1
+        if feedback != 0 then self.lfsr = self.lfsr ^ ROSC_LFSR_TAPS
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val value = offset & 0xFFC match
+            reg.CTRL_OFFSET -> self.ctrl()
+            reg.FREQA_OFFSET -> self.freqa
+            reg.FREQB_OFFSET -> self.freqb
+            reg.RANDOM_OFFSET -> self.lfsr
+            reg.DORMANT_OFFSET -> if self.dormant then reg.DORMANT_DORMANT_DORMANT else reg.DORMANT_DORMANT_WAKE
+            reg.DIV_OFFSET -> self.div
+            reg.PHASE_OFFSET -> self.phase
+            reg.STATUS_OFFSET ->
+                var status: u32 = reg.STATUS_DIV_RUNNING_MASK
+                if self.enable == reg.CTRL_ENABLE_ENABLE then status |= reg.STATUS_ENABLED_MASK
+                if self.running() then status |= reg.STATUS_STABLE_MASK
+                if self.badwrite then status |= reg.STATUS_BADWRITE_MASK
+                status
+            reg.RANDOMBIT_OFFSET ->
+                val bit = self.lfsr & 1
+                if self.running() then self.step()
+                bit
+            reg.COUNT_OFFSET -> self.count
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val data = replicated(value, width)
+        offset & 0xFFC match
+            reg.CTRL_OFFSET ->
+                val next = written(self.ctrl(), offset, data)
+                val enable = (next >> 12) & 0xFFF
+                val range = next & 0xFFF
+                // An invalid ENABLE code enables the oscillator.
+                if enable == reg.CTRL_ENABLE_DISABLE
+                    self.enable = reg.CTRL_ENABLE_DISABLE
+                else
+                    self.enable = reg.CTRL_ENABLE_ENABLE
+                    if enable != reg.CTRL_ENABLE_ENABLE then self.badwrite = true
+                var valid = false
+                for r in ROSC_FREQ_RANGES do if r == range then valid = true
+                if valid then self.range = range else self.badwrite = true
+            reg.FREQA_OFFSET ->
+                if (data >> 16) == ROSC_FREQ_PASSWORD then self.freqa = written(self.freqa, offset, data) & ROSC_FREQA_WRITABLE else self.badwrite = true
+            reg.FREQB_OFFSET ->
+                if (data >> 16) == ROSC_FREQ_PASSWORD then self.freqb = written(self.freqb, offset, data) & ROSC_FREQB_WRITABLE else self.badwrite = true
+            reg.RANDOM_OFFSET -> self.lfsr = written(self.lfsr, offset, data)
+            reg.DORMANT_OFFSET ->
+                val next = written(if self.dormant then reg.DORMANT_DORMANT_DORMANT else reg.DORMANT_DORMANT_WAKE, offset, data)
+                if next == reg.DORMANT_DORMANT_DORMANT
+                    self.dormant = true
+                else
+                    self.dormant = false
+                    if next != reg.DORMANT_DORMANT_WAKE then self.badwrite = true
+            reg.DIV_OFFSET ->
+                val next = written(self.div, offset, data & 0xFFFF) & 0xFFFF
+                if next & 0xFF00 == ROSC_DIV_PASSWORD
+                    self.div = next
+                else
+                    self.div = ROSC_DIV_PASSWORD
+                    self.badwrite = true
+            reg.PHASE_OFFSET ->
+                if (data & 0xFF0) == ROSC_PHASE_PASSWORD then self.phase = written(self.phase, offset, data) & 0xF else self.badwrite = true
+            // BADWRITE is write-one-to-clear; a clear alias writes no ones.
+            reg.STATUS_OFFSET -> if data & reg.STATUS_BADWRITE_MASK != 0 && (offset >> 12) & 3 != 3 then self.badwrite = false
+            reg.COUNT_OFFSET -> self.count = written(self.count, offset, data) & 0xFFFF
+            reg.RANDOMBIT_OFFSET -> ()
+            _ -> return Err(AccessError.Unmapped)
+        Ok(())
+end Rosc
+
+rosc() -> Rosc
+    var state: Rosc
+    state.reset()
+    state

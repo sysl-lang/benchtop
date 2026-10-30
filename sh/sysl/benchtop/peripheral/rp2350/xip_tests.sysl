@@ -1,0 +1,290 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, qspi_flash}
+import sh.sysl.benchtop.peripheral.rp2040.AccessError
+import sh.sysl.rp2350.qmi as qmi_reg
+import sh.sysl.rp2350.xip_aux as aux_reg
+import sh.sysl.rp2350.xip_ctrl as xip_reg
+
+// Why a read or write was refused by name, or "" where it was not.
+private why_r(r: Result[u32, XipFault]) -> string = r match
+    Ok(_) -> ""
+    Err(f) -> f match
+        Refused(why) -> why
+        Access(_) -> "access"
+
+private why_w(r: Result[unit, XipFault]) -> string = r match
+    Ok(_) -> ""
+    Err(f) -> f match
+        Refused(why) -> why
+        Access(_) -> "access"
+
+// The register rule a read or write broke, if any.
+private rule_r(r: Result[u32, XipFault]) -> Option[AccessError] = r match
+    Ok(_) -> None
+    Err(f) -> f match
+        Access(e) -> Some(e)
+        Refused(_) -> None
+
+private rule_w(r: Result[unit, XipFault]) -> Option[AccessError] = r match
+    Ok(_) -> None
+    Err(f) -> f match
+        Access(e) -> Some(e)
+        Refused(_) -> None
+
+private flash_of(array: *[8192]u8) -> QspiFlash
+    var f = qspi_flash()
+    f.connect(&array[0], 8192)
+    f
+
+@test("XIP_CTRL: reset 0x83, bit 2 and bits 12 up not writable, the atomic aliases, and POWER_DOWN clearing both enables")
+xip_ctrl_register()
+    var array = [0xFFu8; 8192]
+    var f = flash_of(&array)
+    var q = qmi()
+    var x = xip()
+    val at = xip_reg.CTRL_OFFSET
+    assert(x.read(at, 4, &q, &f).unwrap() == 0x83 && x.enabled())
+    x.write(at, 4, 0xFFFFFFFF, &q, &f).unwrap()
+    assert(x.read(at, 4, &q, &f).unwrap() == 0xFF8, "bit 3 POWER_DOWN set, so the enables drop")
+    assert(!x.enabled())
+    x.write(at + 0x3000, 4, xip_reg.CTRL_POWER_DOWN_MASK, &q, &f).unwrap()
+    x.write(at + 0x2000, 4, xip_reg.CTRL_EN_SECURE_MASK, &q, &f).unwrap()
+    assert(x.enabled() && x.read(at, 4, &q, &f).unwrap() == 0xFF1)
+    x.write(at + 0x1000, 4, 0x401, &q, &f).unwrap()
+    assert(x.read(at, 4, &q, &f).unwrap() == 0xBF0 && !x.enabled(), "XOR toggles WRITABLE_M0 and EN_SECURE")
+    x.write(at, 1, 0x83, &q, &f).unwrap()
+    assert(x.read(at, 4, &q, &f).unwrap() == 0x383, "a byte write is replicated across the word")
+    assert(x.read(at + 1, 1, &q, &f).unwrap() == 3)
+    x.reset()
+    assert(x.read(at, 4, &q, &f).unwrap() == 0x83)
+
+@test("XIP_CTRL: STAT reads FIFO_EMPTY at reset and ignores writes, the counters refuse reads by name and take writes, 0x04 and 0x20 are unmapped")
+xip_ctrl_other_registers()
+    var array = [0xFFu8; 8192]
+    var f = flash_of(&array)
+    var q = qmi()
+    var x = xip()
+    assert(x.read(xip_reg.STAT_OFFSET, 4, &q, &f).unwrap() == xip_reg.STAT_FIFO_EMPTY_MASK)
+    x.write(xip_reg.STAT_OFFSET, 4, 0xFFFFFFFF, &q, &f).unwrap()
+    assert(x.read(xip_reg.STAT_OFFSET, 4, &q, &f).unwrap() == xip_reg.STAT_FIFO_EMPTY_MASK, "read-only")
+    for at in [xip_reg.CTR_HIT_OFFSET, xip_reg.CTR_ACC_OFFSET]
+        assert(why_r(x.read(at, 4, &q, &f)).contains("not counted"))
+        x.write(at, 4, 0, &q, &f).unwrap()
+    for at in [0x04u32, 0x20, 0xFFC]
+        assert(rule_r(x.read(at, 4, &q, &f)) == Some(AccessError.Unmapped) && rule_w(x.write(at, 4, 0, &q, &f)) == Some(AccessError.Unmapped))
+    assert(rule_r(x.read(1, 2, &q, &f)) == Some(AccessError.Unaligned) && rule_r(x.read(0, 3, &q, &f)) == Some(AccessError.InvalidWidth))
+    assert(rule_r(x.read(0x4000, 4, &q, &f)) == Some(AccessError.Unmapped), "past the aliases")
+
+@test("cache maintenance: a pin over XIP_SRAM is live only with the cache enabled; both invalidates unpin; cleans do nothing; pins over flash and reserved ops are refused")
+xip_cache_maintenance()
+    var x = xip()
+    val sram = XIP_SRAM_BASE - XIP_BASE
+    val first = XIP_SRAM_BASE
+    val last = XIP_SRAM_BASE + XIP_SRAM_BYTES - 8
+    assert(!x.sram_live(first) && !x.sram_live(last), "nothing pinned at power-on")
+    x.maintain(sram + 7).unwrap()
+    x.maintain(sram + XIP_SRAM_BYTES - 8 + 7).unwrap()
+    assert(x.sram_live(first) && x.sram_live(first + 7) && x.sram_live(last) && !x.sram_live(first + 8))
+    assert(x.tags[0] & 3 == 3 && x.tags[2047] & 3 == 3, "address bit 13 picks the way: the first line is way 0's, the last way 1's")
+    // The cache disabled or powered down: nothing pinned is reachable.
+    x.ctrl = 0x82
+    assert(!x.sram_live(first))
+    x.ctrl = 0x8B
+    assert(!x.sram_live(first))
+    x.ctrl = 0x83
+    // Cleans by set/way and by address change nothing.
+    x.maintain(sram + 1).unwrap()
+    x.maintain(sram + 3).unwrap()
+    assert(x.sram_live(first))
+    // Invalidate by address of another line in the same set leaves the line; its own address unpins it.
+    x.maintain(2).unwrap()
+    assert(x.sram_live(first))
+    x.maintain(sram + 2).unwrap()
+    assert(!x.sram_live(first))
+    // Invalidate by set and way: way 1, set 1023 is the last line.
+    x.maintain(0x3FF8 + 0).unwrap()
+    assert(!x.sram_live(last))
+    // Every line of a page, for the page to be live.
+    for k in 0u32..<512 do x.maintain(sram + 4096 + k * 8 + 7).unwrap()
+    assert(x.sram_page_live(1) && !x.sram_page_live(0) && !x.sram_page_live(2))
+    x.maintain(sram + 4096 + 511 * 8 + 2).unwrap()
+    assert(!x.sram_page_live(1), "one line short")
+    assert(why_w(x.maintain(sram - 8 + 7)).contains("over flash"), "the line below XIP_SRAM is flash's")
+    assert(why_w(x.maintain(7)).contains("0x10000000"))
+    for op in [4u32, 5, 6] do assert(why_w(x.maintain(sram + op)).contains("reserved"))
+
+@test("the streaming FIFO: two words deep, filled from STREAM_ADDR as STREAM_CTR counts down, the same through XIP_AUX; empty and bad addresses refused")
+xip_stream()
+    var array = [0u8; 8192]
+    for i in 0..<8192 do array[i] = u8(i & 0xFF)
+    var f = flash_of(&array)
+    var q = qmi()
+    var x = xip()
+    x.write(xip_reg.STREAM_ADDR_OFFSET, 4, XIP_BASE + 0x103, &q, &f).unwrap()
+    assert(x.read(xip_reg.STREAM_ADDR_OFFSET, 4, &q, &f).unwrap() == XIP_BASE + 0x100, "word aligned")
+    x.write(xip_reg.STREAM_CTR_OFFSET, 4, 0xFFC00003, &q, &f).unwrap()
+    assert(x.read(xip_reg.STREAM_CTR_OFFSET, 4, &q, &f).unwrap() == 1, "22 bits, and two words already in the FIFO")
+    assert(x.read(xip_reg.STAT_OFFSET, 4, &q, &f).unwrap() == xip_reg.STAT_FIFO_FULL_MASK)
+    assert(x.read(xip_reg.STREAM_FIFO_OFFSET, 4, &q, &f).unwrap() == 0x03020100)
+    assert(xip_aux_read(&x, &q, &f, aux_reg.STREAM_OFFSET, 4).unwrap() == 0x07060504)
+    assert(x.read(xip_reg.STREAM_FIFO_OFFSET, 4, &q, &f).unwrap() == 0x0B0A0908)
+    assert(x.read(xip_reg.STREAM_CTR_OFFSET, 4, &q, &f).unwrap() == 0 && x.read(xip_reg.STAT_OFFSET, 4, &q, &f).unwrap() == xip_reg.STAT_FIFO_EMPTY_MASK)
+    assert(why_r(x.read(xip_reg.STREAM_FIFO_OFFSET, 4, &q, &f)).contains("empty"))
+    assert(why_r(xip_aux_read(&x, &q, &f, aux_reg.STREAM_OFFSET, 4)).contains("empty"))
+    // The array's last word, then the stream wraps with the device's address bits.
+    x.write(xip_reg.STREAM_ADDR_OFFSET, 4, XIP_BASE + 8188, &q, &f).unwrap()
+    x.write(xip_reg.STREAM_CTR_OFFSET, 4, 2, &q, &f).unwrap()
+    assert(x.read(xip_reg.STREAM_FIFO_OFFSET, 4, &q, &f).unwrap() == 0xFFFEFDFC && x.read(xip_reg.STREAM_FIFO_OFFSET, 4, &q, &f).unwrap() == 0x03020100)
+    // A stream from chip select 1 is refused as it starts.
+    x.write(xip_reg.STREAM_ADDR_OFFSET, 4, XIP_BASE + 0x01000000, &q, &f).unwrap()
+    assert(why_w(x.write(xip_reg.STREAM_CTR_OFFSET, 4, 1, &q, &f)).contains("chip select 1"))
+
+@test("XIP addresses: the cached, uncached and untranslated windows read the same flash byte; past the windows, chip select 1, direct mode and CTRL's NO_UNCACHED/NO_UNTRANSLATED are refused")
+xip_windows()
+    var array = [0u8; 8192]
+    for i in 0..<8192 do array[i] = u8(i & 0xFF)
+    array[8191] = 0xEE
+    var f = flash_of(&array)
+    var q = qmi()
+    for base in [XIP_BASE, 0x14000000u32, XIP_UNTRANSLATED_BASE]
+        assert(read_xip(0x83, q, &f, base + 0x10, 4).unwrap() == 0x13121110)
+        assert(xip_target(0x83, q, base + 0x00FFFFFF).unwrap() == 0x00FFFFFF, "the window's last byte")
+        assert(read_xip(0x83, q, &f, base + 8191, 1).unwrap() == 0xEE && read_xip(0x83, q, &f, base + 8192, 1).unwrap() == 0, "the array wraps")
+        assert(why_r(read_xip(0x83, q, &f, base + 0x01000000, 4)).contains("chip select 1"))
+        assert(why_r(read_xip(0x83, q, &f, base + 0x02000000, 4)).contains("past the QMI"))
+        assert(why_r(read_xip(0x83, q, &f, base + 0x03FFFFFC, 4)).contains("past the QMI"))
+    assert(why_r(read_xip(0x83 | xip_reg.CTRL_NO_UNCACHED_SEC_MASK, q, &f, 0x14000000, 4)).contains("NO_UNCACHED_SEC"))
+    assert(read_xip(0x83 | xip_reg.CTRL_NO_UNCACHED_SEC_MASK, q, &f, XIP_BASE, 4).is_ok(), "the cached window stays open")
+    assert(why_r(read_xip(0x83 | xip_reg.CTRL_NO_UNTRANSLATED_SEC_MASK, q, &f, XIP_UNTRANSLATED_BASE, 4)).contains("NO_UNTRANSLATED_SEC"))
+    q.csr |= qmi_reg.DIRECT_CSR_EN_MASK
+    assert(why_r(read_xip(0x83, q, &f, XIP_BASE, 4)).contains("direct mode"))
+
+@test("QMI ATRANS: reset to the identity; ATRANS0-3 refuse any other translation by name, ATRANS4-7 store theirs; SIZE bounds a window")
+qmi_atrans()
+    var array = [0u8; 8192]
+    var f = flash_of(&array)
+    var q = qmi()
+    for n in 0u32..<8
+        assert(q.read(qmi_reg.ATRANS0_OFFSET + n * 4, 4, &f).unwrap() == 0x04000000 | ((n % 4) * 0x400))
+    q.write(qmi_reg.ATRANS1_OFFSET, 4, 0x04000400, &f).unwrap()
+    assert(why_w(q.write(qmi_reg.ATRANS1_OFFSET, 4, 0x04000000, &f)).contains("ATRANS1"))
+    assert(why_w(q.write(qmi_reg.ATRANS0_OFFSET + 0x3000, 4, 0x00010000 << 10, &f)).contains("ATRANS0"), "through the CLR alias too")
+    q.write(qmi_reg.ATRANS0_OFFSET + 0x3000, 4, 0x00010000, &f).unwrap()
+    assert(q.read(qmi_reg.ATRANS0_OFFSET, 4, &f).unwrap() == 0x04000000, "unchanged")
+    q.write(qmi_reg.ATRANS7_OFFSET, 4, 0xFFFFFFFF, &f).unwrap()
+    assert(q.read(qmi_reg.ATRANS7_OFFSET, 4, &f).unwrap() == 0x07FF0FFF)
+    // A translation SIZE smaller than the window makes the rest a bus error.
+    q.atrans[0] = 0x00010000
+    assert(xip_target(0x83, q, XIP_BASE + 4095).unwrap() == 4095)
+    assert(why_r(read_xip(0x83, q, &f, XIP_BASE + 4096, 1)).contains("ATRANS0"))
+    assert(xip_target(0x83, q, XIP_UNTRANSLATED_BASE + 4096).unwrap() == 4096, "the untranslated window ignores it")
+
+@test("QMI window registers: their reset values, read-write masks and atomic aliases; 0x54 on is unmapped")
+qmi_window_registers()
+    var array = [0u8; 8192]
+    var f = flash_of(&array)
+    var q = qmi()
+    val resets: [5]u32 = [0x40000004, 0x1000, 0xA003, 0x1000, 0xA002]
+    val masks: [5]u32 = [0xF3FFF7FF, 0x1007D3FF, 0xFFFF, 0x1007D3FF, 0xFFFF]
+    for w in 0u32..<2
+        for i in 0u32..<5
+            val at = qmi_reg.M0_TIMING_OFFSET + (w * 5 + i) * 4
+            assert(q.read(at, 4, &f).unwrap() == resets[i])
+            q.write(at, 4, 0xFFFFFFFF, &f).unwrap()
+            assert(q.read(at, 4, &f).unwrap() == masks[i])
+            q.write(at + 0x3000, 4, 0xFFFFFFFF, &f).unwrap()
+            assert(q.read(at, 4, &f).unwrap() == 0)
+    assert(rule_r(q.read(0x54, 4, &f)) == Some(AccessError.Unmapped) && rule_w(q.write(0x54, 4, 0, &f)) == Some(AccessError.Unmapped))
+    assert(rule_r(q.read(qmi_reg.DIRECT_TX_OFFSET, 4, &f)) == Some(AccessError.Unmapped), "DIRECT_TX is write-only")
+
+@test("QMI direct mode: DIRECT_CSR at reset, CS0 by ASSERT_CS0N, a JEDEC ID read, NOPUSH, 16-bit entries, and entries waiting while EN is off")
+qmi_direct_basic()
+    var array = [0u8; 8192]
+    var f = flash_of(&array)
+    var q = qmi()
+    val csr = qmi_reg.DIRECT_CSR_OFFSET
+    assert(q.read(csr, 4, &f).unwrap() == 0x01800000 | qmi_reg.DIRECT_CSR_RXEMPTY_MASK | qmi_reg.DIRECT_CSR_TXEMPTY_MASK)
+    q.write(csr, 4, 0xFFFFFFFF & ~(qmi_reg.DIRECT_CSR_AUTO_CS1N_MASK | qmi_reg.DIRECT_CSR_ASSERT_CS1N_MASK | qmi_reg.DIRECT_CSR_AUTO_CS0N_MASK), &f).unwrap()
+    assert(q.read(csr, 4, &f).unwrap() & 0xFFC000CD == 0xFFC00005, "the read-only status bits are not written")
+    assert(f.selected)
+    // 9Fh with its command byte not pushed back, then three bytes; one 16-bit entry for two of them.
+    q.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0x9F | qmi_reg.DIRECT_TX_NOPUSH_MASK, &f).unwrap()
+    q.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0, &f).unwrap()
+    q.write(qmi_reg.DIRECT_TX_OFFSET, 4, qmi_reg.DIRECT_TX_DWIDTH_MASK, &f).unwrap()
+    assert((q.read(csr, 4, &f).unwrap() >> qmi_reg.DIRECT_CSR_RXLEVEL_SHIFT) & 7 == 2)
+    assert(q.read(qmi_reg.DIRECT_RX_OFFSET, 4, &f).unwrap() == 0xEF && q.read(qmi_reg.DIRECT_RX_OFFSET, 4, &f).unwrap() == 0x1640)
+    assert(why_r(q.read(qmi_reg.DIRECT_RX_OFFSET, 4, &f)).contains("empty"))
+    q.write(csr + 0x3000, 4, qmi_reg.DIRECT_CSR_ASSERT_CS0N_MASK | qmi_reg.DIRECT_CSR_EN_MASK, &f).unwrap()
+    assert(!f.selected)
+    // With EN off the entries wait in the TX FIFO, BUSY, until EN is set.
+    q.write(csr + 0x2000, 4, qmi_reg.DIRECT_CSR_ASSERT_CS0N_MASK, &f).unwrap()
+    q.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0x9F, &f).unwrap()
+    q.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0, &f).unwrap()
+    val waiting = q.read(csr, 4, &f).unwrap()
+    assert(waiting & qmi_reg.DIRECT_CSR_BUSY_MASK != 0 && (waiting >> qmi_reg.DIRECT_CSR_TXLEVEL_SHIFT) & 7 == 2)
+    q.write(csr + 0x2000, 4, qmi_reg.DIRECT_CSR_EN_MASK, &f).unwrap()
+    assert(q.read(qmi_reg.DIRECT_RX_OFFSET, 4, &f).unwrap() == 0xFF && q.read(qmi_reg.DIRECT_RX_OFFSET, 4, &f).unwrap() == 0xEF)
+    // The FIFOs are not reached through the atomic aliases.
+    assert(rule_w(q.write(qmi_reg.DIRECT_TX_OFFSET + 0x2000, 4, 0, &f)) == Some(AccessError.UnsupportedAlias))
+    assert(rule_r(q.read(qmi_reg.DIRECT_RX_OFFSET + 0x1000, 4, &f)) == Some(AccessError.UnsupportedAlias))
+    q.write(qmi_reg.DIRECT_RX_OFFSET, 4, 0, &f).unwrap()
+
+@test("QMI direct mode: a full RX FIFO stalls the interface with BUSY set, a full TX FIFO drops what is pushed, and a pop lets the rest through")
+qmi_direct_fifos()
+    var array = [0u8; 8192]
+    for i in 0..<8192 do array[i] = u8(i & 0xFF)
+    var f = flash_of(&array)
+    var q = qmi()
+    val csr = qmi_reg.DIRECT_CSR_OFFSET
+    q.write(csr, 4, qmi_reg.DIRECT_CSR_EN_MASK | qmi_reg.DIRECT_CSR_ASSERT_CS0N_MASK, &f).unwrap()
+    for b in [0x03u32, 0, 0, 0x40] do q.write(qmi_reg.DIRECT_TX_OFFSET, 4, b | qmi_reg.DIRECT_TX_NOPUSH_MASK, &f).unwrap()
+    for k in 0..<9 do q.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0, &f).unwrap()
+    val stalled = q.read(csr, 4, &f).unwrap()
+    assert(stalled & qmi_reg.DIRECT_CSR_RXFULL_MASK != 0 && stalled & qmi_reg.DIRECT_CSR_TXFULL_MASK != 0 && stalled & qmi_reg.DIRECT_CSR_BUSY_MASK != 0)
+    assert((stalled >> qmi_reg.DIRECT_CSR_RXLEVEL_SHIFT) & 7 == 4 && (stalled >> qmi_reg.DIRECT_CSR_TXLEVEL_SHIFT) & 7 == 4)
+    // The ninth was dropped: eight bytes come back, in order.
+    for k in 0u32..<8 do assert(q.read(qmi_reg.DIRECT_RX_OFFSET, 4, &f).unwrap() == 0x40 + k)
+    val idle = q.read(csr, 4, &f).unwrap()
+    assert(idle & qmi_reg.DIRECT_CSR_BUSY_MASK == 0 && idle & qmi_reg.DIRECT_CSR_RXEMPTY_MASK != 0 && idle & qmi_reg.DIRECT_CSR_TXEMPTY_MASK != 0)
+
+@test("QMI direct mode: AUTO_CS0N frames each run of entries; chip select 1, no chip select, and the flash's own refusals are named")
+qmi_direct_chip_selects()
+    var array = [0xFFu8; 8192]
+    var f = flash_of(&array)
+    var q = qmi()
+    val csr = qmi_reg.DIRECT_CSR_OFFSET
+    q.write(csr, 4, qmi_reg.DIRECT_CSR_EN_MASK | qmi_reg.DIRECT_CSR_AUTO_CS0N_MASK, &f).unwrap()
+    q.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0x06, &f).unwrap()
+    assert(!f.selected && f.status[0] & 2 != 0, "the frame closed as the FIFO drained, so 06h took effect")
+    q.write(csr, 4, qmi_reg.DIRECT_CSR_EN_MASK | qmi_reg.DIRECT_CSR_AUTO_CS1N_MASK, &f).unwrap()
+    assert(why_w(q.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0x35, &f)).contains("chip select 1"))
+    var r = qmi()
+    r.write(csr, 4, qmi_reg.DIRECT_CSR_EN_MASK, &f).unwrap()
+    assert(why_w(r.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0x05, &f)).contains("neither chip select"))
+    var s = qmi()
+    s.write(csr, 4, qmi_reg.DIRECT_CSR_EN_MASK | qmi_reg.DIRECT_CSR_ASSERT_CS0N_MASK, &f).unwrap()
+    assert(why_w(s.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0x5A, &f)).contains("chip select 0: instruction 0x5a"))
+    // A board that connects no flash: the transfer is refused, and an XIP read answers the erased level.
+    var none = qspi_flash()
+    var t = qmi()
+    t.write(csr, 4, qmi_reg.DIRECT_CSR_EN_MASK | qmi_reg.DIRECT_CSR_ASSERT_CS0N_MASK, &none).unwrap()
+    assert(why_w(t.write(qmi_reg.DIRECT_TX_OFFSET, 4, 0x9F, &none)).contains("connects no flash"))
+    t.write(csr, 4, 0, &none).unwrap()
+    assert(read_xip(0x83, t, &none, XIP_BASE, 4).unwrap() == 0xFFFFFFFF)
+
+@test("XIP_AUX: the direct-mode FIFOs on the AHB with no atomic aliases; nothing else is mapped")
+xip_aux_block()
+    var array = [0u8; 8192]
+    var f = flash_of(&array)
+    var q = qmi()
+    var x = xip()
+    q.write(qmi_reg.DIRECT_CSR_OFFSET, 4, qmi_reg.DIRECT_CSR_EN_MASK | qmi_reg.DIRECT_CSR_ASSERT_CS0N_MASK, &f).unwrap()
+    xip_aux_write(&q, &f, aux_reg.QMI_DIRECT_TX_OFFSET, 4, 0x9F).unwrap()
+    xip_aux_write(&q, &f, aux_reg.QMI_DIRECT_TX_OFFSET, 4, 0).unwrap()
+    assert(xip_aux_read(&x, &q, &f, aux_reg.QMI_DIRECT_RX_OFFSET, 4).unwrap() == 0xFF && xip_aux_read(&x, &q, &f, aux_reg.QMI_DIRECT_RX_OFFSET, 4).unwrap() == 0xEF)
+    assert(rule_w(xip_aux_write(&q, &f, aux_reg.STREAM_OFFSET, 4, 0)) == Some(AccessError.Unmapped))
+    assert(rule_r(xip_aux_read(&x, &q, &f, aux_reg.QMI_DIRECT_TX_OFFSET, 4)) == Some(AccessError.Unmapped))
+    assert(rule_r(xip_aux_read(&x, &q, &f, 0x1008, 4)) == Some(AccessError.Unmapped), "no aliases")
+    assert(rule_r(xip_aux_read(&x, &q, &f, 0x0C, 4)) == Some(AccessError.Unmapped))

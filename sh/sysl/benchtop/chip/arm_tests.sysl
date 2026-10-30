@@ -109,7 +109,7 @@ private place(b: &ArmBoard, at: u32, code: []const u16)
         b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
         b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
 
-@test("a refused access ends the Arm run with the chip's reason, at the core's PC; a write to the read-only ROM stops the core at Fault there")
+@test("a refused access ends the Arm run with the chip's reason, at the core's PC; a write to the read-only ROM is refused by name")
 arm_refused_access()
     val b = arm_board(PICO2_ARM_SRAM)
     b.boot(ARM_BLINK).unwrap()
@@ -125,8 +125,10 @@ arm_refused_access()
     place(w, 0x20070000, [0x6001, 0xBE00])
     w.cores[0].pc = 0x20070000
     w.cores[0].r[0] = 0x100
-    assert(w.run(1000) == RunEnd.Fault && w.refused.is_empty())
-    assert(w.cores[0].stop == Stop.Fault && w.cores[0].stop_at == 0x100 && w.mem.flash[0x100] == 0, "the ROM is read-only")
+    val before = w.mem.ram[w.rom_at + 0x100]
+    assert(w.run(1000) == RunEnd.Fault)
+    assert(w.refused == "core 0 at pc 0x20070000: 0x00000100 is in the boot ROM, which is read-only", w.refused)
+    assert(w.cores[0].stop == Stop.Unmapped && w.cores[0].stop_at == 0x100 && w.mem.ram[w.rom_at + 0x100] == before, "the ROM is unchanged")
 
 @test("a way to Non-secure state ends the Arm run with its name, on either core: BXNS on core 0, MRS of MSP_NS on core 1")
 arm_non_secure()
@@ -186,8 +188,7 @@ arm_rom_lookup()
     // 'A' with the same flags: no such function. 'SR' asked for RISC-V: not one either.
     assert(c.r[5] == 0 && c.r[0] == 0, s"${c.r[5]} ${c.r[0]}")
     // The magic and the table's address are where the SDK reads them.
-    assert(b.mem.flash[0x10] == u8('M') && b.mem.flash[0x11] == u8('u') && b.mem.flash[0x12] == 2)
-
+    assert(b.mem.ram[b.rom_at + 0x10] == u8('M') && b.mem.ram[b.rom_at + 0x11] == u8('u') && b.mem.ram[b.rom_at + 0x12] == 2)
 private gpioc(kind: CoprocessorKind, opc1: u32, crm: u32, low: u32, high: u32) -> CoprocessorOp = CoprocessorOp(kind, 0, opc1, 0, 0, crm, low, high, false)
 
 @test("the GPIO coprocessor is the SIO's GPIO registers: masks low, high and both, single bits, indexed writes and the reads")
@@ -241,8 +242,21 @@ arm_gpioc_edges()
         c.coprocessor(0, gpioc(w, 6, crm, 47, 0)).unwrap().unwrap()
         c.coprocessor(0, gpioc(p, 4, crm, 0, 1)).unwrap().unwrap()
     assert(c.sio.out == (1u64 << 47) | 1 && c.sio.oe == (1u64 << 47) | 1, s"${c.sio.out} ${c.sio.oe}")
-    // GPIO 48–63 are the SIO's, unbonded on the RP2350A: accepted, and nothing benchtop models moves.
+    // GPIO 56–63 are the SIO's QSPI and USB pads (high-word bits 24–31): stored. 48–55 are reserved.
     assert(c.coprocessor(0, gpioc(w, 5, 0, 63, 0)).unwrap().is_ok())
+    assert(c.sio.out == (1u64 << 63) | (1u64 << 47) | 1)
+    c.coprocessor(0, gpioc(w, 5, 0, 50, 0)).unwrap().unwrap()
+    assert(c.sio.out == (1u64 << 63) | (1u64 << 47) | 1, "pad 50 is reserved")
+    c.coprocessor(0, gpioc(w, 7, 0, 63, 0)).unwrap().unwrap()
+    c.coprocessor(0, gpioc(w, 7, 0, 47, 0)).unwrap().unwrap()
+    c.coprocessor(0, gpioc(w, 7, 0, 0, 0)).unwrap().unwrap()
+    assert(c.sio.out == 0)
+    // The OE bank and the indexed high-register write reach the same pads.
+    c.coprocessor(0, gpioc(w, 6, 4, 60, 0)).unwrap().unwrap()
+    assert(c.sio.oe == (1u64 << 60) | (1u64 << 47) | 1)
+    c.coprocessor(0, gpioc(CoprocessorKind.WritePair, 8, 0, 0xFF00FFFF, 1)).unwrap().unwrap()
+    assert(c.sio.out == 0xFF00_FFFF_0000_0000, s"${c.sio.out}")
+    assert(c.coprocessor(0, gpioc(CoprocessorKind.ReadPair, 0, 0, 0, 0)).unwrap().unwrap() == c.sio.out)
     for crm in [0u32, 4]
         for opc1 in [5u32, 6, 7]
             assert(c.coprocessor(0, gpioc(w, opc1, crm, 64, 0)).unwrap().unwrap_err().why.contains("no GPIO 64"))
@@ -278,8 +292,8 @@ arm_dcp()
     assert(c.coprocessor(0, CoprocessorOp(CoprocessorKind.Write, 1, 0, 0, 0, 0, 0, 0, false)).is_none(), "nothing on CP1")
 
 // Core 0 of a booted board runs `code` at 0x20070000, then a BKPT, under `exec`, with r0 upward from
-// `regs` and the coprocessors `cpacr` enables (CP7 alone unless it says), until it stops.
-private on_core0(exec: *extern(*arm.Cpu) -> unit, code: []const u16, regs: []const u32, cpacr: u32 = 0xC000) -> &ArmBoard
+// `regs` and the coprocessors `cpacr` enables (CP0 and CP7 unless it says), until it stops.
+private on_core0(exec: *extern(*arm.Cpu) -> unit, code: []const u16, regs: []const u32, cpacr: u32 = 0xC003) -> &ArmBoard
     val b = arm_board(PICO2_ARM_SRAM)
     b.boot(ARM_BLINK).unwrap()
     place(b, 0x20070000, code)
@@ -292,6 +306,18 @@ private on_core0(exec: *extern(*arm.Cpu) -> unit, code: []const u16, regs: []con
         arm.set_limit(c, c.retired + 1000)
         exec(c)
     b
+
+@test("under both executors the GPIO coprocessor's high-bank instructions reach GPIO 56-63 in OUT and OE, and the low bank is untouched")
+arm_gpioc_high_executors()
+    for exec in [&arm.run_match, &arm.run_threaded]
+        // mcr p0, #6, r0, c0, c0 (set OUT bit r0); mcr p0, #6, r1, c0, c4 (set OE bit r1); mcr p0, #6, r2, c0, c0
+        val code = [0xEEC0u16, 0x0010, 0xEEC0, 0x1014, 0xEEC0, 0x2010]
+        val b = on_core0(exec, code, [60, 63, 57])
+        val c = &b.cores[0]
+        assert(c.stop == Stop.Breakpoint && c.retired == 3 && b.why.is_empty(), s"${c.stop}: ${b.why}")
+        assert(b.chip.sio.out == (1u64 << 60) | (1u64 << 57), hex(b.chip.sio.out, 16))
+        assert(b.chip.sio.oe == 1u64 << 63, hex(b.chip.sio.oe, 16))
+        assert(b.chip.sio.out & 0xFFFFFFFF == 0 && b.chip.sio.oe & 0xFFFFFFFF == 0)
 
 @test("under both executors the RCP's instructions reach it from the core: salt, canary, check, count, random byte and status land in the core's registers")
 arm_rcp_executors()

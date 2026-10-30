@@ -1,0 +1,291 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.riscv as rv
+import sh.sysl.rp2350.accessctrl as ac
+import sh.sysl.rp2350.clocks as clk
+import sh.sysl.rp2350.powman as pm
+import sh.sysl.rp2350.psm as ps
+import sh.sysl.rp2350.rosc as rs
+import sh.sysl.rp2350.sio as sio_reg
+import sh.sysl.rp2350.sysinfo as si
+import sh.sysl.rp2350.xosc as xr
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// The start-up register blocks on the chip's bus: PSM, ROSC, SYSINFO, SYSCFG, POWMAN, ACCESSCTRL and
+// CLOCKS' frequency counter, with what they do to the cores and the clock tree.
+
+private val BLINK_RV = embed("../../../../examples/pico2-riscv/blink.elf")
+private val HELLO = embed("../../../../examples/pico2/hello_serial.elf")
+private val SRAM = SramMap(0x20000000, 520 * 1024)
+
+private const PW: u32 = 0x5AFE0000
+// FC0_STATUS of a counter whose source never ran: DONE, DIED and FAIL.
+private const DEAD: u32 = 0x10010010
+
+// Thumb halfwords into SRAM at `at`.
+private place(b: &ArmBoard, at: u32, code: []const u16)
+    for i in 0..<code.len
+        b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
+        b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
+
+// A read or write by core 0 of a register, unwrapped.
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+
+@test("the start-up blocks sit at their datasheet addresses and answer; the AON-timer registers of POWMAN are refused by name")
+chip_startup_blocks_on_the_bus()
+    var c = rp2350()
+    assert(rd(&c, si.BASE + si.CHIP_ID_OFFSET) == 0x30004927 && rd(&c, si.BASE + si.PACKAGE_SEL_OFFSET) == 1)
+    assert(rd(&c, ps.BASE + ps.DONE_OFFSET) == 0x01FFFFFF)
+    assert(rd(&c, rs.BASE + rs.STATUS_OFFSET) == 0x80011000)
+    assert(rd(&c, pm.BASE + pm.VREG_CTRL_OFFSET) == 0x8050)
+    assert(rd(&c, ac.BASE + ac.LOCK_OFFSET) == 4)
+    assert(c.read(0, pm.BASE + pm.STATE_OFFSET, 4).unwrap_err() == "POWMAN + 0x38 is not a register benchtop runs")
+    assert(c.write(0, pm.BASE + pm.TIMER_OFFSET, 4, PW).unwrap_err() == "POWMAN + 0x88 is not a register benchtop runs")
+    assert(c.read(0, si.BASE + 0x1C, 4).unwrap_err() == "SYSINFO + 0x1c is not a register benchtop runs")
+    assert(c.read(0, ps.BASE + 1, 4).unwrap_err() == "PSM + 0x1 is not aligned to its width")
+    assert(c.read(0, rs.BASE + rs.STATUS_OFFSET, 3).unwrap_err() == "ROSC + 0x1c is not an access width the block takes")
+    assert(c.read(0, ac.BASE + 0xEC, 4).is_err() && c.write(0, 0x40080000, 4, 0).is_err(), "the gaps between the blocks stay refused")
+
+@test("PSM forces only PROC1 off: any other stage is refused by name and changes nothing, even beside PROC1")
+chip_psm_refusals()
+    var c = rp2350()
+    assert(c.write(0, ps.BASE + ps.FRCE_OFF_OFFSET, 4, ps.FRCE_OFF_PROC0_MASK).unwrap_err() == "PSM FRCE_OFF of PROC0 is not modelled: only PROC1 can be forced off")
+    assert(c.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x2000, 4, ps.FRCE_OFF_CLOCKS_MASK).unwrap_err() == "PSM FRCE_OFF of CLOCKS is not modelled: only PROC1 can be forced off")
+    assert(c.write(0, ps.BASE + ps.FRCE_OFF_OFFSET, 4, 1).unwrap_err() == "PSM FRCE_OFF of PROC_COLD is not modelled: only PROC1 can be forced off")
+    assert(c.write(0, ps.BASE + ps.FRCE_OFF_OFFSET, 4, ps.FRCE_OFF_PROC1_MASK | ps.FRCE_OFF_SRAM9_MASK).is_err())
+    assert(rd(&c, ps.BASE + ps.FRCE_OFF_OFFSET) == 0 && rd(&c, ps.BASE + ps.DONE_OFFSET) == 0x01FFFFFF && !c.take_core1_reset(), "nothing happened")
+    // WDSEL and FRCE_ON take any stage.
+    wr(&c, ps.BASE + ps.WDSEL_OFFSET, 0x01FFFFFF)
+    wr(&c, ps.BASE + ps.FRCE_ON_OFFSET, ps.FRCE_ON_PROC0_MASK)
+    assert(rd(&c, ps.BASE + ps.WDSEL_OFFSET) == 0x01FFFFFF && rd(&c, ps.BASE + ps.FRCE_ON_OFFSET) == ps.FRCE_ON_PROC0_MASK)
+    // A bit that is already forced off stays accepted when written again.
+    wr(&c, ps.BASE + ps.FRCE_OFF_OFFSET, ps.FRCE_OFF_PROC1_MASK)
+    wr(&c, ps.BASE + ps.FRCE_OFF_OFFSET, ps.FRCE_OFF_PROC1_MASK)
+    assert(c.take_core1_reset() && !c.take_core1_reset(), "one reset, reported once")
+    assert(rd(&c, ps.BASE + ps.DONE_OFFSET) == 0x01FFFFFF & ~ps.DONE_PROC1_MASK)
+
+@test("FRCE_OFF on PROC1 stops core 1 and FRCE_OFF clear brings it back to the boot ROM with a 0 in core 0's FIFO, ready to be launched again")
+arm_core1_reset_and_relaunch()
+    val b = arm_board(SRAM)
+    b.boot(HELLO).unwrap()
+    // Core 1 first loops forever (b .); then, after the reset, the second image sets r0 and stops.
+    place(b, 0x20070000, [0xE7FE])
+    place(b, 0x20070200, [0x202A, 0xBE00])
+    // Core 0: wfi, b .
+    place(b, 0x20070100, [0xBF30, 0xE7FD])
+    b.cores[0].pc = 0x20070100
+    val fifo_wr = sio_reg.BASE + sio_reg.FIFO_WR_OFFSET
+    val fifo_rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
+    val fifo_st = sio_reg.BASE + sio_reg.FIFO_ST_OFFSET
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070001]
+        b.chip.write(0, fifo_wr, 4, x).unwrap()
+        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x)
+    assert(b.run(20000) == RunEnd.Budget && b.started[1], "core 1 runs its loop")
+    // Held in reset: core 1 stops, and what core 0 sends it is not answered.
+    b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x2000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    assert(b.chip.read(0, ps.BASE + ps.FRCE_OFF_OFFSET, 4).unwrap() & ps.FRCE_OFF_PROC1_MASK != 0, "multicore_reset_core1 polls FRCE_OFF back")
+    b.chip.write(0, fifo_wr, 4, 0x1234).unwrap()
+    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "no echo while it is held")
+    b.run(1000)
+    assert(!b.started[1], "core 1 is stopped")
+    // Released: the stale word is drained and core 1 reports with a 0.
+    b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x3000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0)
+    assert(b.chip.read(0, fifo_rd, 4).unwrap() == 0 && b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "exactly one 0")
+    assert(b.chip.sio.fifos[1].empty(), "its mailbox was drained")
+    b.run(1000)
+    assert(!b.started[1], "back in the boot ROM, not running")
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070201]
+        b.chip.write(0, fifo_wr, 4, x).unwrap()
+        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x, "the ROM answers the launch again")
+    assert(b.run(100000) == RunEnd.Breakpoint, b.refused)
+    assert(b.started[1] && b.cores[1].r[0] == 42, "the second image ran on core 1")
+
+@test("a write to PSM from core 1 resets core 1 too, and releasing it with nothing in flight changes nothing else")
+arm_core1_reset_before_launch()
+    val b = arm_board(SRAM)
+    b.boot(HELLO).unwrap()
+    place(b, 0x20070100, [0xBF30, 0xE7FD])
+    b.cores[0].pc = 0x20070100
+    b.chip.write(1, ps.BASE + ps.FRCE_OFF_OFFSET + 0x2000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    b.chip.write(1, ps.BASE + ps.FRCE_OFF_OFFSET + 0x3000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    assert(b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_ST_OFFSET, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0, "the 0 is for core 0, whoever wrote")
+    assert(b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_RD_OFFSET, 4).unwrap() == 0)
+    // Releasing again (already released) is no new 0.
+    b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x3000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    assert(b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_ST_OFFSET, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0)
+    assert(b.run(5000) != RunEnd.Fault, b.refused)
+    assert(!b.started[1], "and core 1 is still in the boot ROM")
+
+@test("ROSC: disabling it stops clk_ref and clk_sys, which run from it at power-on; COUNT counts its cycles; DORMANT pauses it")
+chip_rosc_drives_the_clocks()
+    var c = rp2350()
+    assert(c.sys_hz() == 11000000 && c.ref_hz() == 11000000)
+    wr(&c, rs.BASE + rs.COUNT_OFFSET, 100)
+    c.advance(60)
+    assert(rd(&c, rs.BASE + rs.COUNT_OFFSET) == 40, "one ring cycle per clk_sys cycle")
+    wr(&c, rs.BASE + rs.CTRL_OFFSET, (rs.CTRL_ENABLE_DISABLE << 12) | 0xAA0)
+    assert(c.sys_hz() == 0 && c.ref_hz() == 0)
+    c.advance(1000)
+    assert(rd(&c, rs.BASE + rs.COUNT_OFFSET) == 40 && c.now == 60 + 1000, "the cycles pass and the ring does not count")
+    wr(&c, rs.BASE + rs.CTRL_OFFSET, (rs.CTRL_ENABLE_ENABLE << 12) | 0xAA0)
+    assert(c.sys_hz() == 11000000)
+    c.advance(100)
+    assert(rd(&c, rs.BASE + rs.COUNT_OFFSET) == 0, "stopped at 0")
+    wr(&c, rs.BASE + rs.DORMANT_OFFSET, rs.DORMANT_DORMANT_DORMANT)
+    assert(c.sys_hz() == 0)
+    wr(&c, rs.BASE + rs.DORMANT_OFFSET, rs.DORMANT_DORMANT_WAKE)
+    assert(c.sys_hz() == 11000000)
+
+@test("the chip's frequency counter measures its own tree: the ring at power-on, then the crystal and PLL once clk_ref and clk_sys move")
+chip_fc0_measures_the_tree()
+    var c = rp2350()
+    val fc = clk.BASE
+    wr(&c, fc + clk.FC0_REF_KHZ_OFFSET, 11000)
+    wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_CLK_SYS)
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x11 && rd(&c, fc + clk.FC0_RESULT_OFFSET) == 11000 * 32, "clk_sys is the ring")
+    wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_XOSC_CLKSRC)
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == DEAD, "the crystal is off: DONE, DIED, FAIL")
+    // Start the crystal (STARTUP.DELAY 1, ENABLE), let it settle, and count it against the ring.
+    wr(&c, xr.BASE + xr.STARTUP_OFFSET, 1)
+    wr(&c, xr.BASE + xr.CTRL_OFFSET, xr.CTRL_ENABLE_ENABLE << xr.CTRL_ENABLE_SHIFT)
+    c.advance(100000)
+    wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_XOSC_CLKSRC)
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x11)
+    assert(rd(&c, fc + clk.FC0_RESULT_OFFSET) == 12000 * 32)
+    // The counter reads the registers as written, even through its SET alias.
+    wr(&c, fc + clk.FC0_MIN_KHZ_OFFSET + 0x2000, 20000)
+    wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_XOSC_CLKSRC)
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x10 | 0x10000 | 0x100000, "12 MHz is under a 20 MHz minimum")
+    // RESULT and STATUS ignore a write through the bus too.
+    wr(&c, fc + clk.FC0_RESULT_OFFSET, 0)
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x10 | 0x10000 | 0x100000)
+
+@test("POWMAN's interrupt lines reach core 0's NVIC (POW is IRQ 44, TIMER is 45)")
+arm_powman_irqs()
+    val b = arm_board(SRAM)
+    b.boot(HELLO).unwrap()
+    place(b, 0x20070100, [0xBF30, 0xE7FD])
+    b.cores[0].pc = 0x20070100
+    b.chip.write(0, pm.BASE + pm.INTE_OFFSET, 4, PW | 0xF).unwrap()
+    b.chip.write(0, pm.BASE + pm.INTF_OFFSET, 4, PW | pm.INTR_VREG_OUTPUT_LOW_MASK).unwrap()
+    b.run(1000)
+    // Exception number = 16 + IRQ.
+    assert(b.cores[0].pending[0] & (1u64 << 60) != 0 && b.cores[0].pending[0] & (1u64 << 61) == 0, "POW but not TIMER")
+    assert(b.cores[1].pending[0] & (1u64 << 60) == 0 || !b.started[1], "core 1 has not started, so nothing is pending for it")
+
+@test("ACCESSCTRL's LOCK is per core: core 1 locked out cannot write while core 0 still can")
+chip_accessctrl_per_core()
+    var c = rp2350()
+    val pw: u32 = 0xACCE0000
+    c.write(1, ac.BASE + ac.LOCK_OFFSET, 4, pw | 2).unwrap()
+    c.write(1, ac.BASE + ac.UART0_OFFSET, 4, pw | 0x11).unwrap()
+    assert(rd(&c, ac.BASE + ac.UART0_OFFSET) == 0xFC, "core 1 is locked out")
+    c.write(0, ac.BASE + ac.UART0_OFFSET, 4, pw | 0x11).unwrap()
+    assert(rd(&c, ac.BASE + ac.UART0_OFFSET) == 0x11, "core 0 is not")
+    assert(c.read(1, ac.BASE + ac.UART0_OFFSET, 4).unwrap() == 0x11, "locked cores still read")
+
+@test("SYSCFG and the chip's reset: a power-on restores every start-up block")
+chip_reset_restores_startup_blocks()
+    var c = rp2350()
+    wr(&c, rs.BASE + rs.RANDOM_OFFSET, 5)
+    wr(&c, ps.BASE + ps.WDSEL_OFFSET, 3)
+    wr(&c, pm.BASE + pm.SCRATCH0_OFFSET, 0xCAFE)
+    wr(&c, 0x40008000 + 0x14, 0x7F)
+    wr(&c, ac.BASE + ac.GPIO_NSMASK0_OFFSET, 1)
+    c.reset()
+    assert(rd(&c, ac.BASE + ac.GPIO_NSMASK0_OFFSET) == 0)
+    assert(rd(&c, rs.BASE + rs.RANDOM_OFFSET) == 0x3F04B16D && rd(&c, ps.BASE + ps.WDSEL_OFFSET) == 0)
+    assert(rd(&c, pm.BASE + pm.SCRATCH0_OFFSET) == 0 && rd(&c, 0x40008000 + 0x14) == 0)
+
+private val CLOCK_REPORT = embed("../../../../examples/pico2/clock_report.elf")
+
+@test("the SDK's clock_report prints clock_get_hz against the frequency counter for every clock, the SYSINFO identity, PSM, ROSC's random bits and the regulator")
+arm_clock_report()
+    val b = arm_board(SRAM)
+    b.boot(CLOCK_REPORT).unwrap()
+    var text = ""
+    while b.chip.now < 400 * 150000
+        val end = b.run(15000)
+        assert(end == RunEnd.Budget, s"${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+        text = from_utf8_lossy(b.console.view())
+        if text.ends_with("done\r\n") then break
+    // The reference for RANDOMBIT: the first 32 bits out of the seeded LFSR, first bit most significant.
+    var state: u32 = 0x3F04B16D
+    var bits: u32 = 0
+    for i in 0..<32
+        bits = (bits << 1) | (state & 1)
+        val feedback = state & 1
+        state = state >> 1
+        if feedback != 0 then state = state ^ 0x80200003
+    val expected = "chip_id 30004927\r\npackage_sel 1 platform 2\r\npsm_done 1ffffff\r\n" +
+        "clk_ref hz=12000000 khz=12000\r\nclk_sys hz=150000000 khz=150000\r\nclk_peri hz=150000000 khz=150000\r\n" +
+        "clk_usb hz=48000000 khz=48000\r\nclk_adc hz=48000000 khz=48000\r\nclk_hstx hz=75000000 khz=75000\r\n" +
+        "pll_sys khz=150000\r\npll_usb khz=48000\r\nxosc khz=12000\r\nrosc khz=11000\r\nlposc khz=32\r\n" +
+        s"rosc_random ${hex(bits, 8)}\r\nvreg vsel 11\r\ndone\r\n"
+    assert(text == expected, text)
+    assert(b.chip.powman.vreg_vsel() == 11 && b.chip.powman.unlocked(), "vreg_set_voltage unlocked the regulator")
+
+@test("FC0_SRC naming a source the model cannot count is refused by name and leaves the counter as it was; a dead modelled clock finishes DIED")
+chip_fc0_unmodelled_sources()
+    var c = rp2350()
+    val fc = clk.BASE
+    wr(&c, fc + clk.FC0_REF_KHZ_OFFSET, 11000)
+    wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_ROSC_CLKSRC)
+    val result = rd(&c, fc + clk.FC0_RESULT_OFFSET)
+    assert(result == 11000 * 32 && rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x11)
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, clk.FC0_SRC_FC0_SRC_CLKSRC_GPIN0).unwrap_err() == "CLOCKS FC0_SRC = 6 is not modelled: clksrc_gpin0 has no pin driving it")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, clk.FC0_SRC_FC0_SRC_CLKSRC_GPIN1).unwrap_err() == "CLOCKS FC0_SRC = 7 is not modelled: clksrc_gpin1 has no pin driving it")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, clk.FC0_SRC_FC0_SRC_OTP_CLK2FC).unwrap_err() == "CLOCKS FC0_SRC = 15 is not modelled: otp_clk2fc: OTP is not modelled")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, clk.FC0_SRC_FC0_SRC_PLL_USB_CLKSRC_PRIMARY_DFT).unwrap_err() == "CLOCKS FC0_SRC = 16 is not modelled: pll_usb_clksrc_primary_dft is a test tap")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET, 4, 0x11).unwrap_err() == "CLOCKS FC0_SRC = 17 is not modelled: it is not a source")
+    assert(c.write(0, fc + clk.FC0_SRC_OFFSET + 0x2000, 4, 0x80).unwrap_err() == "CLOCKS FC0_SRC = 131 is not modelled: it is not a source", "through an alias too")
+    assert(rd(&c, fc + clk.FC0_SRC_OFFSET) == clk.FC0_SRC_FC0_SRC_ROSC_CLKSRC && rd(&c, fc + clk.FC0_RESULT_OFFSET) == result, "the counter is untouched")
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0x11)
+    // NULL and the last real source are accepted.
+    wr(&c, fc + clk.FC0_SRC_OFFSET, 0)
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == 0)
+    // A modelled clock that is stopped (the crystal, never started) is a finished count, not a hang.
+    wr(&c, fc + clk.FC0_SRC_OFFSET, clk.FC0_SRC_FC0_SRC_XOSC_CLKSRC)
+    assert(rd(&c, fc + clk.FC0_STATUS_OFFSET) == DEAD && rd(&c, fc + clk.FC0_RESULT_OFFSET) == 0)
+
+// Hazard3 instruction words into SRAM at `at`, for a hart to run next from there.
+private put(b: &RiscvBoard, at: u32, code: []const u32)
+    for i in 0..<code.len
+        for j in 0..<4 do b.sram.set(usize(at - 0x20000000) + 4 * i + usize(j), u8.wrap(code[i] >> (8 * u32(j))))
+
+@test("on the RISC-V board too, FRCE_OFF on PROC1 stops hart 1, its release answers hart 0 with a 0, and hart 1 launches again")
+riscv_core1_reset_and_relaunch()
+    val b = riscv_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(BLINK_RV).unwrap()
+    // Hart 1 first spins (j .); after the reset its second image sets a0 and stops. Hart 0: wfi; j .
+    put(b, 0x20070000, [0x0000006F])
+    put(b, 0x20070200, [0x02A00513, 0x00100073])
+    put(b, 0x20070100, [0x10500073, 0x0000006F])
+    b.harts[0].pc = 0x20070100
+    rv.forget_code(&b.harts[0])
+    val fifo_wr = sio_reg.BASE + sio_reg.FIFO_WR_OFFSET
+    val fifo_rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
+    val fifo_st = sio_reg.BASE + sio_reg.FIFO_ST_OFFSET
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070000]
+        b.chip.write(0, fifo_wr, 4, x).unwrap()
+        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x)
+    b.run(20000)
+    assert(b.started[1], "hart 1 runs its spin")
+    b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x2000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    b.chip.write(0, fifo_wr, 4, 0x1234).unwrap()
+    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "no echo while held")
+    b.run(1000)
+    assert(!b.started[1], "hart 1 is stopped")
+    b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x3000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    assert(b.chip.read(0, fifo_rd, 4).unwrap() == 0 && b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "exactly one 0")
+    b.run(1000)
+    assert(!b.started[1], "back in the boot ROM")
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070200]
+        b.chip.write(0, fifo_wr, 4, x).unwrap()
+        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x, "the ROM answers the launch again")
+    assert(b.run(100000) == RunEnd.Breakpoint, b.refused)
+    assert(b.started[1] && b.harts[1].r[10] == 42, "the second image ran on hart 1")
