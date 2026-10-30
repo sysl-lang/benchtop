@@ -776,6 +776,12 @@ spin read `lower 9 after 25001 us`. `examples/pico2-riscv/blink.c` now follows e
 `h3.unblock`, as the SDK's `__sev` does, which the ROM's `h3.block` wait needs. Every other
 `examples/pico2` program prints what it did.
 
+**Cost**, host instructions retired, three runs each against the branch's base: `bench --core
+cortex-m33 kernel33.bin` 37.10 G to 37.14 G; `sram_loop.elf` 5.585 G to 5.642 G and `xip_loop.elf`
+5.808 G to 5.865 G (about 1%, core 1 now started and asleep in the ROM); `dcp.elf` 1.136 G to 1.108 G
+(its waits now sleep). Signalling core 1's NVIC every quantum while it waits cost 8% on the loops,
+which is why a core asleep in `WFE` with nothing enabled is not signalled.
+
 ### Item 34, done: the power states
 
 `peripheral/rp2350/powman.sysl` against `hardware/regs/powman.h` and the SDK's `hardware_powman` (whose
