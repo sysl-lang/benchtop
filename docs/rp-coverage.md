@@ -69,7 +69,7 @@ day. An L is split before it is handed out (§6).
 | M33 stack limits (MSPLIM/PSPLIM) | 3.7 | full | Every SP write below the limit is the UsageFault STKOF, recorded in CFSR and taken where SHCSR enables it and it preempts, else HardFault (HFSR.FORCED), else a lockup stop; exception stacking that crosses the limit stacks only above it, leaves SP at it and derives the fault (late arrival or pending); `CCR.STKOFHFNMIGN` at negative priority (`v6m/t2secure.sysl`, item 2). | `t2_except.sysl` stack-limit tests; `examples/pico2/stack_limit.c` in `chip/arm_tests.sysl` | — | — |
 | TrustZone, Secure-only minimum (SAU stored, TT*, SecureFault, NS transitions refused) | 3.7, 10 Security | full | Secure reset state; SAU_CTRL/TYPE/RNR/RBAR/RLAR stored (8 regions); `TT`/`TTT`/`TTA`/`TTAT` answer from the SAU (no IDAU, no MPU modelled: IREGION and MREGION never valid); SecureFault's enable, priority, SFSR (W1C) and SFAR, pended through SHCSR; `SG` a NOP; `BXNS`/`BLXNS` to Non-secure, EXC_RETURN with S or DCRS clear, `MRS`/`MSR` of `_NS` registers and the PPB's NS alias stop at `NonSecure`, named; EXC_RETURN with ES clear is UsageFault INVPC (item 2). Not detected: INVTRAN (executing from SAU-Non-secure memory). | `v6m/t2secure_tests.sysl`; `examples/pico2/tt.c` in `chip/arm_tests.sysl` | — | — |
 | TrustZone, Non-secure state | 3.7, 10 Security | missing | Both worlds' banked state, IDAU, secure gateways and the NS aliases of PPB and SIO. | — | L | Secure-only |
-| M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | partial | `MCR`, `MRC`, `MCRR`, `MRRC`, `CDP` and their `…2` forms reach the board through `Bus.coprocessor`, gated by CPACR, which keeps the fields of the ports the board fills (`v6m/coproc.sysl`). **GPIOC is full**: every instruction of `gpio_coproc.h` is its SIO equivalent (`chip/coprocessors.sysl`). **RCP is full** (item 3): salts, canaries, boolean and integer checks, the sequence counter, the random byte and `rcp_panic`, each core its own state; a failed check stops the core at `Fault` with the check named (`chip/rcp.sysl`). **DCP**: the `RCMP` read `runtime_init` makes only; every other DCP instruction, and any encoding outside a coprocessor's set, is refused by name. | `v6m/coproc_tests.sysl`, `chip/rcp_tests.sysl`, `chip/arm_tests.sysl` (`rcp.elf`, `gpioc.elf`) | M (DCP) | — |
+| M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | full | `MCR`, `MRC`, `MCRR`, `MRRC`, `CDP` and their `…2` forms reach the board through `Bus.coprocessor`, gated by CPACR, which keeps the fields of the ports the board fills (`v6m/coproc.sysl`). **GPIOC is full**: every instruction of `gpio_coproc.h` is its SIO equivalent (`chip/coprocessors.sysl`). **RCP is full** (item 3): salts, canaries, boolean and integer checks, the sequence counter, the random byte and `rcp_panic`, each core its own state; a failed check stops the core at `Fault` with the check named (`chip/rcp.sysl`). **DCP is full** (item 7): every instruction of `dcp_instr.inc.S` in its `R…` and `P…` forms on CP4 and CP5, each core's two instances its own, so every canned sequence gives its IEEE result (`chip/dcp.sysl`). Any encoding outside a coprocessor's set is refused by name. | `v6m/coproc_tests.sysl`, `chip/rcp_tests.sysl`, `chip/dcp_tests.sysl` (`dcp.elf`), `chip/arm_tests.sysl` (`rcp.elf`, `gpioc.elf`) | — | — |
 | Hazard3 ×2 (RV32IMAC + Zb*/Zc*/Zcmp, PMP, Xh3pmpm, Xh3power) | 3.8 Hazard3 | full | `riscv/rp2350.sysl:6–22` and `riscv/HAZARD3-COVERAGE.md`. | `riscv/hazard3_*_tests`, `chip/tests.sysl:18` | — | — |
 | Hazard3 interrupt controller (Xh3irq) | 3.8 | full | MEIEA, MEIPA, MEINEXT and MEICONTEXT (`riscv/csr.sysl:34–42`). Only the lines `signal` drives ever pend (see "Interrupt routing"). | `riscv/hazard3_tests` | — | — |
 | Architecture switching (ARCHSEL, both pairs) | 3.9 Architecture switching | missing | The board fixes the cores (`boards/pico2-riscv.hocon` against `pico2`). | — | S | Arm board, boot path |
@@ -167,7 +167,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 18 | 10 | 1 | 28 | 57 |
+| RP2350 | 25 | 9 | 1 | 22 | 57 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
 One RP2350 block is a register-stub today (its row says which). Every block that is not modelled is refused by the bus, which is
@@ -189,7 +189,7 @@ every program in the org is.
    - XIP flash, because the default binary type runs from flash;
    - the boot ROM's function table, because the SDK looks functions up through it.
 
-   The DCP follows as soon as a program prints a `%f`.
+   The DCP followed as soon as a program printed a `%f` (item 7, done).
 2. **The blocks `runtime_init` polls.** RESETS, TICKS, PLLs and TIMER are done. PSM (core-1 reset),
    ROSC, BOOTRAM (boot locks), SYSINFO, SYSCFG, the POWMAN/VREG store and FC0 are not. Each one
    missing is a refusal at start-up. The census in item 1 below lists them from a real run instead of
@@ -316,7 +316,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 4 | **XIP flash and QMI**: one flash image behind the 0x1000_0000 aliases, the cache, cache-as-SRAM, XIP_CTRL, QMI stored with direct mode, and the loader writing an ELF's PT_LOAD and a UF2 into flash. `pico_xip_sram_test` is its oracle. **Done** (below). | M | 1 |
 | 5 | **Start-up register blocks** (done, see "Item 5, done"): PSM (FRCE_OFF and DONE), ROSC with RANDOMBIT, BOOTRAM, SYSINFO, SYSCFG, the POWMAN/VREG store, ACCESSCTRL stored, and CLOCKS FC0 measuring the tree. Every refusal in item 1's census is either answered here or named. | M | 1 |
 | 6 | **Boot ROM function table**: the shape follows Q1; with an HLE ROM, the lookup table plus the functions `runtime_init` and stdio reach. It is split in two if Q1 chooses the real ROM. | L | 4, 5 |
-| 7 | **DCP (CP4/5)**: the double coprocessor. `pico_float_test` and a `printf("%f")` program are its oracles. | M | 3 |
+| 7 | **DCP (CP4/5)**: the double coprocessor. `pico_float_test` and a `printf("%f")` program are its oracles. **Done** (below). | M | 3 |
 | 8 | **UART completion**: baud-timed bytes from clk_peri, both UARTs' pins correct, RT timeout, FIFO-level IRQs, break and errors, DREQ outputs. | M | 6 |
 | 9 | **GPIO function mux and GPIO interrupts**: one routing layer where every producer offers level and OE, IO_IRQ_BANK0, and per-core INTE/INTF/INTS. `gpio/hello_gpio_irq` is its oracle. | M | 6 |
 | 10 | **Watchdog counter and chip reset path**: countdown, TRIGGER, REASON, SCRATCH surviving, and the machine restarting through the boot path. **Done** (below). | M | 5 |
@@ -371,7 +371,7 @@ the RCP and MSPLIM itself and vectors through its own table.
 | 7 | `runtime_init_per_core_bootrom_reset` → `rom_func_lookup` | `tt r2, r2` (is the caller Non-secure?) | undefined instruction | `TT*` on a Secure-only core (`v6m/thumb2.sysl`, `Cpu.security`) | 2 (minimum) |
 | 8 | `rom_func_lookup` | ROM halfword at 0x16, then a call into the ROM | not on the bus | benchtop's ROM, read-only at 0 (`chip/rom/rom.S`): the lookup, and `bootrom_state_reset` | 6 (minimum) |
 | 9 | `runtime_init_per_core_enable_coprocessors` | CPACR ← CP0, CP4, CP10 | CP0 and CP4 read as zero | as 1 | 3, 7 |
-| 10 | `runtime_init_per_core_enable_coprocessors` | `mrc p4, #0, r0, c0, c0, #1`, the DCP's RCMP | undefined instruction | the DCP answers this read 0; every other DCP instruction is refused by name | 7 (minimum) |
+| 10 | `runtime_init_per_core_enable_coprocessors` | `mrc p4, #0, r0, c0, c0, #1`, the DCP's RCMP | undefined instruction | the DCP in full (`chip/dcp.sysl`): the read ends any sequence and clears the engaged flag | 7 (done) |
 | 11 | `blink`: `gpio_init`, `gpio_set_dir`, `gpio_put` | `mcr p0, …` and `mcrr p0, #4, …` | undefined instruction | the GPIO coprocessor, in full: each instruction its SIO write or read | 3 |
 
 Nothing else was refused: RESETS, CLOCKS, XOSC, the PLLs, TICKS, TIMER0, the SIO (spinlocks, GPIO),
@@ -486,6 +486,57 @@ the SIO model does not hold; that is the SIO's, not the coprocessor's.
 fault. Tests: `chip/rcp_tests.sysl` (each instruction, its fault message, the edges), the executor
 tests and the two SDK programs in `chip/arm_tests.sysl`: `rcp.elf` runs every `rcp_*` function in
 both forms clean, then corrupts a canary and stops at `Fault` with the check named.
+
+### Item 7, done: the double-precision coprocessor
+
+**`chip/dcp.sysl` runs every instruction of `hardware/dcp_instr.inc.S`**: the 17 `MCRR` writes, the 10
+`CDP` operations, and the 10 `MRC` and 14 `MRRC` reads, each in its `R…` and `P…` (peek) form, on CP4
+(the core's Secure instance) and CP5 (its Non-secure instance, reached directly from Secure code):
+four states, two per core. The registers are the datasheet's (3.6.2.3): `xm`, `ym` (64 bits), `xe`,
+`ye` (14), `xf`, `yf` (sign, zero, infinity, NaN) and the 9-bit status (alignment shift, |X| against
+|Y|, engaged).
+
+- **The datasheet outlines each instruction (tables 114–116); the canned sequences of
+  `dcp_canned.inc.S` fix the formats.** Unpacked mantissas are Q62 under `01`; `RXMS`/`RYMS` read
+  Q62−s; `RXYH` the top words, Q30; `RYMR` a reciprocal estimate and `ym` Q31; `RXMQ` a reciprocal
+  square-root estimate and `xm`'s top word; `WXMO`/`WXFM` take a product Q60, `WXDD` a quotient Q57,
+  `WXFD` one Q61 (the word written twice is its own sticky bit), `WXDQ` a root Q60 and `WXFQ` one Q61.
+  `RCMP` is N engaged, Z equal, C greater or equal, V unordered; `RXVD` and `REFD` put the flags at
+  bits 28–31, the layout `double_fma_dcp.S` reads them from.
+- **Arithmetic is IEEE 754, round to nearest even, with denormals flushed**: an operand whose exponent
+  field is 0 is a zero, and a result IEEE gives as a denormal is a zero of its sign. NaN results are
+  the default NaN (no payload: the flags hold none). The conversions truncate (`NTDC`) or round to
+  nearest even (`NRDC`), saturate, and take a NaN to 0.
+- **What the datasheet does not publish is benchtop's own**: the two estimate tables (9 bits each,
+  `recip_estimate`, `rsqrt_estimate`), so only `ddiv_fast`, `sqrt_fast` and the single-precision
+  `_fast` forms, which do not round correctly, can differ from a chip's in their last bit; the
+  version `RXVD` reads (0); the status bits under `RCMP`'s flags; and the unused bits of `REFD`.
+- **Refused by name**: `MCR`, the `…2` writes and operations, a `CDP` with CRd or CRn not c0, and any
+  opcode or register outside the tables.
+- **The engaged flag** is set by every write, operation and middle read, cleared by the reads that end
+  a sequence and by `RYMD`, and left by the peeks, `RXMD` and `REFD`; `WEFD` restores it.
+
+**Tests.** `chip/dcp_tests.sysl` writes the core's half of every canned sequence out (the long
+multiplies, `SMMLAR`/`SMMLSR` Newton steps and rounding fix-ups) and checks each against the host's
+IEEE arithmetic bit for bit over the edges and 20,000 pseudo-random operand pairs: `dadd`, `dsub`,
+`dmul`, `ddiv`, `dsqrt`, the comparisons, and the single-precision, `fxprod` and conversion
+sequences; the `_fast` forms within an ulp. A mutation of the tie rule or a 4-bit reciprocal table
+turns them red. Register-level tests cover each instruction's layout, the engaged flag in both forms,
+a save and restore around an interrupting operation, `NORM`, `SQR0`, the estimates' accuracy over
+every interval, the special values, the four instances and the refusals; `chip/arm_tests.sysl` runs
+the instructions from the core under both executors (flags through `MRC APSR_nzcv`, CP5, CPACR's NOCP).
+
+`examples/pico2/dcp.c` (with `dcp_ops.S`) runs pico_double — C's `+ - * /`, `sqrt`, `fma`, the
+comparisons and casts, `ddiv_fast`, `sqrt_fast` — and every canned sequence over 3000 operand sets,
+printing one hash per operation, which the test recomputes on the host; core 1 computes alongside, and
+a 20 µs timer interrupts core 0 with double arithmetic of its own, some of it inside a sequence, so the
+SDK's engaged-flag save and restore runs. Then newlib's `printf` prints `%f`, `%.17g`, `%e` and `%g`
+digit for digit as the host's does (the SDK's own printf stops at nine digits, so the program uses
+newlib's). pico_double's `fma` takes its "mla path" when an operand is zero, infinite or NaN — the
+DCP's product, flushed, then the sum — so `-tiny × tiny + 0` is +0 there; the test models that path.
+
+Core 1's launch now returns to the ROM's wait (`ArmBoard.launch` sets LR), as the chip's ROM calls the
+entry: `dcp.c`'s core 1 function returns, and before this ran into the ROM's vector table and faulted.
 
 ### Item 15, done: the doorbells and the interpolators
 
