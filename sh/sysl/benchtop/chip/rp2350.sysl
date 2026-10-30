@@ -1,14 +1,15 @@
 module sh.sysl.benchtop.chip
 
-import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Resets}
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Resets, replicated, written}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
 import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, qspi_flash}
-import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, OtpWindow, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
+import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, Otp, OtpFault, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
 import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_MAINTENANCE_BASE, XIP_WINDOWS_END, read_xip, xip_aux_read, xip_aux_write, xip_target}
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
 import sh.sysl.rp2350.bootram as bootram_reg
+import sh.sysl.rp2350.otp as otp_reg
 import sh.sysl.rp2350.qmi as qmi_reg
 import sh.sysl.rp2350.xip_aux as xip_aux_reg
 import sh.sysl.rp2350.xip_ctrl as xip_ctrl_reg
@@ -32,6 +33,7 @@ import sh.sysl.rp2350.timer1 as timer1_reg
 import sh.sysl.rp2350.uart0 as uart0_reg
 import sh.sysl.rp2350.uart1 as uart1_reg
 import sh.sysl.rp2350.usb as usb_reg
+import sh.sysl.rp2350.usb_device_dpram as usb_dpram_reg
 import sh.sysl.rp2350.watchdog as watchdog_reg
 import sh.sysl.rp2350.xosc as xosc_reg
 import sysl.fmt.hex
@@ -72,6 +74,7 @@ const POWMAN_IRQ_POW: u32 = 44
 const POWMAN_IRQ_TIMER: u32 = 45
 const UART0_IRQ: u32 = 33
 const UART1_IRQ: u32 = 34
+const USBCTRL_IRQ: u32 = 14
 
 // Each APB device's window: its registers and their XOR, SET and CLR aliases.
 private const WINDOW: u32 = 0x4000
@@ -94,6 +97,7 @@ enum Block
     Sio
     BootRam
     UsbCtrl
+    UsbDpram
     Psm
     Rosc
     SysInfo
@@ -109,6 +113,7 @@ enum Block
     OtpDataRaw
     OtpDataGuarded
     OtpDataRawGuarded
+    OtpBlock
 
 /** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
 struct Placed
@@ -118,7 +123,7 @@ struct Placed
     reset: u32
 
 /** Every block the chip runs, with the SVD's base addresses. */
-val BLOCKS: [31]Placed = [
+val BLOCKS: [33]Placed = [
     Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
     Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -135,8 +140,11 @@ val BLOCKS: [31]Placed = [
     Placed(Block.Sio, sio_reg.BASE, "SIO", 0),
     Placed(Block.BootRam, bootram_reg.BASE, "BOOTRAM", 0),
     // Not gated by RESETS: the SDK reads SIE_CTRL before it releases USBCTRL
-    // (`runtime_init_usb_power_down`), and benchtop answers it as the block's power-on state.
+    // (`runtime_init_usb_power_down`), and benchtop answers it as the block's power-on state. RESETS
+    // asserting USBCTRL's bit resets the controller (`reset_blocks`). Its DPRAM is on the AHB, with no
+    // atomic aliases.
     Placed(Block.UsbCtrl, usb_reg.BASE, "USBCTRL", 0),
+    Placed(Block.UsbDpram, usb_dpram_reg.BASE, "USBCTRL_DPRAM", 0),
     Placed(Block.Psm, psm_reg.BASE, "PSM", 0),
     Placed(Block.Rosc, rosc_reg.BASE, "ROSC", 0),
     Placed(Block.SysInfo, sysinfo_reg.BASE, "SYSINFO", 0),
@@ -154,6 +162,8 @@ val BLOCKS: [31]Placed = [
     Placed(Block.OtpDataRaw, OTP_DATA_BASE + 0x4000, "OTP_DATA_RAW", 0),
     Placed(Block.OtpDataGuarded, OTP_DATA_BASE + 0x8000, "OTP_DATA_GUARDED", 0),
     Placed(Block.OtpDataRawGuarded, OTP_DATA_BASE + 0xC000, "OTP_DATA_RAW_GUARDED", 0),
+    // The OTP block's registers, with their atomic aliases; on no RESETS bit.
+    Placed(Block.OtpBlock, otp_reg.BASE, "OTP", 0),
 ]
 
 /** OTP_DATA_BASE (`hardware/regs/addressmap.h`); the raw, guarded and raw guarded windows follow it
@@ -193,6 +203,8 @@ struct Rp2350
     qmi: Qmi
     // The flash on QSPI chip select 0, the board's part, whose array the board connects.
     flash: QspiFlash
+    // The OTP: the board's array, as the part's flash is, and the OTP block's registers.
+    otp: Otp
     // Something a board mirrors in its memory map has changed: the flash's contents, direct mode, or
     // which XIP_SRAM lines are pinned (`take_xip_changed`).
     xip_changed: bool
@@ -228,9 +240,11 @@ struct Rp2350
     reset(*self)
         val bytes = self.flash.bytes
         val size = self.flash.size
+        val array = self.otp
         val fresh = rp2350()
         *self = fresh
         if size != 0 then self.flash.connect(bytes, size)
+        self.otp.power_on(array)
 
     /** Whether the flash's contents, direct mode or the pinned XIP_SRAM lines have changed since the last
      * call, for a board that mirrors them.
@@ -241,12 +255,12 @@ struct Rp2350
         was
 
     /** What each clock source runs at now; the PLLs take the crystal as their reference. */
-    sources(self) -> Sources
+    sources(*self) -> Sources
         val xosc = if self.xosc.stable() then XOSC_HZ else 0
         Sources(self.rosc.hz(ROSC_HZ), xosc, LPOSC_HZ, self.pll_sys.hz(xosc), self.pll_usb.hz(xosc))
 
-    sys_hz(self) -> u64 = self.clocks.sys_hz(self.sources())
-    ref_hz(self) -> u64 = self.clocks.ref_hz(self.sources())
+    sys_hz(*self) -> u64 = self.clocks.sys_hz(self.sources())
+    ref_hz(*self) -> u64 = self.clocks.ref_hz(self.sources())
 
     /** `cycles` of clk_sys pass: every clock the devices count advances with them. */
     advance(*self, cycles: u64)
@@ -288,7 +302,7 @@ struct Rp2350
     end advance
 
     // The crystal's frequency while it runs, else 0.
-    private crystal_hz(self) -> u64 = if self.xosc.stable() then XOSC_HZ else 0
+    private crystal_hz(*self) -> u64 = if self.xosc.stable() then XOSC_HZ else 0
 
     /** Bring the devices to clk_sys cycle `t`, where they are behind it. */
     catch_up(*self, t: u64) = if t > self.now then self.advance(t - self.now)
@@ -298,7 +312,7 @@ struct Rp2350
      * switched core is down only the always-on timer's alarm is one; a power-up GPIO changes only when
      * something outside drives it.
      */
-    next_event(self) -> Option[u64]
+    next_event(*self) -> Option[u64]
         var due = self.powman.next_alarm(self.sys_hz(), LPOSC_HZ, self.crystal_hz())
         if self.swcore_off then return due
         self.watchdog.ticks_to_fire(0) match
@@ -317,7 +331,7 @@ struct Rp2350
 
     // The clk_sys cycles until generator `g`'s `n`th tick from now, rounded up; None while it is
     // stopped.
-    private ticks_to_cycles(self, g: Tick, n: u64) -> Option[u64]
+    private ticks_to_cycles(*self, g: Tick, n: u64) -> Option[u64]
         val sys = self.sys_hz()
         val ref_hz = self.ref_hz()
         if ref_hz == 0 then return None
@@ -344,7 +358,12 @@ struct Rp2350
             Uart1 -> self.uarts[1].read(o, width)
             Sio -> self.sio.read(core, o, width, self.inputs())
             BootRam -> self.bootram.read(o, width)
-            UsbCtrl -> self.usb.read(o, width)
+            UsbCtrl ->
+                self.usb.unmodelled_read(o) match
+                    Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
+                    None -> ()
+                self.usb.read(o, width)
+            UsbDpram -> self.usb.dpram_read(o, width)
             Psm -> self.psm.read(o, width)
             Rosc -> self.rosc.read(o, width)
             SysInfo -> self.sysinfo.read(o, width)
@@ -355,8 +374,7 @@ struct Rp2350
             AccessCtrl -> self.accessctrl.read(o, width)
             IoQspiBlock -> self.io_qspi.read(o, width)
             PadsQspi -> self.pads_qspi.read(o, width)
-            OtpData | OtpDataGuarded -> OtpWindow(false).read(o, width)
-            OtpDataRaw | OtpDataRawGuarded -> OtpWindow(true).read(o, width)
+            OtpData | OtpDataRaw | OtpDataGuarded | OtpDataRawGuarded | OtpBlock -> return self.otp_read(p, o, width)
             XipCtrl -> return self.xip.read(o, width, &self.qmi, &self.flash).map_err(f -> xip_refusal(p, o, f))
             QmiBlock -> return self.qmi.read(o, width, &self.flash).map_err(f -> xip_refusal(p, o, f))
             XipAux -> return xip_aux_read(&self.xip, &self.qmi, &self.flash, o, width).map_err(f -> xip_refusal(p, o, f))
@@ -373,6 +391,7 @@ struct Rp2350
                 self.reset_blocks(self.resets.held & ~before)
                 // Every released block is ready at once.
                 self.resets.complete(~self.resets.held)
+                if (self.resets.held ^ before) & (resets_reg.RESET_IO_BANK0_MASK | resets_reg.RESET_PADS_BANK0_MASK) != 0 then self.gpio_changed()
                 r
             Clocks ->
                 val before = self.clocks
@@ -387,7 +406,10 @@ struct Rp2350
                         return Err(s"CLOCKS FC0_SRC = $wrote is not modelled: $why")
                     self.clocks.measure(self.sources())
                 r
-            Xosc -> self.xosc.write(o, width, x)
+            Xosc ->
+                if o & 0xFFC == xosc_reg.DORMANT_OFFSET && written(self.xosc.dormant, o, replicated(x, width)) == xosc_reg.DORMANT_DORMANT_DORMANT
+                    return Err(s"${p.name} + 0x${hex(o)}: DORMANT, the crystal stopped until a dormant wake, is not modelled (the ROSC's DORMANT is)")
+                self.xosc.write(o, width, x)
             PllSys -> self.pll_sys.write(o, width, x)
             PllUsb -> self.pll_usb.write(o, width, x)
             Ticks -> self.ticks.write(o, width, x)
@@ -398,13 +420,30 @@ struct Rp2350
                 val r = self.watchdog.write(o, width, x)
                 self.watchdog_reset()
                 r
-            IoBank0 -> self.io.write(o, width, x)
-            PadsBank0 -> self.pads.write(o, width, x)
+            IoBank0 ->
+                self.io.unmodelled(o, width, x) match
+                    Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
+                    None -> ()
+                val r = self.io.write(o, width, x)
+                self.gpio_changed()
+                r
+            PadsBank0 ->
+                val r = self.pads.write(o, width, x)
+                self.gpio_changed()
+                r
             Uart0 -> self.uarts[0].write(o, width, x)
             Uart1 -> self.uarts[1].write(o, width, x)
-            Sio -> self.sio.write(core, o, width, x)
+            Sio ->
+                val r = self.sio.write(core, o, width, x)
+                if o & 0xFFC >= sio_reg.GPIO_OUT_OFFSET && o & 0xFFC <= sio_reg.GPIO_HI_OE_XOR_OFFSET then self.gpio_changed()
+                r
             BootRam -> self.bootram.write(o, width, x)
-            UsbCtrl -> self.usb.write(o, width, x)
+            UsbCtrl ->
+                self.usb.unmodelled(o, width, x) match
+                    Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
+                    None -> ()
+                self.usb.write(o, width, x)
+            UsbDpram -> self.usb.dpram_write(o, width, x)
             Psm ->
                 // Only PROC1 can be held in reset: the stages of the chip's own start-up have no state
                 // to lose here, and holding PROC0 would stop the core that is writing.
@@ -416,7 +455,11 @@ struct Rp2350
                     return Err(s"PSM FRCE_OFF of ${psm_stage_name(newly & ~psm_reg.FRCE_OFF_PROC1_MASK)} is not modelled: only PROC1 can be forced off")
                 self.core1_held(before.held(), self.psm.held())
                 r
-            Rosc -> self.rosc.write(o, width, x)
+            Rosc ->
+                val r = self.rosc.write(o, width, x)
+                // DORMANT with a dormant-wake interrupt already asserted wakes again at once.
+                if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
+                r
             SysInfo -> self.sysinfo.write(o, width, x)
             SysCfg -> self.syscfg.write(o, width, x)
             Powman ->
@@ -437,7 +480,8 @@ struct Rp2350
             IoQspiBlock -> self.io_qspi.write(o, width, x)
             PadsQspi -> self.pads_qspi.write(o, width, x)
             OtpData | OtpDataRaw | OtpDataGuarded | OtpDataRawGuarded ->
-                return Err(s"${p.name} + 0x${hex(o)}: the OTP's read windows are read-only, and programming a row is not modelled (docs/rp-coverage.md item 26)")
+                return Err(s"${p.name} + 0x${hex(o)}: the OTP's read windows are read-only; a row is programmed through the OTP block's SBPI bridge")
+            OtpBlock -> return self.otp.write(o, width, x).map_err(f -> otp_refusal(p, o, f))
             XipCtrl | QmiBlock | XipAux ->
                 val r = p.block match
                     XipCtrl -> self.xip.write(o, width, x, &self.qmi, &self.flash)
@@ -464,8 +508,9 @@ struct Rp2350
     // selects every stage but ROSC and XOSC. Where RESETS' own stage is not selected, the peripherals
     // RESETS.WDSEL names go into reset instead. What survives is what no selected stage holds: the
     // watchdog's REASON and SCRATCH registers, POWMAN, PSM's own registers, the SRAM's contents (a
-    // stage's reset is of its controller, not its array) and BOOTRAM's, and the flash part. Stages with
-    // no state benchtop keeps (PROC_COLD, OTP, PSM_READY, BUSFABRIC, ROM, SRAM0–9) change nothing here;
+    // stage's reset is of its controller, not its array) and BOOTRAM's, the flash part and the OTP's
+    // array (OTP's stage resets its registers, reloading the locks from the array). Stages with no
+    // state benchtop keeps (PROC_COLD, PSM_READY, BUSFABRIC, ROM, SRAM0–9) change nothing here;
     // PROC0 and PROC1 are the board's to restart (`take_restart`). TICKS goes with CLOCKS, an assumption:
     // the headers give TICKS no stage of its own.
     private watchdog_reset(*self)
@@ -478,6 +523,11 @@ struct Rp2350
         if sel & psm_reg.WDSEL_XOSC_MASK != 0
             self.xosc = fresh.xosc
             self.xosc_rest = 0
+        if sel & psm_reg.WDSEL_OTP_MASK != 0
+            // The OTP's registers go back to power-on, the locks loaded again from the array.
+            val was = self.otp
+            self.otp = fresh.otp
+            self.otp.power_on(was)
         if sel & psm_reg.WDSEL_RESETS_MASK != 0
             self.resets = fresh.resets
             self.reset_blocks(self.resets.held)
@@ -518,7 +568,7 @@ struct Rp2350
         r
 
     /** Whether a watchdog reset the board has not yet taken has reset core `k`'s PSM stage. */
-    restarting(self, k: u32) -> bool = self.restart match
+    restarting(*self, k: u32) -> bool = self.restart match
         Some(s) -> s & (if k == 0 then psm_reg.WDSEL_PROC0_MASK else psm_reg.WDSEL_PROC1_MASK) != 0
         None -> false
 
@@ -546,7 +596,7 @@ struct Rp2350
     /** Whether a power-down of the switched core waits for the processors to halt (POWMAN's
      * STATE.WAITING); the board, which knows when they have, makes it (`power_down`).
      */
-    power_down_due(self) -> bool = self.powman.power_down_due()
+    power_down_due(*self) -> bool = self.powman.power_down_due()
 
     /** The processors have halted, and POWMAN powers the switched core down to the state STATE.REQ asked
      * for (datasheet 6, "Power management"; Q7: the time it spends there is skipped). Everything in the
@@ -572,8 +622,10 @@ struct Rp2350
         val outside = (self.outside_driven, self.outside_level)
         val bytes = self.flash.bytes
         val size = self.flash.size
+        val array = self.otp
         *self = rp2350()
         if size != 0 then self.flash.connect(bytes, size)
+        self.otp.power_on(array)
         self.powman = powman
         self.now = now
         self.outside_driven = outside.0
@@ -611,12 +663,13 @@ struct Rp2350
                 self.outside_driven |= bit
                 self.outside_level = if v then self.outside_level | bit else self.outside_level & ~bit
             None -> self.outside_driven &= ~bit
+        if !self.swcore_off then self.gpio_changed()
 
     // What POWMAN's power-up requests see on the GPIOs they watch, bit n for GPIO n: the pad's level
     // where its input is enabled. While the switched core is down, a pad's isolation latch holds it: a
     // pad that drove keeps its level, and one that did not follows what drives it from outside, or
     // keeps the level its pulls gave it.
-    private pwrup_levels(self) -> u64
+    private pwrup_levels(*self) -> u64
         var levels: u64 = 0
         for k in 0u32..<4
             self.powman.pwrup_gpio(k) match
@@ -634,7 +687,7 @@ struct Rp2350
 
     // A read of the XIP address space outside XIP_SRAM, which the board runs: the flash through a
     // window, or why it is a bus error.
-    private xip_read(self, a: u32, width: u32) -> Result[u32, string]
+    private xip_read(*self, a: u32, width: u32) -> Result[u32, string]
         if a >= XIP_MAINTENANCE_BASE && a < XIP_MAINTENANCE_BASE + 0x04000000 then return Err(s"0x${hex(a, 8)}: the cache maintenance window takes writes only")
         read_xip(self.xip.ctrl, self.qmi, &self.flash, a, width).map_err(f -> xip_why(f))
 
@@ -648,9 +701,19 @@ struct Rp2350
         if self.xip.ctrl & xip_ctrl_reg.CTRL_WRITABLE_M0_MASK == 0 then return Ok(())
         Err(s"0x${hex(a, 8)}: a write through XIP with XIP_CTRL.WRITABLE_M0 set becomes a QMI write command, which benchtop does not send (the Pico 2's flash is not written through XIP)")
 
+    // A read of the OTP: one of its four windows, or the OTP block's registers.
+    private otp_read(*self, p: Placed, o: u32, width: u32) -> Result[u32, string]
+        val got = p.block match
+            OtpData -> self.otp.read_window(false, false, o, width)
+            OtpDataRaw -> self.otp.read_window(true, false, o, width)
+            OtpDataGuarded -> self.otp.read_window(false, true, o, width)
+            OtpDataRawGuarded -> self.otp.read_window(true, true, o, width)
+            _ -> self.otp.read(o, width)
+        got.map_err(f -> otp_refusal(p, o, f))
+
     // The block an access lands in, refused where none is there, or where RESETS holds it: on silicon
     // that access hangs the bus.
-    private placed(self, a: u32) -> Result[(Placed, u32), string]
+    private placed(*self, a: u32) -> Result[(Placed, u32), string]
         val (p, o) = block_at(a) match
             Some(found) -> found
             None -> return Err(s"0x${hex(a, 8)} is not on the RP2350's bus as benchtop runs it")
@@ -660,6 +723,8 @@ struct Rp2350
     // Power-on state for each block whose reset has just been asserted.
     private reset_blocks(*self, asserted: u32)
         if asserted == 0 then return
+        // USBCTRL is placed ungated (`BLOCKS`), so its reset is not found by the walk below.
+        if asserted & resets_reg.RESET_USBCTRL_MASK != 0 then self.usb.reset_controller()
         for p in BLOCKS
             if p.reset & asserted == 0 then continue
             p.block match
@@ -675,50 +740,65 @@ struct Rp2350
                 PadsQspi -> self.pads_qspi.reset()
                 _ -> ()
 
-    /** What the function selected on GPIO `n` drives it with, after CTRL's overrides. */
-    drive(self, n: u32) -> Drive
-        val f = self.io.function(n)
-        // A UART's TX idles high and drives; bytes leave at once.
-        val d =
-            if f == io_reg.GPIO0_CTRL_FUNCSEL_SIO_0 then Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
-            elif f == io_reg.GPIO0_CTRL_FUNCSEL_UART0_TX && n % 4 == 0 then Drive(true, true)
-            else Drive(false, false)
+    /** What the producer FUNCSEL routes to GPIO `n` drives it with, after CTRL's overrides. */
+    drive(*self, n: u32) -> Drive
+        val d = rp.route(n, self.io.function(n)) match
+            Sio -> Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
+            // A UART's TX idles high and drives; bytes leave at once.
+            UartTx -> Drive(true, true)
+            UartRx | Null -> Drive(false, false)
         self.io.after_overrides(n, d)
 
     /** What GPIO `n` is doing: whether its pad drives, and its level. */
-    pin(self, n: u32) -> Pin
+    pin(*self, n: u32) -> Pin
         val bit = 1u64 << u64(n)
         if self.outside_driven & bit == 0 then return self.pads.pin(n, self.drive(n), None)
         self.pads.pin(n, self.drive(n), Some(self.outside_level & bit != 0))
 
-    private drives(self) -> [GPIO_COUNT]Drive
+    private drives(*self) -> [GPIO_COUNT]Drive
         var all: [GPIO_COUNT]Drive
         for n in 0..<GPIO_COUNT do all[n] = self.drive(n)
         all
 
-    private pins(self) -> [GPIO_COUNT]Pin
+    private pins(*self) -> [GPIO_COUNT]Pin
         var all: [GPIO_COUNT]Pin
         for n in 0..<GPIO_COUNT do all[n] = self.pin(n)
         all
 
-    // GPIO_IN: each pad's input, bit n for GPIO n.
-    private[chip] inputs(self) -> u64
+    // GPIO_IN: what the SIO reads of each GPIO, its pad's input after INOVER, bit n for GPIO n.
+    private[chip] inputs(*self) -> u64
         var bits: u64 = 0
-        for n in 0..<GPIO_COUNT do if self.pin(n).input then bits |= 1u64 << n
+        for n in 0..<GPIO_COUNT do if self.io.peripheral_input(n, self.pin(n).input) then bits |= 1u64 << n
         bits
 
+    // What the GPIO interrupts see: each pad's input after IRQOVER, bit n for GPIO n.
+    private irq_inputs(*self) -> u64
+        var bits: u64 = 0
+        for n in 0..<GPIO_COUNT do if self.io.irq_input(n, self.pin(n).input) then bits |= 1u64 << n
+        bits
+
+    /** Something that decides a GPIO's level may have changed (a function, an override, a pad, the SIO,
+     * or what drives it from outside): the GPIO interrupts sample their inputs again, latching each
+     * edge, except while RESETS holds IO_BANK0. A dormant-wake interrupt wakes a dormant ROSC.
+     */
+    gpio_changed(*self)
+        self.io.irq.sample(self.irq_inputs(), self.resets.held & resets_reg.RESET_IO_BANK0_MASK == 0)
+        if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
+
     /** Drive `p`'s interrupt inputs from the devices' levels. */
-    signal(self, p: *Processor)
+    signal(*self, p: *Processor)
         val k = p.number()
         for i in 0u32..<2
             val lines = self.timers[i].irqs()
             for j in 0u32..<4 do p.interrupt(TIMER0_IRQ_0 + 4 * i + j, lines & (1 << j) != 0)
+        p.interrupt(rp.IO_IRQ_BANK0, self.io.irq.line(k))
         p.interrupt(SIO_IRQ_FIFO, self.sio.fifo_irq(k))
         p.interrupt(SIO_IRQ_BELL, self.sio.bell_irq(k))
         p.interrupt(POWMAN_IRQ_POW, self.powman.irq_pow())
         p.interrupt(POWMAN_IRQ_TIMER, self.powman.irq_timer())
         p.interrupt(UART0_IRQ, self.uarts[0].irq())
         p.interrupt(UART1_IRQ, self.uarts[1].irq())
+        p.interrupt(USBCTRL_IRQ, self.usb.irq())
         p.machine_timer(self.sio.software_irq(k), self.sio.timer_irq(k))
 end Rp2350
 
@@ -727,7 +807,7 @@ rp2350() -> Rp2350 =
     Rp2350(rp.rp2350_resets(), rp.clocks(), rp.xosc(), rp.pll(), rp.pll(), rp.ticks(), [rp.timer(), rp.timer()], rp.watchdog(),
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
-        rp.xip(), rp.qmi(), qspi_flash(), false,
+        rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), false,
         rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0)
 
 private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
@@ -738,6 +818,11 @@ private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
 
 // Why the XIP or QMI blocks refused an access, as a person reads it.
 private xip_refusal(p: Placed, o: u32, f: XipFault) -> string = f match
+    Access(e) -> refusal(p, o, e)
+    Refused(why) -> s"${p.name} + 0x${hex(o)}: $why"
+
+// Why the OTP refused an access, as a person reads it.
+private otp_refusal(p: Placed, o: u32, f: OtpFault) -> string = f match
     Access(e) -> refusal(p, o, e)
     Refused(why) -> s"${p.name} + 0x${hex(o)}: $why"
 

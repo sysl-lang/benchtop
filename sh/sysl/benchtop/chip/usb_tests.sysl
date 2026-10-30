@@ -1,0 +1,247 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2350.{Handshake, InReply, Packet}
+import sh.sysl.benchtop.v6m as arm
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+
+// USB device mode end to end: the SDK's stdio_usb (TinyUSB's device stack and its RP2350 port, unmodified)
+// on the Arm Pico 2, enumerated by a host the test plays through the board's `usb_*` seam
+// (examples/pico2/usb_device.c). What the device answers is checked against the descriptors in the
+// built ELF (`usbd_desc_device` and `usbd_desc_cfg`, dumped with `arm-none-eabi-objcopy`) and the
+// strings in the SDK's `stdio_usb_descriptors.c`.
+
+private val USB_PROGRAM = embed("../../../../examples/pico2/usb_device.elf")
+private val USB_SRAM = SramMap(0x20000000, 520 * 1024)
+private const USB_TENTH_MS: u64 = 15000
+// Up to a second of guest time, in tenths of a millisecond, before a host gives up on a NAKing endpoint.
+private const USB_RETRIES: u32 = 10000
+private val NO_DATA: [1]u8 = [0]
+
+// stdio_usb's device descriptor: USB 2.1, the IAD class triple, 64-byte EP0, Raspberry Pi's VID 0x2E8A,
+// the SDK's CDC PID 0x0009, device 1.00, strings 1 to 3, one configuration.
+private val DEVICE_DESCRIPTOR: [18]u8 = [0x12, 0x01, 0x10, 0x02, 0xEF, 0x02, 0x01, 0x40, 0x8A, 0x2E, 0x09, 0x00, 0x00, 0x01, 0x01, 0x02, 0x03, 0x01]
+
+// Its configuration: three interfaces (CDC's two behind an IAD, then the SDK's reset interface),
+// bus-powered at 250 mA; the CDC notification endpoint 0x81 (interrupt, 8 bytes, every 16 ms) and the
+// data endpoints 0x02 and 0x82 (bulk, 64 bytes).
+private val CONFIG_DESCRIPTOR: [84]u8 = [
+    0x09, 0x02, 0x54, 0x00, 0x03, 0x01, 0x00, 0x80, 0x7D,
+    0x08, 0x0B, 0x00, 0x02, 0x02, 0x02, 0x00, 0x00,
+    0x09, 0x04, 0x00, 0x00, 0x01, 0x02, 0x02, 0x00, 0x04,
+    0x05, 0x24, 0x00, 0x20, 0x01,
+    0x05, 0x24, 0x01, 0x00, 0x01,
+    0x04, 0x24, 0x02, 0x06,
+    0x05, 0x24, 0x06, 0x00, 0x01,
+    0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x10,
+    0x09, 0x04, 0x01, 0x00, 0x02, 0x0A, 0x00, 0x00, 0x00,
+    0x07, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00,
+    0x07, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00,
+    0x09, 0x04, 0x02, 0x00, 0x00, 0xFF, 0x00, 0x01, 0x05,
+]
+
+// String descriptor 0: English (United States) alone.
+private val LANGUAGES: [4]u8 = [4, 3, 0x09, 0x04]
+
+// A standard or class request's SETUP bytes.
+private request(kind: u8, code: u8, value: u32, index: u32, length: u32) -> [8]u8 =
+    [kind, code, u8.wrap(value), u8.wrap(value >> 8), u8.wrap(index), u8.wrap(index >> 8), u8.wrap(length), u8.wrap(length >> 8)]
+
+private get_descriptor(kind: u32, n: u32, length: u32) -> [8]u8 = request(0x80, 6, (kind << 8) | n, if kind == 3 && n != 0 then 0x0409 else 0, length)
+
+// Run the board on a tenth of a millisecond, as a host waits a frame before it retries.
+private wait(b: &ArmBoard) -> Result[unit, string]
+    val end = b.run(USB_TENTH_MS)
+    if end != RunEnd.Budget then return Err(s"the run ended ($end): ${b.refused}")
+    Ok(())
+
+// Run until UART0 has printed `text`, for up to `ms` milliseconds.
+private run_until(b: &ArmBoard, text: string, ms: u32) -> Result[unit, string]
+    var tenths: u32 = 0
+    while tenths < 10 * ms
+        if from_utf8_lossy(b.console.view()).contains(text) then return Ok(())
+        wait(b)?
+        tenths += 1
+    Err(s"UART0 never printed \"$text\"; it printed: ${from_utf8_lossy(b.console.view())}")
+
+// An IN transaction, retried while the device NAKs.
+private in_packet(b: &ArmBoard, address: u32, ep: u32) -> Result[Packet, string]
+    var tries: u32 = 0
+    while tries < USB_RETRIES
+        b.usb_in(address, ep)? match
+            Data(p) -> return Ok(p)
+            Nak -> ()
+            Stall -> return Err(s"EP$ep IN stalled")
+            Silent -> return Err(s"EP$ep IN: no answer at address $address")
+        wait(b)?
+        tries += 1
+    Err(s"EP$ep IN: still NAKing after a second")
+
+// An OUT transaction, retried while the device NAKs.
+private out_packet(b: &ArmBoard, address: u32, ep: u32, pid: u32, data: []const u8) -> Result[unit, string]
+    var tries: u32 = 0
+    while tries < USB_RETRIES
+        val h = b.usb_out(address, ep, pid, data)?
+        if h == Handshake.Ack then return Ok(())
+        if h != Handshake.Nak then return Err(s"EP$ep OUT answered $h")
+        wait(b)?
+        tries += 1
+    Err(s"EP$ep OUT: still NAKing after a second")
+
+// A control transfer with an IN data stage: SETUP, DATA1, DATA0, ... until a short packet or all
+// `wLength` bytes, then the status stage, a zero-length OUT DATA1.
+private control_in(b: &ArmBoard, address: u32, setup: [8]u8) -> Result[Buf[u8], string]
+    val h = b.usb_setup(address, setup)
+    if h != Handshake.Ack then return Err(s"SETUP answered $h")
+    val want = u32(setup[6]) | (u32(setup[7]) << 8)
+    var got: Buf[u8] = buf()
+    var pid: u32 = 1
+    loop
+        val p = in_packet(b, address, 0)?
+        if p.pid != pid then return Err(s"a data stage packet with DATA${p.pid} where DATA$pid was due")
+        for k in 0..<p.len do got.push(p.bytes[k])
+        pid ^= 1
+        if p.len < 64 || u32(got.len()) >= want then break
+    out_packet(b, address, 0, 1, NO_DATA[0..<0])?
+    Ok(got)
+
+// A control transfer with no data stage: SETUP, then the status stage, a zero-length IN DATA1.
+private control_none(b: &ArmBoard, address: u32, setup: [8]u8) -> Result[unit, string]
+    val h = b.usb_setup(address, setup)
+    if h != Handshake.Ack then return Err(s"SETUP answered $h")
+    val p = in_packet(b, address, 0)?
+    if p.len != 0 || p.pid != 1 then return Err(s"a status stage of ${p.len} bytes with DATA${p.pid}")
+    Ok(())
+
+private same(got: Buf[u8], want: []const u8) -> bool
+    if got.len() != want.len then return false
+    for i in 0..<want.len do if got[i] != want[i] then return false
+    true
+
+// A string descriptor's text: its UTF-16LE code units, each taken as one byte (every string here is ASCII).
+private text_of(d: Buf[u8]) -> string
+    var bytes: Buf[u8] = buf()
+    var i: usize = 2
+    while i + 1 < d.len()
+        bytes.push(d[i])
+        i += 2
+    from_utf8_lossy(bytes.view())
+
+private show(d: Buf[u8]) -> string
+    var s = ""
+    for i in 0..<d.len() do s = s + s" ${d[i]}"
+    s
+
+// The enumeration a host makes, through SET_CONFIGURATION, and the CDC port opened: what each step
+// returned, as a line per step.
+private enumerate(b: &ArmBoard) -> Result[string, string]
+    run_until(b, "usb device up", 100)?
+    b.usb_attach(true)
+    wait(b)?
+    if !b.chip.usb.connected then return Err("the device did not connect once the host attached")
+    b.usb_bus_reset()
+    wait(b)?
+    val first = control_in(b, 0, get_descriptor(1, 0, 64))?
+    if !same(first, DEVICE_DESCRIPTOR[0..<18]) then return Err(s"device descriptor:${show(first)}")
+    control_none(b, 0, request(0x00, 5, 9, 0, 0))?
+    // The 2 ms a host allows a device to take its address (USB 2.0, 9.2.6.3); TinyUSB sets ADDR_ENDP
+    // from its task once the status stage has completed. Then the device answers its new address only.
+    for i in 0..<20 do wait(b)?
+    if b.usb_setup(0, get_descriptor(1, 0, 18)) != Handshake.Silent then return Err("address 0 still answered after SET_ADDRESS")
+    val device = control_in(b, 9, get_descriptor(1, 0, 18))?
+    if !same(device, DEVICE_DESCRIPTOR[0..<18]) then return Err(s"device descriptor at address 9:${show(device)}")
+    val head = control_in(b, 9, get_descriptor(2, 0, 9))?
+    if !same(head, CONFIG_DESCRIPTOR[0..<9]) then return Err(s"configuration header:${show(head)}")
+    val config = control_in(b, 9, get_descriptor(2, 0, 84))?
+    if !same(config, CONFIG_DESCRIPTOR[0..<84]) then return Err(s"configuration:${show(config)}")
+    val langs = control_in(b, 9, get_descriptor(3, 0, 255))?
+    if !same(langs, LANGUAGES[0..<4]) then return Err(s"languages:${show(langs)}")
+    val maker = text_of(control_in(b, 9, get_descriptor(3, 1, 255))?)
+    val product = text_of(control_in(b, 9, get_descriptor(3, 2, 255))?)
+    val serial = text_of(control_in(b, 9, get_descriptor(3, 3, 255))?)
+    val cdc = text_of(control_in(b, 9, get_descriptor(3, 4, 255))?)
+    control_none(b, 9, request(0x00, 9, 1, 0, 0))?
+    run_until(b, "configured", 100)?
+    Ok(s"$maker|$product|$serial|$cdc")
+end enumerate
+
+@test("stdio_usb enumerates under benchtop's host: the device descriptor at address 0 and at the address SET_ADDRESS gave it, the configuration in two reads, the strings, and SET_CONFIGURATION, as the ELF's own descriptors have them")
+arm_usb_enumeration()
+    val b = arm_board(USB_SRAM)
+    b.boot(USB_PROGRAM).unwrap()
+    val strings = enumerate(b) match
+        Ok(s) -> s
+        Err(why) -> return assert(false, why)
+    assert(strings.starts_with("Raspberry Pi|Pico|") && strings.ends_with("|Board CDC") && strings.len == 44, strings)
+    // The serial number string descriptor 3 carries is the one the program printed: 16 hex digits, the
+    // SDK's unique board ID, which is the OTP's chip ID through `get_sys_info`'s CHIP_INFO (wafer, then
+    // device, as `pico_unique_id` reverses its bytes).
+    val serial = strings[18..<34]
+    assert(serial == "1B970E427A015CD3", serial)
+    assert(from_utf8_lossy(b.console.view()).contains(s"usb device up, serial $serial\r\n"), serial)
+    assert(b.chip.usb.addr[0] == 9)
+
+@test("on the chip USBCTRL is at 0x50110000 and its DPRAM at 0x50100000; an unmodelled write is refused naming the block, the offset and why; RESETS resets the controller and keeps DPRAM; a SETUP raises USBCTRL_IRQ, IRQ 14, in both cores' NVICs")
+chip_usb_placed()
+    val b = arm_board(USB_SRAM)
+    b.boot(USB_PROGRAM).unwrap()
+    val c = &b.chip
+    c.write(0, 0x50100400, 4, 0x12345678).unwrap()
+    assert(c.read(0, 0x50100402, 2).unwrap() == 0x1234)
+    assert(c.read(0, 0x50101000, 4).unwrap_err() == "USBCTRL_DPRAM + 0x1000 is not a register benchtop runs", c.read(0, 0x50101000, 4).unwrap_err())
+    assert(c.write(0, 0x50110040, 4, 2).unwrap_err().starts_with("USBCTRL + 0x40: MAIN_CTRL.HOST_NDEVICE: host mode is not modelled"))
+    assert(c.read(0, 0x50110040, 4).unwrap() == 4, "the refused write changed nothing")
+    assert(c.read(0, 0x50110108, 4).unwrap_err().starts_with("USBCTRL + 0x108: the controller's state machines"))
+    c.write(0, 0x50110090, 4, 0x10000).unwrap()
+    c.write(0, 0x50110040, 4, 1).unwrap()
+    c.write(0, 0x5011004C, 4, 0x10000).unwrap()
+    c.usb.attach(true)
+    assert(c.usb.setup(0, [0, 0, 0, 0, 0, 0, 0, 0]) == Handshake.Ack && c.usb.irq())
+    for k in 0..<2
+        val p = &b.cores[k]
+        c.signal(p)
+        assert(p.pending[arm.nvic_word(arm.IRQ0 + 14)] & arm.nvic_bit(arm.IRQ0 + 14) != 0, s"core $k")
+    // USBCTRL out of reset, into it (RESETS bit 28, through the SET alias) and out again: the assertion
+    // is what resets the controller.
+    c.write(0, 0x40023000, 4, 1u32 << 28).unwrap()
+    assert(c.read(0, 0x50110090, 4).unwrap() == 0x10000, "releasing changes nothing")
+    c.write(0, 0x40022000, 4, 1u32 << 28).unwrap()
+    c.write(0, 0x40023000, 4, 1u32 << 28).unwrap()
+    assert(!c.usb.irq() && c.read(0, 0x50110090, 4).unwrap() == 0 && c.read(0, 0x5011004C, 4).unwrap() == 0x8000)
+    assert(c.read(0, 0x50100400, 4).unwrap() == 0x12345678 && c.usb.attached && !c.usb.connected)
+
+// The CDC port opened and used: DTR raised with SET_CONTROL_LINE_STATE, the line the program prints
+// read from bulk endpoint 0x82 (DATA0, then DATA1, ...), and a byte written to endpoint 0x02.
+private use_cdc(b: &ArmBoard) -> Result[string, string]
+    control_none(b, 9, request(0x21, 0x22, 1, 0, 0))?
+    var got: Buf[u8] = buf()
+    var pid: u32 = 0
+    while !from_utf8_lossy(got.view()).contains("hello over usb\r\n")
+        val p = in_packet(b, 9, 2)?
+        if p.pid != pid then return Err(s"bulk IN with DATA${p.pid} where DATA$pid was due")
+        pid ^= 1
+        for k in 0..<p.len do got.push(p.bytes[k])
+    var x: [1]u8 = [0x78]
+    out_packet(b, 9, 2, 0, x[0..<1])?
+    var tenths = 0
+    loop
+        val end = b.run(USB_TENTH_MS)
+        if end == RunEnd.Breakpoint then break
+        if end != RunEnd.Budget || tenths > 10000 then return Err(s"the run ended ($end): ${b.refused}")
+        tenths += 1
+    Ok(from_utf8_lossy(got.view()))
+
+@test("stdio_usb's CDC port carries bytes both ways once the host raises DTR: printf's line arrives on bulk IN 0x82 with alternating data PIDs, and a byte sent to bulk OUT 0x02 reaches getchar")
+arm_usb_cdc()
+    val b = arm_board(USB_SRAM)
+    b.boot(USB_PROGRAM).unwrap()
+    enumerate(b) match
+        Ok(_) -> ()
+        Err(why) -> return assert(false, why)
+    val got = use_cdc(b) match
+        Ok(s) -> s
+        Err(why) -> return assert(false, why)
+    assert(got.ends_with("hello over usb\r\n"), got)
+    val text = from_utf8_lossy(b.console.view())
+    assert(text.ends_with("configured\r\nhello over usb\r\ngot 120\r\n"), text)

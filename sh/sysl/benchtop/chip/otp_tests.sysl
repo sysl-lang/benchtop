@@ -1,0 +1,96 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2350.{FACTORY_IDS, ecc_encode, factory_otp}
+import sh.sysl.rp2350.otp as otp_reg
+import sh.sysl.rp2350.psm as psm_reg
+import sh.sysl.rp2350.watchdog as watchdog_reg
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// The OTP end to end on the Arm Pico 2: the SDK's program `examples/pico2/otp.c` reaching it through
+// Raspberry Pi's boot ROM (`otp_access`, `get_sys_info`), and the board's side of it (the factory image,
+// the chip ID the boot path copies, the array kept through a reset and started again by a boot).
+
+private val OTP_PROGRAM = embed("../../../../examples/pico2/otp.elf")
+private val RISCV_PROGRAM = embed("../../../../examples/pico2-riscv/blink.elf")
+
+private run_otp_program() -> (&ArmBoard, string)
+    val b = arm_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(OTP_PROGRAM).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 200 * 150000 do end = b.run(150000)
+    val text = from_utf8_lossy(b.console.view())
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}: $text")
+    (b, text)
+
+@test("the SDK reaching the OTP through Raspberry Pi's ROM: the chip ID three ways, a user row written with ECC and read back three ways, a raw row, a cleared bit refused, an ECC write over a set bit stored inverted, a read-only and an inaccessible page refused, the ROM's argument checks")
+otp_program()
+    val (b, text) = run_otp_program()
+    val want = "chip id: 5cd3 7a01 0e42 1b97\r\n" +
+        "get_sys_info: 4 words, package 0x1, device 0x7a015cd3, wafer 0x1b970e42\r\n" +
+        "get_sys_info: 3 words, flags 0x6, critical 0x0, cpu Arm\r\n" +
+        "otp_access chip id: 0, 5cd3 7a01 0e42 1b97\r\n" +
+        "user rows before: 0, 0000 0000\r\n" +
+        "ecc write: 0, read back 0, 1234 beef\r\n" +
+        "ecc window: 1234 beef, raw window: 191234 0ebeef\r\n" +
+        "raw write: 0, read back 0, a5a5c3\r\n" +
+        "clearing a bit: -18, row still a5a5c3\r\n" +
+        "codewords: 230001 250002 260004 070008 290010 2a0020 0b0040 2c0080 0d0100 0e0200 2f0400 310800 321000 132000 344000 158000\r\n" +
+        "ecc over a set bit: 0, raw c20001, read back 0, fffe\r\n" +
+        "read-only page: sw_lock 0x1, write -4, read 0, 0000\r\n" +
+        "inaccessible page: sw_lock 0x3, read -4, write -4\r\n" +
+        "locks only advance: sw_lock 0x3\r\n" +
+        "past the last row: -5, odd length: -11\r\n" +
+        "done\r\n"
+    assert(text == want, text)
+    // What the ROM programmed is in the array, the rows it was refused untouched.
+    assert(b.chip.otp.row(0x400) == 0x191234 && b.chip.otp.row(0x401) == 0x0EBEEF && b.chip.otp.row(0x402) == 0xA5A5C3)
+    assert(b.chip.otp.row(0x440) == 0 && b.chip.otp.row(0x480) == 0, "the locked pages were not programmed")
+
+@test("the ROM's own ECC encoder agrees with benchtop's, built from the datasheet's construction: each data bit alone, two mixed words, and the inverted form the ROM writes over a set bit")
+otp_rom_codewords()
+    val (_, text) = run_otp_program()
+    var want = "codewords:"
+    for i in 0u32..<16 do want = want + s" ${hex(ecc_encode(1u32 << i), 6)}"
+    assert(text.contains(want + "\r\n"), s"$want\n$text")
+    assert(text.contains(s"raw window: ${hex(ecc_encode(0x1234), 6)} ${hex(ecc_encode(0xBEEF), 6)}"))
+    assert(text.contains(s"raw ${hex(0xC00000 | (~ecc_encode(0xFFFE) & 0x3FFFFF), 6)},"), "BRBP: both bits set over the inverted codeword")
+
+@test("the watchdog's reset puts the OTP block's registers back where PSM.WDSEL selects the OTP stage, reloading SW_LOCK from the array, and leaves them where it does not; the rows survive both")
+otp_watchdog_reset()
+    var rows: [4096]u32
+    factory_otp(&rows)
+    rows[0xF80 + 2 * 4 + 1] = 0x010101
+    var c = rp2350()
+    c.otp.connect(&rows[0])
+    for (sel, kept) in [(psm_reg.WDSEL_OTP_MASK, false), (psm_reg.WDSEL_ROSC_MASK, true)]
+        c.write(0, otp_reg.BASE + 4 * 3, 4, 3).unwrap()
+        c.write(0, otp_reg.BASE + 4 * 4, 4, 2).unwrap()
+        c.write(0, psm_reg.BASE + psm_reg.WDSEL_OFFSET, 4, sel).unwrap()
+        c.write(0, watchdog_reg.BASE + watchdog_reg.CTRL_OFFSET, 4, watchdog_reg.CTRL_TRIGGER_MASK).unwrap()
+        assert(c.read(0, otp_reg.BASE + 4 * 3, 4).unwrap() == (if kept then 3 else 0), s"SW_LOCK3, WDSEL 0x${hex(sel)}")
+        assert(c.read(0, otp_reg.BASE + 4 * 4, 4).unwrap() == (if kept then 3 else 1), "SW_LOCK4 from its row")
+        assert(c.read(0, 0x40130000, 4).unwrap() == 0x7A015CD3)
+
+@test("the RISC-V Pico 2's OTP: the same factory image, ARCHSEL and ARCHSEL_STATUS reporting both cores RISC-V, and ARCHSEL refusing Arm")
+otp_riscv_board()
+    val b = riscv_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(RISCV_PROGRAM).unwrap()
+    assert(b.chip.read(0, 0x40130000, 4).unwrap() == 0x7A015CD3, "CHIPID0 and 1")
+    assert(b.chip.read(0, otp_reg.BASE + otp_reg.ARCHSEL_STATUS_OFFSET, 4).unwrap() == 3 && b.chip.read(0, otp_reg.BASE + otp_reg.ARCHSEL_OFFSET, 4).unwrap() == 3)
+    assert(b.chip.write(0, otp_reg.BASE + otp_reg.ARCHSEL_OFFSET, 4, 0).unwrap_err().contains("ARCHSEL = 0 picks an architecture other than the one each core runs (3)"))
+    b.chip.reset()
+    assert(b.chip.read(0, otp_reg.BASE + otp_reg.ARCHSEL_STATUS_OFFSET, 4).unwrap() == 3, "kept through a reset")
+
+@test("the board's OTP: the factory image (CHIPID and RANDID with their ECC, the rest blank) and BOOT_INFO's chip ID from it; a chip reset keeps the programmed rows, and SW_LOCK reloads from the array; a new boot starts from the factory again")
+otp_board()
+    val (b, _) = run_otp_program()
+    for i in 0u32..<12 do assert(b.otp_rows[usize(i)] == ecc_encode(FACTORY_IDS[usize(i)]), s"factory row $i")
+    assert(b.chip.bootram.words[usize(BOOTRAM_CHIP_ID / 4)] == 0x7A015CD3 && b.chip.bootram.words[usize(BOOTRAM_CHIP_ID / 4) + 1] == 0x1B970E42)
+    // The program's SW_LOCK writes go with the chip's reset; the rows it programmed stay.
+    b.chip.reset()
+    assert(b.chip.otp.row(0x400) == 0x191234, "kept through a reset")
+    assert(b.chip.read(0, otp_reg.BASE + 4 * (0x440 / 64), 4).unwrap() == 0, "SW_LOCK back to the lock row's, blank")
+    b.boot(OTP_PROGRAM).unwrap()
+    assert(b.otp_rows[0x400] == 0 && b.otp_rows[0] == ecc_encode(FACTORY_IDS[0]), "a boot is a new run, from the factory image")

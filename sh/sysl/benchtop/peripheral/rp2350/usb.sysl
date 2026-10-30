@@ -1,0 +1,510 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, triggered, w1c, written}
+import sh.sysl.rp2350.usb as reg
+import sh.sysl.rp2350.usb_device_dpram as dp
+import sysl.fmt.hex
+
+// USBCTRL, the USB controller (datasheet 12.7), in device mode (docs/rp-coverage.md Q4): its registers
+// at USBCTRL_REGS and its 4 KB of dual-port RAM at USBCTRL_DPRAM, which hold the SETUP packet, each
+// endpoint's control and buffer control words, and the data buffers.
+//
+// **The bus** is benchtop's own host, which drives it between runs one event or transaction at a time
+// (`attach`, `bus_reset`, `sof`, `setup`, `in_token`, `out_data`; the Arm board's `usb_*` methods make
+// them and let the cores see the interrupt). It is ideal: full speed, every packet arrives, and the host
+// acknowledges every one the device sends, so no CRC, bit-stuff, timeout or overflow error ever arises
+// and EP_TX_ERROR and EP_RX_ERROR read 0. The host keeps the bus out of suspend, so SUSPENDED and the
+// suspend and resume interrupts never assert.
+//
+// **Connection**: the device is on the bus while a host is attached, the controller is enabled in
+// device mode with its PHY out of isolation (MAIN_CTRL), the transceiver is powered (SIE_CTRL), the
+// controller is muxed to the PHY (USB_MUXING.TO_PHY), VBUS is detected and the pull-up is on. VBUS
+// is detected as USB_PWR's override says where it is enabled; otherwise, an assumption, as the host's
+// attachment says. SIE_STATUS.CONNECTED is that state, and each change latches DEV_CONN_DIS until a
+// write to SIE_STATUS.CONNECTED. While on the bus the device answers the address in ADDR_ENDP and no
+// other; a bus reset sets SIE_STATUS.BUS_RESET and leaves ADDR_ENDP alone (TinyUSB clears it itself).
+//
+// **Transactions**: a SETUP lands in DPRAM's first 8 bytes, sets SIE_STATUS.SETUP_REC and clears
+// EP_STALL_ARM, as its description says. An IN or OUT reaches endpoint 0, always enabled, or an endpoint
+// whose control word has ENABLE (one without is silent). EP_ABORT makes it NAK; a STALL in buffer
+// control (on endpoint 0 only with its EP_STALL_ARM bit) makes it STALL. Otherwise the endpoint's current
+// buffer answers: an IN sends its LENGTH bytes with its PID where AVAILABLE and FULL are set, then clears
+// both; an OUT is taken where AVAILABLE is set and FULL is not, its bytes written into the buffer, LENGTH
+// set to the count received and FULL set, AVAILABLE cleared; a buffer not available NAKs, and an
+// INTERRUPT_ON_NAK or INTERRUPT_ON_STALL (EP0_INT_NAK and EP0_INT_STALL for endpoint 0) sets the
+// endpoint's EP_STATUS_STALL_NAK bit. A completed buffer sets its BUFF_STATUS bit with an interrupt per
+// buffer, or with one per two buffers once buffer 1 completes; BUFF_CPU_SHOULD_HANDLE says which buffer
+// it was; LAST sets TRANS_COMPLETE. A double-buffered endpoint alternates between buffer 0 and buffer 1
+// (64 bytes on; endpoint 0's at 0x100 and 0x140) except after a short OUT packet, and a buffer control
+// word written with RESET goes back to buffer 0. An OUT with the wrong data PID sets DATA_SEQ_ERROR and is
+// acknowledged and dropped, as the USB specification has a device do (an assumption: the datasheet
+// names only the error). EP_ABORT_DONE sets as an EP_ABORT bit does: between transactions an endpoint
+// is always idle.
+//
+// **Interrupts**: INTR is each source as its description gives it, INTS is INTR or INTF masked by INTE,
+// and USBCTRL_IRQ is INTS != 0. A SOF sets SOF_RD and DEV_SOF, which a read of SOF_RD clears.
+//
+// **Refused by name**: host mode (MAIN_CTRL.HOST_NDEVICE, Q4: item 32); remote wake-up (SIE_CTRL.RESUME,
+// since the host never suspends); SIE_CTRL's direct drive of the lines (DIRECT_EN) and
+// EP0_STOP_ON_SHORT_PACKET; muxing to anything but the PHY (TO_EXTPHY, TO_DIGITAL_PAD,
+// USBPHY_AS_GPIO); USBPHY_DIRECT and a nonzero USBPHY_DIRECT_OVERRIDE; the SOF timestamps and SM_STATE;
+// DEV_SM_WATCHDOG.ENABLE; and, when a transaction reaches them, an isochronous endpoint, a LENGTH over
+// a full-speed packet's 64 bytes, a buffer past the end of DPRAM, an IN buffer AVAILABLE but not FULL,
+// an OUT buffer AVAILABLE and already FULL, and an OUT packet longer than the buffer's LENGTH. The
+// host-mode registers (ADDR_ENDP1–15, INT_EP_CTRL, SOF_WR, NAK_POLL) are stored, and do nothing in
+// device mode. LINE_STATE and SPEED read 0: the lines' levels are not modelled.
+
+/** USBCTRL_DPRAM's size in bytes. */
+const USB_DPRAM_BYTES: u32 = 4096
+
+/** The most bytes a full-speed control, bulk or interrupt packet carries. */
+const USB_PACKET_MAX: u32 = 64
+
+/** A data packet on the bus: its data PID (0 for DATA0, 1 for DATA1) and its bytes. */
+struct Packet
+    pid: u32
+    len: u32
+    bytes: [64]u8
+
+/** What the device answers an IN token with. */
+enum InReply
+    // A data packet, which the host acknowledges.
+    Data(packet: Packet)
+    Nak
+    Stall
+    // No answer: the device is not on the bus, not at that address, or the endpoint is not enabled.
+    Silent
+
+/** The device's handshake to a SETUP or an OUT. */
+enum Handshake
+    Ack
+    Nak
+    Stall
+    Silent
+
+// Buffer control: buffer 0's fields, which buffer 1's repeat 16 bits up.
+private const BUF_FULL: u32 = dp.EP0_IN_BUFFER_CONTROL_FULL_0_MASK
+private const BUF_LAST: u32 = dp.EP0_IN_BUFFER_CONTROL_LAST_0_MASK
+private const BUF_PID: u32 = dp.EP0_IN_BUFFER_CONTROL_PID_0_MASK
+private const BUF_RESET: u32 = dp.EP0_IN_BUFFER_CONTROL_RESET_MASK
+private const BUF_STALL: u32 = dp.EP0_IN_BUFFER_CONTROL_STALL_MASK
+private const BUF_AVAILABLE: u32 = dp.EP0_IN_BUFFER_CONTROL_AVAILABLE_0_MASK
+private const BUF_LENGTH: u32 = dp.EP0_IN_BUFFER_CONTROL_LENGTH_0_MASK
+
+// Where endpoint 0's buffer 0 sits; buffer 1 follows it.
+private const EP0_BUFFER: u32 = 0x100
+
+// SIE_CTRL's self-clearing controls: RESET_BUS, RESUME, STOP_TRANS and START_TRANS.
+private const SIE_CTRL_SC: u32 = reg.SIE_CTRL_RESET_BUS_MASK | reg.SIE_CTRL_RESUME_MASK | reg.SIE_CTRL_STOP_TRANS_MASK | reg.SIE_CTRL_START_TRANS_MASK
+
+// SIE_STATUS's flags the controller sets and a 1 written clears.
+private const SIE_STATUS_WC: u32 = reg.SIE_STATUS_DATA_SEQ_ERROR_MASK | reg.SIE_STATUS_ACK_REC_MASK | reg.SIE_STATUS_STALL_REC_MASK | reg.SIE_STATUS_NAK_REC_MASK | reg.SIE_STATUS_RX_TIMEOUT_MASK | reg.SIE_STATUS_RX_OVERFLOW_MASK | reg.SIE_STATUS_BIT_STUFF_ERROR_MASK | reg.SIE_STATUS_CRC_ERROR_MASK | reg.SIE_STATUS_ENDPOINT_ERROR_MASK | reg.SIE_STATUS_BUS_RESET_MASK | reg.SIE_STATUS_TRANS_COMPLETE_MASK | reg.SIE_STATUS_SETUP_REC_MASK | reg.SIE_STATUS_RX_SHORT_PACKET_MASK | reg.SIE_STATUS_RESUME_MASK | reg.SIE_STATUS_SUSPENDED_MASK
+
+// MAIN_CTRL's fields: SIM_TIMING, PHY_ISO, HOST_NDEVICE and CONTROLLER_EN.
+private const MAIN_CTRL_FIELDS: u32 = reg.MAIN_CTRL_SIM_TIMING_MASK | reg.MAIN_CTRL_PHY_ISO_MASK | reg.MAIN_CTRL_HOST_NDEVICE_MASK | reg.MAIN_CTRL_CONTROLLER_EN_MASK
+
+/** One endpoint as a transaction finds it. */
+private struct Endpoint
+    // Its bit in BUFF_STATUS, EP_ABORT and the other per-endpoint registers: 2n for IN, 2n + 1 for OUT.
+    index: u32
+    double: bool
+    per_buffer: bool
+    per_two: bool
+    on_nak: bool
+    on_stall: bool
+    // Buffer 0's offset in DPRAM.
+    buffer: u32
+
+/** USBCTRL's registers and DPRAM. */
+struct UsbCtrl
+    dpram: [1024]u32
+    // ADDR_ENDP, then ADDR_ENDP1 to 15.
+    addr: [16]u32
+    main_ctrl: u32
+    sof_wr: u32
+    sof_rd: u32
+    sie_ctrl: u32
+    // SIE_STATUS's write-1-to-clear flags; VBUS_DETECTED and CONNECTED are worked out on a read.
+    sie_status: u32
+    int_ep_ctrl: u32
+    buff_status: u32
+    buff_handle: u32
+    ep_abort: u32
+    ep_abort_done: u32
+    ep_stall_arm: u32
+    nak_poll: u32
+    ep_status_stall_nak: u32
+    muxing: u32
+    pwr: u32
+    phy_trim: u32
+    linestate_tuning: u32
+    inte: u32
+    intf: u32
+    dev_sm_watchdog: u32
+    // A SOF has arrived since SOF_RD was last read (INTR.DEV_SOF).
+    dev_sof: bool
+    // The connection has changed since a write to SIE_STATUS.CONNECTED (INTR.DEV_CONN_DIS).
+    conn_changed: bool
+    connected: bool
+    // A host is attached to the bus: the host's, kept over the controller's reset.
+    attached: bool
+    // Bit n: endpoint index n's next buffer is buffer 1.
+    second: u32
+
+    /** Power-on: the registers at their reset values and DPRAM cleared, with no host attached. */
+    reset(*self)
+        for i in 0..<1024 do self.dpram[i] = 0
+        self.attached = false
+        self.reset_controller()
+
+    /** RESETS has reset the controller: its registers go back to their reset values; DPRAM keeps its
+     * contents, as a RAM does, and a host stays attached.
+     */
+    reset_controller(*self)
+        for i in 0..<16 do self.addr[i] = 0
+        self.main_ctrl = reg.MAIN_CTRL_PHY_ISO_MASK
+        self.sof_wr = 0
+        self.sof_rd = 0
+        self.sie_ctrl = reg.SIE_CTRL_PULLDOWN_EN_MASK
+        self.sie_status = 0
+        self.int_ep_ctrl = 0
+        self.buff_status = 0
+        self.buff_handle = 0
+        self.ep_abort = 0
+        self.ep_abort_done = 0
+        self.ep_stall_arm = 0
+        self.nak_poll = 0x00100010
+        self.ep_status_stall_nak = 0
+        self.muxing = reg.USB_MUXING_TO_PHY_MASK
+        self.pwr = 0
+        self.phy_trim = 0x00001f1f
+        self.linestate_tuning = 0xf8
+        self.inte = 0
+        self.intf = 0
+        self.dev_sm_watchdog = 0
+        self.dev_sof = false
+        self.conn_changed = false
+        self.connected = false
+        self.second = 0
+
+    /** Whether VBUS is detected: USB_PWR's override where it is enabled, otherwise the host's attachment. */
+    vbus(*self) -> bool =
+        if self.pwr & reg.USB_PWR_VBUS_DETECT_OVERRIDE_EN_MASK != 0 then self.pwr & reg.USB_PWR_VBUS_DETECT_MASK != 0 else self.attached
+
+    // Whether the device is on the bus as things stand.
+    private on_bus(*self) -> bool
+        if !self.attached || !self.vbus() then return false
+        if self.main_ctrl & (reg.MAIN_CTRL_CONTROLLER_EN_MASK | reg.MAIN_CTRL_HOST_NDEVICE_MASK | reg.MAIN_CTRL_PHY_ISO_MASK) != reg.MAIN_CTRL_CONTROLLER_EN_MASK then return false
+        if self.sie_ctrl & (reg.SIE_CTRL_PULLUP_EN_MASK | reg.SIE_CTRL_TRANSCEIVER_PD_MASK) != reg.SIE_CTRL_PULLUP_EN_MASK then return false
+        self.muxing & reg.USB_MUXING_TO_PHY_MASK != 0
+
+    // Follow the connection, latching DEV_CONN_DIS where it changed.
+    private track(*self)
+        val now = self.on_bus()
+        if now != self.connected
+            self.connected = now
+            self.conn_changed = true
+
+    /** INTR: each raw interrupt as its source has it. */
+    intr(*self) -> u32
+        val s = self.sie_status
+        var r: u32 = 0
+        if s & reg.SIE_STATUS_SETUP_REC_MASK != 0 then r |= reg.INTR_SETUP_REQ_MASK
+        if s & reg.SIE_STATUS_BUS_RESET_MASK != 0 then r |= reg.INTR_BUS_RESET_MASK
+        if s & reg.SIE_STATUS_TRANS_COMPLETE_MASK != 0 then r |= reg.INTR_TRANS_COMPLETE_MASK
+        if s & reg.SIE_STATUS_DATA_SEQ_ERROR_MASK != 0 then r |= reg.INTR_ERROR_DATA_SEQ_MASK
+        if s & reg.SIE_STATUS_RX_SHORT_PACKET_MASK != 0 then r |= reg.INTR_RX_SHORT_PACKET_MASK
+        if self.buff_status != 0 then r |= reg.INTR_BUFF_STATUS_MASK
+        if self.ep_status_stall_nak != 0 then r |= reg.INTR_EP_STALL_NAK_MASK
+        if self.ep_abort_done != 0 then r |= reg.INTR_ABORT_DONE_MASK
+        if self.dev_sof then r |= reg.INTR_DEV_SOF_MASK
+        if self.conn_changed then r |= reg.INTR_DEV_CONN_DIS_MASK
+        if self.vbus() then r |= reg.INTR_VBUS_DETECT_MASK
+        r
+
+    /** USBCTRL_IRQ's level. */
+    irq(*self) -> bool = self.inte != 0 && (self.intr() | self.intf) & self.inte != 0
+
+    /** Why a read at `offset` is refused by name, where it is. */
+    unmodelled_read(*self, offset: u32) -> Option[string]
+        val a = offset & 0xFFC
+        if a == reg.SOF_TIMESTAMP_RAW_OFFSET || a == reg.SOF_TIMESTAMP_LAST_OFFSET then return Some("the SOF timestamps (the PHY clock's count at each SOF) are not modelled")
+        if a == reg.SM_STATE_OFFSET then return Some("the controller's state machines (SM_STATE) are not modelled")
+        if a == reg.USBPHY_DIRECT_OFFSET then return Some("driving and reading the PHY's lines directly (USBPHY_DIRECT) is not modelled")
+        None
+
+    /** Why a write of `value` at `offset` is refused by name, where it is. */
+    unmodelled(*self, offset: u32, width: u32, value: u32) -> Option[string]
+        access(offset, width, true) match
+            Ok(_) -> ()
+            Err(_) -> return None
+        val a = offset & 0xFFC
+        val data = replicated(value, width)
+        if a == reg.MAIN_CTRL_OFFSET && written(self.main_ctrl, offset, data) & reg.MAIN_CTRL_HOST_NDEVICE_MASK != 0
+            return Some("MAIN_CTRL.HOST_NDEVICE: host mode is not modelled, only device mode (docs/rp-coverage.md Q4, item 32)")
+        if a == reg.SIE_CTRL_OFFSET
+            val next = written(self.sie_ctrl, offset, data)
+            if triggered(offset, data) & reg.SIE_CTRL_RESUME_MASK != 0 then return Some("SIE_CTRL.RESUME: remote wake-up is not modelled, as benchtop's host never suspends the bus")
+            if next & reg.SIE_CTRL_DIRECT_EN_MASK != 0 then return Some("SIE_CTRL.DIRECT_EN: driving the lines directly is not modelled")
+            if next & reg.SIE_CTRL_EP0_STOP_ON_SHORT_PACKET_MASK != 0 then return Some("SIE_CTRL.EP0_STOP_ON_SHORT_PACKET is not modelled")
+        if a == reg.USB_MUXING_OFFSET
+            val routed = written(self.muxing, offset, data) & (reg.USB_MUXING_TO_EXTPHY_MASK | reg.USB_MUXING_TO_DIGITAL_PAD_MASK | reg.USB_MUXING_USBPHY_AS_GPIO_MASK)
+            if routed != 0 then return Some("USB_MUXING: routing the controller to an external PHY, the digital pads or the PHY's pins as GPIOs is not modelled, only to the PHY")
+        if a == reg.USBPHY_DIRECT_OFFSET then return Some("driving and reading the PHY's lines directly (USBPHY_DIRECT) is not modelled")
+        if a == reg.USBPHY_DIRECT_OVERRIDE_OFFSET && written(0, offset, data) != 0 then return Some("USBPHY_DIRECT_OVERRIDE: overriding the PHY's controls is not modelled")
+        if a == reg.DEV_SM_WATCHDOG_OFFSET && written(self.dev_sm_watchdog, offset, data) & reg.DEV_SM_WATCHDOG_ENABLE_MASK != 0
+            return Some("DEV_SM_WATCHDOG.ENABLE: the device state machine's watchdog is not modelled")
+        None
+    end unmodelled
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val a = offset & 0xFFC
+        // Reading SOF_RD clears DEV_SOF.
+        if a == reg.SOF_RD_OFFSET then self.dev_sof = false
+        val value =
+            if a < reg.MAIN_CTRL_OFFSET then self.addr[a >> 2]
+            elif a == reg.MAIN_CTRL_OFFSET then self.main_ctrl
+            elif a == reg.SOF_WR_OFFSET then self.sof_wr
+            elif a == reg.SOF_RD_OFFSET then self.sof_rd
+            elif a == reg.SIE_CTRL_OFFSET then self.sie_ctrl
+            elif a == reg.SIE_STATUS_OFFSET then self.sie_status_now()
+            elif a == reg.INT_EP_CTRL_OFFSET then self.int_ep_ctrl
+            elif a == reg.BUFF_STATUS_OFFSET then self.buff_status
+            elif a == reg.BUFF_CPU_SHOULD_HANDLE_OFFSET then self.buff_handle
+            elif a == reg.EP_ABORT_OFFSET then self.ep_abort
+            elif a == reg.EP_ABORT_DONE_OFFSET then self.ep_abort_done
+            elif a == reg.EP_STALL_ARM_OFFSET then self.ep_stall_arm
+            elif a == reg.NAK_POLL_OFFSET then self.nak_poll
+            elif a == reg.EP_STATUS_STALL_NAK_OFFSET then self.ep_status_stall_nak
+            elif a == reg.USB_MUXING_OFFSET then self.muxing
+            elif a == reg.USB_PWR_OFFSET then self.pwr
+            elif a == reg.USBPHY_DIRECT_OVERRIDE_OFFSET then 0
+            elif a == reg.USBPHY_TRIM_OFFSET then self.phy_trim
+            elif a == reg.LINESTATE_TUNING_OFFSET then self.linestate_tuning
+            elif a == reg.INTR_OFFSET then self.intr()
+            elif a == reg.INTE_OFFSET then self.inte
+            elif a == reg.INTF_OFFSET then self.intf
+            elif a == reg.INTS_OFFSET then (self.intr() | self.intf) & self.inte
+            elif a == reg.EP_TX_ERROR_OFFSET || a == reg.EP_RX_ERROR_OFFSET then 0
+            elif a == reg.DEV_SM_WATCHDOG_OFFSET then self.dev_sm_watchdog
+            else return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+    end read
+
+    // SIE_STATUS as a read finds it.
+    private sie_status_now(*self) -> u32
+        var s = self.sie_status
+        if self.vbus() then s |= reg.SIE_STATUS_VBUS_DETECTED_MASK
+        if self.connected then s |= reg.SIE_STATUS_CONNECTED_MASK
+        s
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val a = offset & 0xFFC
+        val data = replicated(value, width)
+        if a < reg.MAIN_CTRL_OFFSET then self.addr[a >> 2] = written(self.addr[a >> 2], offset, data)
+        elif a == reg.MAIN_CTRL_OFFSET then self.main_ctrl = written(self.main_ctrl, offset, data) & MAIN_CTRL_FIELDS
+        elif a == reg.SOF_WR_OFFSET then self.sof_wr = written(self.sof_wr, offset, data) & 0x7FF
+        elif a == reg.SIE_CTRL_OFFSET
+            // Its self-clearing controls act on a host's transfers and read back as 0.
+            self.sie_ctrl = written(self.sie_ctrl, offset, data) & ~SIE_CTRL_SC
+        elif a == reg.SIE_STATUS_OFFSET
+            self.sie_status = w1c(self.sie_status, data & SIE_STATUS_WC)
+            if data & reg.SIE_STATUS_CONNECTED_MASK != 0 then self.conn_changed = false
+        elif a == reg.INT_EP_CTRL_OFFSET then self.int_ep_ctrl = written(self.int_ep_ctrl, offset, data) & 0xFFFE
+        elif a == reg.BUFF_STATUS_OFFSET then self.buff_status = w1c(self.buff_status, data)
+        elif a == reg.EP_ABORT_OFFSET
+            val next = written(self.ep_abort, offset, data)
+            // Between transactions every endpoint is idle, so an abort is done as it is asked for.
+            self.ep_abort_done |= next & ~self.ep_abort
+            self.ep_abort = next
+        elif a == reg.EP_ABORT_DONE_OFFSET then self.ep_abort_done = w1c(self.ep_abort_done, data)
+        elif a == reg.EP_STALL_ARM_OFFSET then self.ep_stall_arm = written(self.ep_stall_arm, offset, data) & 3
+        elif a == reg.NAK_POLL_OFFSET then self.nak_poll = written(self.nak_poll, offset, data)
+        elif a == reg.EP_STATUS_STALL_NAK_OFFSET then self.ep_status_stall_nak = w1c(self.ep_status_stall_nak, data)
+        elif a == reg.USB_MUXING_OFFSET then self.muxing = written(self.muxing, offset, data) & 0x8000001F
+        elif a == reg.USB_PWR_OFFSET then self.pwr = written(self.pwr, offset, data) & 0x3F
+        elif a == reg.USBPHY_DIRECT_OVERRIDE_OFFSET then ()
+        elif a == reg.USBPHY_TRIM_OFFSET then self.phy_trim = written(self.phy_trim, offset, data) & 0x1F1F
+        elif a == reg.LINESTATE_TUNING_OFFSET then self.linestate_tuning = written(self.linestate_tuning, offset, data) & 0xFFF
+        elif a == reg.INTE_OFFSET then self.inte = written(self.inte, offset, data) & 0xFFFFFF
+        elif a == reg.INTF_OFFSET then self.intf = written(self.intf, offset, data) & 0xFFFFFF
+        elif a == reg.EP_TX_ERROR_OFFSET || a == reg.EP_RX_ERROR_OFFSET then ()
+        elif a == reg.DEV_SM_WATCHDOG_OFFSET
+            val next = written(self.dev_sm_watchdog, offset, data)
+            self.dev_sm_watchdog = next & (reg.DEV_SM_WATCHDOG_LIMIT_MASK | reg.DEV_SM_WATCHDOG_ENABLE_MASK | reg.DEV_SM_WATCHDOG_RESET_MASK)
+        else return Err(AccessError.Unmapped)
+        self.track()
+        Ok(())
+    end write
+
+    /** A read of `width` bytes at `offset` into DPRAM, which has no atomic aliases. */
+    dpram_read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, false)?
+        Ok(read_lane(self.dpram[offset >> 2], offset, width))
+
+    /** A write into DPRAM. A buffer control word written with RESET sends its endpoint back to buffer 0. */
+    dpram_write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, false)?
+        val i = offset >> 2
+        val lanes: u32 = if width == 4 then 0xFFFFFFFF else ((1u32 << (width * 8)) - 1) << ((offset & 3) * 8)
+        self.dpram[i] = (self.dpram[i] & ~lanes) | (replicated(value, width) & lanes)
+        if offset >= dp.EP0_IN_BUFFER_CONTROL_OFFSET && offset < 0x100 && lanes & BUF_RESET != 0 && self.dpram[i] & BUF_RESET != 0
+            self.second &= ~(1u32 << ((offset - dp.EP0_IN_BUFFER_CONTROL_OFFSET) >> 2))
+        Ok(())
+
+    // ---- The bus, as benchtop's host drives it ----
+
+    /** The host attaches to the bus, or detaches from it. */
+    attach(*self, on: bool)
+        self.attached = on
+        self.track()
+
+    /** The host resets the bus: a device on it sees SIE_STATUS.BUS_RESET. */
+    bus_reset(*self)
+        if self.connected then self.sie_status |= reg.SIE_STATUS_BUS_RESET_MASK
+
+    /** A start of frame numbered `frame`. */
+    sof(*self, frame: u32)
+        if !self.connected then return
+        self.sof_rd = frame & 0x7FF
+        self.dev_sof = true
+
+    // Whether a transaction to `address` reaches the device.
+    private answers(*self, address: u32) -> bool = self.connected && address == self.addr[0] & reg.ADDR_ENDP_ADDRESS_MASK
+
+    /** A SETUP to `address` with its 8 bytes. */
+    setup(*self, address: u32, packet: [8]u8) -> Handshake
+        if !self.answers(address) then return Handshake.Silent
+        for k in 0u32..<2
+            val b = 4 * k
+            self.dpram[k] = u32(packet[b]) | (u32(packet[b + 1]) << 8) | (u32(packet[b + 2]) << 16) | (u32(packet[b + 3]) << 24)
+        self.sie_status |= reg.SIE_STATUS_SETUP_REC_MASK
+        self.ep_stall_arm = 0
+        // Endpoint 0 starts the control transfer from buffer 0 (an assumption).
+        self.second &= ~3u32
+        Handshake.Ack
+
+    /** An IN token to `address`, endpoint `ep`: the packet the device sends, or its handshake. */
+    in_token(*self, address: u32, ep: u32) -> Result[InReply, string]
+        if !self.answers(address) || ep > 15 then return Ok(InReply.Silent)
+        val e = self.endpoint(ep, false)? match
+            Some(found) -> found
+            None -> return Ok(InReply.Silent)
+        val ctl = usize((dp.EP0_IN_BUFFER_CONTROL_OFFSET >> 2) + e.index)
+        val bc = self.dpram[ctl]
+        if self.ep_abort & (1u32 << e.index) != 0
+            self.nakked(e)
+            return Ok(InReply.Nak)
+        if self.stalls(e, bc)
+            self.stalled(e)
+            return Ok(InReply.Stall)
+        val b = self.buffer_of(e)
+        val half = bc >> (16 * b)
+        if half & BUF_AVAILABLE == 0
+            self.nakked(e)
+            return Ok(InReply.Nak)
+        if half & BUF_FULL == 0 then return Err(s"EP$ep IN buffer $b is AVAILABLE but not FULL, which is not modelled")
+        val len = half & BUF_LENGTH
+        val at = self.data_at(e, b, len, ep, "IN")?
+        var p: Packet
+        p.pid = if half & BUF_PID != 0 then 1 else 0
+        p.len = len
+        for k in 0..<len do p.bytes[k] = u8.wrap(self.dpram[(at + k) >> 2] >> (((at + k) & 3) * 8))
+        self.dpram[ctl] = bc & ~((BUF_AVAILABLE | BUF_FULL) << (16 * b))
+        self.completed(e, b, half, true)
+        Ok(InReply.Data(p))
+    end in_token
+
+    /** An OUT to `address`, endpoint `ep`, with a data packet of PID `pid` (0 or 1) and `data`. */
+    out_data(*self, address: u32, ep: u32, pid: u32, data: []const u8) -> Result[Handshake, string]
+        if data.len > usize(USB_PACKET_MAX) then return Err(s"an OUT packet of ${data.len} bytes: a full-speed packet carries at most $USB_PACKET_MAX")
+        if !self.answers(address) || ep > 15 then return Ok(Handshake.Silent)
+        val e = self.endpoint(ep, true)? match
+            Some(found) -> found
+            None -> return Ok(Handshake.Silent)
+        val ctl = usize((dp.EP0_IN_BUFFER_CONTROL_OFFSET >> 2) + e.index)
+        val bc = self.dpram[ctl]
+        if self.ep_abort & (1u32 << e.index) != 0
+            self.nakked(e)
+            return Ok(Handshake.Nak)
+        if self.stalls(e, bc)
+            self.stalled(e)
+            return Ok(Handshake.Stall)
+        val b = self.buffer_of(e)
+        val half = bc >> (16 * b)
+        if half & BUF_AVAILABLE == 0
+            self.nakked(e)
+            return Ok(Handshake.Nak)
+        if half & BUF_FULL != 0 then return Err(s"EP$ep OUT buffer $b is AVAILABLE and already FULL, which is not modelled")
+        if (half & BUF_PID != 0) != (pid != 0)
+            // The wrong data PID: acknowledged and dropped.
+            self.sie_status |= reg.SIE_STATUS_DATA_SEQ_ERROR_MASK
+            return Ok(Handshake.Ack)
+        val room = half & BUF_LENGTH
+        val len = u32(data.len)
+        if len > room then return Err(s"EP$ep OUT: a packet of $len bytes into buffer $b, whose LENGTH is $room: what the controller does with the overflow is not modelled")
+        val at = self.data_at(e, b, room, ep, "OUT")?
+        for k in 0..<len
+            val i = (at + k) >> 2
+            val shift = ((at + k) & 3) * 8
+            self.dpram[i] = (self.dpram[i] & ~(0xFFu32 << shift)) | (u32(data[k]) << shift)
+        val kept = (half & ~(BUF_AVAILABLE | BUF_LENGTH)) | BUF_FULL | len
+        self.dpram[ctl] = (bc & ~(0xFFFFu32 << (16 * b))) | ((kept & 0xFFFF) << (16 * b))
+        val short = len < room
+        if short then self.sie_status |= reg.SIE_STATUS_RX_SHORT_PACKET_MASK
+        self.completed(e, b, half, !short)
+        Ok(Handshake.Ack)
+    end out_data
+
+    // Endpoint `ep` in the direction `out`, or None where it is not enabled.
+    private endpoint(*self, ep: u32, out: bool) -> Result[Option[Endpoint], string]
+        val index = 2 * ep + (if out then 1 else 0)
+        if ep == 0
+            val s = self.sie_ctrl
+            return Ok(Some(Endpoint(index, s & reg.SIE_CTRL_EP0_DOUBLE_BUF_MASK != 0, s & reg.SIE_CTRL_EP0_INT_1BUF_MASK != 0,
+                s & reg.SIE_CTRL_EP0_INT_2BUF_MASK != 0, s & reg.SIE_CTRL_EP0_INT_NAK_MASK != 0, s & reg.SIE_CTRL_EP0_INT_STALL_MASK != 0, EP0_BUFFER)))
+        val c = self.dpram[(dp.EP1_IN_CONTROL_OFFSET >> 2) + index - 2]
+        if c & dp.EP1_IN_CONTROL_ENABLE_MASK == 0 then return Ok(None)
+        if (c & dp.EP1_IN_CONTROL_ENDPOINT_TYPE_MASK) >> dp.EP1_IN_CONTROL_ENDPOINT_TYPE_SHIFT == dp.EP1_IN_CONTROL_ENDPOINT_TYPE_ISOCHRONOUS
+            return Err(s"EP$ep ${if out then "OUT" else "IN"} is isochronous, which is not modelled")
+        // BUFFER_ADDRESS is 64-byte aligned: its low six bits are ignored.
+        Ok(Some(Endpoint(index, c & dp.EP1_IN_CONTROL_DOUBLE_BUFFERED_MASK != 0, c & dp.EP1_IN_CONTROL_INTERRUPT_PER_BUFF_MASK != 0,
+            c & dp.EP1_IN_CONTROL_INTERRUPT_PER_DOUBLE_BUFF_MASK != 0, c & dp.EP1_IN_CONTROL_INTERRUPT_ON_NAK_MASK != 0,
+            c & dp.EP1_IN_CONTROL_INTERRUPT_ON_STALL_MASK != 0, c & dp.EP1_IN_CONTROL_BUFFER_ADDRESS_MASK & ~0x3Fu32)))
+
+    // Whether the endpoint STALLs: buffer control's STALL, and on endpoint 0 its EP_STALL_ARM bit too.
+    private stalls(*self, e: Endpoint, bc: u32) -> bool
+        if bc & BUF_STALL == 0 then return false
+        e.index >= 2 || self.ep_stall_arm & (1u32 << e.index) != 0
+
+    // The buffer the endpoint uses next: 1 only when double-buffered and buffer 0 last completed.
+    private buffer_of(*self, e: Endpoint) -> u32 = if e.double && self.second & (1u32 << e.index) != 0 then 1 else 0
+
+    // Buffer `b`'s offset in DPRAM for `len` bytes, refused where LENGTH is more than a packet or the
+    // buffer runs past DPRAM's end.
+    private data_at(*self, e: Endpoint, b: u32, len: u32, ep: u32, dir: string) -> Result[u32, string]
+        if len > USB_PACKET_MAX then return Err(s"EP$ep $dir buffer $b has LENGTH $len, more than a full-speed packet's $USB_PACKET_MAX bytes, which is not modelled")
+        val at = e.buffer + USB_PACKET_MAX * b
+        if at + USB_PACKET_MAX > USB_DPRAM_BYTES then return Err(s"EP$ep $dir buffer $b at DPRAM offset 0x${hex(at)} runs past DPRAM's 4 KB")
+        Ok(at)
+
+    // Buffer `b` (its fields `half` before it completed) has completed: BUFF_STATUS where the endpoint
+    // interrupts for it, TRANS_COMPLETE for a LAST buffer, and the next buffer where double-buffered.
+    private completed(*self, e: Endpoint, b: u32, half: u32, toggle: bool)
+        val bit = 1u32 << e.index
+        if half & BUF_LAST != 0 then self.sie_status |= reg.SIE_STATUS_TRANS_COMPLETE_MASK
+        if e.per_buffer || (e.per_two && b == 1)
+            self.buff_status |= bit
+            self.buff_handle = if b == 1 then self.buff_handle | bit else self.buff_handle & ~bit
+        if e.double && toggle then self.second ^= bit
+
+    private nakked(*self, e: Endpoint) = if e.on_nak then self.ep_status_stall_nak |= 1u32 << e.index
+    private stalled(*self, e: Endpoint) = if e.on_stall then self.ep_status_stall_nak |= 1u32 << e.index
+end UsbCtrl
+
+usb_ctrl() -> UsbCtrl
+    var state: UsbCtrl
+    state.reset()
+    state
