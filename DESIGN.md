@@ -1088,9 +1088,12 @@ The VCP's line goes to one of three back-ends (`--uart`):
   a REPL in the terminal benchtop runs in. Ctrl-] leaves.
 - **`pty`**: benchtop opens a pseudo-terminal and prints its `/dev/ttys…` name, so `screen`, `picocom`
   or a host tool that expects a serial device attaches as it would to the real ST-LINK VCP. The
-  pty's baud setting is ignored; the guest's BRR governs timing. **`posix_openpt`, `grantpt`,
-  `unlockpt` and `ptsname` are missing from `cstd`** (`cstd/POSIX.md` lists them as missing), so this
-  back-end waits on them (§8).
+  pty's baud setting is ignored; the guest's BRR governs timing. The pseudo-terminal is
+  `host/pty.sysl` over a POSIX shim beside it (`host/__posix__/pty.c`): `posix_openpt`, `grantpt`,
+  `unlockpt` and `ptsname` open it, `cfmakeraw` makes its terminal side raw (no echo, no translation,
+  no signals), the controlling side is non-blocking, and benchtop holds the terminal side open itself
+  so a program that opens and closes it does not hang it up. Bytes are exchanged between runs of the
+  board. The Pico 2's USB serial port uses it today (`benchtop run --usb pty`).
 - **`tcp:PORT`**: a raw socket, for scripted tests (`sysl.net`).
 
 Tests also use `--expect "line" --timeout 10s`, which exits 0 when every expected line has appeared
@@ -1384,7 +1387,7 @@ None is designed around. Each goes to the `sysl` session (or `cstd`) as the org'
 | # | what | evidence | what benchtop needs | kind |
 |---|---|---|---|---|
 | G1 | **WITHDRAWN: not a gap.** A guaranteed tail call between functions, for a tail-calling interpreter (each handler ends by jumping to the next one's, the shape wasm3 and CPython 3.14 use). The claim was made from `@tailrec` (`attributes.md`), which is about a function's call to itself. sysl has `become`, a guaranteed tail call between functions (LLVM `musttail`), and `sysl-lang/forth`'s interpreter is built on it | the org's own program | a tail-calling dispatch as the alternative to §2.3's `match` loop, chosen by measurement | withdrawn |
-| G2 | **`posix_openpt`/`grantpt`/`unlockpt`/`ptsname` missing** from `cstd` (`cstd/POSIX.md`: "missing") | read | the pty back-end of §3.2 | **library gap**: add them to `cstd` (its POSIX-complete project) |
+| G2 | **WITHDRAWN: not a gap.** A pseudo-terminal needs `posix_openpt`, `grantpt`, `unlockpt`, `ptsname` and termios, which `cstd` does not carry; benchtop is hosted, so a C file beside the module that declares the `extern`s reaches the system's own (`host/__posix__/pty.c`, under `host/pty.sysl`) | the built pty back-end and its tests (`host/pty_tests.sysl`) | the pty back-end of §3.2 | withdrawn |
 | G3 | Is a capture-free named function stored as `&Fn` a plain code pointer, or a counted box? (`types.md`: "no separate function-pointer concept") | probe | not needed by the `match` design; matters if a table of 450 handlers is ever wanted, and for G1's alternative | probe |
 | G4 | Can reflection (`T::Fields`) derive a register block's offset-to-field `read`/`write` dispatch, so a device is written once against its struct? | probe | otherwise every device repeats its layout as a `match` on offsets; the generator can write that, but a language that can derive it is the pleasant answer | probe |
 | G5 | AArch64 FPCR/FPSR as system registers in a **hosted** build (the compiler supports AArch64 sysregs) | probe | §2.1's host-FPU mapping of FPSCR modes and flags | probe |
