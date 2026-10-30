@@ -903,7 +903,8 @@ in a 9-byte and an 84-byte read, string descriptors 0 to 4, SET_CONFIGURATION; e
 ELF's own `usbd_desc_device` and `usbd_desc_cfg` and the strings in `stdio_usb_descriptors.c` (the
 serial number with the one the program prints). Then SET_CONTROL_LINE_STATE raises DTR, the program's
 line arrives on bulk IN 0x82 with alternating PIDs, and a byte written to bulk OUT 0x02 reaches its
-`getchar`. The serial number reads 0000000000000000: the unique ID comes from OTP (item 26).
+`getchar`. The serial number is the OTP's chip ID, 1B970E427A015CD3, through `get_sys_info`'s CHIP_INFO
+(item 26).
 
 **Cost**, host instructions retired, three runs each against the branch's base. DPRAM's 4 KB inside
 `Rp2350` first cost 3% on the loops and 10% on `dcp.elf` (`sram_loop.elf` 5.645 G to 5.831 G): the
@@ -912,3 +913,63 @@ chip's read-only methods took `self` by value, which copies the whole chip, and 
 pin and drive queries) and the controller's own (`irq` on every signal) now take `*self`. With that:
 `bench --core cortex-m33 kernel33.bin` 37.14 G to 37.14 G; `sram_loop.elf` 5.645 G to 5.201 G and
 `xip_loop.elf` 5.868 G to 5.421 G (8% fewer); `dcp.elf` 1.110 G to 0.960 G (14% fewer).
+
+### Item 26, done: the OTP
+
+Q10 decided "OTP with ECC": the array with its ECC, the read windows, the control registers, and access
+from Raspberry Pi's boot ROM (`peripheral/rp2350/otp.sysl`, wired in `chip/rp2350.sysl`).
+
+**Persistence: per run, as the flash is.** The array (4096 words, a row in the low 24 bits of each) is
+the board's (`ArmBoard.otp_rows`, `RiscvBoard.otp_rows`), connected to the chip as the flash's array is.
+Each `boot` starts it from the factory image (`factory_otp`): CHIPID0–3 and RANDID0–7 programmed with
+their ECC, benchtop's own fixed values (no real chip's), the rest blank. A chip reset, the watchdog's and
+POWMAN's power-up keep it; nothing is written to a file.
+
+**What is modelled:**
+
+| what | model |
+|---|---|
+| the four windows | OTP_DATA and _GUARDED: 16 bits a row through the ECC, two rows a word; _RAW and _RAW_GUARDED: 24 bits a row; every width and lane |
+| the ECC | the datasheet's SECDED: data bit j at the j-th Hamming position that is not a power of two, ECC bit 5 the parity of the rest; one wrong bit of 22 corrected; a row with both BRBP bits set is its codeword inverted |
+| SW_LOCK0–63 | a write ORs in (plain, SET, XOR; CLR clears nothing); the OTP's reset loads each from PAGEn_LOCK1 by a 3-way majority of its bytes; a Secure read of an INACCESSIBLE page (or the reserved 2) is a bus fault through a guarded window and reads 0 through the others; the lock rows always read |
+| SBPI | as the ROM's `otp_access` drives it: one-byte register writes to the macro's DAP (0x02) and PMC (0x3a); the row in DAP 0xfc/0xfd, its bits in 0xc0/0xc1/0xe0, PMC 0x01 programs (0 to 1 only), the one-byte PMC 0xbf read, PMC 0x02; INSTR_DONE and RDATA_VLD write-one-to-clear; only while USR.DCTRL is clear |
+| USR | DCTRL and PD; the windows are the bus error while DCTRL is clear or PD set |
+| CRITICAL, KEY_VALID | 0: no critical flag row or key can be programmed |
+| ARCHSEL, ARCHSEL_STATUS | the board's architecture (Arm 0, RISC-V 3) |
+| the boot path's chip ID | `write_boot_info` copies OTP_DATA's first two words to BOOTRAM 0x3f8, as the ROM's boot path does (ROM 0x39fc), which `get_sys_info`'s CHIP_INFO answers and the SDK's unique board ID (and so the USB serial number) reads |
+| the watchdog's reset | OTP's PSM stage (WDSEL bit 1) puts the registers back, reloading SW_LOCK |
+
+The SBPI protocol is the ROM's own: the instruction stream `otp_access` sent (traced once from
+`examples/pico2/otp.c`) is what the model decodes; the macro's timing registers are stored and mean
+nothing here.
+
+**Refused by name:** any other SBPI instruction; programming a row SW_LOCK leaves not writable (a lock
+row by its own page's lock; the ROM checks first and never sends one), a critical flag row (CRIT0, CRIT1:
+the boot, debug and core enables are not run), a hardware key or its valid flags, and key locks in a
+PAGEn_LOCK0; an uncorrectable row through the unguarded ECC window; one BRBP bit of two; ARCHSEL naming
+the other architecture; DBG, BIST, CRT_KEY_W0–3, DEBUGEN, DEBUGEN_LOCK, BOOTDIS, INTR/INTE/INTF/INTS.
+
+**Assumptions**, since the headers do not say: an unguarded read of an inaccessible page reads 0 (the
+ROM's `otp_access` reads the row through OTP_DATA_RAW before checking its lock, ROM 0xa60, so silicon
+cannot fault there, and the value is discarded); a CLR-alias write to SW_LOCK clears nothing; the 0xbf
+status read answers 0, which the ROM takes as success.
+
+**The oracle**, `examples/pico2/otp.c` (built by `build.sh`), through the ROM: the chip ID through
+OTP_DATA, `get_sys_info` (CHIP_INFO, CRITICAL, CPU_INFO) and `otp_access`; two user rows written with ECC
+and read back through the ROM, the ECC window and the raw window; a raw row; a write clearing a bit (-18,
+UNSUPPORTED_MODIFICATION); the codeword of each data bit alone; an ECC write over a row with a bit set,
+which the ROM stores inverted with both BRBP bits (c20001); a page SW_LOCK makes read-only (write -4,
+read 0) and one it makes inaccessible (both -4); a lock that does not go back; a row past the end (-5)
+and an odd length (-11). `chip/otp_tests.sysl` asserts every line, the rows in the array, and each
+codeword the ROM's encoder made against benchtop's own `ecc_encode` (built from the construction, not
+from the ROM's output; changing the parity rule turns it red). `peripheral/rp2350/otp_tests.sysl` covers
+the model register by register.
+
+**Cost**, host instructions retired, three runs each against the branch's base. The array inside each
+board (16 KB) and the OTP block's registers inside `Rp2350` first cost 1.5% on the loops and 20% on
+`dcp.elf`: the boards' read-only methods took `self` by value, copying the whole board, and the hot ones
+(`at` on every device access, `asleep`, `reset_first`, `sram_line`) and the chip's `restarting` and
+`power_down_due` now take `*self`; the OTP block keeps only the macro's address and data registers
+(`row_at`, `row_bits`) and SW_LOCK as bytes. With that: `bench --core cortex-m33 kernel33.bin` 37.17 G to
+37.17 G; `sram_loop.elf` 5.207 G to 5.105 G and `xip_loop.elf` 5.428 G to 5.323 G (2% fewer); `dcp.elf`
+0.961 G to 0.694 G (28% fewer).

@@ -33,8 +33,9 @@ import sysl.fmt.hex
 // **Programming** goes through the SBPI bridge as the boot ROM's `otp_access` drives it: register
 // writes to the macro's DAP (0x02) and PMC (0x3a) targets, the row's address in DAP registers 0xfc
 // and 0xfd and its 24 bits in DAP 0xc0, 0xc1 and 0xe0, then PMC command 0x01, which programs the row
-// (a bit can only go from 0 to 1), a one-byte read of PMC 0xbf, and PMC command 0x02. The macro's
-// timing registers are stored and mean nothing here. Any other SBPI instruction is refused by name.
+// (a bit can only go from 0 to 1), a one-byte read of PMC 0xbf, and PMC command 0x02. A write to the
+// macro's other registers (its timing and mode, which the ROM sets around each row) is taken and
+// dropped: they mean nothing here. Any other SBPI instruction is refused by name.
 // Programming a page whose Secure lock is not READ_WRITE through SBPI directly is refused (the ROM
 // checks the lock first and never sends it), as is programming the rows whose effect benchtop does not
 // run: the critical flags (CRIT0, CRIT1), the hardware keys, their valid flags and the key fields of
@@ -89,16 +90,18 @@ struct Otp
     // Each core's architecture, as ARCHSEL_STATUS reports it: 0 for both Arm, 3 for both RISC-V.
     arch: u32
     // Each page's lock, as SW_LOCKn holds it: Secure in bits 1:0, Non-secure in bits 3:2.
-    sw_lock: [64]u32
+    sw_lock: [64]u8
     usr: u32
     archsel: u32
-    // SBPI: the instruction register, the payloads, and the macro's DAP and PMC registers.
+    // SBPI: the instruction register, the payloads, and the DAP registers programming reads: the
+    // row's address (0xfc, 0xfd) and its bits (0xc0, 0xc1, 0xe0). The macro's other registers mean
+    // nothing here, and a write to them is dropped.
     instr: u32
     wdata: [4]u32
     rdata: [4]u32
     status: u32
-    dap: [256]u8
-    pmc: [256]u8
+    row_at: u32
+    row_bits: u32
 
     /** Connect the array: `OTP_ROWS` rows from `rows`, each in the low 24 bits of a word, and load
      * the locks from it.
@@ -131,11 +134,11 @@ struct Otp
     private load_locks(*self)
         for p in 0u32..<OTP_PAGES
             val bits = majority3(self.row(OTP_LOCK_ROWS + 2 * p + 1))
-            self.sw_lock[usize(p)] = bits & 0xF
+            self.sw_lock[usize(p)] = u8(bits & 0xF)
 
     // Page `p`'s Secure lock, the reserved 2 read as INACCESSIBLE.
     private secure_lock(self, p: u32) -> u32
-        val s = self.sw_lock[usize(p)] & 3
+        val s = u32(self.sw_lock[usize(p)]) & 3
         if s == 2 then 3 else s
 
     /** A read of `width` bytes at `offset` in one of the four windows: raw (a row a word) or through
@@ -179,7 +182,7 @@ struct Otp
         access(offset, width, true).map_err(e -> OtpFault.Access(e))?
         val a = offset & 0xFFC
         val v =
-            if a < 0x100 then self.sw_lock[usize(a >> 2)]
+            if a < 0x100 then u32(self.sw_lock[usize(a >> 2)])
             elif a == otp_reg.SBPI_INSTR_OFFSET then self.instr
             elif a >= otp_reg.SBPI_WDATA_0_OFFSET && a <= otp_reg.SBPI_WDATA_3_OFFSET then self.wdata[usize((a - otp_reg.SBPI_WDATA_0_OFFSET) >> 2)]
             elif a >= otp_reg.SBPI_RDATA_0_OFFSET && a <= otp_reg.SBPI_RDATA_3_OFFSET then self.rdata[usize((a - otp_reg.SBPI_RDATA_0_OFFSET) >> 2)]
@@ -199,7 +202,7 @@ struct Otp
         if a < 0x100
             // A lock only advances: the bits written are ORed in, through every alias but CLR's, which
             // clears nothing.
-            if (offset >> 12) & 3 != 3 then self.sw_lock[usize(a >> 2)] |= data & 0xF
+            if (offset >> 12) & 3 != 3 then self.sw_lock[usize(a >> 2)] |= u8(data & 0xF)
         elif a == otp_reg.SBPI_INSTR_OFFSET
             self.instr = written(self.instr, offset, data) & 0x7FFFFFFF
             if self.instr & otp_reg.SBPI_INSTR_EXEC_MASK != 0
@@ -235,8 +238,15 @@ struct Otp
         val size = ((i & otp_reg.SBPI_INSTR_PAYLOAD_SIZE_M1_MASK) >> otp_reg.SBPI_INSTR_PAYLOAD_SIZE_M1_SHIFT) + 1
         val short = i & otp_reg.SBPI_INSTR_SHORT_WDATA_MASK
         if payload && is_wr && size == 1 && (target == SBPI_DAP || target == SBPI_PMC)
-            // A register write to the macro.
-            if target == SBPI_DAP then self.dap[usize(cmd)] = u8(short) else self.pmc[usize(cmd)] = u8(short)
+            // A register write to the macro: the DAP's address and data registers are kept.
+            if target == SBPI_DAP
+                cmd match
+                    0xFC -> self.row_at = (self.row_at & 0xFF00) | short
+                    0xFD -> self.row_at = (self.row_at & 0xFF) | (short << 8)
+                    0xC0 -> self.row_bits = (self.row_bits & 0xFFFF00) | short
+                    0xC1 -> self.row_bits = (self.row_bits & 0xFF00FF) | (short << 8)
+                    0xE0 -> self.row_bits = (self.row_bits & 0x00FFFF) | (short << 16)
+                    _ -> ()
         elif target == SBPI_PMC && !payload && cmd == 0x01
             self.program()?
         elif target == SBPI_PMC && !payload && cmd == 0x02
@@ -251,8 +261,8 @@ struct Otp
 
     // PMC command 0x01: the row DAP 0xfc and 0xfd name takes the 1 bits in DAP 0xc0, 0xc1 and 0xe0.
     private program(*self) -> Result[unit, OtpFault]
-        val r = u32(self.dap[0xFC]) | (u32(self.dap[0xFD]) << 8)
-        val bits = u32(self.dap[0xC0]) | (u32(self.dap[0xC1]) << 8) | (u32(self.dap[0xE0]) << 16)
+        val r = self.row_at
+        val bits = self.row_bits
         if r >= OTP_ROWS then return Err(OtpFault.Refused(s"SBPI programs row 0x${hex(r)}, past the array's last"))
         if !self.connected then return Err(OtpFault.Refused("no OTP array is connected to this chip"))
         // A page's lock rows are protected by that page's own lock.
