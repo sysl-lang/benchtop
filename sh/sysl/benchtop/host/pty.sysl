@@ -1,0 +1,92 @@
+module sh.sysl.benchtop.host
+
+import sh.sysl.benchtop.chip.UsbHost
+import sysl.buf.{Buf, buf}
+import sysl.math.min
+import sysl.text.{cstring, from_cstring}
+
+// A pseudo-terminal on the Mac for a guest's USB serial port (`benchtop run --usb pty`): benchtop holds
+// its controlling side and a program such as `screen` or `picocom` opens its terminal, `/dev/ttys…`,
+// as it would the board's `/dev/cu.usbmodem…`. The terminal is raw: bytes pass unchanged both ways and
+// nothing is echoed. The C beside this file (`__posix__/pty.c`) opens it.
+
+@needs(os)
+private extern "benchtop_pty_open" c_pty_open(fds: *int, name: *u8, room: int) -> int
+@needs(os)
+private extern "benchtop_pty_attach" c_pty_attach(name: *u8) -> int
+@needs(os)
+private extern "benchtop_pty_read" c_pty_read(fd: int, into: *u8, room: long) -> long
+@needs(os)
+private extern "benchtop_pty_write" c_pty_write(fd: int, from: *u8, len: long) -> long
+@needs(os)
+private extern "benchtop_pty_close" c_pty_close(fd: int) -> int
+@needs(os)
+private extern "benchtop_pty_error" c_pty_error(code: int) -> *u8
+
+// The most bytes taken from the terminal into the guest's queue at a time.
+private const PTY_CHUNK: usize = 256
+
+/** A pseudo-terminal: the controlling side's descriptor, the terminal side benchtop holds open, and the
+ * terminal's name.
+ */
+struct Pty
+    fd: int
+    held: int
+    name: string
+
+// errno's text for a negative code the C answered.
+private pty_error(code: int) -> string = from_cstring(c_pty_error(code)).unwrap_or("an unknown error")
+
+/** A new pseudo-terminal, raw, or why the system could not make one. */
+open_pty() -> Result[Pty, string]
+    var fds: [2]int = [-1, -1]
+    var name: [256]u8 = [0; 256]
+    val e = c_pty_open(&fds[0], &name[0], 256)
+    if e != 0 then return Err(s"cannot open a pseudo-terminal: ${pty_error(e)}")
+    Ok(Pty(fds[0], fds[1], from_cstring(&name[0]).unwrap_or("")))
+
+/** The terminal side of the pseudo-terminal `name`, opened raw and non-blocking as a serial program
+ * opens a port: its descriptor, or why it could not be opened.
+ */
+attach_pty(name: string) -> Result[int, string]
+    val c = cstring(name)
+    val fd = c_pty_attach(c.ptr)
+    if fd < 0 then return Err(s"cannot open $name: ${pty_error(fd)}")
+    Ok(fd)
+
+/** Bytes written to descriptor `fd` without waiting: how many it took (0 where it has no room now). */
+write_some(fd: int, bytes: []const u8) -> Result[usize, string]
+    if bytes.len == 0 then return Ok(0)
+    val k = c_pty_write(fd, &bytes[0], long(bytes.len))
+    if k < 0 then return Err(pty_error(int(k)))
+    Ok(usize(k))
+
+/** What is waiting on descriptor `fd`, up to `room` bytes, appended to `into` without waiting. */
+read_some(fd: int, into: *Buf[u8], room: usize) -> Result[usize, string]
+    if room == 0 then return Ok(0)
+    var chunk: [256]u8 = [0; 256]
+    val k = c_pty_read(fd, &chunk[0], long(min(room, PTY_CHUNK)))
+    if k < 0 then return Err(pty_error(int(k)))
+    for i in 0..<usize(k) do into.push(chunk[i])
+    Ok(usize(k))
+
+/** Close descriptor `fd`. */
+close_fd(fd: int)
+    c_pty_close(fd)
+
+impl Pty
+    /** The guest's USB serial port and the terminal exchange what is waiting, without waiting: what the
+     * host has read from the device's bulk IN goes to the terminal as far as it has room, and what a
+     * program has written to the terminal joins what the host sends to bulk OUT, as far as the host has
+     * room. Why the terminal failed, where it did.
+     */
+    exchange(*self, h: *UsbHost) -> Result[unit, string]
+        val took = write_some(self.fd, h.received.view())?
+        h.consume(took)
+        read_some(self.fd, &h.sending, h.room_to_send())?
+        Ok(())
+
+    /** Close both sides. */
+    close(*self)
+        close_fd(self.held)
+        close_fd(self.fd)
