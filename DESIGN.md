@@ -2033,7 +2033,8 @@ the parameter's type as on a board. A built-in board is untouched: each instance
 ### 12.7 The view and input
 
 `view { size = [w, h], background = <colour>, elements { ... } }`, in host pixels at 1×. An element
-draws one thing — a part (`show = d1`), a caption (`text = "BTN1"`) or a box (`box = "#202020"`) — at
+draws one thing — a part (`show = d1`), a caption (`text = "BTN1"`), a box (`box = "#202020"`) or,
+in a product, a board whole (`show = pico`, §12.11) — at
 `at = [x, y]`, with `size = [w, h]`, an optional `label`, and `look { color, border, shape = round |
 square, rotate = 0 | 90 | 180 | 270 }`. A display part's element may leave out its size, which is
 its glass, turned with `rotate`. `input { keys { <key> = <part>[.<control>] }, pointer { <element> =
@@ -2115,7 +2116,9 @@ Each points at the name or value it is about; `<x>` is the name in the file.
 - **The view and input.** `the view has no size`; `the view's size must be positive`; `` `view.size`
   must be [width, height], two whole numbers ``; `` the element `e` does not say what it draws ``,
   `` says both `show` and `text` ``, `` has no place in the view ``, `` shows `nope`, which is not a
-  part ``, `` has no size ``, `` must have a positive size ``, `` lies outside the view ``; `` unknown
+  part ``, `` shows `pico` whole, so its size is the board's own ``, `` shows the board `n` whole,
+  but it has no view ``, `` `pico.led` is already drawn in `pico`'s view ``, `` `pico` is already
+  drawn whole ``, `` has no size ``, `` must have a positive size ``, `` lies outside the view ``; `` unknown
   look `colr` ``, and each look's value; `` unknown key `upp` ``; `` `j` has several controls: name
   one ``; `` `j` (joystick) has no control `upp` ``; `` `d1` (led) has no control a key can drive
   ``; `` `nope` is not an element of the view ``; `` cannot be driven by the pointer ``.
@@ -2144,8 +2147,8 @@ Each points at the name or value it is about; `<x>` is the name in the file.
 
 ### 12.11 The chip as a description
 
-**Built, except where marked**: the product's view showing a board whole is design, and the
-questions at the end are open.
+**Built, except where marked**: a product with no `view` laying its boards out side by side is
+design, and the questions at the end are open.
 
 **The MCU is a level of its own between the cores and the board**, and it is where everything on
 the cores' bus lives. Each level has one kind of content:
@@ -2236,15 +2239,24 @@ mcu {
   emulate, by name (`` benchtop does not emulate the rp2350's `rom` (rom) yet ``), and a board with
   parts of its own, which nothing emulates yet.
 
-**Design: a product's view takes precedence, and shows a board's view where the board can be seen.** A board
+**A product's view takes precedence, and shows a board's view where the board can be seen.** A board
 may sit inside the product's case, or in the open — a Pico in the breadboard kit's socket. So the
 product's view is what is drawn, and its elements may show a board instance as a whole: `pico {
 show = pico, at = [124, 54] }` draws the board's own view there at its own size, with the board's elements in it,
 turned by `look { rotate }` as a display is. A board left out of the product's view is not drawn,
 and its parts appear only as the product shows them one by one (`led { show = pico.led }`), as a
-case's window shows an LED. A product with no `view` shows each board's view, side by side in the
-order the boards are written. A board shown whole and one of its parts shown alone is refused: ``
-`pico.led` is already drawn in `pico`'s view ``.
+case's window shows an LED. *(Design:)* a product with no `view` shows each board's view, side by
+side in the order the boards are written.
+
+The element's size is the board's view turned, and is left out; a size written is held to it (``
+the element `p` shows `pico` whole, so its size is the board's own, 168 × 408, not 9 × 9 ``). A
+board with no view has nothing to show whole (`` shows the board `n` whole, but it has no view ``).
+A board shown whole draws each of its parts, so one of its parts shown alone beside it is refused,
+`` `pico.led` is already drawn in `pico`'s view ``, and so is the board shown whole twice, `` `pico`
+is already drawn whole by the element `p` ``. The window draws the board as its own view is drawn —
+its background with the board's edge, the element's label under it — and then the board's elements,
+moved and turned with it and named as the product names them (`pico.led`), so a click on the
+board's LED selects `pico.led` (`drawing.sysl`).
 
 The chip's diagnostics are §12.9's **A chip** and **The bus**.
 
