@@ -131,19 +131,19 @@ day. An L is split before it is handed out (§6).
 |---|---|---|---|---|---|---|
 | Chip layer: bus decode, clock tree, IRQ routing, Pico board | 2.2 Address map | full | `chip.Rp2040` (`chip/rp2040.sysl`) on `ArmBoard[Rp2040]`, the `pico` board (item 22). Every block not on the chip yet is refused by name with its item. | `chip/pico_tests.sysl` | — | — |
 | Cortex-M0+ ×2 | 2.4 Cortex-M0+ | partial | v6m on the Pico, on the instruction timing table (the SDK's divider wait needs it), with WFE and SEV between the cores (item 22). The 8-region MPU (`mcus/rp2040.hocon:9`) is not modelled. | `v6m/*_tests`, `v6m/exceptions.sysl` (WFE/SEV) | S (MPU, PMSAv7 subset) | — |
-| NVIC and SysTick (M0+) | 2.3.2 Interrupts, 2.4 | full | `v6m/except.sysl`, `v6m/nvic.sysl`. 26 IRQ lines; the chip drives TIMER 0–3, IO_IRQ_BANK0 (13), SIO_IRQ_PROC0/1 (15, 16, each into its own core) and UART0/1 (20, 21). | `v6m/nvic_tests`, `chip/pico_tests.sysl` | — | — |
+| NVIC and SysTick (M0+) | 2.3.2 Interrupts, 2.4 | full | `v6m/except.sysl`, `v6m/nvic.sysl`. 26 IRQ lines; the chip drives TIMER 0–3, IO_IRQ_BANK0 (13), SIO_IRQ_PROC0/1 (15, 16, each into its own core), UART0/1 (20, 21) and RTC (25). | `v6m/nvic_tests`, `chip/pico_tests.sysl`, `chip/pico_xip_tests.sysl` | — | — |
 | SIO: CPUID, FIFOs (8-deep), spinlocks, FIFO IRQ | 2.3.1 SIO | full | The RP2350's `Sio` with its depth a parameter (`sio_rp2040`), at the RP2040's offsets (`Rp2040.sio_read`). | `chip/pico_tests.sysl` | — | — |
-| SIO GPIO (OUT/OE/IN, SET/CLR/XOR) | 2.3.1 SIO | full | GPIO 0–29 at the RP2040's offsets, mapped onto the shared model's. The GPIO_HI bank (the QSPI pins) is refused by name (item 24). | `chip/pico_tests.sysl` | — | — |
+| SIO GPIO (OUT/OE/IN, SET/CLR/XOR) | 2.3.1 SIO | full | GPIO 0–29 at the RP2040's offsets, mapped onto the shared model's. The GPIO_HI bank (the QSPI pins as levels, and so the BOOTSEL read) is refused by name: the pins are not modelled as levels. | `chip/pico_tests.sysl` | — | — |
 | SIO hardware divider (per core) | 2.3.1.5 Integer divider | full | `peripheral/rp2040/divider.sysl:5–84`: 8-cycle completion, DIRTY, signed and unsigned. Each core's at SIO 0x060–0x078 (item 22). | `rp2040/tests.sysl`, `chip/pico_tests.sysl` (the bus, and the SDK's sequence on a core) | — | — |
 | SIO interpolators (with the RP2040's blend and clamp modes) | 2.3.1.6 Interpolator | full | `peripheral/rp2040/interp.sysl`, the RP2350's model with SHIFT a logical right shift (item 15), each core's pair on the RP2040's SIO (item 22). | `rp2040/interp_tests.sysl` (both shifts) | — | — |
 | Bus fabric, BUSCTRL, performance counters | 2.1 Bus fabric | missing | — | — | S | — |
 | DMA: 12 channels, DREQs, pacing timers, chaining, ring, sniff/CRC | 2.5 DMA | missing | — | — | L (shared with RP2350, which has more channels and security) | DREQs |
 | ROM: contents, float/double/mem tables, `rom_func_lookup`, core-1 launch | 2.8 Bootrom | partial | A stand-in of benchtop's own (`chip/rom/rp2040-standin.S`, item 22): the header (magic, version 3, the table pointers) and core 1's launch wait, by the datasheet's protocol. The tables, `rom_table_lookup`, the handlers and core 0's boot path are refused by name; the SDK calls the ROM for float, double, memcpy and memset (DESIGN.md §10.1), so the examples use the compiler's (`examples/pico/README.md`). | `chip/pico_tests.sysl` | L | XIP/SSI for the flash routines |
-| Boot sequence (boot2, CRC check, USB boot) | 2.7 Boot sequence | partial | The debugger entry: an ELF into SRAM, core 0 at its entry, core 1 in the ROM (item 22). Boot2 is not run; a UF2 is refused (it is for the flash). | `chip/pico_tests.sysl` | L (real path) | ROM, SSI |
+| Boot sequence (boot2, CRC check, USB boot) | 2.7 Boot sequence | partial | The debugger entry: an ELF into SRAM, core 0 at its entry, core 1 in the ROM (item 22); a RAM UF2 (family 0xe48bff56) entered at its first byte as the ROM enters one; either may also write the 2 MB flash (item 24). An image that starts in flash needs the ROM's boot path (boot2 from flash, its CRC check), refused by name (item 23); boot2 itself runs when a program calls it (`ssi_flash`). | `chip/pico_tests.sysl`, `chip/pico_xip_tests.sysl` | L (real path) | ROM |
 | SRAM (264 KB, striped, plus non-striped aliases at 0x2100_0000) | 2.6.2 SRAM | full | 264 KB at 0x2000_0000 on the cores' fast path; the non-striped aliases of banks 0–3 through the bus, word w of bank b at striped word 4w + b (item 22). | `chip/pico_tests.sysl` | — | — |
-| XIP, XIP cache, XIP_CTRL, streaming | 2.6.3 Flash | missing | Refused by name (item 24). | `chip/pico_tests.sysl` | M (shared with RP2350 XIP) | loader |
-| SSI (DW_apb_ssi) | 4.10 SSI | missing | Refused by name (item 24). | `chip/pico_tests.sysl` | S (store, flash reads work) / M (direct commands) | XIP |
-| VREG_AND_CHIP_RESET | 2.10 Core supply regulator, 2.12 Chip-level reset | missing | Refused by name (item 24). | `chip/pico_tests.sysl` | S | — |
+| XIP, XIP cache, XIP_CTRL, streaming | 2.6.3 Flash | full | The Pico's W25Q16JV, 2 MB (`parts/qspi_flash`, shared with the RP2350), behind the cached, noalloc, nocache and nocache_noalloc aliases, each 16 MB repeating it; read where the SSI is set for XIP, on the cores' fast path while it is (item 24). XIP_CTRL's CTRL (POWER_DOWN disabling the cache), FLUSH, STAT and the streaming FIFO; a write to an uncached alias a bus fault under ERR_BADWRITE, dropped without. The cache as 16 KB of SRAM at 0x1500_0000 while disabled, on the fast path. The cache is functional: no read is stale, CTR_HIT/CTR_ACC refused. | `chip/pico_xip_tests.sysl` (`ssi_flash`) | — | — |
+| SSI (DW_apb_ssi) | 4.10 SSI | partial | `peripheral/rp2040/ssi.sysl` (item 24): every register; transfers timed at SCKDV clk_sys cycles a clock, lazily, so chip select stays low while the TX FIFO feeds a command; transmit-and-receive and transmit-only on one lane, the EEPROM read on one, two or four lanes (instruction, address, wait cycles, NDF + 1 frames); chip select from IO_QSPI's SS override; XIP reads honoured exactly where the configuration reads the flash (a copy of it tried over a pattern), boot2_w25q080's quad continuous read and boot2_generic_03h's alike. Refused by name: receive-only, TI/Microwire, loopback, DDR, DMA, the interrupt (XIP_IRQ), either FIFO's overflow or underflow. | `chip/pico_xip_tests.sysl` | S (interrupt, DMA) | DMA |
+| VREG_AND_CHIP_RESET | 2.10 Core supply regulator, 2.12 Chip-level reset | full | `peripheral/rp2040/rtc.sysl` `Vreg` (item 24): VREG's VSEL and BOD stored, ROK; CHIP_RESET reporting the power-on reset (HAD_POR), the one reset path benchtop makes. Turning the regulator off or into high impedance is refused by name. | `chip/pico_xip_tests.sysl` | — | — |
 | PSM | 2.13 Power-on state machine | full | The RP2350's `Psm` over 17 stages (`psm_rp2040`). Only PROC1 can be forced off, as on the RP2350; its release starts core 1 in the ROM's wait (item 22). | `chip/pico_tests.sysl` | — | — |
 | RESETS (25 outputs) | 2.14 Subsystem resets | full | `peripheral/rp2040/resets.sysl:7–55` on the `virt*` boards (`virt/rp.sysl:19–24`). | `rp2040/tests.sysl`, `virt/rp_tests.sysl:246,268` | — | — |
 | CLOCKS (no TICKS; clk_rtc instead of clk_hstx) | 2.15 Clocks | partial | `ClocksRp2040` (`peripheral/rp2350/clocks_rp2040.sysl`, item 22): the RP2040's generators, 24.8 and two-bit dividers, clk_peri with none, FC0 from its source table; the watchdog's TICK makes the 1 µs tick. The resus and GPOUT are stored, as on the RP2350. | `chip/pico_tests.sysl` | — | — |
@@ -151,7 +151,7 @@ day. An L is split before it is handed out (§6).
 | ROSC (RANDOMBIT) | 2.17 Ring oscillator | full | The RP2350's `Rosc` at the RP2040's offsets (no RANDOM), at a nominal 6.5 MHz (Q8). | `chip/pico_tests.sysl` | — | — |
 | PLL_SYS, PLL_USB | 2.18 PLL | full | The RP2350's `Pll`, without its interrupt registers. | `chip/pico_tests.sysl` (125 MHz from the SDK's start-up) | — | — |
 | IO_BANK0, PADS_BANK0 (30 GPIOs, no ISO bit) | 2.19 GPIO | full | The RP2350's models with a GPIO count, CTRL's overrides at the RP2040's bits, no IRQSUMMARY, pads with no ISO (reset 0x56); the RP2040's function table, each unmodelled function refused by name (item 22). | `chip/pico_tests.sysl` | — | — |
-| IO_QSPI, PADS_QSPI | 2.19 GPIO | missing | Refused by name (item 24). | — | S | — |
+| IO_QSPI, PADS_QSPI | 2.19 GPIO | partial (stored) | The RP2350's models in the RP2040's shape (`io_qspi_rp2040`, `qspi_pads_rp2040`, item 24): six pins, CTRL's bits at the RP2040's places, INTR at 0x30, pads with no ISO. SS's OUTOVER is the flash's chip select, and a transfer needs every pin's FUNCSEL on the SSI; OUTOVER invert and each STATUS refused by name. | `chip/pico_xip_tests.sysl` | S (levels, BOOTSEL) | — |
 | GPIO interrupts (PROC0/1, DORMANT_WAKE) | 2.19 GPIO | full | `GpioIrq` at 30 GPIOs from INTR0 at 0xF0, IO_IRQ_BANK0 (13) into each core; the dormant wake wakes a dormant ROSC (item 22). | `rp2350/gpio_irq_tests.sysl`, `chip/pico_tests.sysl` | — | — |
 | SYSINFO | 2.20 Sysinfo | full | CHIP_ID 0x20002927 (B2), PLATFORM ASIC, GITREF 0; read-only (item 22). | `chip/pico_tests.sysl` | — | — |
 | SYSCFG | 2.21 Syscfg | missing | Refused by name. | `chip/pico_tests.sysl` | S | — |
@@ -164,7 +164,7 @@ day. An L is split before it is handed out (§6).
 | PWM (8 slices) | 4.5 PWM | missing | Shared. | — | (shared) | — |
 | TIMER | 4.6 Timer | full | `peripheral/rp2040/timer.sysl:5–120`: latch, 4 alarms, pause, debug pause. | `rp2040/tests.sysl`, `virt/rp_tests.sysl` (13) | — | — |
 | WATCHDOG | 4.7 Watchdog | partial | The tick generator and the counter shared with the RP2350 (`peripheral/rp2040/watchdog.sysl`), TIME falling two a tick (erratum RP2040-E1): CTRL, LOAD, TRIGGER, REASON, SCRATCH0–7. On the `virt*` boards the reset stops the cores at `Reset`, named, since they have no PSM. On the Pico the watchdog firing, by its counter or TRIGGER, ends the run named: the RP2040's reset boots through its ROM's boot path (item 23). | `rp2040/tests.sysl`, `rp2040/watchdog_tests.sysl`, `virt/rp_tests.sysl`, `chip/pico_tests.sysl` | S (reset path) | ROM |
-| RTC | 4.8 RTC | missing | — | — | M | clk_rtc |
+| RTC | 4.8 RTC | full | `peripheral/rp2040/rtc.sysl` (item 24): the calendar counting clk_rtc over CLKDIV_M1 + 1, with the RP2040's leap-year rule and FORCE_NOTLEAPYEAR; SETUP and LOAD; RTC_0 latching RTC_1; the alarm's masks, taken as the time changes, held until MATCH_ENA clears; INTE/INTF/INTS and IRQ 25. The next second is scheduled only while the alarm is armed. Refused by name: a LOAD of a date the calendar does not hold, CLKDIV_M1 changed while running. | `chip/pico_xip_tests.sysl` (`hello_rtc`, `rtc_alarm`) | — | — |
 | ADC and temperature sensor | 4.9 ADC | missing | `rp-adc` has `modelled = false`. | — | (shared) | — |
 
 ## 3. Counts
@@ -172,7 +172,7 @@ day. An L is split before it is handed out (§6).
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
 | RP2350 | 34 | 8 | 0 | 16 | 58 |
-| RP2040 | 15 | 7 | 0 | 15 | 37 |
+| RP2040 | 18 | 9 | 0 | 10 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
 benchtop's policy for unsupported accesses (`docs/peripheral-models.md:54`). Several items below
@@ -337,7 +337,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 21 | **USB host enumerator and CDC bridge to a pty**. `hello_world/usb` is its oracle. **Done** (below). | M | 20 |
 | 22 | **RP2040 chip layer**: `chip.Rp2040` over the shared models (CLOCKS without TICKS, pads without ISO, SIO with 8-deep FIFOs and the divider wired), and the `pico` board running. **Done** (below). | M | 5, 8, 9 |
 | 23 | **RP2040 ROM**, following Q1: the float, double and mem tables plus the lookup. | L | 22 |
-| 24 | **RP2040 SSI, VREG_AND_CHIP_RESET and RTC**. | M | 22 |
+| 24 | **RP2040 SSI, VREG_AND_CHIP_RESET and RTC**. **Done** (below). | M | 22 |
 | 25 | **TRNG and SHA-256**. | S | 11 |
 | 26 | **OTP** (a stored array with ROM access; beyond that per Q10). **Done** (below). | M | 6 |
 | 27 | **POWMAN AON timer and LPOSC**. **Done** (below). | M | 5 |
@@ -1351,3 +1351,61 @@ breaking the FIFO depth, the M0+'s timing or the WFE decode turns them red.
 f6e7b41): `bench kernel.bin` (M0+) 40.207–40.211 G to 40.209–40.213 G; `bench --core cortex-m33
 kernel33.bin` 36.846–36.850 G to 36.847–36.847 G; `sram_loop.elf` 5.401–5.406 G to 5.402–5.405 G;
 `xip_loop.elf` 5.624–5.625 G to 5.624–5.625 G. Unchanged.
+
+### Item 24, done: the RP2040's SSI and XIP, VREG_AND_CHIP_RESET and the RTC
+
+`examples/pico` adds pico-examples' `rtc/hello_rtc` and `rtc/rtc_alarm` (unchanged), `ssi_flash`
+(benchtop's own) and `blink.uf2`; `chip/pico_xip_tests.sysl` (16 cases) runs them and every register
+rule and refusal.
+
+**The flash path.** The Pico's flash is the RP2350's flash model (`parts/qspi_flash`) as a W25Q16JV
+(`w25q16jv`: 2 MB, JEDEC EFh 40h 15h), connected to the board's array as on the Pico 2. The SSI
+(`peripheral/rp2040/ssi.sysl`) times its frames at SCKDV clk_sys cycles a clock and is evaluated
+lazily, whenever it, IO_QSPI or XIP is touched, so nothing is scheduled and the run loop pays nothing.
+The timing is what puts chip select where silicon puts it: low while the TX FIFO feeds a command, up
+when it runs dry, so boot2's back-to-back `01h 00h 02h` is one frame and a late byte is a new
+instruction. IO_QSPI's SS override forces it, as the SDK's `flash_do_cmd` does. An XIP read is honoured
+exactly where the SSI's configuration would read the flash: the read is framed as the SSI frames it
+(XIP_CMD as an instruction before a 24-bit address, or as the mode bits of a 32-bit one, then the wait
+cycles) and tried on a copy of the flash over a pattern, which must answer the address's bytes and
+end in the state it began in. So boot2_w25q080's quad continuous read and boot2_generic_03h's 03h
+both work, and 0Bh without its dummy byte, or a 32-bit address before continuous mode, is refused with
+the registers named. While XIP is honoured the board puts the flash on the cores' fast path
+(`sync_pico_xip`); a program or erase re-decodes what it changed, as on the Pico 2. XIP_CTRL, its
+stream and the cache as SRAM at 0x1500_0000 (on the fast path while the cache is disabled) are the
+RP2040's own (`XipCtrl`). `ssi_flash` drives it all with no ROM function: the IDs, an erase and two
+page programs in direct mode, the SDK's own `boot2_w25q080.S` linked in and called, the four aliases,
+a function programmed into flash and called through XIP, reprogrammed and called again (so the
+re-decode is seen), the stream, a function run from the cache's SRAM.
+
+**The loader** takes a UF2 of the RP2040's family (0xe48bff56), entering a RAM image at its first
+byte as the ROM does; an ELF or UF2 may write the flash. An image that starts in flash is refused by
+name: it boots through the ROM's boot path (item 23).
+
+**VREG_AND_CHIP_RESET** stores VSEL and BOD, reads ROK, and reports HAD_POR, the one reset benchtop
+makes; turning the regulator off or into high impedance is refused. **The RTC** counts clk_rtc into a
+calendar a second at a time (the RP2040's leap rule, FORCE_NOTLEAPYEAR), takes LOAD and SETUP, latches
+RTC_1 on a read of RTC_0, and raises IRQ 25 when the time changes to one matching every enabled
+field, until MATCH_ENA clears; the chip schedules the next second through `due` only while the alarm
+is armed.
+
+**Not run, by name:** the SSI's receive-only mode, TI and Microwire formats, loopback, DDR, DMA and
+interrupt (XIP_IRQ), and either FIFO's overflow or underflow; OUTOVER invert on SS; IO_QSPI's STATUS
+and the SIO's GPIO_HI bank (the QSPI pins as levels, so the BOOTSEL read); the cache's counters; a
+write to an uncached alias under ERR_BADWRITE; the cache's SRAM while enabled or powered down; an RTC
+LOAD of a date the calendar does not hold, and CLKDIV_M1 changed while it runs. **Fidelity limits, not
+refused:** the cache never makes a read stale; a store into the flash window's first 2 MB stops the
+core at `Fault` where silicon deallocates a line; the RTC's clock-domain crossing takes no time; with
+chip select forced high a byte reads FFh. pico-examples' `flash/program` is not run: its erase and
+program go through the ROM's flash functions, which the stand-in refuses (item 23).
+
+**Assumption, from the SDK rather than the datasheet:** the alarm is taken as the time changes, so
+enabling it within a matching second raises nothing until the next match; the SDK's repeating alarm
+re-enables from its handler within that second and would otherwise interrupt for the rest of it.
+
+**Cost**, host instructions retired, three interleaved runs each against the branch's base (dev at
+bc38ba4): `bench kernel.bin` (M0+) 40.208–40.215 G to 40.208–40.212 G; `bench --core cortex-m33
+kernel33.bin` 36.846–36.853 G to 36.845–36.854 G; `sram_loop.elf` 5.408–5.413 G to 5.406–5.413 G;
+`xip_loop.elf` 5.629–5.632 G to 5.629–5.635 G. Unchanged. `hello_multicore` on the Pico, a 0.3 G run
+that is mostly boot, 0.315–0.319 G to 0.344–0.350 G: the 2 MB flash array the boot now lays out and
+copies, once.
