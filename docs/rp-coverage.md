@@ -1410,26 +1410,56 @@ kernel33.bin` 36.846–36.853 G to 36.845–36.854 G; `sram_loop.elf` 5.408–5.
 that is mostly boot, 0.315–0.319 G to 0.344–0.350 G: the 2 MB flash array the boot now lays out and
 copies, once.
 
-### Item 23, done: the RP2040's boot ROM, Raspberry Pi's
+### Item 23, done: the RP2040's boot ROM, benchtop's own
 
-**The image** is the B2 stepping's ROM from github.com/raspberrypi/pico-bootrom-rp2040 (tag `b2`,
-commit `ef22cd8ede5bc007f81d7f2416b48db90f313434`): the release's only asset is `b2.elf`, and
-`chip/rom/bootrom-rp2040-b2.bin` is its 16 KB `.text`, SHA-256
-`9c19b46f068c21f90d200c514faad4a0d5cecfc978f155b8c9d25cb6bc2efd81`, unmodified (`chip/rom/README.md`,
-`LICENSE-rp2040.TXT`). The licence's first lines say `mufplib.S` and `mufplib-double.S`, whose code
-is in the image, are licensed separately; their terms were not fetched. The stand-in and its build
-script are gone. The whole 16 KB is on the cores' fast path at 0, read-only.
+**The image** is benchtop's own, written in sysl to work as the RP2040's does (`chip/rom/rp2040/`,
+`chip/rom/README.md`): 16 KB at 0 on the cores' fast path, read-only, built by `image/build.sh`
+(`sysl build-c --target thumbv6m-freestanding -Oz`, then Arm's `ld` with `rom.ld`), reproducibly:
+SHA-256 `c85e249afdb8b577a03fab2e516fc588041a69a1db4631f0d541cb67d5c4d601` from sysl 0.8.5 and 0.8.6
+alike, code and data to 0x3CA7. Raspberry Pi's image is not in the repository; neither it nor its
+float code was read. **Clean-room sources:** the Pico SDK's `pico/bootrom.h`, `bootrom_constants.h`
+and `pico/bootrom/sf_table.h` (the header, the codes, the tables' layout and the size byte before
+each), `pico_float`'s and `pico_double`'s RP2040 callers (which entries, in which registers, with
+which rounding: `float2int` toward −∞, `fsin` with the cosine in r1, the V3 double `sincos` in r0 to
+r3, the trigonometric ranges ±128 and ±1024), `hardware_flash` (how the flash functions are used),
+`boot_stage2` (boot2's entry with lr 0, `pad_checksum`'s CRC), `hardware_watchdog` (the reboot
+vector), `hardware_regs`; and the datasheet-level facts they rest on.
 
-**What runs as the ROM's code:** core 1's launch wait (it sets SLEEPDEEP, reads its FIFO once before
-looking at VLD, so its ROE is set as on silicon, and answers a word out of place with 0);
-`rom_table_lookup`; the soft float and double tables (correctly rounded against the host, denormals
-flushed to zero as the datasheet says); popcount, clz, ctz, reverse, memset, memcpy; the flash
-functions through the SSI (`connect_internal_flash`, `flash_exit_xip`, `flash_range_erase`,
-`flash_range_program`, `flash_flush_cache`); **core 0's boot path**: an image
-that starts in flash starts core 0 from reset in the ROM, which reads BOOTSEL, takes the flash out of
-XIP, reads boot2 under each SSI setting until its CRC matches, runs it, and boot2 enters the image;
-and `reset_usb_boot` up to its watchdog reboot. The examples are built with the SDK's defaults, so
-float, double, the bit operations and memcpy/memset go through the ROM.
+**What runs as the ROM's code**, every line of it sysl but where the comment says why not:
+- **the header and tables:** the vectors and the magic are a sysl struct in a section; the soft float
+  and double tables are structs of typed function pointers (`tables.sysl`); the header's three 16-bit
+  pointers and the function and data tables, whose entries are the low halves of link-time addresses
+  that no language's constant expressions produce, are `SHORT` data in `rom.ld`;
+- **core 1's launch wait:** it drains its FIFO and sends core 0 a 0, then echoes 0, 0, 1, VTOR, SP and
+  the entry, a 0 keeping its place among the first three and any other word out of place answered 0,
+  and starts the entry; it waits in WFE on its own stack at the top of USB's DPRAM;
+- **core 0's boot path:** a SCRATCH4–7 vector the SDK's `watchdog_reboot` left (taken once); the QSPI
+  pins and pads out of reset; BOOTSEL (SS with its output disabled, through GPIO_HI_IN); the flash out
+  of XIP; boot2 read with the serial 03h command into the top of SRAM5, its CRC-32 checked over its
+  first 252 bytes, and entered with lr 0, so that boot2 enters the image;
+- `rom_table_lookup`; popcount, clz, ctz, reverse; memset, memset4, memcpy, memcpy44 (word-wise
+  where aligned, any length); the flash functions through the SSI (`connect_internal_flash`,
+  `flash_exit_xip` with the data pads pulled down then up, `flash_range_erase` with the 64 KB block
+  command where a block fits, `flash_range_program`, `flash_flush_cache`, `flash_enter_cmd_xip`);
+  `reset_usb_boot` up to its watchdog reboot;
+- **the soft float and double tables**, every entry: add, subtract, multiply, divide, square root and
+  every conversion IEEE-correct (round to nearest even), denormals flushed as the datasheet documents;
+  sine, cosine, tangent, eˣ, ln and atan2 in 64-bit extended floats, with 192-bit argument reduction,
+  rounded once.
+- **Assembly**, `hw.sysl`, four uses, each a thing no language's statements express: WFE, SEV, setting
+  MSP and branching (a program's start from its vector table, core 1's own stack), and branching with
+  lr 0 (how boot2 knows it came from the ROM).
+
+The examples are built with the SDK's defaults, so float, double, the bit operations and memcpy/memset
+go through the ROM.
+
+**Where the ROM's documented behaviour is not IEEE, or IEEE leaves it open** (`oracle/oracle.sysl`):
+a denormal input reads as a zero of its sign and a denormal result is delivered as one (after
+rounding at the denormal precision, so a carry into the smallest normal survives); conversions to
+integers round toward −∞ and saturate, ∞ and NaN by their sign, a negative value to an unsigned
+integer 0; an invalid operation answers the default NaN, a NaN operand itself quieted; `fcmp`
+answers 1 for an unordered pair; sine, cosine and tangent take |x| < 2048 (wider than the ROM's
+documented ±128 and ±1024) and answer NaN beyond.
 
 **The watchdog's reset** is modelled on the Pico now: the PSM stages WDSEL selects go back to power-on
 (as `Rp2350.watchdog_reset` does; RESETS.WDSEL where RESETS' own stage is not selected), the
@@ -1437,15 +1467,17 @@ watchdog's REASON, SCRATCH and tick survive, and so do SRAM, USB's DPRAM and the
 core starts again in the ROM, whose boot path takes a SCRATCH4–7 vector or boots the flash.
 `hello_watchdog` boots twice through it.
 
-**What the ROM needed, modelled now:**
+**Modelled in this item** (the first of them for the ROM, the rest kept from an earlier attempt that
+ran Raspberry Pi's image, whose code needed them; programs reach them too):
 
 | what | where | model |
 |---|---|---|
-| SCR (the launch wait sets SLEEPDEEP) | `v6m/t2system.sysl` | every profile's SCR: SLEEPONEXIT, SLEEPDEEP, SEVONPEND stored, SLEEPDEEPS with the Security Extension; an M0+ and a Main core without it used to stop at `Unmapped` |
-| USB's DPRAM, the ROM's `.bss` (`watchdog_reboot`'s flag) | `chip/rp2040.sysl` | 4 KB of memory, any width, ungated; the controller still refused |
-| TBMAN PLATFORM (`watchdog_reboot`, the boot path) | `chip/rp2040.sysl` | reads ASIC, ungated; the rest refused |
-| SYSCFG PROC0/1_NMI_MASK (core 0's reset) | `chip/rp2040.sysl` | stored, 26 bits, ungated; the rest refused; nothing raises an NMI |
-| SYSINFO read while RESETS holds it (USB boot after a watchdog reset) | `chip/rp2040.sysl` | ungated |
+| the ROM's doorbell, its last word | `chip/rp2040.sysl` (`rom_doorbell_refusal`) | a word stored there is the ROM refusing by name: USB boot (BOOTSEL held, no valid boot2, or `reset_usb_boot`), a left-out lookup code, the tables' flags comparison, an exception through the ROM's vectors |
+| SCR | `v6m/t2system.sysl` | every profile's SCR: SLEEPONEXIT, SLEEPDEEP, SEVONPEND stored, SLEEPDEEPS with the Security Extension; an M0+ and a Main core without it used to stop at `Unmapped` |
+| USB's DPRAM, core 1's stack in the ROM | `chip/rp2040.sysl` | 4 KB of memory, any width, ungated; the controller still refused |
+| TBMAN PLATFORM | `chip/rp2040.sysl` | reads ASIC, ungated; the rest refused |
+| SYSCFG PROC0/1_NMI_MASK | `chip/rp2040.sysl` | stored, 26 bits, ungated; the rest refused; nothing raises an NMI |
+| SYSINFO read while RESETS holds it | `chip/rp2040.sysl` | ungated |
 | GPIO_HI_IN (the BOOTSEL read) | `chip/rp2040.sysl` | SS is the flash's chip select, high unless driven low (the button is never pressed); the other five pins read 0, their levels not modelled; the rest of GPIO_HI refused |
 | PADS_QSPI output disable on the data pads (`flash_exit_xip`) | `peripheral/rp2040/ssi.sysl` | the flash sees the pad's pull, not the SSI's bits: pulled down, mode bits of 0 end continuous read, and an instruction of 00h is ignored in SPI mode; pulled up, FFh; with no pull, refused by name |
 
@@ -1460,19 +1492,51 @@ core starts again in the ROM, whose boot path takes a SCRATCH4–7 vector or boo
   `uart_loopback.c`'s receive timeout now reads `after 802 us` where it read 804 (798.6 µs on the
   line; the interrupt is taken at a quantum's end, which now falls where the cores reached).
 
-**Refused by name:** USB boot, whether from `reset_usb_boot` (named at the watchdog's reset) or from a
-flash with no valid boot2 (at USBCTRL, which the ROM reaches after setting up the clocks).
+**Refused by name**, through the doorbell: USB boot (BOOTSEL held; the flash holding no valid boot2;
+`reset_usb_boot`, named already at the watchdog's reset); the lookup codes the RP2040's ROM has and
+this one leaves out ('D', 'T' `debug_trampoline`, 'D', 'E', 'W', 'V' `wait_for_vector`, 'F', 'S' and
+'F', 'E'); the soft float and double tables' comparison that answers in the flags (offset 0x14),
+which no function's result can; an exception taken through the ROM's own vectors.
 
-`chip/pico_tests.sysl` runs `rom_funcs` (benchtop's own: every lookup and call checked against the
-host), pico-examples' `hello_world/serial`, `flash/program` and `watchdog/hello_watchdog` as flash
-images, and `hello_serial`, `blink` and `hello_multicore` on the SDK's defaults; the ROM's own
-functions called from a test against the host; boot2 with a broken CRC; the watchdog's reset; the
-stored blocks. `chip/pico_xip_tests.sysl` adds the pads' output disable. Breaking the quantum carry,
-the BOOTSEL level, the pads' pull or TBMAN's PLATFORM turns them red.
+**Tests and oracles.**
+- `chip/rom40_float_tests.sysl` (9 tests) compiles the ROM's routines for the host and checks them
+  against the host's IEEE arithmetic and libm (`sh.sysl.rp2040rom.oracle`): 30,000 to 60,000
+  edge-biased cases per routine (zeros, denormals, the extreme normals, ∞, NaN, ties, neighbours a
+  unit apart, cancellations), the documented edges each by name, and the double scientific functions'
+  correctly rounded values at 25 arguments from `bc -l` at 80 digits.
+- **The sweep**, `chip/rom/rp2040/examples/sweep`, built `-O2`, run once: every one of the 2^32
+  inputs of `fsqrt` (150 s), of every float-to-integer and fixed-point conversion and `float2double`
+  (65 s), and of every 32-bit integer to float and double (120 s), each with no mismatch; 16 million
+  cases of the four float operations and of the four double operations, 4 million `dsqrt` and 4
+  million double-to-integer conversions, all bit-exact; 6 million each of the float and the double
+  scientific functions within one unit (float) and three (double) of the host's libm. macOS's libm is
+  the looser side: its `tan` misses the correctly rounded value by up to three units where the ROM's
+  is right (bc), while the ROM's is within about 0.502 of a unit: it rounds wrongly only when the
+  exact value lies within about 2^−9 of a unit of a rounding boundary (its `tan(−1.0229…)`,
+  `BFF05E00014D9CC7`, is …CF where …CE.7FE5 rounds to …CE).
+- `chip/pico_tests.sysl`: every entry of both tables called on the Pico as the SDK calls it, bit for
+  bit against the host build of the same routine (1,488 calls); the image's layout; the doorbell's
+  refusals; core 1's launch; `rom_funcs`, pico-examples' `hello_world/serial`, `flash/program` and
+  `watchdog/hello_watchdog` as flash images, and `hello_serial`, `blink` and `hello_multicore` on the
+  SDK's defaults; boot2 with a broken CRC; the watchdog's reset; **the Pico SDK's own float tests**
+  (`pico_float_test`, `pico_double_test`, `custom_float_funcs_test`, `custom_double_funcs_test`,
+  `examples/pico/sdk_tests`), flash images on the ROM, each `PASSED`; and **the cross-check
+  firmware** (`examples/pico/rom_crosscheck`), 71,248 cases, no mismatch, `CROSSCHECK 71248 0
+  8c217b56`, the line a real Pico must print with its own ROM on the other side (its README). The
+  SDK's `pico_divider_test` is not run: it ends in an endless loop by design, and its nesting test
+  needs DMA; neither goes through the ROM.
+- Breaking the ties-to-even rounding turns three of `rom40_float_tests` red; inverting the BOOTSEL
+  level turns the flash-image boot red with USB boot named.
+
+**sysl findings** (reported; the ROM written around none of them): (1) a `@section` val whose
+initializer takes a function's address as an integer is silently zero in a `build-c` archive; (2)
+`-Os`/`-Oz` do not mark functions `optsize`/`minsize`, so fixed-count loops unroll (at -Os the ROM is
+18.9 KB; shared division and root routines bring -Oz to 15.5 KB); (3) `@export` beside `@section`
+and `@align` on a binding is refused, so `rom.ld` aligns the soft float tables' size bytes itself.
 
 **Cost**, host instructions retired, three interleaved runs each against the branch's base (dev at
-34243c8): `bench kernel.bin` (M0+) 40.238–40.259 G to 40.238–40.250 G; `bench --core cortex-m33
-kernel33.bin` 118.19–118.21 G to 118.18–118.19 G; `sram_loop.elf` 5.411–5.418 G to 5.414–5.416 G;
-`xip_loop.elf` 5.635–5.641 G to 5.636–5.647 G. Unchanged. `hello_multicore` on the Pico, 0.200 G to
-0.349–0.355 G: it now runs its float and memory routines through the ROM, and core 1's wait is the
-ROM's own code.
+1cf881d): `bench kernel.bin` (M0+) 40.207–40.213 G to 40.206–40.214 G; `bench --core cortex-m33
+kernel33.bin` 36.847–36.853 G to 36.845–36.849 G; `sram_loop.elf` 5.407–5.413 G to 5.412–5.416 G;
+`xip_loop.elf` 5.629–5.636 G to 5.633–5.634 G. Unchanged. `hello_multicore` on the Pico, 0.344–0.346 G
+(dev's build, the compiler's float on the stand-in) to 0.348–0.350 G on this ROM with the SDK's
+defaults; Raspberry Pi's image ran it in 0.349–0.355 G.

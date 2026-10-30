@@ -47,7 +47,7 @@ target_link_libraries(rtc_alarm hardware_rtc)
 find_program(SYSL_COMPILER sysl REQUIRED)
 set(OURS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rom_crosscheck/ours)
 set(OURS_LIB ${CMAKE_CURRENT_BINARY_DIR}/libours.a)
-file(GLOB_RECURSE OURS_SOURCES ${OURS_DIR}/*.sysl ${CMAKE_CURRENT_SOURCE_DIR}/../../sh/sysl/benchtop/chip/rom/rp2040/sh/sysl/*.sysl)
+file(GLOB_RECURSE OURS_SOURCES ${OURS_DIR}/*.sysl ${OURS_DIR}/sysl.hocon ${CMAKE_CURRENT_SOURCE_DIR}/../../sh/sysl/benchtop/chip/rom/rp2040/sh/sysl/*.sysl)
 add_custom_command(OUTPUT ${OURS_LIB}
     COMMAND ${SYSL_COMPILER} build-c ${OURS_DIR} --target thumbv6m-freestanding -Oz -o ${OURS_LIB}
     DEPENDS ${OURS_SOURCES} ${SYSL_COMPILER})
