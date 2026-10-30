@@ -1,0 +1,297 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2040.{DMA_READ_ERROR, Dma, DmaFault, DmaLayout, RP2040_DMA, dma}
+import sh.sysl.rp2040.dma as d40
+import sh.sysl.rp2350.dma as d50
+
+// The DMA's registers and channel state by themselves (`peripheral/rp2040/dma.sysl`), at both chips'
+// layouts: the RP2350's 16 channels and four IRQ lines, the RP2040's 12 and two, with each chip's CTRL
+// field positions and register offsets. The transfers through the chip's bus are `chip/dma_tests.sysl`.
+
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+// Everything both chips drive in these tests: UART0's TX request (28), the timers and the permanent one.
+private const MODELLED: u64 = (1u64 << 28) | (0x1Fu64 << 59)
+
+private why_of(f: DmaFault) -> string = f match
+    Access(_) -> "an access error"
+    Refused(why) -> why
+    Treq(k, sel) -> s"channel $k TREQ_SEL $sel"
+
+private wr(d: *Dma, o: u32, x: u32)
+    d.write(o, 4, x) match
+        Ok(_) -> ()
+        Err(f) -> assert(false, s"write 0x${o} = 0x${x}: ${why_of(f)}")
+
+private rd(d: *Dma, o: u32) -> u32 = d.read(o, 4).unwrap()
+
+// `value` put in the field `mask` covers.
+private put(value: u32, mask: u32) -> u32 = (value << mask.trailing_zeros()) & mask
+
+// CTRL for `l`: transfers of 2^`size` bytes, the read and write addresses incrementing as asked,
+// chaining to `chain`, paced by `treq`, enabled.
+private ctrl(l: DmaLayout, size: u32, incr_read: bool, incr_write: bool, chain: u32, treq: u32) -> u32 =
+    put(size, l.size) | (if incr_read then l.incr_read else 0) | (if incr_write then l.incr_write else 0) | put(chain, l.chain) | put(treq, l.treq) | l.en
+
+// Each chip's DMA, as the tests below run it on both.
+private layouts() -> [2]DmaLayout = [RP2350_DMA, RP2040_DMA]
+
+// The offset of the RP2350's register `o` from TIMER0 on, at layout `l` (the RP2040's are 0x20 lower).
+private at(l: DmaLayout, o: u32) -> u32 = if l.rp2350 || o < 0x440 then o else o - 0x20
+
+@test("power-on: N_CHANNELS, every channel idle with CHAIN_TO 0, SECCFG at its reset values, both chips' register offsets")
+dma_power_on()
+    var d50x = dma(RP2350_DMA, MODELLED)
+    assert(rd(&d50x, d50.N_CHANNELS_OFFSET) == 16 && rd(&d50x, d50.CH15_DBG_TCR_OFFSET) == 0)
+    assert(rd(&d50x, d50.SECCFG_CH0_OFFSET) == 3 && rd(&d50x, d50.SECCFG_IRQ3_OFFSET) == 3 && rd(&d50x, d50.SECCFG_MISC_OFFSET) == 0x3ff)
+    assert(rd(&d50x, d50.MPU_CTRL_OFFSET) == 0 && rd(&d50x, d50.MPU_LAR7_OFFSET) == 0)
+    var d40x = dma(RP2040_DMA, MODELLED)
+    assert(rd(&d40x, d40.N_CHANNELS_OFFSET) == 12)
+    assert(d40x.read(d40.CH11_DBG_TCR_OFFSET + 0x40, 4).is_err(), "no channel 12 on the RP2040")
+    assert(d40x.read(0x424, 4).unwrap() == 0 && d40x.read(0x434, 4).is_ok(), "TIMER1 and SNIFF_CTRL, not INTE2 and INTS3")
+    assert(d40x.read(0x480, 4).is_err(), "no SECCFG on the RP2040")
+    for l in layouts()
+        var d = dma(l, MODELLED)
+        for k in 0u32..<l.channels do assert(rd(&d, k * 0x40 + 0xC) == 0 && d.busy == 0)
+        assert(!d.running())
+
+@test("the four alias sets reach each channel's four registers, and only the last of each set triggers")
+dma_aliases()
+    for l in layouts()
+        var d = dma(l, MODELLED)
+        val base: u32 = 3 * 0x40
+        // Alias 1: CTRL, READ_ADDR, WRITE_ADDR, TRANS_COUNT_TRIG.
+        wr(&d, base + 0x10, ctrl(l, 2, true, true, 3, 0x3f))
+        wr(&d, base + 0x14, 0x20000100)
+        wr(&d, base + 0x18, 0x20000200)
+        assert(d.busy == 0, "no trigger yet")
+        wr(&d, base + 0x1C, 5)
+        assert(d.busy == 8 && rd(&d, base + 0x8) == 5, "TRANS_COUNT_TRIG starts it")
+        assert(rd(&d, base) == 0x20000100 && rd(&d, base + 0x4) == 0x20000200)
+        assert(rd(&d, base + 0xC) & l.busy != 0 && rd(&d, base + 0x10) == rd(&d, base + 0xC), "BUSY in CTRL through every alias")
+        // Alias 2: CTRL, TRANS_COUNT, READ_ADDR, WRITE_ADDR_TRIG; alias 3: CTRL, WRITE_ADDR, TRANS_COUNT, READ_ADDR_TRIG.
+        d.abort(8)
+        wr(&d, base + 0x24, 7)
+        assert(rd(&d, 0x800 + base + 4) == 7 && rd(&d, base + 0x8) == 5, "TRANS_COUNT sets RELOAD; the live count stays")
+        wr(&d, base + 0x28, 0x20000400)
+        wr(&d, base + 0x2C, 0x20000800)
+        assert(d.busy == 8 && rd(&d, base + 0x8) == 7 && rd(&d, base + 0x4) == 0x20000800, "WRITE_ADDR_TRIG starts it with RELOAD")
+        d.abort(8)
+        wr(&d, base + 0x34, 0x20000900)
+        wr(&d, base + 0x38, 9)
+        wr(&d, base + 0x3C, 0x20000A00)
+        assert(d.busy == 8 && rd(&d, base + 0x8) == 9 && rd(&d, base) == 0x20000A00 && rd(&d, base + 0x24) == 9)
+        // A trigger to a busy channel is ignored; so is one to a disabled channel.
+        wr(&d, base + 0x1C, 2)
+        assert(rd(&d, base + 0x8) == 9, "busy: ignored")
+        d.abort(8)
+        wr(&d, base + 0x10, ctrl(l, 2, true, true, 3, 0x3f) & ~l.en)
+        wr(&d, base + 0xC, ctrl(l, 2, true, true, 3, 0x3f) & ~l.en)
+        assert(d.busy == 0, "disabled: ignored")
+
+@test("a null trigger starts nothing, and raises the interrupt only with IRQ_QUIET; an ordinary end raises it only without")
+dma_null_trigger()
+    for l in layouts()
+        var d = dma(l, MODELLED)
+        wr(&d, 0x10, ctrl(l, 0, false, false, 0, 0x3f) | l.quiet)
+        wr(&d, 0x14, 0)
+        wr(&d, 0x3C, 0)
+        assert(d.busy == 0 && rd(&d, 0x400) == 1, "null READ_ADDR_TRIG with IRQ_QUIET")
+        wr(&d, 0x400, 1)
+        assert(rd(&d, 0x400) == 0, "INTR is write-1-to-clear")
+        wr(&d, 0x10, ctrl(l, 0, false, false, 0, 0x3f))
+        wr(&d, 0x1C, 0)
+        assert(d.busy == 0 && rd(&d, 0x400) == 0, "no IRQ_QUIET: a null trigger raises nothing")
+        // With IRQ_QUIET a sequence ends silently; without, it raises the interrupt.
+        wr(&d, 0x10, ctrl(l, 0, false, false, 0, 0x3f) | l.quiet)
+        wr(&d, 0x1C, 1)
+        d.transferred(0)
+        assert(d.busy == 0 && rd(&d, 0x400) == 0)
+        wr(&d, 0x10, ctrl(l, 0, false, false, 0, 0x3f))
+        wr(&d, 0x1C, 1)
+        d.transferred(0)
+        assert(d.busy == 0 && rd(&d, 0x400) == 1)
+
+@test("INTEn, INTFn and INTSn per IRQ line: INTS = INTR & INTE | INTF, a write to INTS clears INTR, the atomic aliases; the RP2040 has two lines")
+dma_irq_lines()
+    for l in layouts()
+        var d = dma(l, MODELLED)
+        d.intr = 0x5
+        for n in 0u32..<l.irq_lines
+            val inte: u32 = 0x404 + 0x10 * n
+            wr(&d, inte, 1 << n)
+            assert(d.irq(n) == (n == 0 || n == 2), s"line $n")
+            assert(rd(&d, inte + 8) == 0x5 & (1 << n))
+        wr(&d, 0x408 + SET, 0x10)
+        assert(rd(&d, 0x40C) == 0x11 && d.irq(0), "INTF forces INTS")
+        wr(&d, 0x408 + CLR, 0x10)
+        wr(&d, 0x404 + SET, 0x4)
+        assert(rd(&d, 0x404) == 0x5)
+        wr(&d, 0x40C, 0x1)
+        assert(d.intr == 0x4 && rd(&d, 0x40C) == 0x4, "INTS0 clears INTR's bit 0")
+        wr(&d, 0x400 + CLR, 0x4)
+        assert(d.intr == 0, "a 1 through the CLR alias clears it too")
+        assert(!d.irq(4) && !d.irq(l.irq_lines))
+    var d40x = dma(RP2040_DMA, MODELLED)
+    assert(d40x.read(0x424, 4).is_ok() && !d40x.irq(2), "0x424 is TIMER1 on the RP2040")
+
+@test("MULTI_CHAN_TRIGGER starts each enabled idle channel named; CHAN_ABORT stops one mid-sequence with its count left, no interrupt, no chain")
+dma_multi_and_abort()
+    for l in layouts()
+        var d = dma(l, MODELLED)
+        for k in 0u32..<3
+            wr(&d, k * 0x40 + 0x8, 10)
+            wr(&d, k * 0x40 + 0x10, ctrl(l, 2, true, true, if k == 0 then 2 else k, 0x3f))
+        wr(&d, at(l, 0x450), 0x3)
+        assert(d.busy == 0x3 && rd(&d, at(l, 0x450)) == 0)
+        for i in 0..<4 do d.transferred(0)
+        wr(&d, at(l, 0x464), 0x1)
+        assert(d.busy == 0x2 && rd(&d, 0x8) == 6 && d.intr == 0 && rd(&d, at(l, 0x464)) == 0, "aborted at 6 left; channel 2 not chained")
+        wr(&d, at(l, 0x450) + CLR, 0x4)
+        assert(d.busy == 0x2, "the CLR alias triggers nothing")
+
+@test("a sequence's end chains to CHAIN_TO, not to itself; RP2350 TRANS_COUNT.MODE: TRIGGER_SELF restarts it, ENDLESS never counts down")
+dma_chain_and_modes()
+    for l in layouts()
+        var d = dma(l, MODELLED)
+        wr(&d, 0x40 + 0x8, 2)
+        wr(&d, 0x40 + 0x10, ctrl(l, 2, true, true, 1, 0x3f))
+        wr(&d, 0x8, 1)
+        wr(&d, 0x10, ctrl(l, 2, true, true, 1, 0x3f))
+        wr(&d, 0x1C, 1)
+        d.transferred(0)
+        assert(d.busy == 2 && rd(&d, 0x40 + 0x8) == 2 && d.intr == 1, "channel 0 done, chained to 1")
+        d.transferred(1)
+        d.transferred(1)
+        assert(d.busy == 0 && d.intr == 3, "channel 1 chains to itself: nothing more")
+    var d = dma(RP2350_DMA, MODELLED)
+    wr(&d, 0x10, ctrl(RP2350_DMA, 2, true, true, 0, 0x3f))
+    wr(&d, 0x1C, (1 << 28) | 3)
+    assert(rd(&d, 0x8) == (1 << 28) | 3, "MODE reads back with the count")
+    for i in 0..<3 do d.transferred(0)
+    assert(d.busy == 1 && rd(&d, 0x8) & 0x0FFFFFFF == 3 && d.intr == 1, "TRIGGER_SELF: done, interrupt, started again")
+    d.abort(1)
+    wr(&d, 0x1C, (15 << 28) | 0)
+    assert(d.busy == 1, "ENDLESS starts with a count of 0")
+    for i in 0..<1000 do d.transferred(0)
+    assert(d.busy == 1 && rd(&d, 0x8) & 0x0FFFFFFF == 0)
+    assert(d.completion_due(0).is_none(), "ENDLESS never ends")
+
+@test("what the model refuses by name: DATA_SIZE 3, SNIFF_EN, a TREQ_SEL with no source, reserved MODEs, a count of 0, the sniffer, and a change to SECCFG or the MPU")
+dma_refusals()
+    for l in layouts()
+        var d = dma(l, MODELLED)
+        val reasons = [
+            (0x10u32, ctrl(l, 3, false, false, 0, 0x3f), "DATA_SIZE 3 is reserved"),
+            (0x10, ctrl(l, 2, false, false, 0, 0x3f) | l.sniff, "item 12"),
+            (at(l, 0x454), 1, "the sniffer"),
+            (at(l, 0x458), 0, "the sniffer"),
+        ]
+        for (o, x, want) in reasons
+            d.write(o, 4, x) match
+                Ok(_) -> assert(false, s"0x$o = 0x$x was let through")
+                Err(f) -> assert(why_of(f).contains(want), why_of(f))
+        d.write(0x10, 4, ctrl(l, 0, false, false, 0, 24)) match
+            Err(Treq(k, sel)) -> assert(k == 0 && sel == 24)
+            _ -> assert(false, "TREQ_SEL 24 has no source here")
+        // A refused CTRL write leaves CTRL as it was (the chip restores the copy it made).
+        assert(rd(&d, 0xC) == 0)
+        wr(&d, at(l, 0x454), 0)
+        wr(&d, 0x10, ctrl(l, 2, false, false, 0, 0x3f))
+        d.write(0x1C, 4, 0x0) match
+            Ok(_) -> ()
+            Err(f) -> assert(false, why_of(f))
+        assert(d.busy == 0, "0 written to a trigger register is a null trigger, not a count of 0")
+        wr(&d, 0x8, 0)
+        d.write(at(l, 0x450), 4, 1) match
+            Ok(_) -> assert(false, "a trigger with TRANS_COUNT 0")
+            Err(f) -> assert(why_of(f).contains("TRANS_COUNT 0"), why_of(f))
+    var d = dma(RP2350_DMA, MODELLED)
+    d.write(0x8, 4, 2 << 28) match
+        Ok(_) -> assert(false, "MODE 2")
+        Err(f) -> assert(why_of(f).contains("MODE 2 is reserved"), why_of(f))
+    for (o, name) in [(d50.SECCFG_CH0_OFFSET, "SECCFG_CH0"), (d50.SECCFG_IRQ2_OFFSET, "SECCFG_IRQ2"), (d50.SECCFG_MISC_OFFSET, "SECCFG_MISC"), (d50.MPU_CTRL_OFFSET, "MPU_CTRL"), (d50.MPU_LAR3_OFFSET, "MPU_LAR3")]
+        val was = rd(&d, o)
+        wr(&d, o, was)
+        d.write(o, 4, was ^ 1) match
+            Ok(_) -> assert(false, s"$name changed")
+            Err(f) -> assert(why_of(f).contains(name) && why_of(f).contains("item 12"), why_of(f))
+        assert(rd(&d, o) == was)
+    d.write(d50.TIMER2_OFFSET, 4, 1 << 16) match
+        Ok(_) -> assert(false, "Y 0")
+        Err(f) -> assert(why_of(f).contains("Y 0"), why_of(f))
+
+@test("RP2350 CTRL's REV bits: INCR with REV counts down, REV alone skips by twice the size; the ring wraps within 2^RING_SIZE, on either address")
+dma_steps_and_ring()
+    val l = RP2350_DMA
+    var d = dma(l, MODELLED)
+    wr(&d, 0x10, ctrl(l, 2, true, false, 0, 0x3f) | l.read_rev | l.write_rev)
+    val c = d.ch[0]
+    assert(c.read_step == 0 -% 4 && c.write_step == 8 && c.size == 4)
+    wr(&d, 0x10, ctrl(l, 1, true, true, 0, 0x3f) | put(3, l.ring_size))
+    val r = d.ch[0]
+    assert(r.ring == 7 && !r.ring_write)
+    assert(r.next(0x20000106, 2, true) == 0x20000100, "read address wraps on 8 bytes")
+    assert(r.next(0x20000106, 2, false) == 0x20000108, "the write address does not")
+    wr(&d, 0x10, ctrl(l, 1, true, true, 0, 0x3f) | put(3, l.ring_size) | l.ring_sel)
+    assert(d.ch[0].ring_write)
+    val down = d.ch[0]
+    assert(down.next(0x20000100, 0 -% 2, true) == 0x20000106, "a decrementing address wraps the other way")
+    var d4 = dma(RP2040_DMA, MODELLED)
+    wr(&d4, 0x10, ctrl(RP2040_DMA, 0, true, true, 0, 0x3f) | put(15, RP2040_DMA.ring_size))
+    assert(d4.ch[0].ring == 0x7FFF && d4.ch[0].read_step == 1 && d4.ch[0].write_step == 1)
+
+@test("the pacing timers: X/Y requests per cycle counted into each busy channel they pace (at most 63), the wait to the next, and a completion bound")
+dma_pacing_timers()
+    for l in layouts()
+        var d = dma(l, MODELLED)
+        val timer0 = at(l, 0x440)
+        wr(&d, timer0 + 4, (1 << 16) | 4)
+        assert(rd(&d, timer0 + 4) == 0x10004)
+        wr(&d, 0x8, 10)
+        wr(&d, 0x10, ctrl(l, 2, true, true, 0, 0x3c))
+        wr(&d, 0x1C, 10)
+        assert(d.timer_wait() == Some(4), s"${d.timer_wait()}")
+        d.pace_to(3)
+        assert(d.ch[0].credit == 0 && d.timer_wait() == Some(1))
+        d.pace_to(9)
+        assert(d.ch[0].credit == 2 && rd(&d, 0x800) == 2 && d.timer_wait().is_none(), "two requests by cycle 9, one more at 12")
+        assert(d.pulse_in(1, 1) == Some(3), "phase 1 of 4: the next request 3 cycles on")
+        d.transferred(0)
+        assert(d.ch[0].credit == 1 && rd(&d, 0x8) == 9)
+        // Nine transfers to go with one request in hand: eight more requests, the last 31 cycles after
+        // cycle 9, and its transfer in the cycle after.
+        assert(d.completion_due(9) == Some(32), s"${d.completion_due(9)}")
+        wr(&d, 0x800, 0)
+        assert(d.ch[0].credit == 0, "a write to DBG_CTDREQ clears it")
+        d.pace_to(100000)
+        assert(d.ch[0].credit == 63, "six bits")
+        // X ≥ Y is one request a cycle.
+        wr(&d, timer0, (3 << 16) | 2)
+        assert(d.pulse_in(0, 5) == Some(5))
+        // Requests made while no channel is busy are no one's.
+        d.abort(1)
+        wr(&d, 0x800, 0)
+        d.pace_to(200000)
+        assert(d.ch[0].credit == 0)
+
+@test("a bus error halts the channel with its flag, AHB_ERROR their OR, and raises the interrupt even with IRQ_QUIET; a write of 1 clears it")
+dma_bus_error()
+    for l in layouts()
+        var d = dma(l, MODELLED)
+        wr(&d, 0x10, ctrl(l, 2, true, true, 0, 0x3f) | l.quiet)
+        wr(&d, 0x1C, 4)
+        d.bus_error(0, DMA_READ_ERROR)
+        assert(d.busy == 0 && d.intr == 1 && rd(&d, 0xC) & 0xC0000000 == 0xC0000000)
+        wr(&d, 0x10, ctrl(l, 2, true, true, 0, 0x3f) | 0x40000000)
+        assert(rd(&d, 0xC) & 0xE0000000 == 0)
+
+@test("RESETS: the DMA's reset puts it back to power-on, keeping its layout and the timers' clock")
+dma_reset()
+    var d = dma(RP2350_DMA, MODELLED)
+    wr(&d, 0x10, ctrl(RP2350_DMA, 2, true, true, 0, 0x3f))
+    wr(&d, 0x1C, 4)
+    d.pace_to(500)
+    d.reset()
+    assert(d.busy == 0 && rd(&d, 0xC) == 0 && rd(&d, 0x468) == 16 && d.paced_at == 500)

@@ -109,7 +109,7 @@ day. An L is split before it is handed out (§6).
 | I2C0/1 (DW_apb_i2c) | 12.2 I2C | missing | `dw-i2c` has `modelled = false` (`registry.sysl:322`). The device callbacks exist (`peripheral/i2c/i2c.sysl`). | — | M (master), S (slave) | mux, DMA |
 | PWM (12 slices) | 12.5 PWM | missing | Only `virt-pwm` (`peripheral/pwm/pwm.sysl`). | — | M | mux, DMA, IRQ |
 | ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
-| DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | missing | Not decoded. | — | L (core) + S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
+| DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | partial | Item 11: the 16 channels with their four alias sets and triggers, TRANS_COUNT with MODE, every CTRL field, the UART DREQs, the four X/Y pacing timers and TREQ_PERMANENT, chaining, IRQ0–3, MULTI_CHAN_TRIGGER, CHAN_ABORT; transfers through the chip's bus, one a cycle, scheduled through `next_event` (`peripheral/rp2040/dma.sysl`, `chip/dma.sysl`). Refused by name: the sniffer, a change to SECCFG_* or MPU_* (item 12), a TREQ_SEL whose source is not modelled. | `rp2350/dma_tests.sysl`, `chip/dma_tests.sysl` | S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
 | PIO0/1/2 | 11 PIO | missing | Not decoded. DESIGN.md §9.7 costs it at 4–6 agent-days. The RP2350 adds a third block, `MOV` to and from the RX FIFO, and the GPIO base (16/48). | — | L (machine) + M (GPIO/DMA/IRQ) | mux, DMA, IRQ, clk_sys |
 | USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | partial | The controller in device mode, whole (`peripheral/rp2350/usb.sysl`, item 20): the registers, DPRAM with the SETUP packet, endpoint and buffer control, single and double buffering, NAK, STALL, abort, the interrupts and USBCTRL_IRQ, driven by a host through the Arm board's `usb_*` seam. Not gated by RESETS, since the SDK reads SIE_CTRL before releasing USBCTRL; RESETS asserting it resets the controller. The CDC bridge to a pty is item 21. | `peripheral/rp2350/usb_tests.sysl`, `chip/usb_tests.sysl` | M (bridge) | clk_usb |
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
@@ -135,7 +135,7 @@ day. An L is split before it is handed out (§6).
 | SIO hardware divider (per core) | 2.3.1.5 Integer divider | full | `peripheral/rp2040/divider.sysl:5–84`: 8-cycle completion, DIRTY, signed and unsigned. Reached only from a test bus. | `rp2040/tests.sysl`, `v6m/rp2040_peripheral_tests.sysl` | S (wire) | chip layer |
 | SIO interpolators (with the RP2040's blend and clamp modes) | 2.3.1.6 Interpolator | full | `peripheral/rp2040/interp.sysl`, the RP2350's model with SHIFT a logical right shift (item 15). Reached only from tests until the RP2040 chip layer places it. | `rp2040/interp_tests.sysl` (both shifts) | S (wire) | chip layer |
 | Bus fabric, BUSCTRL, performance counters | 2.1 Bus fabric | missing | — | — | S | — |
-| DMA: 12 channels, DREQs, pacing timers, chaining, ring, sniff/CRC | 2.5 DMA | missing | — | — | L (shared with RP2350, which has more channels and security) | DREQs |
+| DMA: 12 channels, DREQs, pacing timers, chaining, ring, sniff/CRC | 2.5 DMA | missing | Not on a chip yet (item 22). The register model is shared and built for the RP2040's layout (`RP2040_DMA`: 12 channels, two IRQ lines, its CTRL fields and offsets), tested at register level beside the RP2350's. | `rp2350/dma_tests.sysl` | S (place it) | DREQs |
 | ROM: contents, float/double/mem tables, `rom_func_lookup`, core-1 launch | 2.8 Bootrom | missing | Not mapped. The RP2040 SDK calls the ROM for float, double, memcpy and memset (DESIGN.md §10.1). | — | L | XIP/SSI for the flash routines |
 | Boot sequence (boot2, CRC check, USB boot) | 2.7 Boot sequence | missing | DESIGN.md §10.1: the debugger entry, boot2 not run. | — | M (debugger entry); L (real path) | ROM, SSI |
 | SRAM (264 KB, striped, plus non-striped aliases at 0x2100_0000) | 2.6.2 SRAM | partial | The 264 KB region is described (`mcus/rp2040.hocon:14`). The aliases are absent, and the chip does not run. | — | S | chip layer |
@@ -169,7 +169,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 33 | 8 | 0 | 17 | 58 |
+| RP2350 | 33 | 9 | 0 | 16 | 58 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
@@ -322,7 +322,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 8 | **UART completion**: baud-timed bytes from clk_peri, both UARTs' pins correct, RT timeout, FIFO-level IRQs, break and errors, DREQ outputs. **Done** (below). | M | 6 |
 | 9 | **GPIO function mux and GPIO interrupts**: one routing layer where every producer offers level and OE, IO_IRQ_BANK0, and per-core INTE/INTF/INTS. `gpio/hello_gpio_irq` is its oracle. **Done** (below). | M | 6 |
 | 10 | **Watchdog counter and chip reset path**: countdown, TRIGGER, REASON, SCRATCH surviving, and the machine restarting through the boot path. **Done** (below). | M | 5 |
-| 11 | **DMA core**: channels, DREQ inputs, pacing timers, chaining, ring, IRQs. The register model is shared by both chips' channel counts. | L | 9 |
+| 11 | **DMA core**: channels, DREQ inputs, pacing timers, chaining, ring, IRQs. The register model is shared by both chips' channel counts. **Done** (below). | L | 9 |
 | 12 | **DMA sniff/CRC and security attributes**. | S | 11 |
 | 13 | **PIO state machine**: the instruction set, FIFOs, shift registers, side-set, divider, IRQ flags, and the RP2350 additions, with register-level tests. | L | 9 |
 | 14 | **PIO integration**: pins through the mux, DREQs, the IRQ lines. `ws2812`, `pio_blink`, `uart_tx` and `uart_rx` are its oracles. | M | 11, 13 |

@@ -22,9 +22,15 @@ function(benchtop_program target source type)
 endfunction()
 
 # RAM images: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
-foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp aon_timer rom otp hello_gpio_irq gpio_irq hello_uart uart_advanced uart_loopback)
+foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp aon_timer rom otp hello_gpio_irq gpio_irq hello_uart uart_advanced uart_loopback hello_dma control_blocks dma_uart)
     benchtop_program(${prog} ${prog}.c no_flash)
 endforeach()
+target_link_libraries(hello_dma hardware_dma)
+target_link_libraries(control_blocks hardware_dma)
+target_link_libraries(dma_uart hardware_dma)
+# hello_dma from flash too: the DMA reads its source through the XIP cache.
+benchtop_program(hello_dma_flash hello_dma.c default)
+target_link_libraries(hello_dma_flash hardware_dma)
 target_link_libraries(gpio_irq pico_multicore)
 # rom.c calls the boot ROM's functions, the flash's among them, from SRAM.
 target_link_libraries(rom hardware_flash hardware_watchdog)
