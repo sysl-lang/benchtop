@@ -1,0 +1,278 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.rp2350.uart0 as ur
+import sysl.buf.{Buf, buf}
+import sysl.math.min
+
+// The PL011 by itself (`uart.sysl`), its line timed in quarter clk_peri cycles as the chip passes them:
+// frames at the latched divisor, their shape and bits, the FIFOs and their trigger levels, the receive
+// timeout, the errors and the overrun, break both ways, loopback, the DMA requests, and the settings it
+// refuses. The chip's side (pins, wires, the console, programs) is `chip/uart_tests.sysl`.
+
+// One bit at 115200 baud from 150 MHz: the SDK's IBRD 81 and FBRD 24, 64 × 81 + 24 quarter cycles.
+private const BIT: u64 = 5208
+private const FRAME_8N1: u64 = 10 * BIT
+
+private wr(u: *Uart, o: u32, x: u32) = u.write(o, 4, x).unwrap()
+private rd(u: *Uart, o: u32) -> u32 = u.read(o, 4).unwrap()
+
+// A UART set up as the SDK's `uart_init(uart, 115200)` leaves it: 8N1, FIFOs on, enabled.
+private sdk_uart() -> Uart
+    var u = uart()
+    wr(&u, ur.UARTIBRD_OFFSET, 81)
+    wr(&u, ur.UARTFBRD_OFFSET, 24)
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x70)
+    wr(&u, ur.UARTCR_OFFSET, 0x301)
+    u
+
+// `units` quarter cycles pass event by event, as the chip passes them: what the line sent, in order.
+private run_line(u: *Uart, units: u64) -> Buf[Sent]
+    var out: Buf[Sent] = buf()
+    var left = units
+    while left > 0 && u.active()
+        val step = min(left, u.until_event())
+        u.pass(step) match
+            Some(s) -> out.push(s)
+            None -> ()
+        left -= step
+    out
+
+@test("a frame takes ten bits at the latched divisor, and IBRD and FBRD wait for an LCR_H write")
+uart_frame_timing()
+    var u = sdk_uart()
+    wr(&u, ur.UARTDR_OFFSET, u32('A'))
+    assert(u.active() && u.until_event() == FRAME_8N1, s"${u.until_event()}")
+    assert(rd(&u, ur.UARTFR_OFFSET) & ur.UARTFR_BUSY_MASK != 0, "BUSY while the frame is on the line")
+    assert(run_line(&u, FRAME_8N1 - 1).len() == 0 && u.take().is_none(), "not a quarter cycle early")
+    val sent = run_line(&u, 1)
+    assert(sent.len() == 1 && sent[0].frame.data == u8('A') && sent[0].divisor == 5208 && u.take().unwrap() == u8('A'))
+    assert(!u.active() && rd(&u, ur.UARTFR_OFFSET) == 0x90, "idle: BUSY clear")
+    // Twice the divisor: only once LCR_H has been written.
+    wr(&u, ur.UARTIBRD_OFFSET, 162)
+    wr(&u, ur.UARTFBRD_OFFSET, 48)
+    wr(&u, ur.UARTDR_OFFSET, 1)
+    assert(u.until_event() == FRAME_8N1, "the old divisor until LCR_H is written")
+    run_line(&u, FRAME_8N1)
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x70)
+    wr(&u, ur.UARTDR_OFFSET, 2)
+    assert(u.until_event() == 2 * FRAME_8N1 && u.latched_divisor() == 2 * 5208)
+
+@test("frame shapes: 5 to 8 data bits, parity even, odd and stuck, two stop bits, bit by bit on the line")
+uart_frame_shape()
+    // 5 bits, even parity, two stop bits: start, 5 data, parity, 2 stop.
+    assert(frame_bits(0x0E) == 9 && frame_bits(0x70) == 10 && frame_bits(0x6A) == 12 && frame_bits(0x00) == 7)
+    var u = sdk_uart()
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x1E)
+    wr(&u, ur.UARTDR_OFFSET, 0b10110)
+    assert(u.until_event() == 9 * BIT)
+    // Start, then 0 1 1 0 1 from the least significant bit, parity 1 (three ones, even), stop, stop.
+    val want = [false, false, true, true, false, true, true, true, true]
+    for i in 0..<9
+        assert(u.line_level() == want[i], s"bit $i")
+        run_line(&u, BIT)
+    assert(u.line_level(), "idle high")
+    // Odd parity of three ones is 0; stick parity sends EPS's inverse.
+    assert(!frame_bit(0b10110, 0x0A, 6) && frame_bit(0b10110, 0x0E, 6))
+    assert(frame_bit(0, 0x82, 6) && !frame_bit(0xFF, 0x86, 6), "SPS: 1 with EPS clear, 0 with it set")
+    assert(frame_bit(0x80, 0x60, 8) && !frame_bit(0x80, 0x46, 8), "the eighth bit is data in an 8-bit word, parity in a 7-bit one")
+
+@test("the transmit FIFO: filled while the UART is off, sent once it is on; 32 deep, or 1 without FEN; TX raised as it falls to its level")
+uart_transmit_fifo()
+    var u = uart()
+    wr(&u, ur.UARTIBRD_OFFSET, 81)
+    wr(&u, ur.UARTFBRD_OFFSET, 24)
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x70)
+    for i in 0..<33 do wr(&u, ur.UARTDR_OFFSET, u32(i))
+    assert(rd(&u, ur.UARTFR_OFFSET) & (ur.UARTFR_TXFF_MASK | ur.UARTFR_BUSY_MASK) == ur.UARTFR_TXFF_MASK | ur.UARTFR_BUSY_MASK, "BUSY with the UART off")
+    assert(!u.active() && !u.sending(), "nothing goes while UARTEN is clear")
+    wr(&u, ur.UARTCR_OFFSET, 0x301)
+    // IFLS's power-on TX level is half: 16. The 33rd character was lost; the first went to the shifter.
+    var sent = run_line(&u, 14 * FRAME_8N1)
+    assert(sent.len() == 14 && rd(&u, ur.UARTRIS_OFFSET) & ur.UARTRIS_TXRIS_MASK == 0, "17 waiting, above the level")
+    sent = run_line(&u, FRAME_8N1)
+    assert(rd(&u, ur.UARTRIS_OFFSET) & ur.UARTRIS_TXRIS_MASK != 0, "16 waiting")
+    wr(&u, ur.UARTDR_OFFSET, 99)
+    assert(rd(&u, ur.UARTRIS_OFFSET) & ur.UARTRIS_TXRIS_MASK == 0, "a write above the level clears it")
+    sent = run_line(&u, 40 * FRAME_8N1)
+    assert(sent.len() == 18 && sent[16].frame.data == 31 && sent[17].frame.data == 99, s"${sent.len()}")
+    wr(&u, ur.UARTICR_OFFSET, ur.UARTICR_TXIC_MASK)
+    assert(rd(&u, ur.UARTRIS_OFFSET) & ur.UARTRIS_TXRIS_MASK == 0, "ICR clears it")
+    // Without the FIFO: one character waits, and TX rises as the holding register empties.
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x60)
+    wr(&u, ur.UARTDR_OFFSET, 1)
+    assert(rd(&u, ur.UARTRIS_OFFSET) & ur.UARTRIS_TXRIS_MASK != 0, "1 went straight to the shifter")
+    wr(&u, ur.UARTDR_OFFSET, 2)
+    wr(&u, ur.UARTDR_OFFSET, 3)
+    assert(rd(&u, ur.UARTFR_OFFSET) & ur.UARTFR_TXFF_MASK != 0 && rd(&u, ur.UARTRIS_OFFSET) & ur.UARTRIS_TXRIS_MASK == 0)
+    sent = run_line(&u, 3 * FRAME_8N1)
+    assert(sent.len() == 2 && sent[1].frame.data == 2, "3 was lost to the full holding register")
+
+@test("a frame in progress finishes after UARTEN or TXE is cleared, and the next waits")
+uart_disable_mid_frame()
+    var u = sdk_uart()
+    wr(&u, ur.UARTDR_OFFSET, 1)
+    wr(&u, ur.UARTDR_OFFSET, 2)
+    run_line(&u, BIT)
+    wr(&u, ur.UARTCR_OFFSET, 0x201)
+    val sent = run_line(&u, 3 * FRAME_8N1)
+    assert(sent.len() == 1 && sent[0].frame.data == 1 && !u.active() && u.sending() == false)
+    wr(&u, ur.UARTCR_OFFSET, 0x301)
+    assert(run_line(&u, FRAME_8N1).len() == 1)
+
+@test("the receive FIFO: RX at its trigger level and below it again, the 32-bit timeout, and both cleared by reading or ICR")
+uart_receive_levels()
+    var u = sdk_uart()
+    wr(&u, ur.UARTIFLS_OFFSET, 0)
+    wr(&u, ur.UARTIMSC_OFFSET, ur.UARTIMSC_RXIM_MASK | ur.UARTIMSC_RTIM_MASK)
+    for i in 0..<3 do u.receive(Frame(u8(i), 0))
+    assert(!u.irq(), "3 is under 1/8 of 32")
+    u.receive(Frame(3, 0))
+    assert(rd(&u, ur.UARTMIS_OFFSET) == ur.UARTRIS_RXRIS_MASK, "4 reaches it")
+    assert(rd(&u, ur.UARTDR_OFFSET) == 0 && !u.irq(), "3 is below it again")
+    // The timeout: 32 bit periods after the last character, with one waiting.
+    assert(u.until_event() == 32 * BIT)
+    run_line(&u, 32 * BIT - 1)
+    assert(!u.irq())
+    run_line(&u, 1)
+    assert(rd(&u, ur.UARTMIS_OFFSET) == ur.UARTRIS_RTRIS_MASK && !u.active(), "RT, and nothing more to time")
+    wr(&u, ur.UARTICR_OFFSET, ur.UARTICR_RTIC_MASK)
+    assert(!u.irq(), "ICR clears it, and no new character starts it again")
+    u.receive(Frame(9, 0))
+    run_line(&u, 32 * BIT)
+    assert(u.irq())
+    for i in 0..<3 do rd(&u, ur.UARTDR_OFFSET)
+    assert(rd(&u, ur.UARTDR_OFFSET) == 9 && !u.irq() && !u.active(), "reading the FIFO empty clears RT and stops the count")
+    // Each level: 1/8, 1/4, 1/2, 3/4, 7/8.
+    val levels = [4, 8, 16, 24, 28]
+    for sel in 0u32..<5
+        var v = sdk_uart()
+        wr(&v, ur.UARTIFLS_OFFSET, sel << ur.UARTIFLS_RXIFLSEL_SHIFT)
+        for i in 0..<(levels[sel] - 1) do v.receive(Frame(u8(i), 0))
+        assert(v.raw() & ur.UARTRIS_RXRIS_MASK == 0, s"level $sel")
+        v.receive(Frame(0, 0))
+        assert(v.raw() & ur.UARTRIS_RXRIS_MASK != 0, s"level $sel")
+
+@test("errors: FE, PE and BE ride with their character into UARTDR and UARTRSR and raise their interrupts; an overrun loses the character and marks the next")
+uart_receive_errors()
+    var u = sdk_uart()
+    u.receive(Frame(0x55, ur.UARTDR_FE_MASK))
+    u.receive(Frame(0x66, ur.UARTDR_PE_MASK))
+    u.receive(Frame(0, ur.UARTDR_FE_MASK | ur.UARTDR_BE_MASK))
+    assert(rd(&u, ur.UARTRIS_OFFSET) == ur.UARTRIS_FERIS_MASK | ur.UARTRIS_PERIS_MASK | ur.UARTRIS_BERIS_MASK)
+    assert(rd(&u, ur.UARTDR_OFFSET) == 0x155 && rd(&u, ur.UARTRSR_OFFSET) == ur.UARTRSR_FE_MASK)
+    assert(rd(&u, ur.UARTDR_OFFSET) == 0x266 && rd(&u, ur.UARTRSR_OFFSET) == ur.UARTRSR_PE_MASK)
+    assert(rd(&u, ur.UARTDR_OFFSET) == 0x500 && rd(&u, ur.UARTRSR_OFFSET) == ur.UARTRSR_FE_MASK | ur.UARTRSR_BE_MASK, "a break is 0 with BE and FE")
+    wr(&u, ur.UARTRSR_OFFSET, 0)
+    assert(rd(&u, ur.UARTRSR_OFFSET) == 0, "UARTECR clears")
+    wr(&u, ur.UARTICR_OFFSET, 0x7FF)
+    assert(rd(&u, ur.UARTRIS_OFFSET) == 0)
+    // Overrun, without the FIFO: the holding register is full.
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x60)
+    u.receive(Frame(1, 0))
+    u.receive(Frame(2, 0))
+    assert(rd(&u, ur.UARTRSR_OFFSET) == ur.UARTRSR_OE_MASK && rd(&u, ur.UARTRIS_OFFSET) & ur.UARTRIS_OERIS_MASK != 0)
+    assert(rd(&u, ur.UARTDR_OFFSET) == 1, "2 was lost")
+    u.receive(Frame(3, 0))
+    assert(rd(&u, ur.UARTDR_OFFSET) == 0x803, "the next character in carries OE")
+    u.receive(Frame(4, 0))
+    assert(rd(&u, ur.UARTDR_OFFSET) == 4 && rd(&u, ur.UARTRSR_OFFSET) == ur.UARTRSR_OE_MASK, "and only it; RSR keeps OE until cleared")
+    // With the FIFO: 32 fit.
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x70)
+    for i in 0..<33 do u.receive(Frame(u8(i), 0))
+    assert(rd(&u, ur.UARTFR_OFFSET) & ur.UARTFR_RXFF_MASK != 0)
+    for i in 0..<32 do assert(rd(&u, ur.UARTDR_OFFSET) == u32(i))
+    // Off, the receiver takes nothing.
+    wr(&u, ur.UARTCR_OFFSET, 0x101)
+    u.receive(Frame(7, 0))
+    assert(rd(&u, ur.UARTFR_OFFSET) & ur.UARTFR_RXFE_MASK != 0)
+
+@test("a frame from outside arrives a frame time later at the UART's own rate; one at a time")
+uart_arrive()
+    var u = sdk_uart()
+    assert(u.arrive(Frame(u8('x'), 0)) && !u.arrive(Frame(u8('y'), 0)), "the line is busy")
+    run_line(&u, FRAME_8N1 - 1)
+    assert(rd(&u, ur.UARTFR_OFFSET) & ur.UARTFR_RXFE_MASK != 0)
+    run_line(&u, 1)
+    assert(rd(&u, ur.UARTDR_OFFSET) == u32('x') && u.arrive(Frame(u8('y'), 0)))
+
+@test("break: BRK holds the line low after the frame in progress, and a receiver takes it as a break a frame later; no frame starts until BRK clears")
+uart_send_break()
+    var u = sdk_uart()
+    wr(&u, ur.UARTDR_OFFSET, 0xFF)
+    run_line(&u, BIT)
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x71)
+    wr(&u, ur.UARTDR_OFFSET, 0x42)
+    var sent = run_line(&u, FRAME_8N1 - BIT)
+    assert(sent.len() == 1 && sent[0].frame.data == 0xFF && !u.line_level(), "low once the frame has gone")
+    sent = run_line(&u, FRAME_8N1)
+    assert(sent.len() == 1 && sent[0].frame.errors == ur.UARTDR_FE_MASK | ur.UARTDR_BE_MASK && sent[0].frame.data == 0)
+    assert(u.take().unwrap() == 0xFF && u.take().is_none(), "a break is not a character on the console")
+    assert(run_line(&u, 4 * FRAME_8N1).len() == 0 && !u.line_level(), "one break, however long it is held")
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x70)
+    assert(u.line_level() == false, "0x42's start bit")
+    sent = run_line(&u, FRAME_8N1)
+    assert(sent.len() == 1 && sent[0].frame.data == 0x42)
+
+@test("loopback (CR.LBE): the UART receives its own frames and breaks, and not the line from outside")
+uart_loopback_bit()
+    var u = sdk_uart()
+    wr(&u, ur.UARTCR_OFFSET, 0x381)
+    wr(&u, ur.UARTDR_OFFSET, 0x5A)
+    u.arrive(Frame(0x11, 0))
+    run_line(&u, FRAME_8N1)
+    assert(rd(&u, ur.UARTDR_OFFSET) == 0x5A && rd(&u, ur.UARTFR_OFFSET) & ur.UARTFR_RXFE_MASK != 0)
+    wr(&u, ur.UARTLCR_H_OFFSET, 0x71)
+    run_line(&u, FRAME_8N1)
+    assert(rd(&u, ur.UARTDR_OFFSET) == 0x500)
+
+@test("the DMA requests: TX while there is room and TXDMAE, RX while a character waits and RXDMAE, stopped by DMAONERR while an error interrupt is asserted")
+uart_dreqs()
+    var u = sdk_uart()
+    assert(!u.dreq_tx() && !u.dreq_rx(), "DMACR is 0 at power-on")
+    wr(&u, ur.UARTDMACR_OFFSET, ur.UARTDMACR_TXDMAE_MASK | ur.UARTDMACR_RXDMAE_MASK)
+    assert(u.dreq_tx() && !u.dreq_rx())
+    for i in 0..<33 do wr(&u, ur.UARTDR_OFFSET, u32(i))
+    assert(!u.dreq_tx(), "full: 32 waiting, one on the line")
+    run_line(&u, FRAME_8N1)
+    assert(u.dreq_tx())
+    u.receive(Frame(1, ur.UARTDR_PE_MASK))
+    assert(u.dreq_rx())
+    wr(&u, ur.UARTDMACR_OFFSET, 7)
+    assert(u.dreq_rx(), "PE is raw, not asserted, until IMSC enables it")
+    wr(&u, ur.UARTIMSC_OFFSET, ur.UARTIMSC_PEIM_MASK)
+    assert(!u.dreq_rx() && u.dreq_tx(), "DMAONERR stops RX only")
+    wr(&u, ur.UARTICR_OFFSET, ur.UARTICR_PEIC_MASK)
+    assert(u.dreq_rx())
+    rd(&u, ur.UARTDR_OFFSET)
+    assert(!u.dreq_rx())
+
+@test("refused by name: IrDA, hardware flow control through any alias, and the reserved FIFO levels; the rest of CR is stored")
+uart_refusals()
+    var u = sdk_uart()
+    assert(u.unmodelled(ur.UARTCR_OFFSET, 4, 0x303).unwrap().contains("IrDA"))
+    assert(u.unmodelled(ur.UARTCR_OFFSET + 0x2000, 4, ur.UARTCR_CTSEN_MASK).unwrap().contains("flow control"))
+    assert(u.unmodelled(ur.UARTCR_OFFSET + 0x1000, 4, ur.UARTCR_RTSEN_MASK).unwrap().contains("flow control"))
+    assert(u.unmodelled(ur.UARTCR_OFFSET, 4, 0x3301 | ur.UARTCR_RTS_MASK | ur.UARTCR_DTR_MASK).is_none(), "OUT1, OUT2, RTS and DTR are stored")
+    assert(u.unmodelled(ur.UARTIFLS_OFFSET, 4, 5).unwrap().contains("reserved") && u.unmodelled(ur.UARTIFLS_OFFSET, 4, 5 << 3).unwrap().contains("reserved"))
+    assert(u.unmodelled(ur.UARTIFLS_OFFSET, 4, 0x24).is_none())
+    // A character with no divisor latched: the chip refuses the write that leaves it so.
+    var v = uart()
+    wr(&v, ur.UARTCR_OFFSET, 0x301)
+    wr(&v, ur.UARTDR_OFFSET, 1)
+    assert(v.unclocked() && !v.sending())
+
+@test("a receiver hears a frame sent at its own divisor, word length and parity; the stop bits may differ")
+uart_hears()
+    var u = sdk_uart()
+    assert(u.hears(Sent(Frame(1, 0), 5208, 0x60)) && u.hears(Sent(Frame(1, 0), 5208, 0x68)))
+    assert(!u.hears(Sent(Frame(1, 0), 5209, 0x60)) && !u.hears(Sent(Frame(1, 0), 5208, 0x40)) && !u.hears(Sent(Frame(1, 0), 5208, 0x62)))
+
+@test("a reset puts the UART at power-on and keeps what its line has already sent")
+uart_reset_keeps_sent()
+    var u = sdk_uart()
+    wr(&u, ur.UARTDR_OFFSET, 7)
+    wr(&u, ur.UARTDR_OFFSET, 8)
+    run_line(&u, FRAME_8N1)
+    u.reset()
+    assert(!u.active() && rd(&u, ur.UARTFR_OFFSET) == 0x90 && u.take().unwrap() == 7 && u.take().is_none())

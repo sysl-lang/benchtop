@@ -69,7 +69,7 @@ day. An L is split before it is handed out (§6).
 | M33 MPU (PMSAv8, 8 regions per state) | 3.7 | partial (stored) | On a Secure-only core: MPU_TYPE (8), CTRL, RNR (three bits), RBAR, RLAR and their three aliases, MAIR0/1 stored; `TT` answers MREGION, MRVALID, R and RW from them, an overlap naming no region (`v6m/t2secure.sysl`, item 6). **Not enforced**: an access the regions forbid is made where silicon takes MemManage. The Non-secure MPU is not built (Q3). | `v6m/t2rom_tests.sysl` | M (enforcement) | — |
 | M33 stack limits (MSPLIM/PSPLIM) | 3.7 | full | Every SP write below the limit is the UsageFault STKOF, recorded in CFSR and taken where SHCSR enables it and it preempts, else HardFault (HFSR.FORCED), else a lockup stop; exception stacking that crosses the limit stacks only above it, leaves SP at it and derives the fault (late arrival or pending); `CCR.STKOFHFNMIGN` at negative priority (`v6m/t2secure.sysl`, item 2). | `t2_except.sysl` stack-limit tests; `examples/pico2/stack_limit.c` in `chip/arm_tests.sysl` | — | — |
 | TrustZone, Secure-only minimum (SAU stored, TT*, SecureFault, NS transitions refused) | 3.7, 10 Security | full | Secure reset state; SAU_CTRL/TYPE/RNR/RBAR/RLAR stored (8 regions); `TT`/`TTT`/`TTA`/`TTAT` answer from the SAU, the IDAU's one numbered region (the ROM's secure gateways, 0x7e00–0x7fff, region 2, NSC) and the MPU (item 6); NSACR, SCR and the NS alias's CPACR stored; SecureFault's enable, priority, SFSR (W1C) and SFAR, pended through SHCSR; `SG` a NOP; `BXNS`/`BLXNS` to Non-secure, EXC_RETURN with S or DCRS clear, `MRS`/`MSR` of `_NS` registers and the PPB's NS alias stop at `NonSecure`, named; EXC_RETURN with ES clear is UsageFault INVPC (item 2). Not detected: INVTRAN (executing from SAU-Non-secure memory). | `v6m/t2secure_tests.sysl`; `examples/pico2/tt.c` in `chip/arm_tests.sysl` | — | — |
-| TrustZone, Non-secure state | 3.7, 10 Security | missing | Both worlds' banked state, IDAU, secure gateways and the NS aliases of PPB and SIO. | — | L | Secure-only |
+| TrustZone, Non-secure state | 3.7, 10 Security | full | Both states' banked registers, the SCS's Non-secure alias with its own SysTick, SAU and IDAU enforced on fetches and data, SG/BXNS/BLXNS/FNC_RETURN, cross-state exceptions with the integrity signature, NVIC_ITNS, SecureFault INVEP/INVIS/INVER/AUVIOL/INVTRAN. Refused by name: FP context across states, BFHFNMINS/PRIS, a Non-secure PRIGROUP of its own, the SIO's Non-secure bank. See "Item 31, done". | `v6m/t2nonsecure_tests.sysl`, `chip/arm_tests.sysl` (`nonsecure.elf`) | — | — |
 | M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | full | `MCR`, `MRC`, `MCRR`, `MRRC`, `CDP` and their `…2` forms reach the board through `Bus.coprocessor`, gated by CPACR, which keeps the fields of the ports the board fills (`v6m/coproc.sysl`). **GPIOC is full**: every instruction of `gpio_coproc.h` is its SIO equivalent (`chip/coprocessors.sysl`). **RCP is full** (item 3): salts, canaries, boolean and integer checks, the sequence counter, the random byte and `rcp_panic`, each core its own state; a failed check stops the core at `Fault` with the check named (`chip/rcp.sysl`). **DCP is full** (item 7): every instruction of `dcp_instr.inc.S` in its `R…` and `P…` forms on CP4 and CP5, each core's two instances its own, so every canned sequence gives its IEEE result (`chip/dcp.sysl`). Any encoding outside a coprocessor's set is refused by name. | `v6m/coproc_tests.sysl`, `chip/rcp_tests.sysl`, `chip/dcp_tests.sysl` (`dcp.elf`), `chip/arm_tests.sysl` (`rcp.elf`, `gpioc.elf`) | — | — |
 | Hazard3 ×2 (RV32IMAC + Zb*/Zc*/Zcmp, PMP, Xh3pmpm, Xh3power) | 3.8 Hazard3 | full | `riscv/rp2350.sysl:6–22` and `riscv/HAZARD3-COVERAGE.md`. | `riscv/hazard3_*_tests`, `chip/tests.sysl:18` | — | — |
 | Hazard3 interrupt controller (Xh3irq) | 3.8 | full | MEIEA, MEIPA, MEINEXT and MEICONTEXT (`riscv/csr.sysl:34–42`). Only the lines `signal` drives ever pend (see "Interrupt routing"). | `riscv/hazard3_tests` | — | — |
@@ -81,7 +81,7 @@ day. An L is split before it is handed out (§6).
 | SIO interpolators INTERP0/1 (per core) | 3.1 SIO | full | `peripheral/rp2040/interp.sysl`, shared with the RP2040: each core's own pair; shift (rotate here), mask, SIGNED, CROSS_INPUT, CROSS_RESULT, ADD_RAW, FORCE_MSB, BLEND (INTERP0), CLAMP (INTERP1), OVERF flags, PEEK/POP, ACCUMx_ADD, BASE_1AND0 (item 15). | `rp2040/interp_tests.sysl`, `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
 | SIO TMDS encoder | 3.1 SIO | missing | Refused (`sio.sysl:10`). | — | S | HSTX (for a use) |
 | BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | missing | Not decoded. | — | S (counters) | DMA/cores for events |
-| ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. Nothing else on the chip consults it (Secure-only, Q3). | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
+| ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. The Arm board gates every core bus access by it (master, security state, privilege), a denial refused by name; a write restricting a memory device is refused. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl`, `chip/arm_tests.sysl` | — | — |
 | ROM: core-1 launch protocol | 5.3 / 5 Bootrom | full | The real ROM's own code, on both boards: each M33's and Hazard3's core 1 starts from reset in it and waits there (salts, then the FIFO handshake, asleep in `WFE` / `h3.block`); PSM's release restarts it (item 6). | `chip/arm_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | partial | Raspberry Pi's A4 image, whole, at 0 on both boards (`chip/rom/`); every function runs as the ROM's code. Run end to end: the lookup, `get_sys_info`'s BOOT_INFO, CHIP_INFO, CRITICAL and CPU_INFO, `connect_internal_flash`, `flash_exit_xip`, `flash_range_erase`/`_program`, `flash_flush_cache`, the unique ID, `otp_access` (reads and writes, raw and ECC, its lock and argument checks; item 26), `bootrom_state_reset` and `reboot` (PC/SP). Each other function runs until it reaches a block not modelled, which refuses it by name: USB (`reset_usb_boot`), the partition and image calls (item 30). | `chip/arm_tests.sysl` (`rom.elf`), `chip/otp_tests.sysl` (`otp.elf`) | M | USB (20), item 30 |
 | Boot path: IMAGE_DEF, partition tables, UF2, secure-boot flags, signature check | 5 Bootrom, 10 Security | missing | Core 0 does not run the ROM's boot path: power-on and the watchdog's reset hand an image over as it would (`chip/arm_board.sysl`), writing BOOT_INFO and the chip ID it copies from the OTP where the ROM keeps them. It needs TRNG and SHA-256 (the boot salts) and the image parsing; the OTP's boot flags and critical flags it reads are modelled (item 26). | — | L | ROM, XIP, SHA-256 |
@@ -104,7 +104,7 @@ day. An L is split before it is handed out (§6).
 | GPIO interrupts (PROC0/1 INTE/INTF/INTS, edge latch, IO_IRQ_BANK0, dormant wake) | 9 GPIO | full | INTR's levels and latched edges (write 1 to clear through any alias), INTE/INTF/INTS for processor 0, processor 1 and the dormant wake, IRQSUMMARY (Secure only, Q3); processor k's line is IO_IRQ_BANK0 (21) in core k on both boards, the dormant wake's wakes a DORMANT ROSC. Edges latch whenever a GPIO's input can move: a function, override, pad or SIO write, the GPIO coprocessor, or a level driven from outside; none while IO_BANK0 is held (`peripheral/rp2350/gpio_irq.sysl`, shared with the RP2040's layout; item 9). IO_IRQ_BANK0_NS is never raised (Q3). | `rp2350/gpio_irq_tests.sysl`, `chip/gpio_tests.sysl` (`hello_gpio_irq.elf`, `gpio_irq.elf`, `pico2-riscv/gpio_irq.elf`) | — | — |
 | PADS_BANK0 (ISO, IE, OD, pulls, drive, slew) | 9.8 Pads | full | `gpio.sysl:82–131`. Drive and slew are stored. | `rp2350/tests.sysl:169` | — | — |
 | IO_QSPI, PADS_QSPI (including the BOOTSEL read via QSPI_SS) | 9 GPIO | partial (stored) | PADS_QSPI's seven registers and IO_QSPI's eight CTRLs and interrupt registers stored with their reset values and aliases, behind their RESETS bits, which the boards' boot releases (`peripheral/rp2350/qspi_pins.sysl`, item 6). The pins drive nothing (the flash is the QMI's); each STATUS, and so the BOOTSEL read, refused by name. | `peripheral/rp2350/rom_blocks_tests.sysl`, `chip/tests.sysl` | S (levels, BOOTSEL) | XIP for the shared pins |
-| UART0/1 (PL011) | 12.1 UART | partial | DR both ways, FR, the divisors, LCR_H/CR stored, 32-entry FIFOs, RX/TX interrupts (`peripheral/rp2350/uart.sysl:6–12`). Not modelled: byte timing from clk_peri and the baud, modem lines, break and errors, FIFO-level interrupts beyond RX/TX, RT timeout, DMA DREQs (DMACR is stored), and the bit stream on the pin. Atomic aliases of DR and ICR are refused (`uart.sysl:84,112`). | `rp2350/tests.sysl:196`, `chip/tests.sysl:18` | M | CLOCKS (clk_peri), DMA |
+| UART0/1 (PL011) | 12.1 UART | full | Item 8: frames timed from clk_peri at the divisor LCR_H latched, through `next_event`; the bits on the TX pin through the mux, frames over wires between GPIOs and from off the chip; FIFOs or holding registers, the IFLS trigger levels, the RT timeout, break both ways, FE/PE/BE/OE, LBE loopback, the TX and RX DREQs (`peripheral/rp2350/uart.sysl`, `chip/rp2350.sysl` `advance_lines`). Refused by name: IrDA, hardware flow control (CTSEN/RTSEN, and the CTS and RTS functions in the mux), reserved IFLS levels, a character with IBRD 0 latched, and a frame its pins cannot show. Modem status reads 0. | `rp2350/uart_tests.sysl`, `chip/uart_tests.sysl` | — | DMA consumes the DREQs (item 11) |
 | SPI0/1 (PL022) | 12.3 SPI | missing | Not on the chip's bus. The PL022 model exists (`peripheral/spi/spi.sysl`) and runs on STM32 and virtual boards. | `peripheral/spi/tests.sysl` (6) | S (place) + S (DREQ) | mux, DMA |
 | I2C0/1 (DW_apb_i2c) | 12.2 I2C | missing | `dw-i2c` has `modelled = false` (`registry.sysl:322`). The device callbacks exist (`peripheral/i2c/i2c.sysl`). | — | M (master), S (slave) | mux, DMA |
 | PWM (12 slices) | 12.5 PWM | missing | Only `virt-pwm` (`peripheral/pwm/pwm.sysl`). | — | M | mux, DMA, IRQ |
@@ -169,7 +169,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 31 | 9 | 0 | 18 | 58 |
+| RP2350 | 33 | 8 | 0 | 17 | 58 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
@@ -196,8 +196,8 @@ every program in the org is.
    ROSC, BOOTRAM (boot locks), SYSINFO, SYSCFG, the POWMAN/VREG store and FC0 are not. Each one
    missing is a refusal at start-up. The census in item 1 below lists them from a real run instead of
    from memory.
-3. **UART/stdio.** `hello_serial` and every `printf` go through UART0. The model works, but bytes leave
-   at once instead of at the baud rate, and there is no DREQ.
+3. **UART/stdio.** `hello_serial` and every `printf` go through UART0, at the baud rate, with DREQs
+   for the DMA (item 8, done).
 4. **GPIO and IRQ.** GPIO interrupts and the function mux. Every button example needs the
    interrupts. The mux is what every later peripheral drives pins through, so it comes before them.
 5. **Timers and watchdog.** The timers are done. The watchdog's counter and the chip reset it makes
@@ -261,7 +261,7 @@ Each of these is a block, or part of one, that could reasonably be left out. All
 |---|---|
 | Q1 | the **real** boot ROM images, with OTP, BOOTRAM, QMI direct mode and the RCP modelled for them |
 | Q2 | the real boot path is built through **IMAGE_DEF**; the debugger entry stays as well |
-| Q3 | **Secure-only**; Non-secure state is not built |
+| Q3 | **Secure-only** first; Non-secure state then built as item 31 |
 | Q4 | USB **device** mode only, with the CDC bridge |
 | Q5 | the **GDB stub**; no SW-DP, RESCUE or CoreSight trace |
 | Q6 | GLITCH_DETECTOR and TBMAN are **register stubs** |
@@ -319,7 +319,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 5 | **Start-up register blocks** (done, see "Item 5, done"): PSM (FRCE_OFF and DONE), ROSC with RANDOMBIT, BOOTRAM, SYSINFO, SYSCFG, the POWMAN/VREG store, ACCESSCTRL stored, and CLOCKS FC0 measuring the tree. Every refusal in item 1's census is either answered here or named. | M | 1 |
 | 6 | **Boot ROM function table**: per Q1, Raspberry Pi's real ROM, mapped on both boards; core 1's wait and every ROM function run as its code. The core-0 boot path is item 30's. **Done** (below). | L | 4, 5 |
 | 7 | **DCP (CP4/5)**: the double coprocessor. `pico_float_test` and a `printf("%f")` program are its oracles. **Done** (below). | M | 3 |
-| 8 | **UART completion**: baud-timed bytes from clk_peri, both UARTs' pins correct, RT timeout, FIFO-level IRQs, break and errors, DREQ outputs. | M | 6 |
+| 8 | **UART completion**: baud-timed bytes from clk_peri, both UARTs' pins correct, RT timeout, FIFO-level IRQs, break and errors, DREQ outputs. **Done** (below). | M | 6 |
 | 9 | **GPIO function mux and GPIO interrupts**: one routing layer where every producer offers level and OE, IO_IRQ_BANK0, and per-core INTE/INTF/INTS. `gpio/hello_gpio_irq` is its oracle. **Done** (below). | M | 6 |
 | 10 | **Watchdog counter and chip reset path**: countdown, TRIGGER, REASON, SCRATCH surviving, and the machine restarting through the boot path. **Done** (below). | M | 5 |
 | 11 | **DMA core**: channels, DREQ inputs, pacing timers, chaining, ring, IRQs. The register model is shared by both chips' channel counts. | L | 9 |
@@ -342,7 +342,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 28 | **BUSCTRL performance counters, TBMAN, GLITCH_DETECTOR stores**. | S | 11 |
 | 29 | **HSTX and the SIO TMDS encoder** (per Q9). | M | 11 |
 | 30 | **Boot path** (IMAGE_DEF and partitions; per Q2). | L | 6, 25, 26 |
-| 31 | **Non-secure TrustZone** (per Q3). | L | 2 |
+| 31 | **Non-secure TrustZone** (Q3 reopened). **Done** (below). | L | 2 |
 | 32 | **USB host mode** (per Q4). | L | 20 |
 | 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED). | L | 14 |
 | 34 | **POWMAN power states**: STATE, PWRUP0–3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS, the P1.x time skip (Q7) and the power-up boot as far as it needs no ROM. **Done** (below). | M | 27 |
@@ -856,7 +856,7 @@ and the SDK's `hardware_gpio`; the chip routes and samples (`chip/rp2350.sysl` `
 
 - **One routing layer**: FUNCSEL picks a producer (`route`), the producer offers a level and an output
   enable, OUTOVER and OEOVER override them, and the pad decides. Producers today: SIO, NULL, and each
-  UART's TX (idles high and drives; bytes still leave at once, item 8) and RX, on F2 and on F11. A peripheral
+  UART's TX (drives its line: idle high, a frame's bits, a break low; item 8) and RX, on F2 and on F11. A peripheral
   item adds its producer to `route` and drops its refusal.
 - **Refused by name** (`unmodelled_function`), when the FUNCSEL is written, through any alias, CTRL kept:
   SPI (item 16), I²C (17), PWM (18), PIO0–2 (13, 14), HSTX (29), JTAG and CoreSight trace (Q5), UART CTS and
@@ -885,9 +885,8 @@ and the SDK's `hardware_gpio`; the chip routes and samples (`chip/rp2350.sysl` `
   quantum (`ArmBoard.run`). The RISC-V board likewise returned `Asleep` with a hart's interrupt pending
   (a GPIO edge driven between runs); `RiscvBoard.asleep` now asks `riscv.wakes_now`.
 
-The oracles: `examples/pico2/hello_gpio_irq.c` is pico-examples' `gpio/hello_gpio_irq` (pico-examples is
-not cloned in this tree; the source is reproduced from the upstream program and should be checked against
-the checkout once it is), run on the Arm board with GPIO 2 driven high, low, high and released;
+The oracles: `examples/pico2/hello_gpio_irq.c` is pico-examples' `gpio/hello_gpio_irq`, identical to
+`pico-scratch/pico-examples` at commit 0d62f75 apart from its two-line header comment, run on the Arm board with GPIO 2 driven high, low, high and released;
 `examples/pico2/gpio_irq.c` covers both cores, levels, a force, both overrides and the dormant wake with
 nothing outside; `examples/pico2-riscv/gpio_irq.c` is its RISC-V twin, through Hazard3's Xh3irq.
 `chip/gpio_tests.sysl` asserts each program's output line by line, and the mux, overrides, edge sources,
@@ -1022,3 +1021,130 @@ board (16 KB) and the OTP block's registers inside `Rp2350` first cost 1.5% on t
 (`row_at`, `row_bits`) and SW_LOCK as bytes. With that: `bench --core cortex-m33 kernel33.bin` 37.17 G to
 37.17 G; `sram_loop.elf` 5.207 G to 5.105 G and `xip_loop.elf` 5.428 G to 5.323 G (2% fewer); `dcp.elf`
 0.961 G to 0.694 G (28% fewer).
+
+### Item 8, done: the UARTs
+
+`peripheral/rp2350/uart.sysl` against the PL011 TRM and the field descriptions of `hardware/regs/uart.h`;
+the chip times the lines and carries their frames (`chip/rp2350.sysl` `advance_lines`, `deliver`,
+`line_in`, `wire`, `uart_write`).
+
+- **Timed lines**: one bit is 16 periods of clk_peri over IBRD + FBRD/64, counted exactly as 64 × IBRD +
+  FBRD quarter clk_peri cycles; IBRD and FBRD take effect at the next LCR_H write. A frame is a start bit,
+  5 to 8 data bits, the parity bit (even, odd or stuck) and one or two stop bits. The chip hands the UARTs
+  clk_peri's time only while a line is busy (a frame, a break, an arriving frame, the receive timeout),
+  event by event, and offers the next of those as a `next_event`, so a sleeping board wakes for it and an
+  idle UART costs nothing. A frame in progress finishes after UARTEN or TXE is cleared.
+- **Pins and wires**: a TX function drives its pin with the line's level (idle high, the frame's bits, low
+  through a break), on F2 and F11. `Rp2350.wire(a, b)` puts a wire between two GPIOs on the workbench:
+  each sees the other's level where it drives, and a frame sent from a GPIO whose function is a UART's TX
+  and whose pad drives reaches the UART whose RX is the other end's function. `line_in(n, frame)` sends a
+  frame into GPIO `n` from off the chip, arriving a frame later at that UART's rate (false while the line
+  still carries the last). The console is UART0's TX, whatever pin carries it, as before.
+- **FIFOs and interrupts**: 32 deep, or a 1-deep holding register without FEN; a character written while
+  the UART is off waits in the FIFO (BUSY set, as the TRM says). RX asserts as the receive FIFO reaches
+  its IFLS level and clears as reads take it below; TX asserts as the transmit FIFO falls to its level (the
+  holding register empties, without FEN) and clears as writes take it above; RT 32 bit periods after the
+  last character, with one waiting; ICR clears each. UARTRIS reads 0 at power-on (uart.h), where the old
+  model latched TX.
+- **Errors and break**: FE, PE and BE ride with their character into UARTDR and UARTRSR and set their
+  interrupts; a full FIFO loses the character, sets OE in UARTRSR and the interrupt, and marks the next
+  character in with UARTDR.OE; UARTECR clears UARTRSR. LCR_H.BRK holds the line low after the frame in
+  progress, and a receiver at the other end takes it as one break character (0 with BE and FE) a frame
+  later; no frame starts until BRK clears. CR.LBE feeds the UART's frames and breaks to its own receiver
+  and ignores the line from outside.
+- **DMA requests**: `Uart.dreq_tx` (TXDMAE and room in the transmit FIFO) and `dreq_rx` (RXDMAE and a
+  character waiting, stopped by DMAONERR while an error interrupt is asserted); `Rp2350.uart_dreq(n)`
+  answers DREQ 28 to 31 (`DREQ_UART0_TX` on) for item 11.
+- **Refused by name**: CR.SIREN (IrDA), CR.CTSEN and CR.RTSEN (hardware flow control: the CTS and RTS
+  functions stay refused in the mux, so there is no pin for either), the reserved IFLS levels, a character
+  to send with IBRD 0 latched, and a frame its pins cannot show as benchtop models them: one starting on a
+  pin, or the far end of its wire, whose GPIO interrupts are enabled (the interrupts do not sample a
+  frame's bits), and one going over a wire through OUTOVER or OEOVER. Over a wire, a receiver at another
+  divisor, word length or parity, an RX pad that does not read its input, and an INOVER on the RX pin stop
+  the run with the reason (`take_line_fault`). Each refused register write leaves the UART as it was.
+  Modem status reads 0 in UARTFR.
+- **Assumptions**, since the headers do not say: the DREQs are the PL011's single requests; with LBE set
+  the frame still drives the TX pin; a break needs UARTEN.
+- **Two board changes.** A run that ends at a breakpoint or a fault now hands over what the chip did in
+  that last part of a quantum (`settle`): before, those characters reached the console only on the next
+  run. `ArmBoard.finish_sending` and `RiscvBoard.finish_sending` let UART0 send what it holds with the
+  cores stopped, as a chip runs on while a debugger holds its cores; `benchtop run` does that at a
+  breakpoint, so the console still ends with every character the program wrote.
+- **What the console now shows differently**: the same text, at the line's pace. The SDK's `printf` waits
+  until UART0 has sent each line (`stdio_uart`'s flush polls UARTFR.BUSY), so a program's own clock moves
+  on by its characters' time: `aon_timer.elf` now reads 1700000000.252 and 1700000001.754 where it read
+  .250 and .750, `hello_serial` puts 100 ms plus its line's 17 characters between lines, and `watchdog.elf`'s
+  boot lines come their characters later. Every other `examples/pico2` program prints exactly as before.
+- **A finding in `rom.c`**: after the ROM's PC/SP reboot, which resets CLOCKS, `rebooted()` printed through
+  a UART whose clk_peri was off; the instant UART let it, and a Pico 2 would have hung there, as the timed
+  one now does. It now releases the PLLs and runs `runtime_init_clocks()` first.
+
+The oracles: `examples/pico2/hello_uart.c` and `uart_advanced.c` are pico-examples' `uart/hello_uart` and
+`uart/uart_advanced`, identical to `pico-scratch/pico-examples` at commit 0d62f75 apart from their header
+comment. `hello_uart` returns from `main` with characters still in the FIFO; `uart_advanced` echoes `HAL`,
+sent into GPIO 1, as `IBM`, through its RX interrupt with the FIFOs off. `examples/pico2/uart_loopback.c`
+puts UART0 and UART1 on two wires (GPIO 12 to 5, 4 to 13): UART1 hears the console's `ping`, its receive
+timeout raised after 804 µs by the 1 µs timer (798.6 µs on the line, the rest printf's own work and the
+interrupt taken at the end of a 1000-cycle quantum), `pong` back, a break read as 0x500, and an overrun
+of UART0's FIFO. `chip/uart_tests.sysl` asserts each program's output and, at register level, the timing
+through `next_event`, a halved clk_peri, the pins bit by bit, the wires and every refusal;
+`rp2350/uart_tests.sysl` the model alone.
+
+**Cost**, host instructions retired, three interleaved runs each against the branch's base (`/usr/bin/time
+-l`, `benchtop run --board pico2`): `bench --core cortex-m33 kernel33.bin` 120.43–120.45 G to
+120.43–120.45 G, unchanged. The Pico 2 programs rise by the guest's own waiting, not by a cost per
+instruction: `sram_loop.elf` 5.11–5.12 G to 5.46–5.47 G and `xip_loop.elf` 5.33 G to 5.67–5.68 G (+7%,
+their 58 characters now waited for through UARTFR polls), and `dcp.elf` 0.70 G to 6.84 G, whose ~2,000
+characters are now 27 ms of guest time spent polling UART0 on both cores where they took none.
+
+### Item 31, done: Non-secure TrustZone
+
+Q3's cut line is lifted: the M33 runs both security states (`v6m/t2nonsecure.sysl`, DESIGN.md §2.7),
+against the ARMv8-M ARM:
+
+- **Banked registers** live where the Secure-only core kept them, as the current state's copy, with
+  the other state's in `Cpu.banked`; a change of state exchanges them. `MRS`/`MSR` of the `_NS`
+  registers (SP_NS as CONTROL_NS.SPSEL selects) reach the bank from Secure state and read zero from
+  Non-secure state. The system control space's Non-secure alias is Non-secure state's view: its own
+  VTOR, CCR, SCR, CPACR (masked by NSACR), MPU, SHPR, SHCSR, CFSR and a second **SysTick**, counting
+  while either state runs; the NVIC registers of the IRQs NVIC_ITNS gives it; SAU, SFSR, SFAR and HFSR
+  reading zero. Both states' PRIMASK, BASEPRI and FAULTMASK raise the execution priority.
+- **Attribution enforced, free on the fast paths.** Non-secure state runs on records and a page table
+  of its own (each the memory's, per core, made on first entry): a page is on the Non-secure table only
+  where all of it is Non-secure, and every other access takes the slow path, which makes it where it is
+  Non-secure and takes SecureFault AUVIOL (SFAR) where not. Decoding judges the address: INVEP for a
+  Secure address from Non-secure state (the entry to Secure state at a Non-secure-callable `SG`),
+  INVTRAN for a Non-secure one from Secure state. The SAU and the IDAU (the boot ROM's NSC region)
+  combine as the more secure answer. A change to the SAU or to a page's mapping remakes the table and
+  forgets the decoded records, through the code-line marks, before the next run.
+- **Transitions:** `SG`, `BXNS`, `BLXNS` (return address and partial RETPSR on the Secure stack,
+  FNC_RETURN, IPSR 1 from handler mode), FNC_RETURN; exceptions to the other state (S, DCRS, ES exact;
+  the callee registers under the integrity signature and R0–R12 cleared from Secure to Non-secure; the
+  signature checked on return, INVIS; ES checked, INVER or INVPC); banked exceptions' Non-secure copies
+  at `NS_BANK` + n in the NVIC's sets; IRQs by NVIC_ITNS. `VLSTM`/`VLLDM`, which libgcc's
+  `__gnu_cmse_nonsecure_call` wraps around BLXNS, are NOPs with no floating-point context active.
+- **ACCESSCTRL** gates every core bus access on the Arm board by master, state and privilege
+  (FORCE_CORE_NS included): a denial is refused by name as silicon's bus fault. Secure privileged code
+  with nothing denied pays two tests.
+- **Refused by name:** a change of state with a floating-point context active (lazy preservation,
+  SFPA), AIRCR.BFHFNMINS or PRIS set, a Non-secure PRIGROUP other than the Secure one, the FP
+  registers' Non-secure view, the PPB alias outside the system control space, the SIO from Non-secure
+  state (its Non-secure bank), and an ACCESSCTRL write restricting a memory device. The MPU is stored
+  per state and answered by `TT`, not enforced.
+
+`examples/pico2/nonsecure.c` with `nonsecure_ns.S` is the oracle: the SDK-built Secure image gives the
+SAU its own Non-secure code, stack and veneer, calls the Non-secure function through a
+`cmse_nonsecure_call` pointer (libgcc's BLXNS sequence), which calls back through `SG` and returns with
+FNC_RETURN (`ns_function(20) = 142 after 1 call(s)`), prints TT of the three regions, and takes
+SecureFault AUVIOL from a Non-secure load of Secure memory in its own handler (`sfsr 00000048`). The
+compiler's `cmse_nonsecure_entry` is not used: GNU ld puts its veneers in `.gnu.sgstubs`, which the
+SDK's linker script does not place, so the veneer and its BXNS return are hand-written.
+`v6m/t2nonsecure_tests.sysl` (20 cases, both executors) covers each transition, fault and refusal;
+`chip/arm_tests.sysl` the oracle and ACCESSCTRL. Breaking the integrity check or the callee clearing
+turns the INVIS and the IRQ cases red.
+
+**Cost**, host instructions retired, three runs each against the branch's base (dev at b544795):
+`bench --core cortex-m33 kernel33.bin` 37.17 G to 36.88 G; `sram_loop.elf` 5.104 G to 5.080 G and
+`xip_loop.elf` 5.330 G to 5.300 G. A first cut cost 0.7% on the loops: the SecureFault test grew the
+slow path that `load` and `store` inline into every handler; it is out of line now (`slow_load`,
+`slow_store`), which is also why the base got faster.

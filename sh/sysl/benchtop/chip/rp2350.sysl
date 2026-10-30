@@ -5,6 +5,7 @@ import sh.sysl.benchtop.peripheral.rp2350 as rp
 import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, qspi_flash}
 import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, Otp, OtpFault, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
 import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_MAINTENANCE_BASE, XIP_WINDOWS_END, read_xip, xip_aux_read, xip_aux_write, xip_target}
+import sh.sysl.benchtop.peripheral.rp2350.{DREQ_UART0_TX, Frame, Sent, UART_UNITS_PER_CYCLE, uart_of}
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
@@ -75,6 +76,9 @@ const POWMAN_IRQ_TIMER: u32 = 45
 const UART0_IRQ: u32 = 33
 const UART1_IRQ: u32 = 34
 const USBCTRL_IRQ: u32 = 14
+
+/** A GPIO with no wire (`Rp2350.wire`). */
+const NO_WIRE: u8 = 0xFF
 
 // Each APB device's window: its registers and their XOR, SET and CLR aliases.
 private const WINDOW: u32 = 0x4000
@@ -235,16 +239,26 @@ struct Rp2350
     held_driven: u64
     held_level: u64
     held_ie: u64
+    // The clk_sys cycles' remainder carried into the next clk_peri cycle, counted while a UART's line is
+    // busy (`advance_lines`).
+    peri_rest: u64
+    // The wires between GPIOs on the workbench (`wire`): the GPIO each is wired to, NO_WIRE for none.
+    wires: [GPIO_COUNT]u8
+    // Why the UARTs' lines did something benchtop does not model while time passed, for the board to
+    // stop on (`take_line_fault`); empty for nothing.
+    line_fault: string
 
     /** Power-on, with core 1 in the boot ROM; the flash keeps its array, as the board's part. */
     reset(*self)
         val bytes = self.flash.bytes
         val size = self.flash.size
+        val wires = self.wires
         val array = self.otp
         val fresh = rp2350()
         *self = fresh
         if size != 0 then self.flash.connect(bytes, size)
         self.otp.power_on(array)
+        self.wires = wires
 
     /** Whether the flash's contents, direct mode or the pinned XIP_SRAM lines have changed since the last
      * call, for a board that mirrors them.
@@ -299,7 +313,154 @@ struct Rp2350
         // No debugger halts a core or drives JTAG, so no PAUSE applies.
         self.watchdog.advance(made[usize(Tick.Watchdog)], 0)
         self.watchdog_reset()
+        // The UARTs count only while their lines are busy, so an idle UART costs nothing here.
+        if self.uarts[0].active() || self.uarts[1].active() then self.advance_lines(cycles, sys)
     end advance
+
+    // `cycles` of clk_sys at `sys` Hz pass on the UARTs' lines, as clk_peri's cycles, event by event: each
+    // frame that ends is carried over the wires from the GPIOs its TX drives (`deliver`), and a frame
+    // that starts is checked against what watches its pins (`check_frame`).
+    private advance_lines(*self, cycles: u64, sys: u64)
+        val peri = self.clocks.peri_hz(self.sources())
+        if peri == 0 then return
+        // A device access every few cycles (a core polling UARTFR) comes here each time: 64-bit
+        // arithmetic wherever the product fits, which is all but a sleep of hours.
+        var left: u64 = 0
+        if cycles <= 0xFFFFFFFF && peri <= 0xFFFFFFFF
+            val total = self.peri_rest + cycles * peri
+            left = total / sys * UART_UNITS_PER_CYCLE
+            self.peri_rest = total % sys
+        else
+            val total = u128(self.peri_rest) + u128(cycles) * u128(peri)
+            left = u64(total / u128(sys)) * UART_UNITS_PER_CYCLE
+            self.peri_rest = u64(total % u128(sys))
+        // Most steps end before any event: the counts go down and nothing else happens.
+        if left < self.uarts[0].until_event() && left < self.uarts[1].until_event()
+            self.uarts[0].pass(left)
+            self.uarts[1].pass(left)
+            return
+        while left > 0
+            val step = min(left, min(self.uarts[0].until_event(), self.uarts[1].until_event()))
+            // Both lines move through the step before either frame is delivered: a character arriving at
+            // its end starts the receiver's timeout there, not a step earlier.
+            val sent = [self.uarts[0].pass(step), self.uarts[1].pass(step)]
+            for k in 0..<2
+                sent[k] match
+                    Some(s) -> self.deliver(k, s)
+                    None -> ()
+                if self.uarts[k].take_started()
+                    self.check_frame(k) match
+                        Some(why) -> if self.line_fault.is_empty() then self.line_fault = why
+                        None -> ()
+            left -= step
+            if !self.uarts[0].active() && !self.uarts[1].active() then break
+    end advance_lines
+
+    // The clk_sys cycles until a UART's line next does something (`Uart.until_event`); None while both
+    // are idle or clk_peri is stopped.
+    private line_due(*self) -> Option[u64]
+        if !self.uarts[0].active() && !self.uarts[1].active() then return None
+        val peri = self.clocks.peri_hz(self.sources())
+        val sys = self.sys_hz()
+        if peri == 0 || sys == 0 then return None
+        val units = min(self.uarts[0].until_event(), self.uarts[1].until_event())
+        val peri_cycles = (units + UART_UNITS_PER_CYCLE - 1) / UART_UNITS_PER_CYCLE
+        // The first c with (peri_rest + c × peri) / sys reaching peri_cycles.
+        val need = u128(peri_cycles) * u128(sys) - u128(self.peri_rest)
+        Some(u64((need + u128(peri) - 1) / u128(peri)))
+
+    /** The clk_sys cycles until UART `k`'s transmitter has sent everything it will send; None where it
+     * sends nothing more, or cannot (clk_peri stopped).
+     */
+    sending_due(*self, k: usize) -> Option[u64] = if self.uarts[k].sending() then self.line_due() else None
+
+    // UART `k` has finished sending `s`: from each GPIO its TX drives, over that GPIO's wire, to the UART
+    // whose RX is at the other end.
+    private deliver(*self, k: usize, s: Sent)
+        for g in 0u32..<GPIO_COUNT
+            val h = self.wires[g]
+            if h == NO_WIRE || rp.route(g, self.io.function(g)) != rp.Route.UartTx || uart_of(g) != k then continue
+            if !self.pads.pin(g, self.drive(g), None).drives then continue
+            val why = self.hear(u32(h), s)
+            if !why.is_empty() && self.line_fault.is_empty() then self.line_fault = s"UART$k's TX on GPIO $g, wired to GPIO $h: $why"
+
+    // A frame `s` arrives over a wire at GPIO `n`: the UART whose RX is there receives it; empty, or why
+    // benchtop does not model what happens.
+    private hear(*self, n: u32, s: Sent) -> string
+        if rp.route(n, self.io.function(n)) != rp.Route.UartRx then return ""
+        val j = uart_of(n)
+        val why = self.rx_refusal(n)
+        if !why.is_empty() then return why
+        if !self.uarts[j].hears(s) then return s"UART$j's RX there reads at divisor ${self.uarts[j].latched_divisor()} and LCR_H 0x${hex(self.uarts[j].lcr_h)}, the frame was sent at divisor ${s.divisor} and LCR_H 0x${hex(s.format)}: a frame read at another rate or in another shape is not modelled"
+        self.uarts[j].receive(s.frame)
+        ""
+
+    // Why a UART RX on GPIO `n` cannot take a frame as benchtop models it: an input override, or a pad
+    // that does not read its input (the RX would see a low line, a break).
+    private rx_refusal(*self, n: u32) -> string
+        if self.io.ctrl[n] & io_reg.GPIO0_CTRL_INOVER_MASK != 0 then return s"GPIO $n's INOVER changes what its UART RX reads, which is not modelled for frames"
+        if !self.pads.pin(n, self.drive(n), Some(true)).input then return s"GPIO $n's pad does not read its input (IE clear or isolated), so its UART RX would see a break, which is not modelled"
+        ""
+
+    // Why the frame UART `k` has just started cannot be shown as benchtop models it: its TX's pins change
+    // level bit by bit, which the GPIO interrupts do not sample, so one watching a pin the frame reaches
+    // is refused; an output override on a pin the frame goes over a wire from would change it.
+    private check_frame(*self, k: usize) -> Option[string]
+        for g in 0u32..<GPIO_COUNT
+            if rp.route(g, self.io.function(g)) != rp.Route.UartTx || uart_of(g) != k then continue
+            if self.io.irq.watched(g) then return Some(s"UART$k sends a frame on GPIO $g, whose interrupts are enabled: the GPIO interrupts do not sample a frame's bits")
+            val h = self.wires[g]
+            if h == NO_WIRE then continue
+            if self.io.irq.watched(u32(h)) then return Some(s"UART$k sends a frame on GPIO $g to GPIO $h over a wire, and GPIO $h's interrupts are enabled: the GPIO interrupts do not sample a frame's bits")
+            if self.io.ctrl[g] & (io_reg.GPIO0_CTRL_OUTOVER_MASK | io_reg.GPIO0_CTRL_OEOVER_MASK) != 0 then return Some(s"UART$k sends a frame over a wire from GPIO $g, whose OUTOVER or OEOVER changes it, which is not modelled for frames")
+        None
+
+    /** A frame sent into GPIO `n` from off the chip, for the UART whose RX is there: true once it is on
+     * the line, to arrive a frame later at that UART's rate; false while the line still carries the last
+     * one. Refused where no UART receives on GPIO `n`, or not as benchtop models it.
+     */
+    line_in(*self, n: u32, f: Frame) -> Result[bool, string]
+        if n >= GPIO_COUNT then return Err(s"there is no GPIO $n")
+        if rp.route(n, self.io.function(n)) != rp.Route.UartRx then return Err(s"GPIO $n is not a UART's RX (FUNCSEL ${self.io.function(n)})")
+        val j = uart_of(n)
+        val why = self.rx_refusal(n)
+        if !why.is_empty() then return Err(why)
+        val h = self.wires[n]
+        if h != NO_WIRE && self.pads.pin(u32(h), self.drive(u32(h)), None).drives then return Err(s"GPIO $n is wired to GPIO $h, which drives it")
+        if self.uarts[j].latched_divisor() < 64 then return Err(s"UART$j's latched baud divisor has IBRD 0, which times no frame")
+        Ok(self.uarts[j].arrive(f))
+
+    /** A wire between GPIOs `a` and `b` on the workbench, or none from `a` where `b` is None: each pin sees
+     * the other's level where the other drives, and a UART frame sent from one reaches a UART RX at the
+     * other. A GPIO has one wire.
+     */
+    wire(*self, a: u32, b: Option[u32])
+        val was = self.wires[a]
+        if was != NO_WIRE then self.wires[usize(was)] = NO_WIRE
+        self.wires[a] = NO_WIRE
+        b match
+            Some(other) ->
+                val prior = self.wires[other]
+                if prior != NO_WIRE then self.wires[usize(prior)] = NO_WIRE
+                self.wires[a] = u8(other)
+                self.wires[other] = u8(a)
+            None -> ()
+        if !self.swcore_off then self.gpio_changed()
+
+    /** Why the UARTs' lines stopped being modelled since the last call, if they did. */
+    take_line_fault(*self) -> Option[string]
+        if self.line_fault.is_empty() then return None
+        val why = self.line_fault
+        self.line_fault = ""
+        Some(why)
+
+    /** DMA request `dreq` as the UARTs drive it (the SDK's `DREQ_UART0_TX` to `DREQ_UART1_RX`); None for
+     * a request that is not a UART's.
+     */
+    uart_dreq(*self, dreq: u32) -> Option[bool]
+        if dreq < DREQ_UART0_TX || dreq >= DREQ_UART0_TX + 4 then return None
+        val k = usize((dreq - DREQ_UART0_TX) / 2)
+        Some(if (dreq - DREQ_UART0_TX) % 2 == 0 then self.uarts[k].dreq_tx() else self.uarts[k].dreq_rx())
 
     // The crystal's frequency while it runs, else 0.
     private crystal_hz(*self) -> u64 = if self.xosc.stable() then XOSC_HZ else 0
@@ -327,7 +488,7 @@ struct Rp2350
             self.sio.mtime_due(k) match
                 Some(n) -> due = earliest(due, if self.sio.mtime_full_speed() then Some(n) else self.ticks_to_cycles(Tick.Riscv, n))
                 None -> ()
-        due
+        earliest(due, self.line_due())
 
     // The clk_sys cycles until generator `g`'s `n`th tick from now, rounded up; None while it is
     // stopped.
@@ -431,8 +592,8 @@ struct Rp2350
                 val r = self.pads.write(o, width, x)
                 self.gpio_changed()
                 r
-            Uart0 -> self.uarts[0].write(o, width, x)
-            Uart1 -> self.uarts[1].write(o, width, x)
+            Uart0 -> return self.uart_write(0, p, o, width, x)
+            Uart1 -> return self.uart_write(1, p, o, width, x)
             Sio ->
                 val r = self.sio.write(core, o, width, x)
                 if o & 0xFFC >= sio_reg.GPIO_OUT_OFFSET && o & 0xFFC <= sio_reg.GPIO_HI_OE_XOR_OFFSET then self.gpio_changed()
@@ -472,7 +633,11 @@ struct Rp2350
                 val r = self.powman.write(o, width, x)
                 if self.powman.watching() then self.powman.sample(self.pwrup_levels())
                 r
-            AccessCtrl -> self.accessctrl.write(core, o, width, x)
+            AccessCtrl ->
+                self.accessctrl.memory_restriction(core, o, width, x) match
+                    Some(why) -> return Err(why)
+                    None -> ()
+                self.accessctrl.write(core, o, width, x)
             IoQspiBlock -> self.io_qspi.write(o, width, x)
             PadsQspi -> self.pads_qspi.write(o, width, x)
             OtpData | OtpDataRaw | OtpDataGuarded | OtpDataRawGuarded ->
@@ -618,10 +783,12 @@ struct Rp2350
         val outside = (self.outside_driven, self.outside_level)
         val bytes = self.flash.bytes
         val size = self.flash.size
+        val wires = self.wires
         val array = self.otp
         *self = rp2350()
         if size != 0 then self.flash.connect(bytes, size)
         self.otp.power_on(array)
+        self.wires = wires
         self.powman = powman
         self.now = now
         self.outside_driven = outside.0
@@ -736,20 +903,45 @@ struct Rp2350
                 PadsQspi -> self.pads_qspi.reset()
                 _ -> ()
 
+    // A write to UART `k`, refused where it asks for something benchtop does not model: a setting
+    // (`Uart.unmodelled`), a character to send with no divisor to time it, or a frame its pins cannot show.
+    // A refused write leaves the UART as it was.
+    private uart_write(*self, k: usize, p: Placed, o: u32, width: u32, x: u32) -> Result[unit, string]
+        self.uarts[k].unmodelled(o, width, x) match
+            Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
+            None -> ()
+        val before = self.uarts[k]
+        self.uarts[k].write(o, width, x).map_err(e -> refusal(p, o, e))?
+        if self.uarts[k].unclocked()
+            self.uarts[k] = before
+            return Err(s"${p.name} + 0x${hex(o)}: a character waits to be sent and the latched baud divisor has IBRD 0, which times no frame (IBRD takes effect at an LCR_H write)")
+        if self.uarts[k].take_started()
+            self.check_frame(k) match
+                Some(why) ->
+                    self.uarts[k] = before
+                    return Err(s"${p.name} + 0x${hex(o)}: $why")
+                None -> ()
+        Ok(())
+
     /** What the producer FUNCSEL routes to GPIO `n` drives it with, after CTRL's overrides. */
     drive(*self, n: u32) -> Drive
         val d = rp.route(n, self.io.function(n)) match
             Sio -> Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
-            // A UART's TX idles high and drives; bytes leave at once.
-            UartTx -> Drive(true, true)
+            // A UART's TX drives its line: high while idle, a frame's bits, low through a break.
+            UartTx -> Drive(self.uarts[uart_of(n)].line_level(), true)
             UartRx | Null -> Drive(false, false)
         self.io.after_overrides(n, d)
 
-    /** What GPIO `n` is doing: whether its pad drives, and its level. */
+    /** What GPIO `n` is doing: whether its pad drives, and its level. Something outside drives it, or
+     * else the GPIO at the other end of its wire, where that drives.
+     */
     pin(*self, n: u32) -> Pin
         val bit = 1u64 << u64(n)
-        if self.outside_driven & bit == 0 then return self.pads.pin(n, self.drive(n), None)
-        self.pads.pin(n, self.drive(n), Some(self.outside_level & bit != 0))
+        if self.outside_driven & bit != 0 then return self.pads.pin(n, self.drive(n), Some(self.outside_level & bit != 0))
+        val h = self.wires[n]
+        if h == NO_WIRE then return self.pads.pin(n, self.drive(n), None)
+        val far = self.pads.pin(u32(h), self.drive(u32(h)), None)
+        self.pads.pin(n, self.drive(n), if far.drives then Some(far.level) else None)
 
     private drives(*self) -> [GPIO_COUNT]Drive
         var all: [GPIO_COUNT]Drive
@@ -804,7 +996,7 @@ rp2350() -> Rp2350 =
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
         rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), false,
-        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0)
+        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "")
 
 private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
     Some(x) -> b match
