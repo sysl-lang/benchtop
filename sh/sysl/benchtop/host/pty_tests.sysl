@@ -1,0 +1,135 @@
+module sh.sysl.benchtop.host
+@requires(posix)
+@tests
+
+import sh.sysl.benchtop.chip as chip
+import sysl.buf.{Buf, buf}
+import sysl.fs.{File, is_file}
+import sysl.io.Reader
+import sysl.process.{pipe, spawn, Stdio}
+import sysl.text.from_utf8_lossy
+import sysl.testing.skip
+
+// The guest's USB serial port on a pseudo-terminal (`benchtop run --usb pty`): a program on the Mac
+// opens the terminal as it would the board's port, reads what the guest prints and types to it.
+
+private val STDIO_USB = embed("../../../../examples/pico2/usb_device.elf")
+private const PTY_MS: u64 = 150000
+
+// Up to `n` bytes arriving on `r`, a byte at a time, or what came before it closed.
+private drained(r: File, n: usize) -> string
+    var reader = r
+    val got: Buf[u8] = buf()
+    var chunk: []u8 = [0; 1]
+    while got.len() < n
+        val some = reader.read(chunk)
+        if some.len == 0 then break
+        got.push(some[0])
+    from_utf8_lossy(got.view())
+
+// A pseudo-terminal, or the test skipped where the system has none to give.
+private pty_or_skip() -> Pty = open_pty() match
+    Ok(p) -> p
+    Err(why) -> skip(s"no pseudo-terminal here: $why")
+
+@test("a pseudo-terminal opens raw: what is written to one side arrives unchanged on the other, both ways, with nothing echoed")
+pty_passes_bytes_raw()
+    var p = pty_or_skip()
+    assert(p.name.starts_with("/dev/"), p.name)
+    val peer = attach_pty(p.name).unwrap()
+    // A newline, a carriage return and Ctrl-C: a cooked terminal would translate, echo or signal.
+    val sent: [5]u8 = [0x61, 0x0A, 0x62, 0x0D, 0x03]
+    assert(write_some(p.fd, sent[0..<5]).unwrap() == 5)
+    var got: Buf[u8] = buf()
+    var tries = 0
+    while got.len() < 5 && tries < 1000
+        read_some(peer, &got, 64).unwrap()
+        tries += 1
+    assert(got.len() == 5, "no newline translation and no interrupt character")
+    for i in 0..<5 do assert(got[i] == sent[i], s"byte $i")
+    assert(write_some(peer, "xyz".bytes).unwrap() == 3)
+    var back: Buf[u8] = buf()
+    tries = 0
+    while back.len() < 3 && tries < 1000
+        read_some(p.fd, &back, 64).unwrap()
+        tries += 1
+    assert(from_utf8_lossy(back.view()) == "xyz")
+    // Nothing came back to the first side as an echo of what it wrote.
+    var echo: Buf[u8] = buf()
+    read_some(peer, &echo, 64).unwrap()
+    assert(echo.len() == 0)
+    close_fd(peer)
+    p.close()
+
+@test("opening a terminal that does not exist is refused with the system's reason")
+pty_attach_missing()
+    assert(attach_pty("/dev/benchtop-no-such-terminal").unwrap_err().starts_with("cannot open /dev/benchtop-no-such-terminal: "))
+
+@test("stdio_usb's serial port through a real pseudo-terminal: the line the program prints arrives at a program that opened the terminal, and a byte typed there reaches getchar")
+pty_bridges_stdio_usb()
+    var p = pty_or_skip()
+    val peer = attach_pty(p.name).unwrap()
+    val b = chip.arm_board(chip.SramMap(0x20000000, 520 * 1024))
+    b.boot(STDIO_USB).unwrap()
+    b.attach_usb_host(true)
+    var seen: Buf[u8] = buf()
+    var typed = false
+    var t = 0
+    loop
+        val end = b.run(PTY_MS)
+        p.exchange(&b.usb_host).unwrap()
+        read_some(peer, &seen, 256).unwrap()
+        if !typed && from_utf8_lossy(seen.view()).contains("\n")
+            assert(write_some(peer, "x".bytes).unwrap() == 1)
+            typed = true
+        if end == chip.RunEnd.Breakpoint then break
+        assert(end == chip.RunEnd.Budget && t < 3000, s"$end at $t ms: ${b.refused}")
+        t += 1
+    assert(from_utf8_lossy(seen.view()) == "hello over usb\r\n", from_utf8_lossy(seen.view()))
+    val console = from_utf8_lossy(b.console.view())
+    assert(console.ends_with("hello over usb\r\ngot 120\r\n"), console)
+    close_fd(peer)
+    p.close()
+
+// The `benchtop` command itself, with stdout a pipe: pico-examples' hello_world/usb prints its line
+// every second over USB only, and `run`'s default sends a USB serial port to the console beside
+// UART0. Needs the binary `sysl build .` writes beside the manifest.
+@test("benchtop run: hello_world/usb's \"Hello, world!\" lines reach stdout over USB")
+run_shows_usb_lines()
+    if !is_file("benchtop") || !is_file("examples/pico2/hello_usb.elf")
+        skip("needs ./benchtop built with `sysl build .`")
+    val (r, w) = pipe().unwrap()
+    val child = spawn("./benchtop", ["run", "--board", "pico2", "examples/pico2/hello_usb.elf"],
+                      stdout = Stdio.ToFile(w)).unwrap()
+    var closing = w
+    closing.close().unwrap()
+    val got = drained(r, 30)
+    child.kill().unwrap()
+    child.wait().unwrap()
+    var reader = r
+    reader.close().unwrap()
+    assert_eq(got, "Hello, world!\r\nHello, world!\r\n")
+
+@test("benchtop run --usb names its modes, and refuses one it does not have, or a board that has no USB host")
+run_usb_option_refusals()
+    if !is_file("benchtop") then skip("needs ./benchtop built with `sysl build .`")
+    val (r, w) = pipe().unwrap()
+    val child = spawn("./benchtop", ["run", "--board", "pico2", "--usb", "serial", "examples/pico2/hello_usb.elf"],
+                      stderr = Stdio.ToFile(w)).unwrap()
+    var closing = w
+    closing.close().unwrap()
+    val why = drained(r, 1000)
+    child.wait().unwrap()
+    var reader = r
+    reader.close().unwrap()
+    assert_eq(why, "benchtop: --usb takes console, pty or off, not serial\n")
+    val (r2, w2) = pipe().unwrap()
+    val other = spawn("./benchtop", ["run", "--board", "virt", "--usb", "pty", "examples/pico2/hello_usb.elf"],
+                      stderr = Stdio.ToFile(w2)).unwrap()
+    var closing2 = w2
+    closing2.close().unwrap()
+    val why2 = drained(r2, 1000)
+    other.wait().unwrap()
+    var reader2 = r2
+    reader2.close().unwrap()
+    assert_eq(why2, "benchtop: --usb is for a board of an RP2350's Cortex-M33 cores\n")
