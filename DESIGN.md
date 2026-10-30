@@ -1549,7 +1549,8 @@ by a test image. Two facts about the user's board decide how. **It is a Pico 2 W
 the CYW43439 rather than GP25 (`pico2_w.h`: "no PICO_DEFAULT_LED_PIN - LED is on Wireless chip"), so
 a `pico2` build's GP25 blink needs an LED on GP25 or a meter to be seen on the board. **UART0 on
 GP0/GP1 needs a 3.3 V USB-serial adapter** (or a Raspberry Pi Debug Probe) to reach the Mac; the board's
-own USB port carries USB stdio, which benchtop does not model until the USB item.
+own USB port carries USB stdio, whose controller benchtop models (`docs/rp-coverage.md` item 20) and
+whose bridge to a pty on the Mac is item 21.
 
 ---
 

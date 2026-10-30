@@ -111,7 +111,7 @@ day. An L is split before it is handed out (§6).
 | ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
 | DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | missing | Not decoded. | — | L (core) + S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
 | PIO0/1/2 | 11 PIO | missing | Not decoded. DESIGN.md §9.7 costs it at 4–6 agent-days. The RP2350 adds a third block, `MOV` to and from the RX FIFO, and the GPIO base (16/48). | — | L (machine) + M (GPIO/DMA/IRQ) | mux, DMA, IRQ, clk_sys |
-| USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | register-stub | SIE_CTRL alone is stored, which `runtime_init_usb_power_down` reads and sets; it is not gated by RESETS, since the SDK reads it before releasing USBCTRL (`peripheral/rp2350/startup.sysl`). Every other register is refused. DESIGN.md §7 "Later" costs the controller. | `peripheral/rp2350/startup_tests.sysl` | L + M (bridge) | clk_usb, PLL_USB, IRQ |
+| USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | partial | The controller in device mode, whole (`peripheral/rp2350/usb.sysl`, item 20): the registers, DPRAM with the SETUP packet, endpoint and buffer control, single and double buffering, NAK, STALL, abort, the interrupts and USBCTRL_IRQ, driven by a host through the Arm board's `usb_*` seam. Not gated by RESETS, since the SDK reads SIE_CTRL before releasing USBCTRL; RESETS asserting it resets the controller. The CDC bridge to a pty is item 21. | `peripheral/rp2350/usb_tests.sysl`, `chip/usb_tests.sysl` | M (bridge) | clk_usb |
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
 | TIMER0/1 | 12.8 System timers | full | 64-bit counter, latch, 4 alarms, LOCKED, SOURCE (`peripheral/rp2350/timing.sysl:91–145`). | `rp2350/tests.sysl:44`, `chip/tests.sysl:18` | — | — |
 | WATCHDOG | 12.9 Watchdog | full | The RP2040's counter (`peripheral/rp2040/watchdog.sysl`, `WatchdogCounter`), one decrement a tick from TICKS' watchdog generator: CTRL (ENABLE, PAUSE_DBG0/DBG1/JTAG, TIME), LOAD, TRIGGER, REASON, SCRATCH0–7. Firing resets the PSM stages WDSEL selects, and RESETS.WDSEL's peripherals where RESETS' stage is not selected (`Rp2350.watchdog_reset`); the Arm board restarts core 0 through the ROM's boot path (the PC/SP request in SCRATCH4–7, or the flash image's normal boot) and core 1 into the ROM wait; a typed boot request and a blank flash's BOOTSEL are refused by name; the RISC-V board refuses the restart by name. No debugger exists to pause it, so the PAUSE inputs are only tested at the model (item 10). | `rp2040/watchdog_tests.sysl`, `rp2350/tests.sysl`, `chip/watchdog_tests.sysl` (`watchdog.elf`) | — | — |
@@ -169,10 +169,10 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 29 | 9 | 1 | 19 | 58 |
+| RP2350 | 29 | 10 | 0 | 19 | 58 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
-One RP2350 block is a register-stub today (its row says which). Every block that is not modelled is refused by the bus, which is
+No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
 benchtop's policy for unsupported accesses (`docs/peripheral-models.md:54`). Several items below
 build register-stubs on purpose: a block stored as written, with a named refusal for any behaviour
 the stub does not carry out.
@@ -331,7 +331,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 17 | **I²C (DW_apb_i2c) master and slave**. | M | 9, 11 |
 | 18 | **PWM** (12 slices, IRQ, DREQ, pins through the mux). | M | 9, 11 |
 | 19 | **ADC and temperature sensor** (round robin, FIFO, DREQ). | M | 11 |
-| 20 | **USB device controller**: endpoints, buffers, IRQ. | L | 6 |
+| 20 | **USB device controller**: endpoints, buffers, IRQ. **Done** (below). | L | 6 |
 | 21 | **USB host enumerator and CDC bridge to a pty**. `hello_world/usb` is its oracle. | M | 20 |
 | 22 | **RP2040 chip layer**: `chip.Rp2040` over the shared models (CLOCKS without TICKS, pads without ISO, SIO with 8-deep FIFOs and the divider wired), and the `pico` board running. | M | 5, 8, 9 |
 | 23 | **RP2040 ROM**, following Q1: the float, double and mem tables plus the lookup. | L | 22 |
@@ -847,3 +847,68 @@ SRAM bank 0 lost), it sets BOOTDIS.NEXT and BOOT0 and sleeps keeping SRAM bank 0
 which the test drives from outside; woken by PWRUP0 (bit 1), the word kept, BOOTDIS consumed and BOOT0
 ignored, PWRUP0's edge still latched. `chip/power_tests.sysl` asserts every line and that the alarm's
 power-up came between 1000 and 1100 ms on the timer.
+
+### Item 20, done: the USB device controller
+
+`peripheral/rp2350/usb.sysl` against `hardware/regs/usb.h`, `usb_device_dpram.h` and TinyUSB's RP2350
+port (`dcd_rp2040.c`, `rp2040_usb.c`, which is the oracle for how software drives it). It replaces the
+SIE_CTRL stub `startup.sysl` held. USBCTRL_DPRAM is placed at 0x50100000 (4 KB, no atomic aliases) beside
+the registers at 0x50110000, and USBCTRL_IRQ is IRQ 14.
+
+- **The seam for item 21.** benchtop's host drives the bus between runs, one event or transaction per
+  call, on `ArmBoard`: `usb_attach(on)`, `usb_bus_reset()`, `usb_sof(frame)`, `usb_setup(address,
+  [8]u8) -> Handshake`, `usb_in(address, ep) -> Result[InReply, string]` (a `Packet` with its PID and up
+  to 64 bytes, or NAK, STALL, silence) and `usb_out(address, ep, pid, bytes) -> Result[Handshake,
+  string]`. Each is answered by the controller at the chip's present time, and the cores then see the
+  interrupt it raised. A host retries a NAK after running the board on, as a host retries in a later
+  frame, and waits the 2 ms USB allows after SET_ADDRESS (TinyUSB sets ADDR_ENDP from its task). The
+  bus is ideal: full speed, nothing lost, every packet the device sends acknowledged.
+- **Connection**: on the bus while a host is attached, the controller is enabled in device mode, the
+  PHY is out of isolation and powered, the controller is muxed to it, VBUS is detected (USB_PWR's
+  override where enabled, otherwise the host's attachment: an assumption) and the pull-up is on;
+  each change latches DEV_CONN_DIS. Only ADDR_ENDP's address is answered.
+- **Transactions**: a SETUP lands in DPRAM's first 8 bytes, sets SETUP_REC and clears EP_STALL_ARM. IN
+  and OUT reach endpoint 0 or an endpoint whose control word has ENABLE (otherwise silence), NAK under
+  EP_ABORT, STALL on buffer control's STALL (endpoint 0 needs its EP_STALL_ARM bit too), and otherwise
+  use the endpoint's current buffer: an IN sends an AVAILABLE and FULL buffer and clears both, an OUT
+  fills an AVAILABLE buffer, sets LENGTH and FULL and clears AVAILABLE, a buffer not available NAKs.
+  INTERRUPT_ON_NAK/STALL (EP0_INT_NAK/STALL) set EP_STATUS_STALL_NAK. BUFF_STATUS follows the
+  interrupt-per-buffer and per-two-buffers settings, BUFF_CPU_SHOULD_HANDLE names the buffer, LAST sets
+  TRANS_COMPLETE, a short OUT sets RX_SHORT_PACKET and keeps a double-buffered endpoint on its buffer,
+  and a buffer control word written with RESET goes back to buffer 0.
+- **Assumptions**, since the headers do not say: an OUT with the wrong data PID is acknowledged and
+  dropped, with DATA_SEQ_ERROR (the USB specification's rule); a bus reset leaves ADDR_ENDP alone
+  (TinyUSB clears it); a SETUP sends endpoint 0 back to buffer 0; EP_ABORT_DONE sets as an EP_ABORT bit
+  does, every endpoint being idle between transactions; the controller's reset keeps DPRAM's contents.
+  LINE_STATE and SPEED read 0. The host never suspends the bus, so SUSPENDED and the suspend and resume
+  interrupts never assert.
+- **Refused by name**: host mode (Q4, item 32); remote wake-up (SIE_CTRL.RESUME); SIE_CTRL.DIRECT_EN and
+  EP0_STOP_ON_SHORT_PACKET; muxing to anything but the PHY; USBPHY_DIRECT and a nonzero
+  USBPHY_DIRECT_OVERRIDE; the SOF timestamps and SM_STATE; DEV_SM_WATCHDOG.ENABLE; and, when a
+  transaction reaches them, an isochronous endpoint, a LENGTH over 64, a buffer past DPRAM's end, an IN
+  buffer AVAILABLE but not FULL, an OUT buffer AVAILABLE and FULL, and an OUT packet longer than LENGTH.
+  The host-mode registers are stored and do nothing.
+- **SIE_CTRL powers on at 0x8000** (PULLDOWN_EN), the header's reset value; the stub had 0, so the
+  SDK's `runtime_init_usb_power_down`, which sets TRANSCEIVER_PD only where SIE_CTRL holds its reset
+  value, did nothing.
+- **A write to the boot ROM is now ignored on the Arm board** rather than refused: TinyUSB's port stores
+  endpoint 0's control word through a null pointer (`hw_endpoint_start_next_buffer`, whose EP0 has no
+  endpoint control register), so every control transfer writes 0x00000000, which every Pico 2 running
+  stdio_usb survives. The RISC-V board still refuses one (Q13).
+
+`examples/pico2/usb_device.c` is the SDK's stdio_usb, unmodified, with stdio on UART0 as well.
+`chip/usb_tests.sysl` plays the host: attach, bus reset, GET_DESCRIPTOR of the device at address 0,
+SET_ADDRESS, the device descriptor again at the new address (address 0 now silent), the configuration
+in a 9-byte and an 84-byte read, string descriptors 0 to 4, SET_CONFIGURATION; each compared with the
+ELF's own `usbd_desc_device` and `usbd_desc_cfg` and the strings in `stdio_usb_descriptors.c` (the
+serial number with the one the program prints). Then SET_CONTROL_LINE_STATE raises DTR, the program's
+line arrives on bulk IN 0x82 with alternating PIDs, and a byte written to bulk OUT 0x02 reaches its
+`getchar`. The serial number reads 0000000000000000: the unique ID comes from OTP (item 26).
+
+**Cost**, host instructions retired, three runs each against the branch's base. DPRAM's 4 KB inside
+`Rp2350` first cost 3% on the loops and 10% on `dcp.elf` (`sram_loop.elf` 5.645 G to 5.831 G): the
+chip's read-only methods took `self` by value, which copies the whole chip, and the hot ones (`sources`,
+`sys_hz` and `ref_hz` on every catch-up, `placed` on every device access, `signal`, `next_event`, the
+pin and drive queries) and the controller's own (`irq` on every signal) now take `*self`. With that:
+`bench --core cortex-m33 kernel33.bin` 37.14 G to 37.14 G; `sram_loop.elf` 5.645 G to 5.201 G and
+`xip_loop.elf` 5.868 G to 5.421 G (8% fewer); `dcp.elf` 1.110 G to 0.960 G (14% fewer).

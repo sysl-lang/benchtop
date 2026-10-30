@@ -1,0 +1,333 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2040.AccessError
+import sh.sysl.rp2350.usb as reg
+
+// USBCTRL in device mode, register by register and transaction by transaction (`usb.sysl`), against the
+// register descriptions in the SDK's `hardware/regs/usb.h` and `usb_device_dpram.h`.
+
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+// Buffer control's fields for buffer 0; buffer 1's are 16 bits up.
+private const FULL: u32 = 0x8000
+private const LAST: u32 = 0x4000
+private const PID1: u32 = 0x2000
+private const RESET: u32 = 0x1000
+private const STALL: u32 = 0x800
+private const AVAIL: u32 = 0x400
+// DPRAM offsets: endpoint 0's buffer control words and buffer; endpoint 1's control and buffer control.
+private const EP0_IN_BC: u32 = 0x80
+private const EP0_OUT_BC: u32 = 0x84
+private const EP0_BUF: u32 = 0x100
+private const EP1_IN_CTRL: u32 = 0x08
+private const EP1_OUT_CTRL: u32 = 0x0C
+private const EP1_IN_BC: u32 = 0x88
+private const EP1_OUT_BC: u32 = 0x8C
+// Endpoint control: ENABLE, DOUBLE_BUFFERED, INTERRUPT_PER_BUFF, INTERRUPT_PER_DOUBLE_BUFF, a type.
+private const ENABLE: u32 = 0x80000000
+private const DOUBLE: u32 = 0x40000000
+private const PER_BUFF: u32 = 0x20000000
+private const PER_TWO: u32 = 0x10000000
+private const BULK: u32 = 2 << 26
+private const ISO: u32 = 1 << 26
+private const ON_NAK: u32 = 0x10000
+private const ON_STALL: u32 = 0x20000
+
+private val NONE: [1]u8 = [0]
+
+// A controller on the bus at address 0: a host attached, enabled in device mode, the pull-up on, and
+// endpoint 0 interrupting per buffer, as TinyUSB's `dcd_init` and `dcd_connect` leave it.
+private on_bus() -> UsbCtrl
+    var u = usb_ctrl()
+    u.attach(true)
+    u.write(reg.MAIN_CTRL_OFFSET, 4, reg.MAIN_CTRL_CONTROLLER_EN_MASK).unwrap()
+    u.write(reg.SIE_CTRL_OFFSET, 4, reg.SIE_CTRL_EP0_INT_1BUF_MASK | reg.SIE_CTRL_PULLUP_EN_MASK).unwrap()
+    u
+
+private rd(u: *UsbCtrl, offset: u32) -> u32 = u.read(offset, 4).unwrap()
+private wr(u: *UsbCtrl, offset: u32, x: u32) = u.write(offset, 4, x).unwrap()
+private dw(u: *UsbCtrl, offset: u32, x: u32) = u.dpram_write(offset, 4, x).unwrap()
+private dr(u: *UsbCtrl, offset: u32) -> u32 = u.dpram_read(offset, 4).unwrap()
+
+// An IN reply as a line: "nak", "stall", "silent", or "data <len> pid <pid>: <bytes>".
+private reply(r: Result[InReply, string]) -> string = r match
+    Ok(Data(p)) ->
+        var s = s"data ${p.len} pid ${p.pid}:"
+        for k in 0..<p.len do s = s + s" ${p.bytes[k]}"
+        s
+    Ok(Nak) -> "nak"
+    Ok(Stall) -> "stall"
+    Ok(Silent) -> "silent"
+    Err(why) -> s"refused: $why"
+
+private out(u: *UsbCtrl, ep: u32, pid: u32, data: []const u8) -> Handshake = u.out_data(0, ep, pid, data).unwrap()
+
+@test("USBCTRL powers on at the header's reset values; past its registers nothing is mapped")
+usb_power_on()
+    var u = usb_ctrl()
+    assert(rd(&u, reg.MAIN_CTRL_OFFSET) == 0x4 && rd(&u, reg.SIE_CTRL_OFFSET) == 0x8000 && rd(&u, reg.USB_MUXING_OFFSET) == 1)
+    assert(rd(&u, reg.NAK_POLL_OFFSET) == 0x00100010 && rd(&u, reg.USBPHY_TRIM_OFFSET) == 0x1F1F && rd(&u, reg.LINESTATE_TUNING_OFFSET) == 0xF8)
+    assert(rd(&u, reg.SIE_STATUS_OFFSET) == 0 && rd(&u, reg.INTR_OFFSET) == 0 && !u.irq())
+    assert(u.read(0x9C, 4).unwrap_err() == AccessError.Unmapped && u.write(0x118, 4, 0).unwrap_err() == AccessError.Unmapped)
+    assert(u.dpram_read(0x1000, 4).unwrap_err() == AccessError.Unmapped, "DPRAM has no atomic aliases")
+
+@test("the device is on the bus only with every condition met; each change latches DEV_CONN_DIS until a write to SIE_STATUS.CONNECTED")
+usb_connection()
+    var u = on_bus()
+    val connected = reg.SIE_STATUS_CONNECTED_MASK | reg.SIE_STATUS_VBUS_DETECTED_MASK
+    assert(u.connected && rd(&u, reg.SIE_STATUS_OFFSET) == connected)
+    assert(rd(&u, reg.INTR_OFFSET) == reg.INTR_DEV_CONN_DIS_MASK | reg.INTR_VBUS_DETECT_MASK)
+    wr(&u, reg.SIE_STATUS_OFFSET + CLR, reg.SIE_STATUS_CONNECTED_MASK)
+    assert(rd(&u, reg.INTR_OFFSET) == reg.INTR_VBUS_DETECT_MASK, "cleared through the CLR alias too")
+    // Each condition alone takes it off the bus.
+    wr(&u, reg.SIE_CTRL_OFFSET + SET, reg.SIE_CTRL_TRANSCEIVER_PD_MASK)
+    assert(!u.connected && rd(&u, reg.INTR_OFFSET) & reg.INTR_DEV_CONN_DIS_MASK != 0, "transceiver powered down")
+    wr(&u, reg.SIE_CTRL_OFFSET + CLR, reg.SIE_CTRL_TRANSCEIVER_PD_MASK)
+    assert(u.connected)
+    wr(&u, reg.MAIN_CTRL_OFFSET + SET, reg.MAIN_CTRL_PHY_ISO_MASK)
+    assert(!u.connected, "PHY isolated")
+    wr(&u, reg.MAIN_CTRL_OFFSET, reg.MAIN_CTRL_CONTROLLER_EN_MASK)
+    wr(&u, reg.USB_MUXING_OFFSET, reg.USB_MUXING_SOFTCON_MASK)
+    assert(!u.connected, "not muxed to the PHY")
+    wr(&u, reg.USB_MUXING_OFFSET, reg.USB_MUXING_TO_PHY_MASK | reg.USB_MUXING_SOFTCON_MASK)
+    wr(&u, reg.SIE_CTRL_OFFSET + CLR, reg.SIE_CTRL_PULLUP_EN_MASK)
+    assert(!u.connected, "no pull-up")
+    wr(&u, reg.SIE_CTRL_OFFSET + SET, reg.SIE_CTRL_PULLUP_EN_MASK)
+    // USB_PWR's override decides VBUS where it is enabled.
+    wr(&u, reg.USB_PWR_OFFSET, reg.USB_PWR_VBUS_DETECT_OVERRIDE_EN_MASK)
+    assert(!u.connected && rd(&u, reg.SIE_STATUS_OFFSET) & reg.SIE_STATUS_VBUS_DETECTED_MASK == 0, "VBUS overridden off")
+    wr(&u, reg.USB_PWR_OFFSET, reg.USB_PWR_VBUS_DETECT_OVERRIDE_EN_MASK | reg.USB_PWR_VBUS_DETECT_MASK)
+    assert(u.connected)
+    u.attach(false)
+    assert(!u.connected && rd(&u, reg.SIE_STATUS_OFFSET) == reg.SIE_STATUS_VBUS_DETECTED_MASK, "detached, VBUS still forced")
+    // A disconnected device answers nothing.
+    assert(u.setup(0, [0, 0, 0, 0, 0, 0, 0, 0]) == Handshake.Silent && reply(u.in_token(0, 0)) == "silent")
+
+@test("a SETUP lands in DPRAM's first 8 bytes, raises SETUP_REQ through INTE, clears EP_STALL_ARM, and is answered only at ADDR_ENDP's address")
+usb_setup_packet()
+    var u = on_bus()
+    wr(&u, reg.INTE_OFFSET, reg.INTE_SETUP_REQ_MASK)
+    wr(&u, reg.EP_STALL_ARM_OFFSET, 3)
+    assert(u.setup(0, [0x80, 6, 0, 1, 0, 0, 64, 0]) == Handshake.Ack)
+    assert(dr(&u, 0) == 0x01000680 && dr(&u, 4) == 0x00400000 && u.dpram_read(6, 2).unwrap() == 64)
+    assert(rd(&u, reg.SIE_STATUS_OFFSET) & reg.SIE_STATUS_SETUP_REC_MASK != 0 && rd(&u, reg.INTS_OFFSET) == reg.INTS_SETUP_REQ_MASK && u.irq())
+    assert(rd(&u, reg.EP_STALL_ARM_OFFSET) == 0)
+    wr(&u, reg.SIE_STATUS_OFFSET + CLR, reg.SIE_STATUS_SETUP_REC_MASK)
+    assert(!u.irq())
+    wr(&u, reg.ADDR_ENDP_OFFSET, 9)
+    assert(u.setup(0, [0, 5, 9, 0, 0, 0, 0, 0]) == Handshake.Silent && u.setup(9, [0, 9, 1, 0, 0, 0, 0, 0]) == Handshake.Ack)
+    // INTF forces an interrupt INTE lets through.
+    wr(&u, reg.SIE_STATUS_OFFSET, reg.SIE_STATUS_SETUP_REC_MASK)
+    wr(&u, reg.INTF_OFFSET, reg.INTF_SETUP_REQ_MASK)
+    assert(u.irq())
+
+@test("an IN on endpoint 0 sends an AVAILABLE and FULL buffer with its PID, clears both, and sets BUFF_STATUS and TRANS_COMPLETE; otherwise it NAKs, and STALLs only with EP_STALL_ARM")
+usb_ep0_in()
+    var u = on_bus()
+    wr(&u, reg.INTE_OFFSET, reg.INTE_BUFF_STATUS_MASK)
+    dw(&u, EP0_BUF, 0x44332211)
+    assert(reply(u.in_token(0, 0)) == "nak", "nothing available")
+    dw(&u, EP0_IN_BC, FULL | LAST | PID1 | AVAIL | 3)
+    assert(reply(u.in_token(0, 0)) == "data 3 pid 1: 17 34 51")
+    assert(dr(&u, EP0_IN_BC) == LAST | PID1 | 3, "AVAILABLE and FULL cleared, LENGTH kept")
+    assert(rd(&u, reg.BUFF_STATUS_OFFSET) == 1 && rd(&u, reg.BUFF_CPU_SHOULD_HANDLE_OFFSET) == 0 && u.irq())
+    assert(rd(&u, reg.SIE_STATUS_OFFSET) & reg.SIE_STATUS_TRANS_COMPLETE_MASK != 0)
+    assert(reply(u.in_token(0, 0)) == "nak", "the buffer is spent")
+    wr(&u, reg.BUFF_STATUS_OFFSET + CLR, 1)
+    assert(rd(&u, reg.BUFF_STATUS_OFFSET) == 0 && !u.irq())
+    // A zero-length packet, DATA0, no LAST: no TRANS_COMPLETE.
+    wr(&u, reg.SIE_STATUS_OFFSET, reg.SIE_STATUS_TRANS_COMPLETE_MASK)
+    dw(&u, EP0_IN_BC, FULL | AVAIL)
+    assert(reply(u.in_token(0, 0)) == "data 0 pid 0:")
+    assert(rd(&u, reg.SIE_STATUS_OFFSET) & reg.SIE_STATUS_TRANS_COMPLETE_MASK == 0)
+    // Without EP0_INT_1BUF no BUFF_STATUS.
+    wr(&u, reg.BUFF_STATUS_OFFSET, 1)
+    wr(&u, reg.SIE_CTRL_OFFSET + CLR, reg.SIE_CTRL_EP0_INT_1BUF_MASK)
+    dw(&u, EP0_IN_BC, FULL | AVAIL | 1)
+    assert(reply(u.in_token(0, 0)) == "data 1 pid 0: 17" && rd(&u, reg.BUFF_STATUS_OFFSET) == 0)
+    // STALL: endpoint 0 needs EP_STALL_ARM as well; EP0_INT_STALL and EP0_INT_NAK report each.
+    wr(&u, reg.SIE_CTRL_OFFSET + SET, reg.SIE_CTRL_EP0_INT_STALL_MASK | reg.SIE_CTRL_EP0_INT_NAK_MASK)
+    dw(&u, EP0_IN_BC, STALL)
+    assert(reply(u.in_token(0, 0)) == "nak" && rd(&u, reg.EP_STATUS_STALL_NAK_OFFSET) == 1, "STALL without the arm NAKs")
+    wr(&u, reg.EP_STATUS_STALL_NAK_OFFSET + CLR, 1)
+    wr(&u, reg.EP_STALL_ARM_OFFSET, reg.EP_STALL_ARM_EP0_IN_MASK)
+    assert(reply(u.in_token(0, 0)) == "stall" && rd(&u, reg.EP_STATUS_STALL_NAK_OFFSET) == 1)
+    assert(rd(&u, reg.INTR_OFFSET) & reg.INTR_EP_STALL_NAK_MASK != 0)
+    // A SETUP clears the arm, so the STALL goes.
+    assert(u.setup(0, [0, 0, 0, 0, 0, 0, 0, 0]) == Handshake.Ack && reply(u.in_token(0, 0)) == "nak")
+
+@test("an OUT on endpoint 0 fills an AVAILABLE buffer: bytes, LENGTH the count, FULL set; a short packet sets RX_SHORT_PACKET; the wrong data PID sets DATA_SEQ_ERROR and is dropped")
+usb_ep0_out()
+    var u = on_bus()
+    val data: [3]u8 = [7, 8, 9]
+    assert(out(&u, 0, 1, data[0..<3]) == Handshake.Nak, "no buffer")
+    dw(&u, EP0_OUT_BC, PID1 | AVAIL | 64)
+    assert(out(&u, 0, 0, data[0..<3]) == Handshake.Ack)
+    assert(dr(&u, EP0_OUT_BC) == PID1 | AVAIL | 64 && rd(&u, reg.SIE_STATUS_OFFSET) & reg.SIE_STATUS_DATA_SEQ_ERROR_MASK != 0, "DATA0 where DATA1 was due: dropped")
+    assert(rd(&u, reg.INTR_OFFSET) & reg.INTR_ERROR_DATA_SEQ_MASK != 0 && rd(&u, reg.BUFF_STATUS_OFFSET) == 0)
+    assert(out(&u, 0, 1, data[0..<3]) == Handshake.Ack)
+    assert(dr(&u, EP0_OUT_BC) == FULL | PID1 | 3 && dr(&u, EP0_BUF) & 0xFFFFFF == 0x090807)
+    assert(rd(&u, reg.BUFF_STATUS_OFFSET) == 2 && rd(&u, reg.SIE_STATUS_OFFSET) & reg.SIE_STATUS_RX_SHORT_PACKET_MASK != 0)
+    assert(rd(&u, reg.INTR_OFFSET) & reg.INTR_RX_SHORT_PACKET_MASK != 0)
+    assert(out(&u, 0, 0, data[0..<3]) == Handshake.Nak, "FULL, no longer available")
+    // A zero-length status packet into a zero-length buffer is not short.
+    wr(&u, reg.SIE_STATUS_OFFSET, reg.SIE_STATUS_RX_SHORT_PACKET_MASK)
+    dw(&u, EP0_OUT_BC, PID1 | AVAIL | LAST)
+    assert(out(&u, 0, 1, NONE[0..<0]) == Handshake.Ack && dr(&u, EP0_OUT_BC) == FULL | PID1 | LAST)
+    assert(rd(&u, reg.SIE_STATUS_OFFSET) & (reg.SIE_STATUS_RX_SHORT_PACKET_MASK | reg.SIE_STATUS_TRANS_COMPLETE_MASK) == reg.SIE_STATUS_TRANS_COMPLETE_MASK)
+    // The OUT STALL needs its own arm bit.
+    dw(&u, EP0_OUT_BC, STALL)
+    wr(&u, reg.EP_STALL_ARM_OFFSET, reg.EP_STALL_ARM_EP0_IN_MASK)
+    assert(out(&u, 0, 1, NONE[0..<0]) == Handshake.Nak)
+    wr(&u, reg.EP_STALL_ARM_OFFSET, reg.EP_STALL_ARM_EP0_OUT_MASK)
+    assert(out(&u, 0, 1, NONE[0..<0]) == Handshake.Stall)
+
+@test("an endpoint above 0 answers only with ENABLE, from BUFFER_ADDRESS (its low six bits ignored), and STALLs on buffer control's STALL alone")
+usb_epn()
+    var u = on_bus()
+    assert(reply(u.in_token(0, 1)) == "silent" && out(&u, 1, 0, NONE[0..<0]) == Handshake.Silent, "not enabled")
+    dw(&u, EP1_IN_CTRL, ENABLE | BULK | PER_BUFF | ON_NAK | 0x180 | 0x3F)
+    dw(&u, 0x180, 0xCAFE)
+    assert(reply(u.in_token(0, 1)) == "nak" && rd(&u, reg.EP_STATUS_STALL_NAK_OFFSET) == 1 << 2)
+    dw(&u, EP1_IN_BC, FULL | AVAIL | 2)
+    assert(reply(u.in_token(0, 1)) == "data 2 pid 0: 254 202" && rd(&u, reg.BUFF_STATUS_OFFSET) == 1 << 2)
+    dw(&u, EP1_IN_BC, STALL | FULL | AVAIL | 2)
+    assert(reply(u.in_token(0, 1)) == "stall", "no arm needed above endpoint 0")
+    dw(&u, EP1_OUT_CTRL, ENABLE | BULK | ON_STALL | 0x1C0)
+    dw(&u, EP1_OUT_BC, STALL)
+    assert(out(&u, 1, 0, NONE[0..<0]) == Handshake.Stall && rd(&u, reg.EP_STATUS_STALL_NAK_OFFSET) & (1 << 3) != 0)
+    assert(reply(u.in_token(0, 16)) == "silent", "endpoints run 0 to 15")
+
+@test("a double-buffered endpoint alternates buffers 64 bytes apart: an interrupt per two buffers after buffer 1, per buffer naming it in BUFF_CPU_SHOULD_HANDLE; RESET goes back to buffer 0; a short OUT keeps the buffer")
+usb_double_buffered()
+    var u = on_bus()
+    dw(&u, EP1_IN_CTRL, ENABLE | DOUBLE | PER_TWO | BULK | 0x200)
+    dw(&u, 0x200, 0x11)
+    dw(&u, 0x240, 0x22)
+    dw(&u, EP1_IN_BC, ((FULL | AVAIL | PID1 | 1) << 16) | FULL | AVAIL | 1)
+    assert(reply(u.in_token(0, 1)) == "data 1 pid 0: 17" && rd(&u, reg.BUFF_STATUS_OFFSET) == 0, "no interrupt after buffer 0")
+    assert(reply(u.in_token(0, 1)) == "data 1 pid 1: 34" && rd(&u, reg.BUFF_STATUS_OFFSET) == 1 << 2, "one after buffer 1")
+    assert(dr(&u, EP1_IN_BC) == (((PID1 | 1) << 16) | 1))
+    assert(reply(u.in_token(0, 1)) == "nak", "back on buffer 0, spent")
+    // Per buffer: BUFF_CPU_SHOULD_HANDLE names the buffer that completed.
+    dw(&u, EP1_IN_CTRL, ENABLE | DOUBLE | PER_BUFF | BULK | 0x200)
+    wr(&u, reg.BUFF_STATUS_OFFSET, 0xFFFFFFFF)
+    dw(&u, EP1_IN_BC, ((FULL | AVAIL | 1) << 16) | FULL | AVAIL | 1)
+    assert(reply(u.in_token(0, 1)) == "data 1 pid 0: 17" && rd(&u, reg.BUFF_CPU_SHOULD_HANDLE_OFFSET) == 0)
+    assert(reply(u.in_token(0, 1)) == "data 1 pid 0: 34" && rd(&u, reg.BUFF_CPU_SHOULD_HANDLE_OFFSET) == 1 << 2)
+    // A buffer control word written with RESET goes back to buffer 0.
+    dw(&u, EP1_IN_BC, ((FULL | AVAIL | 1) << 16) | FULL | AVAIL | 1)
+    assert(reply(u.in_token(0, 1)) == "data 1 pid 0: 17")
+    dw(&u, EP1_IN_BC, (dr(&u, EP1_IN_BC) & 0xFFFF0000) | RESET | FULL | AVAIL | 1)
+    assert(reply(u.in_token(0, 1)) == "data 1 pid 0: 17", "buffer 0 again, buffer 1 left waiting")
+    // A short OUT keeps the endpoint on the buffer it filled.
+    dw(&u, EP1_OUT_CTRL, ENABLE | DOUBLE | PER_BUFF | BULK | 0x300)
+    val two: [2]u8 = [5, 6]
+    dw(&u, EP1_OUT_BC, ((AVAIL | 64) << 16) | AVAIL | 2)
+    assert(out(&u, 1, 0, two[0..<2]) == Handshake.Ack && dr(&u, 0x300) & 0xFFFF == 0x0605, "a full buffer 0 moves on")
+    assert(out(&u, 1, 0, two[0..<1]) == Handshake.Ack && dr(&u, 0x340) & 0xFF == 5 && dr(&u, EP1_OUT_BC) >> 16 == FULL | 1, "buffer 1, short")
+    dw(&u, EP1_OUT_BC, ((AVAIL | 64) << 16) | AVAIL | 64)
+    assert(out(&u, 1, 0, two[0..<2]) == Handshake.Ack && dr(&u, EP1_OUT_BC) >> 16 == FULL | 2, "still buffer 1 after the short packet")
+
+@test("EP_ABORT NAKs every access to its endpoint and sets EP_ABORT_DONE as it is set, write-1-to-clear; ABORT_DONE is an interrupt")
+usb_abort()
+    var u = on_bus()
+    dw(&u, EP0_IN_BC, FULL | AVAIL | 1)
+    wr(&u, reg.EP_ABORT_OFFSET + SET, 1)
+    assert(rd(&u, reg.EP_ABORT_DONE_OFFSET) == 1 && rd(&u, reg.INTR_OFFSET) & reg.INTR_ABORT_DONE_MASK != 0)
+    assert(reply(u.in_token(0, 0)) == "nak" && dr(&u, EP0_IN_BC) == FULL | AVAIL | 1)
+    wr(&u, reg.EP_ABORT_DONE_OFFSET + CLR, 1)
+    wr(&u, reg.EP_ABORT_OFFSET + SET, 1)
+    assert(rd(&u, reg.EP_ABORT_DONE_OFFSET) == 0, "only a newly set bit is done again")
+    wr(&u, reg.EP_ABORT_OFFSET + CLR, 1)
+    assert(reply(u.in_token(0, 0)) == "data 1 pid 0: 0")
+    wr(&u, reg.EP_ABORT_OFFSET, 2)
+    assert(out(&u, 0, 0, NONE[0..<0]) == Handshake.Nak)
+
+@test("a bus reset sets BUS_RESET and keeps ADDR_ENDP; a SOF sets SOF_RD and DEV_SOF, which a read of SOF_RD clears; neither reaches a device off the bus")
+usb_bus_events()
+    var u = on_bus()
+    wr(&u, reg.ADDR_ENDP_OFFSET, 5)
+    u.bus_reset()
+    assert(rd(&u, reg.INTR_OFFSET) & reg.INTR_BUS_RESET_MASK != 0 && rd(&u, reg.ADDR_ENDP_OFFSET) == 5)
+    wr(&u, reg.SIE_STATUS_OFFSET + SET, reg.SIE_STATUS_BUS_RESET_MASK)
+    assert(rd(&u, reg.SIE_STATUS_OFFSET) & reg.SIE_STATUS_BUS_RESET_MASK == 0, "write-1-to-clear through SET too")
+    u.sof(0x9AB)
+    assert(rd(&u, reg.INTR_OFFSET) & reg.INTR_DEV_SOF_MASK != 0)
+    assert(rd(&u, reg.SOF_RD_OFFSET) == 0x1AB && rd(&u, reg.INTR_OFFSET) & reg.INTR_DEV_SOF_MASK == 0)
+    wr(&u, reg.SIE_CTRL_OFFSET + CLR, reg.SIE_CTRL_PULLUP_EN_MASK)
+    u.bus_reset()
+    u.sof(3)
+    assert(rd(&u, reg.SIE_STATUS_OFFSET) & reg.SIE_STATUS_BUS_RESET_MASK == 0 && rd(&u, reg.SOF_RD_OFFSET) == 0x1AB)
+
+@test("the controller's reset puts its registers back and keeps DPRAM and the host; DPRAM takes bytes, halfwords and words")
+usb_reset_keeps_dpram()
+    var u = on_bus()
+    u.dpram_write(0x401, 1, 0xAB).unwrap()
+    u.dpram_write(0x402, 2, 0xCDEF).unwrap()
+    assert(dr(&u, 0x400) == 0xCDEFAB00 && u.dpram_read(0x403, 1).unwrap() == 0xCD)
+    wr(&u, reg.INTE_OFFSET, 0xFF)
+    wr(&u, reg.ADDR_ENDP_OFFSET, 3)
+    u.reset_controller()
+    assert(dr(&u, 0x400) == 0xCDEFAB00 && u.attached && !u.connected)
+    assert(rd(&u, reg.INTE_OFFSET) == 0 && rd(&u, reg.ADDR_ENDP_OFFSET) == 0 && rd(&u, reg.MAIN_CTRL_OFFSET) == 4)
+    u.reset()
+    assert(dr(&u, 0x400) == 0 && !u.attached)
+
+@test("the host-mode registers are stored and do nothing in device mode; EP_TX_ERROR and EP_RX_ERROR read 0")
+usb_host_registers_stored()
+    var u = on_bus()
+    wr(&u, reg.ADDR_ENDP1_OFFSET, 0x00050005)
+    wr(&u, reg.INT_EP_CTRL_OFFSET, 0xFFFF)
+    wr(&u, reg.SOF_WR_OFFSET, 0xFFFF)
+    wr(&u, reg.NAK_POLL_OFFSET, 0x12345678)
+    assert(rd(&u, reg.ADDR_ENDP1_OFFSET) == 0x00050005 && rd(&u, reg.INT_EP_CTRL_OFFSET) == 0xFFFE && rd(&u, reg.SOF_WR_OFFSET) == 0x7FF && rd(&u, reg.NAK_POLL_OFFSET) == 0x12345678)
+    wr(&u, reg.EP_TX_ERROR_OFFSET, 0xFFFFFFFF)
+    assert(rd(&u, reg.EP_TX_ERROR_OFFSET) == 0 && rd(&u, reg.EP_RX_ERROR_OFFSET) == 0 && u.connected)
+
+@test("what the model does not run is refused by name: host mode, remote wake-up, direct drive, EP0_STOP_ON_SHORT_PACKET, other muxing, the PHY's direct controls, the SOF timestamps, SM_STATE, DEV_SM_WATCHDOG")
+usb_refused_registers()
+    var u = on_bus()
+    assert(u.unmodelled(reg.MAIN_CTRL_OFFSET + SET, 4, reg.MAIN_CTRL_HOST_NDEVICE_MASK).unwrap().contains("host mode"))
+    assert(u.unmodelled(reg.MAIN_CTRL_OFFSET + CLR, 4, reg.MAIN_CTRL_HOST_NDEVICE_MASK).is_none())
+    assert(u.unmodelled(reg.SIE_CTRL_OFFSET + SET, 4, reg.SIE_CTRL_RESUME_MASK).unwrap().contains("remote wake-up"))
+    assert(u.unmodelled(reg.SIE_CTRL_OFFSET + CLR, 4, reg.SIE_CTRL_RESUME_MASK).is_none(), "CLR fires no self-clearing control")
+    assert(u.unmodelled(reg.SIE_CTRL_OFFSET, 4, reg.SIE_CTRL_DIRECT_EN_MASK).unwrap().contains("DIRECT_EN"))
+    assert(u.unmodelled(reg.SIE_CTRL_OFFSET + SET, 4, reg.SIE_CTRL_EP0_STOP_ON_SHORT_PACKET_MASK).unwrap().contains("EP0_STOP_ON_SHORT_PACKET"))
+    assert(u.unmodelled(reg.USB_MUXING_OFFSET, 4, reg.USB_MUXING_TO_EXTPHY_MASK).unwrap().contains("USB_MUXING"))
+    assert(u.unmodelled(reg.USB_MUXING_OFFSET + SET, 1, reg.USB_MUXING_USBPHY_AS_GPIO_MASK).unwrap().contains("USB_MUXING"))
+    assert(u.unmodelled(reg.USBPHY_DIRECT_OFFSET, 4, 0).unwrap().contains("USBPHY_DIRECT"))
+    assert(u.unmodelled(reg.USBPHY_DIRECT_OVERRIDE_OFFSET, 4, 1).unwrap().contains("USBPHY_DIRECT_OVERRIDE"))
+    assert(u.unmodelled(reg.USBPHY_DIRECT_OVERRIDE_OFFSET, 4, 0).is_none())
+    assert(u.unmodelled(reg.DEV_SM_WATCHDOG_OFFSET, 4, reg.DEV_SM_WATCHDOG_ENABLE_MASK).unwrap().contains("DEV_SM_WATCHDOG"))
+    assert(u.unmodelled(reg.SIE_CTRL_OFFSET, 4, reg.SIE_CTRL_PULLUP_EN_MASK | reg.SIE_CTRL_EP0_INT_1BUF_MASK).is_none(), "what TinyUSB writes is not refused")
+    assert(u.unmodelled_read(reg.SOF_TIMESTAMP_RAW_OFFSET).unwrap().contains("SOF timestamps") && u.unmodelled_read(reg.SOF_TIMESTAMP_LAST_OFFSET).is_some())
+    assert(u.unmodelled_read(reg.SM_STATE_OFFSET).unwrap().contains("SM_STATE") && u.unmodelled_read(reg.USBPHY_DIRECT_OFFSET).is_some())
+    assert(u.unmodelled_read(reg.SIE_STATUS_OFFSET).is_none())
+
+@test("a transaction that reaches a buffer set up as the model does not run is refused by name and changes nothing: isochronous, LENGTH over 64, past DPRAM's end, IN AVAILABLE but not FULL, OUT AVAILABLE and FULL, an OUT longer than LENGTH or than 64 bytes")
+usb_refused_transactions()
+    var u = on_bus()
+    dw(&u, EP1_IN_CTRL, ENABLE | ISO | 0x200)
+    assert(reply(u.in_token(0, 1)).contains("isochronous"))
+    dw(&u, EP1_IN_CTRL, ENABLE | BULK | 0x200)
+    dw(&u, EP1_IN_BC, FULL | AVAIL | 65)
+    assert(reply(u.in_token(0, 1)).contains("LENGTH 65") && dr(&u, EP1_IN_BC) == FULL | AVAIL | 65)
+    dw(&u, EP1_IN_CTRL, ENABLE | BULK | 0xFC0)
+    dw(&u, EP1_IN_BC, ((FULL | AVAIL | 1) << 16) | FULL | AVAIL | 1)
+    assert(reply(u.in_token(0, 1)) == "data 1 pid 0: 0", "the last 64 bytes of DPRAM are a buffer")
+    dw(&u, EP1_IN_CTRL, ENABLE | DOUBLE | BULK | 0xFC0)
+    dw(&u, EP1_IN_BC, ((FULL | AVAIL | 1) << 16) | FULL | AVAIL | 1)
+    assert(reply(u.in_token(0, 1)) == "data 1 pid 0: 0")
+    assert(reply(u.in_token(0, 1)).contains("runs past DPRAM"), "buffer 1 of it does not fit")
+    dw(&u, EP0_IN_BC, AVAIL | 1)
+    assert(reply(u.in_token(0, 0)).contains("AVAILABLE but not FULL"))
+    var big: [65]u8
+    for i in 0..<65 do big[i] = 0
+    dw(&u, EP0_OUT_BC, AVAIL | 8)
+    assert(u.out_data(0, 0, 0, big[0..<65]).unwrap_err().contains("at most 64"))
+    assert(u.out_data(0, 0, 0, big[0..<9]).unwrap_err().contains("LENGTH is 8") && dr(&u, EP0_OUT_BC) == AVAIL | 8)
+    dw(&u, EP0_OUT_BC, FULL | AVAIL | 8)
+    assert(u.out_data(0, 0, 0, big[0..<1]).unwrap_err().contains("already FULL"))
+    assert(rd(&u, reg.BUFF_STATUS_OFFSET) == 0)
