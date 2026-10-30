@@ -1,18 +1,42 @@
 module sh.sysl.benchtop.peripheral.rp2350
 
 import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.powman as reg
+import sysl.math.min
 
-// POWMAN, the power manager (datasheet 6), as a store: the voltage regulator, the brown-out detector,
-// the low-power oscillator and crystal settings, the sequencer's configuration, the debug
-// settings, the scratch and boot registers, and the interrupt registers. The power states, the
-// always-on timer and the power-up requests (STATE, the TIMER registers, PWRUP0 to PWRUP3,
-// CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP, BOOTDIS) are the AON-timer item's, and are refused by name.
+// POWMAN, the power manager (datasheet 6): the voltage regulator, the brown-out detector, the
+// low-power oscillator and crystal settings, the sequencer's configuration, the debug settings, the
+// scratch and boot registers and the interrupt registers as a store, and the always-on timer. The
+// power states and the power-up requests (STATE, PWRUP0 to PWRUP3, CURRENT_PWRUP_REQ,
+// LAST_SWCORE_PWRUP, BOOTDIS) are refused by name: the chip never leaves its all-on state.
 //
 // **A write needs a password.** Bits 31:16 of the data on the bus must be 0x5AFE (`POWMAN_PASSWORD_BITS`),
 // through any of the four aliases and at any width, and only the low 16 bits of the word are written.
 // Any other write is dropped and latches BADPASSWD. SCRATCH0 to SCRATCH7 and BOOT0 to BOOT3 are 32 bits wide and take
-// no password.
+// no password. A 1 written to a write-1-to-clear bit clears it through any alias, the CLR alias
+// included: the SDK clears TIMER.ALARM and STATE.REQ_IGNORED with `powman_clear_bits`, and TinyUSB
+// clears USB's SIE_STATUS flags through its CLR alias.
+//
+// **The always-on timer** (`hardware/regs/powman.h`, `hardware_powman`) counts milliseconds in 64
+// bits. Setting TIMER.RUN loads the count from SET_TIME_63TO48 to SET_TIME_15TO0 and starts it;
+// clearing RUN stops it where it is; TIMER.CLEAR zeroes it at any time. Its tick comes from one of
+// three sources, chosen by a write of 1 to USE_LPOSC (the source at power-on), USE_XOSC or
+// USE_GPIO_1KHZ, which read back as 0; while RUN is set, USING_LPOSC, USING_XOSC or USING_GPIO_1KHZ
+// says which. From the LPOSC or the crystal a millisecond is the source frequency the
+// LPOSC_FREQ_KHZ or XOSC_FREQ_KHZ registers state, in kHz with 16 fractional bits, of that source's
+// cycles; a stated frequency of 0 stops the count. From the GPIO EXT_TIME_REF selects (12, 20, 14 or 22) each
+// rising edge is one millisecond, as `powman_timer_set_1khz_tick_source_gpio` expects of a 1 kHz
+// clock. USE_GPIO_1HZ synchronises the seconds to a 1 Hz clock on that GPIO while the milliseconds
+// come from the LPOSC or the crystal: the count holds at the second's 999th millisecond until the
+// edge, and an edge moves it to the start of the next second.
+//
+// The alarm fires while ALARM_ENAB is set and the count has reached the 64-bit ALARM_TIME: TIMER.ALARM
+// latches, which is INTR.TIMER and POWMAN_IRQ_TIMER through INTE. A cleared ALARM latches again at once
+// while the alarm is enabled and past, as `powman_clear_alarm` warns. PWRUP_ON_ALARM and NONSEC_WRITE are
+// stored; the chip never sleeps through POWMAN and runs Secure-only.
+//
+// The LPOSC runs at its nominal 32.768 kHz, whatever LPOSC.TRIM holds (TRIM and MODE are stored).
 //
 // **The regulator's interface is locked** until VREG_CTRL.UNLOCK is set, which nothing can clear again
 // but a power-on: VREG, VREG_LP_ENTRY and VREG_LP_EXIT drop writes while it is clear. An update completes at once,
@@ -65,7 +89,16 @@ private spec(offset: u32) -> Option[PowmanReg] = offset match
     reg.INTR_OFFSET -> Some(PowmanReg(0, 0, reg.INTR_VREG_OUTPUT_LOW_MASK))
     reg.INTE_OFFSET | reg.INTF_OFFSET -> Some(PowmanReg(0, 0xF, 0))
     reg.INTS_OFFSET -> Some(PowmanReg(0, 0, 0))
+    reg.SET_TIME_63TO48_OFFSET | reg.SET_TIME_47TO32_OFFSET | reg.SET_TIME_31TO16_OFFSET | reg.SET_TIME_15TO0_OFFSET -> Some(PowmanReg(0, 0xFFFF, 0))
+    reg.ALARM_TIME_63TO48_OFFSET | reg.ALARM_TIME_47TO32_OFFSET | reg.ALARM_TIME_31TO16_OFFSET | reg.ALARM_TIME_15TO0_OFFSET -> Some(PowmanReg(0, 0xFFFF, 0))
+    reg.READ_TIME_UPPER_OFFSET | reg.READ_TIME_LOWER_OFFSET -> Some(PowmanReg(0, 0, 0))
+    reg.TIMER_OFFSET -> Some(PowmanReg(0, TIMER_RW, reg.TIMER_ALARM_MASK))
     _ -> None
+
+// TIMER's read-write bits: NONSEC_WRITE, RUN, ALARM_ENAB, PWRUP_ON_ALARM and USE_GPIO_1HZ.
+private const TIMER_RW: u32 = 0x2033
+// TIMER's self-clearing controls: CLEAR and the three source selects.
+private const TIMER_SC: u32 = 0x0704
 
 // SCRATCH0 to BOOT3, the 32-bit registers that take no password.
 private unprotected(offset: u32) -> bool = offset >= reg.SCRATCH0_OFFSET && offset <= reg.BOOT3_OFFSET
@@ -75,6 +108,16 @@ private regulator(offset: u32) -> bool = offset == reg.VREG_OFFSET || offset == 
 
 struct Powman
     words: [60]u32
+    // The always-on timer's count in milliseconds, and the part of the next millisecond counted so
+    // far, in source cycles times 65536 (a millisecond is the stated frequency in kHz times 65536).
+    time: u64
+    frac: u64
+    // clk_sys cycles times the source's frequency carried into the next source cycle.
+    rest: u64
+    // The tick's source: USING_LPOSC, USING_XOSC or USING_GPIO_1KHZ.
+    source: u32
+    // The reference GPIO's level at the last advance; a rising edge is a low followed by a high.
+    level: bool
 
     reset(*self)
         for i in 0..<POWMAN_WORDS
@@ -82,11 +125,135 @@ struct Powman
             self.words[i] = found match
                 Some(r) -> r.reset
                 None -> 0
+        self.time = 0
+        self.frac = 0
+        self.rest = 0
+        self.source = reg.TIMER_USING_LPOSC_MASK
+        self.level = true
 
     private word(self, offset: u32) -> u32 = self.words[usize(offset / 4)]
 
+    // A 64-bit time from its four 16-bit registers, the most significant at `offset`.
+    private time_at(self, offset: u32) -> u64
+        var t: u64 = 0
+        for i in 0u32..<4 do t = (t << 16) | u64(self.word(offset + 4 * i) & 0xFFFF)
+        t
+
+    /** The always-on timer's count, in milliseconds. */
+    time_ms(self) -> u64 = self.time
+
+    /** Whether the always-on timer is counting (TIMER.RUN). */
+    counting(self) -> bool = self.word(reg.TIMER_OFFSET) & reg.TIMER_RUN_MASK != 0
+
+    // Whether the seconds follow a 1 Hz clock on the reference GPIO.
+    private synced(self) -> bool =
+        self.word(reg.TIMER_OFFSET) & reg.TIMER_USE_GPIO_1HZ_MASK != 0 && self.source != reg.TIMER_USING_GPIO_1KHZ_MASK
+
+    /** The GPIO whose level `advance` takes, while the running timer counts its edges: 12, 20, 14 or 22,
+     * as EXT_TIME_REF.SOURCE_SEL picks it.
+     */
+    reference_gpio(self) -> Option[u32]
+        if !self.counting() || (self.source != reg.TIMER_USING_GPIO_1KHZ_MASK && !self.synced()) then return None
+        val sel = self.word(reg.EXT_TIME_REF_OFFSET) & reg.EXT_TIME_REF_SOURCE_SEL_MASK
+        Some(if sel == 0 then 12 elif sel == 1 then 20 elif sel == 2 then 14 else 22)
+
+    // The running source's stated frequency in kHz, with 16 fractional bits.
+    private stated_khz(self) -> u64
+        val xosc = self.source == reg.TIMER_USING_XOSC_MASK
+        val whole = self.word(if xosc then reg.XOSC_FREQ_KHZ_INT_OFFSET else reg.LPOSC_FREQ_KHZ_INT_OFFSET)
+        val part = self.word(if xosc then reg.XOSC_FREQ_KHZ_FRAC_OFFSET else reg.LPOSC_FREQ_KHZ_FRAC_OFFSET)
+        (u64(whole) << 16) | u64(part)
+
+    /** `cycles` of clk_sys at `sys_hz` pass, with the LPOSC at `lposc_hz`, the crystal at `xosc_hz` (0
+     * while it is not running) and the reference GPIO (`reference_gpio`) at `level`.
+     */
+    advance(*self, cycles: u64, sys_hz: u64, lposc_hz: u64, xosc_hz: u64, level: bool)
+        if !self.counting() then return
+        val rose = level && !self.level
+        self.level = level
+        var ms: u64 = 0
+        if self.source == reg.TIMER_USING_GPIO_1KHZ_MASK
+            if rose then ms = 1
+        else
+            val hz = if self.source == reg.TIMER_USING_XOSC_MASK then xosc_hz else lposc_hz
+            val khz = self.stated_khz()
+            if hz != 0 && sys_hz != 0 && khz != 0
+                val total = u128(self.rest) + u128(cycles) * u128(hz)
+                val ticks = total / u128(sys_hz)
+                self.rest = u64(total % u128(sys_hz))
+                val counted = u128(self.frac) + ticks * 65536
+                ms = u64.wrap(counted / u128(khz))
+                self.frac = u64(counted % u128(khz))
+        if self.synced()
+            val second = self.time - self.time % 1000
+            val last = second +% 999
+            self.time = if rose then second +% 1000 elif ms >= last -% self.time then last else self.time +% ms
+            if rose then self.frac = 0
+        else
+            self.time = self.time +% ms
+        self.check_alarm()
+    end advance
+
+    /** The clk_sys cycles at `sys_hz` until the alarm fires, from the LPOSC at `lposc_hz` or the crystal
+     * at `xosc_hz`; None while no alarm is pending, the timer is stopped, or its tick comes from a GPIO.
+     */
+    next_alarm(self, sys_hz: u64, lposc_hz: u64, xosc_hz: u64) -> Option[u64]
+        val t = self.word(reg.TIMER_OFFSET)
+        if t & reg.TIMER_ALARM_ENAB_MASK == 0 || t & reg.TIMER_ALARM_MASK != 0 || !self.counting() then return None
+        if self.source == reg.TIMER_USING_GPIO_1KHZ_MASK then return None
+        val hz = if self.source == reg.TIMER_USING_XOSC_MASK then xosc_hz else lposc_hz
+        val khz = self.stated_khz()
+        val alarm = self.time_at(reg.ALARM_TIME_63TO48_OFFSET)
+        if hz == 0 || sys_hz == 0 || khz == 0 || alarm <= self.time then return None
+        // The source cycles until the count reaches the alarm, then the clk_sys cycles until those have run.
+        val owed = u128(alarm - self.time) * u128(khz)
+        val ticks = if owed > u128(self.frac) then (owed - u128(self.frac) + 65535) / 65536 else 1
+        val need = ticks * u128(sys_hz)
+        val cycles = if need > u128(self.rest) then (need - u128(self.rest) + u128(hz) - 1) / u128(hz) else 1
+        Some(u64(min(u128(NEVER), cycles)))
+
+    // Latch ALARM while the alarm is enabled and the count has reached it.
+    private check_alarm(*self)
+        val i = usize(reg.TIMER_OFFSET / 4)
+        if self.words[i] & reg.TIMER_ALARM_ENAB_MASK != 0 && self.time >= self.time_at(reg.ALARM_TIME_63TO48_OFFSET)
+            self.words[i] |= reg.TIMER_ALARM_MASK
+
+    // TIMER has been written: `before` is what it held, `next` the value the write made, self-clearing
+    // controls included.
+    private timer_written(*self, before: u32, next: u32)
+        val after = self.word(reg.TIMER_OFFSET)
+        if before & reg.TIMER_RUN_MASK == 0 && after & reg.TIMER_RUN_MASK != 0
+            self.time = self.time_at(reg.SET_TIME_63TO48_OFFSET)
+            self.frac = 0
+            self.rest = 0
+            self.level = true
+        if next & reg.TIMER_CLEAR_MASK != 0
+            self.time = 0
+            self.frac = 0
+        // A write naming more than one source takes the GPIO over the crystal over the LPOSC.
+        var chosen: u32 = 0
+        if next & reg.TIMER_USE_LPOSC_MASK != 0 then chosen = reg.TIMER_USING_LPOSC_MASK
+        if next & reg.TIMER_USE_XOSC_MASK != 0 then chosen = reg.TIMER_USING_XOSC_MASK
+        if next & reg.TIMER_USE_GPIO_1KHZ_MASK != 0 then chosen = reg.TIMER_USING_GPIO_1KHZ_MASK
+        if chosen != 0 && chosen != self.source
+            self.source = chosen
+            self.rest = 0
+            self.frac = 0
+            self.level = true
+        if before & reg.TIMER_USE_GPIO_1HZ_MASK == 0 && after & reg.TIMER_USE_GPIO_1HZ_MASK != 0 then self.level = true
+
+    // TIMER as read: the stored bits, and while it runs the source it is using.
+    private timer(self) -> u32
+        val t = self.word(reg.TIMER_OFFSET)
+        if t & reg.TIMER_RUN_MASK == 0 then return t
+        t | self.source | (if self.synced() then reg.TIMER_USING_GPIO_1HZ_MASK else 0)
+
+    // INTR: the stored VREG_OUTPUT_LOW, and TIMER as the alarm has latched it.
+    private intr(self) -> u32 =
+        self.word(reg.INTR_OFFSET) | (if self.word(reg.TIMER_OFFSET) & reg.TIMER_ALARM_MASK != 0 then reg.INTR_TIMER_MASK else 0)
+
     /** The interrupt status: forced or raised, and enabled. */
-    ints(self) -> u32 = (self.word(reg.INTR_OFFSET) | self.word(reg.INTF_OFFSET)) & self.word(reg.INTE_OFFSET)
+    ints(self) -> u32 = (self.intr() | self.word(reg.INTF_OFFSET)) & self.word(reg.INTE_OFFSET)
 
     /** Whether POWMAN_IRQ_POW is asserted: PWRUP_WHILE_WAITING, STATE_REQ_IGNORED or VREG_OUTPUT_LOW. */
     irq_pow(self) -> bool = self.ints() & (reg.INTR_PWRUP_WHILE_WAITING_MASK | reg.INTR_STATE_REQ_IGNORED_MASK | reg.INTR_VREG_OUTPUT_LOW_MASK) != 0
@@ -110,7 +277,13 @@ struct Powman
         spec(address) match
             Some(_) -> ()
             None -> return Err(AccessError.Unmapped)
-        val value = if address == reg.INTS_OFFSET then self.ints() else self.word(address)
+        val value = address match
+            reg.INTS_OFFSET -> self.ints()
+            reg.INTR_OFFSET -> self.intr()
+            reg.TIMER_OFFSET -> self.timer()
+            reg.READ_TIME_UPPER_OFFSET -> u32(self.time >> 32)
+            reg.READ_TIME_LOWER_OFFSET -> u32.wrap(self.time)
+            _ -> self.word(address)
         Ok(read_lane(value, offset, width))
 
     write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
@@ -129,11 +302,13 @@ struct Powman
         val bits = if unprotected(address) then data else data & 0xFFFF
         val next = written(cur, offset, bits)
         var updated = (cur & ~r.rw) | (next & r.rw)
-        // A write of 1 clears a write-1-to-clear bit; a clear alias writes no ones.
-        if (offset >> 12) & 3 != 3 then updated = updated & ~(bits & r.wc)
+        // A 1 in the data clears a write-1-to-clear bit, through any alias.
+        updated = updated & ~(bits & r.wc)
         // UNLOCK, once set, stays set.
         if address == reg.VREG_CTRL_OFFSET then updated |= cur & reg.VREG_CTRL_UNLOCK_MASK
         self.words[i] = updated
+        if address == reg.TIMER_OFFSET then self.timer_written(cur, next & TIMER_SC)
+        self.check_alarm()
         Ok(())
 end Powman
 

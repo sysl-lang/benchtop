@@ -22,9 +22,10 @@ function(benchtop_program target source type)
 endfunction()
 
 # RAM images: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
-foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp)
+foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp aon_timer)
     benchtop_program(${prog} ${prog}.c no_flash)
 endforeach()
+target_link_libraries(aon_timer pico_aon_timer hardware_powman)
 
 # rcp.c uses the redundancy coprocessor's header directly.
 target_link_libraries(rcp hardware_rcp)

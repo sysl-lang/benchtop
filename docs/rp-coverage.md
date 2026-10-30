@@ -73,7 +73,7 @@ day. An L is split before it is handed out (§6).
 | Hazard3 ×2 (RV32IMAC + Zb*/Zc*/Zcmp, PMP, Xh3pmpm, Xh3power) | 3.8 Hazard3 | full | `riscv/rp2350.sysl:6–22` and `riscv/HAZARD3-COVERAGE.md`. | `riscv/hazard3_*_tests`, `chip/tests.sysl:18` | — | — |
 | Hazard3 interrupt controller (Xh3irq) | 3.8 | full | MEIEA, MEIPA, MEINEXT and MEICONTEXT (`riscv/csr.sysl:34–42`). Only the lines `signal` drives ever pend (see "Interrupt routing"). | `riscv/hazard3_tests` | — | — |
 | Architecture switching (ARCHSEL, both pairs) | 3.9 Architecture switching | missing | The board fixes the cores (`boards/pico2-riscv.hocon` against `pico2`). | — | S | Arm board, boot path |
-| Interrupt routing (52 lines) | 3.2 Interrupts | partial | Wired: TIMER0/1 ×4, SIO_FIFO, SIO_BELL, UART0 and UART1, plus MTIME and the soft IRQ (`chip/rp2350.sysl:325–336`). Every other source is absent with its block. | `chip/tests.sysl:18` | grows with each block | — |
+| Interrupt routing (52 lines) | 3.2 Interrupts | partial | Wired: TIMER0/1 ×4, SIO_FIFO, SIO_BELL, POWMAN_IRQ_POW and POWMAN_IRQ_TIMER, UART0 and UART1, plus MTIME and the soft IRQ (`chip/rp2350.sysl:325–336`). Every other source is absent with its block. | `chip/tests.sysl:18` | grows with each block | — |
 | SIO: CPUID, GPIO (both banks), FIFOs (4-deep), spinlocks, FIFO IRQ | 3.1 SIO | full | `peripheral/rp2350/sio.sysl:6–11,13,39–60`. The E2 erratum option (DESIGN.md §9.3) is not built. | `peripheral/rp2350/tests.sysl:129`, `chip/tests.sysl:94,115` | — | — |
 | SIO RISC-V platform timer (MTIME, MTIMECMP, soft IRQ) | 3.1.8 / 3.1 SIO | full | `peripheral/rp2350/sio.sysl:15–16,48–51`. | `rp2350/tests.sysl:129` | — | — |
 | SIO doorbells (8, SIO_IRQ_BELL) | 3.1 SIO | full | DOORBELL_OUT_SET/CLR (the other core's DOORBELL_IN) and DOORBELL_IN_SET/CLR (this core's), bits 7:0; SIO_IRQ_BELL (26) per core while any bit is set (`peripheral/rp2350/sio.sysl`, `chip/rp2350.sysl` `signal`; item 15). The Non-secure SIO's SIO_IRQ_BELL_NS is not (Secure-only). | `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
@@ -89,7 +89,8 @@ day. An L is split before it is handed out (§6).
 | XIP: flash window, aliases, cache, cache-as-SRAM, XIP_CTRL, streaming FIFO | 4.4 XIP | full | One 4 MB flash array (`parts/qspi_flash`, a W25Q32RV) behind the cached, uncached and untranslated windows, read and executed in place on the cores' fast path from the cached window's first 4 MB (`chip/arm_board.sysl`); the rest through the chip, translated by ATRANS and wrapping at the device's size (`peripheral/rp2350/xip.sysl`). XIP_CTRL in full, the cache's tags with every maintenance operation, lines pinned over XIP_SRAM holding their bytes (a fully pinned page on the fast path, a partly pinned one checked line by line), the streaming FIFO and XIP_AUX. Fidelity limits: the cache is functional, not timed (no lookups, so CTR_HIT/CTR_ACC are refused by name and a read is never stale); a pin over flash, a write through XIP with WRITABLE_M0 set, and code fetched from flash in direct mode or from an unpinned XIP_SRAM line are the cases not run or not refused (item 4 below). | `peripheral/rp2350/xip_tests.sysl`, `chip/xip_tests.sysl` | — | — |
 | QMI (flash and PSRAM interface; direct mode) | 12.14 QMI | full | Direct mode with both FIFOs, NOPUSH, 16-bit entries, ASSERT and AUTO chip selects, RX-full stall and BUSY, all to the flash on CS0; the window, timing and ATRANS registers stored. Instantaneous: no clock divider timing. CS1 (no PSRAM on the Pico 2) and a non-identity ATRANS0-3 are refused by name. The ROM's flash routines (`flash_range_erase` and friends) need item 6. | `peripheral/rp2350/xip_tests.sysl`, `chip/xip_tests.sysl` (`qmi_flash`) | — | — |
 | OTP | 13 OTP | missing | Not decoded. It is read for the unique ID and for boot configuration. | — | M (stored array, ROM access); L (ECC, locks, keys) | ROM |
-| POWMAN, including the AON timer, LPOSC, VREG and BOD control | 6 Power | partial | The store is done: VREG (locked until UNLOCK, VSEL limit), BOD, LPOSC and XOSC settings, SEQ_CFG, CHIP_RESET (HAD_POR), WDSEL, SCRATCH/BOOT, the interrupt registers into IRQs 44 and 45, all behind the 0x5AFE password. Refused by name, for item 27: STATE, the TIMER/time/alarm registers, PWRUP0-3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP, BOOTDIS. LPOSC is still a constant 32768 Hz. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | M (AON timer) | TICKS/clocks |
+| POWMAN: the AON timer, LPOSC, VREG and BOD control | 6 Power | full | The store: VREG (locked until UNLOCK, VSEL limit), BOD, LPOSC (TRIM, MODE) and XOSC settings, SEQ_CFG, CHIP_RESET (HAD_POR), WDSEL, SCRATCH/BOOT, the interrupt registers into IRQs 44 and 45, all behind the 0x5AFE password; a 1 clears a W1C bit through any alias. The AON timer (item 27): 64-bit milliseconds loaded from SET_TIME by RUN, CLEAR, READ_TIME live (the SDK's re-read catches the carry); from the LPOSC (nominal 32.768 kHz) or the crystal at the rate LPOSC_/XOSC_FREQ_KHZ state, from GPIO 12/20/14/22 one millisecond per rising edge, or synchronised to a 1 Hz edge; the 64-bit alarm latching TIMER.ALARM into INTR.TIMER and IRQ 45, and a sleeping core skipping to it (`peripheral/rp2350/powman.sysl`). | `rp2350/aon_tests.sysl`, `rp2350/sysctl_tests.sysl`, `chip/aon_tests.sysl` (`aon_timer.elf`), `chip/startup_tests.sysl` | — | — |
+| POWMAN power states and power-up requests | 6.2 Power management | missing | STATE, PWRUP0-3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS are refused by name: the chip never leaves its all-on state, so P1.x states, GPIO and alarm power-ups (PWRUP_ON_ALARM is stored) and the SLEEP/DORMANT time skip (Q7) are not built. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | M | Q7 time skip, GPIO interrupts |
 | GLITCH_DETECTOR | 10.9 Glitch detector | missing | Not decoded. | — | S (store) | — |
 | RESETS (29 outputs) | 7.5 Subsystem resets | full | `peripheral/rp2350/timing.sysl:15–22` over `rp2040/resets.sysl:7–11`. Release completes at once. | `rp2350/tests.sysl:15`, `chip/tests.sysl:43,81` | — | — |
 | PSM (power-on state machine; FRCE_ON/FRCE_OFF/DONE) | 7.4 Power-on state machine | full | The 25-stage sequence: FRCE_OFF holds a stage and those after it, FRCE_ON releases from a later stage, DONE is computed, WDSEL stored. PROC1 forced off stops core 1 and its release re-enters the ROM wait with a 0 for core 0 (`multicore_reset_core1`). Forcing any other stage off is refused by name. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
@@ -167,7 +168,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 25 | 9 | 1 | 22 | 57 |
+| RP2350 | 26 | 8 | 1 | 23 | 58 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
 One RP2350 block is a register-stub today (its row says which). Every block that is not modelled is refused by the bus, which is
@@ -336,7 +337,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 24 | **RP2040 SSI, VREG_AND_CHIP_RESET and RTC**. | M | 22 |
 | 25 | **TRNG and SHA-256**. | S | 11 |
 | 26 | **OTP** (a stored array with ROM access; beyond that per Q10). | M | 6 |
-| 27 | **POWMAN AON timer and LPOSC**. | M | 5 |
+| 27 | **POWMAN AON timer and LPOSC**. **Done** (below). | M | 5 |
 | 28 | **BUSCTRL performance counters, TBMAN, GLITCH_DETECTOR stores**. | S | 11 |
 | 29 | **HSTX and the SIO TMDS encoder** (per Q9). | M | 11 |
 | 30 | **Boot path** (IMAGE_DEF and partitions; per Q2). | L | 6, 25, 26 |
@@ -399,8 +400,8 @@ BOOTRAM is 1 KB, WRITE_ONCE0/1 and BOOTLOCK0-7 with BOOTLOCK_STAT. The new block
 - **SYSINFO**, **SYSCFG**: as in the matrix. PACKAGE_SEL is 1 (the Pico 2's QFN60 RP2350A).
 - **POWMAN** (`powman.sysl`): a store behind the password (data bits 31:16 = 0x5AFE through any alias; a
   bad one is dropped and latches BADPASSWD). SCRATCH0-7 and BOOT0-3 take no password and all 32 bits. The
-  regulator registers drop writes until VREG_CTRL.UNLOCK is set, and UNLOCK never clears. The AON timer,
-  power states and power-up requests are refused by name for item 27.
+  regulator registers drop writes until VREG_CTRL.UNLOCK is set, and UNLOCK never clears. The AON timer is
+  item 27's (below); the power states and power-up requests stay refused by name.
 - **ACCESSCTRL** (`accessctrl.sysl`): stored behind the 0xACCE password; the password rules for LOCK and
   CFGRESET and the lock being per core are assumptions from the register descriptions, since the SDK headers
   do not state them.
@@ -653,3 +654,44 @@ as `stop_at` and say so.
 100 ms after the last feed, REASON 0x1, `watchdog_caused_reboot` and `watchdog_enable_caused_reboot`
 yes), `watchdog_reboot(0, 0, 0)` (REASON 0x2, enable-caused no), and a PC/SP `watchdog_reboot` into a
 function that records the boot type (PC_SP) and `watchdog_caused_reboot` (no) before a breakpoint.
+
+### Item 27, done: the always-on timer and the LPOSC
+
+`peripheral/rp2350/powman.sysl`, against `hardware/regs/powman.h` and the SDK's `hardware_powman` and
+`pico_aon_timer`; the chip advances it with clk_sys and asks it for the next alarm (`chip/rp2350.sysl`).
+
+- **The count**: 64 bits of milliseconds. A rising TIMER.RUN loads SET_TIME_63TO48..15TO0 (so a stop
+  then a start resumes from the last set time, as `powman_timer_stop` documents); RUN cleared holds it;
+  CLEAR zeroes it at any time, running or not. READ_TIME_UPPER and LOWER are the live count, so a read
+  of UPPER, LOWER, UPPER that straddles the carry is seen and re-read by `powman_timer_get_ms`. 2^64 ms
+  wraps to 0.
+- **The tick**: USE_LPOSC (the source at power-on), USE_XOSC and USE_GPIO_1KHZ are self-clearing selects;
+  USING_* report the source while RUN is set. From the LPOSC or the crystal a millisecond is the stated
+  frequency (LPOSC_FREQ_KHZ / XOSC_FREQ_KHZ, kHz with 16 fractional bits) of real source cycles, carried
+  exactly in fixed point: at the reset values the crystal (12000 kHz stated, 12 MHz real) is exact and the
+  LPOSC (32.768005 kHz stated, 32.768 kHz real) runs 0.2 ppm slow. A stated 0 stops the count; the crystal
+  counts only while XOSC is stable. From the GPIO EXT_TIME_REF selects (12, 20, 14, 22) each rising edge
+  is one millisecond, which is what `powman_timer_set_1khz_tick_source_gpio` assumes of a 1 kHz clock (it
+  sets no frequency). USE_GPIO_1HZ holds the count at the second's 999th millisecond until the 1 Hz edge
+  and moves it to the next whole second on the edge. The GPIO is sampled once per chip advance (a board
+  quantum), ample for 1 kHz.
+- **The alarm**: while ALARM_ENAB is set and the count is at or past ALARM_TIME, TIMER.ALARM latches; it is
+  INTR.TIMER and, through INTE, POWMAN_IRQ_TIMER (45). Cleared while still enabled and past, it latches
+  again (the warning on `powman_clear_alarm`). `next_event` includes the alarm while it counts from the
+  LPOSC or the crystal, exact to the clk_sys cycle, so cores asleep in WFI skip straight to it (Q7).
+- **The password** covers every timer register; a 1 clears a write-1-to-clear bit through any alias,
+  the CLR alias included, because the SDK clears TIMER.ALARM and STATE.REQ_IGNORED with
+  `powman_clear_bits` and TinyUSB clears SIE_STATUS through USB's CLR alias. (ROSC's STATUS.BADWRITE and
+  ACCESSCTRL still treat a CLR alias as writing no ones.)
+- **The LPOSC** runs at its nominal 32.768 kHz; TRIM and MODE are stored and change nothing (Q8).
+- **Assumptions**, since the headers do not say: a write naming several sources takes the GPIO over the
+  crystal over the LPOSC; SET_TIME and the frequency registers written while running take effect at the
+  next RUN and at once respectively, where the headers only say not to; the 1 Hz synchronisation is the
+  hold-and-jump above. PWRUP_ON_ALARM and NONSEC_WRITE are stored with no effect (no low-power states,
+  Secure-only).
+
+**Still refused by name**: STATE, PWRUP0-3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS (the power
+states row). `examples/pico2/aon_timer.c` starts the timer from the crystal at a wall-clock time with
+`aon_timer_start`, reads it after `sleep_ms(250)`, waits for an alarm 1.5 s ahead in WFI, clears it
+enabled and disabled, fires an alarm already past, stops the timer and reads it held, and crosses the
+32-bit carry; `chip/aon_tests.sysl` asserts every line.
