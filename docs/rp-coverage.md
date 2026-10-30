@@ -73,11 +73,11 @@ day. An L is split before it is handed out (§6).
 | Hazard3 ×2 (RV32IMAC + Zb*/Zc*/Zcmp, PMP, Xh3pmpm, Xh3power) | 3.8 Hazard3 | full | `riscv/rp2350.sysl:6–22` and `riscv/HAZARD3-COVERAGE.md`. | `riscv/hazard3_*_tests`, `chip/tests.sysl:18` | — | — |
 | Hazard3 interrupt controller (Xh3irq) | 3.8 | full | MEIEA, MEIPA, MEINEXT and MEICONTEXT (`riscv/csr.sysl:34–42`). Only the lines `signal` drives ever pend (see "Interrupt routing"). | `riscv/hazard3_tests` | — | — |
 | Architecture switching (ARCHSEL, both pairs) | 3.9 Architecture switching | missing | The board fixes the cores (`boards/pico2-riscv.hocon` against `pico2`). | — | S | Arm board, boot path |
-| Interrupt routing (52 lines) | 3.2 Interrupts | partial | Wired: TIMER0/1 ×4, SIO_FIFO, UART0 and UART1, plus MTIME and the soft IRQ (`chip/rp2350.sysl:325–336`). Every other source is absent with its block. | `chip/tests.sysl:18` | grows with each block | — |
+| Interrupt routing (52 lines) | 3.2 Interrupts | partial | Wired: TIMER0/1 ×4, SIO_FIFO, SIO_BELL, UART0 and UART1, plus MTIME and the soft IRQ (`chip/rp2350.sysl:325–336`). Every other source is absent with its block. | `chip/tests.sysl:18` | grows with each block | — |
 | SIO: CPUID, GPIO (both banks), FIFOs (4-deep), spinlocks, FIFO IRQ | 3.1 SIO | full | `peripheral/rp2350/sio.sysl:6–11,13,39–60`. The E2 erratum option (DESIGN.md §9.3) is not built. | `peripheral/rp2350/tests.sysl:129`, `chip/tests.sysl:94,115` | — | — |
 | SIO RISC-V platform timer (MTIME, MTIMECMP, soft IRQ) | 3.1.8 / 3.1 SIO | full | `peripheral/rp2350/sio.sysl:15–16,48–51`. | `rp2350/tests.sysl:129` | — | — |
-| SIO doorbells (8, SIO_IRQ_BELL) | 3.1 SIO | missing | Refused (`sio.sysl:10`). | — | S | IRQ routing |
-| SIO interpolators INTERP0/1 (per core) | 3.1 SIO | missing | Refused (`sio.sysl:10`). | — | M | — |
+| SIO doorbells (8, SIO_IRQ_BELL) | 3.1 SIO | full | DOORBELL_OUT_SET/CLR (the other core's DOORBELL_IN) and DOORBELL_IN_SET/CLR (this core's), bits 7:0; SIO_IRQ_BELL (26) per core while any bit is set (`peripheral/rp2350/sio.sysl`, `chip/rp2350.sysl` `signal`; item 15). The Non-secure SIO's SIO_IRQ_BELL_NS is not (Secure-only). | `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
+| SIO interpolators INTERP0/1 (per core) | 3.1 SIO | full | `peripheral/rp2040/interp.sysl`, shared with the RP2040: each core's own pair; shift (rotate here), mask, SIGNED, CROSS_INPUT, CROSS_RESULT, ADD_RAW, FORCE_MSB, BLEND (INTERP0), CLAMP (INTERP1), OVERF flags, PEEK/POP, ACCUMx_ADD, BASE_1AND0 (item 15). | `rp2040/interp_tests.sysl`, `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
 | SIO TMDS encoder | 3.1 SIO | missing | Refused (`sio.sysl:10`). | — | S | HSTX (for a use) |
 | BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | missing | Not decoded. | — | S (counters) | DMA/cores for events |
 | ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. Nothing else on the chip consults it (Secure-only, Q3). | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
@@ -131,7 +131,7 @@ day. An L is split before it is handed out (§6).
 | SIO: CPUID, FIFOs (8-deep), spinlocks, FIFO IRQ | 2.3.1 SIO | partial | `virt-sio` (`virt/sio.sysl:3–40`) for the virtual boards. It has no GPIO registers, and `rp-sio` is `modelled = false` (`registry.sysl:301`). The RP2350 SIO model is the base to parameterise (depth 8, no high bank, no MTIME). | `virt/session_tests`, `virt/machine_tests` | S | chip layer |
 | SIO GPIO (OUT/OE/IN, SET/CLR/XOR) | 2.3.1 SIO | missing | Not on an RP2040 bus. Shared with the RP2350 model. | — | S | IO_BANK0 |
 | SIO hardware divider (per core) | 2.3.1.5 Integer divider | full | `peripheral/rp2040/divider.sysl:5–84`: 8-cycle completion, DIRTY, signed and unsigned. Reached only from a test bus. | `rp2040/tests.sysl`, `v6m/rp2040_peripheral_tests.sysl` | S (wire) | chip layer |
-| SIO interpolators (with the RP2040's blend and clamp modes) | 2.3.1.6 Interpolator | missing | — | — | M (shared with RP2350) | — |
+| SIO interpolators (with the RP2040's blend and clamp modes) | 2.3.1.6 Interpolator | full | `peripheral/rp2040/interp.sysl`, the RP2350's model with SHIFT a logical right shift (item 15). Reached only from tests until the RP2040 chip layer places it. | `rp2040/interp_tests.sysl` (both shifts) | S (wire) | chip layer |
 | Bus fabric, BUSCTRL, performance counters | 2.1 Bus fabric | missing | — | — | S | — |
 | DMA: 12 channels, DREQs, pacing timers, chaining, ring, sniff/CRC | 2.5 DMA | missing | — | — | L (shared with RP2350, which has more channels and security) | DREQs |
 | ROM: contents, float/double/mem tables, `rom_func_lookup`, core-1 launch | 2.8 Bootrom | missing | Not mapped. The RP2040 SDK calls the ROM for float, double, memcpy and memset (DESIGN.md §10.1). | — | L | XIP/SSI for the flash routines |
@@ -167,10 +167,10 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 22 | 10 | 1 | 24 | 57 |
-| RP2040 | 4 | 4 | 0 | 29 | 37 |
+| RP2350 | 24 | 10 | 1 | 22 | 57 |
+| RP2040 | 5 | 4 | 0 | 28 | 37 |
 
-One block is a register-stub today (the USB controller's SIE_CTRL). Every block that is not modelled is refused by the bus, which is
+One RP2350 block is a register-stub today (its row says which). Every block that is not modelled is refused by the bus, which is
 benchtop's policy for unsupported accesses (`docs/peripheral-models.md:54`). Several items below
 build register-stubs on purpose: a block stored as written, with a named refusal for any behaviour
 the stub does not carry out.
@@ -324,7 +324,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 12 | **DMA sniff/CRC and security attributes**. | S | 11 |
 | 13 | **PIO state machine**: the instruction set, FIFOs, shift registers, side-set, divider, IRQ flags, and the RP2350 additions, with register-level tests. | L | 9 |
 | 14 | **PIO integration**: pins through the mux, DREQs, the IRQ lines. `ws2812`, `pio_blink`, `uart_tx` and `uart_rx` are its oracles. | M | 11, 13 |
-| 15 | **Doorbells and interpolators** (shared by both chips). | M | 1 |
+| 15 | **Doorbells and interpolators** (shared by both chips). **Done** (below). | M | 1 |
 | 16 | **SPI on the chip**: the PL022 placed, with DREQs. | S | 9, 11 |
 | 17 | **I²C (DW_apb_i2c) master and slave**. | M | 9, 11 |
 | 18 | **PWM** (12 slices, IRQ, DREQ, pins through the mux). | M | 9, 11 |
@@ -537,6 +537,45 @@ DCP's product, flushed, then the sum — so `-tiny × tiny + 0` is +0 there; the
 
 Core 1's launch now returns to the ROM's wait (`ArmBoard.launch` sets LR), as the chip's ROM calls the
 entry: `dcp.c`'s core 1 function returns, and before this ran into the ROM's vector table and faulted.
+
+### Item 15, done: the doorbells and the interpolators
+
+**The interpolator** (`peripheral/rp2040/interp.sysl`) is one model for both chips, against the
+RP2040 and RP2350 `hardware/regs/sio.h` INTERP0_*/INTERP1_* descriptions and `hardware_interp`. Each
+RP2350 core's SIO holds its own INTERP0 and INTERP1 (`Sio.interps`); the RP2040's will hold the same
+when its chip layer places them. The one difference between the chips is the lane's SHIFT: a logical
+right shift on the RP2040, a right rotate on the RP2350 (each chip's `sio.h` says so).
+
+- Each lane: its own accumulator or, with CROSS_INPUT, the other's; shifted or rotated; bits
+  MASK_LSB..MASK_MSB kept (MASK_LSB above MASK_MSB keeps none, signed or not); sign-extended from
+  MASK_MSB with SIGNED. The result is BASE plus that, or plus the raw input with ADD_RAW (CROSS_INPUT
+  is ahead of the bypass). FULL is BASE2 plus both lanes' values, whatever ADD_RAW says.
+- PEEK reads; POP reads and writes both lane results back, each into the other accumulator with
+  CROSS_RESULT. FORCE_MSB is ORed into bits 29:28 of a lane as the bus reads it only.
+- **BLEND** (INTERP0's lane 0 only): lane 1 is `(BASE0·(256−α) + BASE1·α) >> 8`, signed by lane 1's
+  SIGNED (rounding down), α the 8 low bits of lane 1's value; lane 0 is α; FULL leaves lane 1 out.
+  **CLAMP** (INTERP1's lane 0 only): lane 0's value held to BASE0 below, then BASE1 above (so BASE0
+  wins where the bounds cross), compared signed by lane 0's SIGNED, nothing added. Each interpolator
+  stores only its own mode bit.
+- OVERF0/OVERF1/OVERF (read-only, lane 0's CTRL): a lane's shifted input has a bit above MASK_MSB.
+  ACCUMx_ADD adds its 24-bit field (bits 23:0, as `sio.h` gives it) to the whole accumulator and reads
+  the lane's shift-and-mask value. BASE_1AND0 sign-extends each half by its lane's SIGNED and reads 0
+  (`interp_hw_t.base01` is write-only). A write to PEEK or POP does nothing.
+
+**The doorbells** (RP2350 only): DOORBELL_OUT_SET/CLR write the other core's DOORBELL_IN and read it;
+DOORBELL_IN_SET/CLR this core's; bits 7:0. SIO_IRQ_BELL (26) is raised in a core while its
+DOORBELL_IN is non-zero (`chip/rp2350.sysl` `signal`). SIO_IRQ_BELL_NS and PERI_NONSEC are Non-secure
+(Q3) and refused by name with the TMDS encoder (item 29).
+
+Tests: `peripheral/rp2040/interp_tests.sysl` (every mode on both chips' shift: reset and the stored
+CTRL bits, shift 0 and 31, mask edges, signed, ADD_RAW, cross both ways, POP and FULL, FORCE_MSB,
+blend unsigned and signed, clamp at and past its bounds, BASE_1AND0, ACCUMx_ADD, OVERF);
+`peripheral/rp2350/sio_tests.sysl` (each core's own pair, both counting at once, access widths, every
+doorbell register); `chip/interp_tests.sysl`: core 0's loads and stores under both executors, the bell
+pending in core 1's NVIC only, and `examples/pico2/interp.c`, which prints each mode's answers through
+`hardware_interp` (the test holds the values worked by hand from the datasheet), launches core 1 to
+count on its own INTERP0 while core 0 counts on its, then rings doorbells: core 0 on itself, core 0 on
+core 1, whose SIO_IRQ_BELL handler acknowledges and rings back.
 
 ### Item 4, done: XIP flash, the cache and the QMI
 

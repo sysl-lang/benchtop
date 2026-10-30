@@ -1,17 +1,24 @@
 module sh.sysl.benchtop.peripheral.rp2350
 
-import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane}
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Interp, access, interp, read_lane}
 import sh.sysl.rp2350.sio as reg
 
 // The RP2350's single-cycle IO block (datasheet, "SIO"): one view per core, chosen by the core the
 // chip says made the access. Modelled: CPUID, the GPIO output and output-enable registers with their
-// SET/CLR/XOR forms (GPIO 0–31 and the high bank: GPIO 32–47 and the QSPI and USB pads in bits 24–31), GPIO_IN as the chip's pads report it,
-// the two inter-core FIFOs, the 32 spinlocks, and the Hazard3 cores' software interrupts and RISC-V
-// platform timer (MTIME, and each core's own MTIMECMP). The doorbells, interpolators and TMDS encoder
-// are refused. SIO has no atomic aliases.
+// SET/CLR/XOR forms (GPIO 0–31 and the high bank: GPIO 32–47 and the QSPI and USB pads in bits 24–31),
+// GPIO_IN as the chip's pads report it, the two inter-core FIFOs, the 32 spinlocks, each core's own two
+// interpolators (`rp2040.Interp`, which rotates here), the eight doorbells each way with each core's
+// SIO_IRQ_BELL, and the Hazard3 cores' software interrupts and RISC-V platform timer (MTIME, and each
+// core's own MTIMECMP). The TMDS encoder and PERI_NONSEC are refused. SIO has no atomic aliases.
 
 /** The inter-core FIFOs are four entries deep on the RP2350. */
 const FIFO_DEPTH: usize = 4
+
+// One interpolator's registers: 16 words, INTERP0 at 0x080 and INTERP1 at 0x0C0.
+private const INTERP_WINDOW: u32 = 0x3F
+
+// The index into `Sio.interps` of core `k`'s interpolator at SIO offset `address`.
+private interp_at(k: u32, address: u32) -> u32 = 2 * k + ((address - reg.INTERP0_ACCUM0_OFFSET) >> 6)
 
 /** The defined bits of GPIO_HI_OUT, GPIO_HI_OE, GPIO_HI_IN and their SET/CLR/XOR forms (sio.h,
  * SIO_GPIO_HI_OUT_BITS): bits 0–15 are GPIO 32–47 and bits 24–31 are USB DP, USB DM, QSPI SCK, QSPI CSn
@@ -56,6 +63,10 @@ struct Sio
     mtime_ctrl: u32
     mtime: u64
     mtimecmp: [2]u64
+    // interps[2k + n] is core k's INTERPn.
+    interps: [4]Interp
+    // bells[k] is core k's DOORBELL_IN; bits 7:0.
+    bells: [2]u32
 
     reset(*self)
         self.out = 0
@@ -64,6 +75,8 @@ struct Sio
             self.fifos[k] = Fifo([0; FIFO_DEPTH], 0, 0)
             self.errors[k] = 0
             self.mtimecmp[k] = ~0u64
+            self.bells[k] = 0
+        for i in 0..<4 do self.interps[i] = interp(u32(i % 2), true)
         self.locks = 0
         self.softirq = 0
         // MTIME counts at power-on, paused while either core is halted by a debugger.
@@ -72,6 +85,9 @@ struct Sio
 
     /** Whether core `k`'s FIFO interrupt (SIO_IRQ_FIFO) is raised: a word waits, or an error flag is set. */
     fifo_irq(self, k: u32) -> bool = !self.fifos[k].empty() || self.errors[k] != 0
+
+    /** Core `k`'s doorbell interrupt (SIO_IRQ_BELL): any bit of its DOORBELL_IN is set. */
+    bell_irq(self, k: u32) -> bool = self.bells[k] != 0
 
     /** Core `k`'s machine software interrupt. */
     software_irq(self, k: u32) -> bool = self.softirq & (1 << k) != 0
@@ -103,6 +119,8 @@ struct Sio
             if self.locks & bit != 0 then return Ok(0)
             self.locks |= bit
             return Ok(read_lane(bit, offset, width))
+        if address >= reg.INTERP0_ACCUM0_OFFSET && address <= reg.INTERP1_BASE_1AND0_OFFSET
+            return Ok(read_lane(self.interps[interp_at(k, address)].read(address & INTERP_WINDOW)?, offset, width))
         val value = address match
             reg.CPUID_OFFSET -> k
             reg.GPIO_IN_OFFSET -> u32.wrap(inputs)
@@ -130,6 +148,9 @@ struct Sio
             reg.MTIMEH_OFFSET -> u32(self.mtime >> 32)
             reg.MTIMECMP_OFFSET -> u32.wrap(self.mtimecmp[k])
             reg.MTIMECMPH_OFFSET -> u32(self.mtimecmp[k] >> 32)
+            // The OUT pair reads the other core's DOORBELL_IN, the IN pair this core's.
+            reg.DOORBELL_OUT_SET_OFFSET | reg.DOORBELL_OUT_CLR_OFFSET -> self.bells[1 - k]
+            reg.DOORBELL_IN_SET_OFFSET | reg.DOORBELL_IN_CLR_OFFSET -> self.bells[k]
             _ -> return Err(AccessError.Unmapped)
         Ok(read_lane(value, offset, width))
     end read
@@ -141,6 +162,8 @@ struct Sio
         if offset >= reg.SPINLOCK0_OFFSET && offset <= reg.SPINLOCK31_OFFSET
             self.locks &= ~(1u32 << ((offset - reg.SPINLOCK0_OFFSET) >> 2))
             return Ok(())
+        if offset >= reg.INTERP0_ACCUM0_OFFSET && offset <= reg.INTERP1_BASE_1AND0_OFFSET
+            return self.interps[interp_at(k, offset)].write(offset & INTERP_WINDOW, x)
         val low = u64(x)
         val high = u64(x & GPIO_HI_BITS) << 32
         offset match
@@ -175,6 +198,11 @@ struct Sio
             reg.MTIMEH_OFFSET -> self.mtime = (self.mtime & 0xFFFFFFFF) | (low << 32)
             reg.MTIMECMP_OFFSET -> self.mtimecmp[k] = (self.mtimecmp[k] & ~0xFFFFFFFFu64) | low
             reg.MTIMECMPH_OFFSET -> self.mtimecmp[k] = (self.mtimecmp[k] & 0xFFFFFFFF) | (low << 32)
+            // Write one to set or clear a doorbell: OUT on the other core, IN on this one.
+            reg.DOORBELL_OUT_SET_OFFSET -> self.bells[1 - k] |= x & reg.DOORBELL_OUT_SET_DOORBELL_OUT_SET_MASK
+            reg.DOORBELL_OUT_CLR_OFFSET -> self.bells[1 - k] &= ~x
+            reg.DOORBELL_IN_SET_OFFSET -> self.bells[k] |= x & reg.DOORBELL_IN_SET_DOORBELL_IN_SET_MASK
+            reg.DOORBELL_IN_CLR_OFFSET -> self.bells[k] &= ~x
             _ -> return Err(AccessError.Unmapped)
         Ok(())
     end write
