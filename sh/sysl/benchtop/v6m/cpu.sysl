@@ -114,6 +114,9 @@ struct Memory
     // itself: `LINE_CODE` once a record has been decoded from it or from the 3 bytes after it,
     // `LINE_WATCHED` once a load-exclusive has read it or the 3 bytes after it.
     code_lines: [16384]u8
+    // One bit per 4 KB page of flash, set once a record has been decoded from it: the pages whose
+    // records a board taking the flash off the fast path must forget (`flash_unmapped`).
+    flash_code_pages: [16]u64
     // Each core's count of the stores it has made to each watched line, which the other core's
     // store-exclusive checks (t2sem.sysl).
     line_stores: [2][16384]u32
@@ -207,7 +210,7 @@ end Memory
  * Its count is atomic, since a machine's cores run on threads of their own.
  */
 memory() -> &sync Memory =
-    Memory(0, RAM_BYTES, 0x10000000, 0, [RamBank(0, 0, 0); 7], 0, 0, [0; 1048576], [0; 4194304], [0; 1048576], [0; 16384], [0; 16384],
+    Memory(0, RAM_BYTES, 0x10000000, 0, [RamBank(0, 0, 0); 7], 0, 0, [0; 1048576], [0; 4194304], [0; 1048576], [0; 16384], [0; 16384], [0; 16],
         [[0; 16384]; 2], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442],
         [null; 2621442], [null; 2621442])
 
@@ -498,6 +501,7 @@ reset(cpu: *Cpu, mem: &sync Memory, image: []const u8, entry: u32)
     for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do mem.page_table[p] = usize(&mem.ram[p << PAGE_SHIFT])
     for i in 0..<mem.bank_store_pages.len do mem.bank_store_pages[i] = 0
     for i in 0..<mem.code_lines.len do mem.code_lines[i] = 0
+    for i in 0..<mem.flash_code_pages.len do mem.flash_code_pages[i] = 0
     for i in 0..<mem.code_lines.len
         mem.line_stores[0][i] = 0
         mem.line_stores[1][i] = 0
@@ -633,6 +637,20 @@ stop_access(cpu: *Cpu, ip: *Insn, n: u64)
     cpu.pc = addr_of(cpu, ip)
     cpu.retired = n
 
+// The decode of the record at `ip`, `n` retired before it, stopped the core: a fetch of its bytes
+// went to the bus, which refused it (an XIP_SRAM line not pinned, the flash in direct mode). The core
+// stops there with the instruction not executed, and the records decoded from what the refused fetch
+// answered — its own, a branch fused with it, an IT block's after it — go back to "not decoded", so a
+// later run fetches them again.
+@noinline
+@cold
+fetch_refused(cpu: *Cpu, ip: *Insn, n: u64)
+    val at = u32(ip - cpu.dec)
+    for i in at..<(if at + 10 < (NO_CODE >> 1) then at + 10 else NO_CODE >> 1)
+        if cpu.dec[i].op != Op.Undecoded then cpu.dec[i] = undecoded()
+    cpu.pc = addr_of(cpu, ip)
+    cpu.retired = n
+
 // A taken `Leave` at `ip`, `n` retired before it: the branch retires, and the core stops at its target.
 leave(cpu: *Cpu, ip: *Insn, n: u64)
     if ip.a != 0 then cpu.r[14] = (addr_of(cpu, ip) + 4) | 1
@@ -662,10 +680,14 @@ undecoded() -> Insn = Insn(&h_decode, 0, Op.Undecoded, 0, 0, 0)
 
 // The record at RAM address `pc` is being decoded from the bytes `pc` to `pc + 3`. A store whose
 // first byte is within 3 of them may write one of them, so the lines holding `pc - 3` to `pc + 3` are
-// marked as holding code.
+// marked as holding code. A record of flash marks its page (`flash_code_pages`).
 holds_code(cpu: *Cpu, address: u32)
     val mem = cpu.mem
 
+    if mem.flash_range(address, 2)
+        val page = (address - mem.flash_base) >> PAGE_SHIFT
+        atomic_or(&mem.flash_code_pages[page >> 6], 1u64 << u64(page & 63), Relaxed)
+        return
     if !mem.ram_range(address, 2) then return
     val pc = mem.ram_offset(address, 2)
     val from = if pc >= 4 then pc - 4 else 0
@@ -1170,9 +1192,45 @@ flash_changed(mem: &sync Memory, offset: u32, length: u32)
     if length == 0 || offset >= mem.flash_size then return
     val from = if offset >= 16 then offset - 16 else 0
     val end = if u64(offset) + u64(length) + 18 < u64(mem.flash_size) then offset + length + 18 else mem.flash_size
-    for i in ((FLASH_OFFSET + from) >> 1)..<((FLASH_OFFSET + end + 1) >> 1)
-        mem.decoded[i] = undecoded()
-        mem.decoded_own[i] = undecoded()
+    forget_decoded(mem, FLASH_OFFSET + from, FLASH_OFFSET + end)
+
+/** A board has taken the flash off the cores' fast path, or put it back (the RP2350's QMI in direct
+ * mode, where a fetch from XIP is a bus error): every record decoded from it decodes again, through
+ * the page table and the bus, when control next reaches it, as `flash_changed` has it. Only the pages
+ * a record has been decoded from are visited (`flash_code_pages`).
+ */
+flash_unmapped(mem: &sync Memory)
+    for w in 0..<mem.flash_code_pages.len
+        val bits = atomic_swap(&mem.flash_code_pages[w], 0, Relaxed)
+        if bits == 0 then continue
+        for k in 0u32..<64
+            if (bits >> u64(k)) & 1 != 0 then flash_changed(mem, (u32(w) * 64 + k) << PAGE_SHIFT, PAGE_BYTES)
+
+/** The `length` bytes at `address`, in one of the RAM regions, are no longer what a core fetching
+ * there reads, or are again: a board has taken them off the cores' memory or put them back (an
+ * XIP_SRAM cache line unpinned or pinned). Every record decoded from them, and every record that
+ * reads them (from 16 bytes before, for an IT block's, to 18 after), decodes again when control next
+ * reaches it, on either core, so a fetch there goes through the page table and the bus.
+ */
+fetch_changed(mem: &sync Memory, address: u32, length: u32)
+    val offset = mem.ram_offset(address, length)
+    if length == 0 || offset == NO_RAM then return
+    forget_decoded(mem, if offset >= 16 then offset - 16 else 0, if offset + length + 18 < RAM_BYTES then offset + length + 18 else RAM_BYTES)
+
+// The records of both record sets from code offset `from` to `end`, put back to "not decoded". A
+// record a core is executing (the store that unpinned its own line) keeps its operands, so its
+// handler finishes with them: only its handler and operation change, and the record after it is
+// what fetches afresh. A record not decoded is left alone, which leaves a bank's guard records alone.
+private forget_decoded(mem: &sync Memory, from: u32, end: u32)
+    val first = from >> 1
+    val last = (end + 1) >> 1
+    for i in first..<last
+        if mem.decoded[i].op != Op.Undecoded
+            mem.decoded[i].h = &h_decode
+            mem.decoded[i].op = Op.Undecoded
+        if mem.decoded_own[i].op != Op.Undecoded
+            mem.decoded_own[i].h = &h_decode
+            mem.decoded_own[i].op = Op.Undecoded
 
 /** A DMA/device bus write made on this core's host thread, to RAM only: it never enters MMIO or
  * faults the CPU, and answers whether it was made. The store's own bookkeeping invalidates decoded

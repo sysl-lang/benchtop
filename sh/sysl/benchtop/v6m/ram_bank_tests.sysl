@@ -167,3 +167,51 @@ ram_banks_code_boundaries()
                     assert(c.stop == Stop.Unmapped && peer.stop == Stop.Unmapped)
                     assert(c.stop_at == 0x24001000 && peer.stop_at == 0x24001000,"fall-through cannot jump across backing into another guest bank")
             unpair(&c,&peer)
+
+@test("RAM banks: code decoded from a page a board takes off the cores' memory decodes again, so its fetch goes to the bus, on either core's records, run straight on into it or reached by a branch decoded before; put back, it runs the bytes there now")
+ram_banks_fetch_changed()
+    for exec in [&run_match, &run_threaded]
+        val mem = memory()
+        var banks: Buf[RamBank] = buf()
+        var c: Cpu
+        c.kind = Kind.V8mMain
+        banks.push(RamBank(0x30000000, 8192, 8192))
+        reset_mapped(&c, mem, [], MemoryMap(0x24000000, 4096, 0x08000000, 0, banks.freeze()))
+        var peer: Cpu
+        attach_memory(&peer, mem)
+        clear(&peer, 0)
+        peer.core = 1
+        peer.kind = Kind.V8mMain
+        peer.bus = &nothing_attached
+        pair(&c, &peer)
+        // b.w 0x30001000 at the bank's base; movs r2, #5; movs r3, #6 at the end of its first page,
+        // running on into the second: movs r0, #7; bkpt.
+        for hw in [(0x30000000u32, 0xF000u32), (0x30000002, 0xBFFE), (0x30000FFC, 0x2205), (0x30000FFE, 0x2306), (0x30001000, 0x2007), (0x30001002, 0xBE00)]
+            store16(&c, hw.0, hw.1)
+        val second = 8192 + 4096
+        for phase in 0..<3
+            if phase == 1
+                // The board takes the second page off (an XIP_SRAM line unpinned).
+                mem.page_table[0x30001000 >> PAGE_SHIFT] = 0
+                fetch_changed(mem, 0x30001000, 4096)
+            if phase == 2
+                // And puts it back, holding movs r0, #9 now.
+                mem.ram[second] = 9
+                mem.page_table[0x30001000 >> PAGE_SHIFT] = usize(&mem.ram[second])
+                fetch_changed(mem, 0x30001000, 4096)
+            for core in [&c, &peer]
+                for start in [0x30000000u32, 0x30000FFC]
+                    for k in 0..<4 do core.r[k] = 0
+                    core.pc = start
+                    core.stop = Stop.Running
+                    val before = core.retired
+                    set_limit(core, executed_cycles(core, core.retired) + 1000)
+                    exec(core)
+                    val ran = f"core ${core.core} from 0x${start}%x in phase $phase: ${core.stop} at 0x${core.stop_at}%x, pc 0x${core.pc}%x, r0 ${core.r[0]}"
+                    if phase == 1
+                        assert(core.stop == Stop.Unmapped && core.stop_at == 0x30001000 && core.pc == 0x30001000 && core.r[0] == 0, ran)
+                        assert(core.retired == before + (if start == 0x30000000 then 1 else 2), f"$ran: the branch, or the two moves, retired")
+                    else
+                        assert(core.stop == Stop.Breakpoint && core.r[0] == (if phase == 0 then 7 else 9), ran)
+                    if start == 0x30000FFC then assert(core.r[2] == 5 && core.r[3] == 6, f"$ran: the first page's code ran")
+        unpair(&c, &peer)
