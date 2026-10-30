@@ -335,7 +335,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 19 | **ADC and temperature sensor** (round robin, FIFO, DREQ). | M | 11 |
 | 20 | **USB device controller**: endpoints, buffers, IRQ. **Done** (below). | L | 6 |
 | 21 | **USB host enumerator and CDC bridge to a pty**. `hello_world/usb` is its oracle. **Done** (below). | M | 20 |
-| 22 | **RP2040 chip layer**: `chip.Rp2040` over the shared models (CLOCKS without TICKS, pads without ISO, SIO with 8-deep FIFOs and the divider wired), and the `pico` board running. | M | 5, 8, 9 |
+| 22 | **RP2040 chip layer**: `chip.Rp2040` over the shared models (CLOCKS without TICKS, pads without ISO, SIO with 8-deep FIFOs and the divider wired), and the `pico` board running. **Done** (below). | M | 5, 8, 9 |
 | 23 | **RP2040 ROM**, following Q1: the float, double and mem tables plus the lookup. | L | 22 |
 | 24 | **RP2040 SSI, VREG_AND_CHIP_RESET and RTC**. | M | 22 |
 | 25 | **TRNG and SHA-256**. | S | 11 |
@@ -1207,3 +1207,63 @@ turns the INVIS and the IRQ cases red.
 `xip_loop.elf` 5.330 G to 5.300 G. A first cut cost 0.7% on the loops: the SecureFault test grew the
 slow path that `load` and `store` inline into every handler; it is out of line now (`slow_load`,
 `slow_store`), which is also why the base got faster.
+
+### Item 22, done: the RP2040 chip layer
+
+`chip.Rp2040` (`chip/rp2040.sysl`) runs on `ArmBoard[Rp2040]`, the `pico` board, two Cortex-M0+ cores.
+The SDK's `hello_serial` and `blink` and pico-examples' `multicore/hello_multicore` (unchanged), built for
+`pico` / `rp2040` as `no_flash` images (`examples/pico`), run end to end: every line at 125 MHz, the LED
+every 250 ms, both cores' lines after core 1's launch through the ROM's FIFO wait.
+
+**The board is generic over its chip.** `ArmBoard[C: ArmChip = Rp2350]`: the trait is what the shared
+run loop asks of a chip (clock, time, the next event, bus reads and writes, interrupt lines, core 1's
+reset and release, the console), and a `const rp2350()` answer under which the RP2350's own machinery
+(its ROM's hand-over, flash, XIP_SRAM, OTP, POWMAN, ACCESSCTRL, coprocessors, USB) is compiled with
+`if const` for that instance alone. Generic rather than a trait object, because the bus is called on
+every device access and an instance is monomorphised: the Pico 2 runs the code it ran before (Cost,
+below). sysl has no per-instance `impl`, so an RP2350-only method body sits under `if const C.rp2350()`
+at half indent; the Pico's boot is a free function over `ArmBoard[Rp2040]`.
+
+**Shared models, parameterised:** `Sio` takes its FIFO depth (8) and the interpolators' shift
+(`sio_rp2040`); `IoBank0` a GPIO count, where IRQSUMMARY starts, and CTRL's overrides at the RP2040's bits
+(`io_bank0_rp2040`, with the RP2040's function table); `Pads` a count and whether ISO exists
+(`pads_bank0_rp2040`, reset 0x56); `Psm` a stage count (`psm_rp2040`, 17). Mapped at the chip: XOSC's
+COUNT (0x1C), ROSC without RANDOM, the PLLs without interrupt registers, the SIO's GPIO registers onto the
+shared model's offsets. The RP2040's own: `ClocksRp2040` (`peripheral/rp2350/clocks_rp2040.sysl`: its
+generators, 24.8 and two-bit dividers, clk_peri undivided, FC0 from its table; the slot where the RP2350
+has clk_peri's DIV reads 0 and drops writes, because the SDK's `clock_configure` writes it); SYSINFO
+(B2's CHIP_ID); the RP2040 watchdog with its TICK as the timer's 1 µs tick; each core's divider at SIO
+0x060–0x078; SIO_IRQ_PROC0/1 (15, 16) each into its own core; USBCTRL's SIE_CTRL alone, stored, for
+`runtime_init_usb_power_down`; the dormant wake on a dormant ROSC; SRAM's non-striped aliases through the
+bus.
+
+**The boot ROM is a stand-in** (`chip/rom/rp2040-standin.S`, assembled by `build-rp2040-standin.sh`),
+until item 23 maps Raspberry Pi's. Its first 4 KB are mapped: the header (magic, version 3, the three
+table pointers) and core 1's wait, the datasheet's protocol (2.8.2): drain, send core 0 a 0, echo 0, 0, 1,
+VTOR, SP, ENTRY, restarting on a word out of place, sleeping in WFE. The tables, `rom_table_lookup`, the
+NMI and HardFault handlers and core 0's boot path all point into the unmapped 12 KB, so a lookup, an
+exception in the ROM or core 0 starting there is refused by name at the fetch. The examples therefore use
+the compiler's float, double, bit operations and memcpy/memset (`examples/pico/README.md`);
+`hello_multicore` needs no ROM function and runs on the stand-in.
+
+**Found on the way, fixed:**
+- **The M0+ decoded WFE and SEV as NOPs** whatever the board said (`v6m/decode.sysl`; the Thumb-2
+  decoder honoured `events`), so core 1 polled its FIFO at full speed. Now as on the M33 (tests in
+  `v6m/exceptions.sysl`).
+- **The SDK's hardware divide needs cycle timing.** `divmod_u32u32_core` reads the quotient after a
+  sequence counted to eight cycles; at one cycle an instruction it read a stale quotient, and PLL_SYS came
+  up at 4.095 GHz. The Pico's M0+s run on the instruction timing table (`v6m/cycles.sysl`).
+
+**Refused by name:** SSI, XIP and its control and cache-as-SRAM, VREG_AND_CHIP_RESET, RTC, IO_QSPI and
+PADS_QSPI and the SIO's GPIO_HI bank (item 24); every ROM function and table (item 23); the watchdog
+firing, by counter or TRIGGER (its reset is the ROM's boot path, item 23); SYSCFG, BUSCTRL, TBMAN, SPI,
+I2C, PWM, ADC, DMA, PIO and the rest of USBCTRL, each with its item; a UF2 (flash, item 24); a write to
+the ROM; `--usb` on the Pico; PSM FRCE_OFF of any stage but PROC1; FC0 on GPIN.
+
+`chip/pico_tests.sysl` (20 cases) runs the three programs and checks each difference at its registers;
+breaking the FIFO depth, the M0+'s timing or the WFE decode turns them red.
+
+**Cost**, host instructions retired, three interleaved runs each against the branch's base (dev at
+f6e7b41): `bench kernel.bin` (M0+) 40.207–40.211 G to 40.209–40.213 G; `bench --core cortex-m33
+kernel33.bin` 36.846–36.850 G to 36.847–36.847 G; `sram_loop.elf` 5.401–5.406 G to 5.402–5.405 G;
+`xip_loop.elf` 5.624–5.625 G to 5.624–5.625 G. Unchanged.
