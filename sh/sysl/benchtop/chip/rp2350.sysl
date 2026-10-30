@@ -148,10 +148,6 @@ val BLOCKS: [36]Placed = [
     Placed(Block.PadsBank0, pads_reg.BASE, "PADS_BANK0", resets_reg.RESET_PADS_BANK0_MASK),
     Placed(Block.Uart0, uart0_reg.BASE, "UART0", resets_reg.RESET_UART0_MASK),
     Placed(Block.Uart1, uart1_reg.BASE, "UART1", resets_reg.RESET_UART1_MASK),
-    // On the AHB, with the atomic aliases.
-    Placed(Block.Pio0, pio0_reg.BASE, "PIO0", resets_reg.RESET_PIO0_MASK),
-    Placed(Block.Pio1, pio1_reg.BASE, "PIO1", resets_reg.RESET_PIO1_MASK),
-    Placed(Block.Pio2, pio2_reg.BASE, "PIO2", resets_reg.RESET_PIO2_MASK),
     Placed(Block.Sio, sio_reg.BASE, "SIO", 0),
     Placed(Block.BootRam, bootram_reg.BASE, "BOOTRAM", 0),
     // Not gated by RESETS: the SDK reads SIE_CTRL before it releases USBCTRL
@@ -179,6 +175,11 @@ val BLOCKS: [36]Placed = [
     Placed(Block.OtpDataRawGuarded, OTP_DATA_BASE + 0xC000, "OTP_DATA_RAW_GUARDED", 0),
     // The OTP block's registers, with their atomic aliases; on no RESETS bit.
     Placed(Block.OtpBlock, otp_reg.BASE, "OTP", 0),
+    // The PIO blocks, on the AHB with the atomic aliases. Last, so the blocks a running program polls
+    // are found without passing them (`block_at` walks the table).
+    Placed(Block.Pio0, pio0_reg.BASE, "PIO0", resets_reg.RESET_PIO0_MASK),
+    Placed(Block.Pio1, pio1_reg.BASE, "PIO1", resets_reg.RESET_PIO1_MASK),
+    Placed(Block.Pio2, pio2_reg.BASE, "PIO2", resets_reg.RESET_PIO2_MASK),
 ]
 
 /** OTP_DATA_BASE (`hardware/regs/addressmap.h`); the raw, guarded and raw guarded windows follow it
@@ -293,8 +294,6 @@ struct Rp2350
         if cycles == 0 then return
         val sys = self.sys_hz()
         self.now += cycles
-        // The state machines run on clk_sys's cycles; with none running this is one test.
-        if self.pio.running && !self.swcore_off then self.pio.advance_to(self.now)
         if sys == 0 then return
         if self.swcore_off
             // Only the always-on domain runs: POWMAN's timer from the LPOSC, and its power-up requests.
@@ -465,6 +464,7 @@ struct Rp2350
      * they did.
      */
     take_line_fault(*self) -> Option[string]
+        self.pio_catch_up()
         if self.line_fault.is_empty() then return self.pio.take_fault()
         val why = self.line_fault
         self.line_fault = ""
@@ -482,10 +482,19 @@ struct Rp2350
     /** The levels on GPIO 0–47 as the PIO blocks read them, from the end of this cycle: the PIO's pins
      * are a vector of their own until item 14 takes them through the mux.
      */
-    pio_drive(*self, levels: u64) = self.pio.drive(self.now, levels)
+    pio_drive(*self, levels: u64)
+        self.pio_catch_up()
+        self.pio.drive(self.now, levels)
 
     /** PIO block `k`'s pins in its own numbering (GPIOBASE moves them): levels, and output enables. */
-    pio_pins(*self, k: u32) -> (u32, u32) = self.pio.pins(k)
+    pio_pins(*self, k: u32) -> (u32, u32)
+        self.pio_catch_up()
+        self.pio.pins(k)
+
+    // The PIO blocks run to `now`. Nothing outside them sees their state but through the bus, these
+    // hooks and the faults the board collects each quantum, so they run only then, and `advance` pays
+    // nothing for them (item 14's pins, DREQs and interrupts will give them events of their own).
+    private pio_catch_up(*self) = if self.pio.running && !self.swcore_off then self.pio.advance_to(self.now)
 
     /** DMA request `dreq` as the UARTs drive it (the SDK's `DREQ_UART0_TX` to `DREQ_UART1_RX`); None for
      * a request that is not a UART's.
@@ -566,9 +575,9 @@ struct Rp2350
                 if self.powman.watching() then self.powman.sample(self.pwrup_levels())
                 self.powman.read(o, width)
             AccessCtrl -> self.accessctrl.read(o, width)
-            Pio0 -> return self.pio.read(0, self.now, o, width).map_err(f -> pio_refusal(p, o, f))
-            Pio1 -> return self.pio.read(1, self.now, o, width).map_err(f -> pio_refusal(p, o, f))
-            Pio2 -> return self.pio.read(2, self.now, o, width).map_err(f -> pio_refusal(p, o, f))
+            Pio0 | Pio1 | Pio2 ->
+                self.pio_catch_up()
+                return self.pio.read(pio_index(p.block), self.now, o, width).map_err(f -> pio_refusal(p, o, f))
             IoQspiBlock -> self.io_qspi.read(o, width)
             PadsQspi -> self.pads_qspi.read(o, width)
             OtpData | OtpDataRaw | OtpDataGuarded | OtpDataRawGuarded | OtpBlock -> return self.otp_read(p, o, width)
@@ -630,9 +639,9 @@ struct Rp2350
                 r
             Uart0 -> return self.uart_write(0, p, o, width, x)
             Uart1 -> return self.uart_write(1, p, o, width, x)
-            Pio0 -> return self.pio.write(0, self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
-            Pio1 -> return self.pio.write(1, self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
-            Pio2 -> return self.pio.write(2, self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
+            Pio0 | Pio1 | Pio2 ->
+                self.pio_catch_up()
+                return self.pio.write(pio_index(p.block), self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
             Sio ->
                 val r = self.sio.write(core, o, width, x)
                 if o & 0xFFC >= sio_reg.GPIO_OUT_OFFSET && o & 0xFFC <= sio_reg.GPIO_HI_OE_XOR_OFFSET then self.gpio_changed()
@@ -676,6 +685,7 @@ struct Rp2350
                 self.accessctrl.memory_restriction(core, o, width, x) match
                     Some(why) -> return Err(why)
                     None -> ()
+                self.pio_catch_up()
                 val r = self.accessctrl.write(core, o, width, x)
                 self.pio.ns = self.pio_ns()
                 r
@@ -929,6 +939,8 @@ struct Rp2350
         if asserted == 0 then return
         // USBCTRL is placed ungated (`BLOCKS`), so its reset is not found by the walk below.
         if asserted & resets_reg.RESET_USBCTRL_MASK != 0 then self.usb.reset_controller()
+        // The PIO blocks to this cycle first: a neighbour of one reset saw it running until now.
+        if asserted & (resets_reg.RESET_PIO0_MASK | resets_reg.RESET_PIO1_MASK | resets_reg.RESET_PIO2_MASK) != 0 then self.pio_catch_up()
         for p in BLOCKS
             if p.reset & asserted == 0 then continue
             p.block match
@@ -1052,6 +1064,9 @@ private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
 private xip_refusal(p: Placed, o: u32, f: XipFault) -> string = f match
     Access(e) -> refusal(p, o, e)
     Refused(why) -> s"${p.name} + 0x${hex(o)}: $why"
+
+// Which PIO block `b` is.
+private pio_index(b: Block) -> u32 = if b == Block.Pio0 then 0 elif b == Block.Pio1 then 1 else 2
 
 // Why a PIO block refused an access, as a person reads it.
 private pio_refusal(p: Placed, o: u32, f: PioFault) -> string = f match
