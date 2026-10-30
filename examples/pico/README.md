@@ -16,6 +16,8 @@ end to end:
 | `hello_world_serial.c` | pico-examples' `hello_world/serial` (commit 0d62f75), unchanged, **a flash image**: the boot ROM checks boot2's CRC, runs it, and boot2 enters the image | `Hello, world!` every second of guest time; XIP left reading the flash |
 | `flash_program.c` | pico-examples' `flash/program` (commit 0d62f75), unchanged, a flash image: a sector erased and a page programmed 256 KB in through the ROM's flash functions | every line, and the page in the flash array |
 | `hello_watchdog.c` | pico-examples' `watchdog/hello_watchdog` (commit 0d62f75), unchanged, a flash image: the watchdog's reset boots it again through the ROM | `Clean boot`, the five updates, then `Rebooted by Watchdog!` |
+| `sdk_tests/` | the Pico SDK's own `test/pico_float_test` programs (SDK 2.3.0), unchanged but for a first line naming their origin: `pico_float_test`, `pico_double_test`, `custom_float_funcs_test`, `custom_double_funcs_test`, flash images on the SDK's default implementation, the ROM's | `PASSED` |
+| `rom_crosscheck/` | benchtop's own: the chip's ROM against benchtop's ROM routines compiled into the firmware, bit for bit; a flash image and a UF2 for a real Pico (below) | every function's line with no mismatch, and `CROSSCHECK 71248 0 8c217b56` |
 
 ```sh
 ./benchtop run --board pico examples/pico/hello_serial.elf
@@ -43,6 +45,35 @@ The settings, all in `CMakeLists.txt`:
   CMakeLists build them, boot2 and all, and boot through the ROM;
 - `ssi_flash` links the SDK's own `src/rp2040/boot_stage2/boot2_w25q080.S` into its RAM image and
   calls it, as the SDK's `flash_enable_xip_via_boot2` calls its copy;
-- stdio on UART0, not USB;
+- stdio on UART0, not USB (`rom_crosscheck` has both);
 - otherwise the SDK's defaults: float, double, the bit operations and memcpy/memset from the boot ROM,
-  which benchtop runs as Raspberry Pi's own code, and the SIO's hardware divider.
+  which on benchtop is benchtop's own (`sh/sysl/benchtop/chip/rom/README.md`), and the SIO's hardware
+  divider;
+- `rom_crosscheck` links an archive `sysl build-c` makes from `rom_crosscheck/ours` (sysl 0.8.5 on
+  the PATH), benchtop's ROM routines compiled for the Cortex-M0+.
+
+## The ROM cross-check on a real Pico
+
+`rom_crosscheck` calls every soft float and double entry and the bit and memory functions of the
+chip's own boot ROM beside benchtop's ROM routines, compiled into the firmware, on a fixed, seeded set
+of inputs, and compares them bit for bit. On benchtop both sides are benchtop's, every case agrees,
+and the last line is `CROSSCHECK 71248 0 8c217b56` (`chip/pico_tests.sysl`). On a Pico the chip's ROM
+is Raspberry Pi's: the mismatches say where the two ROMs differ, and the CRC, of benchtop's answers
+alone, must again be `8c217b56`.
+
+To run it, with the Pico not yet connected:
+
+1. Hold BOOTSEL and plug the Pico in; it mounts as `RPI-RP2`.
+2. Copy `examples/pico/rom_crosscheck.uf2` onto it. The Pico reboots into the firmware.
+3. Open its USB serial port (`/dev/cu.usbmodem*` on a Mac, e.g. `screen /dev/cu.usbmodem1101 115200`).
+   The firmware waits for the port to open, runs once (a minute or so), then repeats its `CROSSCHECK`
+   line every five seconds. The same output is on UART0 (GPIO 0) at 115200 baud.
+4. Paste the whole output back.
+
+With the Pico plugged into this Mac, `picotool` does steps 1 and 2:
+
+```sh
+picotool load -x examples/pico/rom_crosscheck.uf2
+```
+
+(BOOTSEL held at plug-in the first time, since the Pico's current firmware may not answer picotool.)

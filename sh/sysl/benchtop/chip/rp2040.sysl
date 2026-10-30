@@ -45,6 +45,7 @@ import sh.sysl.rp2040.xip_ctrl as xip_ctrl_reg
 import sh.sysl.rp2040.xosc as xosc_reg
 import sysl.fmt.hex
 import sysl.math.min
+import sysl.text.char_from_u32
 
 // The RP2040 as its two Cortex-M0+ cores see it (RP2040 datasheet chapter 2, "System Description"):
 // the RP2350's models where the two chips share a block, at the RP2040's addresses and in its shape,
@@ -83,13 +84,15 @@ import sysl.math.min
 //   striped over banks 0–3 with banks 4 and 5 after them) and its non-striped aliases at 0x2100_0000
 //   (the board's, off the fast path).
 //
-// **The boot ROM** is Raspberry Pi's (`rom/README.md`): core 1's launch wait, core 0's boot path
-// (boot2 from flash) and every function and table the SDK looks up run as its own code. What it touches
-// that no other item built is here, stored: USB's DPRAM, where it keeps its variables; SYSCFG's NMI
-// masks; TBMAN's PLATFORM. **The watchdog's reset** takes down the PSM stages WDSEL selects
-// (`watchdog_fired`), and the board starts each reset core in the ROM again (`take_reset`); one whose
-// boot vector is `reset_usb_boot`'s ends the run with USB boot named (`take_fault`), as does a refused
-// access.
+// **The boot ROM** is benchtop's own (`rom/rp2040/`, written in sysl to work as the RP2040's does):
+// core 1's launch wait, core 0's boot path (boot2 from flash) and every function and table the SDK
+// looks up run as its code. What it reaches that no other item built is here: USB's DPRAM, memory,
+// where core 1 waits on its stack; and the ROM's doorbell (`rom_doorbell_refusal`), the store by which
+// it refuses by name what benchtop does not model, USB boot first. SYSCFG's NMI masks and TBMAN's
+// PLATFORM are stored for programs that read them. **The watchdog's reset** takes down the PSM stages
+// WDSEL selects (`watchdog_fired`), and the board starts each reset core in the ROM again
+// (`take_reset`); one whose boot vector is `reset_usb_boot`'s ends the run with USB boot named
+// (`take_fault`), as does a refused access.
 //
 // **Time is clk_sys cycles** (`now`), as on the RP2350 chip.
 
@@ -110,16 +113,21 @@ private const UART0_IRQ_RP2040: u32 = 20
 private const UART1_IRQ_RP2040: u32 = 21
 private const RTC_IRQ_RP2040: u32 = 25
 
-/** The boot ROM: Raspberry Pi's, for the B2 stepping (`rom/README.md`), all 16 KB of it mapped
+/** The boot ROM: benchtop's own (`rom/rp2040/`, built by its `image/build.sh`), all 16 KB of it mapped
  * read-only at 0.
  */
 const ROM_BYTES_RP2040: u32 = 16 * 1024
-private[chip] val ROM_RP2040 = embed("rom/bootrom-rp2040-b2.bin")
+private[chip] val ROM_RP2040 = embed("rom/rp2040/rom.bin")
 
-/** Where in the ROM its USB boot starts after a watchdog reboot (`_usb_boot_reboot_wrapper`), the PC
- * `reset_usb_boot` leaves in SCRATCH4's boot vector, Thumb bit set.
+/** Where in the ROM its USB boot starts after a watchdog reboot (`usb_boot_entry`, placed there by
+ * `rom.ld`), the PC `reset_usb_boot` leaves in SCRATCH7's boot vector, Thumb bit set.
  */
-const ROM_USB_BOOT_RP2040: u32 = 0x1B89
+const ROM_USB_BOOT_RP2040: u32 = 0x201
+
+/** The ROM's doorbell (`rom/rp2040/image/boot.sysl`): its last word, a store to which is the ROM
+ * refusing by name what benchtop does not model, the word stored saying what.
+ */
+const ROM_DOORBELL_RP2040: u32 = 0x3FFC
 
 /** The XIP address space, through the SSI; XIP_CTRL, the cache as SRAM and the SSI follow it. */
 const XIP_BASE_RP2040: u32 = 0x10000000
@@ -865,6 +873,7 @@ impl ArmChip for Rp2040
         self.read(core, a, width)
 
     store(*self, core: u32, a: u32, width: u32, x: u32) -> Result[unit, string]
+        if a == ROM_DOORBELL_RP2040 && width == 4 then return Err(rom_doorbell_refusal(x))
         if a < ROM_BYTES_RP2040 then return Err(s"0x${hex(a, 8)} is the boot ROM, which is read-only: what a write there does on silicon is not modelled")
         if a >= XIP_BASE_RP2040 && a < XIP_END_RP2040 then return self.xip_store(a, width, x)
         self.write(core, a, width, x)
@@ -981,6 +990,24 @@ rom_read_rp2040(at: u32, width: u32) -> u32
 
 /** The little-endian word at `at` in the ROM. */
 rom_word_rp2040(at: u32) -> u32 = rom_read_rp2040(at, 4)
+
+/** What the ROM's doorbell refuses, by the word it was rung with (`rom/rp2040/image/boot.sysl`'s
+ * `BELL_*`).
+ */
+rom_doorbell_refusal(why: u32) -> string
+    val usb = "the RP2040's USB device controller is not on the chip yet"
+    if why == 1 then return s"the boot ROM's USB boot, entered because BOOTSEL is held: $usb"
+    if why == 2 then return s"the boot ROM's USB boot, entered because the flash holds no valid boot2 (its CRC32 does not match): $usb"
+    if why == 3 then return s"the boot ROM's USB boot, entered from reset_usb_boot's watchdog reboot: $usb"
+    val code = why & 0xFFFF
+    if why >> 16 == 1
+        val name = s"${char_from_u32(code & 0xFF).unwrap_or('?')}${char_from_u32(code >> 8).unwrap_or('?')}"
+        return s"the boot ROM's table entry '$name' (code 0x${hex(code, 4)}), which the RP2040's ROM has, is not provided by benchtop's ROM"
+    if why >> 16 == 2
+        val table = if code >= 0x100 then "soft double" else "soft float"
+        return s"the boot ROM's $table table entry at 0x${hex(code & 0xFF, 2)} (the comparison that answers in the flags) is not provided by benchtop's ROM"
+    if why >> 16 == 3 then return s"exception ${code} taken through the boot ROM's own vector table (VTOR 0): the ROM has no handler for it"
+    s"the boot ROM rang its doorbell with 0x${hex(why, 8)}, which names nothing"
 
 // An access to the XIP address space that reaches nothing: XIP_SRAM while the cache is not SRAM
 // (`closed` says why), or an address between the blocks.

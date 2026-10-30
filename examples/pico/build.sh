@@ -8,7 +8,10 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cmake -S . -B "$work" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$work"
-for prog in hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash hello_world_serial rom_funcs flash_program hello_watchdog; do
+for prog in hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash hello_world_serial rom_funcs flash_program hello_watchdog rom_crosscheck \
+        pico_float_test pico_double_test custom_float_funcs_test custom_double_funcs_test; do
     cp "$work/$prog.elf" "$prog.elf"
 done
 cp "$work/blink.uf2" blink.uf2
+cp "$work/rom_crosscheck.uf2" rom_crosscheck.uf2
+shasum -a 256 rom_crosscheck.uf2
