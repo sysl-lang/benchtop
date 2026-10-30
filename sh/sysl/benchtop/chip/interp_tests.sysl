@@ -1,0 +1,53 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.v6m as arm
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.rp2350.sio as sio_reg
+import sysl.fmt.hex
+
+// The SIO's interpolators and doorbells from the M33s: Thumb loads and stores under both executors, the
+// doorbell reaching the other core's NVIC as SIO_IRQ_BELL, and the SDK's hardware_interp and multicore
+// doorbells end to end (examples/pico2/interp.c).
+
+private val ARM_INTERP = embed("../../../../examples/pico2/interp.elf")
+
+// SIO_IRQ_BELL (`intctrl.h`).
+private const BELL: u32 = 26
+
+private pending(c: *arm.Cpu, irq: u32) -> bool = c.pending[arm.nvic_word(arm.IRQ0 + irq)] & arm.nvic_bit(arm.IRQ0 + irq) != 0
+
+@test("under both executors core 0's stores and loads reach its interpolator and core 1's doorbell, and the chip raises SIO_IRQ_BELL in core 1 only")
+arm_interp_doorbell_executors()
+    for exec in [&arm.run_match, &arm.run_threaded]
+        // str r1, [r0]; str r3, [r2]; ldr r5, [r4]; ldr r6, [r4]; ldr r7, [r0]
+        val code = [0x6001u16, 0x6013, 0x6825, 0x6826, 0x6807]
+        val regs = [sio_reg.BASE + sio_reg.DOORBELL_OUT_SET_OFFSET, 0x20, sio_reg.BASE + sio_reg.INTERP0_BASE0_OFFSET, 7,
+            sio_reg.BASE + sio_reg.INTERP0_POP_LANE0_OFFSET]
+        val b = on_core0(exec, code, regs)
+        val c = &b.cores[0]
+        assert(c.stop == Stop.Breakpoint && c.retired == 5 && b.why.is_empty(), s"${c.stop} at 0x${hex(c.stop_at, 8)}: ${b.why}")
+        // INTERP0's lane 0 at reset keeps bit 0 only (MASK_MSB 0): BASE0 + 0, then BASE0 + bit 0 of 7.
+        assert(c.r[5] == 7 && c.r[6] == 8 && c.r[7] == 0x20, s"r5 ${c.r[5]} r6 ${c.r[6]} r7 ${c.r[7]}")
+        assert(b.chip.sio.read(1, sio_reg.INTERP0_ACCUM0_OFFSET, 4, 0).unwrap() == 0, "core 1's INTERP0 is untouched")
+        b.chip.signal(&b.cores[1])
+        b.chip.signal(&b.cores[0])
+        assert(pending(&b.cores[1], BELL) && !pending(&b.cores[0], BELL))
+
+@test("the SDK's hardware_interp in every mode and the multicore doorbells, on both cores of a Pico 2: each line as the datasheet computes it")
+arm_interp_program()
+    val text = run_to_breakpoint(ARM_INTERP, 200)
+    val want = "count by 7: 7 14 21 28 35\r\n" +
+        "blend 500..1000: 500 625 750 875 998 alpha 255\r\n" +
+        "signed blend -1000..1000: -1000 -500 0 500 992\r\n" +
+        "clamp -10..10: -10 -10 0 10 10\r\n" +
+        "rotate 31: 00000007 force 20001002 raw 2 add_raw 20001123\r\n" +
+        "cross result: full 122 accum 22 11, cross input: lane 1 42\r\n" +
+        "restored: base0 10 accum0 22\r\n" +
+        "core 1 sees its own INTERP0: base2 0 accum1 0\r\n" +
+        "both counting: core 0 0 wrong, ends 80; core 1 0 wrong, ends 48\r\n" +
+        "doorbell 1 on core 0: set 1, cleared 1\r\n" +
+        "core 0 rang itself: 0x08\r\n" +
+        "core 1 heard 0x20 and rang back 0x80\r\n" +
+        "pending: core 0 0x00 core 1 0x00\r\n"
+    assert(text == want, text)

@@ -1,0 +1,91 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.rp2350.sio as sr
+
+// The RP2350 SIO's interpolators and doorbells as each core sees them (`hardware/regs/sio.h`: INTERP0 at
+// 0x080, INTERP1 at 0x0C0, DOORBELL_OUT_SET/CLR and DOORBELL_IN_SET/CLR at 0x180–0x18C).
+
+private const WHOLE: u32 = 31 << sr.INTERP0_CTRL_LANE0_MASK_MSB_SHIFT
+
+@test("SIO: each core has its own INTERP0 and INTERP1; both cores count on theirs at once, interleaved, without touching the other's")
+rp2350_sio_interp_per_core()
+    var s = sio()
+    for k in 0u32..<2
+        s.write(k, sr.INTERP0_CTRL_LANE0_OFFSET, 4, WHOLE).unwrap()
+        s.write(k, sr.INTERP1_CTRL_LANE0_OFFSET, 4, WHOLE).unwrap()
+    s.write(0, sr.INTERP0_BASE0_OFFSET, 4, 5).unwrap()
+    s.write(1, sr.INTERP0_BASE0_OFFSET, 4, 3).unwrap()
+    s.write(0, sr.INTERP1_BASE0_OFFSET, 4, 100).unwrap()
+    s.write(1, sr.INTERP1_BASE0_OFFSET, 4, 1000).unwrap()
+    for n in 1u32..<9
+        assert(s.read(0, sr.INTERP0_POP_LANE0_OFFSET, 4, 0).unwrap() == 5 * n, "core 0's INTERP0")
+        assert(s.read(1, sr.INTERP0_POP_LANE0_OFFSET, 4, 0).unwrap() == 3 * n, "core 1's INTERP0")
+        assert(s.read(0, sr.INTERP1_POP_LANE0_OFFSET, 4, 0).unwrap() == 100 * n, "core 0's INTERP1")
+        if n % 2 == 0 then assert(s.read(1, sr.INTERP1_POP_LANE0_OFFSET, 4, 0).unwrap() == 1000 * (n / 2), "core 1's INTERP1, half as often")
+    assert(s.read(0, sr.INTERP0_ACCUM0_OFFSET, 4, 0).unwrap() == 40 && s.read(1, sr.INTERP0_ACCUM0_OFFSET, 4, 0).unwrap() == 24)
+    assert(s.read(0, sr.INTERP1_ACCUM0_OFFSET, 4, 0).unwrap() == 800 && s.read(1, sr.INTERP1_ACCUM0_OFFSET, 4, 0).unwrap() == 4000)
+    // INTERP0 blends and INTERP1 clamps, on both cores; neither the other.
+    for k in 0u32..<2
+        s.write(k, sr.INTERP0_CTRL_LANE0_OFFSET, 4, 0xFFFFFFFF).unwrap()
+        s.write(k, sr.INTERP1_CTRL_LANE0_OFFSET, 4, 0xFFFFFFFF).unwrap()
+        assert(s.read(k, sr.INTERP0_CTRL_LANE0_OFFSET, 4, 0).unwrap() & (sr.INTERP0_CTRL_LANE0_BLEND_MASK | sr.INTERP1_CTRL_LANE0_CLAMP_MASK) == sr.INTERP0_CTRL_LANE0_BLEND_MASK)
+        assert(s.read(k, sr.INTERP1_CTRL_LANE0_OFFSET, 4, 0).unwrap() & (sr.INTERP0_CTRL_LANE0_BLEND_MASK | sr.INTERP1_CTRL_LANE0_CLAMP_MASK) == sr.INTERP1_CTRL_LANE0_CLAMP_MASK)
+    // The RP2350's SHIFT rotates.
+    s.write(0, sr.INTERP1_CTRL_LANE1_OFFSET, 4, WHOLE | 31).unwrap()
+    s.write(0, sr.INTERP1_ACCUM1_OFFSET, 4, 0x80000003).unwrap()
+    assert(s.read(0, sr.INTERP1_ACCUM1_ADD_OFFSET, 4, 0).unwrap() == 7)
+    s.reset()
+    for k in 0u32..<2
+        for o in 0u32..<32 do assert(s.read(k, sr.INTERP0_ACCUM0_OFFSET + 4 * o, 4, 0).unwrap() == 0, "reset")
+
+@test("SIO interpolator access: a byte or halfword read takes its lane of the word, and of a POP still pops; a narrow write is refused")
+rp2350_sio_interp_widths()
+    var s = sio()
+    s.write(1, sr.INTERP0_CTRL_LANE0_OFFSET, 4, WHOLE).unwrap()
+    s.write(1, sr.INTERP0_BASE0_OFFSET, 4, 0x01020304).unwrap()
+    assert(s.read(1, sr.INTERP0_PEEK_LANE0_OFFSET + 1, 1, 0).unwrap() == 0x03 && s.read(1, sr.INTERP0_PEEK_LANE0_OFFSET + 2, 2, 0).unwrap() == 0x0102)
+    assert(s.read(1, sr.INTERP0_POP_LANE0_OFFSET + 3, 1, 0).unwrap() == 0x01)
+    assert(s.read(1, sr.INTERP0_ACCUM0_OFFSET, 4, 0).unwrap() == 0x01020304, "the byte read popped")
+    assert(s.write(1, sr.INTERP0_BASE0_OFFSET, 1, 9).is_err() && s.write(1, sr.INTERP0_BASE0_OFFSET + 2, 2, 9).is_err())
+    assert(s.read(1, sr.INTERP0_BASE0_OFFSET + 1, 2, 0).is_err(), "unaligned")
+    assert(s.read(1, sr.INTERP0_BASE0_OFFSET, 4, 0).unwrap() == 0x01020304)
+
+@test("SIO doorbells: OUT sets and clears the other core's DOORBELL_IN, IN this core's; only bits 7:0; SIO_IRQ_BELL while any bit is set")
+rp2350_sio_doorbells()
+    var s = sio()
+    for k in 0u32..<2
+        assert(!s.bell_irq(k))
+        for o in [sr.DOORBELL_OUT_SET_OFFSET, sr.DOORBELL_OUT_CLR_OFFSET, sr.DOORBELL_IN_SET_OFFSET, sr.DOORBELL_IN_CLR_OFFSET]
+            assert(s.read(k, o, 4, 0).unwrap() == 0, "reset")
+    s.write(0, sr.DOORBELL_OUT_SET_OFFSET, 4, 0x81).unwrap()
+    assert(s.bell_irq(1) && !s.bell_irq(0), "core 0 rang core 1")
+    assert(s.read(1, sr.DOORBELL_IN_SET_OFFSET, 4, 0).unwrap() == 0x81 && s.read(1, sr.DOORBELL_IN_CLR_OFFSET, 4, 0).unwrap() == 0x81)
+    assert(s.read(0, sr.DOORBELL_OUT_SET_OFFSET, 4, 0).unwrap() == 0x81 && s.read(0, sr.DOORBELL_OUT_CLR_OFFSET, 4, 0).unwrap() == 0x81, "core 0 sees what it posted")
+    assert(s.read(0, sr.DOORBELL_IN_SET_OFFSET, 4, 0).unwrap() == 0 && s.read(1, sr.DOORBELL_OUT_SET_OFFSET, 4, 0).unwrap() == 0)
+    // Bits above 7 do not exist; a set is an OR.
+    s.write(0, sr.DOORBELL_OUT_SET_OFFSET, 4, 0xFFFFFF00).unwrap()
+    s.write(0, sr.DOORBELL_OUT_SET_OFFSET, 4, 0x02).unwrap()
+    assert(s.read(1, sr.DOORBELL_IN_SET_OFFSET, 4, 0).unwrap() == 0x83)
+    // Core 1 acknowledges one at a time; the interrupt stays up until the last.
+    s.write(1, sr.DOORBELL_IN_CLR_OFFSET, 4, 0x01).unwrap()
+    assert(s.read(1, sr.DOORBELL_IN_CLR_OFFSET, 4, 0).unwrap() == 0x82 && s.bell_irq(1))
+    s.write(1, sr.DOORBELL_IN_CLR_OFFSET, 4, 0xFFFFFF02).unwrap()
+    assert(s.read(1, sr.DOORBELL_IN_CLR_OFFSET, 4, 0).unwrap() == 0x80 && s.bell_irq(1))
+    // Core 0 withdraws the last through OUT_CLR.
+    s.write(0, sr.DOORBELL_OUT_CLR_OFFSET, 4, 0x80).unwrap()
+    assert(s.read(1, sr.DOORBELL_IN_SET_OFFSET, 4, 0).unwrap() == 0 && !s.bell_irq(1))
+    // A core rings itself through IN_SET; both ring each other at once.
+    s.write(0, sr.DOORBELL_IN_SET_OFFSET, 4, 0x08).unwrap()
+    assert(s.bell_irq(0) && !s.bell_irq(1))
+    s.write(1, sr.DOORBELL_OUT_SET_OFFSET, 4, 0x10).unwrap()
+    s.write(0, sr.DOORBELL_OUT_SET_OFFSET, 4, 0x20).unwrap()
+    assert(s.read(0, sr.DOORBELL_IN_SET_OFFSET, 4, 0).unwrap() == 0x18 && s.read(1, sr.DOORBELL_IN_SET_OFFSET, 4, 0).unwrap() == 0x20)
+    // A clear of a bit not set changes nothing; a write to OUT_CLR does not touch the writer's own.
+    s.write(1, sr.DOORBELL_OUT_CLR_OFFSET, 4, 0x20).unwrap()
+    assert(s.read(1, sr.DOORBELL_IN_SET_OFFSET, 4, 0).unwrap() == 0x20 && s.read(0, sr.DOORBELL_IN_SET_OFFSET, 4, 0).unwrap() == 0x18)
+    // A byte read takes its lane; a narrow write is refused.
+    assert(s.read(0, sr.DOORBELL_IN_SET_OFFSET, 1, 0).unwrap() == 0x18 && s.read(0, sr.DOORBELL_IN_SET_OFFSET + 1, 1, 0).unwrap() == 0)
+    assert(s.write(0, sr.DOORBELL_OUT_SET_OFFSET, 1, 1).is_err())
+    s.reset()
+    assert(!s.bell_irq(0) && !s.bell_irq(1) && s.read(0, sr.DOORBELL_IN_SET_OFFSET, 4, 0).unwrap() == 0)

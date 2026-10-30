@@ -1,14 +1,14 @@
 # RP2040 peripheral models
 
-Reusable, instance-owned models for RESETS, TIMER, the watchdog's tick generator and the SIO
-integer divider. They import the SVD-generated `github.com/sysl-lang/rp2040` register constants. No
+Reusable, instance-owned models for RESETS, TIMER, the watchdog's tick generator, the SIO
+integer divider and the SIO interpolators (the last shared with the RP2350's SIO). They import the SVD-generated `github.com/sysl-lang/rp2040` register constants. No
 model imports a CPU module, uses global device state, starts a host thread, or reads the host clock.
 
 RESETS, TIMER and the watchdog are library peripherals (`rp-resets`, `rp-timer`, `rp-watchdog`),
 placed by `mcus/rp2040.hocon` and run by `sh.sysl.benchtop.virt` (`virt/rp.sysl`) on any runnable
 board whose mcu places them. The `rp2040` mcu itself does not run: its ROM and SIO are not
 modelled, and the divider is used only where an SIO is. GPIO/pads, UART, clock generators, the watchdog
-counter, DMA, SPI, I2C, PWM, PIO, USB, interpolators, flash and boot ROM are separate work.
+counter, DMA, SPI, I2C, PWM, PIO, USB, flash and boot ROM are separate work.
 
 ## Machine integration contract
 
@@ -42,6 +42,11 @@ state.
   divider's input clocks with `advance(cycles)`. `remaining` is the distance to completion, 0
   when ready. Every operand write restarts eight clocks; result writes cancel pending work.
   Read the remainder before the quotient when preserving DIRTY for SDK context-save logic.
+- **Interpolators:** four `Interp` instances, `interp(n, rotate)` for each processor's INTERPn.
+  Dispatch the SIO offsets 0x80–0xBC (INTERP0) and 0xC0–0xFC (INTERP1) of the requesting
+  processor, relative to the interpolator and word-aligned; take a byte or halfword read's lane
+  of the word. `rotate` is false on the RP2040 (SHIFT is a logical shift) and true on the RP2350
+  (a rotate); `peripheral/rp2350/sio.sysl` places them so.
 
 The peripheral methods do not assert CPU pending bits themselves. In particular, the machine must
 resample level IRQs at scheduling/exception boundaries as well as after register writes.
