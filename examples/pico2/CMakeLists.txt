@@ -9,16 +9,21 @@ project(benchtop_pico2 C CXX ASM)
 
 pico_sdk_init()
 
+# Every program is entered at `_entry_point` without going back through the boot ROM: crt0 sets up
+# the RCP and MSPLIM itself and vectors through the image's own table. benchtop does not run the
+# Raspberry Pi ROM's boot path.
+function(benchtop_program target source type)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} pico_stdlib)
+    pico_set_binary_type(${target} ${type})
+    target_compile_definitions(${target} PRIVATE PICO_CRT0_DEBUG_ENTRY_RESETS_VIA_BOOTROM=0)
+    pico_enable_stdio_uart(${target} 1)
+    pico_enable_stdio_usb(${target} 0)
+endfunction()
+
+# RAM images: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
 foreach(prog hello_serial blink rcp gpioc stack_limit tt clock_report)
-    add_executable(${prog} ${prog}.c)
-    target_link_libraries(${prog} pico_stdlib)
-    # A RAM image: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
-    pico_set_binary_type(${prog} no_flash)
-    # Entered at `_entry_point` without going back through the boot ROM: crt0 sets up the RCP and
-    # MSPLIM itself and vectors through the image's own table. benchtop does not run the ROM yet.
-    target_compile_definitions(${prog} PRIVATE PICO_CRT0_DEBUG_ENTRY_RESETS_VIA_BOOTROM=0)
-    pico_enable_stdio_uart(${prog} 1)
-    pico_enable_stdio_usb(${prog} 0)
+    benchtop_program(${prog} ${prog}.c no_flash)
 endforeach()
 
 # rcp.c uses the redundancy coprocessor's header directly.
@@ -26,3 +31,17 @@ target_link_libraries(rcp hardware_rcp)
 target_link_libraries(stack_limit hardware_exception)
 # ACLE's TTA and TTAT intrinsics are only declared for code built for the Security Extension.
 target_compile_options(tt PRIVATE -mcmse)
+
+# Flash images, the SDK's default: the ELF's segments are written into the flash behind XIP_BASE.
+foreach(prog hello_serial blink)
+    benchtop_program(${prog}_flash ${prog}.c default)
+endforeach()
+pico_add_uf2_output(hello_serial_flash)
+
+benchtop_program(qmi_flash qmi_flash.c default)
+target_link_libraries(qmi_flash hardware_xip_cache)
+
+# The whole program in the XIP cache's 16 KB, as the SDK's own `pico_xip_sram_test` is built.
+benchtop_program(xip_sram xip_sram.c xip_ram)
+pico_minimize_runtime(xip_sram INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
+target_compile_definitions(xip_sram PRIVATE PICO_HEAP_SIZE=0x200)

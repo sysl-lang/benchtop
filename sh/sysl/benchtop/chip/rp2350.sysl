@@ -2,11 +2,16 @@ module sh.sysl.benchtop.chip
 
 import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Resets}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
-import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, Pads, Pin, Pll, Powman, Psm, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xosc, psm_stage_name}
+import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, qspi_flash}
+import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, Pads, Pin, Pll, Powman, Psm, Qmi, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
+import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_MAINTENANCE_BASE, XIP_WINDOWS_END, read_xip, xip_aux_read, xip_aux_write, xip_target}
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
 import sh.sysl.rp2350.bootram as bootram_reg
+import sh.sysl.rp2350.qmi as qmi_reg
+import sh.sysl.rp2350.xip_aux as xip_aux_reg
+import sh.sysl.rp2350.xip_ctrl as xip_ctrl_reg
 import sh.sysl.rp2350.clocks as clocks_reg
 import sh.sysl.rp2350.io_bank0 as io_reg
 import sh.sysl.rp2350.pads_bank0 as pads_reg
@@ -88,6 +93,9 @@ enum Block
     SysCfg
     Powman
     AccessCtrl
+    XipCtrl
+    QmiBlock
+    XipAux
 
 /** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
 struct Placed
@@ -97,7 +105,7 @@ struct Placed
     reset: u32
 
 /** Every block the chip runs, with the SVD's base addresses. */
-val BLOCKS: [22]Placed = [
+val BLOCKS: [25]Placed = [
     Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
     Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -122,6 +130,10 @@ val BLOCKS: [22]Placed = [
     Placed(Block.SysCfg, syscfg_reg.BASE, "SYSCFG", 0),
     Placed(Block.Powman, powman_reg.BASE, "POWMAN", 0),
     Placed(Block.AccessCtrl, accessctrl_reg.BASE, "ACCESSCTRL", 0),
+    // XIP_CTRL and the QMI have no RESETS bit; XIP_AUX is on the AHB, with no atomic aliases.
+    Placed(Block.XipCtrl, xip_ctrl_reg.BASE, "XIP_CTRL", 0),
+    Placed(Block.QmiBlock, qmi_reg.BASE, "QMI", 0),
+    Placed(Block.XipAux, xip_aux_reg.BASE, "XIP_AUX", 0),
 ]
 
 /** The block whose window holds `a`, with the offset into it. */
@@ -164,6 +176,13 @@ struct Rp2350
     syscfg: SysCfg
     powman: Powman
     accessctrl: AccessCtrl
+    xip: Xip
+    qmi: Qmi
+    // The flash on QSPI chip select 0, the board's part, whose array the board connects.
+    flash: QspiFlash
+    // Something a board mirrors in its memory map has changed: the flash's contents, direct mode, or
+    // which XIP_SRAM lines are pinned (`take_xip_changed`).
+    xip_changed: bool
     rom: RomWait
     rcp: Rcp
     // Core 1 has been put in reset by PSM since the board last asked (`take_core1_reset`).
@@ -175,10 +194,21 @@ struct Rp2350
     xosc_rest: u64
     rosc_rest: u64
 
-    /** Power-on, with core 1 in the boot ROM. */
+    /** Power-on, with core 1 in the boot ROM; the flash keeps its array, as the board's part. */
     reset(*self)
+        val bytes = self.flash.bytes
+        val size = self.flash.size
         val fresh = rp2350()
         *self = fresh
+        if size != 0 then self.flash.connect(bytes, size)
+
+    /** Whether the flash's contents, direct mode or the pinned XIP_SRAM lines have changed since the last
+     * call, for a board that mirrors them.
+     */
+    take_xip_changed(*self) -> bool
+        val was = self.xip_changed
+        self.xip_changed = false
+        was
 
     /** What each clock source runs at now; the PLLs take the crystal as their reference. */
     sources(self) -> Sources
@@ -240,6 +270,7 @@ struct Rp2350
 
     /** A read of `width` bytes at `a` by core `core`: the value, or why the chip refuses it. */
     read(*self, core: u32, a: u32, width: u32) -> Result[u32, string]
+        if a >= XIP_BASE && a < XIP_WINDOWS_END then return self.xip_read(a, width)
         val (p, o) = self.placed(a)?
         val got = p.block match
             Resets -> self.resets.read(o, width)
@@ -264,10 +295,14 @@ struct Rp2350
             SysCfg -> self.syscfg.read(o, width)
             Powman -> self.powman.read(o, width)
             AccessCtrl -> self.accessctrl.read(o, width)
+            XipCtrl -> return self.xip.read(o, width, &self.qmi, &self.flash).map_err(f -> xip_refusal(p, o, f))
+            QmiBlock -> return self.qmi.read(o, width, &self.flash).map_err(f -> xip_refusal(p, o, f))
+            XipAux -> return xip_aux_read(&self.xip, &self.qmi, &self.flash, o, width).map_err(f -> xip_refusal(p, o, f))
         got.map_err(e -> refusal(p, o, e))
 
     /** A write of `width` bytes at `a` by core `core`, or why the chip refuses it. */
     write(*self, core: u32, a: u32, width: u32, x: u32) -> Result[unit, string]
+        if a >= XIP_BASE && a < XIP_WINDOWS_END then return self.xip_write(a)
         val (p, o) = self.placed(a)?
         val got = p.block match
             Resets ->
@@ -323,6 +358,13 @@ struct Rp2350
             SysCfg -> self.syscfg.write(o, width, x)
             Powman -> self.powman.write(o, width, x)
             AccessCtrl -> self.accessctrl.write(core, o, width, x)
+            XipCtrl | QmiBlock | XipAux ->
+                val r = p.block match
+                    XipCtrl -> self.xip.write(o, width, x, &self.qmi, &self.flash)
+                    QmiBlock -> self.qmi.write(o, width, x, &self.flash)
+                    _ -> xip_aux_write(&self.qmi, &self.flash, o, width, x)
+                self.xip_changed = true
+                return r.map_err(f -> xip_refusal(p, o, f))
         got.map_err(e -> refusal(p, o, e))
 
     // PROC1 has gone into reset or come out of it, between the stages held `before` and `after`. Going
@@ -344,6 +386,22 @@ struct Rp2350
         val held = self.core1_reset
         self.core1_reset = false
         held
+
+    // A read of the XIP address space outside XIP_SRAM, which the board runs: the flash through a
+    // window, or why it is a bus error.
+    private xip_read(self, a: u32, width: u32) -> Result[u32, string]
+        if a >= XIP_MAINTENANCE_BASE && a < XIP_MAINTENANCE_BASE + 0x04000000 then return Err(s"0x${hex(a, 8)}: the cache maintenance window takes writes only")
+        read_xip(self.xip.ctrl, self.qmi, &self.flash, a, width).map_err(f -> xip_why(f))
+
+    // A write to the XIP address space: a cache maintenance operation, or one through a flash window,
+    // which XIP_CTRL.WRITABLE_M0 clear downgrades to a read, with no effect.
+    private xip_write(*self, a: u32) -> Result[unit, string]
+        if a >= XIP_MAINTENANCE_BASE && a < XIP_MAINTENANCE_BASE + 0x04000000
+            self.xip_changed = true
+            return self.xip.maintain(a - XIP_MAINTENANCE_BASE).map_err(f -> xip_why(f))
+        xip_target(self.xip.ctrl, self.qmi, a).map_err(f -> xip_why(f))?
+        if self.xip.ctrl & xip_ctrl_reg.CTRL_WRITABLE_M0_MASK == 0 then return Ok(())
+        Err(s"0x${hex(a, 8)}: a write through XIP with XIP_CTRL.WRITABLE_M0 set becomes a QMI write command, which benchtop does not send (the Pico 2's flash is not written through XIP)")
 
     // The block an access lands in, refused where none is there, or where RESETS holds it: on silicon
     // that access hangs the bus.
@@ -444,6 +502,7 @@ rp2350() -> Rp2350 =
     Rp2350(rp.rp2350_resets(), rp.clocks(), rp.xosc(), rp.pll(), rp.pll(), rp.ticks(), [rp.timer(), rp.timer()], rp.watchdog(),
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(),
+        rp.xip(), rp.qmi(), qspi_flash(), false,
         RomWait(true, 0, [0; 3], None), rcp(), false, 0, 0, 0, 0)
 
 private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
@@ -451,6 +510,15 @@ private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
         Some(y) -> Some(min(x, y))
         None -> a
     None -> b
+
+// Why the XIP or QMI blocks refused an access, as a person reads it.
+private xip_refusal(p: Placed, o: u32, f: XipFault) -> string = f match
+    Access(e) -> refusal(p, o, e)
+    Refused(why) -> s"${p.name} + 0x${hex(o)}: $why"
+
+private xip_why(f: XipFault) -> string = f match
+    Access(_) -> "XIP: not an access width the window takes"
+    Refused(why) -> s"XIP: $why"
 
 // Why a block refused an access, as a person reads it.
 private refusal(p: Placed, o: u32, e: AccessError) -> string

@@ -1,0 +1,161 @@
+module sh.sysl.benchtop.parts.qspi_flash
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// A frame: `out` clocked between select and deselect, answering what came back.
+private frame(f: *QspiFlash, out: []const u8) -> Buf[u8]
+    var back: Buf[u8] = buf()
+    f.select()
+    for b in out do back.push(f.exchange(b).unwrap())
+    f.deselect().unwrap()
+    back
+
+private flash_over(array: *[8192]u8) -> QspiFlash
+    var f = qspi_flash()
+    f.connect(&array[0], 8192)
+    f
+
+@test("the flash answers its JEDEC ID, the 90h and ABh device IDs and the 64-bit unique ID after four dummy bytes")
+flash_ids()
+    var array = [0xFFu8; 8192]
+    var f = flash_over(&array)
+    val id = frame(&f, [0x9F, 0, 0, 0, 0])
+    assert(id[1] == 0xEF && id[2] == 0x40 && id[3] == 0x16 && id[4] == 0xFF)
+    val md = frame(&f, [0x90, 0, 0, 0, 0, 0, 0])
+    assert(md[4] == 0xEF && md[5] == 0x15 && md[6] == 0xEF)
+    assert(frame(&f, [0xAB, 0, 0, 0, 0])[4] == 0x15)
+    val uid = frame(&f, [0x4B, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    for k in 0..<8 do assert(uid[5 + k] == UNIQUE_ID[k], s"uid byte $k")
+    assert(uid[4] == 0xFF && uid[13] == 0xFF, "dummy bytes and past the ID drive nothing")
+
+@test("program and erase need WEL, which every completed write clears; a program only clears bits and wraps in its page")
+flash_program_erase()
+    var array = [0xFFu8; 8192]
+    var f = flash_over(&array)
+    // Without WEL a program does nothing.
+    frame(&f, [0x02, 0, 0x10, 0x00, 0x12])
+    assert(array[0x1000] == 0xFF && f.take_changed().is_none())
+    frame(&f, [0x06])
+    assert(frame(&f, [0x05, 0])[1] == 0x02, "WEL reads in status register 1")
+    frame(&f, [0x02, 0, 0x10, 0xFE, 0x12, 0x34, 0x56])
+    assert(array[0x10FE] == 0x12 && array[0x10FF] == 0x34 && array[0x1000] == 0x56, "the third byte wraps to the page's start")
+    assert(frame(&f, [0x05, 0])[1] == 0, "the program cleared WEL and BUSY never shows")
+    assert(f.take_changed().unwrap() == (0x1000u32, 256u32) && f.take_changed().is_none())
+    // A second program ANDs.
+    frame(&f, [0x06])
+    frame(&f, [0x02, 0, 0x10, 0xFE, 0xF0])
+    assert(array[0x10FE] == 0x10)
+    // A 4 KB sector erase, addressed anywhere in it.
+    frame(&f, [0x06])
+    frame(&f, [0x20, 0, 0x10, 0x33])
+    assert(array[0x10FE] == 0xFF && array[0x1000] == 0xFF)
+    assert(f.take_changed().unwrap() == (0x1000u32, 4096u32))
+    // An erase cut short (three address bytes not all sent) does nothing, and WEL stays.
+    array[0] = 0
+    frame(&f, [0x06])
+    frame(&f, [0x20, 0, 0])
+    assert(array[0] == 0 && frame(&f, [0x05, 0])[1] == 0x02)
+    frame(&f, [0xC7])
+    assert(array[0] == 0xFF, "a chip erase")
+    frame(&f, [0x04])
+    assert(frame(&f, [0x05, 0])[1] == 0, "04h clears WEL")
+
+@test("at the array's edges: a program of its last page, 32 KB and 64 KB erases clamped to a smaller array, and an erase while powered down ignored")
+flash_edges()
+    var array = [0u8; 8192]
+    var f = flash_over(&array)
+    frame(&f, [0x06])
+    frame(&f, [0x52, 0, 0x1F, 0xFF])
+    assert(array[0] == 0xFF && array[8191] == 0xFF, "a 32 KB block covers the whole 8 KB array")
+    assert(f.take_changed().unwrap() == (0u32, 8192u32))
+    for i in 0..<8192 do array[i] = 0
+    frame(&f, [0x06])
+    frame(&f, [0xD8, 0, 0, 0])
+    assert(array[4096] == 0xFF && array[8191] == 0xFF)
+    frame(&f, [0x06])
+    frame(&f, [0x02, 0, 0x1F, 0x00, 0x11, 0x22])
+    assert(array[0x1F00] == 0x11 && array[0x1F01] == 0x22 && array[0x1EFF] == 0xFF)
+    frame(&f, [0x06])
+    // An address past the array wraps to it, as the device ignores the bits above its size.
+    frame(&f, [0x02, 0x3F, 0xFF, 0xFF, 0x33])
+    assert(array[0x1FFF] == 0x33)
+    frame(&f, [0x06])
+    frame(&f, [0xB9])
+    frame(&f, [0x20, 0, 0, 0])
+    assert(array[0x1F00] == 0x11, "asleep, the erase is not heard")
+    assert(f.take_changed().unwrap() == (0u32, 8192u32), "the changes since the last ask, merged")
+
+@test("reads: 03h from the address, 0Bh after a dummy byte, EBh after the mode byte and two dummies, wrapping at the array's end")
+flash_reads()
+    var array = [0u8; 8192]
+    for i in 0..<8192 do array[i] = u8(i & 0xFF)
+    array[8191] = 0xAA
+    var f = flash_over(&array)
+    val slow = frame(&f, [0x03, 0, 0x01, 0x05, 0, 0])
+    assert(slow[4] == 0x05 && slow[5] == 0x06)
+    val fast = frame(&f, [0x0B, 0, 0, 0x10, 0, 0, 0])
+    assert(fast[5] == 0x10 && fast[6] == 0x11)
+    val wrapped = frame(&f, [0x03, 0, 0x1F, 0xFF, 0, 0])
+    assert(wrapped[4] == 0xAA && wrapped[5] == 0x00, "address bits above the array are ignored")
+    val quad = frame(&f, [0xEB, 0, 0, 0x20, 0x00, 0, 0, 0, 0])
+    assert(quad[7] == 0x20 && quad[8] == 0x21 && !f.continuous)
+
+@test("EBh with mode bits 10b keeps continuous read mode, where a frame starts at the address; FFh frames leave it")
+flash_continuous()
+    var array = [0u8; 8192]
+    for i in 0..<8192 do array[i] = u8(i & 0xFF)
+    var f = flash_over(&array)
+    frame(&f, [0xEB, 0, 0, 0x40, 0xA0, 0, 0, 0])
+    assert(f.continuous)
+    // No instruction byte now: the address first.
+    val next = frame(&f, [0, 0, 0x42, 0xA0, 0, 0, 0])
+    assert(next[6] == 0x42 && f.continuous)
+    // The exit sequence: FFh before the mode byte.
+    frame(&f, [0xFF, 0xFF])
+    assert(!f.continuous)
+    assert(frame(&f, [0x9F, 0])[1] == 0xEF, "instructions are heard again")
+    // A mode byte other than 10b ends it within the frame.
+    frame(&f, [0xEB, 0, 0, 0, 0xA0, 0, 0])
+    frame(&f, [0, 0, 0, 0x00, 0, 0])
+    assert(!f.continuous)
+
+@test("status registers: 01h writes 1 (and 2) after WEL or 50h, BUSY and WEL read-only; protection refuses a program by name")
+flash_status()
+    var array = [0xFFu8; 8192]
+    var f = flash_over(&array)
+    frame(&f, [0x01, 0xFF])
+    assert(frame(&f, [0x05, 0])[1] == 0, "no write without an enable")
+    frame(&f, [0x50])
+    frame(&f, [0x31, 0x02])
+    assert(frame(&f, [0x35, 0])[1] == 0x02, "QE through the volatile enable")
+    frame(&f, [0x06])
+    frame(&f, [0x01, 0x07, 0x00])
+    assert(frame(&f, [0x05, 0])[1] == 0x04 && frame(&f, [0x35, 0])[1] == 0, "BUSY and WEL cannot be written; SR2 took the second byte")
+    frame(&f, [0x06])
+    f.select()
+    for b in [0x02u8, 0, 0, 0, 0] do f.exchange(b).unwrap()
+    assert(f.deselect().unwrap_err().contains("block protection"))
+    frame(&f, [0x50])
+    frame(&f, [0x11, 0x60])
+    assert(frame(&f, [0x15, 0])[1] == 0x60)
+
+@test("power-down hears only ABh; 66h then 99h resets; an unknown instruction is refused by name")
+flash_power_and_reset()
+    var array = [0xFFu8; 8192]
+    var f = flash_over(&array)
+    frame(&f, [0xB9])
+    assert(frame(&f, [0x9F, 0])[1] == 0xFF, "asleep")
+    frame(&f, [0xAB])
+    assert(frame(&f, [0x9F, 0])[1] == 0xEF, "awake")
+    frame(&f, [0x06])
+    frame(&f, [0x99])
+    assert(frame(&f, [0x05, 0])[1] == 0x02, "99h alone does not reset")
+    frame(&f, [0x66])
+    frame(&f, [0x99])
+    assert(frame(&f, [0x05, 0])[1] == 0, "66h then 99h does")
+    f.select()
+    assert(f.exchange(0x5A).unwrap_err().contains("0x5a"))
+    f.deselect().unwrap()
+    var loose = qspi_flash()
+    assert(loose.exchange(0x9F).is_err(), "chip select high")

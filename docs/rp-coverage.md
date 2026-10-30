@@ -20,14 +20,16 @@ day. An L is split before it is handed out (§6).
 
 ## 0. Where the two chips stand
 
-- **The RP2350 runs on both pairs of cores.** `chip.Rp2350` (`chip/rp2350.sysl`) decodes 16 blocks
+- **The RP2350 runs on both pairs of cores.** `chip.Rp2350` (`chip/rp2350.sysl`) decodes 19 blocks and the XIP address space
   and raises 11 interrupt lines. `chip.RiscvBoard` runs two Hazard3 harts on it
   (`boards/pico2-riscv.hocon`), and `chip.ArmBoard` (`chip/arm_board.sysl`) two Cortex-M33s
   (`boards/pico2.hocon`), with the M33s' coprocessors on their ports (`chip/coprocessors.sysl`) and a
-  boot ROM of benchtop's own at address 0 (`chip/rom/rom.S`). On both boards the image is an ELF
-  loaded into SRAM, and flash is not on the bus. Every other address is refused by name; on the
-  RISC-V board that includes the ROM. The SDK's `hello_serial` and `blink`, `no_flash` builds, run
-  unmodified on the Arm board (`examples/pico2`, item 1 below).
+  boot ROM of benchtop's own at address 0 (`chip/rom/rom.S`). On the RISC-V board the image is an
+  ELF loaded into SRAM. The Arm board also has the Pico 2's 4 MB flash behind XIP_BASE and the XIP
+  cache's lines as SRAM, and loads an ELF or a UF2 into SRAM, flash or XIP_SRAM (item 4 below).
+  Every other address is refused by name; on the RISC-V board that includes the ROM. The SDK's
+  `hello_serial` and `blink` run unmodified on the Arm board as `no_flash` and as flash builds
+  (`examples/pico2`, items 1 and 4).
 - **The RP2040 does not run at all** (`mcus/rp2040.hocon:4`, `peripheral/rp2040/README.md:9–11`).
   Its RESETS, TIMER and watchdog tick generator are library peripherals (`rp-resets`, `rp-timer`,
   `rp-watchdog`). They run on the `virt*` boards through `virt/rp.sysl`, with clk_ref taken to be the
@@ -84,8 +86,8 @@ day. An L is split before it is handed out (§6).
 | Boot path: IMAGE_DEF, partition tables, UF2, secure-boot flags, signature check | 5 Bootrom, 10 Security | missing | Boot is the debugger entry into SRAM (`chip/riscv_board.sysl:13–17`). DESIGN.md §9.2 option 3. | — | L | ROM, OTP, XIP, SHA-256 |
 | SRAM 0–9 (520 KB) | 4.2 SRAM | full | `mcus/rp2350.hocon:19`. Striping does not matter to a program. | every chip test | — | — |
 | BOOTRAM (with boot locks) | 4.3 Boot RAM | full | 1 KB of SRAM, WRITE_ONCE0/1 and the eight boot locks with BOOTLOCK_STAT (`peripheral/rp2350/startup.sysl`). | `peripheral/rp2350/startup_tests.sysl` | — | — |
-| XIP: flash window, aliases, cache, cache-as-SRAM, XIP_CTRL, streaming FIFO | 4.4 XIP | missing | "Flash (XIP) is not on this board's bus yet" (`chip/riscv_board.sysl:16`). | — | M | loader |
-| QMI (flash and PSRAM interface; direct mode) | 12.14 QMI | missing | Not decoded. The ROM's flash routines use direct mode. | — | M | XIP |
+| XIP: flash window, aliases, cache, cache-as-SRAM, XIP_CTRL, streaming FIFO | 4.4 XIP | full | One 4 MB flash array (`parts/qspi_flash`, a W25Q32RV) behind the cached, uncached and untranslated windows, read and executed in place on the cores' fast path from the cached window's first 4 MB (`chip/arm_board.sysl`); the rest through the chip, translated by ATRANS and wrapping at the device's size (`peripheral/rp2350/xip.sysl`). XIP_CTRL in full, the cache's tags with every maintenance operation, lines pinned over XIP_SRAM holding their bytes (a fully pinned page on the fast path, a partly pinned one checked line by line), the streaming FIFO and XIP_AUX. Fidelity limits: the cache is functional, not timed (no lookups, so CTR_HIT/CTR_ACC are refused by name and a read is never stale); a pin over flash, a write through XIP with WRITABLE_M0 set, and code fetched from flash in direct mode or from an unpinned XIP_SRAM line are the cases not run or not refused (item 4 below). | `peripheral/rp2350/xip_tests.sysl`, `chip/xip_tests.sysl` | — | — |
+| QMI (flash and PSRAM interface; direct mode) | 12.14 QMI | full | Direct mode with both FIFOs, NOPUSH, 16-bit entries, ASSERT and AUTO chip selects, RX-full stall and BUSY, all to the flash on CS0; the window, timing and ATRANS registers stored. Instantaneous: no clock divider timing. CS1 (no PSRAM on the Pico 2) and a non-identity ATRANS0-3 are refused by name. The ROM's flash routines (`flash_range_erase` and friends) need item 6. | `peripheral/rp2350/xip_tests.sysl`, `chip/xip_tests.sysl` (`qmi_flash`) | — | — |
 | OTP | 13 OTP | missing | Not decoded. It is read for the unique ID and for boot configuration. | — | M (stored array, ROM access); L (ECC, locks, keys) | ROM |
 | POWMAN, including the AON timer, LPOSC, VREG and BOD control | 6 Power | partial | The store is done: VREG (locked until UNLOCK, VSEL limit), BOD, LPOSC and XOSC settings, SEQ_CFG, CHIP_RESET (HAD_POR), WDSEL, SCRATCH/BOOT, the interrupt registers into IRQs 44 and 45, all behind the 0x5AFE password. Refused by name, for item 27: STATE, the TIMER/time/alarm registers, PWRUP0-3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP, BOOTDIS. LPOSC is still a constant 32768 Hz. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | M (AON timer) | TICKS/clocks |
 | GLITCH_DETECTOR | 10.9 Glitch detector | missing | Not decoded. | — | S (store) | — |
@@ -311,7 +313,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 1 | **Arm Pico 2 board**: an `ArmBoard` beside `RiscvBoard` running two M33s on `chip.Rp2350`. It covers ELF-to-SRAM debugger entry, the core-1 ROM launch into VTOR, SP and PC, and the 52 IRQ lines into the NVIC through `Processor`. A hand-written M33 twin of `examples/pico2-riscv/blink` is its test. It also clones and builds `pico-examples`, and records the refusal census of `hello_serial` and `blink` (`no_flash` builds) in its report. | M | — |
 | 2 | **M33 Secure-only security minimum** (DESIGN.md §2.7): Secure reset state, SAU stored, `TT*`, SecureFault with SFSR/SFAR, NS transitions stopped by name, and STKOF taken as a UsageFault. **Done** (below). | M | — |
 | 3 | **RCP (CP7) and GPIO coprocessor (CP0)** on a coprocessor port the chip supplies. **Done** (below). | M | 1 |
-| 4 | **XIP flash and QMI**: one flash image behind the 0x1000_0000 aliases, the cache, cache-as-SRAM, XIP_CTRL, QMI stored with direct mode, and the loader writing an ELF's PT_LOAD and a UF2 into flash. `pico_xip_sram_test` is its oracle. | M | 1 |
+| 4 | **XIP flash and QMI**: one flash image behind the 0x1000_0000 aliases, the cache, cache-as-SRAM, XIP_CTRL, QMI stored with direct mode, and the loader writing an ELF's PT_LOAD and a UF2 into flash. `pico_xip_sram_test` is its oracle. **Done** (below). | M | 1 |
 | 5 | **Start-up register blocks** (done, see "Item 5, done"): PSM (FRCE_OFF and DONE), ROSC with RANDOMBIT, BOOTRAM, SYSINFO, SYSCFG, the POWMAN/VREG store, ACCESSCTRL stored, and CLOCKS FC0 measuring the tree. Every refusal in item 1's census is either answered here or named. | M | 1 |
 | 6 | **Boot ROM function table**: the shape follows Q1; with an HLE ROM, the lookup table plus the functions `runtime_init` and stdio reach. It is split in two if Q1 chooses the real ROM. | L | 4, 5 |
 | 7 | **DCP (CP4/5)**: the double coprocessor. `pico_float_test` and a `printf("%f")` program are its oracles. | M | 3 |
@@ -484,3 +486,38 @@ the SIO model does not hold; that is the SIO's, not the coprocessor's.
 fault. Tests: `chip/rcp_tests.sysl` (each instruction, its fault message, the edges), the executor
 tests and the two SDK programs in `chip/arm_tests.sysl`: `rcp.elf` runs every `rcp_*` function in
 both forms clean, then corrupts a canary and stops at `Fault` with the check named.
+
+### Item 4, done: XIP flash, the cache and the QMI
+
+`examples/pico2` adds flash builds of `hello_serial` and `blink` (and `hello_serial_flash.uf2`),
+`qmi_flash`, which reprograms a sector of its own flash through direct mode without the ROM and reads
+it back through every window, and `xip_sram`, the SDK's `xip_ram` binary type run whole from the XIP
+cache's 16 KB as `pico_xip_sram_test` is. `chip/xip_tests.sysl` runs all of them and every edge of the
+board's map.
+
+**The memory map.** The cores keep their fast path: SRAM; the flash, read and executed in place from
+the first 4 MB of the cached window; the boot ROM, now a read-only RAM region (`v6m` `read_only`), so a
+store to it is refused by name; and each XIP_SRAM page whose every cache line is pinned. The board
+mirrors the chip (`ArmBoard.sync_xip`): a program or erase makes code decoded from the bytes decode
+again (`v6m` `flash_changed`), direct mode takes the flash off the fast path, so a memory-mapped access
+is the bus error silicon gives, and a page with a line unpinned leaves the fast path, so each access is
+checked by line and an unpinned one refused. Every other XIP address goes through the chip.
+
+**The loader** (`ArmBoard.boot`) writes an ELF's PT_LOAD segments at their physical addresses, so a
+flash image's `.data` load image is in flash for crt0 to copy, and a UF2's blocks at their targets,
+refusing a wrong magic, a missing or foreign family and an address off the memory by name, and
+dropping picotool's RP2350-E10 block. An image that lands in XIP_SRAM has its lines pinned first, as
+the ROM pins them for an image whose block asks. A flash UF2 starts as the ROM hands one over (salts set,
+VTOR, SP and PC from the vector table at XIP_BASE); one placed elsewhere in flash needs the ROM's
+partition search (item 30).
+
+**Not run, by name:** CTR_HIT and CTR_ACC (no lookups are simulated); a pin over flash; a write
+through XIP with WRITABLE_M0 set (a QMI write command); QSPI chip select 1; ATRANS0-3 other than the
+identity; the flash's instructions other than those `parts/qspi_flash` lists, and a program or erase
+under block protection. **Fidelity limits, not refused:** the cache never makes a read stale, so a
+missing maintenance operation goes unseen; a store into the cached window's first 4 MB stops the core
+at `Fault` (the core's read-only flash) where silicon drops it; code already decoded keeps running
+from flash in direct mode, and from an XIP_SRAM line unpinned after it was decoded; QMI transfers take
+no time. The SDK's `flash_range_erase`/`flash_range_program`/`flash_get_unique_id` reach the ROM's
+`connect_internal_flash`, `flash_exit_xip`, `flash_range_*` and `flash_flush_cache`, which are item 6;
+until then the ROM's lookup answers 0 for them.

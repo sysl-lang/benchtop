@@ -1,0 +1,373 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.parts.qspi_flash.QspiFlash
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.qmi as qmi_reg
+import sh.sysl.rp2350.xip_aux as aux_reg
+import sh.sysl.rp2350.xip_ctrl as xip_reg
+import sysl.fmt.hex
+
+// The RP2350's execute-in-place path (datasheet 4.4, "External flash and PSRAM (XIP)", and 12.14,
+// "QSPI memory interface (QMI)"): the XIP block's registers, its cache's tags, its streaming FIFO,
+// and the QMI's registers with direct mode, which shifts bytes to and from the flash on chip select 0.
+//
+// **The cache is functional, not timed.** A read of flash always sees the array as it is now; no
+// lookup, allocation or eviction is simulated, so cache maintenance cannot make a read stale, and the
+// hit and access counters, which would count lookups, are refused by name. What the cache does that a
+// program can see is kept: each line's tag, valid and pinned state, set by the maintenance
+// operations a write to the window at 0x18000000 makes, and the lines pinned over XIP_SRAM_BASE,
+// which hold what is written to them. The data of those lines lives in the board's memory, which runs
+// them on the fast path; the board asks `sram_live` which of them a program may reach.
+//
+// **The QMI is instantaneous.** A direct-mode TX FIFO entry is shifted as soon as it is pushed, so
+// BUSY is high only while the RX FIFO is full and holds the next entry back. The window registers
+// (timing, read and write formats and commands) are stored: the board reads flash in place whatever
+// format they name. ATRANS0-3 must keep their reset (identity) translation, which is what the fast
+// path reads by; a write of another is refused by name.
+
+/** Where the XIP block's cache can be used as SRAM, by pinning its lines there: the last 16 KB of the
+ * cached window, outside both of the QMI's windows.
+ */
+const XIP_SRAM_BASE: u32 = 0x13FFC000
+const XIP_SRAM_BYTES: u32 = 16384
+/** The cache: two ways of 1024 lines of 8 bytes. */
+const CACHE_WAY_LINES: u32 = 1024
+const CACHE_LINE_BYTES: u32 = 8
+/** The XIP address space's four 64 MB windows from XIP_BASE: cached, uncached, maintenance, and
+ * uncached untranslated.
+ */
+const XIP_BASE: u32 = 0x10000000
+const XIP_WINDOWS_END: u32 = 0x20000000
+const XIP_MAINTENANCE_BASE: u32 = 0x18000000
+const XIP_UNTRANSLATED_BASE: u32 = 0x1C000000
+
+// XIP_CTRL's fields, all read-write but bit 2, and its reset value.
+private const CTRL_WRITABLE: u32 = 0xFFB
+private const CTRL_RESET: u32 = 0x83
+// A cache line's tag word: the line's XIP offset, with these two in its low bits.
+private const LINE_VALID: u32 = 1
+private const LINE_PINNED: u32 = 2
+
+/** Why the XIP or QMI blocks refuse an access: a register rule, or a behaviour benchtop does not run. */
+enum XipFault
+    Access(e: AccessError)
+    Refused(why: string)
+
+/** The XIP block: CTRL, the streaming FIFO and the cache's tags. */
+struct Xip
+    ctrl: u32
+    stream_addr: u32
+    stream_ctr: u32
+    // The streaming FIFO, two words deep, oldest first.
+    fifo: [2]u32
+    fifo_count: u32
+    // Way w's line s at `tags[w * 1024 + s]`: the XIP offset it holds, LINE_VALID and LINE_PINNED.
+    tags: [2048]u32
+    // Counts the changes to CTRL and the tags, so a board knows when to ask `sram_page_live` again.
+    epoch: u32
+
+    reset(*self)
+        self.epoch +%= 1
+        self.ctrl = CTRL_RESET
+        self.stream_addr = 0
+        self.stream_ctr = 0
+        self.fifo_count = 0
+        for i in 0..<2048 do self.tags[i] = 0
+
+    /** Whether the cache is on for the Secure accesses every benchtop core makes. */
+    enabled(self) -> bool = self.ctrl & xip_reg.CTRL_EN_SECURE_MASK != 0 && self.ctrl & xip_reg.CTRL_POWER_DOWN_MASK == 0
+
+    /** Whether the XIP_SRAM address `a` is a cache line a program may use as SRAM: pinned there, with the
+     * cache enabled. On silicon any other access there misses, and the miss is a bus error.
+     */
+    sram_live(self, a: u32) -> bool
+        if !self.enabled() then return false
+        val tag = (a - XIP_BASE) & ~(CACHE_LINE_BYTES - 1)
+        val set = (tag >> 3) & (CACHE_WAY_LINES - 1)
+        val want = tag | LINE_VALID | LINE_PINNED
+        self.tags[set] == want || self.tags[CACHE_WAY_LINES + set] == want
+
+    /** Whether every line of the XIP_SRAM page `page` (0 to 3, 4 KB each) is live. */
+    sram_page_live(self, page: u32) -> bool
+        val from = XIP_SRAM_BASE + page * 4096
+        for k in 0u32..<(4096 / CACHE_LINE_BYTES) do if !self.sram_live(from + k * CACHE_LINE_BYTES) then return false
+        true
+
+    read(*self, offset: u32, width: u32, qmi: *Qmi, flash: *QspiFlash) -> Result[u32, XipFault]
+        access(offset, width, true).map_err(e -> XipFault.Access(e))?
+        val at = offset & 0xFFC
+        val value =
+            if at == xip_reg.CTRL_OFFSET then self.ctrl
+            elif at == xip_reg.STAT_OFFSET then self.stat()
+            elif at == xip_reg.CTR_HIT_OFFSET || at == xip_reg.CTR_ACC_OFFSET then return Err(XipFault.Refused("the cache's hit and access counters are not counted: benchtop does not simulate the cache's lookups"))
+            elif at == xip_reg.STREAM_ADDR_OFFSET then self.stream_addr
+            elif at == xip_reg.STREAM_CTR_OFFSET then self.stream_ctr
+            elif at == xip_reg.STREAM_FIFO_OFFSET then self.pop(qmi, flash)?
+            else return Err(XipFault.Access(AccessError.Unmapped))
+        Ok(read_lane(value, offset, width))
+
+    // XIP_STAT: the streaming FIFO's flags; FLUSH_READY is RP2040's alone.
+    private stat(self) -> u32 =
+        (if self.fifo_count == 2 then xip_reg.STAT_FIFO_FULL_MASK else 0) | (if self.fifo_count == 0 then xip_reg.STAT_FIFO_EMPTY_MASK else 0)
+
+    /** The streaming FIFO's oldest word, from XIP_CTRL or XIP_AUX, refused where it is empty. */
+    pop(*self, qmi: *Qmi, flash: *QspiFlash) -> Result[u32, XipFault]
+        if self.fifo_count == 0 then return Err(XipFault.Refused("the XIP streaming FIFO is empty: a read of it is undefined on silicon"))
+        val got = self.fifo[0]
+        self.fifo[0] = self.fifo[1]
+        self.fifo_count -= 1
+        self.refill(qmi, flash)?
+        Ok(got)
+
+    // The stream moves words from flash into the FIFO while it has room and a count left.
+    private refill(*self, qmi: *Qmi, flash: *QspiFlash) -> Result[unit, XipFault]
+        while self.fifo_count < 2 && self.stream_ctr > 0
+            self.fifo[self.fifo_count] = read_xip(self.ctrl, *qmi, flash, self.stream_addr, 4)?
+            self.fifo_count += 1
+            self.stream_addr += 4
+            self.stream_ctr -= 1
+        Ok(())
+
+    write(*self, offset: u32, width: u32, value: u32, qmi: *Qmi, flash: *QspiFlash) -> Result[unit, XipFault]
+        access(offset, width, true).map_err(e -> XipFault.Access(e))?
+        val at = offset & 0xFFC
+        val data = replicated(value, width)
+        if at == xip_reg.CTRL_OFFSET
+            var next = written(self.ctrl, offset, data) & CTRL_WRITABLE
+            // Powering the cache down disables it.
+            if next & xip_reg.CTRL_POWER_DOWN_MASK != 0 then next &= ~(xip_reg.CTRL_EN_SECURE_MASK | xip_reg.CTRL_EN_NONSECURE_MASK)
+            self.ctrl = next
+            self.epoch +%= 1
+            return Ok(())
+        // A write of any value clears a counter; there is nothing counted to clear.
+        if at == xip_reg.CTR_HIT_OFFSET || at == xip_reg.CTR_ACC_OFFSET then return Ok(())
+        if at == xip_reg.STREAM_ADDR_OFFSET
+            self.stream_addr = written(self.stream_addr, offset, data) & xip_reg.STREAM_ADDR_STREAM_ADDR_MASK
+            return Ok(())
+        if at == xip_reg.STREAM_CTR_OFFSET
+            self.stream_ctr = written(self.stream_ctr, offset, data) & xip_reg.STREAM_CTR_STREAM_CTR_MASK
+            // Writing 0 halts the stream and discards what it had in flight, not what the FIFO holds.
+            return self.refill(qmi, flash)
+        if at == xip_reg.STAT_OFFSET || at == xip_reg.STREAM_FIFO_OFFSET then return Ok(())
+        Err(XipFault.Access(AccessError.Unmapped))
+
+    /** A write to the maintenance window, `offset` bytes past 0x18000000: the operation in its low three
+     * bits, on the line its other bits name (datasheet 4.4.1, "Cache maintenance").
+     */
+    maintain(*self, offset: u32) -> Result[unit, XipFault]
+        val op = offset & 7
+        val line = offset & 0x03FFFFF8
+        val set = (line >> 3) & (CACHE_WAY_LINES - 1)
+        val way = (line >> 13) & 1
+        self.epoch +%= 1
+        op match
+            // Invalidate by set and way, which also unpins.
+            0 -> self.tags[way * CACHE_WAY_LINES + set] = 0
+            // Clean: no line holds data owed to the flash, whose window is read-only.
+            1 | 3 -> ()
+            // Invalidate by address: whichever way holds the line.
+            2 ->
+                for w in 0u32..<2
+                    val i = w * CACHE_WAY_LINES + set
+                    if self.tags[i] & ~(LINE_VALID | LINE_PINNED) == line && self.tags[i] & LINE_VALID != 0 then self.tags[i] = 0
+            7 ->
+                if line < XIP_SRAM_BASE - XIP_BASE
+                    return Err(XipFault.Refused(s"pinning a cache line over flash (0x${hex(XIP_BASE + line, 8)}) is not modelled: benchtop reads flash straight from the array"))
+                // Address bit 13 picks the way, so the 16 KB at XIP_SRAM_BASE is the cache's two ways in order.
+                self.tags[way * CACHE_WAY_LINES + set] = line | LINE_VALID | LINE_PINNED
+            _ -> return Err(XipFault.Refused(s"cache maintenance operation $op is reserved"))
+        Ok(())
+end Xip
+
+xip() -> Xip
+    var state: Xip
+    state.reset()
+    state
+
+/** The flash byte offset the XIP address `a` reads, in a window other than maintenance, or why the
+ * access is a bus error: direct mode on, a window CTRL closes to Secure code, an address past the QMI's
+ * windows or its translation, or chip select 1, where the Pico 2 fits nothing.
+ */
+xip_target(ctrl: u32, q: Qmi, a: u32) -> Result[u32, XipFault]
+    val where = s"0x${hex(a, 8)}"
+    if q.direct_enabled() then return Err(XipFault.Refused(s"$where: a memory-mapped flash access while the QMI is in direct mode is a bus error"))
+    val window = (a - XIP_BASE) >> 26
+    if window == 1 && ctrl & xip_reg.CTRL_NO_UNCACHED_SEC_MASK != 0 then return Err(XipFault.Refused(s"$where: XIP_CTRL.NO_UNCACHED_SEC makes the uncached window a bus error"))
+    if window == 3 && ctrl & xip_reg.CTRL_NO_UNTRANSLATED_SEC_MASK != 0 then return Err(XipFault.Refused(s"$where: XIP_CTRL.NO_UNTRANSLATED_SEC makes the untranslated window a bus error"))
+    val v = (a - XIP_BASE) & 0x03FFFFFF
+    if v >= 0x02000000 then return Err(XipFault.Refused(s"$where is past the QMI's two 16 MB windows"))
+    if v >= 0x01000000 then return Err(XipFault.Refused(s"$where: nothing is on QSPI chip select 1 (the Pico 2 fits no PSRAM)"))
+    if window == 3 then return Ok(v)
+    val t = q.atrans[v >> 22]
+    val size = ((t >> 16) & 0x7FF) * 4096
+    val within = v & 0x3FFFFF
+    if within >= size then return Err(XipFault.Refused(s"$where is past ATRANS${v >> 22}'s SIZE"))
+    Ok((t & 0xFFF) * 4096 + within)
+
+/** A read of `width` bytes at XIP address `a`, little-endian from the flash. */
+read_xip(ctrl: u32, q: Qmi, flash: *QspiFlash, a: u32, width: u32) -> Result[u32, XipFault]
+    val at = xip_target(ctrl, q, a)?
+    var value: u32 = 0
+    for k in 0u32..<width do value |= u32(flash.byte(at + k)) << (8 * k)
+    Ok(value)
+
+// DIRECT_CSR's read-write fields: RXDELAY, CLKDIV, AUTO_CS1N/0N, ASSERT_CS1N/0N and EN.
+private const CSR_WRITABLE: u32 = 0xFFC000CD
+private const CSR_RESET: u32 = 0x01800000
+// Each window register's read-write fields, and its reset value, in register order from M0_TIMING.
+private val WINDOW_MASKS: [5]u32 = [0xF3FFF7FF, 0x1007D3FF, 0xFFFF, 0x1007D3FF, 0xFFFF]
+private val WINDOW_RESETS: [5]u32 = [0x40000004, 0x00001000, 0x0000A003, 0x00001000, 0x0000A002]
+private const ATRANS_MASK: u32 = 0x07FF0FFF
+private const FIFO_DEPTH: u32 = 4
+
+/** The QMI: direct mode's control, its two four-entry FIFOs, and the window and translation registers. */
+struct Qmi
+    csr: u32
+    tx: [4]u32
+    tx_count: u32
+    rx: [4]u32
+    rx_count: u32
+    // M0_TIMING to M0_WCMD, then M1's.
+    windows: [10]u32
+    atrans: [8]u32
+    // A frame AUTO_CS0N opened, which closes when the TX FIFO drains.
+    auto_frame: bool
+
+    reset(*self)
+        self.csr = CSR_RESET
+        self.tx_count = 0
+        self.rx_count = 0
+        for i in 0..<10 do self.windows[i] = WINDOW_RESETS[i % 5]
+        for n in 0u32..<8 do self.atrans[n] = identity(n)
+        self.auto_frame = false
+
+    /** Whether direct mode is on, which makes memory-mapped flash accesses bus errors. */
+    direct_enabled(self) -> bool = self.csr & qmi_reg.DIRECT_CSR_EN_MASK != 0
+
+    read(*self, offset: u32, width: u32, flash: *QspiFlash) -> Result[u32, XipFault]
+        access(offset, width, true).map_err(e -> XipFault.Access(e))?
+        val at = offset & 0xFFC
+        val value =
+            if at == qmi_reg.DIRECT_CSR_OFFSET then self.status()
+            elif at == qmi_reg.DIRECT_RX_OFFSET
+                if offset >= 0x1000 then return Err(XipFault.Access(AccessError.UnsupportedAlias))
+                self.pop_rx(flash)?
+            elif at >= qmi_reg.M0_TIMING_OFFSET && at <= qmi_reg.M1_WCMD_OFFSET then self.windows[(at - qmi_reg.M0_TIMING_OFFSET) >> 2]
+            elif at >= qmi_reg.ATRANS0_OFFSET && at <= qmi_reg.ATRANS7_OFFSET then self.atrans[(at - qmi_reg.ATRANS0_OFFSET) >> 2]
+            // DIRECT_TX is write-only.
+            else return Err(XipFault.Access(AccessError.Unmapped))
+        Ok(read_lane(value, offset, width))
+
+    // DIRECT_CSR with its status fields as the FIFOs stand.
+    private status(self) -> u32
+        var s = self.csr
+        s |= self.rx_count << qmi_reg.DIRECT_CSR_RXLEVEL_SHIFT
+        if self.rx_count == FIFO_DEPTH then s |= qmi_reg.DIRECT_CSR_RXFULL_MASK
+        if self.rx_count == 0 then s |= qmi_reg.DIRECT_CSR_RXEMPTY_MASK
+        s |= self.tx_count << qmi_reg.DIRECT_CSR_TXLEVEL_SHIFT
+        if self.tx_count == 0 then s |= qmi_reg.DIRECT_CSR_TXEMPTY_MASK
+        if self.tx_count == FIFO_DEPTH then s |= qmi_reg.DIRECT_CSR_TXFULL_MASK
+        if self.tx_count != 0 then s |= qmi_reg.DIRECT_CSR_BUSY_MASK
+        s
+
+    write(*self, offset: u32, width: u32, value: u32, flash: *QspiFlash) -> Result[unit, XipFault]
+        access(offset, width, true).map_err(e -> XipFault.Access(e))?
+        val at = offset & 0xFFC
+        val data = replicated(value, width)
+        if at == qmi_reg.DIRECT_CSR_OFFSET
+            val before = self.csr
+            self.csr = written(self.csr, offset, data) & CSR_WRITABLE
+            val held = qmi_reg.DIRECT_CSR_ASSERT_CS0N_MASK
+            if before & held == 0 && self.csr & held != 0 then flash.select()
+            if before & held != 0 && self.csr & held == 0 then flash.deselect().map_err(why -> flash_fault(why))?
+            return self.pump(flash)
+        if at == qmi_reg.DIRECT_TX_OFFSET
+            if offset >= 0x1000 then return Err(XipFault.Access(AccessError.UnsupportedAlias))
+            return self.push_tx(data, flash)
+        if at >= qmi_reg.M0_TIMING_OFFSET && at <= qmi_reg.M1_WCMD_OFFSET
+            val i = (at - qmi_reg.M0_TIMING_OFFSET) >> 2
+            self.windows[i] = written(self.windows[i], offset, data) & WINDOW_MASKS[i % 5]
+            return Ok(())
+        if at >= qmi_reg.ATRANS0_OFFSET && at <= qmi_reg.ATRANS7_OFFSET
+            val n = (at - qmi_reg.ATRANS0_OFFSET) >> 2
+            val next = written(self.atrans[n], offset, data) & ATRANS_MASK
+            if n < 4 && next != identity(n)
+                return Err(XipFault.Refused(s"ATRANS$n = 0x${hex(next, 8)}: an address translation other than the identity is not modelled (the fast path reads flash in place)"))
+            self.atrans[n] = next
+            return Ok(())
+        // DIRECT_RX is read-only.
+        if at == qmi_reg.DIRECT_RX_OFFSET then return Ok(())
+        Err(XipFault.Access(AccessError.Unmapped))
+
+    /** An entry for the TX FIFO, from DIRECT_TX or XIP_AUX; one pushed while it is full is dropped. */
+    push_tx(*self, entry: u32, flash: *QspiFlash) -> Result[unit, XipFault]
+        if self.tx_count == FIFO_DEPTH then return Ok(())
+        self.tx[self.tx_count] = entry
+        self.tx_count += 1
+        self.pump(flash)
+
+    /** The RX FIFO's oldest entry, from DIRECT_RX or XIP_AUX, refused where it is empty. */
+    pop_rx(*self, flash: *QspiFlash) -> Result[u32, XipFault]
+        if self.rx_count == 0 then return Err(XipFault.Refused("DIRECT_RX is empty: a read of it is undefined on silicon"))
+        val got = self.rx[0]
+        for i in 1u32..<self.rx_count do self.rx[i - 1] = self.rx[i]
+        self.rx_count -= 1
+        self.pump(flash)?
+        Ok(got)
+
+    // Shift TX entries out while direct mode is on and the RX FIFO has room for what comes back. Each
+    // entry is a byte, or two bytes least significant first, to whichever chip select is asserted.
+    private pump(*self, flash: *QspiFlash) -> Result[unit, XipFault]
+        if !self.direct_enabled() then return Ok(())
+        while self.tx_count > 0
+            val e = self.tx[0]
+            val keep = e & qmi_reg.DIRECT_TX_NOPUSH_MASK == 0
+            if keep && self.rx_count == FIFO_DEPTH then break
+            val manual0 = self.csr & qmi_reg.DIRECT_CSR_ASSERT_CS0N_MASK != 0
+            val manual1 = self.csr & qmi_reg.DIRECT_CSR_ASSERT_CS1N_MASK != 0
+            val auto0 = self.csr & qmi_reg.DIRECT_CSR_AUTO_CS0N_MASK != 0
+            val auto1 = self.csr & qmi_reg.DIRECT_CSR_AUTO_CS1N_MASK != 0
+            if manual1 || auto1 then return Err(XipFault.Refused("a direct-mode transfer to QSPI chip select 1, where the Pico 2 fits nothing"))
+            if !manual0 && !auto0 then return Err(XipFault.Refused("a direct-mode transfer with neither chip select asserted"))
+            if !flash.connected() then return Err(XipFault.Refused("a direct-mode transfer to QSPI chip select 0, where this board connects no flash"))
+            if auto0 && !manual0 && !self.auto_frame
+                flash.select()
+                self.auto_frame = true
+            val wide = e & qmi_reg.DIRECT_TX_DWIDTH_MASK != 0
+            var back = u32(flash.exchange(u8(e & 0xFF)).map_err(why -> flash_fault(why))?)
+            if wide then back |= u32(flash.exchange(u8((e >> 8) & 0xFF)).map_err(why -> flash_fault(why))?) << 8
+            for i in 1u32..<self.tx_count do self.tx[i - 1] = self.tx[i]
+            self.tx_count -= 1
+            if keep
+                self.rx[self.rx_count] = back
+                self.rx_count += 1
+        if self.tx_count == 0 && self.auto_frame
+            self.auto_frame = false
+            flash.deselect().map_err(why -> flash_fault(why))?
+        Ok(())
+end Qmi
+
+qmi() -> Qmi
+    var state: Qmi
+    state.reset()
+    state
+
+// ATRANSn's reset value: 4 MB at the window's own 4 MB.
+private identity(n: u32) -> u32 = 0x04000000 | ((n % 4) * 0x400)
+
+private flash_fault(why: string) -> XipFault = XipFault.Refused(s"the flash on QSPI chip select 0: $why")
+
+/** XIP_AUX (datasheet 4.4, "XIP_AUX"): the streaming FIFO and the QMI's direct-mode FIFOs on the
+ * AHB, for DMA; no atomic aliases.
+ */
+xip_aux_read(x: *Xip, q: *Qmi, flash: *QspiFlash, offset: u32, width: u32) -> Result[u32, XipFault]
+    access(offset, width, false).map_err(e -> XipFault.Access(e))?
+    val at = offset & 0xFFC
+    if at == aux_reg.STREAM_OFFSET then return x.pop(q, flash).map(v -> read_lane(v, offset, width))
+    if at == aux_reg.QMI_DIRECT_RX_OFFSET then return q.pop_rx(flash).map(v -> read_lane(v, offset, width))
+    Err(XipFault.Access(AccessError.Unmapped))
+
+xip_aux_write(q: *Qmi, flash: *QspiFlash, offset: u32, width: u32, value: u32) -> Result[unit, XipFault]
+    access(offset, width, false).map_err(e -> XipFault.Access(e))?
+    if offset & 0xFFC == aux_reg.QMI_DIRECT_TX_OFFSET then return q.push_tx(replicated(value, width), flash)
+    Err(XipFault.Access(AccessError.Unmapped))
