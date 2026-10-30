@@ -1,0 +1,206 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2040.clocks as reg
+
+// The RP2040's CLOCKS (RP2040 datasheet 2.15, "Clocks"): `Clocks`' behaviour at the RP2040's own
+// registers, which differ in more than their places. Its generators are clk_gpout0–3, clk_ref, clk_sys,
+// clk_peri (no divider), clk_usb, clk_adc and clk_rtc (no clk_hstx); clk_ref and clk_sys divide 24.8
+// (INT from bit 8) where the RP2350's divide 16.16; clk_ref, clk_usb and clk_adc have a two-bit INT; and
+// clk_ref has no LPOSC. There is no TICKS block: the watchdog's TICK divides clk_ref into the 1 µs tick
+// the timer and the watchdog count (`rp2040.Watchdog`). Frequency counter 0 measures as `Clocks.measure`
+// does, from the RP2040's FC0_SRC table. Every condition a start-up polls becomes true as on the RP2350
+// model: each glitchless mux's SELECTED as soon as CTRL names the source.
+
+// CLOCKS is a file of words, from CLK_GPOUT0_CTRL to INTS.
+private const WORDS: usize = usize(reg.INTS_OFFSET / 4 + 1)
+
+// The frequency counter's fields, as `Clocks` has them; the RP2040's STATUS bits are in the same places.
+private const KHZ_MASK: u32 = 0x1FFFFFF
+private const PASS: u32 = 0x1
+private const DONE: u32 = 0x10
+private const DIED: u32 = 0x10000000
+private const FAIL: u32 = 0x10000
+private const SLOW: u32 = 0x100000
+private const FAST: u32 = 0x1000000
+
+// Where the RP2350 has clk_peri's DIV, between its CTRL and SELECTED.
+private const PERI_DIV_SLOT: u32 = reg.CLK_PERI_CTRL_OFFSET + 4
+
+// A generator's CTRL.ENABLE and CTRL.KILL.
+private const ENABLE: u32 = 0x800
+private const KILL: u32 = 0x400
+
+/** The RP2040's CLOCKS: every generator's CTRL and DIV stored as written; frequency counter 0 runs. */
+struct ClocksRp2040
+    words: [WORDS]u32
+    fc_status: u32
+    fc_result: u32
+
+    reset(*self)
+        for i in 0..<WORDS do self.words[i] = 0
+        self.fc_status = 0
+        self.fc_result = 0
+        self.words[usize(reg.FC0_MAX_KHZ_OFFSET / 4)] = KHZ_MASK
+        self.words[usize(reg.FC0_DELAY_OFFSET / 4)] = 1
+        self.words[usize(reg.FC0_INTERVAL_OFFSET / 4)] = 8
+        // Each DIV powers up dividing by one (INT 1, at bit 8 in every one).
+        for div in [reg.CLK_GPOUT0_DIV_OFFSET, reg.CLK_GPOUT1_DIV_OFFSET, reg.CLK_GPOUT2_DIV_OFFSET, reg.CLK_GPOUT3_DIV_OFFSET,
+                reg.CLK_REF_DIV_OFFSET, reg.CLK_SYS_DIV_OFFSET, reg.CLK_USB_DIV_OFFSET, reg.CLK_ADC_DIV_OFFSET, reg.CLK_RTC_DIV_OFFSET]
+            self.words[usize(div / 4)] = 1 << reg.CLK_SYS_DIV_INT_SHIFT
+
+    private word(self, offset: u32) -> u32 = self.words[usize(offset / 4)]
+
+    /** clk_ref's frequency from `s`: the ring, the crystal or PLL_USB over DIV.INT (0 divides by 4). */
+    ref_hz(self, s: Sources) -> u64
+        val ctrl = self.word(reg.CLK_REF_CTRL_OFFSET)
+        val source = (ctrl & reg.CLK_REF_CTRL_SRC_MASK) match
+            reg.CLK_REF_CTRL_SRC_ROSC_CLKSRC_PH -> s.rosc
+            reg.CLK_REF_CTRL_SRC_XOSC_CLKSRC -> s.xosc
+            reg.CLK_REF_CTRL_SRC_CLKSRC_CLK_REF_AUX ->
+                if (ctrl & reg.CLK_REF_CTRL_AUXSRC_MASK) >> reg.CLK_REF_CTRL_AUXSRC_SHIFT == reg.CLK_REF_CTRL_AUXSRC_CLKSRC_PLL_USB then s.pll_usb else 0
+            _ -> 0
+        source / u64(self.small_divisor(reg.CLK_REF_DIV_OFFSET))
+
+    /** clk_sys's frequency from `s`: clk_ref, or the aux mux's source, over DIV's 24.8 divisor. */
+    sys_hz(self, s: Sources) -> u64
+        val ctrl = self.word(reg.CLK_SYS_CTRL_OFFSET)
+        val aux = (ctrl & reg.CLK_SYS_CTRL_AUXSRC_MASK) >> reg.CLK_SYS_CTRL_AUXSRC_SHIFT match
+            reg.CLK_SYS_CTRL_AUXSRC_CLKSRC_PLL_SYS -> s.pll_sys
+            reg.CLK_SYS_CTRL_AUXSRC_CLKSRC_PLL_USB -> s.pll_usb
+            reg.CLK_SYS_CTRL_AUXSRC_ROSC_CLKSRC -> s.rosc
+            reg.CLK_SYS_CTRL_AUXSRC_XOSC_CLKSRC -> s.xosc
+            _ -> 0
+        val source = if ctrl & reg.CLK_SYS_CTRL_SRC_MASK == reg.CLK_SYS_CTRL_SRC_CLK_REF then self.ref_hz(s) else aux
+        fractional(source, self.word(reg.CLK_SYS_DIV_OFFSET))
+
+    /** clk_peri's frequency from `s`: clk_sys, a PLL, the ring or the crystal, undivided, while enabled. */
+    peri_hz(self, s: Sources) -> u64
+        val ctrl = self.word(reg.CLK_PERI_CTRL_OFFSET)
+        if ctrl & ENABLE == 0 || ctrl & KILL != 0 then return 0
+        self.aux(reg.CLK_PERI_CTRL_OFFSET) match
+            0 -> self.sys_hz(s)
+            1 -> s.pll_sys
+            2 -> s.pll_usb
+            3 -> s.rosc
+            4 -> s.xosc
+            _ -> 0
+
+    /** clk_usb's frequency from `s`. */
+    usb_hz(self, s: Sources) -> u64 = self.gated(reg.CLK_USB_CTRL_OFFSET, s) / u64(self.small_divisor(reg.CLK_USB_DIV_OFFSET))
+
+    /** clk_adc's frequency from `s`. */
+    adc_hz(self, s: Sources) -> u64 = self.gated(reg.CLK_ADC_CTRL_OFFSET, s) / u64(self.small_divisor(reg.CLK_ADC_DIV_OFFSET))
+
+    /** clk_rtc's frequency from `s`: its source over DIV's 24.8 divisor. */
+    rtc_hz(self, s: Sources) -> u64 = fractional(self.gated(reg.CLK_RTC_CTRL_OFFSET, s), self.word(reg.CLK_RTC_DIV_OFFSET))
+
+    // The source of clk_usb, clk_adc or clk_rtc, whose muxes are alike, while it is enabled; else 0.
+    private gated(self, ctrl_offset: u32, s: Sources) -> u64
+        val ctrl = self.word(ctrl_offset)
+        if ctrl & ENABLE == 0 || ctrl & KILL != 0 then return 0
+        self.aux(ctrl_offset) match
+            0 -> s.pll_usb
+            1 -> s.pll_sys
+            2 -> s.rosc
+            3 -> s.xosc
+            _ -> 0
+
+    // A two-bit DIV.INT at bit 8, 0 dividing by 4.
+    private small_divisor(self, div_offset: u32) -> u32
+        val whole = (self.word(div_offset) >> 8) & 3
+        if whole == 0 then 4 else whole
+
+    // AUXSRC, bits 7:5 of a generator's CTRL.
+    private aux(self, ctrl_offset: u32) -> u32 = (self.word(ctrl_offset) >> 5) & 7
+
+    // The frequency of FC0_SRC's source `src`, 0 for a stopped clock.
+    private fc_source_hz(self, src: u32, s: Sources) -> u64 = src match
+        reg.FC0_SRC_FC0_SRC_PLL_SYS_CLKSRC_PRIMARY -> s.pll_sys
+        reg.FC0_SRC_FC0_SRC_PLL_USB_CLKSRC_PRIMARY -> s.pll_usb
+        reg.FC0_SRC_FC0_SRC_ROSC_CLKSRC | reg.FC0_SRC_FC0_SRC_ROSC_CLKSRC_PH -> s.rosc
+        reg.FC0_SRC_FC0_SRC_XOSC_CLKSRC -> s.xosc
+        reg.FC0_SRC_FC0_SRC_CLK_REF -> self.ref_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_SYS -> self.sys_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_PERI -> self.peri_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_USB -> self.usb_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_ADC -> self.adc_hz(s)
+        reg.FC0_SRC_FC0_SRC_CLK_RTC -> self.rtc_hz(s)
+        _ -> 0
+
+    /** A write of FC0_SRC has started frequency counter 0: as `Clocks.measure`, from this chip's table. */
+    measure(*self, s: Sources)
+        self.fc_result = 0
+        self.fc_status = 0
+        val src = self.word(reg.FC0_SRC_OFFSET) & reg.FC0_SRC_FC0_SRC_MASK
+        if src == reg.FC0_SRC_FC0_SRC_NULL then return
+        val tested = self.fc_source_hz(src, s)
+        val reference = self.ref_hz(s)
+        if tested == 0 || reference == 0
+            self.fc_status = DONE | DIED | FAIL | (if self.word(reg.FC0_MIN_KHZ_OFFSET) > 0 then SLOW else 0)
+            return
+        val fixed = tested * u64(self.word(reg.FC0_REF_KHZ_OFFSET)) * 32 / reference
+        self.fc_result = u32(fixed & 0x3FFFFFFF)
+        val khz = u32((fixed >> 5) & KHZ_MASK)
+        val slow = khz < self.word(reg.FC0_MIN_KHZ_OFFSET)
+        val fast = khz > self.word(reg.FC0_MAX_KHZ_OFFSET)
+        var status = DONE
+        if slow then status |= SLOW
+        if fast then status |= FAST
+        status |= if slow || fast then FAIL else PASS
+        self.fc_status = status
+
+    /** Why FC0_SRC, as stored, names a source this model cannot count, or "" where it is fine. */
+    unmodelled_source(self) -> string
+        val src = self.word(reg.FC0_SRC_OFFSET) & reg.FC0_SRC_FC0_SRC_MASK
+        src match
+            reg.FC0_SRC_FC0_SRC_CLKSRC_GPIN0 -> "clksrc_gpin0 has no pin driving it"
+            reg.FC0_SRC_FC0_SRC_CLKSRC_GPIN1 -> "clksrc_gpin1 has no pin driving it"
+            _ -> if src > reg.FC0_SRC_FC0_SRC_CLK_RTC then "it is not a source" else ""
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        if address > reg.INTS_OFFSET then return Err(AccessError.Unmapped)
+        val value = address match
+            // clk_peri has no DIV; its slot reads 0 (`write`).
+            PERI_DIV_SLOT -> 0
+            reg.FC0_STATUS_OFFSET -> self.fc_status
+            reg.FC0_RESULT_OFFSET -> self.fc_result
+            reg.CLK_REF_SELECTED_OFFSET -> 1 << (self.word(reg.CLK_REF_CTRL_OFFSET) & reg.CLK_REF_CTRL_SRC_MASK)
+            reg.CLK_SYS_SELECTED_OFFSET -> 1 << (self.word(reg.CLK_SYS_CTRL_OFFSET) & reg.CLK_SYS_CTRL_SRC_MASK)
+            reg.CLK_GPOUT0_SELECTED_OFFSET | reg.CLK_GPOUT1_SELECTED_OFFSET | reg.CLK_GPOUT2_SELECTED_OFFSET | reg.CLK_GPOUT3_SELECTED_OFFSET -> 1
+            reg.CLK_PERI_SELECTED_OFFSET | reg.CLK_USB_SELECTED_OFFSET | reg.CLK_ADC_SELECTED_OFFSET | reg.CLK_RTC_SELECTED_OFFSET -> 1
+            _ -> self.word(address)
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        if address > reg.INTS_OFFSET then return Err(AccessError.Unmapped)
+        // clk_peri has no DIV, and its slot between CTRL and SELECTED holds nothing: the SDK's
+        // `clock_configure` writes every clock's DIV, clk_peri's included, and the write does nothing.
+        // The counter's two result registers are read-only.
+        if address == PERI_DIV_SLOT || address == reg.FC0_STATUS_OFFSET || address == reg.FC0_RESULT_OFFSET then return Ok(())
+        val i = usize(address / 4)
+        val next = written(self.words[i], offset, replicated(value, width))
+        self.words[i] = address match
+            reg.FC0_REF_KHZ_OFFSET -> next & 0xFFFFF
+            reg.FC0_MIN_KHZ_OFFSET | reg.FC0_MAX_KHZ_OFFSET -> next & KHZ_MASK
+            reg.FC0_DELAY_OFFSET -> next & 7
+            reg.FC0_INTERVAL_OFFSET -> next & 0xF
+            reg.FC0_SRC_OFFSET -> next & reg.FC0_SRC_FC0_SRC_MASK
+            _ -> next
+        Ok(())
+end ClocksRp2040
+
+clocks_rp2040() -> ClocksRp2040
+    var state: ClocksRp2040
+    state.reset()
+    state
+
+// `source` over a 24.8 divisor `div` (INT in bits 31:8, 0 dividing by 2^24).
+private fractional(source: u64, div: u32) -> u64
+    var whole = u64(div >> 8)
+    if whole == 0 then whole = 1 << 24
+    (source << 8) / ((whole << 8) + u64(div & 0xFF))
