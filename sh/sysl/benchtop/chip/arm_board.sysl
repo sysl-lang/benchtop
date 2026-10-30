@@ -5,6 +5,7 @@ import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.benchtop.v6m as arm
 import sh.sysl.benchtop.v6m.{CoprocessorOp, Fpu, Kind, MemoryMap, RamBank, Stop}
 import sh.sysl.elf
+import sh.sysl.rp2350.psm as psm_reg
 import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
 import sysl.math.min
@@ -21,6 +22,20 @@ import sysl.math.min
 // a flash image over (the RCP's salts set, VTOR, SP and PC from the vector table at XIP_BASE) and a
 // RAM one at its first byte. Core 1 waits in the boot ROM until core 0 launches it through the SIO
 // FIFOs (§9.6), when it starts at the entry it was sent, with the stack pointer and VTOR it was sent.
+//
+// **The watchdog's reset** (`Rp2350.watchdog_reset`) stops each core whose PSM stage it took down at
+// once, at `Stop.Reset`, before the access that found it; at the end of the quantum the board restarts
+// them. Core 1 goes back to the boot ROM. Core 0 boots as the boot ROM boots it after a watchdog reset
+// (datasheet chapter 5, "Bootrom", its boot sequence; the SDK's `watchdog_reboot` and crt0 write the requests): SCRATCH4
+// holding 0xb007c0d3 with SCRATCH5 = SCRATCH7 ^ -0xb007c0d3 asks for SCRATCH7 as the PC and SCRATCH6
+// as the SP, a request the ROM consumes (it clears SCRATCH4; that it does is an assumption); a
+// SCRATCH7 of the magic itself asks for a boot of the type in SCRATCH6, which is the ROM's real boot
+// path and refused by name (items 6 and 30). Otherwise it is the normal boot: the flash image, handed
+// over as a flash UF2 is at power-on. A flash with no image in its first 4 KB (no block marker
+// 0xffffded3) would leave the ROM in BOOTSEL's USB boot, which is not modelled, so that run ends,
+// named. The ROM's `get_sys_info` answers BOOT_INFO with the boot each took (`write_boot_info`): at
+// power-on NORMAL where the flash holds an image and BOOTSEL where it does not, as the ROM had booted
+// before the debugger entered; NORMAL or PC_SP after a watchdog reset.
 //
 // **Memory** is on the cores' fast path: SRAM; the flash, read and executed in place from the cached
 // window's first 4 MB (the other windows and the rest of it reach the chip, `Rp2350.read`); the boot
@@ -48,6 +63,18 @@ const ROM_BYTES: u32 = 32 * 1024
 private val ROM = embed("rom/rom.bin")
 /** The Pico 2's flash: 4 MB on QSPI chip select 0. */
 const FLASH_BYTES: u32 = 4 * 1024 * 1024
+
+/** Where benchtop's ROM keeps the four words of BOOT_INFO that `get_sys_info` answers (rom/rom.S). */
+const BOOT_INFO_AT: u32 = 0x100
+/** The boot types BOOT_INFO reports (`boot/bootrom_constants.h`). */
+const BOOT_TYPE_NORMAL: u32 = 0
+const BOOT_TYPE_BOOTSEL: u32 = 2
+const BOOT_TYPE_PC_SP: u32 = 0xD
+/** The magic of a watchdog boot request in SCRATCH4 (the SDK's `watchdog_reboot`). */
+const WATCHDOG_BOOT_MAGIC: u32 = 0xB007C0D3
+// The first word of an image's block (`boot/picobin.h`), which the ROM's normal boot looks for in the
+// flash's first 4 KB.
+private const BLOCK_MARKER_START: u32 = 0xFFFFDED3
 
 // UF2 (github.com/microsoft/uf2): 512-byte blocks, their magic numbers, the flag that marks a block
 // not for the device's main memory and the one that says a family ID is present, and the families an
@@ -154,9 +181,67 @@ impl ArmBoard
         self.why = ""
         self.refused = ""
         self.console.clear()
+        self.write_boot_info(if self.flash_image() then BOOT_TYPE_NORMAL else BOOT_TYPE_BOOTSEL)
         if start.pc & 1 == 0 then return Err(s"the entry 0x${hex(start.pc, 8)} is not a Thumb address")
         Ok(())
     end boot
+
+    /** Whether the flash holds an image the boot ROM's normal boot would find: a block marker in its
+     * first 4 KB.
+     */
+    flash_image(self) -> bool
+        for at in 0u32..<1024 do if self.flash_word(4 * at) == BLOCK_MARKER_START then return true
+        false
+
+    // The little-endian word at byte `at` of the flash.
+    private flash_word(self, at: u32) -> u32
+        var v: u32 = 0
+        for k in 0u32..<4 do v |= u32(self.mem.flash[at + k]) << (8 * k)
+        v
+
+    // BOOT_INFO in benchtop's ROM: the boot `boot_type` with no partition table (diagnostic partition
+    // and partition both BOOT_PARTITION_NONE, -1), no diagnostic and no reboot parameters.
+    private write_boot_info(*self, boot_type: u32)
+        val info = [0xFF | (boot_type << 8) | (0xFF << 16), 0, 0, 0]
+        for i in 0..<4
+            for k in 0..<4 do self.mem.ram[self.rom_at + BOOT_INFO_AT + u32(4 * i + k)] = u8.wrap(info[i] >> u32(8 * k))
+
+    /** The boot ROM's boot of core 0 after a watchdog reset: the request in SCRATCH4–7, or the normal
+     * boot of the flash image; or why benchtop cannot make it.
+     */
+    private watchdog_boot(*self) -> Result[Start, string]
+        val s = self.chip.watchdog.scratch
+        if s[4] == WATCHDOG_BOOT_MAGIC && s[5] == s[7] ^ (0 -% WATCHDOG_BOOT_MAGIC)
+            self.chip.watchdog.scratch[4] = 0
+            if s[7] == WATCHDOG_BOOT_MAGIC
+                return Err(s"the watchdog's reset asks the boot ROM for a boot of type ${s[6]} (SCRATCH6), which is the ROM's own boot path, not modelled (docs/rp-coverage.md items 6 and 30)")
+            self.write_boot_info(BOOT_TYPE_PC_SP)
+            return Ok(Start(s[7], s[6], 0, false, true))
+        if !self.flash_image()
+            return Err("the watchdog's reset leaves the boot ROM a normal boot, and the flash holds no image (no block marker 0xffffded3 in its first 4 KB): the ROM would enter BOOTSEL's USB boot, which is not modelled")
+        self.write_boot_info(BOOT_TYPE_NORMAL)
+        Ok(Start(self.flash_word(4), self.flash_word(0), XIP_BASE, false, true))
+
+    // The watchdog's reset has taken down the PSM `stages`: the XIP block's mapping follows it, and the
+    // cores among the stages restart, core 1 in the boot ROM (`settle` has stopped it) and core 0
+    // through `watchdog_boot`. A boot benchtop cannot make ends the run with its reason.
+    private restart(*self, stages: u32) -> Result[unit, string]
+        if self.chip.take_xip_changed()
+            self.xip_epoch = self.chip.xip.epoch +% 1
+            self.sync_xip()
+        if stages & psm_reg.WDSEL_PROC0_MASK == 0 then return Ok(())
+        val start = self.watchdog_boot()?
+        val c = &self.cores[0]
+        arm.clear(c, start.pc & ~1)
+        self.configure(c, 0)
+        c.r[13] = start.sp
+        c.vtor = start.vtor
+        self.started[0] = true
+        // The ROM salts the RCP before it hands over, as at power-on.
+        self.chip.rcp = rcp()
+        self.chip.rcp.salted = [true, true]
+        if start.pc & 1 == 0 then arm.halt(c, Stop.Fault, start.pc)
+        Ok(())
 
     // An ELF's loadable segments, each at its physical address: the entry, the stack at SRAM's top, and
     // the XIP_SRAM lines pinned where a segment lands there.
@@ -226,13 +311,27 @@ impl ArmBoard
                 if end != RunEnd.Budget then return end
             self.chip.catch_up(self.quantum_at + q)
             self.settle()
+            if !self.take_restart() then return RunEnd.Fault
             if self.asleep()
                 val next = self.next_wake() match
                     Some(n) -> min(n, limit - self.chip.now)
                     None -> return RunEnd.Asleep
                 self.sleep(next)
+                if !self.take_restart() then return RunEnd.Fault
         RunEnd.Budget
     end run
+
+    // Restart what a watchdog reset since the last call took down; false, with `refused` saying why,
+    // where the boot it asks for is not one benchtop makes. Only between quanta: no core is running.
+    private take_restart(*self) -> bool
+        val stages = self.chip.take_restart() match
+            Some(s) -> s
+            None -> return true
+        self.restart(stages) match
+            Ok(_) -> true
+            Err(why) ->
+                self.refused = s"core 0: $why"
+                false
 
     // Core `k` through `q` cycles of the quantum: run while awake, sleep the rest.
     private run_core(*self, k: usize, q: u64) -> RunEnd
@@ -252,6 +351,9 @@ impl ArmBoard
             c.stop match
                 Running -> ()
                 Breakpoint -> return RunEnd.Breakpoint
+                // The watchdog's reset stopped it: the board restarts it once the quantum is over.
+                // Any other reset (AIRCR.SYSRESETREQ) is not modelled, and ends the run.
+                Reset -> if self.chip.restarting(u32(k)) then break else return RunEnd.Fault
                 NonSecure ->
                     self.refused = s"core $k at pc 0x${hex(c.stop_at, 8)}: ${arm.transition_name(c.transition)}: Non-secure state is not modelled"
                     return RunEnd.Fault
@@ -309,6 +411,13 @@ impl ArmBoard
     // The chip's clock at core `cpu`'s `n`th retired instruction.
     private at(self, cpu: *arm.Cpu, n: u64) -> u64 = self.quantum_at + (arm.clock(cpu, n) - self.clock_at[usize(cpu.core)])
 
+    // Where the watchdog has reset `cpu`'s PSM stage by the time of its access to `a`, the reset came
+    // first: the core stops there, at `Stop.Reset`, and the access is not made.
+    private reset_first(self, cpu: *arm.Cpu, a: u32) -> bool
+        if !self.chip.restarting(cpu.core) then return false
+        arm.halt(cpu, Stop.Reset, a)
+        true
+
     // The first refusal is the run's reason.
     private refuse(*self, cpu: *arm.Cpu, a: u32, why: string)
         if self.why.is_empty() then self.why = why
@@ -344,6 +453,7 @@ end ArmBoard
 impl arm.Bus for ArmBoard
     read(*self, cpu: *arm.Cpu, a: u32, width: u32, n: u64) -> u32
         self.chip.catch_up(self.at(cpu, n))
+        if self.reset_first(cpu, a) then return 0
         if in_xip_sram(u64(a))
             self.sram_line(a, width) match
                 Ok(at) ->
@@ -361,6 +471,7 @@ impl arm.Bus for ArmBoard
 
     write(*self, cpu: *arm.Cpu, a: u32, width: u32, x: u32, n: u64)
         self.chip.catch_up(self.at(cpu, n))
+        if self.reset_first(cpu, a) then return
         if a < ROM_BYTES
             self.refuse(cpu, a, s"0x${hex(a, 8)} is in the boot ROM, which is read-only")
             return
@@ -374,11 +485,15 @@ impl arm.Bus for ArmBoard
         val r = self.chip.write(cpu.core, a, width, x)
         if self.chip.take_xip_changed() then self.sync_xip()
         r match
-            Ok(_) -> self.settle()
+            Ok(_) ->
+                self.settle()
+                // TRIGGER: the core stops after the store that made the reset.
+                if self.chip.restarting(cpu.core) then arm.halt(cpu, Stop.Reset, a)
             Err(why) -> self.refuse(cpu, a, why)
 
     override coprocessor(*self, cpu: *arm.Cpu, op: CoprocessorOp, n: u64) -> Option[u64]
         self.chip.catch_up(self.at(cpu, n))
+        if self.reset_first(cpu, 0) then return Some(0)
         self.chip.coprocessor(cpu.core, op) match
             None -> None
             Some(Ok(x)) ->

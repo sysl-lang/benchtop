@@ -188,6 +188,8 @@ struct Rp2350
     rcp: Rcp
     // Core 1 has been put in reset by PSM since the board last asked (`take_core1_reset`).
     core1_reset: bool
+    // The PSM stages the watchdog's resets have taken down since the board last asked (`take_restart`).
+    restart: Option[u32]
     // clk_sys cycles since power-on, and the remainders carried into the next clk_ref, crystal and
     // ring-oscillator cycle.
     now: u64
@@ -241,14 +243,22 @@ struct Rp2350
             val t = &self.timers[i]
             t.advance(if t.clk_sys then cycles else made[usize(Tick.Timer0) + i])
         self.sio.advance_mtime(if self.sio.mtime_full_speed() then cycles else made[usize(Tick.Riscv)])
+        // No debugger halts a core or drives JTAG, so no PAUSE applies.
+        self.watchdog.advance(made[usize(Tick.Watchdog)], 0)
+        self.watchdog_reset()
     end advance
 
     /** Bring the devices to clk_sys cycle `t`, where they are behind it. */
     catch_up(*self, t: u64) = if t > self.now then self.advance(t - self.now)
 
-    /** The clk_sys cycles until the next device event that could wake a core: an alarm or MTIMECMP. */
+    /** The clk_sys cycles until the next device event that could wake a core: an alarm, MTIMECMP, or
+     * the watchdog firing, whose reset the board takes.
+     */
     next_event(self) -> Option[u64]
         var due: Option[u64] = None
+        self.watchdog.ticks_to_fire(0) match
+            Some(n) -> due = self.ticks_to_cycles(Tick.Watchdog, n)
+            None -> ()
         for i in 0..<2
             val t = self.timers[i]
             t.next_alarm() match
@@ -332,7 +342,11 @@ struct Rp2350
             Ticks -> self.ticks.write(o, width, x)
             Timer0 -> self.timers[0].write(o, width, x)
             Timer1 -> self.timers[1].write(o, width, x)
-            Watchdog -> self.watchdog.write(o, width, x)
+            Watchdog ->
+                // TRIGGER resets the chip at once.
+                val r = self.watchdog.write(o, width, x)
+                self.watchdog_reset()
+                r
             IoBank0 -> self.io.write(o, width, x)
             PadsBank0 -> self.pads.write(o, width, x)
             Uart0 -> self.uarts[0].write(o, width, x)
@@ -381,6 +395,71 @@ struct Rp2350
             self.rom = RomWait(true, 0, [0; 3], None)
             while !self.sio.fifos[1].empty() do self.sio.fifos[1].pop()
             self.sio.fifos[0].push(0)
+
+    // Where the watchdog has fired (by TRIGGER or by its counter reaching 0), the reset it makes
+    // (datasheet 7.4, "Power-on state machine", and 12.9, "Watchdog"): each PSM stage PSM.WDSEL selects
+    // goes back to its power-on state, one by one, as the SDK's `_watchdog_enable` relies on when it
+    // selects every stage but ROSC and XOSC. Where RESETS' own stage is not selected, the peripherals
+    // RESETS.WDSEL names go into reset instead. What survives is what no selected stage holds: the
+    // watchdog's REASON and SCRATCH registers, POWMAN, PSM's own registers, the SRAM's contents (a
+    // stage's reset is of its controller, not its array) and BOOTRAM's, and the flash part. Stages with
+    // no state benchtop keeps (PROC_COLD, OTP, PSM_READY, BUSFABRIC, ROM, SRAM0–9) change nothing here;
+    // PROC0 and PROC1 are the board's to restart (`take_restart`). TICKS goes with CLOCKS, an assumption:
+    // the headers give TICKS no stage of its own.
+    private watchdog_reset(*self)
+        if self.watchdog.take_fired() == 0 then return
+        val sel = self.psm.wdsel
+        val fresh = rp2350()
+        if sel & psm_reg.WDSEL_ROSC_MASK != 0
+            self.rosc = fresh.rosc
+            self.rosc_rest = 0
+        if sel & psm_reg.WDSEL_XOSC_MASK != 0
+            self.xosc = fresh.xosc
+            self.xosc_rest = 0
+        if sel & psm_reg.WDSEL_RESETS_MASK != 0
+            self.resets = fresh.resets
+            self.reset_blocks(self.resets.held)
+        else
+            val asserted = self.resets.watchdog & ~self.resets.held
+            self.resets.held |= self.resets.watchdog
+            self.resets.done &= ~self.resets.held
+            self.reset_blocks(asserted)
+        if sel & psm_reg.WDSEL_CLOCKS_MASK != 0
+            self.clocks = fresh.clocks
+            self.ticks = fresh.ticks
+            self.ref_rest = 0
+        if sel & psm_reg.WDSEL_BOOTRAM_MASK != 0
+            val words = self.bootram.words
+            self.bootram = fresh.bootram
+            self.bootram.words = words
+        if sel & psm_reg.WDSEL_XIP_MASK != 0
+            self.xip = fresh.xip
+            self.qmi = fresh.qmi
+            self.xip_changed = true
+        if sel & psm_reg.WDSEL_SIO_MASK != 0 then self.sio = fresh.sio
+        if sel & psm_reg.WDSEL_ACCESSCTRL_MASK != 0 then self.accessctrl = fresh.accessctrl
+        if sel & psm_reg.WDSEL_PROC1_MASK != 0
+            // Core 1 back in the boot ROM, waiting for a launch, as at power-on.
+            self.core1_reset = true
+            self.rom = fresh.rom
+        val before = self.restart match
+            Some(s) -> s
+            None -> 0
+        self.restart = Some(before | sel)
+    end watchdog_reset
+
+    /** The PSM stages the watchdog's resets have taken down since the last call (bit n for stage n),
+     * where it has fired at all; the board restarts PROC0 and PROC1 where they are among them.
+     */
+    take_restart(*self) -> Option[u32]
+        val r = self.restart
+        self.restart = None
+        r
+
+    /** Whether a watchdog reset the board has not yet taken has reset core `k`'s PSM stage. */
+    restarting(self, k: u32) -> bool = self.restart match
+        Some(s) -> s & (if k == 0 then psm_reg.WDSEL_PROC0_MASK else psm_reg.WDSEL_PROC1_MASK) != 0
+        None -> false
 
     /** Whether PSM has put core 1 in reset since the last call; the board stops the core. */
     take_core1_reset(*self) -> bool
@@ -505,7 +584,7 @@ rp2350() -> Rp2350 =
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(),
         rp.xip(), rp.qmi(), qspi_flash(), false,
-        RomWait(true, 0, [0; 3], None), rcp(), false, 0, 0, 0, 0)
+        RomWait(true, 0, [0; 3], None), rcp(), false, None, 0, 0, 0, 0)
 
 private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
     Some(x) -> b match

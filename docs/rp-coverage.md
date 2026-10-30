@@ -82,7 +82,7 @@ day. An L is split before it is handed out (§6).
 | BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | missing | Not decoded. | — | S (counters) | DMA/cores for events |
 | ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. Nothing else on the chip consults it (Secure-only, Q3). | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | ROM: core-1 launch protocol | 5.3 / 5 Bootrom | partial | The ROM's FIFO echo loop and launch are emulated without ROM code (`chip/rp2350.sysl:271–287`). Core 1 is released by the emulation, not by the real ROM. | `chip/tests.sysl:115` | — | — |
-| ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | partial | On the Arm board, benchtop's own ROM (`chip/rom/rom.S`, read-only at 0): the vector table, the magic and the well-known pointers, the Arm lookup, and `bootrom_state_reset` ('SR'), which has no state to reset. Any other code looks up as 0, as the real ROM answers for a code it lacks. On the RISC-V board a ROM read is refused. | `chip/arm_tests.sysl` | L | XIP/QMI, OTP, BOOTRAM |
+| ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | partial | On the Arm board, benchtop's own ROM (`chip/rom/rom.S`, read-only at 0): the vector table, the magic and the well-known pointers, the Arm lookup, `bootrom_state_reset` ('SR'), which has no state to reset, and `get_sys_info` ('GS') answering BOOT_INFO alone, from words the board writes at each boot (item 10). Any other code looks up as 0, as the real ROM answers for a code it lacks. On the RISC-V board a ROM read is refused. | `chip/arm_tests.sysl` | L | XIP/QMI, OTP, BOOTRAM |
 | Boot path: IMAGE_DEF, partition tables, UF2, secure-boot flags, signature check | 5 Bootrom, 10 Security | missing | Boot is the debugger entry into SRAM (`chip/riscv_board.sysl:13–17`). DESIGN.md §9.2 option 3. | — | L | ROM, OTP, XIP, SHA-256 |
 | SRAM 0–9 (520 KB) | 4.2 SRAM | full | `mcus/rp2350.hocon:19`. Striping does not matter to a program. | every chip test | — | — |
 | BOOTRAM (with boot locks) | 4.3 Boot RAM | full | 1 KB of SRAM, WRITE_ONCE0/1 and the eight boot locks with BOOTLOCK_STAT (`peripheral/rp2350/startup.sysl`). | `peripheral/rp2350/startup_tests.sysl` | — | — |
@@ -112,7 +112,7 @@ day. An L is split before it is handed out (§6).
 | USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | register-stub | SIE_CTRL alone is stored, which `runtime_init_usb_power_down` reads and sets; it is not gated by RESETS, since the SDK reads it before releasing USBCTRL (`peripheral/rp2350/startup.sysl`). Every other register is refused. DESIGN.md §7 "Later" costs the controller. | `peripheral/rp2350/startup_tests.sysl` | L + M (bridge) | clk_usb, PLL_USB, IRQ |
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
 | TIMER0/1 | 12.8 System timers | full | 64-bit counter, latch, 4 alarms, LOCKED, SOURCE (`peripheral/rp2350/timing.sysl:91–145`). | `rp2350/tests.sysl:44`, `chip/tests.sysl:18` | — | — |
-| WATCHDOG | 12.9 Watchdog | partial | CTRL and SCRATCH0–7 are stored. The counter does not count, TRIGGER makes no reset, and REASON reads 0 (`timing.sysl:147–186`). | `rp2350/tests.sysl:70` | M | chip reset path, PSM |
+| WATCHDOG | 12.9 Watchdog | full | The RP2040's counter (`peripheral/rp2040/watchdog.sysl`, `WatchdogCounter`), one decrement a tick from TICKS' watchdog generator: CTRL (ENABLE, PAUSE_DBG0/DBG1/JTAG, TIME), LOAD, TRIGGER, REASON, SCRATCH0–7. Firing resets the PSM stages WDSEL selects, and RESETS.WDSEL's peripherals where RESETS' stage is not selected (`Rp2350.watchdog_reset`); the Arm board restarts core 0 through the ROM's boot path (the PC/SP request in SCRATCH4–7, or the flash image's normal boot) and core 1 into the ROM wait; a typed boot request and a blank flash's BOOTSEL are refused by name; the RISC-V board refuses the restart by name. No debugger exists to pause it, so the PAUSE inputs are only tested at the model (item 10). | `rp2040/watchdog_tests.sysl`, `rp2350/tests.sysl`, `chip/watchdog_tests.sysl` (`watchdog.elf`) | — | — |
 | HSTX | 12.11 HSTX | missing | Not decoded. | — | M | clk_hstx, DMA, mux, a display part |
 | TRNG | 12.12 TRNG | missing | Not decoded. | — | S | — |
 | SHA-256 | 12.13 SHA-256 | missing | Not decoded. | — | S | DMA (for the SDK's DMA path) |
@@ -159,7 +159,7 @@ day. An L is split before it is handed out (§6).
 | SPI0/1 (PL022) | 4.4 SPI | missing | The model exists (`peripheral/spi/spi.sysl`). | — | S (place) | chip layer |
 | PWM (8 slices) | 4.5 PWM | missing | Shared. | — | (shared) | — |
 | TIMER | 4.6 Timer | full | `peripheral/rp2040/timer.sysl:5–120`: latch, 4 alarms, pause, debug pause. | `rp2040/tests.sysl`, `virt/rp_tests.sysl` (13) | — | — |
-| WATCHDOG | 4.7 Watchdog | partial | The tick generator and SCRATCH are modelled. CTRL, LOAD and REASON are refused as unmapped (`peripheral/rp2040/watchdog.sysl:47–49`). | `virt/rp_tests.sysl:304` | M (shared with RP2350) | chip reset path |
+| WATCHDOG | 4.7 Watchdog | partial | The tick generator and the counter shared with the RP2350 (`peripheral/rp2040/watchdog.sysl`), TIME falling two a tick (erratum RP2040-E1): CTRL, LOAD, TRIGGER, REASON, SCRATCH0–7. On the `virt*` boards the reset stops the cores at `Reset`, named, since they have no PSM; the RP2040's chip reset path comes with its chip layer (item 22). | `rp2040/tests.sysl`, `rp2040/watchdog_tests.sysl`, `virt/rp_tests.sysl` | S (reset path) | chip layer |
 | RTC | 4.8 RTC | missing | — | — | M | clk_rtc |
 | ADC and temperature sensor | 4.9 ADC | missing | `rp-adc` has `modelled = false`. | — | (shared) | — |
 
@@ -319,7 +319,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 7 | **DCP (CP4/5)**: the double coprocessor. `pico_float_test` and a `printf("%f")` program are its oracles. | M | 3 |
 | 8 | **UART completion**: baud-timed bytes from clk_peri, both UARTs' pins correct, RT timeout, FIFO-level IRQs, break and errors, DREQ outputs. | M | 6 |
 | 9 | **GPIO function mux and GPIO interrupts**: one routing layer where every producer offers level and OE, IO_IRQ_BANK0, and per-core INTE/INTF/INTS. `gpio/hello_gpio_irq` is its oracle. | M | 6 |
-| 10 | **Watchdog counter and chip reset path**: countdown, TRIGGER, REASON, SCRATCH surviving, and the machine restarting through the boot path. | M | 5 |
+| 10 | **Watchdog counter and chip reset path**: countdown, TRIGGER, REASON, SCRATCH surviving, and the machine restarting through the boot path. **Done** (below). | M | 5 |
 | 11 | **DMA core**: channels, DREQ inputs, pacing timers, chaining, ring, IRQs. The register model is shared by both chips' channel counts. | L | 9 |
 | 12 | **DMA sniff/CRC and security attributes**. | S | 11 |
 | 13 | **PIO state machine**: the instruction set, FIFOs, shift registers, side-set, divider, IRQ flags, and the RP2350 additions, with register-level tests. | L | 9 |
@@ -560,3 +560,45 @@ from flash in direct mode, and from an XIP_SRAM line unpinned after it was decod
 no time. The SDK's `flash_range_erase`/`flash_range_program`/`flash_get_unique_id` reach the ROM's
 `connect_internal_flash`, `flash_exit_xip`, `flash_range_*` and `flash_flush_cache`, which are item 6;
 until then the ROM's lookup answers 0 for them.
+
+### Item 10, done: the watchdog counter and the chip reset path
+
+**The counter** is one model for both chips (`peripheral/rp2040/watchdog.sysl`, `WatchdogCounter`), at
+the offsets `hardware/regs/watchdog.h` gives both: CTRL (ENABLE, PAUSE_DBG0/DBG1/JTAG stored; TIME
+read-only; TRIGGER self-clearing, reads 0), LOAD (write-only, 24 bits, reads 0; an alias applies to
+0), REASON (TIMER or FORCE, alone; power-on clears it) and SCRATCH0–7. TIME falls once per tick on the
+RP2350 (TICKS' watchdog generator) and twice on the RP2040 (its own TICK, erratum RP2040-E1, the
+SDK's `WATCHDOG_XFACTOR`). The tick that takes TIME to 0 fires it; a counter enabled at 0 fires on its
+first tick; TRIGGER fires it at once, enabled or not. Firing resets the counter's own CTRL to its
+power-on value (an assumption: the headers say only that SCRATCH persists, and the SDK never disables
+a watchdog left enabled), so TIME stops at 0 and it never fires twice. Each PAUSE bit stops it while
+its debug state (`HALTED_CORE0/1`, `HALTED_JTAG`) holds; no board has a debugger yet, so they pass none.
+
+**The RP2350's reset** (`Rp2350.watchdog_reset`, datasheet 7.4 and 12.9): each PSM stage WDSEL selects
+goes back to power-on, one by one, not cascading (the SDK selects all but ROSC and XOSC and relies on
+those two surviving): ROSC, XOSC, RESETS (every peripheral held and reset), CLOCKS with TICKS (an
+assumption: TICKS has no stage of its own), BOOTRAM's locks and WRITE_ONCE (its words kept), XIP and
+QMI (the flash part kept), SIO, ACCESSCTRL; PROC0 and PROC1 go to the board. Where RESETS' stage is not
+selected, RESETS.WDSEL's peripherals go into reset instead. Kept: REASON and SCRATCH, POWMAN, PSM's own
+registers, the SRAM's contents. WDSEL 0 resets nothing and still records REASON. The expiry is a
+device event (`next_event`), so a board whose cores sleep wakes for it.
+
+**The Arm board's restart** (`ArmBoard.restart`): a core whose stage was reset stops at `Stop.Reset`
+before its next access (after the store, for TRIGGER), under both executors; between quanta core 1
+goes back to the ROM wait and core 0 boots as the ROM boots it after a watchdog reset. Modelled at the
+board, with the SDK's `watchdog_reboot` and crt0 as the spec: SCRATCH4 = 0xb007c0d3 and SCRATCH5 =
+SCRATCH7 ^ -0xb007c0d3 is a PC/SP request (SCRATCH7, SCRATCH6), consumed (SCRATCH4 cleared — an
+assumption); otherwise the normal boot hands over the flash image through its vector table at
+XIP_BASE, as a flash UF2 at power-on. **Refused by name**: a request whose SCRATCH7 is the magic (a
+typed boot, SCRATCH6, e.g. crt0's RAM-image boot — the ROM's boot path, items 6 and 30), and a normal
+boot of a flash with no block marker 0xffffded3 in its first 4 KB (BOOTSEL's USB boot). The ROM gains
+`get_sys_info` answering BOOT_INFO only, from words the board writes: NORMAL or BOOTSEL at power-on
+(by whether the flash holds an image), NORMAL or PC_SP after a watchdog reset — which is what the
+RP2350's `watchdog_caused_reboot` reads. The RISC-V board refuses a reset of a hart's stage by name
+(Q13); the RP2040 `virt*` boards, which have no PSM, stop the cores at `Reset` with the watchdog's base
+as `stop_at` and say so.
+
+`examples/pico2/watchdog.c` (a flash image) runs four boots: fed three times and starved (the reset
+100 ms after the last feed, REASON 0x1, `watchdog_caused_reboot` and `watchdog_enable_caused_reboot`
+yes), `watchdog_reboot(0, 0, 0)` (REASON 0x2, enable-caused no), and a PC/SP `watchdog_reboot` into a
+function that records the boot type (PC_SP) and `watchdog_caused_reboot` (no) before a breakpoint.

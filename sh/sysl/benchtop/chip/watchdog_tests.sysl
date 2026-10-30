@@ -1,0 +1,309 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.v6m as arm
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.rp2350.accessctrl as ac
+import sh.sysl.rp2350.bootram as br
+import sh.sysl.rp2350.clocks as clk
+import sh.sysl.rp2350.powman as pm
+import sh.sysl.rp2350.psm as ps
+import sh.sysl.rp2350.qmi as qm
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.rosc as rs
+import sh.sysl.rp2350.sio as sio_reg
+import sh.sysl.rp2350.ticks as tk
+import sh.sysl.rp2350.watchdog as wd
+import sh.sysl.rp2350.xosc as xr
+import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// The watchdog's reset of the RP2350 (`Rp2350.watchdog_reset`) and the Arm board's restart through
+// the boot ROM's boot path (`ArmBoard.restart`): which PSM stages WDSEL takes down, REASON after each
+// kind of reset, SCRATCH surviving, and the SDK's own watchdog API end to end (examples/pico2/watchdog.c).
+
+private val WATCHDOG = embed("../../../../examples/pico2/watchdog.elf")
+private val BLINK_RAM = embed("../../../../examples/pico2/blink.elf")
+private val RISCV_BLINK = embed("../../../../examples/pico2-riscv/blink.elf")
+private val SRAM = SramMap(0x20000000, 520 * 1024)
+private const MS: u64 = 150000
+private const TENTH_MS: u64 = 15000
+
+private const CTRL: u32 = wd.BASE + wd.CTRL_OFFSET
+private const SET: u32 = 0x2000
+private const PROC0: u32 = ps.WDSEL_PROC0_MASK
+private const PROC1: u32 = ps.WDSEL_PROC1_MASK
+// What the SDK's `_watchdog_enable` selects: every stage but ROSC and XOSC.
+private const SDK_WDSEL: u32 = 0x01FFFFFF & ~(ps.WDSEL_ROSC_MASK | ps.WDSEL_XOSC_MASK)
+
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+
+private place(b: &ArmBoard, at: u32, code: []const u16)
+    for i in 0..<code.len
+        b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
+        b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
+
+// A chip whose watchdog TRIGGERs with `wdsel` in PSM and `resets_wdsel` in RESETS.
+private triggered(c: *Rp2350, wdsel: u32, resets_wdsel: u32) -> Option[u32]
+    wr(c, ps.BASE + ps.WDSEL_OFFSET, wdsel)
+    wr(c, rr.BASE + rr.WDSEL_OFFSET, resets_wdsel)
+    wr(c, CTRL + SET, wd.CTRL_TRIGGER_MASK)
+    c.take_restart()
+
+// One register a stage's reset returns to its power-on value: the stage, the register and a value
+// to write that differs from it.
+struct Probe
+    stage: u32
+    at: u32
+    value: u32
+
+private val PROBES = [
+    Probe(ps.WDSEL_ROSC_MASK, rs.BASE + rs.COUNT_OFFSET, 77),
+    Probe(ps.WDSEL_XOSC_MASK, xr.BASE + xr.STARTUP_OFFSET, 47),
+    Probe(ps.WDSEL_RESETS_MASK, rr.BASE + rr.RESET_OFFSET, 0),
+    Probe(ps.WDSEL_CLOCKS_MASK, clk.BASE + clk.CLK_SYS_DIV_OFFSET, 2 << clk.CLK_SYS_DIV_INT_SHIFT),
+    Probe(ps.WDSEL_CLOCKS_MASK, tk.BASE + tk.WATCHDOG_CYCLES_OFFSET, 11),
+    Probe(ps.WDSEL_XIP_MASK, qm.BASE + qm.M0_TIMING_OFFSET, 0x40000202),
+    Probe(ps.WDSEL_SIO_MASK, sio_reg.BASE + sio_reg.GPIO_OUT_OFFSET, 0x20),
+    Probe(ps.WDSEL_ACCESSCTRL_MASK, ac.BASE + ac.GPIO_NSMASK0_OFFSET, 0xACCE0005),
+]
+
+@test("the watchdog's reset puts back exactly the stages PSM.WDSEL selects, one by one: each probe returns to power-on alone")
+chip_watchdog_wdsel_stages()
+    for p in PROBES
+        for selected in [true, false]
+            var c = rp2350()
+            val before = rd(&c, p.at)
+            wr(&c, p.at, p.value)
+            val changed = rd(&c, p.at)
+            assert(changed != before, s"${hex(p.at)} takes the probe")
+            // The one stage, or every stage but it.
+            val sel = if selected then p.stage else 0x01FFFFFF & ~p.stage
+            assert(triggered(&c, sel, 0).unwrap() == sel)
+            val after = if p.stage == ps.WDSEL_RESETS_MASK then c.resets.held else rd(&c, p.at)
+            if p.stage == ps.WDSEL_RESETS_MASK
+                assert(after == (if selected then 0x1FFFFFFF else 0), s"RESETS selected $selected: ${hex(after)}")
+            else
+                assert(after == (if selected then before else changed), s"${hex(p.at)} selected $selected: ${hex(after)}")
+
+@test("the watchdog's reset keeps REASON, SCRATCH, POWMAN, PSM's registers, BOOTRAM's words and the SRAM stages' state; BOOTRAM's locks go back")
+chip_watchdog_survivors()
+    var c = rp2350()
+    for i in 0u32..<8 do wr(&c, wd.BASE + wd.SCRATCH0_OFFSET + 4 * i, 0xA0 + i)
+    wr(&c, pm.BASE + pm.SCRATCH0_OFFSET, 0x1234)
+    wr(&c, br.BASE, 0xFEED)
+    assert(rd(&c, br.BASE + br.BOOTLOCK0_OFFSET) == 1 && rd(&c, br.BASE + br.BOOTLOCK_STAT_OFFSET) == 0xFE, "lock 0 claimed")
+    wr(&c, ps.BASE + ps.FRCE_ON_OFFSET, ps.FRCE_ON_SRAM3_MASK)
+    assert(triggered(&c, 0x01FFFFFF, 0).unwrap() == 0x01FFFFFF)
+    for i in 0u32..<8 do assert(rd(&c, wd.BASE + wd.SCRATCH0_OFFSET + 4 * i) == 0xA0 + i)
+    assert(rd(&c, wd.BASE + wd.REASON_OFFSET) == wd.REASON_FORCE_MASK)
+    assert(rd(&c, pm.BASE + pm.SCRATCH0_OFFSET) == 0x1234 && rd(&c, br.BASE) == 0xFEED)
+    assert(rd(&c, br.BASE + br.BOOTLOCK_STAT_OFFSET) == 0xFF, "the locks are free again")
+    assert(rd(&c, ps.BASE + ps.WDSEL_OFFSET) == 0x01FFFFFF && rd(&c, ps.BASE + ps.FRCE_ON_OFFSET) == ps.FRCE_ON_SRAM3_MASK)
+    // A power-on clears all of it, REASON with it.
+    c.reset()
+    assert(rd(&c, wd.BASE + wd.REASON_OFFSET) == 0 && rd(&c, wd.BASE + wd.SCRATCH0_OFFSET) == 0 && c.take_restart().is_none())
+
+@test("with WDSEL 0 the watchdog resets nothing but records REASON; without RESETS' stage, RESETS.WDSEL puts its peripherals into reset")
+chip_watchdog_resets_wdsel()
+    var c = rp2350()
+    wr(&c, rr.BASE + rr.RESET_OFFSET, 0)
+    c.resets.complete(~c.resets.held)
+    assert(triggered(&c, 0, 0).unwrap() == 0 && c.resets.held == 0 && !c.restarting(0) && !c.restarting(1))
+    assert(rd(&c, wd.BASE + wd.REASON_OFFSET) == wd.REASON_FORCE_MASK)
+    wr(&c, wd.BASE + wd.SCRATCH0_OFFSET, 3)
+    val uart = rr.RESET_UART0_MASK | rr.RESET_TIMER0_MASK
+    assert(triggered(&c, ps.WDSEL_CLOCKS_MASK, uart).unwrap() == ps.WDSEL_CLOCKS_MASK)
+    assert(c.resets.held == uart && c.resets.done == 0x1FFFFFFF & ~uart, s"${hex(c.resets.held)} ${hex(c.resets.done)}")
+    assert(c.read(0, 0x40070000, 4).unwrap_err() == "UART0 is held in reset (RESETS bit 26): release it before touching 0x40070000")
+    // RESETS' own stage wins: everything held.
+    assert(triggered(&c, ps.WDSEL_RESETS_MASK, uart).unwrap() == ps.WDSEL_RESETS_MASK && c.resets.held == 0x1FFFFFFF && c.resets.done == 0)
+
+@test("PROC0 and PROC1 in WDSEL: the chip marks them for the board, core 1 back in the boot ROM; two resets before the board looks add up")
+chip_watchdog_procs()
+    var c = rp2350()
+    assert(triggered(&c, PROC1, 0).unwrap() == PROC1 && c.take_core1_reset() && c.rom.waiting)
+    wr(&c, ps.BASE + ps.WDSEL_OFFSET, PROC0)
+    wr(&c, CTRL + SET, wd.CTRL_TRIGGER_MASK)
+    assert(c.restarting(0) && !c.restarting(1))
+    wr(&c, ps.BASE + ps.WDSEL_OFFSET, PROC1)
+    wr(&c, CTRL + SET, wd.CTRL_TRIGGER_MASK)
+    assert(c.restarting(0) && c.restarting(1) && c.take_restart().unwrap() == PROC0 | PROC1 && c.take_restart().is_none())
+
+@test("the counter counts TICKS' watchdog generator in clk_sys time: next_event names its firing, and advance fires it there with REASON TIMER")
+chip_watchdog_countdown()
+    var c = rp2350()
+    // clk_ref and clk_sys both on the ring oscillator at power-on: 11 cycles a microsecond.
+    wr(&c, tk.BASE + tk.WATCHDOG_CYCLES_OFFSET, 11)
+    wr(&c, tk.BASE + tk.WATCHDOG_CTRL_OFFSET, tk.WATCHDOG_CTRL_ENABLE_MASK)
+    wr(&c, ps.BASE + ps.WDSEL_OFFSET, SDK_WDSEL)
+    wr(&c, wd.BASE + wd.LOAD_OFFSET, 1000)
+    assert(c.next_event().is_none(), "not enabled: no event")
+    wr(&c, CTRL + SET, wd.CTRL_ENABLE_MASK)
+    assert(c.next_event().unwrap() == 11000, s"${c.next_event()}")
+    c.advance(10999)
+    assert(rd(&c, CTRL) & wd.CTRL_TIME_MASK == 1 && c.take_restart().is_none())
+    c.advance(1)
+    assert(c.take_restart().unwrap() == SDK_WDSEL && rd(&c, wd.BASE + wd.REASON_OFFSET) == wd.REASON_TIMER_MASK)
+    assert(c.next_event().is_none() && rd(&c, CTRL) == 0x07000000, "the reset stopped the counter, and TICKS with CLOCKS")
+    // Fed in time, it never fires.
+    var f = rp2350()
+    wr(&f, tk.BASE + tk.WATCHDOG_CYCLES_OFFSET, 11)
+    wr(&f, tk.BASE + tk.WATCHDOG_CTRL_OFFSET, tk.WATCHDOG_CTRL_ENABLE_MASK)
+    wr(&f, wd.BASE + wd.LOAD_OFFSET, 100)
+    wr(&f, CTRL, wd.CTRL_ENABLE_MASK)
+    for i in 0..<50
+        f.advance(1000)
+        wr(&f, wd.BASE + wd.LOAD_OFFSET, 100)
+    assert(f.take_restart().is_none() && rd(&f, wd.BASE + wd.REASON_OFFSET) == 0)
+
+// A booted board whose core 0 runs `code` at 0x20070000, with WDSEL `wdsel`.
+private watchdog_board(code: []const u16, wdsel: u32) -> &ArmBoard
+    val b = arm_board(SRAM)
+    b.boot(BLINK_RAM).unwrap()
+    place(b, 0x20070000, code)
+    b.cores[0].pc = 0x20070000
+    b.chip.psm.wdsel = wdsel
+    b
+
+// The SDK's `watchdog_reboot` request in SCRATCH4-7: boot at `pc` with `sp`.
+private request(b: &ArmBoard, pc: u32, sp: u32)
+    b.chip.watchdog.scratch[4] = WATCHDOG_BOOT_MAGIC
+    b.chip.watchdog.scratch[5] = pc ^ (0 -% WATCHDOG_BOOT_MAGIC)
+    b.chip.watchdog.scratch[6] = sp
+    b.chip.watchdog.scratch[7] = pc
+
+// Core 0's code: str r1, [r0]; movs r2, #7; bkpt. r0 CTRL's SET alias, r1 TRIGGER.
+private val TRIGGER_CODE = [0x6001u16, 0x2207, 0xBE00]
+
+@test("under both executors a TRIGGER stops core 0 at Stop.Reset on the store when PROC0 is selected, and not otherwise")
+arm_watchdog_trigger_executors()
+    for exec in [&arm.run_match, &arm.run_threaded]
+        for sel in [PROC0, 0x01FFFFFF & ~PROC0]
+            val b = watchdog_board(TRIGGER_CODE, sel)
+            val c = &b.cores[0]
+            c.r[0] = CTRL + SET
+            c.r[1] = wd.CTRL_TRIGGER_MASK
+            arm.set_limit(c, 1000)
+            exec(c)
+            if sel == PROC0
+                assert(c.stop == Stop.Reset && c.stop_at == CTRL + SET && c.r[2] == 0, s"${c.stop} 0x${hex(c.stop_at, 8)} r2 ${c.r[2]}")
+            else
+                assert(c.stop == Stop.Breakpoint && c.r[2] == 7, "core 0 is not reset: it runs on")
+            assert(b.chip.watchdog.reason == wd.REASON_FORCE_MASK)
+
+@test("a core whose stage the watchdog has reset stops at its next access, before making it, whichever the access")
+arm_watchdog_reset_comes_first()
+    // ldr r1, [r0]; bkpt — r0 SIO's GPIO_OUT.
+    val b = watchdog_board([0x6801, 0xBE00], PROC0)
+    val c = &b.cores[0]
+    c.r[0] = sio_reg.BASE + sio_reg.GPIO_OUT_OFFSET
+    c.r[1] = 0x55
+    b.chip.restart = Some(PROC0)
+    arm.set_limit(c, 1000)
+    arm.run_threaded(c)
+    assert(c.stop == Stop.Reset && c.stop_at == sio_reg.BASE + sio_reg.GPIO_OUT_OFFSET && c.r[1] == 0x55, s"${c.stop}")
+
+@test("after the watchdog's reset the board boots core 0 from SCRATCH4-7's PC and SP request, consumes it, and reports PC_SP in BOOT_INFO")
+arm_watchdog_pc_sp_boot()
+    val b = watchdog_board(TRIGGER_CODE, SDK_WDSEL)
+    // Where it lands: movs r3, #9; bkpt.
+    place(b, 0x20070100, [0x2309, 0xBE00])
+    request(b, 0x20070101, 0x20041000)
+    b.cores[0].r[0] = CTRL + SET
+    b.cores[0].r[1] = wd.CTRL_TRIGGER_MASK
+    assert(b.mem.ram[b.rom_at + BOOT_INFO_AT + 1] == u8(BOOT_TYPE_BOOTSEL), "a RAM image on a blank flash: the ROM had gone to BOOTSEL")
+    assert(b.run(10000) == RunEnd.Breakpoint, s"${b.refused}")
+    val c = &b.cores[0]
+    assert(c.r[3] == 9 && c.r[2] == 0 && c.r[13] == 0x20041000 && c.vtor == 0 && c.stop_at == 0x20070102, s"r3 ${c.r[3]} sp 0x${hex(c.r[13])}")
+    assert(b.chip.watchdog.scratch[4] == 0 && b.chip.watchdog.scratch[7] == 0x20070101, "the request is consumed")
+    assert(b.mem.ram[b.rom_at + BOOT_INFO_AT + 1] == u8(BOOT_TYPE_PC_SP) && b.mem.ram[b.rom_at + BOOT_INFO_AT + 2] == 0xFF)
+    assert(!b.started[1] && b.chip.rcp.salted[0] && b.chip.resets.held == 0x1FFFFFFF, "core 1 in the ROM, the RCP salted, RESETS at power-on")
+
+@test("the boots the board cannot make after a watchdog reset end the run by name: a typed boot request, and a normal boot of a blank flash")
+arm_watchdog_boot_refusals()
+    val t = watchdog_board(TRIGGER_CODE, SDK_WDSEL)
+    t.chip.watchdog.scratch[4] = WATCHDOG_BOOT_MAGIC
+    t.chip.watchdog.scratch[6] = 3
+    t.chip.watchdog.scratch[7] = WATCHDOG_BOOT_MAGIC
+    t.chip.watchdog.scratch[5] = 0xFFFFFFFE
+    t.cores[0].r[0] = CTRL + SET
+    t.cores[0].r[1] = wd.CTRL_TRIGGER_MASK
+    assert(t.run(10000) == RunEnd.Fault)
+    assert(t.refused == "core 0: the watchdog's reset asks the boot ROM for a boot of type 3 (SCRATCH6), which is the ROM's own boot path, not modelled (docs/rp-coverage.md items 6 and 30)", t.refused)
+    // A wrong SCRATCH5 is no request: the normal boot, and this flash is blank.
+    val n = watchdog_board(TRIGGER_CODE, SDK_WDSEL)
+    n.chip.watchdog.scratch[4] = WATCHDOG_BOOT_MAGIC
+    n.chip.watchdog.scratch[7] = 0x20070101
+    n.cores[0].r[0] = CTRL + SET
+    n.cores[0].r[1] = wd.CTRL_TRIGGER_MASK
+    assert(n.run(10000) == RunEnd.Fault)
+    assert(n.refused == "core 0: the watchdog's reset leaves the boot ROM a normal boot, and the flash holds no image (no block marker 0xffffded3 in its first 4 KB): the ROM would enter BOOTSEL's USB boot, which is not modelled", n.refused)
+    // A PC without its Thumb bit: the core faults on its first instruction.
+    val e = watchdog_board(TRIGGER_CODE, SDK_WDSEL)
+    request(e, 0x20070100, 0x20041000)
+    e.cores[0].r[0] = CTRL + SET
+    e.cores[0].r[1] = wd.CTRL_TRIGGER_MASK
+    assert(e.run(10000) == RunEnd.Fault && e.cores[0].stop == Stop.Fault && e.cores[0].stop_at == 0x20070100)
+
+@test("a watchdog firing while both cores sleep wakes the board at its time, and the reset reboots core 0")
+arm_watchdog_wakes_sleepers()
+    // wfi; b . — core 0 sleeps, and nothing else would wake it.
+    val b = watchdog_board([0xBF30, 0xE7FD], SDK_WDSEL)
+    place(b, 0x20070100, [0xBE00])
+    val ch = &b.chip
+    ch.write(0, tk.BASE + tk.WATCHDOG_CYCLES_OFFSET, 4, 11).unwrap()
+    ch.write(0, tk.BASE + tk.WATCHDOG_CTRL_OFFSET, 4, tk.WATCHDOG_CTRL_ENABLE_MASK).unwrap()
+    ch.write(0, wd.BASE + wd.LOAD_OFFSET, 4, 2000).unwrap()
+    ch.write(0, CTRL, 4, wd.CTRL_ENABLE_MASK).unwrap()
+    request(b, 0x20070101, 0x20041000)
+    val start = ch.now
+    assert(b.run(100000000) == RunEnd.Breakpoint, s"${b.refused}")
+    // 2000 µs at 11 cycles each, plus at most a quantum.
+    val took = b.chip.now - start
+    assert(took >= 22000 && took <= 22000 + 1000, s"$took cycles")
+    assert(b.chip.watchdog.reason == wd.REASON_TIMER_MASK && b.cores[0].stop_at == 0x20070100)
+
+@test("on the RISC-V board a watchdog reset of a hart ends the run by name; one that spares both harts does not")
+riscv_watchdog_reset()
+    val b = riscv_board(SRAM)
+    b.boot(RISCV_BLINK).unwrap()
+    b.chip.psm.wdsel = PROC0
+    b.chip.write(0, CTRL + SET, 4, wd.CTRL_TRIGGER_MASK).unwrap()
+    assert(b.run(100000) == RunEnd.Fault)
+    // Hart 0 at its next access to the chip, or the chip between quanta, whichever comes first.
+    assert(b.refused.ends_with(": the watchdog has reset the chip, and restarting the RISC-V harts through the boot ROM is not modelled (docs/rp-coverage.md Q13: Arm first)"), b.refused)
+    val k = riscv_board(SRAM)
+    k.boot(RISCV_BLINK).unwrap()
+    k.chip.psm.wdsel = ps.WDSEL_SIO_MASK
+    k.chip.write(0, CTRL + SET, 4, wd.CTRL_TRIGGER_MASK).unwrap()
+    assert(k.run(1000) == RunEnd.Budget && k.refused.is_empty(), k.refused)
+
+@test("the SDK's watchdog API on a Pico 2 across four boots: starved, TRIGGER, a PC/SP reboot; REASON, SCRATCH and the boot type each time")
+arm_watchdog_program()
+    val b = arm_board(SRAM)
+    b.boot(WATCHDOG).unwrap()
+    var lines: Buf[u64] = buf()
+    var seen: usize = 0
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 1000 * MS
+        end = b.run(TENTH_MS)
+        for i in seen..<b.console.len() do if b.console[i] == u8('\n') then lines.push(b.chip.now)
+        seen = b.console.len()
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+    val text = from_utf8_lossy(b.console.view())
+    val want = "boot 1: reason 0x0, caused no, enable caused no\r\nfed 0\r\nfed 1\r\nfed 2\r\nstarving it\r\n" +
+        "boot 2: reason 0x1, caused yes, enable caused yes\r\nboot 3: reason 0x2, caused yes, enable caused no\r\n"
+    assert(text == want, text)
+    // Fed every 50 ms; the reset 100 ms after the last feed ("fed 2"), and boot 2 prints at once.
+    val starved = lines[5] - lines[3]
+    assert(starved >= 100 * MS && starved <= 100 * MS + 10 * TENTH_MS, s"boot 2 came $starved cycles after the last feed")
+    assert(lines[6] - lines[5] < 2 * MS, "TRIGGER resets at once")
+    // Boot 4: `landed`, entered by the ROM with no runtime, recorded PC_SP and caused-reboot false.
+    val w = b.chip.watchdog
+    assert(w.scratch[0] == 3 && w.scratch[1] == BOOT_TYPE_PC_SP && w.scratch[2] == 0, s"${w.scratch[0]} ${w.scratch[1]} ${w.scratch[2]}")
+    assert(w.reason == wd.REASON_TIMER_MASK && w.scratch[4] == 0, "the 10 ms reboot was a timeout; the request consumed")
+    assert(b.cores[0].r[13] < 0x20081000 && b.cores[0].r[13] > 0x20080000, "on the stack it was given")
+    assert(lines[6] < 1000 * MS)

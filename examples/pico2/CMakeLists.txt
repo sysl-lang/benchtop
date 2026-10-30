@@ -40,6 +40,10 @@ endforeach()
 pico_add_uf2_output(hello_serial_flash)
 
 benchtop_program(qmi_flash qmi_flash.c default)
+
+# A flash image, so that the boot ROM's normal boot after the watchdog's reset finds it again.
+benchtop_program(watchdog watchdog.c default)
+target_link_libraries(watchdog hardware_watchdog)
 target_link_libraries(qmi_flash hardware_xip_cache)
 
 # The whole program in the XIP cache's 16 KB, as the SDK's own `pico_xip_sram_test` is built.

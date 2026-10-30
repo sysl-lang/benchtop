@@ -22,6 +22,12 @@ module sh.sysl.benchtop.virt
 // what the bus does then is not something benchtop will guess at. A device released is reported done
 // in RESET_DONE at once. A chip with no RESETS on its bus has its timer running from the start.
 //
+// **The watchdog's counter counts its ticks too**, and its reset stops the cores at `Stop.Reset`,
+// `stop_at` the watchdog's base: the virt boards have no power-on state machine for the reset to
+// restart, so the run ends there and says so (the chips' reset path is `chip.Rp2350`'s). A run ends
+// where the counter fires, and a board whose cores all sleep wakes there. No debugger halts these
+// cores, so CTRL's PAUSE bits never apply.
+//
 // An access the models refuse stops the core: one to no register at `Stop.Unmapped`, and one of a
 // width, alignment or atomic alias the register does not take at `Stop.Fault`. The three devices are
 // under one lock, which every access takes, whichever thread the core runs on.
@@ -39,12 +45,15 @@ import sysl.threads.Mutex
 struct RpState
     has_resets: bool
     has_timer: bool
+    has_watchdog: bool
+    // The watchdog's base address, where its reset stops a core.
+    watchdog_at: u32
     timer_irqs: [4]int
     live: Mutex[RpLive]
 
 /** The three devices, whether RESETS is on the bus (so it can hold the timer), the clock the timer
- * and the watchdog have been brought to, and the clock the timer's interrupt lines went up at (`NEVER`
- * while none is up).
+ * and the watchdog have been brought to, the clock the timer's interrupt lines went up at (`NEVER`
+ * while none is up), and whether the watchdog has fired, so every core is to stop.
  */
 struct RpLive
     resets: rp.Resets
@@ -53,16 +62,19 @@ struct RpLive
     has_resets: bool
     at: u64
     raised_at: u64
+    fired: bool
 
-private rp_live(has_resets: bool) -> RpLive = RpLive(rp.resets(), rp.timer(), rp.watchdog(), has_resets, 0, NEVER)
+private rp_live(has_resets: bool) -> RpLive = RpLive(rp.resets(), rp.timer(), rp.watchdog(), has_resets, 0, NEVER, false)
 
 /** None of the three on the bus. */
-rp_state() -> RpState = RpState(false, false, [-1;4], Mutex.new(rp_live(false)))
+rp_state() -> RpState = RpState(false, false, false, 0, [-1;4], Mutex.new(rp_live(false)))
 
 // The devices a bus of `ds` has, with the IRQs the chip gives the timer's alarms.
 private[virt] rp_of(ds: []const Mapped) -> RpState
     var has_resets = false
     var has_timer = false
+    var has_watchdog = false
+    var watchdog_at: u32 = 0
     var irqs = [-1;4]
 
     for m in ds
@@ -71,8 +83,11 @@ private[virt] rp_of(ds: []const Mapped) -> RpState
             Timer ->
                 has_timer = true
                 for k in 0..<4 do irqs[k] = m.irqs[k]
+            Watchdog ->
+                has_watchdog = true
+                watchdog_at = m.base
             _ -> ()
-    RpState(has_resets, has_timer, irqs, Mutex.new(rp_live(has_resets)))
+    RpState(has_resets, has_timer, has_watchdog, watchdog_at, irqs, Mutex.new(rp_live(has_resets)))
 
 // The devices as at power-on, at clock 0.
 private[virt] boot_rp(d: *RpState)
@@ -81,7 +96,8 @@ private[virt] boot_rp(d: *RpState)
         s.timer.reset()
         s.watchdog.reset()
         s.at = 0
-        s.raised_at = NEVER)
+        s.raised_at = NEVER
+        s.fired = false)
 
 private timer_held(s: *RpLive) -> bool = s.has_resets && s.resets.held & RESET_TIMER_MASK != 0
 
@@ -101,9 +117,22 @@ private bring(s: *RpLive, t: u64)
     val fires = min(due(s), t)
     val ticks = s.watchdog.advance(t - s.at)
 
+    if s.watchdog.counter.take_fired() != 0 then s.fired = true
     if !timer_held(s) then s.timer.advance(ticks, 0)
     s.at = t
     note_raised(s, fires)
+
+// The clock at which the watchdog's counter fires; `NEVER` while it is stopped.
+private watchdog_due(s: *RpLive) -> u64 = s.watchdog.cycles_to_fire(0) match
+    Some(c) -> s.at +| c
+    None -> NEVER
+
+// The clock at which the next event of the devices on the bus comes: an alarm, or the watchdog firing.
+private next_due(d: *RpState, s: *RpLive) -> u64 =
+    min(if d.has_timer then due(s) else NEVER, if d.has_watchdog then watchdog_due(s) else NEVER)
+
+// Stop `cpu` where the watchdog has fired: its reset is the end of the run.
+private stop_on_reset(d: *RpState, cpu: *Cpu, fired: bool) = if fired then halt(cpu, Stop.Reset, d.watchdog_at)
 
 // The clock at which the timer's next armed alarm fires; `NEVER` where none will.
 private due(s: *RpLive) -> u64
@@ -117,22 +146,27 @@ private due(s: *RpLive) -> u64
         Some(c) -> s.at +| c
         None -> NEVER
 
-/** The clock at which a run is to end for the timer's next alarm; `NEVER` where none will fire. */
+/** The clock at which a run is to end for the timer's next alarm or the watchdog's firing; `NEVER`
+ * where neither will come.
+ */
 private[virt] timer_due(d: *RpState) -> u64
-    if !d.has_timer then return NEVER
+    if !d.has_timer && !d.has_watchdog then return NEVER
 
-    d.live.with(s -> due(s))
+    d.live.with(s -> next_due(d, s))
 
 /** The clock at which the timer's interrupt wakes a sleeping `cpu`; `NEVER` where it will not. A line
  * already up, which another core's access may have brought the timer past an alarm to raise, wakes it
  * at the clock the line went up at; failing that, the next alarm whose interrupt is enabled wakes it
- * where it fires. An alarm that fires and raises nothing has still let the time pass.
+ * where it fires. An alarm that fires and raises nothing has still let the time pass. The watchdog's
+ * firing wakes it too, to be stopped by the reset.
  */
 private[virt] timer_wake(d: *RpState, cpu: *Cpu) -> u64
-    if !d.has_timer then return NEVER
+    if !d.has_timer && !d.has_watchdog then return NEVER
 
-    val (t, enabled, lines, raised) = d.live.with(s -> (due(s), s.timer.enable | s.timer.force, timer_lines(s), s.raised_at))
-    var wake = NEVER
+    val (t, enabled, lines, raised, fires) = d.live.with(s ->
+        (due(s), s.timer.enable | s.timer.force, timer_lines(s), s.raised_at, if d.has_watchdog then watchdog_due(s) else NEVER))
+    var wake = fires
+    if !d.has_timer then return wake
 
     for i in 0..<4
         val n = d.timer_irqs[i]
@@ -144,14 +178,18 @@ private[virt] timer_wake(d: *RpState, cpu: *Cpu) -> u64
 
     wake
 
-/** Raise in `cpu` the timer's interrupts that are raised at its clock. */
+/** Raise in `cpu` the timer's interrupts that are raised at its clock, or stop it where the watchdog
+ * has fired.
+ */
 private[virt] signal_rp(d: *RpState, cpu: *Cpu)
-    if !d.has_timer then return
+    if !d.has_timer && !d.has_watchdog then return
 
-    val lines = d.live.with(s ->
+    val (lines, fired) = d.live.with(s ->
         bring(s, board_time(cpu, cpu.retired))
-        timer_lines(s))
+        (timer_lines(s), s.fired))
 
+    stop_on_reset(d, cpu, fired)
+    if !d.has_timer then return
     for i in 0..<4
         val n = d.timer_irqs[i]
 
@@ -160,15 +198,19 @@ private[virt] signal_rp(d: *RpState, cpu: *Cpu)
 // A device's half of an access the board's bus sent it, `n` instructions retired before the one
 // making it.
 private[virt] rp_read(st: *RpState, cpu: *Cpu, d: Device, a: u32, o: u32, width: u32, n: u64) -> u32
-    val (held, got) = st.live.with(s ->
+    val (held, got, fired) = st.live.with(s ->
         bring(s, board_time(cpu, n))
 
         val held = d == Device.Timer && timer_held(s)
-        (held, if held then Ok(0u32) else d match
+        (held, if held || s.fired then Ok(0u32) else d match
             Resets -> s.resets.read(o, width)
             Watchdog -> s.watchdog.read(o, width)
-            _ -> s.timer.read(o, width)))
+            _ -> s.timer.read(o, width), s.fired))
 
+    // The reset came before the access, which is not made.
+    if fired
+        stop_on_reset(st, cpu, true)
+        return 0
     if held
         in_reset(cpu, a)
         return 0
@@ -180,23 +222,32 @@ private[virt] rp_read(st: *RpState, cpu: *Cpu, d: Device, a: u32, o: u32, width:
             0
 
 private[virt] rp_write(st: *RpState, cpu: *Cpu, d: Device, a: u32, o: u32, width: u32, x: u32, n: u64)
-    val (held, got, t) = st.live.with(s ->
+    val (held, got, t, fired) = st.live.with(s ->
         bring(s, board_time(cpu, n))
 
         val held = d == Device.Timer && timer_held(s)
-        val got = if held then Ok(()) else d match
+        // Where the reset came first, the write is not made.
+        val got = if held || s.fired then Ok(()) else d match
             Resets ->
                 val r = s.resets.write(o, width, x)
 
                 if timer_held(s) then s.timer.reset()
                 s.resets.complete(rp.RESET_BITS)
                 r
-            Watchdog -> s.watchdog.write(o, width, x)
+            Watchdog ->
+                // TRIGGER fires it at once.
+                val r = s.watchdog.write(o, width, x)
+
+                if s.watchdog.counter.take_fired() != 0 then s.fired = true
+                r
             _ -> s.timer.write(o, width, x)
         // A write may raise a line (an alarm set to the time, INTF) or clear one (INTR).
         note_raised(s, s.at)
-        (held, got, due(s)))
+        (held, got, next_due(st, s), s.fired))
 
+    if fired
+        stop_on_reset(st, cpu, true)
+        return
     if held
         in_reset(cpu, a)
         return

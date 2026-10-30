@@ -3,6 +3,7 @@ module sh.sysl.benchtop.chip
 import sh.sysl.benchtop.riscv as rv
 import sh.sysl.benchtop.riscv.{Insn, Stop}
 import sh.sysl.elf
+import sh.sysl.rp2350.psm as psm_reg
 import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
 import sysl.math.min
@@ -20,6 +21,13 @@ import sysl.math.min
 // quantum through its decode cache, a device access is timed at the quantum's start plus the hart's
 // instructions into it, and the chip is brought to the quantum's end before the next. While both
 // harts sleep the board skips to the next device event. A hart that EBREAKs ends the run.
+//
+// **A watchdog reset that takes down a hart's PSM stage ends the run**, named: restarting the harts
+// through the boot ROM is the Arm board's (`ArmBoard`) and comes to this one with the RISC-V boot
+// path (docs/rp-coverage.md Q13, Arm first). The chip's own reset (`Rp2350.watchdog_reset`) is made.
+
+// Why a watchdog reset of a hart ends the run.
+private const RESTART_REFUSED: string = "the watchdog has reset the chip, and restarting the RISC-V harts through the boot ROM is not modelled (docs/rp-coverage.md Q13: Arm first)"
 
 /** Where and how large the SRAM is: the description's `ram`. */
 struct SramMap
@@ -106,14 +114,26 @@ impl RiscvBoard
                     _ -> return RunEnd.Fault
             self.chip.catch_up(self.quantum_at + q)
             self.settle()
+            if self.watchdog_reset() then return RunEnd.Fault
             if self.asleep()
                 val next = self.chip.next_event() match
                     Some(n) -> n
                     None -> return RunEnd.Asleep
                 self.chip.advance(min(next, limit - self.chip.now))
                 self.settle()
+                if self.watchdog_reset() then return RunEnd.Fault
         RunEnd.Budget
     end run
+
+    // Whether a watchdog reset since the last call has taken down a hart's PSM stage, which ends the
+    // run with `refused` saying so.
+    private watchdog_reset(*self) -> bool
+        val stages = self.chip.take_restart() match
+            Some(s) -> s
+            None -> return false
+        if stages & (psm_reg.WDSEL_PROC0_MASK | psm_reg.WDSEL_PROC1_MASK) == 0 then return false
+        if self.refused.is_empty() then self.refused = s"the chip: $RESTART_REFUSED"
+        true
 
     /** The harts that have started are all asleep. */
     asleep(self) -> bool
@@ -152,6 +172,9 @@ end RiscvBoard
 impl rv.Bus for RiscvBoard
     read(*self, cpu: *rv.Cpu, a: u32, width: u32, n: u64) -> u32
         self.chip.catch_up(self.at(cpu, n))
+        if self.chip.restarting(cpu.hart)
+            self.refuse(cpu, a, RESTART_REFUSED)
+            return 0
         self.chip.read(cpu.hart, a, width) match
             Ok(v) -> v
             Err(why) ->
@@ -160,6 +183,11 @@ impl rv.Bus for RiscvBoard
 
     write(*self, cpu: *rv.Cpu, a: u32, width: u32, x: u32, n: u64)
         self.chip.catch_up(self.at(cpu, n))
+        if self.chip.restarting(cpu.hart)
+            self.refuse(cpu, a, RESTART_REFUSED)
+            return
         self.chip.write(cpu.hart, a, width, x) match
-            Ok(_) -> self.settle()
+            Ok(_) ->
+                self.settle()
+                if self.chip.restarting(cpu.hart) then self.refuse(cpu, a, RESTART_REFUSED)
             Err(why) -> self.refuse(cpu, a, why)

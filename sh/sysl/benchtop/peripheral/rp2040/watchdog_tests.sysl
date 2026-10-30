@@ -1,0 +1,194 @@
+module sh.sysl.benchtop.peripheral.rp2040
+@tests
+
+import sh.sysl.rp2040.watchdog as wd
+
+// The watchdog's counter (`WatchdogCounter`), which both chips share at the same offsets: every
+// register and field against `hardware/regs/watchdog.h`, with the RP2040's step of 2 (erratum
+// RP2040-E1) and the RP2350's of 1.
+
+private const PAUSES: u32 = 0x07000000
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const XOR: u32 = 0x1000
+
+private time(w: WatchdogCounter) -> u32 = w.read(wd.CTRL_OFFSET, 4).unwrap() & wd.CTRL_TIME_MASK
+
+// A counter of `step` loaded with `load` and enabled with the power-on PAUSE bits.
+private running(step: u32, load: u32) -> WatchdogCounter
+    var w = watchdog_counter(step)
+    w.write(wd.LOAD_OFFSET, 4, load).unwrap()
+    w.write(wd.CTRL_OFFSET + SET, 4, wd.CTRL_ENABLE_MASK).unwrap()
+    w
+
+@test("the counter powers up stopped: CTRL 0x07000000, LOAD and REASON 0, every SCRATCH 0, and no tick moves it")
+watchdog_power_on()
+    for step in [1u32, 2]
+        var w = watchdog_counter(step)
+        assert(w.read(wd.CTRL_OFFSET, 4).unwrap() == PAUSES && w.read(wd.LOAD_OFFSET, 4).unwrap() == 0)
+        assert(w.read(wd.REASON_OFFSET, 4).unwrap() == 0)
+        for i in 0u32..<8 do assert(w.read(wd.SCRATCH0_OFFSET + 4 * i, 4).unwrap() == 0)
+        assert(w.ticks_to_fire(0).is_none())
+        w.advance(0xFFFFFFFFFFFFFFFF, 0)
+        assert(w.take_fired() == 0 && time(w) == 0, "not enabled: a stopped counter")
+
+@test("CTRL keeps ENABLE and the PAUSE bits; TIME is read-only, bits 27-29 are reserved and read 0, TRIGGER reads 0")
+watchdog_ctrl_fields()
+    var w = watchdog_counter(1)
+    w.write(wd.LOAD_OFFSET, 4, 500).unwrap()
+    w.write(wd.CTRL_OFFSET, 4, 0x78FFFFFF).unwrap()
+    assert(w.read(wd.CTRL_OFFSET, 4).unwrap() == wd.CTRL_ENABLE_MASK | 500, "TIME untouched, reserved dropped, PAUSE bits cleared")
+    w.write(wd.CTRL_OFFSET + SET, 4, PAUSES).unwrap()
+    w.write(wd.CTRL_OFFSET + CLR, 4, wd.CTRL_PAUSE_DBG1_MASK).unwrap()
+    w.write(wd.CTRL_OFFSET + XOR, 4, wd.CTRL_PAUSE_JTAG_MASK | wd.CTRL_ENABLE_MASK).unwrap()
+    assert(w.read(wd.CTRL_OFFSET, 4).unwrap() == wd.CTRL_PAUSE_DBG0_MASK | 500, "SET, CLR and XOR")
+    // The byte lanes: byte 3 is ENABLE and the PAUSE bits, byte 0 a lane of TIME.
+    assert(w.read(wd.CTRL_OFFSET + 3, 1).unwrap() == 0x02 && w.read(wd.CTRL_OFFSET, 2).unwrap() == 500)
+    w.write(wd.CTRL_OFFSET + 3, 1, 0x40).unwrap()
+    assert(w.read(wd.CTRL_OFFSET, 4).unwrap() == wd.CTRL_ENABLE_MASK | 500, "a byte is replicated over the word; TIME ignores it")
+    assert(w.take_fired() == 0, "none of those triggered")
+
+@test("LOAD sets TIME, masked to 24 bits, reads 0, and reloads a running counter: feeding it")
+watchdog_load()
+    var w = running(1, 0xFFFFFFFF)
+    assert(time(w) == 0xFFFFFF && w.read(wd.LOAD_OFFSET, 4).unwrap() == 0, "the largest load; LOAD is write-only")
+    w.advance(0xFFFFFE, 0)
+    assert(time(w) == 1 && w.take_fired() == 0)
+    w.write(wd.LOAD_OFFSET, 4, 100).unwrap()
+    assert(time(w) == 100, "fed while running")
+    w.advance(99, 0)
+    w.write(wd.LOAD_OFFSET, 4, 100).unwrap()
+    w.advance(99, 0)
+    assert(w.take_fired() == 0 && time(w) == 1, "fed in time, twice")
+    // An alias applies to 0, what LOAD reads: SET and XOR load the value, CLR loads 0.
+    w.write(wd.LOAD_OFFSET + SET, 4, 300).unwrap()
+    assert(time(w) == 300)
+    w.write(wd.LOAD_OFFSET + XOR, 4, 400).unwrap()
+    assert(time(w) == 400)
+    w.write(wd.LOAD_OFFSET + CLR, 4, 400).unwrap()
+    assert(time(w) == 0)
+    w.write(wd.LOAD_OFFSET, 1, 0xAB).unwrap()
+    assert(time(w) == 0xABABAB, "a byte replicated, masked to 24 bits")
+    w.write(wd.LOAD_OFFSET + 2, 2, 0x1234).unwrap()
+    assert(time(w) == 0x341234)
+    // LOAD while stopped sets TIME too.
+    var s = watchdog_counter(1)
+    s.write(wd.LOAD_OFFSET, 4, 7).unwrap()
+    assert(time(s) == 7 && s.ticks_to_fire(0).is_none())
+
+@test("TIME reaching 0 fires on that tick exactly, step 1 and step 2; a counter enabled at 0 fires on its first tick")
+watchdog_countdown()
+    for n in [1u32, 2, 3, 1000, 0xFFFFFF]
+        var one = running(1, n)
+        assert(one.ticks_to_fire(0).unwrap() == u64(n))
+        one.advance(u64(n) - 1, 0)
+        assert(one.take_fired() == 0 && time(one) == 1, s"$n: one short")
+        one.advance(1, 0)
+        assert(one.take_fired() == wd.REASON_TIMER_MASK, s"$n: fired")
+        // Step 2: TIME n fires after n/2 ticks, rounded up (an odd n reaches 0 from 1).
+        var two = running(2, n)
+        val due = u64((n + 1) / 2)
+        assert(two.ticks_to_fire(0).unwrap() == due)
+        two.advance(due - 1, 0)
+        assert(two.take_fired() == 0 && time(two) == n - 2 * (u32(due) - 1), s"$n: step 2 one short")
+        two.advance(1, 0)
+        assert(two.take_fired() == wd.REASON_TIMER_MASK)
+    var zero = running(1, 0)
+    assert(zero.ticks_to_fire(0).unwrap() == 1)
+    zero.advance(1, 0)
+    assert(zero.take_fired() == wd.REASON_TIMER_MASK)
+    // A skip far past the point fires once, and leaves TIME at 0 and the counter stopped.
+    var far = running(2, 10)
+    far.advance(0xFFFFFFFFFFFFFFFF, 0)
+    assert(far.take_fired() == wd.REASON_TIMER_MASK && far.read(wd.CTRL_OFFSET, 4).unwrap() == PAUSES)
+    far.advance(1000, 0)
+    assert(far.take_fired() == 0 && far.ticks_to_fire(0).is_none(), "the reset stopped it: it does not fire again")
+
+@test("clearing ENABLE freezes TIME; setting it again counts on from there")
+watchdog_enable_pauses()
+    var w = running(1, 50)
+    w.advance(20, 0)
+    w.write(wd.CTRL_OFFSET + CLR, 4, wd.CTRL_ENABLE_MASK).unwrap()
+    w.advance(1000, 0)
+    assert(time(w) == 30 && w.take_fired() == 0 && w.ticks_to_fire(0).is_none())
+    w.write(wd.CTRL_OFFSET + SET, 4, wd.CTRL_ENABLE_MASK).unwrap()
+    assert(w.ticks_to_fire(0).unwrap() == 30)
+    w.advance(30, 0)
+    assert(w.take_fired() == wd.REASON_TIMER_MASK)
+
+@test("each PAUSE bit stops the counter only while its own debug state holds: core 0, core 1, JTAG")
+watchdog_pause_on_debug()
+    val states = [HALTED_CORE0, HALTED_CORE1, HALTED_JTAG]
+    val bits = [wd.CTRL_PAUSE_DBG0_MASK, wd.CTRL_PAUSE_DBG1_MASK, wd.CTRL_PAUSE_JTAG_MASK]
+    for i in 0..<3
+        // With every PAUSE bit set (power-on), each state pauses it.
+        var w = running(1, 10)
+        assert(w.ticks_to_fire(states[i]).is_none())
+        w.advance(100, states[i])
+        assert(time(w) == 10 && w.take_fired() == 0)
+        // With only this one's bit clear, its state does not pause it, the other two still do.
+        w.write(wd.CTRL_OFFSET + CLR, 4, bits[i]).unwrap()
+        assert(w.ticks_to_fire(states[i]).unwrap() == 10)
+        for j in 0..<3 do if j != i then assert(w.ticks_to_fire(states[j]).is_none() && w.ticks_to_fire(states[i] | states[j]).is_none())
+        w.advance(4, states[i])
+        assert(time(w) == 6)
+    // With no PAUSE bit set, nothing pauses it.
+    var w = running(1, 10)
+    w.write(wd.CTRL_OFFSET + CLR, 4, PAUSES).unwrap()
+    w.advance(10, HALTED_CORE0 | HALTED_CORE1 | HALTED_JTAG)
+    assert(w.take_fired() == wd.REASON_TIMER_MASK)
+
+@test("TRIGGER fires at once, enabled or not, through a write, SET, XOR and a byte; CLR never; REASON says FORCE alone")
+watchdog_trigger()
+    for alias in [0u32, SET, XOR]
+        var w = watchdog_counter(1)
+        w.write(wd.CTRL_OFFSET + alias, 4, wd.CTRL_TRIGGER_MASK).unwrap()
+        assert(w.take_fired() == wd.REASON_FORCE_MASK && w.read(wd.REASON_OFFSET, 4).unwrap() == wd.REASON_FORCE_MASK)
+        assert(w.read(wd.CTRL_OFFSET, 4).unwrap() == PAUSES, "TRIGGER reads 0; the reset leaves CTRL at power-on")
+    var c = running(1, 10)
+    c.write(wd.CTRL_OFFSET + CLR, 4, wd.CTRL_TRIGGER_MASK).unwrap()
+    assert(c.take_fired() == 0 && time(c) == 10)
+    c.write(wd.CTRL_OFFSET + 3, 1, 0x80).unwrap()
+    assert(c.take_fired() == wd.REASON_FORCE_MASK, "the byte holding bit 31")
+    // A timeout after a TRIGGER says TIMER alone, and a TRIGGER after a timeout FORCE alone.
+    var t = running(2, 2)
+    t.write(wd.CTRL_OFFSET, 4, wd.CTRL_TRIGGER_MASK).unwrap()
+    t.write(wd.LOAD_OFFSET, 4, 2).unwrap()
+    t.write(wd.CTRL_OFFSET, 4, wd.CTRL_ENABLE_MASK).unwrap()
+    t.advance(1, 0)
+    assert(t.read(wd.REASON_OFFSET, 4).unwrap() == wd.REASON_TIMER_MASK && t.take_fired() == wd.REASON_TIMER_MASK)
+    // Two firings before the chip takes one: the last is what it takes.
+    t.write(wd.CTRL_OFFSET, 4, wd.CTRL_TRIGGER_MASK).unwrap()
+    t.write(wd.LOAD_OFFSET, 4, 0).unwrap()
+    t.write(wd.CTRL_OFFSET, 4, wd.CTRL_ENABLE_MASK).unwrap()
+    t.advance(1, 0)
+    assert(t.take_fired() == wd.REASON_TIMER_MASK && t.take_fired() == 0)
+
+@test("REASON is read-only through every alias and width; SCRATCH0-7 keep their values through the watchdog's reset")
+watchdog_reason_and_scratch()
+    var w = watchdog_counter(1)
+    for i in 0u32..<8 do w.write(wd.SCRATCH0_OFFSET + 4 * i, 4, 0xC0DE0000 + i).unwrap()
+    w.write(wd.CTRL_OFFSET, 4, wd.CTRL_TRIGGER_MASK).unwrap()
+    for alias in [0u32, SET, CLR, XOR]
+        w.write(wd.REASON_OFFSET + alias, 4, 0xFFFFFFFF).unwrap()
+        w.write(wd.REASON_OFFSET + alias, 1, 0).unwrap()
+    assert(w.read(wd.REASON_OFFSET, 4).unwrap() == wd.REASON_FORCE_MASK && w.read(wd.REASON_OFFSET, 1).unwrap() == 2)
+    for i in 0u32..<8 do assert(w.read(wd.SCRATCH0_OFFSET + 4 * i, 4).unwrap() == 0xC0DE0000 + i, s"SCRATCH$i")
+    // Narrow and alias writes of a SCRATCH register.
+    w.write(wd.SCRATCH7_OFFSET + 1, 1, 0x5A).unwrap()
+    assert(w.read(wd.SCRATCH7_OFFSET, 4).unwrap() == 0x5A5A5A5A)
+    w.write(wd.SCRATCH7_OFFSET + CLR, 4, 0x0F0F0F0F).unwrap()
+    assert(w.read(wd.SCRATCH7_OFFSET + 2, 2).unwrap() == 0x5050)
+    // Power-on clears them, and REASON with them.
+    w.power_on(1)
+    assert(w.read(wd.SCRATCH7_OFFSET, 4).unwrap() == 0 && w.read(wd.REASON_OFFSET, 4).unwrap() == 0)
+
+@test("the counter refuses a bad width, an unaligned access and anything past SCRATCH7, and leaves itself unchanged")
+watchdog_counter_refusals()
+    var w = running(1, 10)
+    assert(w.read(wd.CTRL_OFFSET, 3).unwrap_err() == AccessError.InvalidWidth)
+    assert(w.write(wd.LOAD_OFFSET + 1, 2, 5).unwrap_err() == AccessError.Unaligned)
+    assert(w.write(wd.CTRL_OFFSET + 2, 4, wd.CTRL_TRIGGER_MASK).unwrap_err() == AccessError.Unaligned)
+    assert(w.read(wd.SCRATCH7_OFFSET + 4, 4).unwrap_err() == AccessError.Unmapped && w.write(0xFFC, 4, 1).unwrap_err() == AccessError.Unmapped)
+    assert(w.read(0x4000, 4).unwrap_err() == AccessError.Unmapped, "past the aliases")
+    assert(time(w) == 10 && w.take_fired() == 0)

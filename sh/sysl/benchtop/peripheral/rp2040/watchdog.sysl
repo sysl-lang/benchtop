@@ -47,33 +47,111 @@ struct TickGenerator
         self.count = cycles
 end TickGenerator
 
-// The watchdog's tick generator and its scratch registers. The watchdog counter itself (CTRL, LOAD,
-// REASON) is not modelled, and an access to it is refused as unmapped.
-struct Watchdog
-    tick: TickGenerator
+/** The debug states that can pause the watchdog's counter, as bits of `halted`: core 0 halted by a
+ * debugger, core 1 halted, and the JTAG port reaching the bus. Each pauses it only where CTRL's
+ * matching PAUSE bit is set.
+ */
+const HALTED_CORE0: u32 = 1
+const HALTED_CORE1: u32 = 2
+const HALTED_JTAG: u32 = 4
+
+// CTRL's power-on value: stopped, with all three PAUSE bits set (`WATCHDOG_CTRL_RESET`, 0x07000000).
+private const CTRL_POWER_ON: u32 = reg.CTRL_PAUSE_DBG1_MASK | reg.CTRL_PAUSE_DBG0_MASK | reg.CTRL_PAUSE_JTAG_MASK
+// The CTRL bits that are stored as written: ENABLE and the three PAUSE bits.
+private const CTRL_STORED: u32 = reg.CTRL_ENABLE_MASK | CTRL_POWER_ON
+
+/** The watchdog's counter, which the RP2040 (datasheet 4.7) and the RP2350 (12.9) share at the same
+ * offsets (`hardware/regs/watchdog.h`): CTRL, LOAD, REASON and SCRATCH0–7.
+ *
+ * - **TIME** (CTRL 23:0, read-only) counts down once per watchdog tick while ENABLE is set and no
+ *   selected PAUSE applies, by `step`: 2 on the RP2040, whose counter decrements twice per tick
+ *   (erratum RP2040-E1, which the SDK's `WATCHDOG_XFACTOR` allows for), 1 on the RP2350. The tick
+ *   that takes it to 0 fires the watchdog; so does the first tick of a counter enabled at 0.
+ * - **LOAD** (write-only, 23:0, reads 0) sets TIME, whether or not the counter is running: it is how
+ *   the watchdog is fed. An alias write applies to 0, the value a read gives.
+ * - **TRIGGER** (CTRL 31, self-clearing, reads 0) fires the watchdog at once, enabled or not.
+ * - **Firing** is a reset of the chip (the chip takes it from `take_fired`), and of the counter itself:
+ *   CTRL returns to its power-on value, so TIME stops at 0. **REASON** records what fired it, TIMER
+ *   (bit 0) or FORCE (bit 1), and alone; power-on clears it. **SCRATCH0–7** keep their values
+ *   through the watchdog's reset ("information persists through soft reset of the chip").
+ *
+ * That the watchdog's own reset returns CTRL to its power-on value is an assumption: the headers say
+ * only that SCRATCH persists and that REASON logs the last reset. The SDK's start-up never disables
+ * the watchdog, so a counter still enabled at 0 after its reset would fire again at once, which
+ * `hello_watchdog`'s second boot shows it does not.
+ */
+struct WatchdogCounter
+    // CTRL's ENABLE and PAUSE bits as written.
+    ctrl: u32
+    // CTRL.TIME.
+    time: u32
+    step: u32
+    reason: u32
     scratch: [8]u32
+    // The REASON bit of a firing the chip has not yet taken (`take_fired`), or 0.
+    fired: u32
 
-    reset(*self)
-        self.tick.reset(true)
-        for i in 0u32..<8 do self.scratch[i] = 0
+    /** Power-on: stopped, TIME 0, REASON and every SCRATCH 0, decrementing `step` a tick. */
+    power_on(*self, step: u32)
+        self.ctrl = CTRL_POWER_ON
+        self.time = 0
+        self.step = step
+        self.reason = 0
+        for i in 0..<8 do self.scratch[i] = 0
+        self.fired = 0
 
-    running(self) -> bool = self.tick.running()
+    enabled(self) -> bool = self.ctrl & reg.CTRL_ENABLE_MASK != 0
 
-    // The ticks made over `cycles` clk_ref cycles.
-    advance(*self, cycles: u64) -> u64 = self.tick.advance(cycles)
+    /** Whether the counter is stopped: not enabled, or paused by one of the `halted` states its PAUSE
+     * bits select.
+     */
+    paused(self, halted: u32) -> bool
+        if !self.enabled() then return true
+        val pause = (if halted & HALTED_CORE0 != 0 then reg.CTRL_PAUSE_DBG0_MASK else 0) |
+            (if halted & HALTED_CORE1 != 0 then reg.CTRL_PAUSE_DBG1_MASK else 0) |
+            (if halted & HALTED_JTAG != 0 then reg.CTRL_PAUSE_JTAG_MASK else 0)
+        self.ctrl & pause != 0
 
-    // The clk_ref cycles until the `n`th tick from now, n at least 1; None while stopped.
-    cycles_to(self, n: u64) -> Option[u64] = self.tick.cycles_to(n)
+    /** The ticks until the counter fires, at least 1; None while it is stopped. */
+    ticks_to_fire(self, halted: u32) -> Option[u64]
+        if self.paused(halted) then return None
+        Some(if self.time == 0 then 1 else u64((self.time + self.step - 1) / self.step))
 
-    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+    /** `ticks` watchdog ticks pass. */
+    advance(*self, ticks: u64, halted: u32)
+        if ticks == 0 then return
+        val due = self.ticks_to_fire(halted) match
+            Some(n) -> n
+            None -> return
+        if ticks >= due then self.fire(reg.REASON_TIMER_MASK) else self.time -= u32(ticks) * self.step
+
+    /** The reset the counter has made since the last call: REASON's bit for it, or 0. */
+    take_fired(*self) -> u32
+        val f = self.fired
+        self.fired = 0
+        f
+
+    // The watchdog fires: REASON says why, and the counter's own reset stops it.
+    private fire(*self, why: u32)
+        self.reason = why
+        self.fired = why
+        self.ctrl = CTRL_POWER_ON
+        self.time = 0
+
+    /** A read of CTRL, LOAD, REASON or a SCRATCH register; any other offset is `Unmapped`. */
+    read(self, offset: u32, width: u32) -> Result[u32, AccessError]
         access(offset, width, true)?
         val address = offset & 0xFFC
         if address >= reg.SCRATCH0_OFFSET && address <= reg.SCRATCH7_OFFSET
             return Ok(read_lane(self.scratch[(address - reg.SCRATCH0_OFFSET) >> 2], offset, width))
-        if address != reg.TICK_OFFSET then return Err(AccessError.Unmapped)
-        Ok(read_lane(self.tick_value(), offset, width))
-    end read
+        val value = address match
+            reg.CTRL_OFFSET -> self.ctrl | self.time
+            reg.LOAD_OFFSET -> 0
+            reg.REASON_OFFSET -> self.reason
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
 
+    /** A write of CTRL, LOAD, REASON (read-only, so dropped) or a SCRATCH register. */
     write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
         access(offset, width, true)?
         val address = offset & 0xFFC
@@ -82,12 +160,64 @@ struct Watchdog
             val i = (address - reg.SCRATCH0_OFFSET) >> 2
             self.scratch[i] = written(self.scratch[i], offset, data)
             return Ok(())
-        if address != reg.TICK_OFFSET then return Err(AccessError.Unmapped)
-        val t = &self.tick
-        val now = written(t.cycles | (if t.enable then reg.TICK_ENABLE_MASK else 0), offset, data)
-        t.set(now & reg.TICK_CYCLES_MASK, now & reg.TICK_ENABLE_MASK != 0)
+        address match
+            reg.CTRL_OFFSET ->
+                val now = written(self.ctrl | self.time, offset, data)
+                self.ctrl = now & CTRL_STORED
+                if now & reg.CTRL_TRIGGER_MASK != 0 then self.fire(reg.REASON_FORCE_MASK)
+            reg.LOAD_OFFSET -> self.time = written(0, offset, data) & reg.LOAD_LOAD_MASK
+            reg.REASON_OFFSET -> ()
+            _ -> return Err(AccessError.Unmapped)
         Ok(())
     end write
+end WatchdogCounter
+
+/** The watchdog's counter at power-on, decrementing `step` a tick. */
+watchdog_counter(step: u32) -> WatchdogCounter
+    var state: WatchdogCounter
+    state.power_on(step)
+    state
+
+/** The RP2040's watchdog: its tick generator (TICK) and its counter, which counts the tick twice. */
+struct Watchdog
+    tick: TickGenerator
+    counter: WatchdogCounter
+
+    reset(*self)
+        self.tick.reset(true)
+        self.counter.power_on(2)
+
+    running(self) -> bool = self.tick.running()
+
+    /** The ticks made over `cycles` clk_ref cycles, which the counter counts. */
+    advance(*self, cycles: u64) -> u64 = self.advance_while(cycles, 0)
+
+    /** The ticks made over `cycles` clk_ref cycles; the counter counts them unless `halted` pauses it. */
+    advance_while(*self, cycles: u64, halted: u32) -> u64
+        val ticks = self.tick.advance(cycles)
+        self.counter.advance(ticks, halted)
+        ticks
+
+    // The clk_ref cycles until the `n`th tick from now, n at least 1; None while stopped.
+    cycles_to(self, n: u64) -> Option[u64] = self.tick.cycles_to(n)
+
+    /** The clk_ref cycles until the counter fires; None while it or the tick is stopped. */
+    cycles_to_fire(self, halted: u32) -> Option[u64] = self.counter.ticks_to_fire(halted) match
+        Some(n) -> self.tick.cycles_to(n)
+        None -> None
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        if offset & 0xFFC != reg.TICK_OFFSET then return self.counter.read(offset, width)
+        Ok(read_lane(self.tick_value(), offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        if offset & 0xFFC != reg.TICK_OFFSET then return self.counter.write(offset, width, value)
+        val t = &self.tick
+        val now = written(t.cycles | (if t.enable then reg.TICK_ENABLE_MASK else 0), offset, replicated(value, width))
+        t.set(now & reg.TICK_CYCLES_MASK, now & reg.TICK_ENABLE_MASK != 0)
+        Ok(())
 
     private tick_value(self) -> u32
         val t = self.tick
