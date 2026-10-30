@@ -22,13 +22,14 @@ function(benchtop_program target source type)
 endfunction()
 
 # RAM images: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
-foreach(prog hello_serial blink rcp gpioc stack_limit tt clock_report)
+foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report)
     benchtop_program(${prog} ${prog}.c no_flash)
 endforeach()
 
 # rcp.c uses the redundancy coprocessor's header directly.
 target_link_libraries(rcp hardware_rcp)
 target_link_libraries(stack_limit hardware_exception)
+target_link_libraries(interp hardware_interp pico_multicore)
 # ACLE's TTA and TTAT intrinsics are only declared for code built for the Security Extension.
 target_compile_options(tt PRIVATE -mcmse)
 
@@ -45,3 +46,10 @@ target_link_libraries(qmi_flash hardware_xip_cache)
 benchtop_program(xip_sram xip_sram.c xip_ram)
 pico_minimize_runtime(xip_sram INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
 target_compile_definitions(xip_sram PRIVATE PICO_HEAP_SIZE=0x200)
+
+# A busy loop from XIP_SRAM, and the same loop from SRAM, for measuring the two paths side by side.
+benchtop_program(xip_loop xip_loop.c xip_ram)
+pico_minimize_runtime(xip_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
+target_compile_definitions(xip_loop PRIVATE PICO_HEAP_SIZE=0x200)
+benchtop_program(sram_loop xip_loop.c no_flash)
+pico_minimize_runtime(sram_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)

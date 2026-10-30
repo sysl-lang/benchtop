@@ -106,6 +106,10 @@ struct Memory
     flash: [4194304]u8
     // One entry per 4 KB page of the 4 GB address space (`PAGES`).
     page_table: [1048576]usize
+    // One bit per 4 KB page, set for a page of one of the other RAM regions that is not read-only: a
+    // store inside such a page whose entry is not 0 writes in place (`store_page`). A board that takes
+    // a page off the fast path clears its entry, and the bit is not consulted.
+    bank_store_pages: [16384]u64
     // One byte per 64-byte line of RAM, and what a store to the line must do besides the store
     // itself: `LINE_CODE` once a record has been decoded from it or from the 3 bytes after it,
     // `LINE_WATCHED` once a load-exclusive has read it or the 3 bytes after it.
@@ -167,6 +171,10 @@ struct Memory
     code_offset(*self, a: u32) -> u32
         if a >= self.ram_base && u64(a) + 2 <= u64(self.ram_base) + u64(self.ram_size) then return a - self.ram_base
         if self.flash_range(a, 2) then return FLASH_OFFSET + a - self.flash_base
+        // Another region's page on the fast path holds its offset in the backing: a branch into a
+        // pinned XIP_SRAM page, or a boot ROM, finds its record without searching the regions.
+        val page = self.page_table[a >> PAGE_SHIFT] -% usize(&self.ram[0])
+        if page < usize(RAM_BYTES) && a & PAGE_MASK <= PAGE_MASK - 1 then return u32(page) + (a & PAGE_MASK)
         val offset = self.extra_ram_offset(a, 2)
         if offset != NO_RAM then offset else NO_CODE
 
@@ -199,7 +207,7 @@ end Memory
  * Its count is atomic, since a machine's cores run on threads of their own.
  */
 memory() -> &sync Memory =
-    Memory(0, RAM_BYTES, 0x10000000, 0, [RamBank(0, 0, 0); 7], 0, 0, [0; 1048576], [0; 4194304], [0; 1048576], [0; 16384],
+    Memory(0, RAM_BYTES, 0x10000000, 0, [RamBank(0, 0, 0); 7], 0, 0, [0; 1048576], [0; 4194304], [0; 1048576], [0; 16384], [0; 16384],
         [[0; 16384]; 2], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442],
         [null; 2621442], [null; 2621442])
 
@@ -208,6 +216,9 @@ memory() -> &sync Memory =
 // page's first byte, or 0 for a page with no fast path.
 const PAGE_SHIFT: u32 = 12
 const PAGES = 1 << 20
+const PAGE_BYTES: u32 = 4096
+// An address's offset in its page.
+const PAGE_MASK: u32 = PAGE_BYTES - 1
 
 // A line of RAM is the unit a store is checked against for code, once it is on a page that holds some.
 const LINE_SHIFT: u32 = 6
@@ -485,6 +496,7 @@ reset(cpu: *Cpu, mem: &sync Memory, image: []const u8, entry: u32)
     for i in 0..<image.len do mem.ram[i] = image[i]
     for i in 0..<mem.page_table.len do mem.page_table[i] = 0
     for p in 0..<(RAM_BYTES >> PAGE_SHIFT) do mem.page_table[p] = usize(&mem.ram[p << PAGE_SHIFT])
+    for i in 0..<mem.bank_store_pages.len do mem.bank_store_pages[i] = 0
     for i in 0..<mem.code_lines.len do mem.code_lines[i] = 0
     for i in 0..<mem.code_lines.len
         mem.line_stores[0][i] = 0
@@ -817,19 +829,36 @@ addr_of(cpu: *Cpu, ip: *Insn) -> u32 = cpu.mem.code_address(u32(ip - cpu.dec) <<
 @inline
 page_of(cpu: *Cpu, a: u32) -> usize = cpu.pages[a >> PAGE_SHIFT]
 
-// The page of the `width` bytes at `a`, or 0 where they run past the RAM's last byte. The RAM is one
-// host array, so an access across a page boundary inside it is still one host access; only an
-// unaligned access at the RAM's very end would reach the host memory after it, and it takes the
-// slow path, which stops the core on it.
+// The page of the `width` bytes at `a`, or 0 where they run past the RAM's last byte. Every entry that
+// is not 0 is a whole page of the RAM, of another RAM region or of the flash, and a board takes a page
+// off the fast path by clearing its entry (a pinned XIP_SRAM page unpinned, the flash in direct mode),
+// so for an access inside one page the table is the whole test, whichever region it is in.
 @inline
-page_for(cpu: *Cpu, a: u32, width: u32) -> usize = if cpu.mem.ram_range(a, width) || cpu.mem.flash_range(a, width) then page_of(cpu, a) else 0
+page_for(cpu: *Cpu, a: u32, width: u32) -> usize
+    if a & PAGE_MASK <= PAGE_BYTES - width then return page_of(cpu, a)
+    straddling_page(cpu, a, width)
+
+// An access across a page boundary. Each region is one host array, so one inside a region is still one
+// host access where both pages are on the fast path; one at a region's very end would reach the host
+// memory after it, and one into a page a board has taken off the fast path would miss its check, so
+// both take the slow path.
+@noinline
+@cold
+private straddling_page(cpu: *Cpu, a: u32, width: u32) -> usize =
+    if (cpu.mem.ram_range(a, width) || cpu.mem.flash_range(a, width)) && page_of(cpu, a + width - 1) != 0 then page_of(cpu, a) else 0
 
 // The page a store of `width` bytes at `a` may write through: RAM only. Flash is read-only to the
 // guest, so a store that touches it finds no page and takes the slow path, which faults it; a store
 // to a read-only RAM region takes it to the bus. The fast path pays nothing for the protection: the
-// first region's test is the same, and the others' is made off it.
+// first region's test is the same, and another region's page is one bit (`bank_store_pages`).
 @inline
-store_page(cpu: *Cpu, a: u32, width: u32) -> usize = if cpu.mem.ram_store_range(a, width) then page_of(cpu, a) else 0
+store_page(cpu: *Cpu, a: u32, width: u32) -> usize
+    val mem = cpu.mem
+    if a >= mem.ram_base && u64(a) + u64(width) <= u64(mem.ram_base) + u64(mem.ram_size) then return page_of(cpu, a)
+    if a & PAGE_MASK <= PAGE_BYTES - width
+        val page = a >> PAGE_SHIFT
+        return if (mem.bank_store_pages[page >> 6] >> u64(page & 63)) & 1 != 0 then page_of(cpu, a) else 0
+    if mem.extra_store_range(a, width) && page_of(cpu, a + width - 1) != 0 then page_of(cpu, a) else 0
 
 // The slow path of a read, `width` bytes at `a`.
 slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
@@ -1111,7 +1140,10 @@ reset_mapped(cpu: *Cpu, mem: &sync Memory, image: []const u8, map: MemoryMap)
         assert(u64(bank.offset) + u64(bank.size) <= u64(RAM_BYTES), "RAM bank fits backing")
         mem.extra_ram[mem.extra_ram_count] = bank
         mem.extra_ram_count += 1
-        for p in 0..<(bank.size >> PAGE_SHIFT) do mem.page_table[(bank.base >> PAGE_SHIFT) + p] = usize(&mem.ram[bank.offset + (p << PAGE_SHIFT)])
+        for p in 0..<(bank.size >> PAGE_SHIFT)
+            val page = (bank.base >> PAGE_SHIFT) + p
+            mem.page_table[page] = usize(&mem.ram[bank.offset + (p << PAGE_SHIFT)])
+            mem.bank_store_pages[page >> 6] |= 1u64 << u64(page & 63)
     mem.install_ram_guards(&mem.decoded[0])
     for i in 0..<mem.flash_size do mem.flash[i] = image[usize(RAM_BYTES + i)]
     for p in 0..<(mem.flash_size >> PAGE_SHIFT) do mem.page_table[(mem.flash_base >> PAGE_SHIFT) + p] = usize(&mem.flash[p << PAGE_SHIFT])
@@ -1121,7 +1153,13 @@ reset_mapped(cpu: *Cpu, mem: &sync Memory, image: []const u8, map: MemoryMap)
  * fast path, while a store to it goes to the bus (`Bus.write`), which says why it is refused.
  */
 read_only(mem: &sync Memory, base: u32)
-    for i in 0..<mem.extra_ram_count do if mem.extra_ram[i].base == base then mem.read_only_banks |= 1u32 << u32(i)
+    for i in 0..<mem.extra_ram_count
+        val b = mem.extra_ram[i]
+        if b.base != base then continue
+        mem.read_only_banks |= 1u32 << u32(i)
+        for p in 0..<(b.size >> PAGE_SHIFT)
+            val page = (b.base >> PAGE_SHIFT) + p
+            mem.bank_store_pages[page >> 6] &= ~(1u64 << u64(page & 63))
 
 /** `length` bytes of flash from `offset` have been changed by something other than a core's store (a
  * flash device being programmed or erased): every record decoded from them, and every record that

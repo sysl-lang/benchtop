@@ -1,0 +1,169 @@
+module sh.sysl.benchtop.peripheral.rp2040
+
+import sh.sysl.rp2040.sio as reg
+
+// One of a core's two interpolators (RP2040 datasheet 2.3.1.6, RP2350 datasheet "Interpolator"; the
+// SDK's `hardware/regs/sio.h` INTERP0_*/INTERP1_* and `hardware_interp`). Both chips put two in each
+// core's SIO, INTERP0 at 0x080 and INTERP1 at 0x0C0, with one register layout, so an offset here is
+// relative to the interpolator (`interp_hw_t`). They differ in two places: INTERP0 has BLEND and INTERP1
+// has CLAMP (each a bit of lane 0's CTRL the other does not store), and a lane's SHIFT is a logical right
+// shift on the RP2040 and a right rotate on the RP2350.
+//
+// Each lane takes its own accumulator, or the other lane's with CROSS_INPUT; shifts or rotates it; keeps
+// bits MASK_LSB to MASK_MSB (none where MASK_LSB is above MASK_MSB); and sign-extends from MASK_MSB where
+// SIGNED. That is the lane's shift-and-mask value. A lane's result is its BASE plus that value, or plus
+// the unshifted input with ADD_RAW; FULL is BASE2 plus both lanes' values whatever ADD_RAW says. PEEK
+// reads a result; POP reads one and writes both lane results back into the accumulators, each into the
+// other lane's with CROSS_RESULT. FORCE_MSB is ORed into bits 29:28 of a lane result as the bus reads
+// it, and is not part of what POP writes back.
+
+/** The lane-control bits every lane stores: SHIFT, MASK_LSB, MASK_MSB, SIGNED, CROSS_INPUT, CROSS_RESULT,
+ * ADD_RAW and FORCE_MSB. Lane 0 adds BLEND on INTERP0 and CLAMP on INTERP1; OVERF0, OVERF1 and OVERF
+ * are read-only.
+ */
+const INTERP_LANE_BITS: u32 = reg.INTERP0_CTRL_LANE1_SHIFT_MASK | reg.INTERP0_CTRL_LANE1_MASK_LSB_MASK | reg.INTERP0_CTRL_LANE1_MASK_MSB_MASK |
+    reg.INTERP0_CTRL_LANE1_SIGNED_MASK | reg.INTERP0_CTRL_LANE1_CROSS_INPUT_MASK | reg.INTERP0_CTRL_LANE1_CROSS_RESULT_MASK |
+    reg.INTERP0_CTRL_LANE1_ADD_RAW_MASK | reg.INTERP0_CTRL_LANE1_FORCE_MSB_MASK
+
+struct Interp
+    accum: [2]u32
+    base: [3]u32
+    ctrl: [2]u32
+    // 0 for INTERP0, which blends; 1 for INTERP1, which clamps.
+    index: u32
+    // Whether SHIFT rotates (the RP2350) rather than shifts (the RP2040).
+    rotate: bool
+
+    reset(*self)
+        self.accum = [0; 2]
+        self.base = [0; 3]
+        self.ctrl = [0; 2]
+
+    /** Lane `i`'s shift-and-mask value: what ACCUMi_ADD reads. */
+    shift_mask(self, i: usize) -> u32
+        val v = self.shifted(i) & self.mask(i)
+        val msb = self.mask_msb(i)
+        if self.signed(i) && v & (1u32 << msb) != 0 then v | (~0u32 << msb) else v
+
+    /** Lane `i`'s result as POP writes it back, without FORCE_MSB. */
+    lane(self, i: usize) -> u32
+        if self.blending()
+            // Lane 0 answers the blend's alpha, lane 1 the blend.
+            val alpha = self.shift_mask(1) & 0xFF
+            return if i == 0 then alpha else self.blend(alpha)
+        if i == 0 && self.clamping() then return self.clamp()
+        val from = if self.ctrl[i] & reg.INTERP0_CTRL_LANE0_ADD_RAW_MASK != 0 then self.input(i) else self.shift_mask(i)
+        self.base[i] +% from
+
+    /** FULL: BASE2 and lane 0's shift-and-mask value, and lane 1's but in blend mode. */
+    full(self) -> u32 = self.base[2] +% self.shift_mask(0) +% (if self.blending() then 0 else self.shift_mask(1))
+
+    /** A word read at `offset` within the interpolator. A POP read is the one with a side effect. */
+    read(*self, offset: u32) -> Result[u32, AccessError]
+        val value = reg.INTERP0_ACCUM0_OFFSET + offset match
+            reg.INTERP0_ACCUM0_OFFSET -> self.accum[0]
+            reg.INTERP0_ACCUM1_OFFSET -> self.accum[1]
+            reg.INTERP0_BASE0_OFFSET -> self.base[0]
+            reg.INTERP0_BASE1_OFFSET -> self.base[1]
+            reg.INTERP0_BASE2_OFFSET -> self.base[2]
+            reg.INTERP0_POP_LANE0_OFFSET -> self.pop(0)
+            reg.INTERP0_POP_LANE1_OFFSET -> self.pop(1)
+            reg.INTERP0_POP_FULL_OFFSET -> self.pop(2)
+            reg.INTERP0_PEEK_LANE0_OFFSET -> self.peek(0)
+            reg.INTERP0_PEEK_LANE1_OFFSET -> self.peek(1)
+            reg.INTERP0_PEEK_FULL_OFFSET -> self.full()
+            reg.INTERP0_CTRL_LANE0_OFFSET -> self.ctrl[0] | self.overflow()
+            reg.INTERP0_CTRL_LANE1_OFFSET -> self.ctrl[1]
+            reg.INTERP0_ACCUM0_ADD_OFFSET -> self.shift_mask(0)
+            reg.INTERP0_ACCUM1_ADD_OFFSET -> self.shift_mask(1)
+            // BASE_1AND0 is write-only (`interp_hw_t.base01` is `io_wo_32`).
+            reg.INTERP0_BASE_1AND0_OFFSET -> 0
+            _ -> return Err(AccessError.Unmapped)
+        Ok(value)
+    end read
+
+    /** A word written at `offset` within the interpolator. The PEEK and POP registers ignore a write. */
+    write(*self, offset: u32, x: u32) -> Result[unit, AccessError]
+        reg.INTERP0_ACCUM0_OFFSET + offset match
+            reg.INTERP0_ACCUM0_OFFSET -> self.accum[0] = x
+            reg.INTERP0_ACCUM1_OFFSET -> self.accum[1] = x
+            reg.INTERP0_BASE0_OFFSET -> self.base[0] = x
+            reg.INTERP0_BASE1_OFFSET -> self.base[1] = x
+            reg.INTERP0_BASE2_OFFSET -> self.base[2] = x
+            reg.INTERP0_POP_LANE0_OFFSET | reg.INTERP0_POP_LANE1_OFFSET | reg.INTERP0_POP_FULL_OFFSET -> ()
+            reg.INTERP0_PEEK_LANE0_OFFSET | reg.INTERP0_PEEK_LANE1_OFFSET | reg.INTERP0_PEEK_FULL_OFFSET -> ()
+            reg.INTERP0_CTRL_LANE0_OFFSET -> self.ctrl[0] = x & (INTERP_LANE_BITS | self.mode_bit())
+            reg.INTERP0_CTRL_LANE1_OFFSET -> self.ctrl[1] = x & INTERP_LANE_BITS
+            // ACCUMi_ADD is a 24-bit field (`sio.h`: bits 23:0), added to the whole accumulator.
+            reg.INTERP0_ACCUM0_ADD_OFFSET -> self.accum[0] +%= x & reg.INTERP0_ACCUM0_ADD_INTERP0_ACCUM0_ADD_MASK
+            reg.INTERP0_ACCUM1_ADD_OFFSET -> self.accum[1] +%= x & reg.INTERP0_ACCUM1_ADD_INTERP0_ACCUM1_ADD_MASK
+            // The low half to BASE0 and the high half to BASE1, each sign-extended where its lane is SIGNED.
+            reg.INTERP0_BASE_1AND0_OFFSET ->
+                self.base[0] = self.half(0, x & 0xFFFF)
+                self.base[1] = self.half(1, x >> 16)
+            _ -> return Err(AccessError.Unmapped)
+        Ok(())
+    end write
+
+    // PEEK of lane `i`, or of FULL where `i` is 2.
+    private peek(self, i: usize) -> u32 =
+        if i == 2 then self.full() else self.lane(i) | ((self.ctrl[i] & reg.INTERP0_CTRL_LANE0_FORCE_MSB_MASK) << (28 - reg.INTERP0_CTRL_LANE0_FORCE_MSB_SHIFT))
+
+    // POP: the PEEK, then each accumulator takes its lane's result, or the other lane's with CROSS_RESULT.
+    private pop(*self, i: usize) -> u32
+        val got = self.peek(i)
+        val r0 = self.lane(0)
+        val r1 = self.lane(1)
+        self.accum[0] = if self.crossed_result(0) then r1 else r0
+        self.accum[1] = if self.crossed_result(1) then r0 else r1
+        got
+
+    // The CTRL_LANE0 mode bit this interpolator stores: BLEND on INTERP0, CLAMP on INTERP1.
+    private mode_bit(self) -> u32 = if self.index == 0 then reg.INTERP0_CTRL_LANE0_BLEND_MASK else reg.INTERP1_CTRL_LANE0_CLAMP_MASK
+
+    private blending(self) -> bool = self.index == 0 && self.ctrl[0] & reg.INTERP0_CTRL_LANE0_BLEND_MASK != 0
+    private clamping(self) -> bool = self.index == 1 && self.ctrl[0] & reg.INTERP1_CTRL_LANE0_CLAMP_MASK != 0
+    private signed(self, i: usize) -> bool = self.ctrl[i] & reg.INTERP0_CTRL_LANE0_SIGNED_MASK != 0
+    private crossed_result(self, i: usize) -> bool = self.ctrl[i] & reg.INTERP0_CTRL_LANE0_CROSS_RESULT_MASK != 0
+    private mask_msb(self, i: usize) -> u32 = (self.ctrl[i] & reg.INTERP0_CTRL_LANE0_MASK_MSB_MASK) >> reg.INTERP0_CTRL_LANE0_MASK_MSB_SHIFT
+    private mask_lsb(self, i: usize) -> u32 = (self.ctrl[i] & reg.INTERP0_CTRL_LANE0_MASK_LSB_MASK) >> reg.INTERP0_CTRL_LANE0_MASK_LSB_SHIFT
+
+    // Lane `i`'s input: its own accumulator, or the other lane's with CROSS_INPUT.
+    private input(self, i: usize) -> u32 = if self.ctrl[i] & reg.INTERP0_CTRL_LANE0_CROSS_INPUT_MASK != 0 then self.accum[1 - i] else self.accum[i]
+
+    private shifted(self, i: usize) -> u32
+        val n = self.ctrl[i] & reg.INTERP0_CTRL_LANE0_SHIFT_MASK
+        if self.rotate then self.input(i).rotate_right(n) else self.input(i) >> n
+
+    // Bits MASK_LSB to MASK_MSB inclusive; none where MASK_LSB is above MASK_MSB.
+    private mask(self, i: usize) -> u32 = (~0u32 << self.mask_lsb(i)) & (~0u32 >> (31 - self.mask_msb(i)))
+
+    // OVERF0 and OVERF1: a lane's shifted input has a bit set above its MASK_MSB. OVERF: either.
+    private overflow(self) -> u32
+        var bits: u32 = 0
+        for i in 0..<2
+            if self.shifted(i) & ~(~0u32 >> (31 - self.mask_msb(i))) != 0 then bits |= reg.INTERP0_CTRL_LANE0_OVERF0_MASK << u32(i)
+        if bits != 0 then bits | reg.INTERP0_CTRL_LANE0_OVERF_MASK else 0
+
+    // Blend: BASE0 + alpha/256 of the way to BASE1, the bases signed where lane 1 is SIGNED.
+    private blend(self, alpha: u32) -> u32
+        val a = i64(alpha)
+        val x0 = if self.signed(1) then i64(i32.wrap(self.base[0])) else i64(self.base[0])
+        val x1 = if self.signed(1) then i64(i32.wrap(self.base[1])) else i64(self.base[1])
+        u32.wrap((x0 * (256 - a) + x1 * a) >> 8)
+
+    // Clamp: lane 0's shift-and-mask value held to BASE0 below and BASE1 above (BASE0 is tested first),
+    // compared signed where lane 0 is SIGNED.
+    private clamp(self) -> u32
+        val v = self.shift_mask(0)
+        val (low, high) = (self.base[0], self.base[1])
+        if self.signed(0)
+            if i32.wrap(v) < i32.wrap(low) then low elif i32.wrap(v) > i32.wrap(high) then high else v
+        else if v < low then low elif v > high then high else v
+
+    // A BASE_1AND0 half for lane `i`, sign-extended from bit 15 where the lane is SIGNED.
+    private half(self, i: usize, h: u32) -> u32 = if self.signed(i) && h & 0x8000 != 0 then h | 0xFFFF0000 else h
+end Interp
+
+/** INTERP0 (`index` 0) or INTERP1 (`index` 1) at reset; `rotate` on the RP2350. */
+interp(index: u32, rotate: bool) -> Interp = Interp([0; 2], [0; 3], [0; 2], index, rotate)
