@@ -22,9 +22,10 @@ function(benchtop_program target source type)
 endfunction()
 
 # RAM images: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
-foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp aon_timer rom otp)
+foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp aon_timer rom otp hello_gpio_irq gpio_irq)
     benchtop_program(${prog} ${prog}.c no_flash)
 endforeach()
+target_link_libraries(gpio_irq pico_multicore)
 # rom.c calls the boot ROM's functions, the flash's among them, from SRAM.
 target_link_libraries(rom hardware_flash hardware_watchdog)
 target_compile_definitions(rom PRIVATE PICO_ALWAYS_INCLUDE_FLASH_ID_FUNCTIONS=1)

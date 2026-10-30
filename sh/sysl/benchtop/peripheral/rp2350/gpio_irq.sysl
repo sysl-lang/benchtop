@@ -1,0 +1,146 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, read_lane, w1c, written}
+
+// The user bank's GPIO interrupts (datasheet 9.5, "Interrupts"; `hardware/regs/io_bank0.h`), the same
+// on both chips but for the number of GPIOs and where the registers start: the RP2350's 48 GPIOs from
+// INTR0 at 0x230, the RP2040's 30 from 0xF0.
+//
+// Each GPIO has four interrupt sources, a nibble of its own in the 8-GPIO words: LEVEL_LOW (bit 0) and
+// LEVEL_HIGH (1), which follow the GPIO's interrupt input as it is, and EDGE_LOW (2) and EDGE_HIGH (3),
+// which latch a falling and a rising edge of it until a 1 written to INTR clears them, through any
+// alias. INTR is raw: it latches whatever is enabled. Three destinations each have their own INTE
+// (enables) and INTF (forces), and read INTS = (INTR | INTF) & INTE: processor 0, processor 1 and the
+// dormant wake. A destination's line is asserted while any of its INTS bits is set; processor k's is
+// IO_IRQ_BANK0 in core k, and the dormant wake's wakes an oscillator in DORMANT.
+//
+// The interrupt input is the pad's input (`Pin.input`: 0 while the input is disabled or the pad
+// isolated) after the GPIO's IRQOVER, which the chip applies (`IoBank0.irq_input`).
+
+/** The most GPIOs a bank has (the RP2350's 48); a word of INTR covers 8. */
+const IRQ_WORDS_MAX: u32 = 6
+
+/** The destinations of the GPIO interrupts: processor 0, processor 1, and the dormant wake. */
+const DORMANT_WAKE: u32 = 2
+
+// A word's nibbles: the LEVEL_LOW, LEVEL_HIGH, EDGE_LOW and EDGE_HIGH bits of all eight GPIOs.
+private const LEVEL_LOW_BITS: u32 = 0x11111111
+private const EDGE_BITS: u32 = 0xCCCCCCCC
+
+struct GpioIrq
+    // GPIOs in the bank, the words they take, and the offset of INTR0.
+    count: u32
+    words: u32
+    intr_at: u32
+    // The interrupt inputs as last sampled, bit n for GPIO n, and the latched edges, INTR's layout.
+    inputs: u64
+    edges: [IRQ_WORDS_MAX]u32
+    // INTE and INTF for destination d at word w: [d * IRQ_WORDS_MAX + w].
+    inte: [3 * IRQ_WORDS_MAX]u32
+    intf: [3 * IRQ_WORDS_MAX]u32
+    // Each destination's line, worked out again whenever anything it depends on changes.
+    lines: [3]bool
+
+    /** Reset: nothing latched, enabled or forced; the inputs are kept, as the pads still see them. */
+    reset(*self)
+        for w in 0..<IRQ_WORDS_MAX do self.edges[w] = 0
+        for i in 0..<(3 * IRQ_WORDS_MAX)
+            self.inte[i] = 0
+            self.intf[i] = 0
+        self.update()
+
+    /** Whether destination `d`'s line is asserted (0 and 1 the processors, `DORMANT_WAKE`). */
+    line(self, d: u32) -> bool = self.lines[d]
+
+    /** The GPIOs whose INTS for destination `d` has any bit set, bit n for GPIO n (IRQSUMMARY). */
+    summary(self, d: u32) -> u64
+        var bits: u64 = 0
+        for w in 0..<self.words
+            val s = self.ints(d, w)
+            for j in 0u32..<8 do if (s >> (4 * j)) & 0xF != 0 then bits |= 1u64 << u64(8 * w + j)
+        bits
+
+    /** INTR word `w`: the level bits from the inputs, the latched edges. */
+    intr(self, w: u32) -> u32
+        var high: u32 = 0
+        for j in 0u32..<8 do if self.inputs & (1u64 << u64(8 * w + j)) != 0 then high |= 2u32 << (4 * j)
+        val present = self.present(w)
+        (high | ((~high >> 1) & LEVEL_LOW_BITS) | self.edges[w]) & present
+
+    /** INTS word `w` of destination `d`. */
+    ints(self, d: u32, w: u32) -> u32 = (self.intr(w) | self.intf[d * IRQ_WORDS_MAX + w]) & self.inte[d * IRQ_WORDS_MAX + w]
+
+    /** The interrupt inputs are now `now`, bit n for GPIO n: a rising input latches EDGE_HIGH and a
+     * falling one EDGE_LOW, where `latch` holds (not while the bank is held in reset).
+     */
+    sample(*self, now: u64, latch: bool)
+        val was = self.inputs
+        if now == was then return
+        self.inputs = now
+        if latch
+            val rose = now & ~was
+            val fell = was & ~now
+            for n in 0..<self.count
+                val bit = 1u64 << u64(n)
+                if (rose | fell) & bit == 0 then continue
+                val at = 4 * (n % 8)
+                self.edges[n / 8] |= (if rose & bit != 0 then 8u32 else 4u32) << at
+        self.update()
+
+    /** A read of the register at `address` (word-aligned, from INTR0), at `offset` for the lane. */
+    read(self, address: u32, offset: u32, width: u32) -> Result[u32, AccessError]
+        val (group, w) = self.register(address)?
+        val d = if group == 0 then 0 else (group - 1) / 3
+        val v =
+            if group == 0 then self.intr(w)
+            elif (group - 1) % 3 == 0 then self.inte[d * IRQ_WORDS_MAX + w]
+            elif (group - 1) % 3 == 1 then self.intf[d * IRQ_WORDS_MAX + w]
+            else self.ints(d, w)
+        Ok(read_lane(v, offset, width))
+
+    /** A write of `data` (replicated over the word) to the register at `address`. INTR clears the edges
+     * its 1s name, through any alias; INTE and INTF take the alias's operation; INTS is read-only.
+     */
+    write(*self, address: u32, offset: u32, data: u32) -> Result[unit, AccessError]
+        val (group, w) = self.register(address)?
+        if group == 0
+            self.edges[w] = w1c(self.edges[w], data & EDGE_BITS)
+        else
+            val d = (group - 1) / 3
+            val i = d * IRQ_WORDS_MAX + w
+            (group - 1) % 3 match
+                0 -> self.inte[i] = written(self.inte[i], offset, data) & self.present(w)
+                1 -> self.intf[i] = written(self.intf[i], offset, data) & self.present(w)
+                _ -> ()
+        self.update()
+        Ok(())
+
+    // The register at `address`: its group (0 INTR, then INTE, INTF and INTS for each destination in
+    // turn) and its word.
+    private register(self, address: u32) -> Result[(u32, u32), AccessError]
+        if address < self.intr_at then return Err(AccessError.Unmapped)
+        val r = (address - self.intr_at) / 4
+        if r >= 10 * self.words then return Err(AccessError.Unmapped)
+        Ok((r / self.words, r % self.words))
+
+    // The bits of word `w` that belong to a GPIO the bank has.
+    private present(self, w: u32) -> u32
+        val left = self.count - 8 * w
+        if left >= 8 then 0xFFFFFFFF else (1u32 << (4 * left)) - 1
+
+    private update(*self)
+        for d in 0u32..<3
+            var any = false
+            for w in 0..<self.words do if self.ints(d, w) != 0 then any = true
+            self.lines[d] = any
+end GpioIrq
+
+/** A bank of `count` GPIOs whose INTR0 is at `intr_at`, at reset. */
+gpio_irq(count: u32, intr_at: u32) -> GpioIrq
+    var state: GpioIrq
+    state.count = count
+    state.words = (count + 7) / 8
+    state.intr_at = intr_at
+    state.inputs = 0
+    state.reset()
+    state
