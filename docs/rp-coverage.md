@@ -1022,3 +1022,55 @@ board (16 KB) and the OTP block's registers inside `Rp2350` first cost 1.5% on t
 (`row_at`, `row_bits`) and SW_LOCK as bytes. With that: `bench --core cortex-m33 kernel33.bin` 37.17 G to
 37.17 G; `sram_loop.elf` 5.207 G to 5.105 G and `xip_loop.elf` 5.428 G to 5.323 G (2% fewer); `dcp.elf`
 0.961 G to 0.694 G (28% fewer).
+
+### Item 31, done: Non-secure TrustZone
+
+Q3's cut line is lifted: the M33 runs both security states (`v6m/t2nonsecure.sysl`, DESIGN.md §2.7),
+against the ARMv8-M ARM:
+
+- **Banked registers** live where the Secure-only core kept them, as the current state's copy, with
+  the other state's in `Cpu.banked`; a change of state exchanges them. `MRS`/`MSR` of the `_NS`
+  registers (SP_NS as CONTROL_NS.SPSEL selects) reach the bank from Secure state and read zero from
+  Non-secure state. The system control space's Non-secure alias is Non-secure state's view: its own
+  VTOR, CCR, SCR, CPACR (masked by NSACR), MPU, SHPR, SHCSR, CFSR and a second **SysTick**, counting
+  while either state runs; the NVIC registers of the IRQs NVIC_ITNS gives it; SAU, SFSR, SFAR and HFSR
+  reading zero. Both states' PRIMASK, BASEPRI and FAULTMASK raise the execution priority.
+- **Attribution enforced, free on the fast paths.** Non-secure state runs on records and a page table
+  of its own (each the memory's, per core, made on first entry): a page is on the Non-secure table only
+  where all of it is Non-secure, and every other access takes the slow path, which makes it where it is
+  Non-secure and takes SecureFault AUVIOL (SFAR) where not. Decoding judges the address: INVEP for a
+  Secure address from Non-secure state (the entry to Secure state at a Non-secure-callable `SG`),
+  INVTRAN for a Non-secure one from Secure state. The SAU and the IDAU (the boot ROM's NSC region)
+  combine as the more secure answer. A change to the SAU or to a page's mapping remakes the table and
+  forgets the decoded records, through the code-line marks, before the next run.
+- **Transitions:** `SG`, `BXNS`, `BLXNS` (return address and partial RETPSR on the Secure stack,
+  FNC_RETURN, IPSR 1 from handler mode), FNC_RETURN; exceptions to the other state (S, DCRS, ES exact;
+  the callee registers under the integrity signature and R0–R12 cleared from Secure to Non-secure; the
+  signature checked on return, INVIS; ES checked, INVER or INVPC); banked exceptions' Non-secure copies
+  at `NS_BANK` + n in the NVIC's sets; IRQs by NVIC_ITNS. `VLSTM`/`VLLDM`, which libgcc's
+  `__gnu_cmse_nonsecure_call` wraps around BLXNS, are NOPs with no floating-point context active.
+- **ACCESSCTRL** gates every core bus access on the Arm board by master, state and privilege
+  (FORCE_CORE_NS included): a denial is refused by name as silicon's bus fault. Secure privileged code
+  with nothing denied pays two tests.
+- **Refused by name:** a change of state with a floating-point context active (lazy preservation,
+  SFPA), AIRCR.BFHFNMINS or PRIS set, a Non-secure PRIGROUP other than the Secure one, the FP
+  registers' Non-secure view, the PPB alias outside the system control space, the SIO from Non-secure
+  state (its Non-secure bank), and an ACCESSCTRL write restricting a memory device. The MPU is stored
+  per state and answered by `TT`, not enforced.
+
+`examples/pico2/nonsecure.c` with `nonsecure_ns.S` is the oracle: the SDK-built Secure image gives the
+SAU its own Non-secure code, stack and veneer, calls the Non-secure function through a
+`cmse_nonsecure_call` pointer (libgcc's BLXNS sequence), which calls back through `SG` and returns with
+FNC_RETURN (`ns_function(20) = 142 after 1 call(s)`), prints TT of the three regions, and takes
+SecureFault AUVIOL from a Non-secure load of Secure memory in its own handler (`sfsr 00000048`). The
+compiler's `cmse_nonsecure_entry` is not used: GNU ld puts its veneers in `.gnu.sgstubs`, which the
+SDK's linker script does not place, so the veneer and its BXNS return are hand-written.
+`v6m/t2nonsecure_tests.sysl` (20 cases, both executors) covers each transition, fault and refusal;
+`chip/arm_tests.sysl` the oracle and ACCESSCTRL. Breaking the integrity check or the callee clearing
+turns the INVIS and the IRQ cases red.
+
+**Cost**, host instructions retired, three runs each against the branch's base (dev at b544795):
+`bench --core cortex-m33 kernel33.bin` 37.17 G to 36.88 G; `sram_loop.elf` 5.104 G to 5.080 G and
+`xip_loop.elf` 5.330 G to 5.300 G. A first cut cost 0.7% on the loops: the SecureFault test grew the
+slow path that `load` and `store` inline into every handler; it is out of line now (`slow_load`,
+`slow_store`), which is also why the base got faster.
