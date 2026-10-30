@@ -1280,4 +1280,12 @@ divides `clock_get_hz`'s integer before making the float, on silicon as here. `r
 Breaking the synchroniser's delay, autopull's stall, side-set's priority, IRQ REL, X--'s test or the
 divider's rounding each turns its tests red.
 
-**Cost**: COST_PENDING
+**Cost**, host instructions retired, interleaved runs against the branch's base (dev at 92a2019),
+`/usr/bin/time -l`, `benchtop run --board pico2`: `sram_loop.elf` 5.407–5.426 G (median 5.411) to
+5.412–5.422 G (5.413), eight runs each; `xip_loop.elf` 5.631–5.640 G (5.632) to 5.635–5.640 G (5.636);
+`bench --core cortex-m33 kernel33.bin`, which never touches the chip, 36.875–36.897 G to 36.868–36.883 G.
+With no state machine running the chip pays one flag test a quantum (`take_line_fault`), about 0.7 M of
+these runs; the rest of the 0.04–0.06% is the base's own spread between sessions (10 M) and code layout,
+as `kernel33` moving both ways shows. Two first cuts cost 0.08%: a test in `advance` on every clk_sys
+step, and a `take_line_fault` that had grown past inlining; the blocks now run only when something can
+see them, and the rare path is out of line (`next_line_fault`).
