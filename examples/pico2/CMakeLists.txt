@@ -22,7 +22,7 @@ function(benchtop_program target source type)
 endfunction()
 
 # RAM images: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
-foreach(prog hello_serial blink rcp gpioc stack_limit tt interp)
+foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report)
     benchtop_program(${prog} ${prog}.c no_flash)
 endforeach()
 

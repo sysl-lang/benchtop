@@ -80,7 +80,7 @@ day. An L is split before it is handed out (§6).
 | SIO interpolators INTERP0/1 (per core) | 3.1 SIO | full | `peripheral/rp2040/interp.sysl`, shared with the RP2040: each core's own pair; shift (rotate here), mask, SIGNED, CROSS_INPUT, CROSS_RESULT, ADD_RAW, FORCE_MSB, BLEND (INTERP0), CLAMP (INTERP1), OVERF flags, PEEK/POP, ACCUMx_ADD, BASE_1AND0 (item 15). | `rp2040/interp_tests.sysl`, `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
 | SIO TMDS encoder | 3.1 SIO | missing | Refused (`sio.sysl:10`). | — | S | HSTX (for a use) |
 | BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | missing | Not decoded. | — | S (counters) | DMA/cores for events |
-| ACCESSCTRL | 10.6 Access control | missing | Not decoded. DESIGN.md §2.7 says to store it, with the reset state granting Secure code everything. | — | S | — |
+| ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. Nothing else on the chip consults it (Secure-only, Q3). | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | ROM: core-1 launch protocol | 5.3 / 5 Bootrom | partial | The ROM's FIFO echo loop and launch are emulated without ROM code (`chip/rp2350.sysl:271–287`). Core 1 is released by the emulation, not by the real ROM. | `chip/tests.sysl:115` | — | — |
 | ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | partial | On the Arm board, benchtop's own ROM (`chip/rom/rom.S`, read-only at 0): the vector table, the magic and the well-known pointers, the Arm lookup, and `bootrom_state_reset` ('SR'), which has no state to reset. Any other code looks up as 0, as the real ROM answers for a code it lacks. On the RISC-V board a ROM read is refused. | `chip/arm_tests.sysl` | L | XIP/QMI, OTP, BOOTRAM |
 | Boot path: IMAGE_DEF, partition tables, UF2, secure-boot flags, signature check | 5 Bootrom, 10 Security | missing | Boot is the debugger entry into SRAM (`chip/riscv_board.sysl:13–17`). DESIGN.md §9.2 option 3. | — | L | ROM, OTP, XIP, SHA-256 |
@@ -89,13 +89,13 @@ day. An L is split before it is handed out (§6).
 | XIP: flash window, aliases, cache, cache-as-SRAM, XIP_CTRL, streaming FIFO | 4.4 XIP | full | One 4 MB flash array (`parts/qspi_flash`, a W25Q32RV) behind the cached, uncached and untranslated windows, read and executed in place on the cores' fast path from the cached window's first 4 MB (`chip/arm_board.sysl`); the rest through the chip, translated by ATRANS and wrapping at the device's size (`peripheral/rp2350/xip.sysl`). XIP_CTRL in full, the cache's tags with every maintenance operation, lines pinned over XIP_SRAM holding their bytes (a fully pinned page on the fast path, a partly pinned one checked line by line), the streaming FIFO and XIP_AUX. Fidelity limits: the cache is functional, not timed (no lookups, so CTR_HIT/CTR_ACC are refused by name and a read is never stale); a pin over flash, a write through XIP with WRITABLE_M0 set, and code fetched from flash in direct mode or from an unpinned XIP_SRAM line are the cases not run or not refused (item 4 below). | `peripheral/rp2350/xip_tests.sysl`, `chip/xip_tests.sysl` | — | — |
 | QMI (flash and PSRAM interface; direct mode) | 12.14 QMI | full | Direct mode with both FIFOs, NOPUSH, 16-bit entries, ASSERT and AUTO chip selects, RX-full stall and BUSY, all to the flash on CS0; the window, timing and ATRANS registers stored. Instantaneous: no clock divider timing. CS1 (no PSRAM on the Pico 2) and a non-identity ATRANS0-3 are refused by name. The ROM's flash routines (`flash_range_erase` and friends) need item 6. | `peripheral/rp2350/xip_tests.sysl`, `chip/xip_tests.sysl` (`qmi_flash`) | — | — |
 | OTP | 13 OTP | missing | Not decoded. It is read for the unique ID and for boot configuration. | — | M (stored array, ROM access); L (ECC, locks, keys) | ROM |
-| POWMAN, including the AON timer, LPOSC, VREG and BOD control | 6 Power | missing | LPOSC is a constant only (`chip/rp2350.sysl:44`). `vreg_set_voltage` writes POWMAN. | — | M (AON timer + store) | TICKS/clocks |
+| POWMAN, including the AON timer, LPOSC, VREG and BOD control | 6 Power | partial | The store is done: VREG (locked until UNLOCK, VSEL limit), BOD, LPOSC and XOSC settings, SEQ_CFG, CHIP_RESET (HAD_POR), WDSEL, SCRATCH/BOOT, the interrupt registers into IRQs 44 and 45, all behind the 0x5AFE password. Refused by name, for item 27: STATE, the TIMER/time/alarm registers, PWRUP0-3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP, BOOTDIS. LPOSC is still a constant 32768 Hz. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | M (AON timer) | TICKS/clocks |
 | GLITCH_DETECTOR | 10.9 Glitch detector | missing | Not decoded. | — | S (store) | — |
 | RESETS (29 outputs) | 7.5 Subsystem resets | full | `peripheral/rp2350/timing.sysl:15–22` over `rp2040/resets.sysl:7–11`. Release completes at once. | `rp2350/tests.sysl:15`, `chip/tests.sysl:43,81` | — | — |
-| PSM (power-on state machine; FRCE_ON/FRCE_OFF/DONE) | 7.4 Power-on state machine | missing | Not decoded. `multicore_reset_core1` writes FRCE_OFF and polls it before every launch. | — | S | — |
-| CLOCKS | 8.1 Clocks | partial | CTRL and DIV are stored. clk_ref and clk_sys follow their muxes and drive time. SELECTED is one-hot (`peripheral/rp2350/clocks.sysl:25–30`). The frequency counter (FC0) and resus are stored, not run. clk_peri, clk_usb, clk_adc and clk_hstx have no consumer. GPOUT is not driven on a pin. | `rp2350/tests.sysl:112` | M | consumers |
+| PSM (power-on state machine; FRCE_ON/FRCE_OFF/DONE) | 7.4 Power-on state machine | full | The 25-stage sequence: FRCE_OFF holds a stage and those after it, FRCE_ON releases from a later stage, DONE is computed, WDSEL stored. PROC1 forced off stops core 1 and its release re-enters the ROM wait with a 0 for core 0 (`multicore_reset_core1`). Forcing any other stage off is refused by name. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
+| CLOCKS | 8.1 Clocks | partial | CTRL and DIV are stored. clk_ref and clk_sys follow their muxes and drive time. SELECTED is one-hot (`peripheral/rp2350/clocks.sysl:25–30`). The frequency counter FC0 is run (it measures the modelled tree, finishing at once); resus is stored. clk_peri, clk_usb, clk_adc and clk_hstx have frequencies from their AUXSRC and DIV, which FC0 reads, but no consumer. GPOUT is not driven on a pin. | `rp2350/tests.sysl:112`, `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | S | consumers |
 | XOSC | 8.2 Crystal oscillator | partial | STABLE after STARTUP.DELAY×256 (`clocks.sysl:97–105`). DORMANT and COUNT are not modelled. | `rp2350/tests.sysl:81` | S | — |
-| ROSC (including RANDOMBIT) | 8.3 Ring oscillator | missing | Only the nominal frequency (`chip/rp2350.sysl:41–42`). The block is refused, and `pico_rand` reads RANDOMBIT. | — | S | — |
+| ROSC (including RANDOMBIT) | 8.3 Ring oscillator | full | Every register, the code-protected fields with BADWRITE, DORMANT, COUNT. Frequency stays the nominal 11 MHz (Q8) and follows ENABLE and DORMANT. RANDOMBIT is a seeded LFSR (seed 0x3F04B16D at power-on, reloaded by RANDOM, one step per read). | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | TICKS (6 generators) | 8.4 Tick generators | full | `peripheral/rp2350/timing.sysl:24–90`. | `rp2350/tests.sysl:25` | — | — |
 | PLL_SYS, PLL_USB | 8.6 PLL | full | LOCK once powered with an FBDIV. The output frequency is computed (`clocks.sysl:167–225`). Lock is instant. | `rp2350/tests.sysl:81` | — | — |
 | IO_BANK0: FUNCSEL, overrides, STATUS | 9 GPIO | partial | 48 GPIOs with overrides (`peripheral/rp2350/gpio.sysl:7–80`). Only SIO is a real driver. UART TX is "idles high" on `n % 4 == 0` (`chip/rp2350.sysl:299–303`), and no peripheral's bit stream reaches a pin. There is no mux layer for PIO, PWM, SPI or I²C (`docs/peripheral-models.md:17–22`). | `chip/tests.sysl:94`, `rp2350/tests.sysl:183` | M (mux layer) | each peripheral |
@@ -116,8 +116,8 @@ day. An L is split before it is handed out (§6).
 | HSTX | 12.11 HSTX | missing | Not decoded. | — | M | clk_hstx, DMA, mux, a display part |
 | TRNG | 12.12 TRNG | missing | Not decoded. | — | S | — |
 | SHA-256 | 12.13 SHA-256 | missing | Not decoded. | — | S | DMA (for the SDK's DMA path) |
-| SYSINFO (CHIP_ID, PLATFORM, GITREF) | 12.15 System control | missing | Not decoded. The SDK reads it for chip revision and platform. | — | S | — |
-| SYSCFG (NMI masks, proc in-sync bypass, DBGFORCE, mem power-down) | 12.15 System control | missing | Not decoded. | — | S | — |
+| SYSINFO (CHIP_ID, PLATFORM, GITREF) | 12.15 System control | full | CHIP_ID 0x30004927, PACKAGE_SEL 1 (RP2350A), PLATFORM ASIC, GITREF 0; read-only. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
+| SYSCFG (NMI masks, proc in-sync bypass, DBGFORCE, mem power-down) | 12.15 System control | full (stored) | PROC_CONFIG (halted flags read 0), PROC_IN_SYNC_BYPASS(_HI), DBGFORCE, MEMPOWERDOWN (memory is not lost), AUXCTRL stored with their writable bits. | `rp2350/sysctl_tests.sysl` | — | — |
 | TBMAN | 12.15 / 2 System bus | missing | Not decoded. | — | S | — |
 | Debug: SW-DP, RESCUE, CoreSight trace | 3.5 Debug | missing | Debugger *entry* is how images boot. The probe itself is not modelled. | — | L | — |
 
@@ -314,7 +314,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 2 | **M33 Secure-only security minimum** (DESIGN.md §2.7): Secure reset state, SAU stored, `TT*`, SecureFault with SFSR/SFAR, NS transitions stopped by name, and STKOF taken as a UsageFault. **Done** (below). | M | — |
 | 3 | **RCP (CP7) and GPIO coprocessor (CP0)** on a coprocessor port the chip supplies. **Done** (below). | M | 1 |
 | 4 | **XIP flash and QMI**: one flash image behind the 0x1000_0000 aliases, the cache, cache-as-SRAM, XIP_CTRL, QMI stored with direct mode, and the loader writing an ELF's PT_LOAD and a UF2 into flash. `pico_xip_sram_test` is its oracle. **Done** (below). | M | 1 |
-| 5 | **Start-up register blocks**: PSM (FRCE_OFF and DONE), ROSC with RANDOMBIT, BOOTRAM, SYSINFO, SYSCFG, the POWMAN/VREG store, ACCESSCTRL stored, and CLOCKS FC0 measuring the tree. Every refusal in item 1's census is either answered here or named. | M | 1 |
+| 5 | **Start-up register blocks** (done, see "Item 5, done"): PSM (FRCE_OFF and DONE), ROSC with RANDOMBIT, BOOTRAM, SYSINFO, SYSCFG, the POWMAN/VREG store, ACCESSCTRL stored, and CLOCKS FC0 measuring the tree. Every refusal in item 1's census is either answered here or named. | M | 1 |
 | 6 | **Boot ROM function table**: the shape follows Q1; with an HLE ROM, the lookup table plus the functions `runtime_init` and stdio reach. It is split in two if Q1 chooses the real ROM. | L | 4, 5 |
 | 7 | **DCP (CP4/5)**: the double coprocessor. `pico_float_test` and a `printf("%f")` program are its oracles. | M | 3 |
 | 8 | **UART completion**: baud-timed bytes from clk_peri, both UARTs' pins correct, RT timeout, FIFO-level IRQs, break and errors, DREQ outputs. | M | 6 |
@@ -376,6 +376,46 @@ the RCP and MSPLIM itself and vectors through its own table.
 
 Nothing else was refused: RESETS, CLOCKS, XOSC, the PLLs, TICKS, TIMER0, the SIO (spinlocks, GPIO),
 IO_BANK0, PADS_BANK0, UART0 and the NVIC took every access the two programs make as they were.
+
+### Item 5, done: the start-up register blocks
+
+Census rows 5 and 6 (BOOTRAM's boot locks) were answered in item 1 and are tested complete here:
+BOOTRAM is 1 KB, WRITE_ONCE0/1 and BOOTLOCK0-7 with BOOTLOCK_STAT. The new blocks, each in
+`peripheral/rp2350/` and wired into `chip/rp2350.sysl` at the SVD base:
+
+- **PSM** (`psm.sysl`). Stage n out of reset = not FRCE_OFF[n] and (FRCE_ON[n] or stage n-1 out of reset);
+  DONE is that, bit 0 (PROC_COLD) first and bit 24 (PROC1) last. FRCE_OFF wins over FRCE_ON. Releases
+  complete at once. The chip acts on PROC1 only: forced off, core 1 stops (`take_core1_reset`, both
+  boards); released, the ROM wait restarts, core 1's mailbox is drained and a 0 goes to core 0's FIFO,
+  which is what `multicore_reset_core1` waits for. Words core 0 sends while it is held sit unanswered.
+  Forcing any other stage off is refused: `PSM FRCE_OFF of PROC0 is not modelled: only PROC1 can be forced
+  off`. WDSEL is stored for the watchdog item.
+- **ROSC** (`rosc.sysl`). Running at power-on. A wrong code in ENABLE, FREQ_RANGE, DORMANT, DIV or a
+  password field is dropped (ENABLE: enables) and latches STATUS.BADWRITE (write 1 to clear). Frequency is
+  the nominal 11 MHz while enabled and not DORMANT, else 0. **RANDOMBIT**: a 32-bit Galois LFSR (taps
+  x^32+x^22+x^2+x+1, mask 0x80200003) seeded 0x3F04B16D at power-on and reloaded by any write to RANDOM;
+  a read returns bit 0 then steps once (no step while the ring is stopped). The nth read after a load of S
+  is bit 0 of the state n-1 steps on. COUNT counts the ring's cycles down and stops at 0.
+- **SYSINFO**, **SYSCFG**: as in the matrix. PACKAGE_SEL is 1 (the Pico 2's QFN60 RP2350A).
+- **POWMAN** (`powman.sysl`): a store behind the password (data bits 31:16 = 0x5AFE through any alias; a
+  bad one is dropped and latches BADPASSWD). SCRATCH0-7 and BOOT0-3 take no password and all 32 bits. The
+  regulator registers drop writes until VREG_CTRL.UNLOCK is set, and UNLOCK never clears. The AON timer,
+  power states and power-up requests are refused by name for item 27.
+- **ACCESSCTRL** (`accessctrl.sysl`): stored behind the 0xACCE password; the password rules for LOCK and
+  CFGRESET and the lock being per core are assumptions from the register descriptions, since the SDK headers
+  do not state them.
+- **CLOCKS FC0**: a write of FC0_SRC measures at once. RESULT = source Hz x FC0_REF_KHZ x 32 / clk_ref Hz
+  (kHz with 5 fractional bits); PASS/FAIL/SLOW/FAST compare the whole kHz with MIN and MAX. A stopped
+  source or a stopped clk_ref finishes at once with DONE, DIED and FAIL (SLOW too where MIN_KHZ is above
+  0) and a RESULT of 0, rather than WAITING for ever: that is an assumption, since the headers only say
+  DIED is "test clock stopped during test". A source with no model (GPIN0/1, OTP's clock, the DFT tap, a
+  value past 0x10) is refused at the FC0_SRC write by name, `CLOCKS FC0_SRC = 6 is not modelled: ...`, and
+  FC0_SRC keeps its old value. clk_peri, clk_usb, clk_adc and
+  clk_hstx are computed from AUXSRC, DIV and ENABLE/KILL.
+
+`examples/pico2/clock_report.c` prints `clock_get_hz` against `frequency_count_khz` for the six
+generators and the sources, the chip id, PSM DONE, 32 RANDOMBIT bits and the regulator; `chip/startup_tests.sysl`
+asserts every line.
 
 ### Item 2, done: the M33's Secure-only minimum
 
