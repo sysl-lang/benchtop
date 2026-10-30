@@ -112,7 +112,7 @@ day. An L is split before it is handed out (§6).
 | PWM (12 slices) | 12.5 PWM | missing | Only `virt-pwm` (`peripheral/pwm/pwm.sysl`). | — | M | mux, DMA, IRQ |
 | ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
 | DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | missing | Not decoded. | — | L (core) + S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
-| PIO0/1/2 | 11 PIO | missing | Not decoded. DESIGN.md §9.7 costs it at 4–6 agent-days. The RP2350 adds a third block, `MOV` to and from the RX FIFO, and the GPIO base (16/48). | — | L (machine) + M (GPIO/DMA/IRQ) | mux, DMA, IRQ, clk_sys |
+| PIO0/1/2 | 11 PIO | partial | The state machines are full (item 13): every PIO version 1 instruction, delay and side-set, the FIFOs and their joins (FJOIN_RX_GET/PUT too), the shift registers' thresholds, the fractional divider cycle-exact against clk_sys, EXECCTRL, SM_RESTART/CLKDIV_RESTART and their PREV/NEXT forms, SMx_INSTR, the IRQ flags across blocks, INTR and both interrupt lines' INTE/INTF/INTS, FDEBUG, FLEVEL, DBG_PADOUT/PADOE and GPIOBASE (`peripheral/rp2350/pio.sysl`). The pins are a vector of their own: FUNCSEL PIO0–2 stays refused, and the DREQs and the lines into the NVIC are item 14's. | `rp2350/pio_tests.sysl`, `chip/pio_tests.sysl` (`pio_programs.elf`: `hello_pio`, `ws2812`, `uart_tx`, `uart_rx`, the RP2350-only pair) | M (GPIO/DMA/IRQ) | mux, DMA, IRQ |
 | USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | full | The controller in device mode, whole (`peripheral/rp2350/usb.sysl`, item 20): the registers, DPRAM with the SETUP packet, endpoint and buffer control, single and double buffering, NAK, STALL, abort, the interrupts and USBCTRL_IRQ, driven by a host through the Arm board's `usb_*` seam. Not gated by RESETS, since the SDK reads SIE_CTRL before releasing USBCTRL; RESETS asserting it resets the controller. benchtop's own host (`chip/usb_host.sysl`, item 21) enumerates a CDC ACM device on a 1 ms frame schedule and bridges its port to the console or a pty (`benchtop run --usb`). | `peripheral/rp2350/usb_tests.sysl`, `chip/usb_tests.sysl`, `chip/usb_host_tests.sysl`, `host/pty_tests.sysl` | — | clk_usb |
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
 | TIMER0/1 | 12.8 System timers | full | 64-bit counter, latch, 4 alarms, LOCKED, SOURCE (`peripheral/rp2350/timing.sysl:91–145`). | `rp2350/tests.sysl:44`, `chip/tests.sysl:18` | — | — |
@@ -156,7 +156,7 @@ day. An L is split before it is handed out (§6).
 | SYSINFO | 2.20 Sysinfo | full | CHIP_ID 0x20002927 (B2), PLATFORM ASIC, GITREF 0; read-only (item 22). | `chip/pico_tests.sysl` | — | — |
 | SYSCFG | 2.21 Syscfg | missing | Refused by name. | `chip/pico_tests.sysl` | S | — |
 | TBMAN | 2.22 TBMAN | missing | Refused by name (item 28). | — | S | — |
-| PIO0/1 | 3 PIO | missing | The same machine as the RP2350's, with two blocks and no RP2350 additions. | — | (shared) | mux, DMA |
+| PIO0/1 | 3 PIO | missing | The same machine as the RP2350's (`peripheral/rp2350/pio.sysl`, item 13), with two blocks and no RP2350 additions: PREV and NEXT name the one other block, WAIT IRQ's bit 4 is REL, only flags 0–3 reach INTR, and MOV PINDIRS, the RX entries and JMPPIN are reserved. | — | (shared) | mux, DMA |
 | USB controller (device and host) | 4.1 USB | missing | The same controller as the RP2350's. SIE_CTRL alone is stored, ungated, for the SDK's `runtime_init_usb_power_down`; every other register is refused by name (item 22). | `chip/pico_tests.sysl` | (shared) | — |
 | UART0/1 (PL011) | 4.2 UART | partial | The RP2350's `Uart`, placed (item 22): frames timed from clk_peri through `next_event`, its TX on the pins through the mux, IRQs 20 and 21. The workbench's wires and frames sent in from outside (`Rp2350.wire`, `line_in`) are not on the RP2040 yet. | `chip/pico_tests.sysl` (hello_serial) | S (wires) | — |
 | I2C0/1 | 4.3 I2C | missing | Shared. | — | (shared) | — |
@@ -171,7 +171,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 34 | 7 | 0 | 17 | 58 |
+| RP2350 | 34 | 8 | 0 | 16 | 58 |
 | RP2040 | 15 | 7 | 0 | 15 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
@@ -326,7 +326,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 10 | **Watchdog counter and chip reset path**: countdown, TRIGGER, REASON, SCRATCH surviving, and the machine restarting through the boot path. **Done** (below). | M | 5 |
 | 11 | **DMA core**: channels, DREQ inputs, pacing timers, chaining, ring, IRQs. The register model is shared by both chips' channel counts. | L | 9 |
 | 12 | **DMA sniff/CRC and security attributes**. | S | 11 |
-| 13 | **PIO state machine**: the instruction set, FIFOs, shift registers, side-set, divider, IRQ flags, and the RP2350 additions, with register-level tests. | L | 9 |
+| 13 | **PIO state machine**: the instruction set, FIFOs, shift registers, side-set, divider, IRQ flags, and the RP2350 additions, with register-level tests. **Done** (below). | L | 9 |
 | 14 | **PIO integration**: pins through the mux, DREQs, the IRQ lines. `ws2812`, `pio_blink`, `uart_tx` and `uart_rx` are its oracles. | M | 11, 13 |
 | 15 | **Doorbells and interpolators** (shared by both chips). **Done** (below). | M | 1 |
 | 16 | **SPI on the chip**: the PL022 placed, with DREQs. | S | 9, 11 |
@@ -1207,6 +1207,90 @@ turns the INVIS and the IRQ cases red.
 `xip_loop.elf` 5.330 G to 5.300 G. A first cut cost 0.7% on the loops: the SecureFault test grew the
 slow path that `load` and `store` inline into every handler; it is out of line now (`slow_load`,
 `slow_store`), which is also why the base got faster.
+
+### Item 13, done: the PIO state machines
+
+`peripheral/rp2350/pio.sysl` against the field descriptions of `hardware/regs/pio.h`, the encodings of
+`hardware/pio_instructions.h` and the SDK's `pioasm`; the chip places PIO0–2 behind their RESETS bits and
+runs them on clk_sys (`chip/rp2350.sysl` `advance`, `pio_drive`, `pio_pins`).
+
+- **Time**: each state machine runs one cycle on each clk_sys cycle its fractional divider fires: a phase
+  in 1/256 cycles gains 256 a cycle and fires on reaching 256 × INT + FRAC (INT 0 is 65536), so 2.5 runs
+  3, 2, 3, 2 cycles apart and 1.25 on cycles 2, 3, 4, 5, 7. The dividers free-run whether or not their
+  state machines do, and CLKDIV_RESTART (and NEXTPREV_CLKDIV_RESTART) puts the phase at 0; a new
+  divisor keeps the cycles a state machine has left. The phase is worked out from the time when needed,
+  so nothing is counted while no state machine runs. The blocks run to the chip's `now` only when
+  something can see them: a PIO, RESETS or ACCESSCTRL access, `pio_drive` and `pio_pins`, and the
+  faults the board collects each quantum (`take_line_fault`), so the chip's `advance` pays nothing for
+  them. Item 14's pins, DREQs and interrupts will give them events of their own.
+- **Only what changes is run**: a state machine is visited on the cycle its delay ends, its next attempt,
+  or an autopull refill. One stalled on an empty TX FIFO, a full RX FIFO, a pin or an IRQ flag is not
+  visited until a FIFO access, a register write, a level driven onto the inputs or an IRQ flag changes;
+  then it tries again on its next cycle, as it would have. A WAIT on a pin wakes on the cycle the
+  synchroniser brings the level through.
+- **The instruction set**, PIO version 1: JMP's eight conditions (X-- and Y-- decrement either way),
+  WAIT on GPIO (relative to GPIOBASE), PIN (the IN mapping and IN_COUNT), IRQ (polarity 1 clears it) and
+  JMPPIN + 0–3; IN from every source, either direction, the count saturating, autopush at PUSH_THRESH;
+  OUT to every destination, PC, ISR (its count set) and EXEC (its own delay not taken) among them,
+  autopull at PULL_THRESH; PUSH and PULL with IfFull, IfEmpty and Block (a non-blocking PULL of an empty
+  FIFO takes X); MOV with every source (STATUS by TX level, RX level, or an IRQ flag of this block or
+  either neighbour), invert and bit-reverse, to PINS, PINDIRS, EXEC, PC, ISR and OSR (resetting their
+  counts); MOV to and from the RX FIFO's entries by Y or index; IRQ set, wait and clear with REL, PREV
+  and NEXT; SET. Delay, side-set (SIDE_EN, SIDE_PINDIR), wrap (a jump taken at WRAP_TOP wins).
+- **Pins**: a 32-bit level and direction per block in its own numbering, GPIOBASE placing it on GPIO
+  0–31 or 16–47, and GPIO 0–47's levels read through a two-cycle synchroniser per pin that
+  INPUT_SYNC_BYPASS removes. Side-set is made as the instruction issues, even when it stalls, and wins
+  over its own state machine's OUT, SET or MOV; the higher-numbered state machine wins a pin on a cycle;
+  OUT_STICKY asserts the last write again every cycle; INLINE_OUT_EN gates OUT and MOV to the pins by a
+  data bit and lets a sticky write go. Tests drive the vector: FUNCSEL PIO0–2 is still refused, naming
+  item 14.
+- **FIFOs and flags**: 4 and 4, or 8 joined either way with the other reading full and empty; FJOIN_RX_PUT
+  and _GET give the RX storage to MOV and RXFn_PUTGETm (the processor's only while exactly one is set);
+  FSTAT, FLEVEL, FDEBUG's four sticky flags, INTR (RXNEMPTY, TXNFULL, all eight flags), IRQ0/1
+  INTE/INTF/INTS and `irq_line` for item 14. IRQ flags change at the end of the cycle, so another state
+  machine sees one on its next. SM_RESTART, SMx_INSTR (EXEC_STALLED while it stalls) and CTRL's
+  NEXTPREV operations; blocks ACCESSCTRL makes one Non-secure and the other not are disconnected from
+  each other's PREV and NEXT, as the datasheet says.
+- **Refused by name**: every reserved encoding (IN source 4, MOV source 4 and operation 3, SET
+  destination 3, IRQ bit 7, reserved PUSH/PULL/MOV-RX bits, WAIT JMPPIN beyond + 3), STATUS_N beyond the
+  FIFO's depth or naming no flag, MOV to or from the RX entries without FJOIN_RX_PUT or _GET, and
+  SIDE_EN with no side-set bits, each stopping the state machine with the run (`take_line_fault`);
+  CLKDIV INT 0 with a fraction, STATUS_SEL 3, SIDESET_COUNT or SET_COUNT above 5, OUT_COUNT above 32, a
+  read of TXFn, and RXFn_PUTGETm outside its mode, at the access. A FIFO or SMx_INSTR through an atomic
+  alias is refused as an alias.
+- **Assumptions**, since the headers do not say: SM_RESTART leaves the OSR empty (count 32); an OUT finding
+  the OSR empty under autopull stalls that cycle while the refill happens at its end; under autopull a
+  PULL is a no-op only while the OSR is full; a non-blocking PUSH to a full FIFO still clears the ISR;
+  MOV OSR, RXFIFO[] leaves the OSR full; a system-written instruction runs on its state machine's next
+  divider cycle, after any delay in progress, enabled or not; a flag set and cleared on one cycle ends
+  set; changing any join bit flushes both FIFOs; a level driven in cycle t is read in cycle t + 2.
+
+The oracles: `examples/pico2/pio/` holds pico-examples' `hello.pio`, `ws2812.pio`, `uart_tx.pio` and
+`uart_rx.pio` (commit 0d62f75, unchanged but for a header comment) and benchtop's `rp2350_only.pio`, which
+the SDK's CMake assembles with pioasm 2.3.0 built from `pico-sdk/tools/pioasm` into the committed
+`*.pio.h`. `examples/pico2/pio_programs.c` prints each program's words beside the four registers the
+pico-examples init has the SDK's `sm_config_*` compute; `chip/pio_tests.sysl` boots it, checks the words
+against the headers line by line, and runs each at register level as `pio_sm_init` would: `hello_pio`'s
+words reaching pin 25 two cycles after the TX write; `ws2812`'s pixel compared with its expected level on
+every clk_sys cycle (a 1 high 108 cycles, a 0 54, a bit 180), stepping a cycle and 13 at a time; `uart_tx`'s
+"Hello, world! (from PIO!)" read back off the pin by a UART decoder; `uart_rx` fed a 115200-baud waveform
+on GPIO 3 (four bytes, a framing error raising IRQ 4, then a byte after the line idles); and the
+RP2350-only pair across PIO0, PIO1 and PIO2 cycle by cycle, at GPIOBASE 0 and 16. The SDK's own numbers
+caught one fact: pico-examples' `ws2812` clocks at divisor 18.0, not 18.75 (833 kHz, not 800), since it
+divides `clock_get_hz`'s integer before making the float, on silicon as here. `rp2350/pio_tests.sysl`
+(18 tests) covers each instruction, the divider, the FIFOs, the flags and every refusal at register level.
+Breaking the synchroniser's delay, autopull's stall, side-set's priority, IRQ REL, X--'s test or the
+divider's rounding each turns its tests red.
+
+**Cost**, host instructions retired, interleaved runs against the branch's base (dev at 92a2019),
+`/usr/bin/time -l`, `benchtop run --board pico2`: `sram_loop.elf` 5.407–5.426 G (median 5.411) to
+5.412–5.422 G (5.413), eight runs each; `xip_loop.elf` 5.631–5.640 G (5.632) to 5.635–5.640 G (5.636);
+`bench --core cortex-m33 kernel33.bin`, which never touches the chip, 36.875–36.897 G to 36.868–36.883 G.
+With no state machine running the chip pays one flag test a quantum (`take_line_fault`), about 0.7 M of
+these runs; the rest of the 0.04–0.06% is the base's own spread between sessions (10 M) and code layout,
+as `kernel33` moving both ways shows. Two first cuts cost 0.08%: a test in `advance` on every clk_sys
+step, and a `take_line_fault` that had grown past inlining; the blocks now run only when something can
+see them, and the rare path is out of line (`next_line_fault`).
 
 ### Item 22, done: the RP2040 chip layer
 
