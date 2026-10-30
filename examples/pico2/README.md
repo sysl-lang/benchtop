@@ -16,6 +16,7 @@ Pico SDK programs that the `pico2` board runs on its Cortex-M33s, and that
 | `tt.c` | ACLE's `cmse_TT`/`TTT`/`TTA`/`TTAT` of SRAM and the PPB, before and after two SAU regions (built with `-mcmse`) | each answer's word |
 | `rcp.c` | every `hardware/rcp.h` function and macro, both forms, passing; then a corrupted canary | its lines on UART0, then core 0 stopped at `Fault` with `rcp_canary_check` named |
 | `gpioc.c` | every `hardware/gpio_coproc.h` function, each compared with its SIO equivalent | `87 checks, 0 mismatches` and the final OUT and OE |
+| `interp.c` | `hardware_interp` in each mode (counter, blend unsigned and signed, clamp, rotate, FORCE_MSB, ADD_RAW, cross, save/restore); core 1 counting on its own INTERP0 at the same time; the multicore doorbells, each core's SIO_IRQ_BELL handler acknowledging | each line's values, worked from the datasheet (`chip/interp_tests.sysl`) |
 
 ```sh
 ./benchtop run --board pico2 examples/pico2/hello_serial.elf
