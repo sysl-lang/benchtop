@@ -1,5 +1,5 @@
-// benchtop's own: the RP2040's flash through its SSI, using no boot ROM function, since benchtop's
-// stand-in ROM carries none (README.md). Commands go out in direct mode the way the SDK's
+// benchtop's own: the RP2040's flash through its SSI, using no boot ROM function, so that what it
+// checks is the SSI's own sequences (README.md). Commands go out in direct mode the way the SDK's
 // hardware_flash sends them (`flash_do_cmd`: chip select forced through IO_QSPI, at most 14 bytes in
 // flight); XIP is entered by the SDK's own second stage, `boot2_w25q080.S`, linked in and called as the
 // SDK's `flash_enable_xip_via_boot2` calls its copy. Every line it prints is a check.

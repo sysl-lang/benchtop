@@ -12,10 +12,10 @@ end to end:
 | `rtc_alarm.c` | pico-examples' `rtc/rtc_alarm` (commit 0d62f75), unchanged: an alarm five seconds on, through RTC_IRQ | `RTC Alarm!`, `Alarm Fired At Wednesday 13 January 11:20:05 2020` five seconds of guest time on |
 | `ssi_flash.c` | benchtop's own: the flash through the SSI with no ROM function, the SDK's `flash_do_cmd` sequence (chip select forced through IO_QSPI) for the IDs, an erase and two page programs; the SDK's boot2 into quad XIP; the four XIP aliases, code run from flash and again after reprogramming, the stream, the cache as SRAM, VREG | every line it prints (`chip/pico_xip_tests.sysl`) |
 | `blink.uf2` | `blink` as a RAM UF2 | GPIO 25 toggling, as the ELF does |
-
-pico-examples' `flash/program` is not here: it erases and programs through the boot ROM's flash
-functions (`flash_range_erase` and the rest look them up with `rom_func_lookup`), which the stand-in
-ROM refuses until item 23 maps Raspberry Pi's. `ssi_flash` drives the same SSI sequences itself.
+| `rom_funcs.c` | benchtop's own: `rom_func_lookup` of the bit functions, memset and memcpy, `rom_data_lookup` of the soft float and double tables, each called; then the SDK's own float and double divide, which go through the ROM | every line, against the host's arithmetic |
+| `hello_world_serial.c` | pico-examples' `hello_world/serial` (commit 0d62f75), unchanged, **a flash image**: the boot ROM checks boot2's CRC, runs it, and boot2 enters the image | `Hello, world!` every second of guest time; XIP left reading the flash |
+| `flash_program.c` | pico-examples' `flash/program` (commit 0d62f75), unchanged, a flash image: a sector erased and a page programmed 256 KB in through the ROM's flash functions | every line, and the page in the flash array |
+| `hello_watchdog.c` | pico-examples' `watchdog/hello_watchdog` (commit 0d62f75), unchanged, a flash image: the watchdog's reset boots it again through the ROM | `Clean boot`, the five updates, then `Rebooted by Watchdog!` |
 
 ```sh
 ./benchtop run --board pico examples/pico/hello_serial.elf
@@ -36,15 +36,13 @@ It needs CMake, Ninja and Arm's `arm-none-eabi` toolchain (Arm GNU Toolchain 15.
 The settings, all in `CMakeLists.txt`:
 
 - `PICO_BOARD=pico`, `PICO_PLATFORM=rp2040`;
-- `pico_set_binary_type(... no_flash)`: a RAM image, which benchtop loads into SRAM and enters at the
-  ELF entry as a debugger does (a flash image starts through the boot ROM's boot path, boot2 from
-  flash, which benchtop's stand-in ROM does not carry: docs/rp-coverage.md item 23). `blink` is also
-  a RAM UF2 (`pico_add_uf2_output`), which benchtop enters at its first byte as the ROM does;
+- `pico_set_binary_type(... no_flash)` for benchtop's own programs and the first three: a RAM image,
+  which benchtop loads into SRAM and enters at the ELF entry as a debugger does. `blink` is also a RAM
+  UF2 (`pico_add_uf2_output`), which benchtop enters at its first byte as the ROM does. The three
+  pico-examples programs that are flash images (`benchtop_flash_program`) are built as their own
+  CMakeLists build them, boot2 and all, and boot through the ROM;
 - `ssi_flash` links the SDK's own `src/rp2040/boot_stage2/boot2_w25q080.S` into its RAM image and
   calls it, as the SDK's `flash_enable_xip_via_boot2` calls its copy;
 - stdio on UART0, not USB;
-- **the compiler's float, double, bit operations and memcpy/memset** (`pico_set_float_implementation`,
-  `..._double_...`, `..._bit_ops_...`, `..._mem_ops_...` with `compiler`). The SDK's defaults look these
-  up in the RP2040's boot ROM, and benchtop's ROM is a stand-in that carries only core 1's launch wait
-  and refuses a lookup by name; Raspberry Pi's ROM is item 23. The divider is the SDK's default, the
-  SIO's hardware divider.
+- otherwise the SDK's defaults: float, double, the bit operations and memcpy/memset from the boot ROM,
+  which benchtop runs as Raspberry Pi's own code, and the SIO's hardware divider.

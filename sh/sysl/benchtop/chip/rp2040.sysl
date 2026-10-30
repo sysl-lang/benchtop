@@ -60,8 +60,9 @@ import sysl.math.min
 // - **The SIO** has FIFOs eight deep, interpolators that shift right rather than rotate, each core's
 //   hardware divider at 0x060–0x078 (`rp2040.Divider`, eight clk_sys cycles a division), and its GPIO
 //   registers at the RP2040's offsets; each core's FIFO interrupt is a line of its own (SIO_IRQ_PROC0,
-//   IRQ 15, into core 0; SIO_IRQ_PROC1, IRQ 16, into core 1). Its GPIO_HI bank, which is the QSPI pins
-//   as levels, is refused by name.
+//   IRQ 15, into core 0; SIO_IRQ_PROC1, IRQ 16, into core 1). Of its GPIO_HI bank, the QSPI pins as
+//   levels, GPIO_HI_IN answers SS, the flash's chip select (the boot ROM's BOOTSEL read); the rest of
+//   the bank is refused by name.
 // - **26 interrupt lines** into each M0+'s NVIC: the TIMER's four (0–3), IO_IRQ_BANK0 (13), the SIO's
 //   (15, 16), the UARTs' (20, 21) and the RTC's (25) are driven; the rest belong to blocks not on the
 //   chip yet.
@@ -82,9 +83,13 @@ import sysl.math.min
 //   striped over banks 0–3 with banks 4 and 5 after them) and its non-striped aliases at 0x2100_0000
 //   (the board's, off the fast path).
 //
-// **The watchdog's reset** of the RP2040 runs its boot ROM's boot path again, which benchtop's
-// stand-in ROM does not carry: when the watchdog fires, by its counter or by TRIGGER, the run ends with
-// that named (`take_fault`). So does a refused access.
+// **The boot ROM** is Raspberry Pi's (`rom/README.md`): core 1's launch wait, core 0's boot path
+// (boot2 from flash) and every function and table the SDK looks up run as its own code. What it touches
+// that no other item built is here, stored: USB's DPRAM, where it keeps its variables; SYSCFG's NMI
+// masks; TBMAN's PLATFORM. **The watchdog's reset** takes down the PSM stages WDSEL selects
+// (`watchdog_fired`), and the board starts each reset core in the ROM again (`take_reset`); one whose
+// boot vector is `reset_usb_boot`'s ends the run with USB boot named (`take_fault`), as does a refused
+// access.
 //
 // **Time is clk_sys cycles** (`now`), as on the RP2350 chip.
 
@@ -105,20 +110,16 @@ private const UART0_IRQ_RP2040: u32 = 20
 private const UART1_IRQ_RP2040: u32 = 21
 private const RTC_IRQ_RP2040: u32 = 25
 
-/** The boot ROM's window, and the part of it benchtop's stand-in image fills (`rom/rp2040-standin.S`):
- * the board maps that 4 KB page, and an access to the rest reaches the chip, which names it.
+/** The boot ROM: Raspberry Pi's, for the B2 stepping (`rom/README.md`), all 16 KB of it mapped
+ * read-only at 0.
  */
 const ROM_BYTES_RP2040: u32 = 16 * 1024
-const ROM_MAPPED_RP2040: u32 = 4096
-private[chip] val ROM_RP2040 = embed("rom/rp2040-standin.bin")
+private[chip] val ROM_RP2040 = embed("rom/bootrom-rp2040-b2.bin")
 
-// What the stand-in's pointers name in the unmapped part of the ROM (`rp2040-standin.S`).
-private const ROM_FUNC_TABLE: u32 = 0x1000
-private const ROM_DATA_TABLE: u32 = 0x1100
-private const ROM_TABLE_LOOKUP: u32 = 0x1200
-private const ROM_CORE0_BOOT: u32 = 0x1300
-private const ROM_NMI: u32 = 0x1400
-private const ROM_HARD_FAULT: u32 = 0x1500
+/** Where in the ROM its USB boot starts after a watchdog reboot (`_usb_boot_reboot_wrapper`), the PC
+ * `reset_usb_boot` leaves in SCRATCH4's boot vector, Thumb bit set.
+ */
+const ROM_USB_BOOT_RP2040: u32 = 0x1B89
 
 /** The XIP address space, through the SSI; XIP_CTRL, the cache as SRAM and the SSI follow it. */
 const XIP_BASE_RP2040: u32 = 0x10000000
@@ -151,6 +152,8 @@ enum Block40
     Psm
     Rosc
     SysInfo
+    TbMan
+    SysCfg
     Rtc
     Vreg
     IoQspi
@@ -163,7 +166,7 @@ struct Placed40
     name: string
     reset: u32
 
-val BLOCKS_RP2040: [18]Placed40 = [
+val BLOCKS_RP2040: [20]Placed40 = [
     Placed40(Block40.Resets, resets_reg.BASE, "RESETS", 0),
     Placed40(Block40.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed40(Block40.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -177,7 +180,13 @@ val BLOCKS_RP2040: [18]Placed40 = [
     Placed40(Block40.Uart1, uart1_reg.BASE, "UART1", resets_reg.RESET_UART1_MASK),
     Placed40(Block40.Psm, psm_reg.BASE, "PSM", 0),
     Placed40(Block40.Rosc, rosc_reg.BASE, "ROSC", 0),
-    Placed40(Block40.SysInfo, sysinfo_reg.BASE, "SYSINFO", resets_reg.RESET_SYSINFO_MASK),
+    // Read while RESETS holds it: the boot ROM's USB boot reads GITREF_RP2040 straight after a watchdog
+    // reset has put every block back in reset.
+    Placed40(Block40.SysInfo, sysinfo_reg.BASE, "SYSINFO", 0),
+    // Neither gated by its RESETS bit: the boot ROM reads PLATFORM and writes the NMI masks at
+    // power-on, with every block held.
+    Placed40(Block40.TbMan, tbman_reg.BASE, "TBMAN", 0),
+    Placed40(Block40.SysCfg, syscfg_reg.BASE, "SYSCFG", 0),
     Placed40(Block40.Rtc, rtc_reg.BASE, "RTC", resets_reg.RESET_RTC_MASK),
     Placed40(Block40.Vreg, vreg_reg.BASE, "VREG_AND_CHIP_RESET", 0),
     Placed40(Block40.IoQspi, io_qspi_reg.BASE, "IO_QSPI", resets_reg.RESET_IO_QSPI_MASK),
@@ -191,10 +200,8 @@ struct Absent40
     name: string
     why: string
 
-val ABSENT_RP2040: [14]Absent40 = [
-    Absent40(syscfg_reg.BASE, WINDOW_RP2040, "SYSCFG", "not on the chip yet: its NMI masks and the processors' DAP instance IDs are RP2040 registers no item has built (docs/rp-coverage.md §2)"),
+val ABSENT_RP2040: [11]Absent40 = [
     Absent40(busctrl_reg.BASE, WINDOW_RP2040, "BUSCTRL", "not on the chip yet (docs/rp-coverage.md item 28)"),
-    Absent40(tbman_reg.BASE, WINDOW_RP2040, "TBMAN", "not on the chip yet (docs/rp-coverage.md item 28)"),
     Absent40(spi0_reg.BASE, WINDOW_RP2040, "SPI0", "not on the chip yet (docs/rp-coverage.md item 16)"),
     Absent40(spi1_reg.BASE, WINDOW_RP2040, "SPI1", "not on the chip yet (docs/rp-coverage.md item 16)"),
     Absent40(i2c0_reg.BASE, WINDOW_RP2040, "I2C0", "not on the chip yet (docs/rp-coverage.md item 17)"),
@@ -205,7 +212,6 @@ val ABSENT_RP2040: [14]Absent40 = [
     Absent40(pio0_reg.BASE, 0x1000, "PIO0", "not on the chip yet (docs/rp-coverage.md items 13 and 14)"),
     Absent40(pio1_reg.BASE, 0x1000, "PIO1", "not on the chip yet (docs/rp-coverage.md items 13 and 14)"),
     Absent40(usb_reg.BASE, WINDOW_RP2040, "USBCTRL", "the RP2040's USB controller is not on the chip yet beyond SIE_CTRL, which the SDK's runtime_init stores (docs/rp-coverage.md item 20 built the RP2350's)"),
-    Absent40(usb_dpram_reg.BASE, 0x1000, "USBCTRL_DPRAM", "the RP2040's USB controller is not on the chip yet (docs/rp-coverage.md item 20 built the RP2350's)"),
 ]
 
 // IO_QSPI's pins, in register order.
@@ -237,6 +243,12 @@ struct Rp2040
     // USBCTRL's SIE_CTRL, stored: the SDK's `runtime_init_usb_power_down` reads it and powers the
     // transceiver down, before it has released USBCTRL from reset, so it is not gated by RESETS.
     usb_sie_ctrl: u32
+    // USB's 4 KB of DPRAM, as memory: the boot ROM keeps its variables there (its `.bss`, 0x50100400 on),
+    // `watchdog_reboot` among them. The controller that would read it is not on the chip.
+    usb_dpram: [1024]u32
+    // SYSCFG's PROC0_NMI_MASK and PROC1_NMI_MASK, stored: the boot ROM clears both as core 0 boots, and no
+    // line raises an NMI.
+    nmi_masks: [2]u32
     // The flash and the path to it: the SSI, XIP_CTRL, the QSPI pins and pads.
     ssi: r40.Ssi
     xip: r40.XipCtrl
@@ -253,6 +265,9 @@ struct Rp2040
     // Core 1 has been put in reset by PSM since the board last asked, or taken out of it.
     core1_reset: bool
     core1_release: bool
+    // The PSM stages the watchdog's resets have taken down since the board last asked (`take_reset`),
+    // bit n for stage n; 0 for none.
+    restart: u32
     // clk_sys cycles since power-on, and the remainders carried into the next clk_ref, crystal,
     // ring-oscillator and clk_peri cycle.
     now: u64
@@ -263,8 +278,8 @@ struct Rp2040
     // What drives each GPIO from off the chip, bit n for GPIO n (`drive_from_outside`).
     outside_driven: u64
     outside_level: u64
-    // Why the chip did something benchtop does not model while time passed (the watchdog's reset, a
-    // UART frame its pins cannot show), for the board to stop on; empty for nothing.
+    // Why the chip did something benchtop does not model while time passed (a watchdog reset into USB
+    // boot, a UART frame its pins cannot show), for the board to stop on; empty for nothing.
     fault: string
 
     /** Power-on, with core 1 in the boot ROM. */
@@ -389,13 +404,65 @@ struct Rp2040
             return self.ssi.write(a - ssi_reg.BASE, width, x, self.now, &self.flash, self.qspi_cs(), self.qspi_pins())
         Err(xip_refusal40(a, self.xip.sram_closed()))
 
-    // The watchdog has fired, by its counter or by TRIGGER: the reset the RP2040 makes then (its PSM
-    // stages per WDSEL, and the boot ROM's boot path for core 0) is the real ROM's, item 23's.
+    // The watchdog has fired, by its counter or by TRIGGER: the reset the RP2040 makes (datasheet 2.13,
+    // "Power-On State Machine", and 4.7, "Watchdog"). Each PSM stage PSM.WDSEL selects goes back to its
+    // power-on state, as on the RP2350 (`Rp2350.watchdog_reset`); where RESETS' own stage is not
+    // selected, the peripherals RESETS.WDSEL names go into reset instead. What survives is what no
+    // selected stage holds: the watchdog itself (its REASON and SCRATCH, and the tick), PSM, the SRAM's
+    // contents and USB's DPRAM, and the flash part, still in whatever mode it was left. PROC0 and PROC1
+    // are the board's to restart from reset in the boot ROM (`take_reset`), whose boot path then runs:
+    // a boot vector in SCRATCH4–7, or boot2 from flash. A vector into the ROM's own USB boot
+    // (`reset_usb_boot`'s) ends the run instead, named: USB is not on the chip.
     private watchdog_fired(*self)
         val why = self.watchdog.counter.take_fired()
         if why == 0 || !self.fault.is_empty() then return
-        val cause = if why == watchdog_reg.REASON_FORCE_MASK then "by TRIGGER" else "by its counter reaching 0"
-        self.fault = s"the watchdog has fired $cause: the RP2040's watchdog reset boots core 0 through the boot ROM's boot path, which benchtop's stand-in ROM does not carry (docs/rp-coverage.md item 23)"
+        if self.boot_vector_pc() == Some(ROM_USB_BOOT_RP2040)
+            val cause = if why == watchdog_reg.REASON_FORCE_MASK then "by TRIGGER" else "by its counter reaching 0"
+            self.fault = s"the watchdog has fired $cause, and its reset boots core 0 into the boot ROM's USB boot (reset_usb_boot): the RP2040's USB device controller is not on the chip yet"
+            return
+        val sel = self.psm.wdsel
+        val fresh = rp2040()
+        if sel & psm_reg.WDSEL_ROSC_MASK != 0
+            self.rosc = fresh.rosc
+            self.rosc_rest = 0
+        if sel & psm_reg.WDSEL_XOSC_MASK != 0
+            self.xosc = fresh.xosc
+            self.xosc_rest = 0
+        if sel & psm_reg.WDSEL_CLOCKS_MASK != 0
+            self.clocks = fresh.clocks
+            self.ref_rest = 0
+            self.peri_rest = 0
+        if sel & psm_reg.WDSEL_RESETS_MASK != 0
+            self.resets = fresh.resets
+            self.reset_blocks(self.resets.held)
+            self.usb_sie_ctrl = 0
+            self.nmi_masks = [0, 0]
+        else
+            val asserted = self.resets.watchdog & ~self.resets.held
+            self.resets.held |= self.resets.watchdog
+            self.resets.done &= ~self.resets.held
+            self.reset_blocks(asserted)
+        if sel & psm_reg.WDSEL_XIP_MASK != 0
+            self.ssi = fresh.ssi
+            self.xip = fresh.xip
+            self.xip_changed = true
+        if sel & psm_reg.WDSEL_VREG_AND_CHIP_RESET_MASK != 0 then self.vreg = fresh.vreg
+        if sel & psm_reg.WDSEL_SIO_MASK != 0
+            self.sio = fresh.sio
+            self.dividers = fresh.dividers
+        // The flash's data pins and chip select follow the SSI and the QSPI bank as their resets leave them.
+        self.ssi.undriven = self.data_pads()
+        self.cs_changed() match
+            Ok(_) -> ()
+            Err(e) -> self.fault = s"the watchdog's reset moved the flash's chip select: $e"
+        if sel & psm_reg.WDSEL_PROC1_MASK != 0 then self.core1_reset = true
+        self.restart |= sel
+
+    // The PC of the boot vector in SCRATCH4–7, as the ROM's `check_wdog` takes it: the magic, the PC
+    // XORed with the magic's negation, the SP, the PC.
+    private boot_vector_pc(*self) -> Option[u32]
+        val s = self.watchdog.counter.scratch
+        if s[4] == WATCHDOG_BOOT_MAGIC && s[5] == s[7] ^ (0 -% WATCHDOG_BOOT_MAGIC) then Some(s[7]) else None
 
     // `cycles` of clk_sys at `sys` Hz pass on the UARTs' lines, as clk_peri's cycles (`Rp2350.advance_lines`,
     // with no wires on this chip's workbench yet).
@@ -463,6 +530,11 @@ struct Rp2040
         if is_sie_ctrl(a)
             r40.access(a - usb_reg.BASE, width, true).map_err(e -> s"USBCTRL + 0x${hex(a - usb_reg.BASE)} ${what_refused(e)}")?
             return Ok(r40.read_lane(self.usb_sie_ctrl, a - usb_reg.BASE, width))
+        if a >= usb_dpram_reg.BASE && a - usb_dpram_reg.BASE < 0x1000
+            val o = a - usb_dpram_reg.BASE
+            if o & (width - 1) != 0 then return Err(s"USBCTRL_DPRAM + 0x${hex(o)} is not aligned to its width")
+            val lane = self.usb_dpram[o >> 2] >> (8 * (o & 3))
+            return Ok(if width == 4 then lane else lane & ((1u32 << (8 * width)) - 1))
         val (p, o) = self.placed(a)?
         val got = p.block match
             Resets -> self.resets.read(o, width)
@@ -481,6 +553,8 @@ struct Rp2040
             Psm -> self.psm.read(o, width)
             Rosc -> self.rosc.read(rosc_offset(o), width)
             SysInfo -> sysinfo_read(o, width)
+            TbMan -> tbman_read(o, width)
+            SysCfg -> self.syscfg_read(o, width)
             Rtc -> self.rtc.read(o, width, self.clocks.rtc_hz(self.sources()) != 0)
             Vreg -> self.vreg.read(o, width)
             IoQspi -> self.io_qspi.read(o, width)
@@ -494,6 +568,13 @@ struct Rp2040
             val o = a - usb_reg.BASE
             r40.access(o, width, true).map_err(e -> s"USBCTRL + 0x${hex(o)} ${what_refused(e)}")?
             self.usb_sie_ctrl = written(self.usb_sie_ctrl, o, replicated(x, width))
+            return Ok(())
+        if a >= usb_dpram_reg.BASE && a - usb_dpram_reg.BASE < 0x1000
+            val o = a - usb_dpram_reg.BASE
+            if o & (width - 1) != 0 then return Err(s"USBCTRL_DPRAM + 0x${hex(o)} is not aligned to its width")
+            val shift = 8 * (o & 3)
+            val mask = if width == 4 then 0xFFFFFFFF else ((1u32 << (8 * width)) - 1) << shift
+            self.usb_dpram[o >> 2] = (self.usb_dpram[o >> 2] & ~mask) | ((x << shift) & mask)
             return Ok(())
         val (p, o) = self.placed(a)?
         val got = p.block match
@@ -561,10 +642,12 @@ struct Rp2040
                 if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
                 r
             SysInfo -> sysinfo_write(o, width)
+            TbMan -> tbman_write(o, width)
+            SysCfg -> self.syscfg_write(o, width, x)
             Rtc -> return self.rtc.write(o, width, x)
             Vreg -> return self.vreg.write(o, width, x)
             IoQspi -> return self.io_qspi_write(p, o, width, x)
-            PadsQspi -> self.pads_qspi.write(o, width, x)
+            PadsQspi -> return self.pads_qspi_write(p, o, width, x)
         got.map_err(e -> refusal40(p, o, e))
 
     // A write to IO_QSPI, after the SSI is brought up to now: chip select follows SS's override at once.
@@ -578,14 +661,56 @@ struct Rp2040
             return Err(s"${p.name} + 0x${hex(o)}: GPIO_QSPI_SS_CTRL OUTOVER 1 inverts the SSI's chip select, which is not modelled")
         self.cs_changed()
 
+    // A write to PADS_QSPI, after the SSI is brought up to now: what the flash sees on its data pins
+    // follows their output disables and pulls at once.
+    private pads_qspi_write(*self, p: Placed40, o: u32, width: u32, x: u32) -> Result[unit, string]
+        self.ssi_catch_up()?
+        self.pads_qspi.write(o, width, x).map_err(e -> refusal40(p, o, e))?
+        self.ssi.undriven = self.data_pads()
+        Ok(())
+
+    // What the flash sees on SD0, its data in from the SSI in SPI mode, as PADS_QSPI leaves the pad (OD
+    // bit 7, PUE bit 3, PDE bit 2): the SSI's bits, or the pad's pull with its output disabled.
+    private data_pads(*self) -> u32
+        val pad = self.pads_qspi.pads[2]
+        if pad & 0x80 == 0 then return r40.DRIVEN
+        val up = pad & 0x08 != 0
+        val down = pad & 0x04 != 0
+        if up && !down then r40.PULLED_HIGH elif down && !up then r40.PULLED_LOW else r40.FLOATING
+
     // The SIO at the RP2040's offsets: the shared model's FIFOs, spinlocks, interpolators and low GPIO
     // bank, and each core's own divider.
     private sio_read(*self, core: u32, o: u32, width: u32) -> Result[u32, string]
         val address = o & 0xFFC
         if address >= sio_reg.DIV_UDIVIDEND_OFFSET && address <= sio_reg.DIV_CSR_OFFSET
             return self.dividers[core].read(o, width).map_err(e -> sio_refusal(o, e))
+        if address == sio_reg.GPIO_HI_IN_OFFSET then return self.gpio_hi_in(o, width)
         val mapped = sio_offset(o)?
         self.sio.read(core, mapped, width, self.inputs()).map_err(e -> sio_refusal(o, e))
+
+    // SYSCFG's two NMI masks, a bit per IRQ line; the rest of SYSCFG (PROC_CONFIG, the input
+    // synchronizer bypasses, DBGFORCE, MEMPOWERDOWN) is refused.
+    private syscfg_read(*self, o: u32, width: u32) -> Result[u32, AccessError]
+        r40.access(o, width, true)?
+        val k = o & 0xFFC
+        if k > syscfg_reg.PROC1_NMI_MASK_OFFSET then return Err(AccessError.Unmapped)
+        Ok(r40.read_lane(self.nmi_masks[k >> 2], o, width))
+
+    private syscfg_write(*self, o: u32, width: u32, x: u32) -> Result[unit, AccessError]
+        r40.access(o, width, true)?
+        val k = o & 0xFFC
+        if k > syscfg_reg.PROC1_NMI_MASK_OFFSET then return Err(AccessError.Unmapped)
+        self.nmi_masks[k >> 2] = written(self.nmi_masks[k >> 2], o, replicated(x, width)) & ((1u32 << RP2040_IRQS) - 1)
+        Ok(())
+
+    // GPIO_HI_IN, of which only SS (bit 1) is modelled: the flash's chip select line, high unless the
+    // SSI or IO_QSPI's override drives it low. That is the boot ROM's BOOTSEL read, and the button is
+    // never pressed. The other five pins (SCLK, SD0–3) read 0: their levels are not modelled.
+    private gpio_hi_in(*self, o: u32, width: u32) -> Result[u32, string]
+        r40.access(o, width, false).map_err(e -> sio_refusal(o, e))?
+        self.ssi_catch_up()?
+        self.cs_changed()?
+        Ok(r40.read_lane(if self.flash.selected then 0 else 2, o, width))
 
     private sio_write(*self, core: u32, o: u32, width: u32, x: u32) -> Result[unit, string]
         val address = o & 0xFFC
@@ -628,7 +753,9 @@ struct Rp2040
                 Uart1 -> self.uarts[1].reset()
                 Rtc -> self.rtc.reset()
                 IoQspi -> self.io_qspi.reset()
-                PadsQspi -> self.pads_qspi.reset()
+                PadsQspi ->
+                    self.pads_qspi.reset()
+                    self.ssi.undriven = self.data_pads()
                 _ -> ()
 
     // A write to UART `k`, refused where it asks for something benchtop does not model; a refused write
@@ -707,8 +834,8 @@ end Rp2040
 rp2040() -> Rp2040 =
     Rp2040(r40.resets(), rp.clocks_rp2040(), rp.xosc(), rp.pll(), rp.pll(), r40.watchdog(), r40.timer(), rp.sio_rp2040(),
         [divider(), divider()], rp.io_bank0_rp2040(), rp.pads_bank0_rp2040(), [rp.uart(), rp.uart()], rp.psm_rp2040(), rp.rosc(),
-        rp.sysinfo(), 0, r40.ssi(), r40.xip_ctrl(), w25q16jv(), rp.io_qspi_rp2040(), rp.qspi_pads_rp2040(), r40.vreg(), r40.rtc(), 0, true,
-        false, false, 0, 0, 0, 0, 0, 0, 0, "")
+        rp.sysinfo(), 0, [0; 1024], [0, 0], r40.ssi(), r40.xip_ctrl(), w25q16jv(), rp.io_qspi_rp2040(), rp.qspi_pads_rp2040(), r40.vreg(), r40.rtc(), 0, true,
+        false, false, 0, 0, 0, 0, 0, 0, 0, 0, "")
 
 impl ArmChip for Rp2040
     const rp2350() -> bool = false
@@ -730,7 +857,10 @@ impl ArmChip for Rp2040
         earliest(earliest(due, self.line_due()), self.rtc_due())
 
     load(*self, core: u32, a: u32, width: u32) -> Result[u32, string]
-        if a < ROM_BYTES_RP2040 then return Err(rom_refusal(a))
+        // The board maps the ROM on the cores' fast path; an access that reaches the bus reads the same bytes.
+        if a < ROM_BYTES_RP2040
+            if a & (width - 1) != 0 then return Err(s"0x${hex(a, 8)} in the boot ROM is not aligned to its width")
+            return Ok(rom_read_rp2040(a, width))
         if a >= XIP_BASE_RP2040 && a < XIP_END_RP2040 then return self.xip_load(a, width)
         self.read(core, a, width)
 
@@ -763,9 +893,14 @@ impl ArmChip for Rp2040
         self.core1_release = false
         released
 
-    // The watchdog's reset is refused (`take_fault`), so no core is ever restarting.
-    resetting(*self, k: u32) -> bool = false
-    take_reset(*self) -> Option[u32] = None
+    /** Whether a watchdog reset the board has not yet taken has reset core `k`'s PSM stage. */
+    resetting(*self, k: u32) -> bool = self.restart & (if k == 0 then psm_reg.WDSEL_PROC0_MASK else psm_reg.WDSEL_PROC1_MASK) != 0
+
+    take_reset(*self) -> Option[u32]
+        if self.restart == 0 then return None
+        val r = self.restart
+        self.restart = 0
+        Some(r)
 
     take_fault(*self) -> Option[string]
         if self.fault.is_empty() then return None
@@ -801,8 +936,8 @@ private sio_offset(o: u32) -> Result[u32, string]
     val address = o & 0xFFC
     if address >= sio_reg.GPIO_OUT_OFFSET && address <= sio_reg.GPIO_OE_XOR_OFFSET
         return Ok(SIO_GPIO_RP2350[(address - sio_reg.GPIO_OUT_OFFSET) / 4] | (o & 3))
-    if address == sio_reg.GPIO_HI_IN_OFFSET || (address >= sio_reg.GPIO_HI_OUT_OFFSET && address <= sio_reg.GPIO_HI_OE_XOR_OFFSET)
-        return Err(s"SIO + 0x${hex(o)}: the GPIO_HI bank drives and reads the QSPI pins as levels, which benchtop does not model: the pins are the flash's, reached through the SSI")
+    if address >= sio_reg.GPIO_HI_OUT_OFFSET && address <= sio_reg.GPIO_HI_OE_XOR_OFFSET
+        return Err(s"SIO + 0x${hex(o)}: the GPIO_HI bank drives the QSPI pins as levels, which benchtop does not model: the pins are the flash's, reached through the SSI")
     if address > sio_reg.SPINLOCK31_OFFSET then return Err(s"SIO + 0x${hex(o)} is not a register of the RP2040's SIO")
     Ok(o)
 
@@ -827,25 +962,25 @@ private sysinfo_write(o: u32, width: u32) -> Result[unit, AccessError]
         sysinfo_reg.CHIP_ID_OFFSET | sysinfo_reg.PLATFORM_OFFSET | sysinfo_reg.GITREF_RP2040_OFFSET -> Ok(())
         _ -> Err(AccessError.Unmapped)
 
-/** The little-endian word at `at` in the stand-in ROM's image. */
-rom_word_rp2040(at: u32) -> u32
+// TBMAN, its one register: PLATFORM reads ASIC, which the boot ROM's `watchdog_reboot` and boot path
+// check before choosing their timings (`tbman.h`). It is read-only; a write is dropped.
+private tbman_read(o: u32, width: u32) -> Result[u32, AccessError]
+    r40.access(o, width, true)?
+    if o & 0xFFC != tbman_reg.PLATFORM_OFFSET then return Err(AccessError.Unmapped)
+    Ok(r40.read_lane(tbman_reg.PLATFORM_ASIC_MASK, o, width))
+
+private tbman_write(o: u32, width: u32) -> Result[unit, AccessError]
+    r40.access(o, width, true)?
+    if o & 0xFFC != tbman_reg.PLATFORM_OFFSET then Err(AccessError.Unmapped) else Ok(())
+
+/** `width` bytes at `at` in the ROM, little-endian; `at` must be inside it. */
+rom_read_rp2040(at: u32, width: u32) -> u32
     var v: u32 = 0
-    for k in 0u32..<4 do v |= u32(ROM_RP2040[usize(at + k)]) << (8 * k)
+    for k in 0u32..<width do v |= u32(ROM_RP2040[usize(at + k)]) << (8 * k)
     v
 
-/** Why an access to the ROM's window reached the chip: the stand-in maps its first 4 KB, and names
- * what the rest would hold.
- */
-rom_refusal(a: u32) -> string
-    val what =
-        if a >= ROM_FUNC_TABLE && a < ROM_DATA_TABLE then "the ROM's function table, which rom_func_lookup searches"
-        elif a >= ROM_DATA_TABLE && a < ROM_TABLE_LOOKUP then "the ROM's data table"
-        elif a >= ROM_TABLE_LOOKUP && a < ROM_CORE0_BOOT then "rom_table_lookup, the ROM's lookup function"
-        elif a >= ROM_CORE0_BOOT && a < ROM_NMI then "core 0's boot path (boot2 from flash, or USB boot)"
-        elif a >= ROM_NMI && a < ROM_HARD_FAULT then "the ROM's NMI handler"
-        elif a >= ROM_HARD_FAULT && a < ROM_HARD_FAULT + 0x100 then "the ROM's HardFault handler"
-        else "the rest of the ROM"
-    s"0x${hex(a, 8)} is $what: benchtop's stand-in RP2040 ROM carries only core 1's launch wait, and Raspberry Pi's ROM is docs/rp-coverage.md item 23"
+/** The little-endian word at `at` in the ROM. */
+rom_word_rp2040(at: u32) -> u32 = rom_read_rp2040(at, 4)
 
 // An access to the XIP address space that reaches nothing: XIP_SRAM while the cache is not SRAM
 // (`closed` says why), or an address between the blocks.

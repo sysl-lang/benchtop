@@ -9,25 +9,34 @@ project(benchtop_pico C CXX ASM)
 
 pico_sdk_init()
 
-# Every program is a RAM image entered at `_entry_point`, as a debugger enters it. benchtop's RP2040
-# boot ROM is a stand-in that carries no function (README.md), so the SDK's helpers that it would look
-# up through the ROM's table are the compiler's own: float, double, the bit operations and memcpy and
-# memset. The divider stays the SIO's hardware divider, the SDK's default.
+# Every program is a RAM image entered at `_entry_point`, as a debugger enters it, with the SDK's
+# defaults otherwise: float, double, the bit operations and memcpy/memset from the boot ROM, and the
+# SIO's hardware divider.
 function(benchtop_program target source)
     add_executable(${target} ${source})
     target_link_libraries(${target} pico_stdlib)
     pico_set_binary_type(${target} no_flash)
     pico_enable_stdio_uart(${target} 1)
     pico_enable_stdio_usb(${target} 0)
-    pico_set_float_implementation(${target} compiler)
-    pico_set_double_implementation(${target} compiler)
-    pico_set_bit_ops_implementation(${target} compiler)
-    pico_set_mem_ops_implementation(${target} compiler)
 endfunction()
 
-foreach(prog hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash)
+foreach(prog hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash rom_funcs)
     benchtop_program(${prog} ${prog}.c)
 endforeach()
+
+# pico-examples' programs as their own CMakeLists build them: flash images, with boot2 in the first
+# 256 bytes, which the boot ROM's boot path checks and runs.
+function(benchtop_flash_program target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} pico_stdlib)
+    pico_enable_stdio_uart(${target} 1)
+    pico_enable_stdio_usb(${target} 0)
+endfunction()
+
+benchtop_flash_program(hello_world_serial hello_world_serial.c)
+benchtop_flash_program(flash_program flash_program.c)
+benchtop_flash_program(hello_watchdog hello_watchdog.c)
+target_link_libraries(flash_program hardware_flash)
 target_link_libraries(hello_multicore pico_multicore)
 # blink also as a UF2, the RAM image the boot ROM's USB drive takes and enters at its first byte.
 pico_add_uf2_output(blink)

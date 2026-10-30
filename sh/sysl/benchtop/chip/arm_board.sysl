@@ -7,6 +7,7 @@ import sh.sysl.benchtop.v6m as arm
 import sh.sysl.benchtop.v6m.{CoprocessorOp, Fpu, Kind, MemoryMap, RamBank, Stop}
 import sh.sysl.elf
 import sh.sysl.rp2350.powman as powman_reg
+import sh.sysl.rp2040.psm as psm40_reg
 import sh.sysl.rp2350.psm as psm_reg
 import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
@@ -83,13 +84,14 @@ import sysl.math.min
 // through the trait; everything above that is the RP2350's (its ROM's hand-over, flash, XIP_SRAM, the
 // OTP, POWMAN, ACCESSCTRL and the M33s' coprocessors) is compiled for it alone (`if const
 // C.rp2350()`). Each instance is its own code, so the Pico 2 pays nothing for the Pico. **On the
-// Pico** an ELF is loaded into the 264 KB of SRAM and core 0 starts at its entry with SP at SRAM's top;
-// core 1 starts from reset in benchtop's stand-in ROM (`Rp2040`, `rom/rp2040-standin.S`), whose only
-// code is the launch wait. The cores are ARMv6-M with an NVIC of 26 lines and two priority bits. SRAM's
-// non-striped aliases at 0x2100_0000 are reached off the fast path, each word at its striped address
-// (`striped`). An ELF or a UF2 may also write the Pico's 2 MB flash, which is on the fast path while
-// the SSI is set for XIP and the chip's otherwise (`sync_pico_xip`), with the XIP cache's 16 KB as SRAM
-// at 0x1500_0000 while the cache is disabled; an image that starts in flash needs the ROM's boot path.
+// Pico** core 1 starts from reset in Raspberry Pi's boot ROM (`Rp2040`, `rom/README.md`), which every
+// ROM function the SDK looks up runs from too. An image that starts in SRAM starts core 0 at its entry
+// with SP at SRAM's top; one that starts in flash starts core 0 in the ROM, whose boot path runs boot2
+// and the image, as it does again after a watchdog reset (`restart`). The cores are ARMv6-M with an
+// NVIC of 26 lines and two priority bits. SRAM's non-striped aliases at 0x2100_0000 are reached off
+// the fast path, each word at its striped address (`striped`). An ELF or a UF2 may also write the
+// Pico's 2 MB flash, which is on the fast path while the SSI is set for XIP and the chip's otherwise
+// (`sync_pico_xip`), with the XIP cache's 16 KB as SRAM at 0x1500_0000 while the cache is disabled.
 
 /** The RP2350's external interrupt lines, IRQ 0 to 51. */
 const RP2350_IRQS: u32 = 52
@@ -178,6 +180,9 @@ struct ArmBoard[C: ArmChip = Rp2350]
     // The chip's clock at the start of the running quantum, and each core's clock there.
     quantum_at: u64
     clock_at: [2]u64
+    // The chip's clock each core had reached when its last quantum ended: its last instruction ends where
+    // it ends, past the quantum's end, and the next quantum starts it there.
+    reached: [2]u64
     quantum: u64
     // Why the chip refused the running core's access, or faulted it (the RCP), before the core has
     // said where it stopped; then the run's reason, with the core and its PC.
@@ -208,14 +213,14 @@ arm_board(map: SramMap) -> &ArmBoard
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
     val sram_at = rom_at + ROM_BYTES + arm.GUARD_BYTES
-    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host())
+    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host())
 
 /** A Pico, an RP2040 on its two Cortex-M0+ cores, with `map`'s SRAM, powered on, holding no image. */
 pico_board(map: SramMap) -> &ArmBoard[Rp2040]
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
     val sram_at = rom_at + ROM_BYTES_RP2040 + arm.GUARD_BYTES
-    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host())
+    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host())
 
 impl[C: ArmChip] ArmBoard[C]
     /** Power on with `image`, written where its addresses say: core 0 at its entry, core 1 in the boot
@@ -268,6 +273,7 @@ impl[C: ArmChip] ArmBoard[C]
         self.start_core0(start)
         self.rom_reset(1)
         self.quantum_at = 0
+        self.reached = [0, 0]
         self.why = ""
         self.refused = ""
         self.console.clear()
@@ -372,7 +378,7 @@ impl[C: ArmChip] ArmBoard[C]
         self.write_boot_info(BOOT_TYPE_NORMAL)?
         Ok(Start(self.flash_word(4), self.flash_word(0), XIP_BASE, false, true))
       else
-        Err(s"$cause: the RP2040's boot path is its boot ROM's (docs/rp-coverage.md item 23)")
+        Err(s"$cause: the RP2040's boot path is its boot ROM's, which reads boot2 from flash through the SSI (docs/rp-coverage.md item 24)")
 
     // The boot a vector (magic, check, SP, PC) asks for: a PC/SP boot, which BOOT_INFO reports; a PC of
     // the magic asks for a boot of the type in the SP's word, the ROM's own boot path, refused by name
@@ -403,6 +409,11 @@ impl[C: ArmChip] ArmBoard[C]
         if start.pc & 1 == 0 then arm.halt(&self.cores[0], Stop.Fault, start.pc)
         Ok(())
       else
+        // The RP2040: each core whose stage was reset starts from reset in the boot ROM, whose own code
+        // is the boot path (a watchdog vector, or boot2 from flash) and core 1's wait.
+        if self.chip.take_xip_changed() then sync_pico_xip(self)
+        if stages & psm40_reg.WDSEL_PROC1_MASK != 0 then self.rom_reset(1)
+        if stages & psm40_reg.WDSEL_PROC0_MASK != 0 then self.rom_reset(0)
         Ok(())
 
     // An ELF's loadable segments, each at its physical address: the entry, the stack at SRAM's top, and
@@ -609,7 +620,8 @@ impl[C: ArmChip] ArmBoard[C]
                 if const C.rp2350()
                     if self.chip.power_down_due() then self.power_down()
                 val next = self.next_wake() match
-                    Some(n) -> min(n, limit - self.chip.clock())
+                    // A core's last access can take the chip past the run's end.
+                    Some(n) -> min(n, limit -| self.chip.clock())
                     None -> return RunEnd.Asleep
                 self.sleep(next)
                 if !self.take_restart() || !self.serve_usb() then return RunEnd.Fault
@@ -711,15 +723,23 @@ impl[C: ArmChip] ArmBoard[C]
       else
         Ok(())
 
-    // Core `k` through `q` cycles of the quantum: run while awake, sleep the rest.
+    // Core `k` through `q` cycles of the quantum: run while awake, sleep the rest. A core that ran past the
+    // last quantum's end starts this one where it reached, so its accesses keep the spacing its instructions
+    // give them (the SDK's hardware divide reads its result eight cycles after the write, wherever a
+    // quantum ends between them). One past a whole quantum sits this one out. A core started again since
+    // (`rom_reset`) starts afresh.
     private run_core(*self, k: usize, q: u64) -> RunEnd
         val c = &self.cores[k]
         val start = arm.clock(c, c.retired)
-        self.clock_at[k] = start
-        val end = start + q
+        val past = if self.reached[k] > self.quantum_at && self.reached[k] - self.quantum_at <= start then self.reached[k] - self.quantum_at else 0
+        self.clock_at[k] = start - past
+        val end = start + q - min(past, q)
+        // Where the core's clock was last seen running; a core that stops asleep reached nothing past
+        // the quantum's end.
+        var now = start
         loop
             if c.sleeping && !arm.wake_by(c, end) then break
-            val now = arm.clock(c, c.retired)
+            now = arm.clock(c, c.retired)
             if now >= end then break
             arm.set_limit(c, c.retired + (end - now))
             arm.run_threaded(c)
@@ -736,6 +756,7 @@ impl[C: ArmChip] ArmBoard[C]
                     self.refused = s"core $k at pc 0x${hex(c.stop_at, 8)}: ${arm.transition_name(c.transition)}"
                     return RunEnd.Fault
                 _ -> return RunEnd.Fault
+        self.reached[k] = self.quantum_at + (now - self.clock_at[k])
         RunEnd.Budget
     end run_core
 
@@ -1003,12 +1024,13 @@ const SRAM_ALIAS_RP2040: u32 = 0x21000000
 const SRAM_BANK_RP2040: u32 = 0x10000
 
 // The Pico's boot: an image written where its addresses say, into SRAM and the 2 MB flash (erased
-// first, and the chip's for the run); core 0 at the image's entry in SRAM with SP at SRAM's top, as a
-// debugger leaves it or as the boot ROM enters a RAM UF2 (at its first byte); and core 1 from reset in
-// the stand-in ROM, whose first 4 KB are mapped read-only at 0. An image that starts in flash is
-// booted through the ROM's boot path (boot2 from flash), which is item 23's, and is refused by name.
-// The flash is behind the SSI, which is not set for XIP at power-on, so it starts off the fast path
-// (`sync_pico_xip`); the XIP cache is enabled, so its 16 KB of SRAM are unmapped.
+// first, and the chip's for the run), and Raspberry Pi's boot ROM mapped read-only at 0. Core 1 starts
+// from reset in the ROM. An image that starts in SRAM starts core 0 at its entry with SP at SRAM's top,
+// as a debugger leaves it or as the boot ROM enters a RAM UF2 (at its first byte); one that starts in
+// flash starts core 0 from reset in the ROM too, whose boot path checks boot2's CRC in the flash's
+// first 256 bytes, runs it, and boot2 enters the image. The flash is behind the SSI, which is not set
+// for XIP at power-on, so it starts off the fast path (`sync_pico_xip`); the XIP cache is enabled, so
+// its 16 KB of SRAM are unmapped.
 private boot_pico(b: *ArmBoard[Rp2040], image: []const u8) -> Result[unit, string]
     if b.sram_at + XIP_SRAM_BYTES_RP2040 + arm.GUARD_BYTES > arm.RAM_BYTES then return Err("the SRAM leaves no room for the boot ROM and the XIP cache in the cores' memory")
     var packed: Buf[u8] = buf()
@@ -1018,18 +1040,16 @@ private boot_pico(b: *ArmBoard[Rp2040], image: []const u8) -> Result[unit, strin
     val all = packed.view()
     var regions = [elf.Region(u64(b.map.base), all[..<usize(b.map.size)]), elf.Region(u64(XIP_BASE_RP2040), all[usize(arm.RAM_BYTES)..])]
     val entry = if is_uf2(image) then load_uf2_pico(b, image, regions[..])? else load_elf_pico(image, regions[..])?
-    if entry < b.map.base || entry >= b.map.base + b.map.size
-        return Err(s"the image starts at 0x${hex(entry, 8)}, not in SRAM: an image that starts in flash boots through the RP2040's boot ROM (boot2 from flash), which is docs/rp-coverage.md item 23")
+    val in_flash = entry >= XIP_BASE_RP2040 && entry - XIP_BASE_RP2040 < FLASH_BYTES_RP2040
+    if !in_flash && (entry < b.map.base || entry >= b.map.base + b.map.size)
+        return Err(s"the image starts at 0x${hex(entry, 8)}, neither in SRAM nor in the flash")
     var banks: Buf[RamBank] = buf()
-    // The ROM's whole window is code the cores may fetch; only the stand-in's page is on the fast path,
-    // so a fetch from the rest goes to the bus, which names it (`rom_refusal`).
     banks.push(RamBank(0, ROM_BYTES_RP2040, b.rom_at))
     banks.push(RamBank(XIP_SRAM_BASE_RP2040, XIP_SRAM_BYTES_RP2040, b.sram_at))
     val first = &b.cores[0]
     first.kind = Kind.V6m
     arm.reset_mapped(first, b.mem, packed.view(), MemoryMap(b.map.base, b.map.size, XIP_BASE_RP2040, FLASH_BYTES_RP2040, banks.freeze()))
     arm.read_only(b.mem, 0)
-    for p in (ROM_MAPPED_RP2040 >> 12)..<(ROM_BYTES_RP2040 >> 12) do b.mem.page_table[p] = 0
     b.chip.reset()
     b.chip.flash.connect(&b.mem.flash[0], FLASH_BYTES_RP2040)
     // reset_mapped put the flash and the cache's SRAM on the fast path; the sync takes off what the
@@ -1038,13 +1058,17 @@ private boot_pico(b: *ArmBoard[Rp2040], image: []const u8) -> Result[unit, strin
     b.sram_open = true
     sync_pico_xip(b)
     arm.attach_memory(&b.cores[1], b.mem)
-    val c = &b.cores[0]
-    arm.clear(c, entry & ~1)
-    b.configure(c, 0)
-    c.r[13] = b.map.base + b.map.size
-    b.started[0] = true
+    if in_flash
+        b.rom_reset(0)
+    else
+        val c = &b.cores[0]
+        arm.clear(c, entry & ~1)
+        b.configure(c, 0)
+        c.r[13] = b.map.base + b.map.size
+        b.started[0] = true
     b.rom_reset(1)
     b.quantum_at = 0
+    b.reached = [0, 0]
     b.why = ""
     b.refused = ""
     b.console.clear()
