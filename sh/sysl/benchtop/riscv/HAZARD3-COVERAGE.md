@@ -42,7 +42,7 @@ existing profiles, not separate Hazard3 implementations. The stateful extension 
 | BINVI | 1600 |
 | BEXTI | 1600 |
 | H3.BEXTM | 7280 |
-| H3.BEXTMI | 17920 |
+| H3.BEXTMI | 6880 |
 | AMOADD.W | 2000 |
 | AMOSWAP.W | 2000 |
 | AMOXOR.W | 2000 |
@@ -95,6 +95,6 @@ enforcement, User-mode interrupt masking (E7), counters, LR/SC/AMO faults and pa
 reservation invalidation/unblock signals. These are targeted architectural boundaries, not
 exhaustive state enumeration or physical-board differential validation.
 
-59 additional vector-tested instructions plus 16 named stateful instructions, 78,372 vectors; five profiles.
+59 additional vector-tested instructions plus 16 named stateful instructions, 67,332 vectors; five profiles.
 
 Regenerate with `python3 examples/riscv/generate-hazard3-tests.py` or verify with `--check`.
