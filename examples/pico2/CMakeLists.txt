@@ -43,6 +43,12 @@ pico_set_printf_implementation(dcp compiler)
 target_link_libraries(interp hardware_interp pico_multicore)
 # ACLE's TTA and TTAT intrinsics are only declared for code built for the Security Extension.
 target_compile_options(tt PRIVATE -mcmse)
+# Non-secure code of its own: the Secure side built for the Security Extension, the Non-secure code,
+# stack and veneer in nonsecure_ns.S.
+benchtop_program(nonsecure nonsecure.c no_flash)
+target_sources(nonsecure PRIVATE nonsecure_ns.S)
+target_compile_options(nonsecure PRIVATE -mcmse)
+target_link_libraries(nonsecure hardware_exception)
 
 # Flash images, the SDK's default: the ELF's segments are written into the flash behind XIP_BASE.
 foreach(prog hello_serial blink)

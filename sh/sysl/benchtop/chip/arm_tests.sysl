@@ -170,26 +170,63 @@ arm_refused_access()
     assert(w.run(1000) == RunEnd.Breakpoint, w.refused)
     assert(w.refused.is_empty() && w.mem.ram[w.rom_at + 0x100] == before && w.mem.ram[w.rom_at + 0x100] != 0xA5, "the store is ignored and the ROM is unchanged")
 
-@test("a way to Non-secure state ends the Arm run with its name, on either core: BXNS on core 0, MRS of MSP_NS on core 1")
-arm_non_secure()
+private val ARM_NONSECURE = embed("../../../../examples/pico2/nonsecure.elf")
+
+@test("the SDK-built nonsecure: BLXNS to Non-secure code, its call back through an SG veneer and BXNS, FNC_RETURN; TT of the three SAU regions; a Non-secure load of Secure memory is SecureFault AUVIOL in the program's handler")
+arm_nonsecure()
+    val text = run_to_breakpoint(ARM_NONSECURE, 50)
+    val tt = s"tt ns ${hex(0x003E0000u32, 8)} nsc ${hex(0x004E0200u32, 8)} secure ${hex(0x004C0000u32, 8)}\r\n"
+    val want = s"ns_function(20) = 142 after 1 call(s)\r\n${tt}securefault sfsr 00000048 sfar 20003f48\r\n"
+    assert(text == want, text)
+
+// Core 0 of a booted blink with the SAU making 0x20070080–0x200700FF Non-secure code, and the
+// peripherals and the SIO Non-secure too; at 0x20070000 the Secure `bxns r1` to it, and there the
+// Non-secure `ldr r0, [r2]; bkpt` of `a`.
+private ns_load(a: u32) -> &ArmBoard
     val b = arm_board(PICO2_ARM_SRAM)
     b.boot(ARM_BLINK).unwrap()
-    // bxns r0, r0 an even address; bkpt
-    place(b, 0x20070000, [0x4704, 0xBE00])
-    b.cores[0].pc = 0x20070000
-    b.cores[0].r[0] = 0x20070100
-    assert(b.run(1000) == RunEnd.Fault)
-    assert(b.refused == "core 0 at pc 0x20070000: BXNS to a Non-secure address: Non-secure state is not modelled", b.refused)
-    assert(b.cores[0].stop == Stop.NonSecure && b.cores[0].pc == 0x20070000)
+    val c = &b.cores[0]
+    val regions: [3][2]u32 = [[0x20070080, 0x200700E0], [0x40000000, 0x4FFFFFE0], [0xD0000000, 0xD003FFE0]]
+    for k in 0..<3
+        c.sau_rbar[k] = regions[k][0]
+        c.sau_rlar[k] = regions[k][1] | 1
+    c.sau_ctrl = 1
+    c.attribution_stale = true
+    place(b, 0x20070000, [0x470C])
+    place(b, 0x20070080, [0x6810, 0xBE00])
+    c.pc = 0x20070000
+    c.r[1] = 0x20070080
+    c.r[2] = a
+    b
 
-    val s = arm_board(PICO2_ARM_SRAM)
-    s.boot(ARM_BLINK).unwrap()
-    // Core 1: mrs r0, msp_ns. Core 0: wfi, b . (asleep until core 1 ends the run).
-    place(s, 0x20070000, [0xF3EF, 0x8088, 0xBE00])
-    park_core0(s)
-    launch_from_test(s, 0x20000000, 0x20080000, 0x20070001)
-    assert(s.run(100000) == RunEnd.Fault)
-    assert(s.refused == "core 1 at pc 0x20070000: MRS or MSR of a Non-secure register: Non-secure state is not modelled", s.refused)
+@test("ACCESSCTRL on the Arm board: Non-secure code reaching the PSM is refused by name until the PSM's register grants NSP; the SIO from Non-secure state is refused; a write restricting an SRAM bank is refused")
+arm_accessctrl()
+    // PSM's FRCE_ON, a block no reset holds.
+    val psm = 0x40018000u32
+    val b = ns_load(psm)
+    val end = b.run(1000)
+    assert(end == RunEnd.Fault, s"$end ${b.refused}: core 0 ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}, pc 0x${hex(b.cores[0].pc, 8)}, sfsr 0x${hex(b.cores[0].sfsr)}")
+    val why = s"core 0 at pc 0x20070080: ACCESSCTRL.PSM is 0x${hex(0xB8u32, 2)}, which does not let core 0, Non-secure privileged, reach 0x40018000: a bus fault on silicon"
+    assert(b.refused == why, b.refused)
+    assert(b.cores[0].ns, "refused in Non-secure state")
+
+    val g = ns_load(psm)
+    g.chip.write(0, ACCESSCTRL + 0xDC, 4, 0xACCE00BA).unwrap()
+    assert(g.run(1000) == RunEnd.Breakpoint, g.refused)
+    assert(g.cores[0].r[0] == g.chip.read(0, psm, 4).unwrap() && g.cores[0].pc == 0x20070082, "granted NSP, the load is made")
+
+    val s = ns_load(0xD0000000)
+    assert(s.run(1000) == RunEnd.Fault)
+    assert(s.refused == s"core 0 at pc 0x20070080: 0x${hex(0xD0000000u32, 8)} is the SIO, from Non-secure state: the SIO's Non-secure bank is not modelled", s.refused)
+
+    val m = arm_board(PICO2_ARM_SRAM)
+    m.boot(ARM_BLINK).unwrap()
+    m.chip.write(0, ACCESSCTRL + 0x1C, 4, 0xACCE00FC) match
+        Ok(_) -> assert(false, "restricting SRAM0 is refused")
+        Err(e) -> assert(e.contains(s"ACCESSCTRL.SRAM0 written 0x${hex(0xFCu32, 2)}: restricting a memory device is not modelled"), e)
+    m.chip.write(0, ACCESSCTRL + 0x1C, 4, 0xACCE00FF).unwrap()
+
+private const ACCESSCTRL: u32 = 0x40060000
 
 @test("core 1 leaves the boot ROM's own wait at the entry, stack pointer and VTOR core 0 sends it, and runs on the Arm board")
 arm_core1_launch()
@@ -208,7 +245,7 @@ arm_core1_launch()
     assert(c.r[14] == 0x243, s"lr 0x${hex(c.r[14], 8)}")
     // The ROM left its own security set-up on the core: CP7 in CPACR, NSACR and the Non-secure CPACR,
     // and SAU region 7 enabled.
-    assert(c.cpacr == ROM_CPACR && c.nsacr == ROM_NSACR && c.cpacr_ns == ROM_CPACR, s"0x${hex(c.cpacr)} 0x${hex(c.nsacr)}")
+    assert(c.cpacr == ROM_CPACR && c.nsacr == ROM_NSACR && c.banked.cpacr == ROM_CPACR, s"0x${hex(c.cpacr)} 0x${hex(c.nsacr)}")
     assert(c.sau_ctrl == 1 && c.sau_rbar[7] == ROM_SAU_RBAR && c.sau_rlar[7] == ROM_SAU_RLAR)
 
 @test("the boot ROM's handshake as its code has it: a word other than 1 in the 1's place is answered with 0 and the handshake starts again; a 0 in the vector table's place restarts it too; the launch after")

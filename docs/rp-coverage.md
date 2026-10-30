@@ -69,7 +69,7 @@ day. An L is split before it is handed out (§6).
 | M33 MPU (PMSAv8, 8 regions per state) | 3.7 | partial (stored) | On a Secure-only core: MPU_TYPE (8), CTRL, RNR (three bits), RBAR, RLAR and their three aliases, MAIR0/1 stored; `TT` answers MREGION, MRVALID, R and RW from them, an overlap naming no region (`v6m/t2secure.sysl`, item 6). **Not enforced**: an access the regions forbid is made where silicon takes MemManage. The Non-secure MPU is not built (Q3). | `v6m/t2rom_tests.sysl` | M (enforcement) | — |
 | M33 stack limits (MSPLIM/PSPLIM) | 3.7 | full | Every SP write below the limit is the UsageFault STKOF, recorded in CFSR and taken where SHCSR enables it and it preempts, else HardFault (HFSR.FORCED), else a lockup stop; exception stacking that crosses the limit stacks only above it, leaves SP at it and derives the fault (late arrival or pending); `CCR.STKOFHFNMIGN` at negative priority (`v6m/t2secure.sysl`, item 2). | `t2_except.sysl` stack-limit tests; `examples/pico2/stack_limit.c` in `chip/arm_tests.sysl` | — | — |
 | TrustZone, Secure-only minimum (SAU stored, TT*, SecureFault, NS transitions refused) | 3.7, 10 Security | full | Secure reset state; SAU_CTRL/TYPE/RNR/RBAR/RLAR stored (8 regions); `TT`/`TTT`/`TTA`/`TTAT` answer from the SAU, the IDAU's one numbered region (the ROM's secure gateways, 0x7e00–0x7fff, region 2, NSC) and the MPU (item 6); NSACR, SCR and the NS alias's CPACR stored; SecureFault's enable, priority, SFSR (W1C) and SFAR, pended through SHCSR; `SG` a NOP; `BXNS`/`BLXNS` to Non-secure, EXC_RETURN with S or DCRS clear, `MRS`/`MSR` of `_NS` registers and the PPB's NS alias stop at `NonSecure`, named; EXC_RETURN with ES clear is UsageFault INVPC (item 2). Not detected: INVTRAN (executing from SAU-Non-secure memory). | `v6m/t2secure_tests.sysl`; `examples/pico2/tt.c` in `chip/arm_tests.sysl` | — | — |
-| TrustZone, Non-secure state | 3.7, 10 Security | missing | Both worlds' banked state, IDAU, secure gateways and the NS aliases of PPB and SIO. | — | L | Secure-only |
+| TrustZone, Non-secure state | 3.7, 10 Security | full | Both states' banked registers, the SCS's Non-secure alias with its own SysTick, SAU and IDAU enforced on fetches and data, SG/BXNS/BLXNS/FNC_RETURN, cross-state exceptions with the integrity signature, NVIC_ITNS, SecureFault INVEP/INVIS/INVER/AUVIOL/INVTRAN. Refused by name: FP context across states, BFHFNMINS/PRIS, a Non-secure PRIGROUP of its own, the SIO's Non-secure bank. See "Item 31, done". | `v6m/t2nonsecure_tests.sysl`, `chip/arm_tests.sysl` (`nonsecure.elf`) | — | — |
 | M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | full | `MCR`, `MRC`, `MCRR`, `MRRC`, `CDP` and their `…2` forms reach the board through `Bus.coprocessor`, gated by CPACR, which keeps the fields of the ports the board fills (`v6m/coproc.sysl`). **GPIOC is full**: every instruction of `gpio_coproc.h` is its SIO equivalent (`chip/coprocessors.sysl`). **RCP is full** (item 3): salts, canaries, boolean and integer checks, the sequence counter, the random byte and `rcp_panic`, each core its own state; a failed check stops the core at `Fault` with the check named (`chip/rcp.sysl`). **DCP is full** (item 7): every instruction of `dcp_instr.inc.S` in its `R…` and `P…` forms on CP4 and CP5, each core's two instances its own, so every canned sequence gives its IEEE result (`chip/dcp.sysl`). Any encoding outside a coprocessor's set is refused by name. | `v6m/coproc_tests.sysl`, `chip/rcp_tests.sysl`, `chip/dcp_tests.sysl` (`dcp.elf`), `chip/arm_tests.sysl` (`rcp.elf`, `gpioc.elf`) | — | — |
 | Hazard3 ×2 (RV32IMAC + Zb*/Zc*/Zcmp, PMP, Xh3pmpm, Xh3power) | 3.8 Hazard3 | full | `riscv/rp2350.sysl:6–22` and `riscv/HAZARD3-COVERAGE.md`. | `riscv/hazard3_*_tests`, `chip/tests.sysl:18` | — | — |
 | Hazard3 interrupt controller (Xh3irq) | 3.8 | full | MEIEA, MEIPA, MEINEXT and MEICONTEXT (`riscv/csr.sysl:34–42`). Only the lines `signal` drives ever pend (see "Interrupt routing"). | `riscv/hazard3_tests` | — | — |
@@ -81,7 +81,7 @@ day. An L is split before it is handed out (§6).
 | SIO interpolators INTERP0/1 (per core) | 3.1 SIO | full | `peripheral/rp2040/interp.sysl`, shared with the RP2040: each core's own pair; shift (rotate here), mask, SIGNED, CROSS_INPUT, CROSS_RESULT, ADD_RAW, FORCE_MSB, BLEND (INTERP0), CLAMP (INTERP1), OVERF flags, PEEK/POP, ACCUMx_ADD, BASE_1AND0 (item 15). | `rp2040/interp_tests.sysl`, `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
 | SIO TMDS encoder | 3.1 SIO | missing | Refused (`sio.sysl:10`). | — | S | HSTX (for a use) |
 | BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | missing | Not decoded. | — | S (counters) | DMA/cores for events |
-| ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. Nothing else on the chip consults it (Secure-only, Q3). | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
+| ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. The Arm board gates every core bus access by it (master, security state, privilege), a denial refused by name; a write restricting a memory device is refused. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl`, `chip/arm_tests.sysl` | — | — |
 | ROM: core-1 launch protocol | 5.3 / 5 Bootrom | full | The real ROM's own code, on both boards: each M33's and Hazard3's core 1 starts from reset in it and waits there (salts, then the FIFO handshake, asleep in `WFE` / `h3.block`); PSM's release restarts it (item 6). | `chip/arm_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | partial | Raspberry Pi's A4 image, whole, at 0 on both boards (`chip/rom/`); every function runs as the ROM's code. Run end to end: the lookup, `get_sys_info`'s BOOT_INFO, CHIP_INFO, CRITICAL and CPU_INFO, `connect_internal_flash`, `flash_exit_xip`, `flash_range_erase`/`_program`, `flash_flush_cache`, the unique ID, `otp_access` (reads and writes, raw and ECC, its lock and argument checks; item 26), `bootrom_state_reset` and `reboot` (PC/SP). Each other function runs until it reaches a block not modelled, which refuses it by name: USB (`reset_usb_boot`), the partition and image calls (item 30). | `chip/arm_tests.sysl` (`rom.elf`), `chip/otp_tests.sysl` (`otp.elf`) | M | USB (20), item 30 |
 | Boot path: IMAGE_DEF, partition tables, UF2, secure-boot flags, signature check | 5 Bootrom, 10 Security | missing | Core 0 does not run the ROM's boot path: power-on and the watchdog's reset hand an image over as it would (`chip/arm_board.sysl`), writing BOOT_INFO and the chip ID it copies from the OTP where the ROM keeps them. It needs TRNG and SHA-256 (the boot salts) and the image parsing; the OTP's boot flags and critical flags it reads are modelled (item 26). | — | L | ROM, XIP, SHA-256 |
@@ -169,7 +169,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 32 | 8 | 0 | 18 | 58 |
+| RP2350 | 33 | 8 | 0 | 17 | 58 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
@@ -261,7 +261,7 @@ Each of these is a block, or part of one, that could reasonably be left out. All
 |---|---|
 | Q1 | the **real** boot ROM images, with OTP, BOOTRAM, QMI direct mode and the RCP modelled for them |
 | Q2 | the real boot path is built through **IMAGE_DEF**; the debugger entry stays as well |
-| Q3 | **Secure-only**; Non-secure state is not built |
+| Q3 | **Secure-only** first; Non-secure state then built as item 31 |
 | Q4 | USB **device** mode only, with the CDC bridge |
 | Q5 | the **GDB stub**; no SW-DP, RESCUE or CoreSight trace |
 | Q6 | GLITCH_DETECTOR and TBMAN are **register stubs** |
@@ -342,7 +342,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 28 | **BUSCTRL performance counters, TBMAN, GLITCH_DETECTOR stores**. | S | 11 |
 | 29 | **HSTX and the SIO TMDS encoder** (per Q9). | M | 11 |
 | 30 | **Boot path** (IMAGE_DEF and partitions; per Q2). | L | 6, 25, 26 |
-| 31 | **Non-secure TrustZone** (per Q3). | L | 2 |
+| 31 | **Non-secure TrustZone** (Q3 reopened). **Done** (below). | L | 2 |
 | 32 | **USB host mode** (per Q4). | L | 20 |
 | 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED). | L | 14 |
 | 34 | **POWMAN power states**: STATE, PWRUP0–3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS, the P1.x time skip (Q7) and the power-up boot as far as it needs no ROM. **Done** (below). | M | 27 |
@@ -1096,3 +1096,55 @@ through `next_event`, a halved clk_peri, the pins bit by bit, the wires and ever
 instruction: `sram_loop.elf` 5.11–5.12 G to 5.46–5.47 G and `xip_loop.elf` 5.33 G to 5.67–5.68 G (+7%,
 their 58 characters now waited for through UARTFR polls), and `dcp.elf` 0.70 G to 6.84 G, whose ~2,000
 characters are now 27 ms of guest time spent polling UART0 on both cores where they took none.
+
+### Item 31, done: Non-secure TrustZone
+
+Q3's cut line is lifted: the M33 runs both security states (`v6m/t2nonsecure.sysl`, DESIGN.md §2.7),
+against the ARMv8-M ARM:
+
+- **Banked registers** live where the Secure-only core kept them, as the current state's copy, with
+  the other state's in `Cpu.banked`; a change of state exchanges them. `MRS`/`MSR` of the `_NS`
+  registers (SP_NS as CONTROL_NS.SPSEL selects) reach the bank from Secure state and read zero from
+  Non-secure state. The system control space's Non-secure alias is Non-secure state's view: its own
+  VTOR, CCR, SCR, CPACR (masked by NSACR), MPU, SHPR, SHCSR, CFSR and a second **SysTick**, counting
+  while either state runs; the NVIC registers of the IRQs NVIC_ITNS gives it; SAU, SFSR, SFAR and HFSR
+  reading zero. Both states' PRIMASK, BASEPRI and FAULTMASK raise the execution priority.
+- **Attribution enforced, free on the fast paths.** Non-secure state runs on records and a page table
+  of its own (each the memory's, per core, made on first entry): a page is on the Non-secure table only
+  where all of it is Non-secure, and every other access takes the slow path, which makes it where it is
+  Non-secure and takes SecureFault AUVIOL (SFAR) where not. Decoding judges the address: INVEP for a
+  Secure address from Non-secure state (the entry to Secure state at a Non-secure-callable `SG`),
+  INVTRAN for a Non-secure one from Secure state. The SAU and the IDAU (the boot ROM's NSC region)
+  combine as the more secure answer. A change to the SAU or to a page's mapping remakes the table and
+  forgets the decoded records, through the code-line marks, before the next run.
+- **Transitions:** `SG`, `BXNS`, `BLXNS` (return address and partial RETPSR on the Secure stack,
+  FNC_RETURN, IPSR 1 from handler mode), FNC_RETURN; exceptions to the other state (S, DCRS, ES exact;
+  the callee registers under the integrity signature and R0–R12 cleared from Secure to Non-secure; the
+  signature checked on return, INVIS; ES checked, INVER or INVPC); banked exceptions' Non-secure copies
+  at `NS_BANK` + n in the NVIC's sets; IRQs by NVIC_ITNS. `VLSTM`/`VLLDM`, which libgcc's
+  `__gnu_cmse_nonsecure_call` wraps around BLXNS, are NOPs with no floating-point context active.
+- **ACCESSCTRL** gates every core bus access on the Arm board by master, state and privilege
+  (FORCE_CORE_NS included): a denial is refused by name as silicon's bus fault. Secure privileged code
+  with nothing denied pays two tests.
+- **Refused by name:** a change of state with a floating-point context active (lazy preservation,
+  SFPA), AIRCR.BFHFNMINS or PRIS set, a Non-secure PRIGROUP other than the Secure one, the FP
+  registers' Non-secure view, the PPB alias outside the system control space, the SIO from Non-secure
+  state (its Non-secure bank), and an ACCESSCTRL write restricting a memory device. The MPU is stored
+  per state and answered by `TT`, not enforced.
+
+`examples/pico2/nonsecure.c` with `nonsecure_ns.S` is the oracle: the SDK-built Secure image gives the
+SAU its own Non-secure code, stack and veneer, calls the Non-secure function through a
+`cmse_nonsecure_call` pointer (libgcc's BLXNS sequence), which calls back through `SG` and returns with
+FNC_RETURN (`ns_function(20) = 142 after 1 call(s)`), prints TT of the three regions, and takes
+SecureFault AUVIOL from a Non-secure load of Secure memory in its own handler (`sfsr 00000048`). The
+compiler's `cmse_nonsecure_entry` is not used: GNU ld puts its veneers in `.gnu.sgstubs`, which the
+SDK's linker script does not place, so the veneer and its BXNS return are hand-written.
+`v6m/t2nonsecure_tests.sysl` (20 cases, both executors) covers each transition, fault and refusal;
+`chip/arm_tests.sysl` the oracle and ACCESSCTRL. Breaking the integrity check or the callee clearing
+turns the INVIS and the IRQ cases red.
+
+**Cost**, host instructions retired, three runs each against the branch's base (dev at b544795):
+`bench --core cortex-m33 kernel33.bin` 37.17 G to 36.88 G; `sram_loop.elf` 5.104 G to 5.080 G and
+`xip_loop.elf` 5.330 G to 5.300 G. A first cut cost 0.7% on the loops: the SecureFault test grew the
+slow path that `load` and `store` inline into every handler; it is out of line now (`slow_load`,
+`slow_store`), which is also why the base got faster.

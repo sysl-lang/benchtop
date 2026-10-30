@@ -81,6 +81,8 @@ clear_exceptions(cpu: *Cpu)
         cpu.active[w] = 0
         cpu.enabled[w] = 0
         cpu.incoming[w] = 0
+    // The Non-secure SVCall, PendSV and SysTick are always enabled, as the Secure ones are.
+    for e in [SVCALL, PENDSV, SYSTICK] do cpu.enabled[nvic_word(NS_BANK + e)] |= nvic_bit(NS_BANK + e)
     cpu.pending_banks = 0
     cpu.active_banks = 0
     cpu.incoming_banks = 0
@@ -116,7 +118,13 @@ begin_run(cpu: *Cpu) -> bool
         halt(cpu, Stop.Asleep, cpu.pc)
         return false
 
-    tick(cpu, clock(cpu, cpu.retired))
+    if cpu.attribution_stale then refresh_attribution(cpu)
+    cpu.access_faulted = false
+
+    val now = clock(cpu, cpu.retired)
+    tick(cpu, now)
+    // The Non-secure SysTick counts too, and cuts the run at its expiry as the Secure one does.
+    val ns_due = if cpu.trustzone then ns_tick_up(cpu, now) else NEVER
     take_pending(cpu)
 
     if cpu.stop != Stop.Running then return false
@@ -125,6 +133,8 @@ begin_run(cpu: *Cpu) -> bool
         val due = cpu.tick_zero - cpu.slept
 
         lower_limit(cpu, due)
+
+    if ns_due != NEVER then lower_limit(cpu, ns_due - cpu.slept)
 
     true
 
@@ -150,7 +160,7 @@ recheck(cpu: *Cpu)
  */
 irqs_enabled(cpu: *Cpu) -> bool
     if cpu.enabled[0] >> IRQ0 != 0 then return true
-    for w in 1..<NVIC_BANKS do if cpu.enabled[w] != 0 then return true
+    for w in 1..<NVIC_BANKS do if cpu.enabled[w] & (if w == NVIC_BANKS - 1 then ~NS_BANK_BITS else ~0u64) != 0 then return true
     false
 
 // Raise IRQ `irq`, from a device: it is pending until it is taken or cleared.
@@ -201,7 +211,7 @@ wake_by(cpu: *Cpu, horizon: u64) -> bool
 
     val now = clock(cpu, cpu.retired)
 
-    tick(cpu, now)
+    ticks(cpu, now)
 
     val e = best_pending(cpu)
 
@@ -211,22 +221,28 @@ wake_by(cpu: *Cpu, horizon: u64) -> bool
         if due == NEVER || due > horizon
             if horizon != NEVER && horizon > now
                 cpu.slept += horizon - now
-                tick(cpu, horizon)
+                ticks(cpu, horizon)
             return false
 
         cpu.slept += due - now
-        tick(cpu, due)
+        ticks(cpu, due)
 
     cpu.sleeping = false
     cpu.on_event = false
     true
 
-// The clock at which a sleeping core's own SysTick wakes it, nothing else pending; `NEVER` if it
-// will not.
-next_wake(cpu: *Cpu) -> u64
-    if cpu.tick_ctrl != TICK_RUNNING || cpu.tick_zero == NEVER || !could_wake(cpu, SYSTICK) then return NEVER
+// Bring SysTick up to `now`, and the Non-secure one where Non-secure state is in use.
+private ticks(cpu: *Cpu, now: u64)
+    tick(cpu, now)
+    if cpu.trustzone then ns_tick_up(cpu, now)
 
-    cpu.tick_zero
+// The clock at which a sleeping core's own SysTick (either state's) wakes it, nothing else pending;
+// `NEVER` if it will not.
+next_wake(cpu: *Cpu) -> u64
+    var due = NEVER
+    if cpu.tick_ctrl == TICK_RUNNING && cpu.tick_zero != NEVER && could_wake(cpu, SYSTICK) then due = cpu.tick_zero
+    if cpu.trustzone && cpu.ns_tick.ctrl == TICK_RUNNING && cpu.ns_tick.zero < due && could_wake(cpu, NS_BANK + SYSTICK) then due = cpu.ns_tick.zero
+    due
 
 // Whether exception `e`, were it pending, would wake a sleeping core.
 could_wake(cpu: *Cpu, e: u32) -> bool
@@ -255,6 +271,8 @@ running_priority(cpu: *Cpu, masked: bool) -> int
 
     if cpu.active_banks != 0 then p = extra_running_priority(cpu,p)
 
+    if cpu.trustzone then return banked_running(cpu, p, masked)
+
     if cpu.basepri != 0 && group(cpu, int(cpu.basepri)) < p then p = group(cpu, int(cpu.basepri))
     if masked && cpu.primask != 0 && p > 0 then p = 0
     if cpu.faultmask != 0 && p > -1 then p = -1
@@ -264,7 +282,7 @@ running_priority(cpu: *Cpu, masked: bool) -> int
 // Whether exception `e` is enabled: an IRQ has its bit in the NVIC, a configurable fault its SHCSR
 // enable (kept in `enabled` too), and the other system exceptions always are.
 eligible(cpu: *Cpu, e: u32) -> bool
-    if e >= IRQ0 then return irq_enabled(cpu,e - IRQ0)
+    if e >= IRQ0 then return if e >= NS_BANK then fault_enabled(cpu, e) else irq_enabled(cpu,e - IRQ0)
 
     ((SYSTEM_EXCEPTIONS | cpu.enabled[0]) >> e) & 1 != 0
 
@@ -330,6 +348,12 @@ set_apsr(cpu: *Cpu, psr: u32)
 // address the exception would have returned to, nothing stacked. CCR.STKOFHFNMIGN ignores the limit
 // for an exception at a negative priority. The handler starts outside any IT block, and with the
 // local exclusive monitor clear.
+//
+// With the Security Extension, `e` may be a Non-secure copy of a banked exception (`NS_BANK` up) and
+// may target the other security state (t2nonsecure.sysl): the frame goes on the stack of the state
+// the core is in, EXC_RETURN's S, DCRS and ES say which states and stacking, the vector comes from the
+// handler's state's VTOR, and the handler runs in that state. From Secure state to a Non-secure
+// handler the callee registers are stacked too, under the integrity signature, and cleared.
 enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     val sp = cpu.r[13]
     // CCR.STKALIGN: configurable on ARMv7-M (fixed at 1 on the M7), RES1 on ARMv8-M.
@@ -337,16 +361,27 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     // With a floating-point context active (CONTROL.FPCA), the frame is extended by S0–S15, FPSCR
     // and a reserved word, stacked at once rather than lazily (fpu.sysl).
     val extended = cpu.control & 4 != 0
-    val size: u32 = if extended then 0x68 else 0x20
-    val frame = (sp -% size) & ~align
+    var target_ns = cpu.ns
+    var callee = false
+    if cpu.trustzone
+        target_ns = targets_ns(cpu, e)
+        if target_ns != cpu.ns && extended
+            non_secure(cpu, Transition.FpContext, ret)
+            return false
+        callee = target_ns && !cpu.ns
+    // The callee registers sit under the caller's frame.
+    val under: u32 = if callee then 0x28 else 0
+    val size: u32 = (if extended then 0x68 else 0x20) + under
+    val low = (sp -% size) & ~align
+    val frame = low +% under
     val words: [8]u32 = [cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[12], cpu.r[14], ret, xpsr(cpu) | ((if align != 0 then (sp >> 2) & 1 else 0) << 9)]
     // Every word is stacked at or above `floor`; the new SP is `top`.
     var floor: u32 = 0
-    var top = frame
+    var top = low
     var derived = -1
     var to = e
 
-    if !is_v6m(cpu.kind) && frame < sp_limit(cpu) && !overflow_ignored(cpu, group(cpu, priority(cpu, e)))
+    if !is_v6m(cpu.kind) && low < sp_limit(cpu) && !overflow_ignored(cpu, group(cpu, priority(cpu, e)))
         derived = derived_overflow(cpu)
 
         if derived < 0
@@ -365,15 +400,28 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
         if frame +% 0x64 >= floor then write32(cpu, frame +% 0x64, 0, n)
         cpu.fpcar = frame +% 0x20
 
-    val at = cpu.vtor + to * 4
-    val vector = read32(cpu, at, n)
+    // A derived fault taken instead is the stack's own state's.
+    if to != e then target_ns = cpu.ns
 
+    val vtor = if target_ns == cpu.ns then cpu.vtor else cpu.banked.vtor
+    val at = vtor + architectural(to) * 4
+    val vector = if target_ns != cpu.ns then vector_read(cpu, at, n) else read32(cpu, at, n)
+
+    // A frame written where Non-secure state may not write has pended SecureFault; the entry goes on.
+    cpu.access_faulted = false
     if cpu.stop != Stop.Running then return false
 
-    // EXC_RETURN's bit 4 is clear for an extended frame.
-    val ftype: u32 = if extended then 0x10 else 0
+    if callee then callee_stack(cpu, low, floor, extended, n)
 
-    cpu.r[14] = (if cpu.ipsr != 0 then 0xFFFFFFF1 else if cpu.control & 2 != 0 then 0xFFFFFFFD else 0xFFFFFFF9) & ~ftype
+    // EXC_RETURN's bit 4 is clear for an extended frame; S (bit 6), DCRS (bit 5) and ES (bit 0) say the
+    // state returned to, whether the callee registers were stacked, and the handler's state.
+    val ftype: u32 = if extended then 0x10 else 0
+    var exc_return = (if cpu.ipsr != 0 then 0xFFFFFFF1 else if cpu.control & 2 != 0 then 0xFFFFFFFD else 0xFFFFFFF9) & ~ftype
+    if cpu.ns then exc_return &= ~0x40
+    if callee then exc_return &= ~0x20
+    if target_ns then exc_return &= ~1
+
+    cpu.r[14] = exc_return
 
     if on_process_stack(cpu)
         cpu.r[13] = cpu.sp_other
@@ -381,8 +429,11 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     else
         cpu.r[13] = top
 
-    cpu.ipsr = to
-    // The handler starts with no floating-point context of its own.
+    cpu.ipsr = architectural(to)
+    // The handler starts with no floating-point context of its own, on its own state's main stack.
+    if target_ns != cpu.ns
+        cpu.control &= ~4
+        switch_state(cpu, target_ns)
     cpu.control &= ~6
     cpu.fp_ready = false
     set_active(cpu,to,true)
@@ -398,30 +449,31 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
 // The record a `BX` or `POP {pc}` at `from` goes to with `v` off the RAM: in handler mode, an
 // EXC_RETURN value returns from the exception; anything else stops the core at `Unmapped`.
 //
-// On a Secure-only core the EXC_RETURN prefix is bits 31–7, and bits 6 (S), 5 (DCRS) and 0 (ES) are
-// the Security Extension's: ES clear names a Non-secure exception, which is not active, so the return
-// is the UsageFault INVPC, taken from the handler at the return; S clear (to the Non-secure stack) and
-// DCRS clear (callee registers stacked, which only an entry to Non-secure state does) stop the core
-// at `NonSecure`.
+// With the Security Extension the EXC_RETURN prefix is bits 31–7, and bits 6 (S), 5 (DCRS) and 0
+// (ES) are the extension's (t2nonsecure.sysl). ES must name the state the handler runs in: clear from
+// Secure state it is the UsageFault INVPC, set from Non-secure state SecureFault INVER, each taken from
+// the handler at the return. S names the state returned to, whose stack holds the frame; DCRS clear
+// says the callee registers are stacked under it, behind the integrity signature, which must match
+// (SecureFault INVIS). S and DCRS both clear names no frame an entry makes, and stops at `Fault`. In
+// Non-secure state a branch to FNC_RETURN returns from a Non-secure call (`function_return`).
 exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
+    if cpu.ns && (v | 1) == FNC_RETURN then return function_return(cpu, from, n)
     if cpu.ipsr == 0 then return insn_at(cpu, v & ~1)
 
     if cpu.security
         if v >> 7 != 0x01FFFFFF then return insn_at(cpu, v & ~1)
-        if v & 1 == 0
-            cpu.cfsr |= CFSR_INVPC
-            fault(cpu, USAGE_FAULT, from, Stop.Fault)
+        if v & 1 == 0 && !cpu.ns
+            usage_fault(cpu, CFSR_INVPC, from, Stop.Fault)
             return stopped_on(cpu, from, n)
-        if v & 0x40 == 0
-            non_secure(cpu, Transition.ReturnNonSecure, from)
+        if v & 1 != 0 && cpu.ns
+            secure_fault(cpu, SFSR_INVER, from)
             return stopped_on(cpu, from, n)
-        if v & 0x20 == 0
-            non_secure(cpu, Transition.ReturnCallee, from)
-            return stopped_on(cpu, from, n)
+        if v & 0x60 == 0 then return fault_at(cpu, from, n)
     else if v >> 5 != 0x07FFFFFF
         return insn_at(cpu, v & ~1)
 
-    val kind = v & 0xF
+    // Mode and SPSEL, with bit 0 set as ES is on a core without the extension.
+    val kind = if cpu.security then (v & 0xE) | 1 else v & 0xF
     // Bit 4 clear: the frame is extended with the floating-point context, which only a core with the
     // extension stacks.
     val extended = v & 0x10 == 0
@@ -429,23 +481,46 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
     if kind != 0x1 && kind != 0x9 && kind != 0xD then return fault_at(cpu, from, n)
     if extended && cpu.fpu == Fpu.Absent then return fault_at(cpu, from, n)
 
+    // The exception returning, and the state returned to, whose banks hold the frame's stack.
+    val returning = in_state(cpu, cpu.ipsr)
+    val was_ns = cpu.ns
+    val to_ns = cpu.security && v & 0x40 == 0
+    val callee = cpu.security && v & 0x20 == 0
+    if to_ns != was_ns
+        if extended
+            non_secure(cpu, Transition.FpContext, from)
+            return stopped_on(cpu, from, n)
+        switch_state(cpu, to_ns)
+
     val to_process = kind == 0xD
-    val frame = if to_process then cpu.sp_other else cpu.r[13]
+    val low = if to_process then cpu.sp_other else cpu.r[13]
+    val frame = if callee then low +% 0x28 else low
     var words: [8]u32
     var fp: [17]u32
+    var saved: [10]u32
 
     for k in 0..<8 do words[k] = read32(cpu, frame +% u32(k) * 4, n)
     if extended then for k in 0..<17 do fp[k] = read32(cpu, frame +% 0x20 +% u32(k) * 4, n)
+    if callee then for k in 0..<10 do saved[k] = read32(cpu, low +% u32(k) * 4, n)
+    cpu.access_faulted = false
 
-    // A frame where nothing is: the core stops on the return, with nothing restored.
-    if cpu.stop != Stop.Running then return stopped_on(cpu, from, n)
+    // A frame where nothing is: the core stops on the return, with nothing restored. A signature that
+    // does not match is SecureFault INVIS, from the handler.
+    val forged = callee && saved[0] != (INTEGRITY | (if extended then 0 else 1))
+    if cpu.stop != Stop.Running || forged
+        if to_ns != was_ns then switch_state(cpu, was_ns)
+        if forged && cpu.stop == Stop.Running then secure_fault(cpu, SFSR_INVIS, from)
+        return stopped_on(cpu, from, n)
 
     val psr = words[7]
     val ipsr = psr & (if is_v6m(cpu.kind) then 0x3fu32 else 0x1ffu32)
 
     // Back to handler mode with no exception, or to thread mode with one: the M0+ would fault.
-    if (kind == 0x1) != (ipsr != 0) then return fault_at(cpu, from, n)
+    if (kind == 0x1) != (ipsr != 0)
+        if to_ns != was_ns then switch_state(cpu, was_ns)
+        return fault_at(cpu, from, n)
 
+    if callee then for k in 0..<8 do cpu.r[4 + k] = saved[2 + k]
     for k in 0..<4 do cpu.r[k] = words[k]
     cpu.r[12] = words[4]
     cpu.r[14] = words[5]
@@ -465,12 +540,14 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
     // IT block the exception interrupted goes on under the ITSTATE its frame holds: what is left of
     // it is decoded under that state, whatever its records held (thumb2.sysl).
     if !is_v6m(cpu.kind)
-        if cpu.ipsr != NMI then cpu.faultmask = 0
+        // The returning exception's state's FAULTMASK, which is the bank's where the state changed.
+        if cpu.ipsr != NMI
+            if to_ns != was_ns then cpu.banked.faultmask = 0 else cpu.faultmask = 0
         cpu.excl = false
         cpu.it = if cpu.kind == Kind.M23 then 0 else it_of_psr(psr)
         if cpu.it != 0 && cpu.mem.is_code(pc) then decode_block(cpu, pc & ~1, cpu.it)
 
-    set_active(cpu,cpu.ipsr,false)
+    set_active(cpu,returning,false)
     cpu.ipsr = ipsr
     set_apsr(cpu, psr)
     if cpu.dsp then cpu.ge = (psr >> 16) & 15
@@ -516,7 +593,8 @@ branch_to(cpu: *Cpu, v: u32, ip: *Insn, n: u64) -> *Insn
 svc(cpu: *Cpu, ip: *Insn, n: u64) -> *Insn
     val from = addr_of(cpu, ip)
     val running = running_priority(cpu, true)
-    val e = if group(cpu, priority(cpu, SVCALL)) < running then SVCALL else HARD_FAULT
+    val svcall = in_state(cpu, SVCALL)
+    val e = if group(cpu, priority(cpu, svcall)) < running then svcall else HARD_FAULT
 
     if group(cpu, priority(cpu, e)) >= running then return fault_at(cpu, from, n)
     if !enter(cpu, e, from + 2, n) then return stopped_on(cpu, from, n)
@@ -676,7 +754,7 @@ scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
             (bit_of(low, NMI) << 31) | (bit_of(low, PENDSV) << 28) | (bit_of(low, SYSTICK) << 26) | irq | (vectpending << 12) | cpu.ipsr
         SCB_VTOR -> if cpu.kind == Kind.M0 || cpu.kind == Kind.M1 then 0 else cpu.vtor
         // VECTKEYSTAT, little-endian.
-        SCB_AIRCR -> 0xFA050000 | (cpu.prigroup << 8)
+        SCB_AIRCR -> 0xFA050000 | (cpu.prigroup << 8) | cpu.aircr_secure
         SCB_SHPR2 -> u32(cpu.prio[SVCALL]) << 24
         SCB_SHPR3 -> u32(cpu.prio[PENDSV]) << 16 | u32(cpu.prio[SYSTICK]) << 24
         _ -> scs_read8(cpu, a)
@@ -723,6 +801,9 @@ scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
         SCB_VTOR -> if cpu.kind != Kind.M0 && cpu.kind != Kind.M1 then cpu.vtor = x & ~0xFF
         // SYSRESETREQ, under the key: the board decides what a reset is.
         SCB_AIRCR ->
+            if x >> 16 == 0x05FA && cpu.security
+                if x & (AIRCR_BFHFNMINS | AIRCR_PRIS) != 0 then return non_secure(cpu, Transition.Aircr, a)
+                cpu.aircr_secure = x & AIRCR_SYSRESETREQS
             if x >> 16 == 0x05FA && !is_baseline(cpu.kind) then cpu.prigroup = (x >> 8) & 7
             if x >> 16 == 0x05FA && x & 4 != 0 then halt(cpu, Stop.Reset, a)
         SCB_SHPR2 -> cpu.prio[SVCALL] = u8((x >> 24) & prio_mask(cpu))

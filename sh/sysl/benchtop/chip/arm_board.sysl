@@ -89,6 +89,9 @@ private const SRAM_BANK1_BASE: u32 = 0x20040000
 // XIP_SRAM's 8-byte cache lines, and a line number no line has.
 private const SRAM_LINES: u32 = XIP_SRAM_BYTES / 8
 private const NO_LINE: u32 = 0xFFFFFFFF
+// The SIO and its Non-secure alias.
+private const SIO_BASE: u32 = 0xD0000000
+private const SIO_END: u32 = 0xD0040000
 
 
 // UF2 (github.com/microsoft/uf2): 512-byte blocks, their magic numbers, the flag that marks a block
@@ -218,7 +221,7 @@ impl ArmBoard
         if start.handoff
             c.cpacr = ROM_CPACR
             c.nsacr = ROM_NSACR
-            c.cpacr_ns = ROM_CPACR
+            c.banked.cpacr = ROM_CPACR
             c.sau_ctrl = 1
             c.sau_rnr = 7
             c.sau_rbar[7] = ROM_SAU_RBAR
@@ -558,7 +561,7 @@ impl ArmBoard
                 // Any other reset (AIRCR.SYSRESETREQ) is not modelled, and ends the run.
                 Reset -> if self.chip.restarting(u32(k)) then break else return RunEnd.Fault
                 NonSecure ->
-                    self.refused = s"core $k at pc 0x${hex(c.stop_at, 8)}: ${arm.transition_name(c.transition)}: Non-secure state is not modelled"
+                    self.refused = s"core $k at pc 0x${hex(c.stop_at, 8)}: ${arm.transition_name(c.transition)}"
                     return RunEnd.Fault
                 _ -> return RunEnd.Fault
         RunEnd.Budget
@@ -638,6 +641,7 @@ impl ArmBoard
             self.direct = direct
             for p in 0u32..<(FLASH_BYTES >> 12) do self.mem.page_table[(XIP_BASE >> 12) + p] = if direct then 0 else usize(&self.mem.flash[p << 12])
             arm.flash_unmapped(self.mem)
+            self.pages_changed()
         if self.chip.xip.epoch == self.xip_epoch then return
         self.xip_epoch = self.chip.xip.epoch
         self.sync_sram_lines()
@@ -645,6 +649,36 @@ impl ArmBoard
             var live = true
             for w in 0u32..<8 do if self.sram_lines[p * 8 + w] != ~0u64 then live = false
             self.mem.page_table[(XIP_SRAM_BASE >> 12) + p] = if live then usize(&self.mem.ram[self.sram_at + (p << 12)]) else 0
+        self.pages_changed()
+
+    // The page table changed: each core's Non-secure copy of it follows.
+    private pages_changed(*self)
+        for k in 0..<2 do arm.pages_changed(&self.cores[k])
+
+    // ACCESSCTRL on the bus: an access whose master, security state and privilege some device denies
+    // looks its device up, and one the device denies is refused by name, where silicon answers a bus
+    // fault. Non-secure state reaching the SIO is refused too: its Non-secure bank is not modelled.
+    // The common case costs two tests: Secure code with nPRIV clear, where no device denies either core
+    // Secure privileged access and FORCE_CORE_NS is clear (`AccessCtrl.secure_free`).
+    @inline
+    private gated(*self, cpu: *arm.Cpu, a: u32) -> bool
+        if !cpu.ns && cpu.control & 1 == 0 && self.chip.accessctrl.secure_free then return false
+        self.gated_slow(cpu, a)
+
+    @noinline
+    @cold
+    private gated_slow(*self, cpu: *arm.Cpu, a: u32) -> bool
+        if cpu.ns && a >= SIO_BASE && a < SIO_END
+            self.refuse(cpu, a, s"0x${hex(a, 8)} is the SIO, from Non-secure state: the SIO's Non-secure bank is not modelled")
+            return true
+        val ac = &self.chip.accessctrl
+        val need = ac.need(cpu.core, cpu.ns, cpu.ipsr != 0 || cpu.control & 1 == 0)
+        if need & ac.denied == 0 then return false
+        ac.refusal(a, need) match
+            None -> false
+            Some(why) ->
+                self.refuse(cpu, a, why)
+                true
 
     // Each XIP_SRAM cache line pinned or unpinned since the last time: the code decoded from each run
     // of changed lines decodes again.
@@ -672,6 +706,7 @@ impl arm.Bus for ArmBoard
     read(*self, cpu: *arm.Cpu, a: u32, width: u32, n: u64) -> u32
         self.chip.catch_up(self.at(cpu, n))
         if self.reset_first(cpu, a) then return 0
+        if self.gated(cpu, a) then return 0
         if in_xip_sram(u64(a))
             self.sram_line(a, width) match
                 Ok(at) ->
@@ -690,6 +725,7 @@ impl arm.Bus for ArmBoard
     write(*self, cpu: *arm.Cpu, a: u32, width: u32, x: u32, n: u64)
         self.chip.catch_up(self.at(cpu, n))
         if self.reset_first(cpu, a) then return
+        if self.gated(cpu, a) then return
         // The boot ROM is read-only, and a write to it is ignored rather than faulted: TinyUSB's RP2350 port
         // stores endpoint 0's control word through a null pointer, to 0x00000000, on every control
         // transfer, which every Pico 2 running stdio_usb survives (`hw_endpoint_start_next_buffer`).
