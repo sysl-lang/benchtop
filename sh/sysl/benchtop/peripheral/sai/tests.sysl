@@ -2,14 +2,31 @@ module sh.sysl.benchtop.peripheral.sai
 @tests
 
 import sysl.buf.{Buf,buf}
-import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.peripheral.ContextModel
 import sh.sysl.benchtop.timing.NEVER
 
-private get(b: &Block, offset: u32) -> Option[u32] = b.read(offset,4,b.time)
-private put(b: &Block, offset: u32, value: u32) -> bool = b.write(offset,4,value,b.time)
+// What a test's serial line has seen: the words a block sent and the time of each slot. It is the
+// block's context, which each `advance` hands its endpoint.
+private struct Line
+    words: Buf[u32]
+    times: Buf[u64]
 
-private stereo(receive: bool = false, hz: u64 = 480000000, kernel: u64 = 12288000, endpoint: Endpoint = no_endpoint) -> &Block
-    val b: &Block = block(hz,kernel,endpoint)
+private line() -> Line = Line(buf(), buf())
+
+// A line that writes the word sent and the time of each slot, and answers zero.
+private recording() -> Endpoint[Line] = (seen,slot,word,time) ->
+    seen.words.push(word)
+    seen.times.push(time)
+    0
+
+private get(b: &Block[Line], offset: u32) -> Option[u32] = b.read(offset,4,b.time)
+// A register write reaches no slot, so it is handed a line of its own.
+private put(b: &Block[Line], offset: u32, value: u32) -> bool
+    var unused = line()
+    b.write(&unused,offset,4,value,b.time)
+
+private stereo(receive: bool = false, hz: u64 = 480000000, kernel: u64 = 12288000, endpoint: Endpoint[Line] = (seen,slot,word,time) -> 0) -> &Block[Line]
+    val b: &Block[Line] = block(hz,kernel,endpoint)
     assert(put(b,8,63 | (31 << 8) | (1 << 16)))
     assert(put(b,12,(3 << 16) | (1 << 8) | (2 << 6)))
     assert(put(b,0,(4 << 5) | (1 << 20) | (if receive then 1u32 else 0)))
@@ -43,52 +60,58 @@ sai_registers()
 
 @test("STM32 SAI: timed slots, masks, inactive TDM slots, underrun, mute and write-one-to-clear")
 sai_transmit()
-    val words: Buf[u32] = buf()
-    val times: Buf[u64] = buf()
-    val b = stereo(endpoint = (slot,word,time) ->
-        words.push(word)
-        times.push(time)
-        0)
+    var seen = line()
+    val b = stereo(endpoint = recording())
     assert(put(b,0,b.cr1 | ENABLE))
     assert(b.due() == NEVER,"master TX starts frames when data arrives")
     assert(put(b,28,0xffff8000) && put(b,28,0x7fff))
     assert(b.due() == 5000)
-    b.advance(4999)
-    assert(words.is_empty())
-    b.advance(15000)
-    assert(words.view() == [0x8000u32,0x7fff,0][..])
-    assert(times.view() == [5000u64,10000,15000][..] && b.flags == OVERRUN_UNDERRUN)
+    b.advance(&seen,4999)
+    assert(seen.words.is_empty())
+    b.advance(&seen,15000)
+    assert(seen.words.view() == [0x8000u32,0x7fff,0][..])
+    assert(seen.times.view() == [5000u64,10000,15000][..] && b.flags == OVERRUN_UNDERRUN)
     assert(put(b,16,1) && b.irq())
     assert(put(b,24,1) && !b.irq())
     assert(put(b,28,123) && put(b,4,32))
-    b.advance(20000)
-    assert(words.at(3) == 0 && b.fifo.is_empty(),"mute still consumes data")
-    b.advance(20000)
-    b.advance(10000)
-    assert(words.len() == 4,"repeated/backward time never replays slots")
+    b.advance(&seen,20000)
+    assert(seen.words.at(3) == 0 && b.fifo.is_empty(),"mute still consumes data")
+    b.advance(&seen,20000)
+    b.advance(&seen,10000)
+    assert(seen.words.len() == 4,"repeated/backward time never replays slots")
 
-    val output: Buf[u32] = buf()
-    val tdm = stereo(endpoint = (slot,word,time) ->
-        output.push(word)
-        0)
+    var output = line()
+    val tdm = stereo(endpoint = recording())
     assert(put(tdm,8,127 | (63 << 8) | (1 << 16)))
     assert(put(tdm,12,(10 << 16) | (3 << 8) | (2 << 6)))
     assert(put(tdm,28,11) && put(tdm,28,22) && put(tdm,0,tdm.cr1 | ENABLE))
-    tdm.advance(10000)
-    assert(output.view() == [0u32,11,0,22][..] && tdm.fifo.is_empty())
+    tdm.advance(&output,10000)
+    assert(output.words.view() == [0u32,11,0,22][..] && tdm.fifo.is_empty())
+
+@test("STM32 SAI: each slot's endpoint is handed the context its advance was handed")
+sai_context_per_advance()
+    var first = line()
+    var second = line()
+    val b = stereo(endpoint = recording())
+    assert(put(b,28,1) && put(b,28,2) && put(b,28,3) && put(b,0,b.cr1 | ENABLE))
+    b.advance(&first,5000)
+    b.advance(&second,15000)
+    assert(first.words.view() == [1u32][..] && first.times.view() == [5000u64][..])
+    assert(second.words.view() == [2u32,3][..] && second.times.view() == [10000u64,15000][..])
 
 @test("STM32 SAI: receive FIFO, half-full DMA request, overflow and external slave slots")
 sai_receive()
-    val b = stereo(true,endpoint = (slot,word,time) -> u32(time) | 0xffff0000)
+    var quiet = line()
+    val b = stereo(true,endpoint = (seen,slot,word,time) -> u32(time) | 0xffff0000)
     assert(put(b,4,2) && put(b,0,b.cr1 | ENABLE | DMA_ENABLE))
     assert(!b.dma_request())
-    b.advance(15000)
+    b.advance(&quiet,15000)
     assert(b.fifo.len() == 3 && !b.dma_request())
-    b.advance(20000)
+    b.advance(&quiet,20000)
     assert(b.fifo.len() == 4 && b.dma_request())
     assert(get(b,28) == Some(5000) && !b.dma_request())
-    b.endpoint = (slot,word,time) -> u32(time)
-    b.advance(50000)
+    b.endpoint = (seen,slot,word,time) -> u32(time)
+    b.advance(&quiet,50000)
     assert(b.fifo.len() == 8 && b.flags & 1 != 0)
     assert(put(b,24,0xffffffff) && b.flags == 0)
     val slave = stereo(true)
@@ -112,42 +135,36 @@ sai_fifo_wraps()
 
 @test("STM32 SAI: a reset mid-stream empties the FIFO and keeps the clocks and the endpoint")
 sai_reset_mid_stream()
-    val words: Buf[u32] = buf()
-    val b = stereo(hz = 240000000, kernel = 6144000, endpoint = (slot,word,time) ->
-        words.push(word)
-        0)
+    var seen = line()
+    val b = stereo(hz = 240000000, kernel = 6144000, endpoint = recording())
     for n in 1u32..5 do assert(put(b,28,n))
     assert(put(b,0,b.cr1 | ENABLE))
-    b.advance(100000)
+    b.advance(&seen,100000)
     assert(b.started && b.due() != NEVER)
     b.reset()
     assert(b.fifo.is_empty() && !b.started && b.due() == NEVER && b.time == 0 && b.phase == 0 && b.slot == 0)
     assert(b.cr1 == 0 && b.frcr == 7 && b.flags == 0)
     assert(b.hz == 240000000 && b.kernel_hz == 6144000)
-    val before = words.len()
+    val before = seen.words.len()
     assert(put(b,8,63 | (31 << 8) | (1 << 16)) && put(b,12,(3 << 16) | (1 << 8) | (2 << 6)))
     assert(put(b,28,7) && put(b,0,(4 << 5) | (1 << 20) | ENABLE))
-    b.advance(b.due())
-    assert(words.len() == before + 1 && words.at(before) == 7, "the endpoint survives the reset")
+    b.advance(&seen,b.due())
+    assert(seen.words.len() == before + 1 && seen.words.at(before) == 7, "the endpoint survives the reset")
 
 @test("STM32 SAI: rational slot clock is independent of advance chunk size and NODIV uses frame length")
 sai_clock()
-    val left: Buf[u64] = buf()
-    val right: Buf[u64] = buf()
-    val a = stereo(false,100000000,13000000,(slot,word,time) ->
-        left.push(time)
-        0)
-    val b = stereo(false,100000000,13000000,(slot,word,at) ->
-        right.push(at)
-        0)
+    var left = line()
+    var right = line()
+    val a = stereo(false,100000000,13000000,recording())
+    val b = stereo(false,100000000,13000000,recording())
     for c in [a,b] do assert(put(c,28,1) && put(c,0,c.cr1 | ENABLE))
-    a.advance(100000)
+    a.advance(&left,100000)
     var time: u64 = 317
     while time < 100000
-        b.advance(time)
+        b.advance(&right,time)
         time += 317
-    b.advance(100000)
-    assert(left.view() == right.view() && left.len() == 101 && left.at(0) == 985)
+    b.advance(&right,100000)
+    assert(left.times.view() == right.times.view() && left.times.len() == 101 && left.times.at(0) == 985)
     assert(a.due() == b.due() && a.phase == b.phase)
     val direct = stereo()
     assert(put(direct,0,direct.cr1 | (1 << 19)))
