@@ -90,7 +90,7 @@ day. An L is split before it is handed out (§6).
 | QMI (flash and PSRAM interface; direct mode) | 12.14 QMI | full | Direct mode with both FIFOs, NOPUSH, 16-bit entries, ASSERT and AUTO chip selects, RX-full stall and BUSY, all to the flash on CS0; the window, timing and ATRANS registers stored. Instantaneous: no clock divider timing. CS1 (no PSRAM on the Pico 2) and a non-identity ATRANS0-3 are refused by name. The ROM's flash routines (`flash_range_erase` and friends) need item 6. | `peripheral/rp2350/xip_tests.sysl`, `chip/xip_tests.sysl` (`qmi_flash`) | — | — |
 | OTP | 13 OTP | missing | Not decoded. It is read for the unique ID and for boot configuration. | — | M (stored array, ROM access); L (ECC, locks, keys) | ROM |
 | POWMAN: the AON timer, LPOSC, VREG and BOD control | 6 Power | full | The store: VREG (locked until UNLOCK, VSEL limit), BOD, LPOSC (TRIM, MODE) and XOSC settings, SEQ_CFG, CHIP_RESET (HAD_POR), WDSEL, SCRATCH/BOOT, the interrupt registers into IRQs 44 and 45, all behind the 0x5AFE password; a 1 clears a W1C bit through any alias. The AON timer (item 27): 64-bit milliseconds loaded from SET_TIME by RUN, CLEAR, READ_TIME live (the SDK's re-read catches the carry); from the LPOSC (nominal 32.768 kHz) or the crystal at the rate LPOSC_/XOSC_FREQ_KHZ state, from GPIO 12/20/14/22 one millisecond per rising edge, or synchronised to a 1 Hz edge; the 64-bit alarm latching TIMER.ALARM into INTR.TIMER and IRQ 45, and a sleeping core skipping to it (`peripheral/rp2350/powman.sysl`). | `rp2350/aon_tests.sysl`, `rp2350/sysctl_tests.sysl`, `chip/aon_tests.sysl` (`aon_timer.elf`), `chip/startup_tests.sysl` | — | — |
-| POWMAN power states and power-up requests | 6.2 Power management | missing | STATE, PWRUP0-3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS are refused by name: the chip never leaves its all-on state, so P1.x states, GPIO and alarm power-ups (PWRUP_ON_ALARM is stored) and the SLEEP/DORMANT time skip (Q7) are not built. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | M | Q7 time skip, GPIO interrupts |
+| POWMAN power states and power-up requests | 6.2 Power management | full | STATE's requests judged as the header describes (WAITING for the processors, BAD_SW_REQ, REQ_IGNORED, PWRUP_WHILE_WAITING into POWMAN_IRQ_POW), PWRUP0–3 level and edge requests with RAW_STATUS and STATUS, the alarm request, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP, BOOTDIS; P1.x entered once every core halts, the switched core back at power-on and the SRAM banks and XIP cache it switches off cleared, time skipped to the alarm (Q7), GPIO power-ups through the pads' isolation latches and from outside the chip, and core 0 booted again as the ROM's power-up path does without the ROM (item 34). Refused by name: an SRAM bank switched off under the running switched core (P0 with a bank off), a PWRUP on a QSPI pin, a BOOT0–3 power-up vector (item 6), and the RISC-V harts' power-down (Q13). | `rp2350/power_tests.sysl`, `chip/power_tests.sysl` (`powman.elf`) | — | — |
 | GLITCH_DETECTOR | 10.9 Glitch detector | missing | Not decoded. | — | S (store) | — |
 | RESETS (29 outputs) | 7.5 Subsystem resets | full | `peripheral/rp2350/timing.sysl:15–22` over `rp2040/resets.sysl:7–11`. Release completes at once. | `rp2350/tests.sysl:15`, `chip/tests.sysl:43,81` | — | — |
 | PSM (power-on state machine; FRCE_ON/FRCE_OFF/DONE) | 7.4 Power-on state machine | full | The 25-stage sequence: FRCE_OFF holds a stage and those after it, FRCE_ON releases from a later stage, DONE is computed, WDSEL stored. PROC1 forced off stops core 1 and its release re-enters the ROM wait with a 0 for core 0 (`multicore_reset_core1`). Forcing any other stage off is refused by name. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
@@ -168,7 +168,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 26 | 8 | 1 | 23 | 58 |
+| RP2350 | 27 | 8 | 1 | 22 | 58 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
 One RP2350 block is a register-stub today (its row says which). Every block that is not modelled is refused by the bus, which is
@@ -344,6 +344,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 31 | **Non-secure TrustZone** (per Q3). | L | 2 |
 | 32 | **USB host mode** (per Q4). | L | 20 |
 | 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED). | L | 14 |
+| 34 | **POWMAN power states**: STATE, PWRUP0–3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS, the P1.x time skip (Q7) and the power-up boot as far as it needs no ROM. **Done** (below). | M | 27 |
 
 ### Item 1, done: the Arm Pico 2 and its refusal census
 
@@ -699,11 +700,72 @@ function that records the boot type (PC_SP) and `watchdog_caused_reboot` (no) be
 - **Assumptions**, since the headers do not say: a write naming several sources takes the GPIO over the
   crystal over the LPOSC; SET_TIME and the frequency registers written while running take effect at the
   next RUN and at once respectively, where the headers only say not to; the 1 Hz synchronisation is the
-  hold-and-jump above. PWRUP_ON_ALARM and NONSEC_WRITE are stored with no effect (no low-power states,
-  Secure-only).
+  hold-and-jump above. NONSEC_WRITE is stored with no effect (Secure-only); PWRUP_ON_ALARM is item 34's.
 
-**Still refused by name**: STATE, PWRUP0-3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS (the power
-states row). `examples/pico2/aon_timer.c` starts the timer from the crystal at a wall-clock time with
+`examples/pico2/aon_timer.c` starts the timer from the crystal at a wall-clock time with
 `aon_timer_start`, reads it after `sleep_ms(250)`, waits for an alarm 1.5 s ahead in WFI, clears it
 enabled and disabled, fires an alarm already past, stops the timer and reads it held, and crosses the
 32-bit carry; `chip/aon_tests.sysl` asserts every line.
+
+### Item 34, done: the power states
+
+`peripheral/rp2350/powman.sysl` against `hardware/regs/powman.h` and the SDK's `hardware_powman` (whose
+`powman_set_power_state`, `powman_configure_wakeup_state` and `pico_low_power`'s P-state path are the
+oracle for how software drives it); the chip powers the switched core down and up
+(`chip/rp2350.sysl`), and the Arm board decides when and boots it again (`chip/arm_board.sysl`).
+
+- **The encoding**: a STATE bit set is a domain down — bit 3 the switched core, 2 the XIP cache, 1 SRAM
+  bank 0 (its bottom 256 KB), 0 bank 1 (the rest, SRAM8 and SRAM9 with it), which is how the SDK reads it.
+  CURRENT reads 0 from power-on: the header's reset value 0xF is the state before the power-on sequence.
+- **Requests** (REQ written plainly, or through an alias that changes it; the SDK's CLR of REQ_IGNORED is
+  none): one powering the switched core down while a power-up request is asserted is ignored (REQ
+  kept, REQ_IGNORED); one mixing power-ups with power-downs, or keeping the switched core up without the
+  XIP cache, is invalid (REQ taken, BAD_SW_REQ, power-ups made); one powering the switched core down
+  waits (WAITING) for the processors, and can be changed or cancelled meanwhile, or is cancelled by a
+  power-up request asserting (PWRUP_WHILE_WAITING); any other is made at once (CHANGING never reads 1).
+  REQ_IGNORED and PWRUP_WHILE_WAITING are write-1-to-clear through any alias and are INTR's bits 2 and
+  3, into POWMAN_IRQ_POW. BAD_HW_REQ reads 0: the hardware's only request, the wake-up, powers up only.
+- **Power-up requests**: PWRUP0–3 watch a GPIO for a level or an edge (STATUS latches the edge until a
+  1 clears it; RAW_STATUS is the level while enabled; a request just enabled latches no edge from the
+  level it finds). The alarm requests while PWRUP_ON_ALARM and ALARM_ENAB are set and ALARM has latched.
+  CURRENT_PWRUP_REQ and LAST_SWCORE_PWRUP are bit masks: bit 1–4 PWRUP0–3, 6 the alarm, 5 the debugger's
+  (never asserted: no debugger asks for power), and LAST_SWCORE_PWRUP 0 after a power-on. The chip samples
+  the watched GPIOs as time passes while a request is enabled or a power-down waits, and before every
+  POWMAN access, so a steady state with none enabled pays one flag test per advance.
+- **Powering down** (Q7): the board makes a waiting power-down once every started core sleeps with
+  nothing pending that would wake it now (a core that would, wakes and runs on). Everything in the
+  switched core goes back to power-on; POWMAN, the flash part and what drives the pins from outside are
+  kept. The SRAM banks and the XIP cache the state switches off read 0 when they come back (code decoded
+  from them decodes again). BOOTDIS.NEXT moves into NOW. While it is down only POWMAN runs: its timer
+  from the LPOSC (the crystal is off, so a timer left on it stops), and its requests; the board skips to
+  the alarm, or the run ends asleep until something outside drives a power-up GPIO
+  (`Rp2350.drive_from_outside`; `benchtop run` says the switched core is powered down).
+- **The pads' isolation latches** hold each pad as it was at the power-down: a pad that drove keeps its
+  level, one that did not follows what drives it from outside (else the level its pulls gave it), and one
+  whose input was off reads low to a power-up request.
+- **Powering up**: the switched core and XIP cache come up, a bank comes up unless SEQ_CFG.HW_PWRUP_SRAMn
+  keeps it as it slept; REQ takes the new state, LAST_SWCORE_PWRUP the requests, CHIP_RESET's HAD_ bits
+  HAD_SWCORE_PD alone (DOUBLE_TAP and RESCUE_FLAG kept). Core 1 waits in the ROM; core 0 boots as the ROM's
+  power-up path does where it needs no ROM (`ArmBoard.power_up_boot`): BOOTDIS.NOW makes it ignore
+  BOOT0–3 and is cleared; otherwise BOOT0–3 all 0 (what `pico_low_power` writes) leave the normal boot of
+  the flash image, as after a watchdog reset, with BOOT_INFO NORMAL.
+- **Where this meets the boot ROM (item 6)**: `power_up_boot` is the seam. Non-zero BOOT0–3 are a boot
+  vector the ROM's power-up path reads, refused by name here, and BOOTDIS.NOW is cleared here in the ROM's
+  stead; a ROM that runs the power-up path itself takes both over, and `power_up` hands it core 0.
+- **Refused by name**: a valid request switching an SRAM bank off under the running switched core (P0
+  with a bank off), and a power-up into one (SEQ_CFG keeping a bank off) — the cores reach SRAM on their
+  fast path; a PWRUP enabled on a QSPI pin (48–53), whose level is not modelled (30–47, not bonded on the
+  QFN-60, and 54–63 are ignored, as the header says of an invalid selection); a BOOT0–3 power-up vector
+  (item 6); a blank flash at power-up (BOOTSEL's USB boot); the RISC-V board's harts powering down (Q13).
+- **Assumptions**, since the headers do not say: the processors have halted when every started core
+  sleeps with nothing pending (no SLEEPDEEP needed; `pico_low_power` sets none for a P-state); an ignored
+  request keeps the REQ it replaced; a power-up request asserting while the power-down waits cancels it;
+  CURRENT_PWRUP_REQ and LAST_SWCORE_PWRUP are bit masks; cleared SRAM reads 0.
+
+`examples/pico2/powman.c` (a flash image) runs three power-ups, counting them in POWMAN's SCRATCH0: P0
+with the XIP cache off (`rc -5`, BAD_SW_REQ), P1.7 against an asserted level request on GPIO 15 (`rc
+-14`, REQ_IGNORED), then P1.7 until an alarm 1 s ahead on the LPOSC; woken by the alarm (bit 6, a word in
+SRAM bank 0 lost), it sets BOOTDIS.NEXT and BOOT0 and sleeps keeping SRAM bank 0 until GPIO 14 rises,
+which the test drives from outside; woken by PWRUP0 (bit 1), the word kept, BOOTDIS consumed and BOOT0
+ignored, PWRUP0's edge still latched. `chip/power_tests.sysl` asserts every line and that the alarm's
+power-up came between 1000 and 1100 ms on the timer.

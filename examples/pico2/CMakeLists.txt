@@ -53,6 +53,10 @@ benchtop_program(watchdog watchdog.c default)
 target_link_libraries(watchdog hardware_watchdog)
 target_link_libraries(qmi_flash hardware_xip_cache)
 
+# A flash image too: the boot ROM boots it again each time POWMAN powers the switched core up.
+benchtop_program(powman powman.c default)
+target_link_libraries(powman hardware_powman)
+
 # The whole program in the XIP cache's 16 KB, as the SDK's own `pico_xip_sram_test` is built.
 benchtop_program(xip_sram xip_sram.c xip_ram)
 pico_minimize_runtime(xip_sram INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
