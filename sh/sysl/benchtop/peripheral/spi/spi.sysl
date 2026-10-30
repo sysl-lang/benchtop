@@ -1,7 +1,7 @@
 module sh.sysl.benchtop.peripheral.spi
 
 import sysl.container.ring.InlineRing
-import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.peripheral.ContextModel
 import sh.sysl.benchtop.timing.NEVER
 import sysl.math.min
 
@@ -18,21 +18,26 @@ const CR0_SPH: u32 = 1 << 7
 const CR1_LBM: u32 = 1
 const CR1_SSE: u32 = 1 << 1
 
-/** The controller's pins: given whether the port is enabled and the SCK and MOSI levels it puts on
- * them at a time, answer the level on MISO.
+/** What the controller puts on its pins at an edge: whether the port is enabled, the SCK and MOSI
+ * levels, and the time.
  */
-type Pins = &Fn(bool,bool,bool,u64) -> bool
+struct Edge
+    enabled: bool
+    sck: bool
+    mosi: bool
+    time: u64
 
-/** Pins wired to nothing: MISO reads low. */
-private val no_pins: Pins = (enabled,sck,mosi,time) -> false
+/** The controller's pins: given the board's context and an edge, answer the level on MISO. */
+type Pins[C] = &Fn(*C,Edge) -> bool
 
 /** PL022 master in Motorola SPI modes 0..3, 4..16 bits, with eight-entry
  * transmit/receive FIFOs. Time is in input-clock ticks. Each call of `pins` observes
  * an actual SCK/MOSI transition and returns MISO. No framebuffer shortcuts.
  * The FIFOs hold `capacity` entries, which the storage bounds at `MAX_FIFO`. `pins` is set once by
- * whoever puts the controller on a board, and a reset keeps it.
+ * whoever puts the controller on a board, and a reset keeps it; it answers from a context of type C,
+ * which `advance` and `drive` hand it.
  */
-struct Controller
+struct Controller[C]
     cr0: u32
     cr1: u32
     cpsr: u32
@@ -51,29 +56,30 @@ struct Controller
     sck: bool
     mosi: bool
     capacity: usize
-    pins: Pins
+    pins: Pins[C]
 
-private fresh(capacity: usize, pins: Pins) -> Controller
+private fresh[C](capacity: usize, pins: Pins[C]) -> Controller[C]
     var empty: InlineRing[u16, MAX_FIFO]
     // Every register zero, both FIFOs empty and nothing on the wire.
     Controller(0, 0, 0, 0, 0, empty, empty, false, 0, 0, 0, 0, 0, 0, false, false, false, capacity, pins)
 
-controller(capacity: usize = 8, pins: Pins = no_pins) -> Controller
+/** A controller; by default its pins are wired to nothing, so MISO reads low. */
+controller[C](capacity: usize = 8, pins: Pins[C] = (ctx,edge) -> false) -> Controller[C]
     require capacity > 0 && capacity <= MAX_FIFO && capacity & (capacity - 1) == 0, "power-of-two SPI FIFO capacity"
     fresh(capacity, pins)
 
-enabled(c: *Controller) -> bool = c.cr1 & CR1_SSE != 0
-private bits(c: *Controller) -> u32 = (c.cr0 & CR0_DSS_MASK) + 1
-private half(c: *Controller) -> u64 = u64(c.cpsr) * u64((c.cr0 >> 8 & 255) + 1) / 2
-private polarity(c: *Controller) -> bool = c.cr0 & CR0_SPO != 0
-private phase(c: *Controller) -> bool = c.cr0 & CR0_SPH != 0
+enabled[C](c: *Controller[C]) -> bool = c.cr1 & CR1_SSE != 0
+private bits[C](c: *Controller[C]) -> u32 = (c.cr0 & CR0_DSS_MASK) + 1
+private half[C](c: *Controller[C]) -> u64 = u64(c.cpsr) * u64((c.cr0 >> 8 & 255) + 1) / 2
+private polarity[C](c: *Controller[C]) -> bool = c.cr0 & CR0_SPO != 0
+private phase[C](c: *Controller[C]) -> bool = c.cr0 & CR0_SPH != 0
 
-kick(c: *Controller) = start(c,c.time)
+kick[C](c: *Controller[C]) = start(c,c.time)
 
-/** Put the controller's SCK and MOSI on its pins at `time`, answering MISO. */
-drive(c: *Controller, time: u64) -> bool = (c.pins)(enabled(c), c.sck, c.mosi, time)
+/** Put the controller's SCK and MOSI on its pins at `time`, the pins answering MISO from `ctx`. */
+drive[C](c: *Controller[C], ctx: *C, time: u64) -> bool = (c.pins)(ctx, Edge(enabled(c), c.sck, c.mosi, time))
 
-private start(c: *Controller, time: u64)
+private start[C](c: *Controller[C], time: u64)
     if c.shifting || !enabled(c) then return
     c.word = c.tx.pop_front() match
         Some(word) -> word
@@ -88,7 +94,7 @@ private start(c: *Controller, time: u64)
 /** Internal edges are advanced lazily at MMIO/pin accesses or word completion.
  * A delayed call emits the same timestamped edges as many small calls.
  */
-private run(c: *Controller, time: u64)
+private run[C](c: *Controller[C], ctx: *C, time: u64)
     if time < c.time then return
     while c.shifting && c.next <= time
         val at = c.next
@@ -97,7 +103,7 @@ private run(c: *Controller, time: u64)
         c.sck = if leading then !polarity(c) else polarity(c)
         if phase(c) && leading
             c.mosi = u32(c.word) & (1 << (bits(c) - 1 - bit)) != 0
-        val input = drive(c, at)
+        val input = drive(c, ctx, at)
         if leading != phase(c)
             val sampled = if c.cr1 & CR1_LBM != 0 then c.mosi else input
             c.received = c.received << 1 | (if sampled then 1 else 0)
@@ -109,20 +115,20 @@ private run(c: *Controller, time: u64)
             c.timeout = at + 64 * half(c)
             c.shifting = false
             start(c, at)
-            if c.shifting then drive(c, at)
+            if c.shifting then drive(c, ctx, at)
         elif !phase(c) && !leading
             c.mosi = u32(c.word) & (1 << (bits(c) - 1 - c.edges / 2)) != 0
-            drive(c, at)
+            drive(c, ctx, at)
     c.time = time
 
-status(c: *Controller) -> u32 =
+status[C](c: *Controller[C]) -> u32 =
     (if c.tx.is_empty() then 1 else 0) |
     (if c.tx.len() < c.capacity then 2 else 0) |
     (if c.rx.is_empty() then 0 else 4) |
     (if c.rx.len() == c.capacity then 8 else 0) |
     (if c.shifting || !c.tx.is_empty() then 16 else 0)
 
-raw_irq(c: *Controller) -> u32 =
+raw_irq[C](c: *Controller[C]) -> u32 =
     (if c.overrun then 1 else 0) |
     (if !c.rx.is_empty() && c.timeout <= c.time then 2 else 0) |
     (if c.rx.len() >= 4 then 4 else 0) |
@@ -130,7 +136,7 @@ raw_irq(c: *Controller) -> u32 =
 
 // Registers answer at any width the bus lets through; the clock is the controller's own, which
 // `advance` brings up before an access.
-impl Model for Controller
+impl[C] ContextModel[C] for Controller[C]
     read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = offset match
         0 -> Some(self.cr0)
         4 -> Some(self.cr1)
@@ -159,7 +165,7 @@ impl Model for Controller
     /** Advance before accessing registers. Unsupported frame formats/slave mode are
      * refused; filling a full TX FIFO drops the write, as hardware does.
      */
-    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool
+    write(*self, ctx: *C, offset: u32, width: u32, value: u32, time: u64) -> bool
         offset match
             0 ->
                 if enabled(self) || value & ~0xffff != 0 then return false
@@ -189,7 +195,7 @@ impl Model for Controller
             _ -> return false
         true
 
-    override advance(*self, time: u64) = run(self, time)
+    override advance(*self, ctx: *C, time: u64) = run(self, ctx, time)
 
     /** The next externally visible FIFO/interrupt change, not every internal edge. */
     override due(*self) -> u64
