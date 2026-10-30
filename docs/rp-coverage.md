@@ -113,7 +113,7 @@ day. An L is split before it is handed out (§6).
 | ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
 | DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | missing | Not decoded. | — | L (core) + S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
 | PIO0/1/2 | 11 PIO | missing | Not decoded. DESIGN.md §9.7 costs it at 4–6 agent-days. The RP2350 adds a third block, `MOV` to and from the RX FIFO, and the GPIO base (16/48). | — | L (machine) + M (GPIO/DMA/IRQ) | mux, DMA, IRQ, clk_sys |
-| USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | partial | The controller in device mode, whole (`peripheral/rp2350/usb.sysl`, item 20): the registers, DPRAM with the SETUP packet, endpoint and buffer control, single and double buffering, NAK, STALL, abort, the interrupts and USBCTRL_IRQ, driven by a host through the Arm board's `usb_*` seam. Not gated by RESETS, since the SDK reads SIE_CTRL before releasing USBCTRL; RESETS asserting it resets the controller. The CDC bridge to a pty is item 21. | `peripheral/rp2350/usb_tests.sysl`, `chip/usb_tests.sysl` | M (bridge) | clk_usb |
+| USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | full | The controller in device mode, whole (`peripheral/rp2350/usb.sysl`, item 20): the registers, DPRAM with the SETUP packet, endpoint and buffer control, single and double buffering, NAK, STALL, abort, the interrupts and USBCTRL_IRQ, driven by a host through the Arm board's `usb_*` seam. Not gated by RESETS, since the SDK reads SIE_CTRL before releasing USBCTRL; RESETS asserting it resets the controller. benchtop's own host (`chip/usb_host.sysl`, item 21) enumerates a CDC ACM device on a 1 ms frame schedule and bridges its port to the console or a pty (`benchtop run --usb`). | `peripheral/rp2350/usb_tests.sysl`, `chip/usb_tests.sysl`, `chip/usb_host_tests.sysl`, `host/pty_tests.sysl` | — | clk_usb |
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
 | TIMER0/1 | 12.8 System timers | full | 64-bit counter, latch, 4 alarms, LOCKED, SOURCE (`peripheral/rp2350/timing.sysl:91–145`). | `rp2350/tests.sysl:44`, `chip/tests.sysl:18` | — | — |
 | WATCHDOG | 12.9 Watchdog | full | The RP2040's counter (`peripheral/rp2040/watchdog.sysl`, `WatchdogCounter`), one decrement a tick from TICKS' watchdog generator: CTRL (ENABLE, PAUSE_DBG0/DBG1/JTAG, TIME), LOAD, TRIGGER, REASON, SCRATCH0–7. Firing resets the PSM stages WDSEL selects, and RESETS.WDSEL's peripherals where RESETS' stage is not selected (`Rp2350.watchdog_reset`); the Arm board restarts core 0 through the ROM's boot path (the PC/SP request in SCRATCH4–7, or the flash image's normal boot) and core 1 into the ROM wait; a typed boot request and a blank flash's BOOTSEL are refused by name; the RISC-V board refuses the restart by name. No debugger exists to pause it, so the PAUSE inputs are only tested at the model (item 10). | `rp2040/watchdog_tests.sysl`, `rp2350/tests.sysl`, `chip/watchdog_tests.sysl` (`watchdog.elf`) | — | — |
@@ -171,7 +171,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 33 | 8 | 0 | 17 | 58 |
+| RP2350 | 34 | 7 | 0 | 17 | 58 |
 | RP2040 | 15 | 7 | 0 | 15 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
@@ -334,7 +334,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 18 | **PWM** (12 slices, IRQ, DREQ, pins through the mux). | M | 9, 11 |
 | 19 | **ADC and temperature sensor** (round robin, FIFO, DREQ). | M | 11 |
 | 20 | **USB device controller**: endpoints, buffers, IRQ. **Done** (below). | L | 6 |
-| 21 | **USB host enumerator and CDC bridge to a pty**. `hello_world/usb` is its oracle. | M | 20 |
+| 21 | **USB host enumerator and CDC bridge to a pty**. `hello_world/usb` is its oracle. **Done** (below). | M | 20 |
 | 22 | **RP2040 chip layer**: `chip.Rp2040` over the shared models (CLOCKS without TICKS, pads without ISO, SIO with 8-deep FIFOs and the divider wired), and the `pico` board running. | M | 5, 8, 9 |
 | 23 | **RP2040 ROM**, following Q1: the float, double and mem tables plus the lookup. | L | 22 |
 | 24 | **RP2040 SSI, VREG_AND_CHIP_RESET and RTC**. | M | 22 |
@@ -963,6 +963,63 @@ chip's read-only methods took `self` by value, which copies the whole chip, and 
 pin and drive queries) and the controller's own (`irq` on every signal) now take `*self`. With that:
 `bench --core cortex-m33 kernel33.bin` 37.14 G to 37.14 G; `sram_loop.elf` 5.645 G to 5.201 G and
 `xip_loop.elf` 5.868 G to 5.421 G (8% fewer); `dcp.elf` 1.110 G to 0.960 G (14% fewer).
+
+### Item 21, done: the USB host and the CDC bridge
+
+`chip/usb_host.sysl` is the computer a Pico 2 is plugged into, in benchtop's own code: `ArmBoard.attach_usb_host`
+puts it on the bus, and the board gives it a frame every millisecond of clk_sys (`serve_usb`, checked at
+each quantum's end; `next_wake` includes the next frame, so sleeping cores wake for it). It counts only
+while it has frames to make: from the device's pull-up appearing until the port is open or given up on,
+then every frame while it runs. A bus with no device on it costs a comparison a quantum and never stops
+a run ending `Asleep`.
+
+- **Enumeration**, as Linux and macOS make it: the 100 ms debounce, the bus reset, 10 ms of reset
+  recovery and a SOF every frame from then on; GET_DESCRIPTOR of the device for 64 bytes at address 0
+  (bMaxPacketSize0 taken from it), SET_ADDRESS 1 and the 2 ms before the device is addressed again, the
+  device descriptor at its address, the configuration's 9-byte header and then all wTotalLength bytes.
+  `cdc_port` finds the first CDC ACM communication interface (class 2, subclass 2) and the first data
+  interface (class 0x0A) with a bulk IN and a bulk OUT endpoint. Then SET_CONFIGURATION and
+  SET_CONTROL_LINE_STATE with DTR. A control stage the device NAKs is retried the next frame.
+- **Running**: every frame polls bulk IN until a NAK (up to 19 packets, and only while `received` holds
+  under 4 KB, as a host's buffer fills), then sends `sending` to bulk OUT 64 bytes a packet; each
+  direction checks its data toggle from DATA0.
+- **Disconnect and reconnect**: the device leaving the bus (`tud_disconnect`, the chip's reset) is
+  forgotten and its return debounced afresh; `request_reset` resets the bus and enumerates again.
+- **Named, never hanging**: a device with no CDC ACM interface (with the classes it has), a stalled
+  request or status stage, a control stage NAKed for 5 s (Linux's USB_CTRL_GET_TIMEOUT), no answer at
+  its address, a data PID out of turn, more data than asked for, a malformed or short descriptor, a
+  stalled bulk endpoint. The host gives up (`take_note`; `benchtop run` prints it on stderr), disables
+  the port until the device disconnects, and the program runs on. It does not clear a halt, send
+  SET_LINE_CODING, poll the notification endpoint, suspend the bus or reach a hub.
+- **The bridge** (`benchtop run --usb console|pty|off`, Arm RP2350 boards only, refused by name with
+  `--window` or another board). **The default is `console`**: the port's bytes join stdout beside UART0,
+  each a line at a time through `show_console`, so neither interleaves inside the other's lines; no
+  input reaches the port, as none reaches UART0 in this command. `pty` opens a raw pseudo-terminal
+  (`host/pty.sysl`, with `host/__posix__/pty.c` for termios: `posix_openpt`, `cfmakeraw`, non-blocking),
+  prints its name on stderr and exchanges bytes with it after every run of the board; benchtop holds
+  the terminal side open itself, so a program that opens and closes it does not hang it up. `off`
+  leaves the socket empty.
+
+The oracles: pico-examples' `hello_world/usb` (`examples/pico2/hello_usb.c`, a flash image, stdio over
+USB only) delivers three "Hello, world!" lines in 3.5 s, the one at power-on dropped as stdio_usb drops
+output with no port open; through `./benchtop run` its lines reach a pipe. `usb_device.c`'s line reaches
+a program that opened a real pty, and the `x` typed there reaches `getchar` (skipped by name where no pty
+can be had). `usb_reconnect.c` (our own) is enumerated twice around `tud_disconnect`/`tud_connect`.
+pico-examples' `usb/device/dev_lowlevel` (vendor class 0xFF, the registers driven directly) is enumerated
+up to its configuration and given up on by name. At the controller alone (`chip/usb_host_tests.sysl`),
+the test plays the firmware: the reset on the 100th frame after the connection and the first SETUP 11
+frames later with SOF_RD 10; a stall; 5000 frames of NAK; DATA0 where DATA1 is due; the device leaving
+mid-enumeration. Changing the debounce to 50 frames, or inverting the data-stage toggle check, turns
+8 of the 15 tests red.
+
+**Cost**, host instructions retired, three interleaved runs each against the branch's base (dev at
+51a684d, `/usr/bin/time -l`, `benchtop run --board pico2`, whose host is now on the bus with no device):
+`sram_loop.elf` 5.392–5.406 G to 5.401 G, `xip_loop.elf` 5.615 G to 5.623 G, `dcp.elf` 6.380 G to
+6.381–6.384 G (+0.1%); `--usb off` on `sram_loop.elf` reads 5.397 G. `bench --core` does not reach the
+board and was not rerun. With USB active, `hello_usb.elf` (cores asleep between lines, the host polling
+an idle port every frame) ran 218,869 guest seconds in 54 s: 6.3 k host instructions a frame, 4,000
+times real time. `usb_device.elf` to its breakpoint (enumeration, then `getchar_timeout_us` spinning
+for 2 s) is 32.90 G, the spinning guest's own.
 
 ### Item 26, done: the OTP
 

@@ -194,6 +194,8 @@ struct ArmBoard[C: ArmChip = Rp2350]
     // The OTP's array, a row in the low 24 bits of each word: the chip's, kept here for the run as the
     // flash's is (`factory_otp`).
     otp_rows: [4096]u32
+    // benchtop's USB host (`usb_host.sysl`), off the bus until `attach_usb_host`.
+    usb_host: UsbHost
 
 /** A board with `map`'s SRAM, powered on, holding no image. */
 arm_board(map: SramMap) -> &ArmBoard
@@ -201,13 +203,13 @@ arm_board(map: SramMap) -> &ArmBoard
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
     val sram_at = rom_at + ROM_BYTES + arm.GUARD_BYTES
-    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], [0; 4096])
+    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], [0; 4096], usb_host())
 
 /** A Pico, an RP2040 on its two Cortex-M0+ cores, with `map`'s SRAM, powered on, holding no image. */
 pico_board(map: SramMap) -> &ArmBoard[Rp2040]
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
-    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, 0, false, 0, [0; 32], [0; 4096])
+    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, 0, false, 0, [0; 32], [0; 4096], usb_host())
 
 impl[C: ArmChip] ArmBoard[C]
     /** Power on with `image`, written where its addresses say: core 0 at its entry, core 1 in the boot
@@ -474,12 +476,11 @@ impl[C: ArmChip] ArmBoard[C]
     // the device controller (`peripheral/rp2350/usb.sysl`); the cores then see whatever interrupt it
     // raised, so the next `run` services it. A transaction the device NAKs is retried by the host after
     // running the board on, as a host retries in a later frame.
+    //
+    // The RP2040's controller is not on its chip yet: on the Pico the bus is silent, a transaction is
+    // refused by name, and benchtop's host does not go onto it.
 
     /** A host attaches to the USB bus (VBUS and the lines), or detaches from it. */
-    //
-    // The RP2040's controller is not on its chip yet: on the Pico the bus is silent, and a transaction
-    // is refused by name.
-
     usb_attach(*self, on: bool)
       if const C.rp2350()
         self.chip.usb.attach(on)
@@ -526,6 +527,56 @@ impl[C: ArmChip] ArmBoard[C]
       else
         Err(NO_USB_RP2040)
 
+    /** benchtop's own USB host (`usb_host.sysl`) goes onto the bus, or off it: from then on `run` gives it
+     * a frame every millisecond of the chip's time while a device is on the bus, and it enumerates the
+     * device, opens its CDC ACM port and moves its bytes (`usb_host.received` and `usb_host.sending`).
+     */
+    attach_usb_host(*self, on: bool)
+      if const C.rp2350()
+        self.usb_host.attach(on)
+        self.chip.usb.attach(on)
+        self.settle()
+
+    // The USB host between quanta: the device's connection as it now stands, and the host's frame where
+    // one is due. A frame is due a millisecond of clk_sys after the last; only while the host has frames
+    // to make does it count (`next_usb_frame`), so a bus with no device on it costs a comparison a
+    // quantum. False, with `refused` saying why, where the controller refuses what the host asked.
+    private serve_usb(*self) -> bool
+      if const C.rp2350()
+        val h = &self.usb_host
+        if !h.on() then return true
+        // The chip's reset takes the controller's view of the host away; the host is still there.
+        if !self.chip.usb.attached
+            self.chip.usb.attach(true)
+            self.settle()
+        h.watch(self.chip.usb.connected)
+        if !h.framed()
+            h.timed = false
+            return true
+        val now = self.chip.now
+        if !h.timed
+            h.due = now
+            h.timed = true
+        if now < h.due then return true
+        h.frame(&self.chip.usb) match
+            Ok(_) -> ()
+            Err(why) ->
+                self.refused = s"the USB host: $why"
+                return false
+        val period = self.chip.sys_hz() / 1000
+        h.due += period
+        if h.due <= now then h.due = now + period
+        self.settle()
+        true
+      else
+        true
+
+    // The clk_sys cycles until the USB host's next frame, while it has frames to make.
+    private next_usb_frame(*self) -> Option[u64]
+        val h = &self.usb_host
+        if !h.timed || !h.framed() then return None
+        Some(if h.due > self.chip.clock() then h.due - self.chip.clock() else 0)
+
     /** Run until `cycles` more clk_sys cycles have passed, or something ends the run first. */
     run(*self, cycles: u64) -> RunEnd
         val limit = self.chip.clock() + cycles
@@ -542,7 +593,7 @@ impl[C: ArmChip] ArmBoard[C]
                     return end
             self.chip.run_to(self.quantum_at + q)
             self.settle()
-            if !self.take_restart() then return RunEnd.Fault
+            if !self.take_restart() || !self.serve_usb() then return RunEnd.Fault
             if self.asleep()
                 // A core with something that wakes it now runs the next quantum rather than sleeping
                 // through it: an interrupt pending, or the event the other core's `SEV` sent it during
@@ -554,7 +605,7 @@ impl[C: ArmChip] ArmBoard[C]
                     Some(n) -> min(n, limit - self.chip.clock())
                     None -> return RunEnd.Asleep
                 self.sleep(next)
-                if !self.take_restart() then return RunEnd.Fault
+                if !self.take_restart() || !self.serve_usb() then return RunEnd.Fault
         RunEnd.Budget
     end run
 
@@ -688,7 +739,7 @@ impl[C: ArmChip] ArmBoard[C]
 
     // The cycles until a device event or a sleeping core's SysTick could wake a core.
     private next_wake(*self) -> Option[u64]
-        var due = self.chip.due()
+        var due = earliest(self.chip.due(), self.next_usb_frame())
         for k in 0..<2
             if !self.started[k] then continue
             val c = &self.cores[k]

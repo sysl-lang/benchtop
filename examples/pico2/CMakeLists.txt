@@ -70,6 +70,17 @@ target_link_libraries(powman hardware_powman)
 # USB device mode: stdio over the SDK's TinyUSB CDC device as well as UART0.
 benchtop_program(usb_device usb_device.c no_flash)
 pico_enable_stdio_usb(usb_device 1)
+benchtop_program(usb_reconnect usb_reconnect.c no_flash)
+pico_enable_stdio_usb(usb_reconnect 1)
+
+# pico-examples' hello_world/usb as it builds there: a flash image, stdio over USB and not UART.
+benchtop_program(hello_usb hello_usb.c default)
+pico_enable_stdio_usb(hello_usb 1)
+pico_enable_stdio_uart(hello_usb 0)
+
+# pico-examples' usb/device/dev_lowlevel: the USB registers driven directly, stdio on UART0.
+benchtop_program(dev_lowlevel dev_lowlevel.c default)
+target_link_libraries(dev_lowlevel hardware_resets hardware_irq)
 
 # The whole program in the XIP cache's 16 KB, as the SDK's own `pico_xip_sram_test` is built.
 benchtop_program(xip_sram xip_sram.c xip_ram)

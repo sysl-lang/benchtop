@@ -1,11 +1,14 @@
 // benchtop: a microcontroller board emulator.
 //
-//     benchtop run [--board <name | file.hocon>] [--window] [--deterministic] <image.elf | image.bin>
+//     benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] <image.elf | image.bin>
 //         Boot the image on the board `--board` names, the virtual board `virt` where none is named,
 //         its console on this terminal, a keystroke at a time. Ctrl-] ends benchtop whatever the
 //         guest is doing. The exit status is the guest's, written to the console's EXIT register.
 //         Each launched guest core runs on its own host thread. Use `--deterministic` for
-//         reproducible core turns on one host thread.
+//         reproducible core turns on one host thread. On a Pico 2 (an RP2350's Cortex-M33 cores)
+//         benchtop's USB host is plugged in: a `stdio_usb` program's serial port prints beside UART0
+//         (`--usb console`, the default), or is a pseudo-terminal whose name is printed on stderr, for
+//         `screen` or `picocom` (`--usb pty`); `--usb off` leaves the USB socket empty.
 //
 //     benchtop check [--mcu] <name | file.hocon>
 //         Read a chip, board or product description and hold it to the library: print every mistake,
@@ -63,7 +66,7 @@ usage()
     print("usage: benchtop demo [--headless] [--frames N] [--screenshot out.png]")
     print("       benchtop view <board | file.hocon> [--frames N] [--screenshot out.png]")
     print("       benchtop render <board | file.hocon> <out.png>")
-    print("       benchtop run [--board <name | file.hocon>] [--window] [--deterministic] <image.elf | image.bin>")
+    print("       benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] <image.elf | image.bin>")
     print("       run --window: [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>] [--instruments <file.hocon>]")
     print("       benchtop check [--mcu] <name | file.hocon>")
     print("       benchtop bench [--core <core>] [--timing unit|estimated] <image.bin> [expected result] [match | threaded]")
@@ -133,6 +136,8 @@ run_command(args: []string)
     var screenshot = ""
     var develop = host.config()
     var instrument_file = ""
+    var usb = UsbMode.Console
+    var usb_named = false
     var i = 2
 
     while i < args.len - 1
@@ -171,6 +176,15 @@ run_command(args: []string)
             "--deterministic" ->
                 parallel = false
                 i += 1
+            "--usb" ->
+                if i + 1 >= args.len - 1 then usage()
+                usb = args[i + 1] match
+                    "console" -> UsbMode.Console
+                    "pty" -> UsbMode.Pty
+                    "off" -> UsbMode.Off
+                    _ -> die(s"--usb takes console, pty or off, not ${args[i + 1]}")
+                usb_named = true
+                i += 2
             "--threads" ->
                 parallel = true
                 i += 1
@@ -178,6 +192,7 @@ run_command(args: []string)
 
     if i != args.len - 1 then usage()
 
+    if window && usb_named then die("--usb is for a run without --window")
     if window
         ui.launch(which, args[i], ui.launch_options(frames = frames, screenshot = screenshot, headless = headless, develop = develop, instrument_file = instrument_file, deterministic = !parallel)) match
             Ok(code) -> exit(code)
@@ -185,29 +200,44 @@ run_command(args: []string)
     if !instrument_file.is_empty() then die("--instruments requires --window")
     if host.enabled(develop) then die("--watch, --build and --watch-source require --window")
     if headless || frames != 0 || !screenshot.is_empty() then die("--headless, --frames and --screenshot require --window")
-    run(which, args[i], parallel)
+    run(which, args[i], parallel, usb, usb_named)
+
+// Where `benchtop run` sends a USB device's serial port (`--usb`).
+enum UsbMode
+    // benchtop's host enumerates the device and its CDC output joins the console on stdout.
+    Console
+    // The same, through a pseudo-terminal whose name is printed on stderr.
+    Pty
+    // No host on the bus.
+    Off
 
 // Run `file` on the board `which` names, each core on a thread of its own where `parallel` says so.
-// A board of RISC-V cores runs on the RP2350 chip layer, both harts on this thread.
-run(which: string, file: string, parallel: bool)
+// A board of RISC-V cores runs on the RP2350 chip layer, both harts on this thread. `usb` is for an Arm
+// RP2350 board; naming it (`usb_named`) for another is refused.
+run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool)
     chip.riscv_named(which) match
-        Some(Ok(map)) -> run_riscv(map, file)
+        Some(Ok(map)) ->
+            if usb_named then die("--usb is for a board of an RP2350's Cortex-M33 cores")
+            run_riscv(map, file)
         Some(Err(why)) ->
             eprints(why)
             exit(1)
         None -> ()
     chip.arm_named(which) match
-        Some(Ok(map)) -> run_arm(chip.arm_board(map), file)
+        Some(Ok(map)) -> run_arm(chip.arm_board(map), file, usb)
         Some(Err(why)) ->
             eprints(why)
             exit(1)
         None -> ()
     chip.pico_named(which) match
-        Some(Ok(map)) -> run_arm(chip.pico_board(map), file)
+        Some(Ok(map)) ->
+            if usb_named then die("--usb is for a board of an RP2350's Cortex-M33 cores: the RP2040's USB controller is not on its chip yet")
+            run_arm(chip.pico_board(map), file, UsbMode.Off)
         Some(Err(why)) ->
             eprints(why)
             exit(1)
         None -> ()
+    if usb_named then die("--usb is for a board of an RP2350's Cortex-M33 cores")
     val board = machine()
     val m = &*board
     board_named(m, which) match
@@ -265,17 +295,39 @@ run_riscv(map: chip.SramMap, file: string) -> never
 
 // Run the image `file` on board `b`, an RP2350 on its Cortex-M33 cores or an RP2040 on its Cortex-M0+
 // cores, UART0 on stdout, until a core executes BKPT (exit 0), faults (exit 3) or both sleep with
-// nothing to wake them (exit 4).
-run_arm[C: chip.ArmChip](b: &chip.ArmBoard[C], file: string) -> never
+// nothing to wake them (exit 4). Unless `usb` is Off (always, on the RP2040), benchtop's USB host is on
+// the bus, and a CDC ACM device's serial port goes to stdout beside UART0, a line at a time, or to a
+// pseudo-terminal whose name goes to stderr.
+run_arm[C: chip.ArmChip](b: &chip.ArmBoard[C], file: string, usb: UsbMode) -> never
     b.boot(read_or_die(file)) match
         Ok(_) -> ()
         Err(why) -> die(s"$file: $why")
+    var pty: Option[host.Pty] = None
+    if usb != UsbMode.Off
+        b.attach_usb_host(true)
+        if usb == UsbMode.Pty
+            val p = host.open_pty() match
+                Ok(p) -> p
+                Err(why) -> die(why)
+            eprints(s"benchtop: the board's USB serial port is ${p.name}\n")
+            pty = Some(p)
     var shown: usize = 0
     loop
         val end = b.run(QUANTUM)
         // At a breakpoint the chip runs on, as under a debugger, until UART0 has sent what it holds.
         if end == chip.RunEnd.Breakpoint && !b.finish_sending() then die(b.refused)
         shown = show_console(b.console.view(), shown, end != chip.RunEnd.Budget)
+        val h = &b.usb_host
+        pty match
+            Some(p) ->
+                var port = p
+                port.exchange(h) match
+                    Ok(_) -> ()
+                    Err(why) -> die(s"${port.name}: $why")
+            None -> h.consume(show_console(h.received.view(), 0, end != chip.RunEnd.Budget))
+        h.take_note() match
+            Some(n) -> eprints(s"benchtop: $n\n")
+            None -> ()
         end match
             Budget -> ()
             Breakpoint -> exit(0)
