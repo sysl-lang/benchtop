@@ -58,28 +58,12 @@ import sysl.math.min
 const RP2350_IRQS: u32 = 52
 /** The coprocessors on each M33's port: GPIOC (CP0), the DCP's two instances (CP4, CP5) and the RCP (CP7). */
 const COPROCESSORS: u32 = 0xB1
-/** The boot ROM's window at address 0, and benchtop's ROM in it (rom/rom.S). */
-const ROM_BYTES: u32 = 32 * 1024
-/** Where core 1 waits in benchtop's ROM (`park`), and where a launched entry returns to. */
-const ROM_PARK: u32 = 0x40
-private val ROM = embed("rom/rom.bin")
 /** The Pico 2's flash: 4 MB on QSPI chip select 0. */
 const FLASH_BYTES: u32 = 4 * 1024 * 1024
 // XIP_SRAM's 8-byte cache lines, and a line number no line has.
 private const SRAM_LINES: u32 = XIP_SRAM_BYTES / 8
 private const NO_LINE: u32 = 0xFFFFFFFF
 
-/** Where benchtop's ROM keeps the four words of BOOT_INFO that `get_sys_info` answers (rom/rom.S). */
-const BOOT_INFO_AT: u32 = 0x100
-/** The boot types BOOT_INFO reports (`boot/bootrom_constants.h`). */
-const BOOT_TYPE_NORMAL: u32 = 0
-const BOOT_TYPE_BOOTSEL: u32 = 2
-const BOOT_TYPE_PC_SP: u32 = 0xD
-/** The magic of a watchdog boot request in SCRATCH4 (the SDK's `watchdog_reboot`). */
-const WATCHDOG_BOOT_MAGIC: u32 = 0xB007C0D3
-// The first word of an image's block (`boot/picobin.h`), which the ROM's normal boot looks for in the
-// flash's first 4 KB.
-private const BLOCK_MARKER_START: u32 = 0xFFFFDED3
 
 // UF2 (github.com/microsoft/uf2): 512-byte blocks, their magic numbers, the flag that marks a block
 // not for the device's main memory and the one that says a family ID is present, and the families an
@@ -167,24 +151,18 @@ impl ArmBoard
         arm.reset_mapped(first, self.mem, packed.view(), MemoryMap(self.map.base, self.map.size, XIP_BASE, FLASH_BYTES, banks.freeze()))
         arm.read_only(self.mem, 0)
         self.chip.reset()
+        self.chip.rom_boot_releases()
         self.chip.flash.connect(&self.mem.flash[0], FLASH_BYTES)
         if start.pin
             for k in 0u32..<(XIP_SRAM_BYTES / 8) do self.chip.xip.maintain(XIP_SRAM_BASE - XIP_BASE + k * 8 + 7).unwrap()
-        if start.handoff then self.chip.rcp.salted = [true, true]
         self.direct = false
         self.xip_epoch = self.chip.xip.epoch +% 1
         self.sram_lines = [0; 32]
         self.sync_xip()
-        self.configure(first, 0)
-        first.pc = start.pc & ~1
-        first.r[13] = start.sp
-        first.vtor = start.vtor
-        val second = &self.cores[1]
-        second.kind = Kind.V8mMain
-        arm.attach_memory(second, self.mem)
-        arm.clear(second, 0)
-        self.configure(second, 1)
-        self.started = [true, false]
+        if start.handoff then self.chip.rcp.salted = [true, true]
+        arm.attach_memory(&self.cores[1], self.mem)
+        self.start_core0(start)
+        self.rom_reset(1)
         self.quantum_at = 0
         self.why = ""
         self.refused = ""
@@ -193,6 +171,36 @@ impl ArmBoard
         if start.pc & 1 == 0 then return Err(s"the entry 0x${hex(start.pc, 8)} is not a Thumb address")
         Ok(())
     end boot
+
+    // Core 0 started where `start` says. Where the boot ROM hands the image over, the core is as the
+    // ROM's start-up leaves it (its `arm8_bootrom_rt0.S`; the MPU it used is cleared before the launch):
+    // the RCP enabled in CPACR, NSACR and the Non-secure CPACR, and SAU region 7, which the ROM keeps
+    // for itself, marking its Non-secure text, enabled.
+    private start_core0(*self, start: Start)
+        val c = &self.cores[0]
+        c.kind = Kind.V8mMain
+        arm.clear(c, start.pc & ~1)
+        self.configure(c, 0)
+        c.r[13] = start.sp
+        c.vtor = start.vtor
+        if start.handoff
+            c.cpacr = ROM_CPACR
+            c.nsacr = ROM_NSACR
+            c.cpacr_ns = ROM_CPACR
+            c.sau_ctrl = 1
+            c.sau_rnr = 7
+            c.sau_rbar[7] = ROM_SAU_RBAR
+            c.sau_rlar[7] = ROM_SAU_RLAR
+        self.started[0] = true
+
+    // Core `k` from reset, in the boot ROM: SP and PC from its vector table at 0, as the M33 takes them.
+    private rom_reset(*self, k: usize)
+        val c = &self.cores[k]
+        c.kind = Kind.V8mMain
+        arm.clear(c, rom_word(4) & ~1)
+        self.configure(c, u32(k))
+        c.r[13] = rom_word(0)
+        self.started[k] = true
 
     /** Whether the flash holds an image the boot ROM's normal boot would find: a block marker in its
      * first 4 KB.
@@ -207,12 +215,15 @@ impl ArmBoard
         for k in 0u32..<4 do v |= u32(self.mem.flash[at + k]) << (8 * k)
         v
 
-    // BOOT_INFO in benchtop's ROM: the boot `boot_type` with no partition table (diagnostic partition
-    // and partition both BOOT_PARTITION_NONE, -1), no diagnostic and no reboot parameters.
+    // BOOT_INFO where the boot ROM keeps it for `get_sys_info`, as its boot path leaves it: the boot
+    // word (no diagnostic partition and no partition, BOOT_PARTITION_NONE, -1, and `boot_type`), no
+    // diagnostic and no reboot parameters.
     private write_boot_info(*self, boot_type: u32)
-        val info = [0xFF | (boot_type << 8) | (0xFF << 16), 0, 0, 0]
-        for i in 0..<4
-            for k in 0..<4 do self.mem.ram[self.rom_at + BOOT_INFO_AT + u32(4 * i + k)] = u8.wrap(info[i] >> u32(8 * k))
+        val words = &self.chip.bootram.words
+        words[usize(BOOTRAM_BOOT_WORD / 4)] = 0xFF | (boot_type << 8) | (0xFF << 16)
+        words[usize(BOOTRAM_BOOT_WORD / 4) + 1] = 0
+        words[usize(BOOTRAM_REBOOT_PARAMS / 4)] = 0
+        words[usize(BOOTRAM_REBOOT_PARAMS / 4) + 1] = 0
 
     /** The boot ROM's boot of core 0 after a watchdog reset: the request in SCRATCH4–7, or the normal
      * boot of the flash image; or why benchtop cannot make it.
@@ -222,7 +233,7 @@ impl ArmBoard
         if s[4] == WATCHDOG_BOOT_MAGIC && s[5] == s[7] ^ (0 -% WATCHDOG_BOOT_MAGIC)
             self.chip.watchdog.scratch[4] = 0
             if s[7] == WATCHDOG_BOOT_MAGIC
-                return Err(s"the watchdog's reset asks the boot ROM for a boot of type ${s[6]} (SCRATCH6), which is the ROM's own boot path, not modelled (docs/rp-coverage.md items 6 and 30)")
+                return Err(s"the watchdog's reset asks the boot ROM for a boot of type ${s[6]} (SCRATCH6), which is the ROM's own boot path, not run (docs/rp-coverage.md items 25, 26 and 30)")
             self.write_boot_info(BOOT_TYPE_PC_SP)
             return Ok(Start(s[7], s[6], 0, false, true))
         if !self.flash_image()
@@ -230,25 +241,23 @@ impl ArmBoard
         self.write_boot_info(BOOT_TYPE_NORMAL)
         Ok(Start(self.flash_word(4), self.flash_word(0), XIP_BASE, false, true))
 
-    // The watchdog's reset has taken down the PSM `stages`: the XIP block's mapping follows it, and the
-    // cores among the stages restart, core 1 in the boot ROM (`settle` has stopped it) and core 0
-    // through `watchdog_boot`. A boot benchtop cannot make ends the run with its reason.
+    // The watchdog's reset has taken down the PSM `stages`: the XIP block's mapping follows it; core 1,
+    // where its stage was among them, starts again from reset in the boot ROM, and core 0 boots through
+    // `watchdog_boot`. The RCP's salts are the cold processor domain's (PROC_COLD), which a core's own
+    // reset keeps. A boot benchtop cannot make ends the run with its reason.
     private restart(*self, stages: u32) -> Result[unit, string]
         if self.chip.take_xip_changed()
             self.xip_epoch = self.chip.xip.epoch +% 1
             self.sync_xip()
+        if stages & psm_reg.WDSEL_PROC_COLD_MASK != 0 then self.chip.rcp = rcp()
+        if stages & psm_reg.WDSEL_PROC1_MASK != 0 then self.rom_reset(1)
         if stages & psm_reg.WDSEL_PROC0_MASK == 0 then return Ok(())
         val start = self.watchdog_boot()?
-        val c = &self.cores[0]
-        arm.clear(c, start.pc & ~1)
-        self.configure(c, 0)
-        c.r[13] = start.sp
-        c.vtor = start.vtor
-        self.started[0] = true
-        // The ROM salts the RCP before it hands over, as at power-on.
-        self.chip.rcp = rcp()
-        self.chip.rcp.salted = [true, true]
-        if start.pc & 1 == 0 then arm.halt(c, Stop.Fault, start.pc)
+        self.chip.rom_boot_releases()
+        self.start_core0(start)
+        // The ROM salts an RCP whose salts are unset before it hands over, as at power-on.
+        if !self.chip.rcp.salted[0] then self.chip.rcp.salted = [true, true]
+        if start.pc & 1 == 0 then arm.halt(&self.cores[0], Stop.Fault, start.pc)
         Ok(())
 
     // An ELF's loadable segments, each at its physical address: the entry, the stack at SRAM's top, and
@@ -305,6 +314,8 @@ impl ArmBoard
         c.priority_bits = 4
         c.coprocessors = COPROCESSORS
         c.security = true
+        c.idau = ROM_NSC
+        c.events = true
         c.bus = self
 
     /** Run until `cycles` more clk_sys cycles have passed, or something ends the run first. */
@@ -399,24 +410,10 @@ impl ArmBoard
             self.chip.uarts[0].take() match
                 Some(c) -> self.console.push(c)
                 None -> break
+        // PSM holding core 1 stops it; releasing it starts it from reset, in the boot ROM.
         if self.chip.take_core1_reset() then self.started[1] = false
-        self.chip.take_launch() match
-            Some(l) -> self.launch(l)
-            None -> ()
+        if self.chip.take_core1_release() then self.rom_reset(1)
         for k in 0..<2 do if self.started[k] then self.chip.signal(&self.cores[k])
-
-    // Core 1 leaves the boot ROM as it was told to, called from it: an entry that returns comes back
-    // to the ROM's wait (`park`, rom/rom.S), as on the chip. An entry without its Thumb bit stops it at
-    // `Fault`, there, as the M33 faults on its first instruction.
-    private launch(*self, l: Launch)
-        val c = &self.cores[1]
-        arm.clear(c, l.entry & ~1)
-        self.configure(c, 1)
-        c.vtor = l.vector_table
-        c.r[13] = l.stack_pointer
-        c.r[14] = ROM_PARK | 1
-        self.started[1] = true
-        if l.entry & 1 == 0 then arm.halt(c, Stop.Fault, l.entry)
 
     // The chip's clock at core `cpu`'s `n`th retired instruction.
     private at(self, cpu: *arm.Cpu, n: u64) -> u64 = self.quantum_at + (arm.clock(cpu, n) - self.clock_at[usize(cpu.core)])
@@ -520,6 +517,10 @@ impl arm.Bus for ArmBoard
                 // TRIGGER: the core stops after the store that made the reset.
                 if self.chip.restarting(cpu.core) then arm.halt(cpu, Stop.Reset, a)
             Err(why) -> self.refuse(cpu, a, why)
+
+    // `SEV`: each core's TXEV is the other's RXEV.
+    override event(*self, cpu: *arm.Cpu)
+        self.cores[1 - usize(cpu.core)].event = true
 
     override coprocessor(*self, cpu: *arm.Cpu, op: CoprocessorOp, n: u64) -> Option[u64]
         // The DCP is the core's own and touches no device, so its instructions need no catch-up.

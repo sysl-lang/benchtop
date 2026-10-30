@@ -232,6 +232,11 @@ struct Qmi
     atrans: [8]u32
     // A frame AUTO_CS0N opened, which closes when the TX FIFO drains.
     auto_frame: bool
+    // Bytes shifted to the flash since chip select 0 was last asserted, and whether the flash ignores
+    // the frame: its instruction came at dual or quad width, which a flash in SPI mode sees as a
+    // fraction of a byte on SD0 (the boot ROM's QPI exits, F5h and FFh, rely on this).
+    frame_bytes: u32
+    frame_ignored: bool
 
     reset(*self)
         self.csr = CSR_RESET
@@ -240,6 +245,14 @@ struct Qmi
         for i in 0..<10 do self.windows[i] = WINDOW_RESETS[i % 5]
         for n in 0u32..<8 do self.atrans[n] = identity(n)
         self.auto_frame = false
+        self.frame_bytes = 0
+        self.frame_ignored = false
+
+    // Chip select 0 asserted: a new frame.
+    private open_frame(*self, flash: *QspiFlash)
+        flash.select()
+        self.frame_bytes = 0
+        self.frame_ignored = false
 
     /** Whether direct mode is on, which makes memory-mapped flash accesses bus errors. */
     direct_enabled(self) -> bool = self.csr & qmi_reg.DIRECT_CSR_EN_MASK != 0
@@ -278,7 +291,7 @@ struct Qmi
             val before = self.csr
             self.csr = written(self.csr, offset, data) & CSR_WRITABLE
             val held = qmi_reg.DIRECT_CSR_ASSERT_CS0N_MASK
-            if before & held == 0 && self.csr & held != 0 then flash.select()
+            if before & held == 0 && self.csr & held != 0 then self.open_frame(flash)
             if before & held != 0 && self.csr & held == 0 then flash.deselect().map_err(why -> flash_fault(why))?
             return self.pump(flash)
         if at == qmi_reg.DIRECT_TX_OFFSET
@@ -328,14 +341,26 @@ struct Qmi
             val auto0 = self.csr & qmi_reg.DIRECT_CSR_AUTO_CS0N_MASK != 0
             val auto1 = self.csr & qmi_reg.DIRECT_CSR_AUTO_CS1N_MASK != 0
             if manual1 || auto1 then return Err(XipFault.Refused("a direct-mode transfer to QSPI chip select 1, where the Pico 2 fits nothing"))
-            if !manual0 && !auto0 then return Err(XipFault.Refused("a direct-mode transfer with neither chip select asserted"))
+            if !manual0 && !auto0
+                // SCK runs with no device selected, as the boot ROM's `flash_exit_xip` clocks the bus
+                // before it asserts CS0: the flash sees nothing. What comes back is the floating bus.
+                if keep then return Err(XipFault.Refused("a direct-mode transfer with neither chip select asserted pushes the floating data lines into DIRECT_RX"))
+                for i in 1u32..<self.tx_count do self.tx[i - 1] = self.tx[i]
+                self.tx_count -= 1
+                continue
             if !flash.connected() then return Err(XipFault.Refused("a direct-mode transfer to QSPI chip select 0, where this board connects no flash"))
             if auto0 && !manual0 && !self.auto_frame
-                flash.select()
+                self.open_frame(flash)
                 self.auto_frame = true
+            if self.frame_bytes == 0 && (e & qmi_reg.DIRECT_TX_IWIDTH_MASK) >> qmi_reg.DIRECT_TX_IWIDTH_SHIFT != qmi_reg.DIRECT_TX_IWIDTH_S
+                self.frame_ignored = true
+            if self.frame_ignored && keep then return Err(XipFault.Refused("DIRECT_RX would take the data lines in a frame the flash ignores (its instruction came at dual or quad width), which nothing drives"))
             val wide = e & qmi_reg.DIRECT_TX_DWIDTH_MASK != 0
-            var back = u32(flash.exchange(u8(e & 0xFF)).map_err(why -> flash_fault(why))?)
-            if wide then back |= u32(flash.exchange(u8((e >> 8) & 0xFF)).map_err(why -> flash_fault(why))?) << 8
+            var back: u32 = 0
+            if !self.frame_ignored
+                back = u32(flash.exchange(u8(e & 0xFF)).map_err(why -> flash_fault(why))?)
+                if wide then back |= u32(flash.exchange(u8((e >> 8) & 0xFF)).map_err(why -> flash_fault(why))?) << 8
+            self.frame_bytes += if wide then 2 else 1
             for i in 1u32..<self.tx_count do self.tx[i - 1] = self.tx[i]
             self.tx_count -= 1
             if keep

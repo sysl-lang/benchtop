@@ -96,9 +96,12 @@ static void sleep_us(u32 us) {
     __asm__ volatile("csrc mie, %0" :: "r"(0x80));
 }
 
+// Each word pushed is followed by h3.unblock (the SDK's `__sev`), which wakes the boot ROM's core 1
+// from the h3.block it waits for words in.
 static void fifo_push(u32 x) {
     while ((REG(SIO + 0x50) & 2) == 0) {}
     REG(SIO + 0x54) = x;
+    __asm__ volatile("slt x0, x0, x1");
 }
 
 static u32 fifo_pop(void) {

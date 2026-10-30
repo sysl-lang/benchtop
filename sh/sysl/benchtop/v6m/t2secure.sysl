@@ -14,9 +14,19 @@ module sh.sysl.benchtop.v6m
 //
 // **The SAU** (`SAU_CTRL`, `SAU_TYPE`, `SAU_RNR`, `SAU_RBAR`, `SAU_RLAR`; `regs/m33.h`, M33_SAU_*) is
 // stored, with the M33's eight regions, and `TT` answers from it. Its reset state, disabled with ALLNS
-// clear, makes every address Secure, which is what the SDK runs under. No IDAU is modelled, so `TT`'s
-// IREGION is never valid, and no MPU, so neither is MREGION. Executing from an address the SAU marks
-// Non-secure (SecureFault INVTRAN) is not detected.
+// clear, makes every address Secure, which is what the SDK runs under. Executing from an address the
+// SAU marks Non-secure (SecureFault INVTRAN) is not detected.
+//
+// **The IDAU** is the board's: at most one region that reports a number (`Cpu.idau`), Secure
+// Non-secure-callable, which outranks the SAU's Non-secure; every other address is exempt or left to
+// the SAU, with no IDAU region valid. The RP2350's is the boot ROM's 0x7e00–0x7fff, region 2 (its
+// boot ROM's start-up checks `TT` of both answers).
+//
+// **The MPU** (`MPU_TYPE`, `MPU_CTRL`, `MPU_RNR`, `MPU_RBAR`, `MPU_RLAR` and their three aliases,
+// `MAIR0`, `MAIR1`; `regs/m33.h`, M33_MPU_*) is stored, with the M33's eight regions, and `TT` answers
+// MREGION, MRVALID and the R and RW permissions from it. It is not enforced: an access its regions
+// forbid is made, where silicon takes a MemManage fault. `NSACR` and the Non-secure alias's `CPACR`
+// (0xE002ED88) are stored; the rest of the alias stops the core at `NonSecure`, as before.
 //
 // **Faults taken.** A stack-limit violation is the UsageFault STKOF, and an EXC_RETURN whose ES bit
 // names a Non-secure exception is the UsageFault INVPC: each is recorded in CFSR and taken where
@@ -34,6 +44,38 @@ const SAU_TYPE: u32 = 0xE000EDD4
 const SAU_RNR: u32 = 0xE000EDD8
 const SAU_RBAR: u32 = 0xE000EDDC
 const SAU_RLAR: u32 = 0xE000EDE0
+
+/** The MPU regions the M33 on the RP2350 has (M33_MPU_TYPE_DREGION_RESET). */
+const MPU_REGIONS: u32 = 8
+
+const SCB_NSACR: u32 = 0xE000ED8C
+const SCB_SCR: u32 = 0xE000ED10
+const MPU_TYPE: u32 = 0xE000ED90
+const MPU_CTRL: u32 = 0xE000ED94
+const MPU_RNR: u32 = 0xE000ED98
+const MPU_RBAR: u32 = 0xE000ED9C
+const MPU_RLAR_A3: u32 = 0xE000EDB8
+const MPU_MAIR0: u32 = 0xE000EDC0
+const MPU_MAIR1: u32 = 0xE000EDC4
+/** CPACR in the private peripheral bus's Non-secure alias. */
+const CPACR_NS: u32 = 0xE002ED88
+
+// The bits each register keeps (M33_*_BITS).
+const NSACR_BITS: u32 = 0x00000CFF
+const SCR_BITS: u32 = 0x0000001E
+const MPU_CTRL_BITS: u32 = 0x7
+const MPU_RLAR_BITS: u32 = 0xFFFFFFEF
+
+/** The IDAU region a board gives its cores: `base` to `limit` inclusive, reporting `number`, Secure
+ * Non-secure-callable. `limit` below `base` is none.
+ */
+struct IdauRegion
+    base: u32
+    limit: u32
+    number: u32
+
+/** No IDAU region. */
+val NO_IDAU: IdauRegion = IdauRegion(1, 0, 0)
 
 const SECURE_FAULT: u32 = 7
 
@@ -63,6 +105,16 @@ clear_security(cpu: *Cpu)
     cpu.sfsr = 0
     cpu.sfar = 0
     cpu.transition = Transition.None
+    cpu.nsacr = 0
+    cpu.scr = 0
+    cpu.cpacr_ns = 0
+    cpu.idau = NO_IDAU
+    cpu.mpu_ctrl = 0
+    cpu.mpu_rnr = 0
+    for k in 0..<MPU_REGIONS
+        cpu.mpu_rbar[k] = 0
+        cpu.mpu_rlar[k] = 0
+    cpu.mpu_mair = [0, 0]
 
 // ---------------------------------------------------------------------------------------------------
 // Taking a fault.
@@ -177,7 +229,18 @@ secure_read(cpu: *Cpu, a: u32) -> Option[u32]
             Some(if a == SAU_RBAR then cpu.sau_rbar[cpu.sau_rnr] else cpu.sau_rlar[cpu.sau_rnr])
         SCB_SFSR -> Some(cpu.sfsr)
         SCB_SFAR -> Some(cpu.sfar)
-        _ -> None
+        SCB_NSACR -> Some(cpu.nsacr)
+        SCB_SCR -> Some(cpu.scr)
+        MPU_TYPE -> Some(MPU_REGIONS << 8)
+        MPU_CTRL -> Some(cpu.mpu_ctrl)
+        MPU_RNR -> Some(cpu.mpu_rnr)
+        MPU_MAIR0 -> Some(cpu.mpu_mair[0])
+        MPU_MAIR1 -> Some(cpu.mpu_mair[1])
+        _ ->
+            if a >= MPU_RBAR && a <= MPU_RLAR_A3
+                val (k, limit) = mpu_region_register(cpu, a)
+                return Some(if limit then cpu.mpu_rlar[k] else cpu.mpu_rbar[k])
+            None
 
 // The same, written; whether `a` is one of them.
 secure_write(cpu: *Cpu, a: u32, x: u32) -> bool
@@ -196,7 +259,37 @@ secure_write(cpu: *Cpu, a: u32, x: u32) -> bool
         // Write one to clear.
         SCB_SFSR -> cpu.sfsr &= ~(x & 0xFF)
         SCB_SFAR -> cpu.sfar = x
-        _ -> return false
+        SCB_NSACR -> cpu.nsacr = x & NSACR_BITS
+        SCB_SCR -> cpu.scr = x & SCR_BITS
+        // The region count is fixed.
+        MPU_TYPE -> ()
+        MPU_CTRL -> cpu.mpu_ctrl = x & MPU_CTRL_BITS
+        // REGION has three bits, for eight regions: the rest are dropped.
+        MPU_RNR -> cpu.mpu_rnr = x & (MPU_REGIONS - 1)
+        MPU_MAIR0 -> cpu.mpu_mair[0] = x
+        MPU_MAIR1 -> cpu.mpu_mair[1] = x
+        _ ->
+            if a < MPU_RBAR || a > MPU_RLAR_A3 then return false
+            val (k, limit) = mpu_region_register(cpu, a)
+            if limit then cpu.mpu_rlar[k] = x & MPU_RLAR_BITS else cpu.mpu_rbar[k] = x
+    true
+
+// The region an MPU_RBAR or MPU_RLAR, or one of their aliases, names (alias n is region RNR + n, in
+// the three bits RNR has), and whether it is the limit register.
+mpu_region_register(cpu: *Cpu, a: u32) -> (usize, bool)
+    val word = (a - MPU_RBAR) / 4
+    (usize((cpu.mpu_rnr + word / 2) & (MPU_REGIONS - 1)), word & 1 != 0)
+
+// The private peripheral bus's Non-secure alias, which a Secure-only core reaches for the registers
+// Non-secure state would use: CPACR's, stored. None for any other address there, which stops the core.
+ns_alias_read(cpu: *Cpu, a: u32) -> Option[u32] = if a == CPACR_NS then Some(cpu.cpacr_ns) else None
+
+ns_alias_write(cpu: *Cpu, a: u32, x: u32) -> bool
+    if a != CPACR_NS then return false
+    // As the Secure CPACR keeps it: CP10 and CP11 where there is an FPU, and the board's coprocessors.
+    var keep: u32 = if cpu.fpu != Fpu.Absent then 0x00F00000 else 0
+    for i in 0u32..<8 do if cpu.coprocessors & (1 << i) != 0 then keep |= 3 << (2 * i)
+    cpu.cpacr_ns = x & keep
     true
 
 // ---------------------------------------------------------------------------------------------------
@@ -231,28 +324,61 @@ attribution(cpu: *Cpu, a: u32) -> Attribution
     Attribution(cpu.sau_rlar[usize(hit)] & 2 == 0, hit)
 
 /** `TT`'s answer for `a` from a Secure core: `alt` for TTA and TTAT, which ask about the Non-secure
- * domain, `unprivileged` for TTT and TTAT. S, SRVALID and SREGION come from the SAU. The MPU fields are
- * answered where the TT was privileged or asks about the other domain: no MPU is modelled, so no region
- * is valid, and the default memory map lets every address be read and written but the private
- * peripheral bus unprivileged; NSR and NSRW are R and RW of a Non-secure address.
+ * domain, `unprivileged` for TTT and TTAT. S, SRVALID and SREGION come from the SAU, IRVALID and
+ * IREGION from the IDAU, whose Non-secure-callable region makes an address Secure whatever the SAU
+ * says. The MPU fields are answered where the TT was privileged or asks about the other domain: with
+ * the MPU enabled, the one region holding `a` gives MREGION and its AP field R and RW, and an address
+ * no region holds has the default map where PRIVDEFENA lets a privileged query use it, and no access
+ * otherwise. The Non-secure domain's MPU is not modelled: TTA and TTAT answer from the default map. The
+ * default map lets every address be read and written but the private peripheral bus unprivileged; NSR
+ * and NSRW are R and RW of a Non-secure address.
  */
 tt_response(cpu: *Cpu, a: u32, alt: bool, unprivileged: bool) -> u32
     val at = attribution(cpu, a)
-    var resp: u32 = if at.non_secure then 0 else 1 << 22
+    val idau = a >= cpu.idau.base && a <= cpu.idau.limit
+    val non_secure = at.non_secure && !idau
+    var resp: u32 = if non_secure then 0 else 1 << 22
 
     if at.region >= 0 then resp |= (u32(at.region) << 8) | (1 << 17)
+    if idau then resp |= (cpu.idau.number << 24) | (1 << 23)
 
     // The Non-secure domain's privilege is its CONTROL.nPRIV, which is never written: privileged.
     val privileged = alt || cpu.ipsr != 0 || cpu.control & 1 == 0
 
     if privileged
-        val ok = !(unprivileged && a >= PPB && a < PPB_END)
+        var r = !(unprivileged && a >= PPB && a < PPB_END)
+        var rw = r
 
-        if ok
-            resp |= (1 << 18) | (1 << 19)
-            if at.non_secure then resp |= (1 << 20) | (1 << 21)
+        if !alt && cpu.mpu_ctrl & 1 != 0
+            val k = mpu_region(cpu, a)
+            if k >= 0
+                resp |= u32(k) | (1 << 16)
+                // AP: bit 2 read-only, bit 1 any privilege.
+                val ap = (cpu.mpu_rbar[usize(k)] >> 1) & 3
+                r = !unprivileged || ap & 1 != 0
+                rw = r && ap & 2 == 0
+            elif unprivileged || cpu.mpu_ctrl & 4 == 0
+                r = false
+                rw = false
+
+        if r then resp |= 1 << 18
+        if rw then resp |= 1 << 19
+        if non_secure
+            if r then resp |= 1 << 20
+            if rw then resp |= 1 << 21
 
     resp
+
+// The one enabled MPU region holding `a`, or -1 where none does or more than one does (an access
+// there faults on silicon, and `TT` reports no region).
+mpu_region(cpu: *Cpu, a: u32) -> int
+    var hit = -1
+    for k in 0..<MPU_REGIONS
+        val limit = cpu.mpu_rlar[k]
+        if limit & 1 != 0 && a >= cpu.mpu_rbar[k] & ~0x1F && a <= (limit | 0x1F)
+            if hit >= 0 then return -1
+            hit = int(k)
+    hit
 
 // `TT`, `TTT`, `TTA` or `TTAT`: a = Rd, b = Rn, imm bit 1 = A, bit 0 = T.
 x_tt(cpu: *Cpu, i: *Insn)

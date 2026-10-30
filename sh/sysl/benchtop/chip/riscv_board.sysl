@@ -81,20 +81,24 @@ impl RiscvBoard
         var regions = [elf.Region(u64(self.base), self.sram.view())]
         val entry = elf.load(e, regions[..]).map_err(why -> s"$why: the image must be linked into the SRAM")?
         self.chip.reset()
-        val model = rv.model_named("hazard3").unwrap()
-        for k in 0..<2
-            val h = &self.harts[k]
-            rv.reset(h, model, rv.RP2350, self.sram.view(), self.base, u32(entry))
-            h.bus = self
-            // EBREAK is the guest's way to end a run; other faults trap as on silicon.
-            h.halt_breakpoint = true
-            rv.use_code_cache(h, self.records[k].view(), self.lines[k].view())
-        rv.pair(&self.harts[0], &self.harts[1])
-        self.started = [true, false]
+        self.chip.rom_boot_releases()
+        self.reset_hart(0, u32(entry))
+        self.reset_hart(1, RISCV_RESET_VECTOR)
         self.quantum_at = 0
         self.refused = ""
         self.console.clear()
         Ok(())
+
+    // Hart `k` from reset at `entry`, on this board's bus and its own code cache, paired with the other.
+    private reset_hart(*self, k: usize, entry: u32)
+        val h = &self.harts[k]
+        rv.reset(h, rv.model_named("hazard3").unwrap(), rv.RP2350, self.sram.view(), self.base, entry)
+        h.bus = self
+        // EBREAK is the guest's way to end a run; other faults trap as on silicon.
+        h.halt_breakpoint = true
+        rv.use_code_cache(h, self.records[k].view(), self.lines[k].view())
+        rv.pair(&self.harts[0], &self.harts[1])
+        self.started[k] = true
 
     /** Run until `cycles` more clk_sys cycles have passed, or something ends the run first. */
     run(*self, cycles: u64) -> RunEnd
@@ -146,19 +150,10 @@ impl RiscvBoard
             self.chip.uarts[0].take() match
                 Some(c) -> self.console.push(c)
                 None -> break
+        // PSM holding core 1 stops it; releasing it starts it from reset, in the boot ROM.
         if self.chip.take_core1_reset() then self.started[1] = false
-        self.chip.take_launch() match
-            Some(l) -> self.launch(l)
-            None -> ()
+        if self.chip.take_core1_release() then self.reset_hart(1, RISCV_RESET_VECTOR)
         for k in 0..<2 do self.chip.signal(&self.harts[k])
-
-    // Core 1 leaves the boot ROM as it was told to.
-    private launch(*self, l: Launch)
-        val h = &self.harts[1]
-        h.pc = l.entry
-        h.r[2] = l.stack_pointer
-        h.cs.mtvec = l.vector_table
-        self.started[1] = true
 
     // The chip's clock at hart `cpu`'s `n`th retired instruction.
     private at(self, cpu: *rv.Cpu, n: u64) -> u64 = self.quantum_at + (n - self.retired_at[usize(cpu.hart)])
@@ -175,6 +170,8 @@ impl rv.Bus for RiscvBoard
         if self.chip.restarting(cpu.hart)
             self.refuse(cpu, a, RESTART_REFUSED)
             return 0
+        // The boot ROM, read and fetched through the bus: a hart's RAM window is the SRAM.
+        if a < ROM_BYTES then return rom_read(a, width)
         self.chip.read(cpu.hart, a, width) match
             Ok(v) -> v
             Err(why) ->
@@ -185,6 +182,9 @@ impl rv.Bus for RiscvBoard
         self.chip.catch_up(self.at(cpu, n))
         if self.chip.restarting(cpu.hart)
             self.refuse(cpu, a, RESTART_REFUSED)
+            return
+        if a < ROM_BYTES
+            self.refuse(cpu, a, s"0x${hex(a, 8)} is in the boot ROM, which is read-only")
             return
         self.chip.write(cpu.hart, a, width, x) match
             Ok(_) ->
