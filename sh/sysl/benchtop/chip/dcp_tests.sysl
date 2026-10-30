@@ -1,8 +1,9 @@
 module sh.sysl.benchtop.chip
 @tests
 
-import sh.sysl.benchtop.v6m.{CoprocessorKind, CoprocessorOp}
+import sh.sysl.benchtop.v6m.{CoprocessorKind, CoprocessorOp, Stop}
 import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
 
 // The double-precision coprocessor (dcp.sysl): every instruction against the datasheet's outline, and
 // every canned sequence of the SDK's `hardware/dcp_canned.inc.S` — with the core's half of each (the
@@ -733,3 +734,102 @@ dcp_refusals()
     assert(cp5.why == "MCR p5, #0, c0, c0, #0 is not a Non-secure double-precision (DCP) coprocessor instruction benchtop runs", cp5.why)
     // A refusal changes nothing.
     for u in d.units do assert(u.xm == 0 && u.ym == 0 && u.xe == 0 && u.ye == 0 && u.xf == 0 && u.yf == 0 && u.status == 0)
+
+// ---- the SDK program, examples/pico2/dcp.c ----
+
+private val ARM_DCP = embed("../../../../examples/pico2/dcp.elf")
+
+// dcp.c's second operands: half the time a fresh one, half the time one near the first.
+private near(g: *Operands, x: u64) -> u64
+    if g.next() & 1 == 0 then return g.double()
+    val a = g.next()
+    val c = g.next()
+    x ^ (a & 0x800FFFFFFFFFFFFF) ^ (c & 0x0030000000000000)
+
+private near_single(g: *Operands, x: u32) -> u32
+    if g.next() & 1 == 0 then return g.single()
+    val a = g.next()
+    val c = g.next()
+    x ^ u32.wrap(a & 0x807FFFFF) ^ u32.wrap(c & 0x01800000)
+
+private mix(h: u64, x: u64) -> u64 = (h ^ x) *% 0x100000001B3
+private const FNV: u64 = 0xCBF29CE484222325
+private const PROGRAM_ROUNDS: u32 = 3000
+
+// RXVD's word for x: its flags at bits 28-31.
+private classify(x: u64) -> u64
+    val e = (x >> 52) & 0x7FF
+    val kind: u64 = if e == 0 then 4 elif e == 0x7FF then (if x & 0xFFFFFFFFFFFFF == 0 then 2 else 1) else 0
+    ((x >> 63) << 3 | kind) << 28
+
+// pico_double's fma (double_fma_dcp.S): with every operand finite and non-zero, the fused result;
+// otherwise its "mla path", the DCP's product (rounded, a result below the normal range flushed to a
+// signed zero) and then the DCP's sum, so that, for one, -tiny × tiny + 0 is +0 where the fused -0 is.
+private fma(x: f64, y: f64, z: f64) -> u64
+    val ordinary = (a: f64) -> a == a && a != 0.0 && a.abs() != f64.from_bits(0x7FF0000000000000)
+    if ordinary(x) && ordinary(y) && ordinary(z) then return out(x.mul_add(y, z))
+    out(f64.from_bits(out(x * y)) + z)
+
+// C's six comparisons and isunordered, one bit each, as dcp.c packs them.
+private compare(x: f64, y: f64) -> u64
+    val bit = (b: bool, k: u32) -> if b then 1u64 << k else 0
+    val un = x != x || y != y
+    bit(x < y, 0) | bit(x <= y, 1) | bit(x == y, 2) | bit(x != y, 3) | bit(x >= y, 4) | bit(x > y, 5) | bit(un, 6)
+
+// What dcp.c prints for its hashes: each operation over the same operands, with the host's arithmetic
+// (denormals flushed), or for the `_fast` forms with this file's canned sequences on the model.
+private program_hashes() -> string
+    val names = ["dadd", "dsub", "dmul", "ddiv", "dsqrt", "dsqrt_fast", "ddiv_fast", "dfma", "dcmp_c", "dcmp_raw", "dclassify",
+        "d2iz", "d2uiz", "i2d", "ui2d", "d2f", "d2i_r", "d2ui_r", "fadd", "fsub", "fmul", "fdiv", "fdiv_fast", "fsqrt", "fsqrt_fast",
+        "fcmp", "fxprod", "f2d", "i2f", "ui2f", "f2i", "f2ui", "f2i_r", "f2ui_r"]
+    var h = [FNV; 34]
+    var d = dcp()
+    var g = Operands(0x9E3779B97F4A7C15)
+    for _ in 0..<PROGRAM_ROUNDS
+        val x = g.double()
+        val y = near(&g, x)
+        val z = g.double()
+        val fx = g.single()
+        val fy = near_single(&g, fx)
+        val n = u32.wrap(g.next())
+        val dx = ftz(x)
+        val dy = ftz(y)
+        val sx = ftz32(fx)
+        val sy = ftz32(fy)
+        val r: [34]u64 = [out(dx + dy), out(dx - dy), out(dx * dy), out(dx / dy), out(dx.sqrt()), dsqrt(&d, y & 0x7FFFFFFFFFFFFFFF, true),
+            ddiv(&d, x, y, true), fma(dx, dy, ftz(z)), compare(dx, dy), u64(want_cmp(dx, dy) >> 28), classify(x),
+            u64(want_int(dx, false, true)), u64(want_int(dx, false, false)), f64(i32.wrap(n)).bits(), f64(n).bits(), u64(out32(f32(dx))),
+            u64(want_int(dx, true, true)), u64(want_int(dx, true, false)), u64(out32(sx + sy)), u64(out32(sx - sy)), u64(out32(sx * sy)),
+            u64(out32(sx / sy)), u64(fdiv(&d, fx, fy, true)), u64(out32(sx.sqrt())), u64(fsqrt(&d, fx, true)), u64(want_cmp(f64(sx), f64(sy)) >> 28),
+            out(f64(sx) * f64(sy)), out(f64(sx)), u64(f32(i32.wrap(n)).bits()), u64(f32(n).bits()), u64(want_int(f64(sx), false, true)),
+            u64(want_int(f64(sx), false, false)), u64(want_int(f64(sx), true, true)), u64(want_int(f64(sx), true, false))]
+        for k in 0..<34 do h[k] = mix(h[k], r[k])
+    var text = ""
+    for k in 0..<34 do text = text + s"${names[k]} ${hex(h[k], 16)}\r\n"
+    var core1 = FNV
+    var c = Operands(0x0123456789ABCDEF)
+    for _ in 0..<PROGRAM_ROUNDS
+        val x = c.double()
+        val y = near(&c, x)
+        core1 = mix(mix(mix(core1, out(ftz(x) + ftz(y))), out(ftz(x) * ftz(y))), out(ftz(x) / ftz(y)))
+    text + s"core1 ${hex(core1, 16)}\r\n"
+end program_hashes
+
+@test("the SDK's own DCP code on a Pico 2: pico_double's arithmetic, sqrt, fma, comparisons and casts, and every canned sequence, hash for hash with the host over 3000 operand sets; core 1 alongside; interrupts inside sequences saved and restored; printf's %f, %e and %g")
+dcp_program()
+    val b = arm_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(ARM_DCP).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 5000 * 150000 do end = b.run(150000)
+    val text = from_utf8_lossy(b.console.view())
+    val c0 = &b.cores[0]
+    val c1 = &b.cores[1]
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused} ${b.why}; core 0 ${c0.stop} at 0x${hex(c0.stop_at, 8)}, core 1 ${c1.stop} at 0x${hex(c1.stop_at, 8)} pc 0x${hex(c1.pc, 8)} lr 0x${hex(c1.r[14], 8)} sp 0x${hex(c1.r[13], 8)} cpacr 0x${hex(c1.cpacr, 8)} vtor 0x${hex(c1.vtor, 8)} ipsr ${c1.ipsr} retired ${c1.retired}: $text")
+    val want = program_hashes() + "interrupts many, some inside a sequence, 0 wrong\r\n" +
+        "3.141593 -0.100000 123456789.125000\r\n" +
+        "0.33333333333333331 1.4142135623730951\r\n" +
+        "1.000000e+300 2.225074e-308 1e-05\r\n" +
+        "2.001 2 4 1000000000000000.250000\r\n"
+    assert(text == want, s"the program printed\n$text\nnot\n$want")
+    // Core 1's entry returned into the boot ROM, which waits there as the chip's does.
+    assert(c1.stop == Stop.Running && c1.pc >= ROM_PARK && c1.pc < ROM_PARK + 4, s"core 1 at 0x${hex(c1.pc, 8)}")

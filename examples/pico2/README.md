@@ -11,6 +11,7 @@ Pico SDK programs that the `pico2` board runs on its Cortex-M33s, and that
 | `tt.c` | ACLE's `cmse_TT`/`TTT`/`TTA`/`TTAT` of SRAM and the PPB, before and after two SAU regions (built with `-mcmse`) | each answer's word |
 | `rcp.c` | every `hardware/rcp.h` function and macro, both forms, passing; then a corrupted canary | its lines on UART0, then core 0 stopped at `Fault` with `rcp_canary_check` named |
 | `gpioc.c` | every `hardware/gpio_coproc.h` function, each compared with its SIO equivalent | `87 checks, 0 mismatches` and the final OUT and OE |
+| `dcp.c` (+ `dcp_ops.S`) | the double coprocessor: pico_double's arithmetic, `sqrt`, `fma`, comparisons, casts, `ddiv_fast`, `sqrt_fast`, and every canned sequence of `hardware/dcp_canned.inc.S`, over 3000 pseudo-random operand sets, one hash per operation; core 1 adding, multiplying and dividing alongside; a 20 µs timer interrupting with double arithmetic of its own; then newlib's `printf` `%f`, `%e`, `%g` | each hash equal to the host's IEEE arithmetic (denormals flushed), the interrupts' count and check, and the printed numbers digit for digit |
 
 ```sh
 ./benchtop run --board pico2 examples/pico2/hello_serial.elf

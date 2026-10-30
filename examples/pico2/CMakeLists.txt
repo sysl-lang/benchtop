@@ -9,7 +9,7 @@ project(benchtop_pico2 C CXX ASM)
 
 pico_sdk_init()
 
-foreach(prog hello_serial blink rcp gpioc stack_limit tt)
+foreach(prog hello_serial blink rcp gpioc stack_limit tt dcp)
     add_executable(${prog} ${prog}.c)
     target_link_libraries(${prog} pico_stdlib)
     # A RAM image: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
@@ -24,5 +24,11 @@ endforeach()
 # rcp.c uses the redundancy coprocessor's header directly.
 target_link_libraries(rcp hardware_rcp)
 target_link_libraries(stack_limit hardware_exception)
+# dcp.c calls the SDK's canned DCP sequences (dcp_ops.S) besides pico_double, and runs core 1.
+target_sources(dcp PRIVATE dcp_ops.S)
+target_link_libraries(dcp hardware_dcp pico_multicore)
+# newlib's printf, whose dtoa converts exactly (the SDK's own printf stops at nine digits), so its %f,
+# %e and %g are the host's, digit for digit, wherever the DCP's arithmetic is.
+pico_set_printf_implementation(dcp compiler)
 # ACLE's TTA and TTAT intrinsics are only declared for code built for the Security Extension.
 target_compile_options(tt PRIVATE -mcmse)

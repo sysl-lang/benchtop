@@ -166,7 +166,9 @@ arm_core1_launch()
     assert(b.run(100000) == RunEnd.Breakpoint, s"${b.refused}")
     val c = &b.cores[1]
     assert(b.started[1] && c.r[0] == 42 && c.vtor == 0x20000000 && c.r[13] == 0x20080000 && c.stop_at == 0x20070002)
-    assert(c.core == 1 && c.security && c.coprocessors == 0x91 && c.nvic_irqs == 52)
+    assert(c.core == 1 && c.security && c.coprocessors == 0xB1 && c.nvic_irqs == 52)
+    // Called from the ROM: an entry that returns goes back to its wait.
+    assert(c.r[14] == ROM_PARK | 1, s"lr 0x${hex(c.r[14], 8)}")
 
 @test("the boot ROM's lookup at 0x16 finds bootrom_state_reset by its code for Secure and Non-secure callers, and answers 0 for another")
 arm_rom_lookup()
@@ -263,24 +265,28 @@ arm_gpioc_edges()
     c.coprocessor(1, gpioc(w, 6, 0, 2, 0)).unwrap().unwrap()
     assert(c.sio.out & 4 != 0)
 
-@test("the DCP answers its RCMP and refuses the rest by name; CP1 has nothing on its port")
+@test("the chip's DCP is on CP4 and CP5, each core's own (dcp_tests.sysl); runtime_init's RCMP reads it idle; an MCR is refused by name; CP1 has nothing on its port")
 arm_dcp()
     var c = rp2350()
     assert(c.coprocessor(0, CoprocessorOp(CoprocessorKind.Read, 4, 0, 1, 0, 0, 0, 0, false)).unwrap().unwrap() == 0, "RCMP")
-    val other = c.coprocessor(0, CoprocessorOp(CoprocessorKind.WritePair, 4, 1, 0, 0, 0, 0, 0, false)).unwrap().unwrap_err()
+    // WXUP of 1.0 on core 1's CP5, read back by RXMD there and nowhere else.
+    assert(c.coprocessor(1, CoprocessorOp(CoprocessorKind.WritePair, 5, 1, 0, 0, 0, 0, 0x3FF00000, false)).unwrap().unwrap() == 0)
+    assert(c.coprocessor(1, CoprocessorOp(CoprocessorKind.ReadPair, 5, 0, 0, 0, 8, 0, 0, false)).unwrap().unwrap() == 0x4000000000000000)
+    assert(c.coprocessor(1, CoprocessorOp(CoprocessorKind.ReadPair, 4, 0, 0, 0, 8, 0, 0, false)).unwrap().unwrap() == 0)
+    val other = c.coprocessor(0, CoprocessorOp(CoprocessorKind.Write, 4, 1, 0, 0, 0, 0, 0, false)).unwrap().unwrap_err()
     assert(!other.fault && other.why.contains("double-precision (DCP)"), other.why)
     assert(c.coprocessor(0, CoprocessorOp(CoprocessorKind.Write, 1, 0, 0, 0, 0, 0, 0, false)).is_none(), "nothing on CP1")
 
 // Core 0 of a booted board runs `code` at 0x20070000, then a BKPT, under `exec`, with r0 upward from
-// `regs` and CP7 enabled, until it stops.
-private on_core0(exec: *extern(*arm.Cpu) -> unit, code: []const u16, regs: []const u32) -> &ArmBoard
+// `regs` and the coprocessors `cpacr` enables (CP7 alone unless it says), until it stops.
+private on_core0(exec: *extern(*arm.Cpu) -> unit, code: []const u16, regs: []const u32, cpacr: u32 = 0xC000) -> &ArmBoard
     val b = arm_board(PICO2_ARM_SRAM)
     b.boot(ARM_BLINK).unwrap()
     place(b, 0x20070000, code)
     place(b, 0x20070000 + 2 * u32(code.len), [0xBE00])
     val c = &b.cores[0]
     c.pc = 0x20070000
-    c.cpacr = 0xC000
+    c.cpacr = cpacr
     for i in 0..<regs.len do c.r[i] = regs[i]
     while c.stop == Stop.Running && c.retired < 100000
         arm.set_limit(c, c.retired + 1000)
@@ -301,6 +307,32 @@ arm_rcp_executors()
         assert(b.chip.rcp.salt[0] == 0x0123456789abcdef && b.chip.rcp.count[0] == 8)
         val canary = b.chip.coprocessor(0, CoprocessorOp(CoprocessorKind.Read, 7, 0, 1, 5, 10, 0, 0, true)).unwrap().unwrap()
         assert(u64(c.r[2]) == canary && c.r[4] < 256 && c.r[5] == RCP_TRUE, s"r2 ${c.r[2]} r4 ${c.r[4]} r5 ${c.r[5]}")
+
+@test("under both executors the DCP runs from the core: dcp_dadd_m into r4:r5, RCMP into the flags, PCMP after it, CP5's own state; CRd not c0 is refused, CP5 without CPACR is NOCP, CP6 has nothing")
+arm_dcp_executors()
+    for exec in [&arm.run_match, &arm.run_threaded]
+        // WXUP r0,r1; WYUP r2,r3; ADD0; ADD1; NRDD; RDDA r4,r5; WXUP; WYUP; ADD0; RCMP APSR_nzcv; mrs r6, apsr;
+        // PCMP r7; mcrr p5,#1,r0,r1,c0 (CP5's WXUP); mrrc2 p5,#0,r8,r9,c8 (CP5's PXMD)
+        val code = [0xEC41u16, 0x0410, 0xEC43, 0x2411, 0xEE00, 0x0401, 0xEE10, 0x0401, 0xEE80, 0x0420, 0xEC55, 0x4410,
+            0xEC41, 0x0410, 0xEC43, 0x2411, 0xEE00, 0x0401, 0xEE10, 0xF430, 0xF3EF, 0x8600, 0xFE10, 0x7430, 0xEC41, 0x0510,
+            0xFC59, 0x8508]
+        // 1.5 + 2.25, and 1.5 against 2.25.
+        val b = on_core0(exec, code, [0, 0x3FF80000, 0, 0x40020000], 0xFF00)
+        val c = &b.cores[0]
+        assert(c.stop == Stop.Breakpoint && c.retired == 14 && b.why.is_empty(), s"${c.stop} at 0x${hex(c.stop_at, 8)}: ${b.why}")
+        assert(c.r[4] == 0 && c.r[5] == 0x400E0000, s"r4:r5 0x${hex(c.r[5], 8)}${hex(c.r[4], 8)}")
+        // RCMP: N the engaged flag, Z, C and V clear (less); PCMP after it reads the flag cleared.
+        assert(c.r[6] >> 28 == 0x8 && c.r[7] >> 28 == 0, s"r6 0x${hex(c.r[6], 8)} r7 0x${hex(c.r[7], 8)}")
+        assert(c.r[8] == 0 && c.r[9] == 0x60000000 && b.chip.dcp.units[0].xm == 0x6000000000000000)
+        // cdp p4, #0, c1, c0, c1, #0: ADD0's encoding with CRd c1.
+        val crd = on_core0(exec, [0xEE00, 0x1401], [], 0xFF00)
+        assert(crd.cores[0].stop == Stop.Unmapped && crd.cores[0].stop_at == 0x20070000, s"${crd.cores[0].stop}")
+        assert(crd.why == "CDP p4, #0, c0, c1, #0 is not a double-precision (DCP) coprocessor instruction benchtop runs", crd.why)
+        // CP5 with only CP4 enabled; CP6, which has nothing on its port.
+        val nocp = on_core0(exec, [0xEC41, 0x0510], [], 0x0300)
+        assert(nocp.cores[0].stop == Stop.Fault && nocp.cores[0].stop_at == 0x20070000 && nocp.cores[0].retired == 0, s"${nocp.cores[0].stop}")
+        val none = on_core0(exec, [0xEC41, 0x0610], [], 0xFFFF)
+        assert(none.cores[0].stop == Stop.Undefined && none.cores[0].stop_at == 0x20070000, s"${none.cores[0].stop}")
 
 @test("under both executors a failed RCP check, rcp_panic and an instruction before the salt stop the core at Fault on the instruction, named; an encoding outside the RCP is refused")
 arm_rcp_fault_executors()
