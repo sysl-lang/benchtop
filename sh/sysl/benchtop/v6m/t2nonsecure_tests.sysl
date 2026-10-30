@@ -1,0 +1,352 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// Non-secure state on an M33 (t2nonsecure.sysl), against the ARMv8-M ARM (DDI0553: "Secure gateway",
+// "BXNS", "BLXNS", "Function return", "Exception entry", "Exception return", "Security attribution",
+// "SecureFault"): the calls between the states and their stacking, attribution enforced on fetches and
+// data, exceptions targeting either state with the callee registers and the integrity signature, both
+// SysTicks, the banked registers through MRS/MSR and the alias, and what is refused by name. Every
+// guest case runs under both executors (`run_both8`), which must agree.
+//
+// The layout every case shares: Secure code at 0 (the test's), the Secure handlers at 0x0300, SAU
+// region 0 Non-secure code at 0x0600–0x07FF, region 1 Non-secure callable at 0x0800–0x081F, region 2
+// Non-secure data at 0x1400–0x1BFF with MSP_NS at its top and VTOR_NS at 0x1800. LOG (0x1000) and the
+// Secure stack (0x2000 down) are Secure.
+
+const NS_CODE: u32 = 0x0600
+const NSC: u32 = 0x0800
+const NS_DATA: u32 = 0x1400
+const NS_STACK: u32 = 0x1C00
+const NS_VECTORS: u32 = 0x1800
+const SECURE_AT: u32 = 0x0300
+const VTOR_NS_ALIAS: u32 = 0xE002ED08
+
+// The Secure handler at SECURE_AT: log SFSR (r5 points at it) and LR, then stop.
+val SECURE_HANDLER: [5]u16 =[0x6828, LOG_R0, MOV_R0_LR, LOG_R0, BKPT]
+
+// Halfwords into memory at `at`.
+put(cpu: *Cpu, at: u32, code: []const u16)
+    for i in 0..<code.len do store16(cpu, at + u32(i) * 2, code[i])
+
+// The layout above, the SAU enabled, the Secure handler placed, HardFault's handler a BKPT.
+layout(cpu: *Cpu)
+    secure(cpu)
+    region(cpu, 0, NS_CODE, 0x07E0, 1)
+    region(cpu, 1, NSC, NSC, 3)
+    region(cpu, 2, NS_DATA, 0x1BE0, 1)
+    store32(cpu, SAU_CTRL, 1)
+    cpu.banked.msp = NS_STACK
+    store32(cpu, VTOR_NS_ALIAS, NS_VECTORS)
+    put(cpu, SECURE_AT, SECURE_HANDLER[..])
+    store16(cpu, FAULT_AT, BKPT)
+
+// The same with SecureFault enabled.
+faulting(cpu: *Cpu)
+    layout(cpu)
+    store32(cpu, SCB_SHCSR, SHCSR_SECUREFAULTENA)
+
+
+// ---------------------------------------------------------------------------------------------------
+// Calls between the states.
+
+// Non-secure code: push {lr}; movs r0, #5; blx r2 (the veneer); adds r0, #1; pop {pc}.
+// The veneer: sg; adds r0, r0, r0; bxns lr.
+call_and_callback(cpu: *Cpu)
+    layout(cpu)
+    put(cpu, NS_CODE, [0xB500, 0x2005, 0x4790, 0x3001, 0xBD00])
+    put(cpu, NSC, [0xE97F, 0xE97F, 0x1800, 0x4774])
+
+@test("BLXNS calls Non-secure code, which calls back through an SG veneer and BXNS returns to it; its POP of FNC_RETURN returns to Secure state, the Secure stack as it was")
+ns_call_and_callback()
+    // blxns r1; log r0
+    var c = run_both8([0x478C, LOG_R0], [0, NS_CODE, NSC | 1, 0, LOG], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &call_and_callback)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 4 && !c.ns, s"${c.stop} at 0x${c.stop_at}")
+    assert(logged(&c, [11]), "5 doubled in Secure state, plus one in Non-secure state")
+    assert(c.r[13] == 0x2000 && c.ipsr == 0 && c.r[14] == 0x0606, "the Secure stack popped; LR as SG left it, bit 0 clear")
+    assert(load32(&c, NS_STACK - 4) == FNC_RETURN && c.banked.msp == NS_STACK, "the Non-secure stack held FNC_RETURN, and is popped")
+    assert(load32(&c, 0x2000 - 8) == 3 && load32(&c, 0x2000 - 4) == 0, "BLXNS stacked the return address and IPSR")
+    assert(c.sfsr == 0 && c.pending == [0u64; 8], "nothing faulted")
+
+@test("BXNS and BLXNS are undefined in Non-secure state; MRS of a Non-secure register reads zero there and MSR is ignored")
+ns_state_undefined()
+    // In Non-secure state: mrs r1, msp_ns; msr msp_ns, r0; bxns r1.
+    var c = run_both8([0x470C], [0x1234, NS_CODE], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &ns_registers_code)
+    assert(c.stop == Stop.Undefined && c.stop_at == NS_CODE + 8 && c.ns, s"${c.stop} at 0x${c.stop_at}")
+    assert(c.r[1] == 0 && c.r[13] == NS_STACK, "MSP_NS reads zero and stays")
+
+ns_registers_code(cpu: *Cpu)
+    layout(cpu)
+    put(cpu, NS_CODE, [0xF3EF, 0x8188, 0xF380, 0x8888, 0x470C])
+
+@test("MRS and MSR of the Non-secure registers from Secure state: MSP_NS, SP_NS, CONTROL_NS, PRIMASK_NS and PSPLIM_NS, the Secure ones untouched")
+ns_registers()
+    // msr msp_ns, r0; mrs r1, msp_ns; msr control_ns, r2; mrs r3, control_ns; msr primask_ns, r2;
+    // mrs r5, sp_ns; msr psplim_ns, r6; mrs r7, psplim_ns
+    val code: []const u16 = [0xF380, 0x8888, 0xF3EF, 0x8188, 0xF382, 0x8894, 0xF3EF, 0x8394, 0xF382, 0x8890, 0xF3EF, 0x8598, 0xF386, 0x888B, 0xF3EF, 0x878B]
+    var c = run_both8(code, [0x1BF3, 0, 1, 0, 0, 0, 0x1A0F], 0, [], &secure)
+    assert(c.r[1] == 0x1BF0 && c.r[5] == 0x1BF0, "MSP_NS keeps bits 31-2, and SP_NS is it")
+    assert(c.r[3] == 1 && c.r[7] == 0x1A08, "CONTROL_NS.nPRIV, PSPLIM_NS bits 31-3")
+    assert(c.banked.primask == 1 && c.primask == 0 && c.control == 0 && c.r[13] == 0x2000 && c.psplim == 0, "the Secure copies untouched")
+    assert(c.trustzone && !c.ns, "Non-secure state configured, not entered")
+
+// ---------------------------------------------------------------------------------------------------
+// Attribution enforced.
+
+// Non-secure code `code` at NS_CODE, SecureFault enabled.
+ns_code(cpu: *Cpu, code: []const u16)
+    faulting(cpu)
+    put(cpu, NS_CODE, code)
+
+// ldr r0, [r3]
+auviol_code(cpu: *Cpu) = ns_code(cpu, [0x6818, BKPT])
+// bx r3
+branch_code(cpu: *Cpu) = ns_code(cpu, [0x4718, BKPT])
+
+// The core ran Non-secure code that took SecureFault with `sfsr` from its thread mode on MSP_NS, the
+// fault's return address `at`.
+secure_fault_from_ns(c: *Cpu, sfsr: u32, at: u32) -> bool =
+    c.stop == Stop.Breakpoint && c.stop_at == SECURE_AT + 8 && !c.ns && c.ipsr == SECURE_FAULT && logged(c, [sfsr, 0xFFFFFFB9]) && load32(c, NS_STACK - 8) == at && c.banked.msp == NS_STACK - 0x20
+
+@test("a Non-secure load from Secure memory is SecureFault AUVIOL with SFAR, the frame on the Non-secure stack, EXC_RETURN naming it")
+ns_auviol()
+    // bxns r1 to the Non-secure ldr r0, [r3] of LOG.
+    val regs: []const u32 = [0, NS_CODE, 0, LOG, LOG, SCB_SFSR]
+    var c = run_both8([0x470C], regs, 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &auviol_code)
+    assert(secure_fault_from_ns(&c, SFSR_AUVIOL | SFSR_SFARVALID, NS_CODE), s"${c.stop} at 0x${c.stop_at}")
+    assert(c.sfar == LOG, "SFAR")
+
+@test("Non-secure code branching to Secure code, or to a Non-secure-callable address without SG, is SecureFault INVEP at the target")
+ns_invep()
+    var c = run_both8([0x470C], [0, NS_CODE, 0, 0x0001, LOG, SCB_SFSR], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &branch_code)
+    assert(secure_fault_from_ns(&c, SFSR_INVEP, 0), "to Secure code")
+    c = run_both8([0x470C], [0, NS_CODE, 0, NSC + 5, LOG, SCB_SFSR], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &veneer_without_sg)
+    assert(secure_fault_from_ns(&c, SFSR_INVEP, NSC + 4), "to the NSC region past its SG")
+
+veneer_without_sg(cpu: *Cpu)
+    branch_code(cpu)
+    put(cpu, NSC, [0xE97F, 0xE97F, 0x1800, 0x4774])
+
+@test("Secure code branching into Non-secure memory is SecureFault INVTRAN at the target")
+ns_invtran()
+    // bx r1, bit 0 set: a Secure branch to Non-secure code.
+    var c = run_both8([0x4708], [0, NS_CODE | 1, 0, 0, LOG, SCB_SFSR], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &branch_code)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == SECURE_AT + 8 && !c.ns && logged(&c, [SFSR_INVTRAN, 0xFFFFFFF9]), s"${c.stop} at 0x${c.stop_at}")
+    assert(load32(&c, 0x2000 - 8) == NS_CODE, "the return address is the target")
+
+@test("SecureFault disabled escalates to HardFault, FORCED, with SFSR recorded")
+ns_secure_fault_escalates()
+    var c = run_both8([0x470C], [0, NS_CODE, 0, LOG, LOG, SCB_SFSR], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &auviol_layout)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == HARD_FAULT && !c.ns, s"${c.stop} at 0x${c.stop_at}")
+    assert(c.hfsr == HFSR_FORCED && c.sfsr == SFSR_AUVIOL | SFSR_SFARVALID, "FORCED and AUVIOL")
+
+auviol_layout(cpu: *Cpu)
+    layout(cpu)
+    put(cpu, NS_CODE, [0x6818, BKPT])
+
+// SAU region 3 over 0x0040–0x005F, not yet enabled; the subroutine there: movs r0, #1; bx lr.
+later_region(cpu: *Cpu)
+    secure(cpu)
+    region(cpu, 3, 0x40, 0x40, 1)
+    put(cpu, 0x40, [0x2001, 0x4770])
+    put(cpu, SECURE_AT, SECURE_HANDLER[..])
+    store32(cpu, SCB_SHCSR, SHCSR_SECUREFAULTENA)
+
+@test("enabling the SAU forgets what was decoded under the old attribution: a subroutine Secure code ran becomes INVTRAN once it is Non-secure")
+ns_sau_change_forgets()
+    // blx r1; log; str r6, [r5] (SAU_CTRL = 1); isb; blx r1; log
+    val code: []const u16 = [0x4788, LOG_R0, STR_R6_R5, ISB_1, ISB_2, 0x4788, LOG_R0]
+    var c = run_both8(code, [0, 0x41, 0, 0, LOG, SAU_CTRL, 1], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &later_region_sfsr)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == SECURE_AT + 8, s"${c.stop} at 0x${c.stop_at}")
+    assert(logged(&c, [1, SFSR_INVTRAN, 0xFFFFFFF9]), "ran once, then INVTRAN")
+
+// The same, r5 then reading SFSR in the handler.
+later_region_sfsr(cpu: *Cpu)
+    later_region(cpu)
+    // The handler reads SFSR through r5, which the code leaves at SAU_CTRL: point its LDR at r6's
+    // neighbour instead — ldr r0, [r7] with r7 SFSR.
+    put(cpu, SECURE_AT, [0x6838, LOG_R0, MOV_R0_LR, LOG_R0, BKPT])
+    cpu.r[7] = SCB_SFSR
+
+@test("Non-secure data: a whole Non-secure page is on the Non-secure page table; a page partly Non-secure is served from RAM off it; both store and load")
+ns_data_paths()
+    // str r0, [r1]; ldr r2, [r1]; str r0, [r3]; ldr r5, [r3]
+    // bxns r6
+    var c = run_both8([0x4734], [0xABCD1234, 0x3010, 0, NS_DATA + 0x10, LOG, 0, NS_CODE], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &data_paths)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == NS_CODE + 8 && c.ns, s"${c.stop} at 0x${c.stop_at}")
+    assert(c.r[2] == 0xABCD1234 && c.r[5] == 0xABCD1234 && c.sfsr == 0, "both made")
+    assert(c.ns_pages[3] != 0 && c.ns_pages[1] == 0 && c.ns_pages[0] == 0, "page 3 whole, page 1 partly, page 0 Secure")
+
+data_paths(cpu: *Cpu)
+    faulting(cpu)
+    region(cpu, 3, 0x3000, 0x3FE0, 1)
+    put(cpu, NS_CODE, [0x6008, 0x680A, 0x6018, 0x681D, BKPT])
+
+// ---------------------------------------------------------------------------------------------------
+// Exceptions across the states.
+
+// IRQ 0 enabled and targeting Non-secure state; its Non-secure handler stores r4, LR and r7 at
+// NS_DATA: movs r1, #0x14; lsls r1, r1, #8; str r4, [r1]; mov r0, lr; str r0, [r1, #4]; mov r0, r7;
+// str r0, [r1, #8]; bx lr.
+irq_to_ns(cpu: *Cpu)
+    layout(cpu)
+    store32(cpu, NVIC_ISER, 1)
+    store32(cpu, NVIC_ITNS, 1)
+    store32(cpu, NS_VECTORS + IRQ0 * 4, (NS_CODE + 0x20) | 1)
+    put(cpu, NS_CODE + 0x20, [0x2114, 0x0209, 0x600C, 0x4670, 0x6048, 0x4638, 0x6088, 0x4770])
+
+@test("an IRQ targeting Non-secure state from Secure code: the callee registers stacked under the integrity signature and cleared, the handler on VTOR_NS, and the return restoring them")
+ns_irq_from_secure()
+    // str r6, [r5] (ISPR); isb; mov r0, r7; log; ldr r0, [r1]; log; ldr r0, [r1, #4]; log; ldr r0, [r1, #8]; log
+    val code: []const u16 = [STR_R6_R5, ISB_1, ISB_2, 0x4638, LOG_R0, 0x6808, LOG_R0, 0x6848, LOG_R0, 0x6888, LOG_R0]
+    var c = run_both8(code, [0, NS_DATA, 0, 0, LOG, NVIC_ISPR, 1, 0x77], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &irq_to_ns)
+    assert(c.stop == Stop.Breakpoint && !c.ns && c.ipsr == 0, s"${c.stop} at 0x${c.stop_at}")
+    assert(logged(&c, [0x77, 0, 0xFFFFFFD8, 0]), "r7 restored; the handler saw r4 and r7 cleared, and EXC_RETURN S=1 DCRS=0 ES=0")
+    assert(load32(&c, 0x2000 - 0x48) == 0xFEFA125B && load32(&c, 0x2000 - 0x48 + 4 * 5) == 0x77, "the signature, and r7 under the caller's frame")
+    assert(c.active == [0u64; 8] && c.r[13] == 0x2000 && c.banked.msp == NS_STACK, "both stacks back")
+
+@test("an EXC_RETURN with ES set from a Non-secure handler is SecureFault INVER")
+ns_inver()
+    var c = run_both8([STR_R6_R5, ISB_1, ISB_2], [0, 0, 0, 0, LOG, NVIC_ISPR, 1], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &inver_handler)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == SECURE_AT && c.ipsr == SECURE_FAULT && !c.ns, s"${c.stop} at 0x${c.stop_at}")
+    assert(c.sfsr == SFSR_INVER && load32(&c, NS_STACK - 8) == NS_CODE + 0x24, "INVER, from the return")
+
+// The Non-secure IRQ handler returns with ES set: movs r5, #0; subs r5, #7 (0xFFFFFFF9); bx r5. The
+// Secure handler is a BKPT: the registers it would log through were cleared on the way in.
+inver_handler(cpu: *Cpu)
+    faulting(cpu)
+    store32(cpu, NVIC_ISER, 1)
+    store32(cpu, NVIC_ITNS, 1)
+    store32(cpu, NS_VECTORS + IRQ0 * 4, (NS_CODE + 0x20) | 1)
+    // Below SecureFault, so the fault preempts the handler.
+    store32(cpu, NVIC_IPR, 0x80)
+    put(cpu, NS_CODE + 0x20, [0x2500, 0x3D07, 0x4728])
+    store16(cpu, SECURE_AT, BKPT)
+
+// The Secure SysTick every 50 cycles with its interrupt, and its handler at SECURE_AT logging LR.
+secure_tick(cpu: *Cpu)
+    layout(cpu)
+    put(cpu, NS_CODE, [0xE7FE])
+    put(cpu, SECURE_AT, [MOV_R0_LR, LOG_R0, BKPT])
+    store32(cpu, SYST_RVR, 50)
+    store32(cpu, SYST_CSR, 7)
+
+@test("the Secure SysTick preempts Non-secure code: its handler runs in Secure state, the frame on the Non-secure stack, EXC_RETURN S=0 ES=1")
+ns_secure_tick_preempts()
+    var c = run_both8([0x470C], [0, NS_CODE, 0, 0, LOG], 0, [[SYSTICK, SECURE_AT]], &secure_tick)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == SECURE_AT + 4 && !c.ns && c.ipsr == SYSTICK, s"${c.stop} at 0x${c.stop_at}")
+    assert(logged(&c, [0xFFFFFFB9]) && c.banked.msp == NS_STACK - 0x20 && load32(&c, NS_STACK - 8) == NS_CODE, "from Non-secure thread mode on MSP_NS")
+
+// The Non-secure SysTick through the alias, its handler at NS_CODE + 0x40 a BKPT.
+ns_tick_setup(cpu: *Cpu)
+    layout(cpu)
+    put(cpu, NS_CODE, [0xE7FE])
+    put(cpu, NS_CODE + 0x40, [BKPT])
+    store32(cpu, NS_VECTORS + SYSTICK * 4, (NS_CODE + 0x40) | 1)
+    store32(cpu, SYST_RVR + 0x20000, 50)
+    store32(cpu, SYST_CSR + 0x20000, 7)
+
+@test("the Non-secure SysTick, set up through the alias, counts and pends the Non-secure SysTick, taken by the Non-secure handler; the Secure one is untouched")
+ns_systick()
+    var c = run_both8([0x470C], [0, NS_CODE, 0, 0, LOG], 0, [], &ns_tick_setup)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == NS_CODE + 0x40 && c.ns && c.ipsr == SYSTICK, s"${c.stop} at 0x${c.stop_at}")
+    assert(exception_active(&c, NS_BANK + SYSTICK) && !exception_active(&c, SYSTICK) && c.r[14] == 0xFFFFFFB8, "the Non-secure copy, EXC_RETURN S=0 DCRS=1 ES=0")
+    assert(load32(&c, SYST_CSR + 0x20000) & 7 == 7 && load32(&c, SYST_CSR) & 1 == 0 && load32(&c, SYST_RVR + 0x20000) == 50, "each SysTick its own")
+
+// svc; movs r0, #7; bkpt — and the Non-secure SVCall handler at NS_CODE + 0x40: movs r5, #0x42; bx lr.
+ns_svc_setup(cpu: *Cpu)
+    layout(cpu)
+    put(cpu, NS_CODE, [SVC, 0x2007, BKPT])
+    put(cpu, NS_CODE + 0x40, [0x2542, 0x4770])
+    store32(cpu, NS_VECTORS + SVCALL * 4, (NS_CODE + 0x40) | 1)
+
+@test("SVC in Non-secure state takes the Non-secure SVCall through VTOR_NS, and returns to Non-secure code")
+ns_svc()
+    var c = run_both8([0x470C], [0, NS_CODE, 0, 0, LOG], 0, [[SVCALL, FAULT_AT]], &ns_svc_setup)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == NS_CODE + 4 && c.ns && c.ipsr == 0, s"${c.stop} at 0x${c.stop_at}")
+    assert(c.r[5] == 0x42 && c.r[0] == 7 && c.active == [0u64; 8], "the handler ran and returned")
+
+// PRIMASK_NS set; IRQ 0 Secure, at priority 0x40, enabled.
+masked_irq(cpu: *Cpu)
+    secure(cpu)
+    store32(cpu, NVIC_ISER, 1)
+    store32(cpu, NVIC_IPR, 0x40)
+    store16(cpu, 0x0300, 0x4770)
+
+@test("PRIMASK_NS raises the execution priority for both states: a Secure IRQ waits until it is cleared")
+ns_primask_masks_secure()
+    // msr primask_ns, r2; str r6, [r5]; isb; movs r0, #1; log; msr primask_ns, r3; isb; movs r0, #2; log
+    val code: []const u16 = [0xF382, 0x8890, STR_R6_R5, ISB_1, ISB_2, 0x2001, LOG_R0, 0xF383, 0x8890, ISB_1, ISB_2, 0x2002, LOG_R0]
+    var c = run_both8(code, [0, 0, 1, 0, LOG, NVIC_ISPR, 1], 0, [[IRQ0, 0x0300]], &masked_irq)
+    assert(c.stop == Stop.Breakpoint && logged(&c, [1, 2]), "both logged")
+    assert(c.pending == [0u64; 8], "taken once unmasked")
+    c = run_both8(code[0..<7], [0, 0, 1, 0, LOG, NVIC_ISPR, 1], 0, [[IRQ0, 0x0300]], &masked_irq)
+    assert(exception_pending(&c, IRQ0), "still pending while PRIMASK_NS is set")
+
+// ---------------------------------------------------------------------------------------------------
+// The Non-secure view of the system control space.
+
+@test("Non-secure state's system control space: its own VTOR, the alias and the SAU reading zero to it; Secure state's view through the alias is the same register")
+ns_view()
+    // In Non-secure state: ldr r0, [r5]; ldr r2, [r6]; ldr r3, [r7]
+    var c = run_both8([0x470C], [0, NS_CODE, 0, 0, LOG, SCB_VTOR, VTOR_NS_ALIAS, SAU_CTRL], 0, [], &ns_view_code)
+    assert(c.stop == Stop.Breakpoint && c.ns, s"${c.stop} at 0x${c.stop_at}")
+    assert(c.r[0] == NS_VECTORS && c.r[2] == 0 && c.r[3] == 0, s"0x${c.r[0]} 0x${c.r[2]} 0x${c.r[3]}")
+    assert(c.banked.vtor == VECTORS && load32(&c, VTOR_NS_ALIAS) == NS_VECTORS, "the Secure VTOR is the bank's; the alias names the Non-secure one")
+
+ns_view_code(cpu: *Cpu)
+    layout(cpu)
+    put(cpu, NS_CODE, [0x6828, 0x6832, 0x683B, BKPT])
+
+@test("NVIC_ITNS: Secure-only, the implemented IRQs' bits; the Non-secure view of ISER sees only the IRQs that target Non-secure state")
+ns_itns()
+    var c = secure_core()
+    store32(&c, NVIC_ITNS, 0xFFFFFFFF)
+    assert(load32(&c, NVIC_ITNS) & 0xF == 0xF && c.trustzone, "the implemented IRQs' bits")
+    store32(&c, NVIC_ITNS, 0x5)
+    store32(&c, NVIC_ISER, 0xF)
+    assert(load32(&c, NVIC_ISER + 0x20000) == 0x5, "ISER_NS")
+    store32(&c, NVIC_ICER + 0x20000, 0xF)
+    assert(load32(&c, NVIC_ISER) == 0xA, "ICER_NS clears only its own")
+    assert(load32(&c, NVIC_ITNS + 0x20000) == 0, "ITNS reads zero through the alias")
+
+// ---------------------------------------------------------------------------------------------------
+// Refused by name.
+
+fp_active(cpu: *Cpu)
+    layout(cpu)
+    cpu.fpu = Fpu.Single
+    cpu.control = 4
+
+@test("VLSTM and VLLDM around a Non-secure call: NOPs in Secure state with no floating-point context, refused by name with one, undefined in Non-secure state")
+ns_vlstm()
+    // vlstm sp; vlldm sp
+    val code: []const u16 = [0xEC2D, 0x0A00, 0xEC3D, 0x0A00]
+    var c = run_both8(code, [], 0, [], &secure)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 8 && c.retired == 2 && c.r[13] == 0x2000, "two NOPs")
+    c = run_both8(code, [], 0, [], &fp_active)
+    assert(c.stop == Stop.NonSecure && c.transition == Transition.FpContext && c.stop_at == 0 && c.pc == 0, "with FPCA")
+    c = run_both8([0x470C], [0, NS_CODE], 0, [], &vlstm_in_ns)
+    assert(c.stop == Stop.Undefined && c.stop_at == NS_CODE && c.ns, "in Non-secure state")
+    c = run_both8([0xEC2F, 0x0A00], [], 0, [], &secure)
+    assert(c.stop == Stop.Undefined && c.stop_at == 0, "Rn PC")
+
+vlstm_in_ns(cpu: *Cpu)
+    layout(cpu)
+    put(cpu, NS_CODE, [0xEC2D, 0x0A00])
+
+@test("a change of state with a floating-point context active, AIRCR.BFHFNMINS or PRIS set, a Non-secure PRIGROUP of its own, and the floating-point registers' Non-secure view each stop at NonSecure by name")
+ns_refused()
+    var c = run_both8([0x470C], [0, NS_CODE], 0, [], &fp_active)
+    assert(c.stop == Stop.NonSecure && c.transition == Transition.FpContext && c.stop_at == 0 && c.pc == 0 && !c.ns, "BXNS with FPCA")
+    // str r0, [r1]
+    c = run_both8([0x6008], [0x05FA2000, SCB_AIRCR], 0, [], &secure)
+    assert(c.stop == Stop.NonSecure && c.transition == Transition.Aircr && c.stop_at == SCB_AIRCR, "BFHFNMINS")
+    c = run_both8([0x6008], [0x05FA4000, SCB_AIRCR], 0, [], &secure)
+    assert(c.stop == Stop.NonSecure && c.transition == Transition.Aircr, "PRIS")
+    c = run_both8([0x6008], [0x05FA0300, SCB_AIRCR + 0x20000], 0, [], &secure)
+    assert(c.stop == Stop.NonSecure && c.transition == Transition.PrigroupNs, "PRIGROUP_NS")
+    c = run_both8([0x6808], [0, FP_FPCCR + 0x20000], 0, [], &secure)
+    assert(c.stop == Stop.NonSecure && c.transition == Transition.NsFpRegister, "FPCCR_NS")
+    // The same PRIGROUP, and SYSRESETREQS, are taken.
+    c = run_both8([0x6008], [0x05FA0008, SCB_AIRCR], 0, [], &secure)
+    assert(c.stop == Stop.Breakpoint && load32(&c, SCB_AIRCR) & 8 == 8, "SYSRESETREQS")

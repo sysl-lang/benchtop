@@ -7,6 +7,7 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "pico/bootrom.h"
+#include "pico/runtime_init.h"
 #include "hardware/flash.h"
 #include "hardware/resets.h"
 #include "hardware/watchdog.h"
@@ -28,9 +29,12 @@ static void print_boot_info(const char *when) {
 }
 
 // Where the ROM's PC/SP reboot lands, on the stack it was given: BOOT_INFO now says PC_SP. The
-// watchdog's reset has put the peripherals back in reset and crt0 has not run again, so the UART's
+// watchdog's reset has put the peripherals and the clocks back to power-on, and crt0 has not run again,
+// so the clocks are set up again (clk_peri, which times the UART, is off until they are) and the UART's
 // blocks come out of reset here.
 static void rebooted(void) {
+    unreset_block_wait(RESETS_RESET_PLL_SYS_BITS | RESETS_RESET_PLL_USB_BITS);
+    runtime_init_clocks();
     unreset_block_wait(RESETS_RESET_IO_BANK0_BITS | RESETS_RESET_PADS_BANK0_BITS | RESETS_RESET_UART0_BITS |
                        RESETS_RESET_TIMER0_BITS);
     stdio_init_all();

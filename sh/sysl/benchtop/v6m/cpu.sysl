@@ -129,6 +129,12 @@ struct Memory
     // condition's (`h_pred`), which runs this one when the condition holds. Read for no other record.
     predicated: [2621442]Handler
     predicated_own: [2621442]Handler
+    // Each core's records, predicated handlers and page table for Non-secure state, made the first
+    // time a core of the memory enters it (t2nonsecure.sysl); a change a board makes to the code
+    // forgets these records too (`forget_decoded`).
+    ns_decoded: [2]*Insn
+    ns_predicated: [2]*Handler
+    ns_page_table: [2]*usize
 
     @inline
     ram_offset(*self, a: u32, width: u32) -> u32
@@ -212,7 +218,7 @@ end Memory
 memory() -> &sync Memory =
     Memory(0, RAM_BYTES, 0x10000000, 0, [RamBank(0, 0, 0); 7], 0, 0, [0; 1048576], [0; 4194304], [0; 1048576], [0; 16384], [0; 16384], [0; 16],
         [[0; 16384]; 2], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442],
-        [null; 2621442], [null; 2621442])
+        [null; 2621442], [null; 2621442], [null; 2], [null; 2], [null; 2])
 
 
 // One page-table entry per 4 KB page of the 4 GB address space. An entry is the host address of the
@@ -275,37 +281,36 @@ enum Stop
     // entry the address it would have returned to; nothing was stored. Where the fault can be taken it
     // is: the UsageFault STKOF, or HardFault (t2system.sysl).
     StackLimit
-    // A core with the Security Extension, which benchtop runs Secure-only, was asked to go to
-    // Non-secure state, which is not modelled: `Cpu.transition` says how. `stop_at` is the instruction
-    // (for an access to a Non-secure alias, the address); nothing of it was done.
+    // A core with the Security Extension was asked for a part of it that is not modelled:
+    // `Cpu.transition` says which. `stop_at` is the instruction (for a register access, the address);
+    // nothing of it was done.
     NonSecure
 
-/** How a Secure-only core was asked to reach Non-secure state (`Stop.NonSecure`). */
+/** The part of the Security Extension a core stopped at `Stop.NonSecure` was asked for. */
 enum Transition: u8
     None = 0
-    // `BXNS` to an address with bit 0 clear.
-    Bxns
-    // `BLXNS` to an address with bit 0 clear: a Non-secure function call.
-    Blxns
-    // An EXC_RETURN with S clear: a return to the Non-secure stack and state.
-    ReturnNonSecure
-    // An EXC_RETURN with DCRS clear: only an exception taken from Secure state to Non-secure state
-    // stacks the callee registers that would unstack.
-    ReturnCallee
-    // A load or store to the Non-secure alias of the private peripheral bus (0xE002_0000).
+    // A load or store to the Non-secure alias of the private peripheral bus (0xE002_0000) outside its
+    // system control space.
     PpbAlias
-    // `MRS` or `MSR` of a Non-secure register (`MSP_NS`, `CONTROL_NS`, …).
-    NsRegister
+    // A change of security state with a floating-point context active (CONTROL.FPCA): lazy
+    // preservation across the states and CONTROL_S.SFPA are not modelled.
+    FpContext
+    // AIRCR.BFHFNMINS or AIRCR.PRIS written 1: HardFault, NMI and BusFault targeting Non-secure
+    // state, and the Non-secure priorities' remapping.
+    Aircr
+    // AIRCR_NS written with a PRIGROUP other than the Secure one: one grouping serves both states.
+    PrigroupNs
+    // The floating-point registers' Non-secure view (FPCCR, FPCAR, FPDSCR).
+    NsFpRegister
 
 /** What a stop for `Stop.NonSecure` says, as a person reads it. */
 transition_name(t: Transition) -> string = t match
     None -> "nothing"
-    Bxns -> "BXNS to a Non-secure address"
-    Blxns -> "BLXNS, a call to Non-secure code"
-    ReturnNonSecure -> "an exception return to Non-secure state"
-    ReturnCallee -> "an exception return with the callee registers stacked (DCRS clear)"
-    PpbAlias -> "an access to the Non-secure alias of the private peripheral bus"
-    NsRegister -> "MRS or MSR of a Non-secure register"
+    PpbAlias -> "an access to the Non-secure alias of the private peripheral bus outside the system control space is not modelled"
+    FpContext -> "a change of security state with a floating-point context active (CONTROL.FPCA) is not modelled"
+    Aircr -> "AIRCR.BFHFNMINS or AIRCR.PRIS set is not modelled"
+    PrigroupNs -> "a Non-secure PRIGROUP other than the Secure one is not modelled"
+    NsFpRegister -> "the floating-point registers' Non-secure view is not modelled"
 
 // The selected core model; `MODELS` (models.sysl) says what each one is. Four are named after the
 // architecture benchtop first modelled with them: `V6m` is the Cortex-M0+, `V8mMain` the Cortex-M33,
@@ -478,12 +483,10 @@ struct Cpu
     sau_rnr: u32
     sau_rbar: [SAU_REGIONS]u32
     sau_rlar: [SAU_REGIONS]u32
-    // A Secure-only core's other security state (t2secure.sysl): NSACR and the Non-secure CPACR,
-    // stored; the IDAU's one region the board gives it; and the MPU's registers, stored, which `TT`
-    // reads (MPU_CTRL, MPU_RNR, each region's MPU_RBAR and MPU_RLAR, MAIR0 and MAIR1).
+    // NSACR and SCR; the IDAU's one region the board gives the core; and the MPU's registers, stored,
+    // which `TT` reads (MPU_CTRL, MPU_RNR, each region's MPU_RBAR and MPU_RLAR, MAIR0 and MAIR1).
     nsacr: u32
     scr: u32
-    cpacr_ns: u32
     idau: IdauRegion
     mpu_ctrl: u32
     mpu_rnr: u32
@@ -503,6 +506,42 @@ struct Cpu
     sfar: u32
     // Why the core stopped at `NonSecure`.
     transition: Transition
+    // The Security Extension's two states (t2nonsecure.sysl). `ns`: the core runs in Non-secure state.
+    // Every banked register above (the stack pointers and their limits, CONTROL, the masks, VTOR, CCR,
+    // CPACR, SCR and the MPU) is the current state's copy, and `banked` holds the other state's.
+    // `trustzone`: Non-secure state has been entered or configured, so priorities and the masks read
+    // both banks. The records, the predicated handlers and the page table the core uses in Non-secure
+    // state are its own (`ns_records`, `ns_predicated`, `ns_pages`, null until first needed), and while
+    // it runs there the Secure ones wait in `secure_records` and `secure_predicated`.
+    ns: bool
+    trustzone: bool
+    banked: Bank
+    ns_records: *Insn
+    ns_predicated: *Handler
+    ns_pages: *usize
+    // The Non-secure records hold this reset's "not decoded" (`prepare_ns`).
+    ns_ready: bool
+    secure_records: *Insn
+    secure_predicated: *Handler
+    // The SAU or a page's mapping has changed since the Non-secure page table and the records'
+    // attribution were last made (`refresh_attribution`).
+    attribution_stale: bool
+    // The lowest and highest address the SAU may make Non-secure, so a Secure-state decode outside
+    // them asks nothing more (`attribution_record`); made again when `ns_bounds_valid` is clear.
+    ns_bounds: [2]u32
+    ns_bounds_valid: bool
+    // A data access the instruction made was refused by attribution: SecureFault AUVIOL is pending, and
+    // the instruction stops without completing (`load`, `store`).
+    access_faulted: bool
+    // NVIC_ITNS: an IRQ's bit set targets Non-secure state.
+    itns: [16]u32
+    // The Non-secure CFSR's MemManage and UsageFault bytes, and AIRCR's Secure-only fields as written
+    // (SYSRESETREQS; BFHFNMINS and PRIS are refused set).
+    cfsr_ns: u32
+    aircr_secure: u32
+    // The Non-secure SysTick, which counts while either state runs: swapped into the `tick_*` fields
+    // to be read, written or brought up to the clock (`ns_tick`).
+    ns_tick: Tick
 
 const LINE_CODE: u8 = 1
 const LINE_WATCHED: u8 = 2
@@ -574,6 +613,7 @@ clear(cpu: *Cpu, entry: u32)
     cpu.cpacr = 0
     cpu.coprocessors = 0
     cpu.security = false
+    clear_non_secure(cpu)
     cpu.events = false
     cpu.event = false
     cpu.on_event = false
@@ -659,6 +699,7 @@ halt(cpu: *Cpu, why: Stop, at: u32)
 stop_access(cpu: *Cpu, ip: *Insn, n: u64)
     cpu.pc = addr_of(cpu, ip)
     cpu.retired = n
+    cpu.access_faulted = false
 
 // The decode of the record at `ip`, `n` retired before it, stopped the core: a fetch of its bytes
 // went to the bus, which refused it (an XIP_SRAM line not pinned, the flash in direct mode). The core
@@ -815,6 +856,11 @@ private drop_records(cpu: *Cpu, a: u32, width: u32)
 
     for i in first..(last_reached(cpu, a, width) >> 1) do if cpu.dec[i].op != Op.Undecoded then cpu.dec[i] = undecoded()
 
+    // The other security state's records read the same bytes.
+    if cpu.ns_records == null then return
+    val other = if cpu.ns then cpu.secure_records else cpu.ns_records
+    for i in first..(last_reached(cpu, a, width) >> 1) do if other[i].op != Op.Undecoded then other[i] = undecoded()
+
 /** Forget the core's own records on every line the other core has posted since the last time, so a
  * record of code the other core has written is decoded afresh. The core's own thread calls it, at a
  * barrier and between runs.
@@ -908,10 +954,12 @@ store_page(cpu: *Cpu, a: u32, width: u32) -> usize
 // The slow path of a read, `width` bytes at `a`.
 slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
     if a >= SCS && a < PPB_NS_END then return ppb_read(cpu, a, width, n)
+    if cpu.ns then return ns_read(cpu, a, width, n)
 
     cpu.bus.read(cpu, a, width, n)
 
 slow_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if cpu.ns && !(a >= SCS && a < PPB_NS_END) then return ns_write(cpu, a, width, x, n)
     if cpu.mem.flash_overlaps(a, width)
         halt(cpu, Stop.Fault, a)
         return
@@ -927,23 +975,16 @@ slow_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
 // Kept out of the slow paths above so that they stay small enough for the accesses' fast paths to
 // take them in.
 ppb_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if cpu.ns then return ns_ppb_read(cpu, a, width, n)
     if a < SCS_END then return scs_read(cpu, a, width, n)
-
-    if cpu.security && a >= PPB_NS
-        if width == 4
-            ns_alias_read(cpu, a) match
-                Some(v) -> return v
-                None -> ()
-        non_secure(cpu, Transition.PpbAlias, a)
-        return 0
+    if cpu.security && a >= PPB_NS then return alias_read(cpu, a, width, n)
 
     cpu.bus.read(cpu, a, width, n)
 
 ppb_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if cpu.ns then return ns_ppb_write(cpu, a, width, x, n)
     if a < SCS_END then return scs_write(cpu, a, width, x, n)
-    if cpu.security && a >= PPB_NS
-        if width == 4 && ns_alias_write(cpu, a, x) then return
-        return non_secure(cpu, Transition.PpbAlias, a)
+    if cpu.security && a >= PPB_NS then return alias_write(cpu, a, width, x, n)
 
     cpu.bus.write(cpu, a, width, x, n)
 
@@ -990,28 +1031,37 @@ low_bytes(x: u32, width: u32) -> u32 = if width == 4 then x else x & ((1 << (wid
 load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
     val page = page_for(cpu, a, width)
 
-    if page == 0
-        val x = slow_read(cpu, a, width, n)
-
-        if cpu.stop != Stop.Running then return false
-
-        into[0] = x
-        return true
+    if page == 0 then return slow_load(cpu, a, width, n, into)
 
     into[0] = host_read(page, a, width)
+    true
+
+// The slow path of `load`, kept out of line so the fast path inlined into each handler stays small. A
+// SecureFault the access took (`access_faulted`) does not complete it, as a stop does not.
+@noinline
+slow_load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
+    val x = slow_read(cpu, a, width, n)
+
+    if cpu.stop != Stop.Running || cpu.access_faulted then return false
+
+    into[0] = x
     true
 
 @inline
 store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
     val page = store_page(cpu, a, width)
 
-    if page == 0
-        slow_write(cpu, a, width, low_bytes(x, width), n)
-        return cpu.stop == Stop.Running
+    if page == 0 then return slow_store(cpu, a, x, width, n)
 
     host_write(page, a, width, x)
     stored(cpu, a, width)
     true
+
+// The slow path of `store`, out of line as `slow_load` is.
+@noinline
+slow_store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
+    slow_write(cpu, a, width, low_bytes(x, width), n)
+    cpu.stop == Stop.Running && !cpu.access_faulted
 
 // The same accesses where nothing stops on them: the exception model's stacking and the host's own.
 @inline
@@ -1058,17 +1108,19 @@ write16(cpu: *Cpu, a: u32, x: u32, n: u64) = write(cpu, a, 2, x, n)
 @inline
 write8(cpu: *Cpu, a: u32, x: u32, n: u64) = write(cpu, a, 1, x, n)
 
-load32(cpu: *Cpu, a: u32) -> u32 = read32(cpu, a, cpu.retired)
+// The host's own accesses see the memory as Secure state does, whichever state the core is in
+// (t2nonsecure.sysl): a Non-secure core's attribution checks are for its guest's accesses alone.
+load32(cpu: *Cpu, a: u32) -> u32 = if cpu.ns then secure_view_read(cpu, a, 4) else read32(cpu, a, cpu.retired)
 
-load16(cpu: *Cpu, a: u32) -> u32 = read16(cpu, a, cpu.retired)
+load16(cpu: *Cpu, a: u32) -> u32 = if cpu.ns then secure_view_read(cpu, a, 2) else read16(cpu, a, cpu.retired)
 
-load8(cpu: *Cpu, a: u32) -> u32 = read8(cpu, a, cpu.retired)
+load8(cpu: *Cpu, a: u32) -> u32 = if cpu.ns then secure_view_read(cpu, a, 1) else read8(cpu, a, cpu.retired)
 
-store32(cpu: *Cpu, a: u32, x: u32) = write32(cpu, a, x, cpu.retired)
+store32(cpu: *Cpu, a: u32, x: u32) = if cpu.ns then secure_view_write(cpu, a, 4, x) else write32(cpu, a, x, cpu.retired)
 
-store16(cpu: *Cpu, a: u32, x: u32) = write16(cpu, a, x, cpu.retired)
+store16(cpu: *Cpu, a: u32, x: u32) = if cpu.ns then secure_view_write(cpu, a, 2, x) else write16(cpu, a, x, cpu.retired)
 
-store8(cpu: *Cpu, a: u32, x: u32) = write8(cpu, a, x, cpu.retired)
+store8(cpu: *Cpu, a: u32, x: u32) = if cpu.ns then secure_view_write(cpu, a, 1, x) else write8(cpu, a, x, cpu.retired)
 
 // ---------------------------------------------------------------------------------------------------
 // Flags.
@@ -1260,6 +1312,11 @@ private forget_decoded(mem: &sync Memory, from: u32, end: u32)
         if mem.decoded_own[i].op != Op.Undecoded
             mem.decoded_own[i].h = &h_decode
             mem.decoded_own[i].op = Op.Undecoded
+        for k in 0..<2
+            val ns = mem.ns_decoded[k]
+            if ns != null && ns[i].op != Op.Undecoded
+                ns[i].h = &h_decode
+                ns[i].op = Op.Undecoded
 
 /** A DMA/device bus write made on this core's host thread, to RAM only: it never enters MMIO or
  * faults the CPU, and answers whether it was made. The store's own bookkeeping invalidates decoded

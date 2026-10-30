@@ -1,21 +1,15 @@
 module sh.sysl.benchtop.v6m
 
-// The Security Extension as a Secure-only core has it (ARMv8-M ARM, DDI0553: "The Security
-// Extension", "Security attribution", "TT, TTT, TTA, TTAT", "Stack limit checks", "Fault
-// handling"), and the faults ARMv8-M Mainline takes rather than stops at.
+// The Security Extension's Secure side (ARMv8-M ARM, DDI0553: "The Security Extension", "Security
+// attribution", "TT, TTT, TTA, TTAT", "Stack limit checks", "Fault handling"), and the faults ARMv8-M
+// Mainline takes rather than stops at. Non-secure state is t2nonsecure.sysl's.
 //
-// **Secure-only.** A core with `Cpu.security` resets into Secure state and never leaves it, so each
-// banked register the core has (MSP, PSP, the limits, CONTROL, the masks, VTOR, SysTick, the SCB) is
-// the Secure copy, and every exception targets Secure state. What would take the core to Non-secure
-// state stops it at `NonSecure`, naming the way (`Transition`): `BXNS` or `BLXNS` to an address with
-// bit 0 clear, an EXC_RETURN naming the Non-secure stack or the callee-stacked frame, `MRS`/`MSR` of a
-// `_NS` register, and an access to the private peripheral bus's Non-secure alias. `SG` is a `NOP` in
-// Secure state, as the architecture has it, so it runs.
+// A core with `Cpu.security` resets into Secure state. `SG` is a `NOP` in Secure state, as the
+// architecture has it.
 //
-// **The SAU** (`SAU_CTRL`, `SAU_TYPE`, `SAU_RNR`, `SAU_RBAR`, `SAU_RLAR`; `regs/m33.h`, M33_SAU_*) is
-// stored, with the M33's eight regions, and `TT` answers from it. Its reset state, disabled with ALLNS
-// clear, makes every address Secure, which is what the SDK runs under. Executing from an address the
-// SAU marks Non-secure (SecureFault INVTRAN) is not detected.
+// **The SAU** (`SAU_CTRL`, `SAU_TYPE`, `SAU_RNR`, `SAU_RBAR`, `SAU_RLAR`; `regs/m33.h`, M33_SAU_*) has
+// the M33's eight regions; `TT` answers from it and the core enforces it (t2nonsecure.sysl). Its reset
+// state, disabled with ALLNS clear, makes every address Secure, which is what the SDK runs under.
 //
 // **The IDAU** is the board's: at most one region that reports a number (`Cpu.idau`), Secure
 // Non-secure-callable, which outranks the SAU's Non-secure; every other address is exempt or left to
@@ -23,16 +17,16 @@ module sh.sysl.benchtop.v6m
 // boot ROM's start-up checks `TT` of both answers).
 //
 // **The MPU** (`MPU_TYPE`, `MPU_CTRL`, `MPU_RNR`, `MPU_RBAR`, `MPU_RLAR` and their three aliases,
-// `MAIR0`, `MAIR1`; `regs/m33.h`, M33_MPU_*) is stored, with the M33's eight regions, and `TT` answers
-// MREGION, MRVALID and the R and RW permissions from it. It is not enforced: an access its regions
-// forbid is made, where silicon takes a MemManage fault. `NSACR` and the Non-secure alias's `CPACR`
-// (0xE002ED88) are stored; the rest of the alias stops the core at `NonSecure`, as before.
+// `MAIR0`, `MAIR1`; `regs/m33.h`, M33_MPU_*) is stored, with the M33's eight regions per state, and
+// `TT` answers MREGION, MRVALID and the R and RW permissions from it. It is not enforced: an access its
+// regions forbid is made, where silicon takes a MemManage fault. `NSACR` and NVIC_ITNS are stored.
 //
 // **Faults taken.** A stack-limit violation is the UsageFault STKOF, and an EXC_RETURN whose ES bit
-// names a Non-secure exception is the UsageFault INVPC: each is recorded in CFSR and taken where
-// SHCSR enables it and its priority preempts, escalated to HardFault (HFSR.FORCED) where it does not,
-// and a lockup — a stop — where not even HardFault would preempt. SecureFault (exception 7) has its
-// enable, its priority in SHPR1 and its status in SFSR and SFAR; software pends it through SHCSR.
+// names a Non-secure exception from Secure state is the UsageFault INVPC: each is recorded in the
+// state's CFSR and taken where SHCSR enables it and its priority preempts, escalated to HardFault
+// (HFSR.FORCED) where it does not, and a lockup — a stop — where not even HardFault would preempt.
+// SecureFault (exception 7) has its enable, its priority in SHPR1 and its status in SFSR and SFAR;
+// software pends it through SHCSR.
 
 /** The SAU regions the M33 on the RP2350 has (M33_SAU_TYPE_SREGION_RESET). */
 const SAU_REGIONS: u32 = 8
@@ -107,7 +101,6 @@ clear_security(cpu: *Cpu)
     cpu.transition = Transition.None
     cpu.nsacr = 0
     cpu.scr = 0
-    cpu.cpacr_ns = 0
     cpu.idau = NO_IDAU
     cpu.mpu_ctrl = 0
     cpu.mpu_rnr = 0
@@ -129,7 +122,7 @@ fault(cpu: *Cpu, e: u32, at: u32, lockup: Stop)
     val running = running_priority(cpu, true)
     var to = e
 
-    if is_baseline(cpu.kind) || (cpu.enabled[0] >> e) & 1 == 0 || group(cpu, priority(cpu, e)) >= running
+    if is_baseline(cpu.kind) || !fault_enabled(cpu, e) || group(cpu, priority(cpu, e)) >= running
         if running <= -1
             halt(cpu, lockup, at)
             return
@@ -151,27 +144,28 @@ overflow_ignored(cpu: *Cpu, priority: int) -> bool = cpu.ccr & CCR_STKOFHFNMIGN 
 stack_overflow(cpu: *Cpu, at: u32) -> bool
     if overflow_ignored(cpu, running_priority(cpu, true)) then return false
 
-    cpu.cfsr |= CFSR_STKOF
-    fault(cpu, USAGE_FAULT, at, Stop.StackLimit)
+    usage_fault(cpu, CFSR_STKOF, at, Stop.StackLimit)
     true
 
 // The fault an exception entry whose frame would go below the stack's limit derives, judged against
-// the priority the core ran at before the entry: the UsageFault STKOF where it is enabled and would
-// preempt, HardFault where only that would; -1 for a lockup.
+// the priority the core ran at before the entry: the UsageFault STKOF of the state whose stack it is,
+// where it is enabled and would preempt, HardFault where only that would; -1 for a lockup.
 derived_overflow(cpu: *Cpu) -> int
     val running = running_priority(cpu, true)
+    val uf = in_state(cpu, USAGE_FAULT)
 
-    cpu.cfsr |= CFSR_STKOF
+    if cpu.ns then cpu.cfsr_ns |= CFSR_STKOF else cpu.cfsr |= CFSR_STKOF
 
-    if !is_baseline(cpu.kind) && (cpu.enabled[0] >> USAGE_FAULT) & 1 != 0 && group(cpu, priority(cpu, USAGE_FAULT)) < running
-        return int(USAGE_FAULT)
+    if !is_baseline(cpu.kind) && fault_enabled(cpu, uf) && group(cpu, priority(cpu, uf)) < running
+        return int(uf)
 
     if running <= -1 then return -1
 
     if !is_baseline(cpu.kind) then cpu.hfsr |= HFSR_FORCED
     int(HARD_FAULT)
 
-// Stop at `NonSecure` on the instruction at `at`, having been asked for Non-secure state by `t`.
+// Stop at `NonSecure` on the instruction (or access) at `at`, having been asked by `t` for something of
+// the Security Extension that is not modelled.
 @cold
 non_secure(cpu: *Cpu, t: Transition, at: u32)
     if cpu.stop != Stop.Running then return
@@ -240,6 +234,7 @@ secure_read(cpu: *Cpu, a: u32) -> Option[u32]
             if a >= MPU_RBAR && a <= MPU_RLAR_A3
                 val (k, limit) = mpu_region_register(cpu, a)
                 return Some(if limit then cpu.mpu_rlar[k] else cpu.mpu_rbar[k])
+            if a >= NVIC_ITNS && a < NVIC_ITNS + 64 then return Some(cpu.itns[usize((a - NVIC_ITNS) / 4)] & itns_mask(cpu, (a - NVIC_ITNS) / 4))
             None
 
 // The same, written; whether `a` is one of them.
@@ -247,7 +242,9 @@ secure_write(cpu: *Cpu, a: u32, x: u32) -> bool
     if !cpu.security then return false
 
     a match
-        SAU_CTRL -> cpu.sau_ctrl = x & 3
+        SAU_CTRL ->
+            cpu.sau_ctrl = x & 3
+            cpu.attribution_stale = true
         // The region count is fixed.
         SAU_TYPE -> ()
         SAU_RNR -> cpu.sau_rnr = x & 0xFF
@@ -256,10 +253,15 @@ secure_write(cpu: *Cpu, a: u32, x: u32) -> bool
                 halt(cpu, Stop.Unmapped, a)
                 return true
             if a == SAU_RBAR then cpu.sau_rbar[cpu.sau_rnr] = x & 0xFFFFFFE0 else cpu.sau_rlar[cpu.sau_rnr] = x & 0xFFFFFFE3
+            cpu.attribution_stale = true
         // Write one to clear.
         SCB_SFSR -> cpu.sfsr &= ~(x & 0xFF)
         SCB_SFAR -> cpu.sfar = x
-        SCB_NSACR -> cpu.nsacr = x & NSACR_BITS
+        SCB_NSACR ->
+            cpu.nsacr = x & NSACR_BITS
+            // The Non-secure CPACR's fields NSACR no longer gives read as zero.
+            if cpu.ns then cpu.cpacr &= nsacr_access(cpu) else cpu.banked.cpacr &= nsacr_access(cpu)
+            cpu.fp_ready = false
         SCB_SCR -> cpu.scr = x & SCR_BITS
         // The region count is fixed.
         MPU_TYPE -> ()
@@ -269,28 +271,27 @@ secure_write(cpu: *Cpu, a: u32, x: u32) -> bool
         MPU_MAIR0 -> cpu.mpu_mair[0] = x
         MPU_MAIR1 -> cpu.mpu_mair[1] = x
         _ ->
+            if a >= NVIC_ITNS && a < NVIC_ITNS + 64
+                val k = (a - NVIC_ITNS) / 4
+                cpu.itns[usize(k)] = x & itns_mask(cpu, k)
+                if x != 0 then cpu.trustzone = true
+                return true
             if a < MPU_RBAR || a > MPU_RLAR_A3 then return false
             val (k, limit) = mpu_region_register(cpu, a)
             if limit then cpu.mpu_rlar[k] = x & MPU_RLAR_BITS else cpu.mpu_rbar[k] = x
     true
+
+// The implemented IRQs of NVIC_ITNS word `k`.
+private itns_mask(cpu: *Cpu, k: u32) -> u32
+    val first = k * 32
+    if first >= cpu.nvic_irqs then return 0
+    if cpu.nvic_irqs - first >= 32 then 0xFFFFFFFF else (1u32 << (cpu.nvic_irqs - first)) - 1
 
 // The region an MPU_RBAR or MPU_RLAR, or one of their aliases, names (alias n is region RNR + n, in
 // the three bits RNR has), and whether it is the limit register.
 mpu_region_register(cpu: *Cpu, a: u32) -> (usize, bool)
     val word = (a - MPU_RBAR) / 4
     (usize((cpu.mpu_rnr + word / 2) & (MPU_REGIONS - 1)), word & 1 != 0)
-
-// The private peripheral bus's Non-secure alias, which a Secure-only core reaches for the registers
-// Non-secure state would use: CPACR's, stored. None for any other address there, which stops the core.
-ns_alias_read(cpu: *Cpu, a: u32) -> Option[u32] = if a == CPACR_NS then Some(cpu.cpacr_ns) else None
-
-ns_alias_write(cpu: *Cpu, a: u32, x: u32) -> bool
-    if a != CPACR_NS then return false
-    // As the Secure CPACR keeps it: CP10 and CP11 where there is an FPU, and the board's coprocessors.
-    var keep: u32 = if cpu.fpu != Fpu.Absent then 0x00F00000 else 0
-    for i in 0u32..<8 do if cpu.coprocessors & (1 << i) != 0 then keep |= 3 << (2 * i)
-    cpu.cpacr_ns = x & keep
-    true
 
 // ---------------------------------------------------------------------------------------------------
 // Security attribution and TT.
@@ -300,14 +301,16 @@ ns_alias_write(cpu: *Cpu, a: u32, x: u32) -> bool
 struct Attribution
     non_secure: bool
     region: int
+    // The region is Non-secure callable.
+    nsc: bool
 
 // The SAU's attribution of `a` ("SecurityCheck"): the private peripheral bus is exempt and Secure
 // here; with the SAU disabled, ALLNS decides for every address; enabled, an address in exactly one
 // enabled region is Non-secure (Secure where the region is Non-secure callable), and any other Secure,
 // with no region.
 attribution(cpu: *Cpu, a: u32) -> Attribution
-    if a >= PPB && a < PPB_END then return Attribution(false, -1)
-    if cpu.sau_ctrl & 1 == 0 then return Attribution(cpu.sau_ctrl & 2 != 0, -1)
+    if a >= PPB && a < PPB_END then return Attribution(false, -1, false)
+    if cpu.sau_ctrl & 1 == 0 then return Attribution(cpu.sau_ctrl & 2 != 0, -1, false)
 
     var hit = -1
     var hits = 0
@@ -319,37 +322,49 @@ attribution(cpu: *Cpu, a: u32) -> Attribution
             hit = int(k)
             hits += 1
 
-    if hits != 1 then return Attribution(false, -1)
+    if hits != 1 then return Attribution(false, -1, false)
 
-    Attribution(cpu.sau_rlar[usize(hit)] & 2 == 0, hit)
+    val nsc = cpu.sau_rlar[usize(hit)] & 2 != 0
+    Attribution(!nsc, hit, nsc)
 
-/** `TT`'s answer for `a` from a Secure core: `alt` for TTA and TTAT, which ask about the Non-secure
+/** `TT`'s answer for `a`: `alt` for TTA and TTAT, which from Secure state ask about the Non-secure
  * domain, `unprivileged` for TTT and TTAT. S, SRVALID and SREGION come from the SAU, IRVALID and
  * IREGION from the IDAU, whose Non-secure-callable region makes an address Secure whatever the SAU
- * says. The MPU fields are answered where the TT was privileged or asks about the other domain: with
- * the MPU enabled, the one region holding `a` gives MREGION and its AP field R and RW, and an address
- * no region holds has the default map where PRIVDEFENA lets a privileged query use it, and no access
- * otherwise. The Non-secure domain's MPU is not modelled: TTA and TTAT answer from the default map. The
- * default map lets every address be read and written but the private peripheral bus unprivileged; NSR
- * and NSRW are R and RW of a Non-secure address.
+ * says; Non-secure state is answered none of them, nor NSR and NSRW. The MPU fields are answered where
+ * the domain asked about is privileged (CONTROL.nPRIV clear, or handler mode): with the MPU enabled,
+ * the one region of that domain's MPU holding `a` gives MREGION and its AP field R and RW, and an
+ * address no region holds has the default map where PRIVDEFENA lets a privileged query use it, and no
+ * access otherwise. The default map lets every address be read and written but the private peripheral
+ * bus unprivileged; NSR and NSRW are R and RW of a Non-secure address.
  */
 tt_response(cpu: *Cpu, a: u32, alt: bool, unprivileged: bool) -> u32
+    // TTA and TTAT from Secure state ask about the other domain: its MPU and CONTROL are the bank's.
+    if alt && !cpu.ns
+        exchange_bank(cpu)
+        val r = tt_domain(cpu, a, unprivileged, true)
+        exchange_bank(cpu)
+        return r
+    tt_domain(cpu, a, unprivileged, !cpu.ns)
+
+// `TT` against the live bank's MPU and privilege, the security fields where `secure` asks.
+private tt_domain(cpu: *Cpu, a: u32, unprivileged: bool, secure: bool) -> u32
     val at = attribution(cpu, a)
     val idau = a >= cpu.idau.base && a <= cpu.idau.limit
     val non_secure = at.non_secure && !idau
-    var resp: u32 = if non_secure then 0 else 1 << 22
+    var resp: u32 = 0
 
-    if at.region >= 0 then resp |= (u32(at.region) << 8) | (1 << 17)
-    if idau then resp |= (cpu.idau.number << 24) | (1 << 23)
+    if secure
+        if !non_secure then resp |= 1 << 22
+        if at.region >= 0 then resp |= (u32(at.region) << 8) | (1 << 17)
+        if idau then resp |= (cpu.idau.number << 24) | (1 << 23)
 
-    // The Non-secure domain's privilege is its CONTROL.nPRIV, which is never written: privileged.
-    val privileged = alt || cpu.ipsr != 0 || cpu.control & 1 == 0
+    val privileged = cpu.ipsr != 0 || cpu.control & 1 == 0
 
     if privileged
         var r = !(unprivileged && a >= PPB && a < PPB_END)
         var rw = r
 
-        if !alt && cpu.mpu_ctrl & 1 != 0
+        if cpu.mpu_ctrl & 1 != 0
             val k = mpu_region(cpu, a)
             if k >= 0
                 resp |= u32(k) | (1 << 16)
@@ -363,7 +378,7 @@ tt_response(cpu: *Cpu, a: u32, alt: bool, unprivileged: bool) -> u32
 
         if r then resp |= 1 << 18
         if rw then resp |= 1 << 19
-        if non_secure
+        if secure && non_secure
             if r then resp |= 1 << 20
             if rw then resp |= 1 << 21
 
@@ -387,7 +402,7 @@ x_tt(cpu: *Cpu, i: *Insn)
     cpu.r[i.a] = tt_response(cpu, cpu.r[i.b], i.imm & 2 != 0, i.imm & 1 != 0)
 
 // `BXNS` or `BLXNS` (c = 1) to Rm = b whose bit 0 is set, which stays in Secure state: `BX` or
-// `BLX`. The executors stop at `NonSecure` on bit 0 clear before they come here.
+// `BLX`. Bit 0 clear goes to Non-secure state (`ns_call`), which the executors ask first.
 ns_branch(cpu: *Cpu, ip: *Insn, n: u64) -> *Insn
     val target = cpu.r[ip.b]
 
@@ -396,17 +411,6 @@ ns_branch(cpu: *Cpu, ip: *Insn, n: u64) -> *Insn
     cpu.r[14] = (addr_of(cpu, ip) + 2) | 1
     insn_at(cpu, target & ~1)
 
-// The Non-secure way a `BXNS` or `BLXNS` at `ip` would go, if its target asks for it.
+// Whether a `BXNS` or `BLXNS` at `ip` goes to Non-secure state: its target's bit 0 is clear.
 @inline
 ns_target(cpu: *Cpu, ip: *Insn) -> bool = cpu.r[ip.b] & 1 == 0
-
-@cold
-stop_ns_branch(cpu: *Cpu, ip: *Insn, n: u64)
-    cpu.transition = if ip.c != 0 then Transition.Blxns else Transition.Bxns
-    stop_here(cpu, ip, n, Stop.NonSecure)
-
-// `MRS` or `MSR` of a `_NS` register, refused whenever it runs.
-@cold
-stop_ns_register(cpu: *Cpu, ip: *Insn, n: u64)
-    cpu.transition = Transition.NsRegister
-    stop_here(cpu, ip, n, Stop.NonSecure)

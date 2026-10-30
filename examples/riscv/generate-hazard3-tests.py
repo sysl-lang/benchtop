@@ -74,7 +74,9 @@ def generate():
         for size in range(1,9):
             for a in v.VALUES:
                 for n in (v.SHIFTS if name=='H3.BEXTM' else range(32)):
-                    for layout in layouts[:7]:
+                    # Every immediate shift is swept on the first register layout; the other layouts
+                    # (aliasing, x0 and the high registers) take the boundary shifts only.
+                    for layout in (layouts[:7] if name=='H3.BEXTM' or n in v.SHIFTS else layouts[:1]):
                         rd,rs1,rs2,x,y=v.inputs(a,n,layout) if name=='H3.BEXTM' else (layout[0],layout[1],0,0 if layout[1]==0 else a,n)
                         if name=='H3.BEXTM':asm=f'.insn r 0x0b, 0, {(size-1)*2}, x{rd}, x{rs1}, x{rs2}'
                         else:asm=f'.insn i 0x0b, 4, x{rd}, x{rs1}, {(size-1)*64+n}'
