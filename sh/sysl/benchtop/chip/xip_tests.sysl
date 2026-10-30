@@ -327,6 +327,103 @@ xip_sram_fast_path_edges()
     assert(run_code(b, [STRB_R1_R0, BKPT], [MAINTENANCE + SRAM_OFFSET + 16384 - 8 + 7, 0, 0, 0, 0, 0]) == RunEnd.Breakpoint, b.refused)
     assert(fast(b, last, 4), "pinned again, on the fast path")
 
+// Thumb halfwords written into XIP_SRAM's backing from `a`, as the loader writes an image.
+private put_sram(b: &ArmBoard, a: u32, code: []const u16)
+    for i in 0..<code.len
+        val at = b.sram_at + (a - XIP_SRAM_BASE) + 2 * u32(i)
+        b.mem.ram[at] = u8.wrap(code[i])
+        b.mem.ram[at + 1] = u8.wrap(code[i] >> 8)
+
+// Core 0 started at `pc` with `regs` in r0 to r7.
+private run_at(b: &ArmBoard, pc: u32, regs: [8]u32) -> RunEnd
+    val c = &b.cores[0]
+    c.stop = Stop.Running
+    c.pc = pc
+    for i in 0..<8 do c.r[i] = regs[i]
+    b.why = ""
+    b.refused = ""
+    b.run(10000)
+
+// Thumb: strb.w r1, [r0], #1; movs r5, #1; movs r6, #2; movs r7, #3 or #4; adds r4, #1; b back to it;
+// b to itself; blx r3; bx lr.
+private const STRB_W_R1_R0_POST1: u16 = 0xF800
+private const STRB_W_POST1_LOW: u16 = 0x1B01
+private const MOVS_R5_1: u16 = 0x2501
+private const MOVS_R6_2: u16 = 0x2602
+private const MOVS_R7_3: u16 = 0x2703
+private const MOVS_R7_4: u16 = 0x2704
+private const ADDS_R4_1: u16 = 0x3401
+private const B_BACK_1: u16 = 0xE7FD
+private const B_SELF: u16 = 0xE7FE
+private const BLX_R3: u16 = 0x4798
+private const BX_LR: u16 = 0x4770
+
+@test("XIP_SRAM: a store unpinning the line after its own stops the core at the line, its next instruction, not executed; the store keeps its write-back; pinned again, the line's bytes now run")
+xip_sram_unpin_running_code()
+    val b = arm_board(PICO2_SRAM)
+    b.boot(PLAIN_BLINK).unwrap()
+    for k in 0u32..<512 do b.chip.xip.maintain(SRAM_OFFSET + k * 8 + 7).unwrap()
+    b.sync_xip()
+    // Line 0: the store and two moves; line 1: a move and the breakpoint.
+    put_sram(b, XIP_SRAM_BASE, [STRB_W_R1_R0_POST1, STRB_W_POST1_LOW, MOVS_R5_1, MOVS_R6_2, MOVS_R7_3, BKPT])
+    val line1 = MAINTENANCE + SRAM_OFFSET + 8
+    // A clean (operation 1) changes nothing: the code runs through, decoded.
+    assert(run_at(b, XIP_SRAM_BASE, [line1 + 1, 0, 0, 0, 0, 0, 0, 0]) == RunEnd.Breakpoint, b.refused)
+    assert(b.cores[0].r[7] == 3)
+    // Invalidating line 1 by address (operation 2) unpins it under the running code.
+    val end = run_at(b, XIP_SRAM_BASE, [line1 + 2, 0, 0, 0, 0, 0, 0, 0])
+    val c = &b.cores[0]
+    assert(end == RunEnd.Fault, s"r7 ${c.r[7]}: the stale record ran")
+    assert(b.refused.contains("pc 0x13ffc008: 0x13ffc008 is in XIP_SRAM, and no cache line is pinned"), b.refused)
+    assert(c.pc == XIP_SRAM_BASE + 8 && c.r[5] == 1 && c.r[6] == 2 && c.r[7] == 0, s"pc 0x${hex(c.pc, 8)} r5 ${c.r[5]} r6 ${c.r[6]} r7 ${c.r[7]}")
+    assert(c.r[0] == line1 + 3, s"the store's write-back: r0 0x${hex(c.r[0], 8)}")
+    // Pinned again, holding movs r7, #4 now: the line is fetched afresh.
+    b.chip.xip.maintain(SRAM_OFFSET + 8 + 7).unwrap()
+    b.sync_xip()
+    put_sram(b, XIP_SRAM_BASE + 8, [MOVS_R7_4])
+    assert(run_at(b, XIP_SRAM_BASE, [line1 + 1, 0, 0, 0, 0, 0, 0, 0]) == RunEnd.Breakpoint, b.refused)
+    assert(b.cores[0].r[7] == 4, s"r7 ${b.cores[0].r[7]}")
+
+@test("XIP_SRAM: the cache disabled by core 0 stops core 1 looping in an XIP_SRAM page at its next fetch there, by name")
+xip_sram_unmapped_under_the_other_core()
+    val b = arm_board(PICO2_SRAM)
+    b.boot(PLAIN_BLINK).unwrap()
+    for k in 0u32..<512 do b.chip.xip.maintain(SRAM_OFFSET + k * 8 + 7).unwrap()
+    b.sync_xip()
+    put_sram(b, XIP_SRAM_BASE + 16, [ADDS_R4_1, B_BACK_1])
+    b.cores[1].pc = XIP_SRAM_BASE + 16
+    b.cores[1].stop = Stop.Running
+    b.started[1] = true
+    // Core 0 spins in SRAM while core 1 loops in XIP_SRAM, decoded.
+    assert(run_code(b, [B_SELF], [0, 0, 0, 0, 0, 0]) == RunEnd.Budget, b.refused)
+    val count = b.cores[1].r[4]
+    assert(count > 0 && b.mem.page_table[XIP_SRAM_BASE >> 12] != 0)
+    // XIP_CTRL's CLR alias takes EN_SECURE away from core 0; core 1 runs after it in the quantum.
+    val end = run_code(b, [STR_R1_R0, B_SELF], [xip_ctrl_reg.BASE + 0x3000, xip_ctrl_reg.CTRL_EN_SECURE_MASK, 0, 0, 0, 0])
+    assert(end == RunEnd.Fault, s"core 1 ran on: r4 ${b.cores[1].r[4]}")
+    assert(b.refused.contains("core 1 at pc 0x13ffc010: 0x13ffc010 is in XIP_SRAM"), b.refused)
+    assert(b.cores[1].r[4] == count, s"r4 ${b.cores[1].r[4]}, was $count")
+
+@test("direct mode stops code decoded from flash being run: a branch back into it is refused by name, and runs again when direct mode ends")
+xip_direct_mode_running_code()
+    val b = arm_board(PICO2_SRAM)
+    b.boot(PLAIN_BLINK).unwrap()
+    // movs r7, #3; bx lr at the flash's last page, called from SRAM.
+    val at: u32 = FLASH_BYTES - 4096
+    for hw in [(0u32, MOVS_R7_3), (2, BX_LR)]
+        b.mem.flash[at + hw.0] = u8.wrap(hw.1)
+        b.mem.flash[at + hw.0 + 1] = u8.wrap(hw.1 >> 8)
+    val csr = qmi_reg.BASE + qmi_reg.DIRECT_CSR_OFFSET
+    for direct in [false, true, false]
+        b.cores[0].r[7] = 0
+        val end = run_code(b, [STR_R1_R0, BLX_R3, BKPT], [csr, if direct then qmi_reg.DIRECT_CSR_EN_MASK else 0, 0, XIP_BASE + at + 1, 0, 0])
+        val c = &b.cores[0]
+        if direct
+            assert(end == RunEnd.Fault && c.r[7] == 0, s"r7 ${c.r[7]}: the stale record ran")
+            assert(b.refused.contains("0x103ff000: a memory-mapped flash access while the QMI is in direct mode"), b.refused)
+        else
+            assert(end == RunEnd.Breakpoint && c.r[7] == 3, s"${b.refused} r7 ${c.r[7]}")
+
 // Whether core 0 reaches the `width` bytes at `a` on its fast path, its loads and its stores alike.
 private fast(b: &ArmBoard, a: u32, width: u32) -> bool
     val load = arm.page_for(&b.cores[0], a, width) != 0

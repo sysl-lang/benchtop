@@ -48,6 +48,9 @@ const ROM_BYTES: u32 = 32 * 1024
 private val ROM = embed("rom/rom.bin")
 /** The Pico 2's flash: 4 MB on QSPI chip select 0. */
 const FLASH_BYTES: u32 = 4 * 1024 * 1024
+// XIP_SRAM's 8-byte cache lines, and a line number no line has.
+private const SRAM_LINES: u32 = XIP_SRAM_BYTES / 8
+private const NO_LINE: u32 = 0xFFFFFFFF
 
 // UF2 (github.com/microsoft/uf2): 512-byte blocks, their magic numbers, the flag that marks a block
 // not for the device's main memory and the one that says a family ID is present, and the families an
@@ -97,6 +100,8 @@ struct ArmBoard
     // were last mapped for.
     direct: bool
     xip_epoch: u32
+    // One bit per 8-byte cache line of XIP_SRAM, set where the line was live when last mapped.
+    sram_lines: [32]u64
 
 /** A board with `map`'s SRAM, powered on, holding no image. */
 arm_board(map: SramMap) -> &ArmBoard
@@ -104,7 +109,7 @@ arm_board(map: SramMap) -> &ArmBoard
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
     val sram_at = rom_at + ROM_BYTES + arm.GUARD_BYTES
-    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0)
+    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32])
 
 impl ArmBoard
     /** Power on with `image`, an ELF or a UF2, written into SRAM, flash and XIP_SRAM: core 0 at its
@@ -139,6 +144,7 @@ impl ArmBoard
         if start.handoff then self.chip.rcp.salted = [true, true]
         self.direct = false
         self.xip_epoch = self.chip.xip.epoch +% 1
+        self.sram_lines = [0; 32]
         self.sync_xip()
         self.configure(first, 0)
         first.pc = start.pc & ~1
@@ -316,7 +322,10 @@ impl ArmBoard
 
     /** Bring the cores' memory map into step with the chip's XIP state: code decoded from flash bytes a
      * program or erase changed decodes again; the flash leaves the fast path while direct mode is on;
-     * and each XIP_SRAM page is on it while every one of its cache lines is pinned.
+     * and each XIP_SRAM page is on it while every one of its cache lines is pinned. Code decoded from
+     * the flash, or from an XIP_SRAM line, decodes again when either leaves the cores' memory or comes
+     * back, so a core executing there (either core, the one whose store made the change included)
+     * fetches its next instruction through the bus, which refuses it by name, rather than running on.
      */
     sync_xip(*self)
         loop
@@ -327,10 +336,27 @@ impl ArmBoard
         if direct != self.direct
             self.direct = direct
             for p in 0u32..<(FLASH_BYTES >> 12) do self.mem.page_table[(XIP_BASE >> 12) + p] = if direct then 0 else usize(&self.mem.flash[p << 12])
+            arm.flash_unmapped(self.mem)
         if self.chip.xip.epoch == self.xip_epoch then return
         self.xip_epoch = self.chip.xip.epoch
+        self.sync_sram_lines()
         for p in 0u32..<(XIP_SRAM_BYTES >> 12)
-            self.mem.page_table[(XIP_SRAM_BASE >> 12) + p] = if self.chip.xip.sram_page_live(p) then usize(&self.mem.ram[self.sram_at + (p << 12)]) else 0
+            var live = true
+            for w in 0u32..<8 do if self.sram_lines[p * 8 + w] != ~0u64 then live = false
+            self.mem.page_table[(XIP_SRAM_BASE >> 12) + p] = if live then usize(&self.mem.ram[self.sram_at + (p << 12)]) else 0
+
+    // Each XIP_SRAM cache line pinned or unpinned since the last time: the code decoded from each run
+    // of changed lines decodes again.
+    private sync_sram_lines(*self)
+        var changed_from: u32 = NO_LINE
+        for k in 0u32..SRAM_LINES
+            val changed = k < SRAM_LINES && self.chip.xip.sram_live(XIP_SRAM_BASE + k * 8) != ((self.sram_lines[k >> 6] >> u64(k & 63)) & 1 != 0)
+            if changed
+                self.sram_lines[k >> 6] ^= 1u64 << u64(k & 63)
+                if changed_from == NO_LINE then changed_from = k
+            elif changed_from != NO_LINE
+                arm.fetch_changed(self.mem, XIP_SRAM_BASE + changed_from * 8, (k - changed_from) * 8)
+                changed_from = NO_LINE
 
     // An access to XIP_SRAM off the fast path, in a page not every line of which is pinned: the line's
     // bytes in the cores' memory where it is pinned, or why the access is a bus error.
