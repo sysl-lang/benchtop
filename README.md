@@ -305,9 +305,10 @@ pair; `unpair` detaches them. Use `external_write` for DMA/debugger writes so bo
 wake events are updated. `irq` and `interrupt_inputs` supply external, software and timer input
 levels. Concurrent host-thread execution is not supported by this RISC-V API.
 
-`run --board` still uses the Cortex-M board runtime. Neither the `pico2` nor `pico2w` description
-boots firmware. RP2350 MMIO devices, ROM/flash boot, core selection and multicore startup are not
-implemented; the core's `pair` API does not supply a boot protocol.
+`run --board pico2` boots an RP2350 firmware ELF on its two Cortex-M33 cores (the programs in
+`examples/pico2` run, with UART0 on stdout), and `pico2-riscv` does the same on the Hazard3 harts.
+`run --board pico2w` is refused: its `wifi` part is a CYW43439, which benchtop does not emulate yet.
+The core's `pair` API itself supplies no boot protocol; the board layer does that.
 
 Every implemented RISC-V mnemonic has a named test in the [base coverage matrix](sh/sysl/benchtop/riscv/COVERAGE.md)
 or [Hazard3 coverage matrix](sh/sysl/benchtop/riscv/HAZARD3-COVERAGE.md), with stateful instruction
