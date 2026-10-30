@@ -166,10 +166,11 @@ enum ProductView
      (`processor/processor.sysl`: its number, its retired count, its interrupt inputs), which
      `v6m.Cpu` and `riscv.Cpu` both implement. The RP2350's devices are core-free models
      (`peripheral/rp2350`) at the SVD's addresses, and `chip.Rp2350` decodes the bus, runs the clock
-     tree and the boot ROM's core-1 launch protocol, and raises interrupts through `Processor`.
+     tree, and raises interrupts through `Processor`.
      `chip.RiscvBoard` runs the two Hazard3 harts on it (`boards/pico2-riscv`, `benchtop run`), and
      `chip.ArmBoard` the two Cortex-M33s (`boards/pico2`), with the chip's coprocessors on their
-     ports and benchtop's own boot ROM at address 0 (`chip/rom/rom.S`).
+     ports; both map Raspberry Pi's own boot ROM at address 0 (`chip/rom/`, `chip/bootrom.sysl`),
+     in which core 1 waits for its launch.
    - Left: the virt devices' handlers still take a v6m `*Cpu`; moving them onto `Processor` is
      mechanical now `virt.machine` is gone. Neither RP2350 board is yet a `Machine` (no window,
      no workers).

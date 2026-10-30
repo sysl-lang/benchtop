@@ -21,6 +21,8 @@ Pico SDK programs that the `pico2` board runs on its Cortex-M33s, and that
 | `dcp.c` (+ `dcp_ops.S`) | the double coprocessor: pico_double's arithmetic, `sqrt`, `fma`, comparisons, casts, `ddiv_fast`, `sqrt_fast`, and every canned sequence of `hardware/dcp_canned.inc.S`, over 3000 pseudo-random operand sets, one hash per operation; core 1 adding, multiplying and dividing alongside; a 20 µs timer interrupting with double arithmetic of its own; then newlib's `printf` `%f`, `%e`, `%g` | each hash equal to the host's IEEE arithmetic (denormals flushed), the interrupts' count and check, and the printed numbers digit for digit |
 | `interp.c` | `hardware_interp` in each mode (counter, blend unsigned and signed, clamp, rotate, FORCE_MSB, ADD_RAW, cross, save/restore); core 1 counting on its own INTERP0 at the same time; the multicore doorbells, each core's SIO_IRQ_BELL handler acknowledging | each line's values, worked from the datasheet (`chip/interp_tests.sysl`) |
 
+| `rom.c` | Raspberry Pi's boot ROM called as the SDK calls it: its magic, version and git revision, `rom_func_lookup` of ten codes and one it lacks, `get_sys_info`'s BOOT_INFO, a sector erased and a page programmed 1 MB into the flash and the flash's unique ID read through the ROM's flash functions (`hardware_flash`), then a PC/SP reboot through the ROM's `reboot` into a function that reads BOOT_INFO again | every line printed over UART0, the programmed bytes in the flash, the salts kept over the reboot (`chip/arm_tests.sysl`) |
+
 ```sh
 ./benchtop run --board pico2 examples/pico2/hello_serial.elf
 ```
@@ -47,6 +49,7 @@ The settings, all in `CMakeLists.txt`:
 - stdio on UART0, not USB;
 - `PICO_CRT0_DEBUG_ENTRY_RESETS_VIA_BOOTROM=0`. By default an RP2350 RAM image entered by a debugger
   goes back through the boot ROM's RAM-image boot (watchdog scratch registers, then the ROM's vector
-  table) to be launched again; benchtop does not run the Raspberry Pi ROM, so the image instead
+  table) to be launched again; benchtop runs the Raspberry Pi ROM's functions and core 1's wait in
+  it, but not core 0's boot path through it (`docs/rp-coverage.md` item 30), so the image instead
   initialises the redundancy coprocessor and MSPLIM itself and vectors through its own table, the
   SDK's other supported entry.

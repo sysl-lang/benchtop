@@ -19,23 +19,32 @@ import sysl.math.min
 // XIP cache's lines at XIP_SRAM_BASE, which are pinned first when an image lands there, as the boot
 // ROM pins them for an image that asks; core 0 starts at the ELF entry with the stack pointer at the
 // top of SRAM. A UF2 is written the same way, block by block; a flash UF2 starts as the boot ROM hands
-// a flash image over (the RCP's salts set, VTOR, SP and PC from the vector table at XIP_BASE) and a
-// RAM one at its first byte. Core 1 waits in the boot ROM until core 0 launches it through the SIO
-// FIFOs (§9.6), when it starts at the entry it was sent, with the stack pointer and VTOR it was sent.
+// a flash image over (the RCP's salts set, VTOR, SP and PC from the vector table at XIP_BASE, and the
+// core as the ROM's start-up leaves it: CP7 enabled, SAU region 7 set) and a RAM one at its first byte.
+//
+// **The boot ROM is Raspberry Pi's** (bootrom.sysl), at address 0 on both cores. Core 1 starts from
+// reset in it, and waits there, the ROM's own code, for its salts and then for core 0's launch through
+// the SIO FIFOs (§9.6), asleep in `WFE` between words: each core's `SEV` is the other's event
+// (`Cpu.events`). PSM holding core 1 stops it; releasing it starts it from reset again. Every ROM
+// function the SDK looks up runs as the ROM's code. **Core 0's boot path through the ROM is not run**
+// (it needs the TRNG, SHA-256, OTP and image parsing: rp-coverage items 25, 26 and 30): power-on and
+// the watchdog's reset hand an image over as that path would, and write BOOT_INFO where the ROM keeps
+// it (`write_boot_info`), with the QSPI bank's pins out of reset as the path leaves them.
 //
 // **The watchdog's reset** (`Rp2350.watchdog_reset`) stops each core whose PSM stage it took down at
 // once, at `Stop.Reset`, before the access that found it; at the end of the quantum the board restarts
-// them. Core 1 goes back to the boot ROM. Core 0 boots as the boot ROM boots it after a watchdog reset
-// (datasheet chapter 5, "Bootrom", its boot sequence; the SDK's `watchdog_reboot` and crt0 write the requests): SCRATCH4
-// holding 0xb007c0d3 with SCRATCH5 = SCRATCH7 ^ -0xb007c0d3 asks for SCRATCH7 as the PC and SCRATCH6
-// as the SP, a request the ROM consumes (it clears SCRATCH4; that it does is an assumption); a
-// SCRATCH7 of the magic itself asks for a boot of the type in SCRATCH6, which is the ROM's real boot
-// path and refused by name (items 6 and 30). Otherwise it is the normal boot: the flash image, handed
-// over as a flash UF2 is at power-on. A flash with no image in its first 4 KB (no block marker
-// 0xffffded3) would leave the ROM in BOOTSEL's USB boot, which is not modelled, so that run ends,
-// named. The ROM's `get_sys_info` answers BOOT_INFO with the boot each took (`write_boot_info`): at
-// power-on NORMAL where the flash holds an image and BOOTSEL where it does not, as the ROM had booted
-// before the debugger entered; NORMAL or PC_SP after a watchdog reset.
+// them. Core 1 starts from reset in the boot ROM. Core 0 boots as the boot ROM boots it after a
+// watchdog reset (datasheet chapter 5, "Bootrom", its boot sequence; the SDK's `watchdog_reboot`, crt0
+// and the ROM's own `reboot` write the requests): SCRATCH4 holding 0xb007c0d3 with SCRATCH5 =
+// SCRATCH7 ^ -0xb007c0d3 asks for SCRATCH7 as the PC and SCRATCH6 as the SP, a request the ROM
+// consumes (it clears SCRATCH4; that it does is an assumption); a SCRATCH7 of the magic itself asks
+// for a boot of the type in SCRATCH6, which is the ROM's real boot path and refused by name. Otherwise
+// it is the normal boot: the flash image, handed over as a flash UF2 is at power-on. A flash with no
+// image in its first 4 KB (no block marker 0xffffded3) would leave the ROM in BOOTSEL's USB boot,
+// which is not modelled, so that run ends, named. BOOT_INFO says which boot each took: at power-on
+// NORMAL where the flash holds an image and BOOTSEL where it does not, as the ROM had booted before the
+// debugger entered; NORMAL or PC_SP after a watchdog reset. The RCP's salts belong to PROC_COLD, which
+// a core's own reset (and the ROM's `reboot`) spares.
 //
 // **Memory** is on the cores' fast path: SRAM; the flash, read and executed in place from the cached
 // window's first 4 MB (the other windows and the rest of it reach the chip, `Rp2350.read`); the boot
@@ -50,9 +59,11 @@ import sysl.math.min
 //
 // **Time** runs in quanta of clk_sys cycles, one per instruction: each started core runs the quantum,
 // a device access is timed at the quantum's start plus the core's cycles into it, and the chip is
-// brought to the quantum's end before the next. A core in `WFI` sleeps to the quantum's end unless
-// an interrupt or its SysTick wakes it; while both sleep the board skips to the next device event or
-// SysTick. A core that executes `BKPT` ends the run.
+// brought to the quantum's end before the next. A core in `WFI`, or in `WFE` with no event, sleeps to
+// the quantum's end unless an interrupt, its SysTick or (for `WFE`) the other core's `SEV` wakes it;
+// while both sleep the board skips to the next device event or SysTick. A core asleep in `WFE` with
+// no interrupt enabled is not signalled the chip's lines until it wakes. A core that executes `BKPT`
+// ends the run.
 
 /** The RP2350's external interrupt lines, IRQ 0 to 51. */
 const RP2350_IRQS: u32 = 52
@@ -413,9 +424,14 @@ impl ArmBoard
         // PSM holding core 1 stops it; releasing it starts it from reset, in the boot ROM.
         if self.chip.take_core1_reset() then self.started[1] = false
         if self.chip.take_core1_release() then self.rom_reset(1)
-        // A core asleep with no interrupt enabled, as core 1 waits in the boot ROM, cannot be woken by
-        // a line: it is signalled once it is awake.
-        for k in 0..<2 do if self.started[k] && !(self.cores[k].sleeping && !arm.irqs_enabled(&self.cores[k])) then self.chip.signal(&self.cores[k])
+        for k in 0..<2 do if self.started[k] && !self.waits_for_event(k) then self.chip.signal(&self.cores[k])
+
+    // Whether core `k` sleeps in `WFE` with no interrupt enabled, as core 1 waits in the boot ROM: no
+    // line can wake it, so it is signalled once an event has (a fidelity limit: a line that rises and
+    // falls while it waits leaves nothing pending in its NVIC, where silicon latches it).
+    private waits_for_event(*self, k: usize) -> bool
+        val c = &self.cores[k]
+        c.sleeping && c.on_event && !arm.irqs_enabled(c)
 
     // The chip's clock at core `cpu`'s `n`th retired instruction.
     private at(self, cpu: *arm.Cpu, n: u64) -> u64 = self.quantum_at + (arm.clock(cpu, n) - self.clock_at[usize(cpu.core)])
