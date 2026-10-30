@@ -1,0 +1,323 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2350.{PAD_RESET, XIP_BASE}
+import sh.sysl.benchtop.v6m as arm
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
+import sh.sysl.rp2350.powman as pm
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.sio as sio_reg
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// POWMAN's power states on the chip and the Arm board (`Rp2350.power_down`, `ArmBoard.power_down` and
+// `power_up_boot`): the power-down once every core has halted, the switched core back at power-on, the
+// SRAM banks and the XIP cache a state switches off cleared, time skipped to the alarm, the GPIO
+// power-ups through the pads' isolation latches and from outside the chip, the boot after a power-up
+// and the boots it cannot make, and the SDK's hardware_powman end to end (examples/pico2/powman.c).
+
+private val POWMAN_PROGRAM = embed("../../../../examples/pico2/powman.elf")
+private val FLASH_HELLO = embed("../../../../examples/pico2/hello_serial_flash.elf")
+private val RAM_HELLO = embed("../../../../examples/pico2/hello_serial.elf")
+private val RISCV_BLINK_IMAGE = embed("../../../../examples/pico2-riscv/blink.elf")
+private val SRAM = SramMap(0x20000000, 520 * 1024)
+private const PW: u32 = 0x5AFE0000
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const STATE: u32 = pm.BASE + pm.STATE_OFFSET
+private const PWRUP0: u32 = pm.BASE + pm.PWRUP0_OFFSET
+private const TIMER: u32 = pm.BASE + pm.TIMER_OFFSET
+// PWRUPn's fields for a request on `gpio`: enabled, a level or an edge, high or low.
+private pwrup(gpio: u32, edge: bool, high: bool) -> u32 =
+    pm.PWRUP0_ENABLE_MASK | gpio | (if edge then pm.PWRUP0_MODE_MASK else 0) | (if high then pm.PWRUP0_DIRECTION_MASK else 0)
+private const TENTH_MS: u64 = 15000
+
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, PW | x).unwrap()
+
+private place(b: &ArmBoard, at: u32, code: []const u16)
+    for i in 0..<code.len
+        b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
+        b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
+
+private word_at(b: &ArmBoard, a: u32) -> u32
+    var v: u32 = 0
+    for k in 0u32..<4 do v |= u32(b.mem.ram[a - b.map.base + k]) << (8 * k)
+    v
+
+private put_word(b: &ArmBoard, a: u32, x: u32)
+    for k in 0u32..<4 do b.mem.ram[a - b.map.base + k] = u8.wrap(x >> (8 * k))
+
+// A board booted from `image` with core 0 moved to `wfi; b .` in SRAM.
+private sleeper(image: []const u8) -> &ArmBoard
+    val b = arm_board(SRAM)
+    b.boot(image).unwrap()
+    place(b, 0x20070100, [0xBF30, 0xE7FD])
+    b.cores[0].pc = 0x20070100
+    b
+
+// IO_BANK0 and PADS_BANK0 out of reset, as the SDK's runtime takes them.
+private release_io(c: *Rp2350) =
+    c.write(0, rr.BASE + rr.RESET_OFFSET + CLR, 4, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK).unwrap()
+
+// GPIO `n`'s pad with its input enabled, as `powman_enable_gpio_wakeup` leaves it.
+private input_enabled(c: *Rp2350, n: u32)
+    release_io(c)
+    c.write(0, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET, 4, pads.GPIO0_IE_MASK).unwrap()
+
+// A sleeper whose core 0 has asked for P1.7 with a level-high power-up on GPIO 14 and run until the
+// board powered the switched core down; `bootdis_next` sets BOOTDIS.NEXT first.
+private powered_down(image: []const u8, bootdis_next: bool) -> &ArmBoard
+    val b = sleeper(image)
+    val c = &b.chip
+    input_enabled(c, 14)
+    wr(c, PWRUP0, pwrup(14, false, true))
+    if bootdis_next then wr(c, pm.BASE + pm.BOOTDIS_OFFSET, pm.BOOTDIS_NEXT_MASK)
+    wr(c, STATE, 0xF << pm.STATE_REQ_SHIFT)
+    assert(b.run(100 * TENTH_MS) == RunEnd.Asleep && c.swcore_off, s"${b.refused}")
+    b
+
+// Drive GPIO 14 high from outside, and run until the switched core has powered up and booted.
+private wake_on_gpio14(b: &ArmBoard) -> RunEnd
+    b.chip.drive_from_outside(14, Some(true))
+    b.run(10 * TENTH_MS)
+
+@test("under both executors core 0's stores reach STATE behind the password: a request for P1.7 reads back WAITING, and the CLR alias of REQ_IGNORED is no request")
+arm_power_state_registers_executors()
+    for exec in [&arm.run_match, &arm.run_threaded]
+        // str r1, [r0]; ldr r2, [r0]; str r4, [r3]; ldr r5, [r0]
+        val code = [0x6001u16, 0x6802, 0x601C, 0x6805]
+        val b = on_core0(exec, code, [STATE, PW | 0xF0, 0, STATE + CLR, PW | pm.STATE_REQ_IGNORED_MASK])
+        val c = &b.cores[0]
+        assert(c.stop == Stop.Breakpoint && b.why.is_empty(), s"${c.stop}: ${b.why}")
+        assert(c.r[2] == 0x10F0 && c.r[5] == 0x10F0, s"0x${hex(c.r[2])} 0x${hex(c.r[5])}")
+        assert(b.chip.power_down_due() && !b.chip.swcore_off, "the power-down waits for the board")
+
+@test("once every started core sleeps the board powers the switched core down: the cores stop, the switched core is at power-on, the SRAM bank and XIP cache the state switches off are cleared, and POWMAN keeps its own")
+arm_power_down()
+    val b = sleeper(FLASH_HELLO)
+    val c = &b.chip
+    put_word(b, 0x20001000, 0x11111111)
+    put_word(b, 0x20050000, 0x22222222)
+    for i in 0u32..<4 do b.mem.ram[b.sram_at + 100 + i] = 0x33
+    c.write(0, sio_reg.BASE + sio_reg.GPIO_OUT_OFFSET, 4, 0x20).unwrap()
+    c.write(0, pm.BASE + pm.SCRATCH0_OFFSET, 4, 77).unwrap()
+    // Every domain but SRAM bank 1 off: 0xE.
+    wr(c, STATE, 0xE << pm.STATE_REQ_SHIFT)
+    assert(rd(c, STATE) == 0x10E0 && c.power_down_due())
+    val now = c.now
+    assert(b.run(100 * TENTH_MS) == RunEnd.Asleep, b.refused)
+    assert(c.swcore_off && !b.started[0] && !b.started[1] && c.powman.read(pm.STATE_OFFSET, 4).unwrap() == 0xEE)
+    assert(word_at(b, 0x20001000) == 0 && word_at(b, 0x20050000) == 0x22222222, "bank 0 cleared, bank 1 kept")
+    assert(b.mem.ram[b.sram_at + 100] == 0, "the XIP cache cleared")
+    assert(c.sio.out == 0 && c.resets.held == 0x1FFFFFFF, "the switched core at power-on")
+    assert(c.powman.read(pm.SCRATCH0_OFFSET, 4).unwrap() == 77 && c.now >= now, "POWMAN keeps its own, and time goes on")
+    // While it is down only POWMAN runs, and nothing on the chip will wake it.
+    assert(c.next_event().is_none())
+    c.advance(1000000)
+    assert(c.swcore_off && c.take_power_up().is_none())
+
+@test("the board keeps the domains the state keeps: P1.0 clears nothing, and an XIP cache kept keeps cache-as-SRAM")
+arm_power_down_keeps()
+    val b = sleeper(FLASH_HELLO)
+    put_word(b, 0x20001000, 0x11111111)
+    put_word(b, 0x20081000, 0x44444444)
+    b.mem.ram[b.sram_at] = 0x55
+    wr(&b.chip, STATE, 0x8 << pm.STATE_REQ_SHIFT)
+    assert(b.run(100 * TENTH_MS) == RunEnd.Asleep && b.chip.swcore_off, b.refused)
+    assert(word_at(b, 0x20001000) == 0x11111111 && word_at(b, 0x20081000) == 0x44444444 && b.mem.ram[b.sram_at] == 0x55)
+
+@test("both cores must halt: while core 1 still runs the power-down waits, and once it sleeps too the board makes it, core 1 back in the ROM")
+arm_power_down_waits_for_both_cores()
+    val b = sleeper(FLASH_HELLO)
+    // Core 1: movs r1, #200; lsls r1, r1, #8; then subs r1, #1; bne back; wfi; b back to the wfi.
+    place(b, 0x20070000, [0x21C8, 0x0209, 0x3901, 0xD1FD, 0xBF30, 0xE7FD])
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070001]
+        b.chip.write(0, sio_reg.BASE + sio_reg.FIFO_WR_OFFSET, 4, x).unwrap()
+        b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_RD_OFFSET, 4).unwrap()
+    wr(&b.chip, STATE, 0xF << pm.STATE_REQ_SHIFT)
+    assert(b.run(20000) == RunEnd.Budget && b.started[1] && !b.chip.swcore_off, b.refused)
+    assert(b.run(1000 * TENTH_MS) == RunEnd.Asleep && b.chip.swcore_off && !b.started[1], b.refused)
+    assert(b.cores[1].r[1] == 0 && b.chip.rom.waiting, "core 1 counted down first; the ROM waits for a launch again")
+
+@test("a pending interrupt keeps a sleeping core from halting: the power-down waits, and the core wakes to run on")
+arm_power_down_waits_for_halt()
+    val b = arm_board(SRAM)
+    b.boot(FLASH_HELLO).unwrap()
+    // cpsid i; str r1, [r0] (NVIC ISER1: POWMAN_IRQ_TIMER); wfi; bkpt
+    place(b, 0x20070100, [0xB672, 0x6001, 0xBF30, 0xBE00])
+    val k = &b.cores[0]
+    k.pc = 0x20070100
+    k.r[0] = 0xE000E104
+    k.r[1] = 1 << (POWMAN_IRQ_TIMER - 32)
+    val c = &b.chip
+    // The alarm latched at once, an interrupt and no power-up request.
+    wr(c, TIMER + SET, pm.TIMER_RUN_MASK)
+    wr(c, pm.BASE + pm.INTE_OFFSET, pm.INTE_TIMER_MASK)
+    wr(c, TIMER + SET, pm.TIMER_ALARM_ENAB_MASK)
+    wr(c, STATE, 0xF << pm.STATE_REQ_SHIFT)
+    assert(c.power_down_due() && c.powman.irq_timer(), s"STATE 0x${hex(rd(c, STATE))} TIMER 0x${hex(rd(c, TIMER))} INTS 0x${hex(rd(c, pm.BASE + pm.INTS_OFFSET))}")
+    val end = b.run(100 * TENTH_MS)
+    assert(end == RunEnd.Breakpoint, s"$end off ${c.swcore_off} ${k.stop} at 0x${hex(k.stop_at)} pc 0x${hex(k.pc)} ${b.refused}")
+    assert(!c.swcore_off && c.power_down_due() && k.stop_at == 0x20070106, s"0x${hex(k.stop_at)}")
+
+@test("the always-on alarm with PWRUP_ON_ALARM powers the switched core up at its time: core 0 boots the flash image, core 1 waits in the ROM, and LAST_SWCORE_PWRUP and CHIP_RESET say why")
+arm_alarm_power_up()
+    val b = sleeper(FLASH_HELLO)
+    val c = &b.chip
+    wr(c, pm.ALARM_TIME_15TO0_OFFSET + pm.BASE, 500)
+    wr(c, TIMER + SET, pm.TIMER_RUN_MASK | pm.TIMER_ALARM_ENAB_MASK | pm.TIMER_PWRUP_ON_ALARM_MASK)
+    wr(c, pm.BASE + pm.CHIP_RESET_OFFSET, pm.CHIP_RESET_DOUBLE_TAP_MASK)
+    wr(c, STATE, 0xF << pm.STATE_REQ_SHIFT)
+    var i = 0
+    while i < 2000 && c.powman.read(pm.LAST_SWCORE_PWRUP_OFFSET, 4).unwrap() == 0
+        assert(b.run(10 * TENTH_MS) != RunEnd.Fault, b.refused)
+        i += 1
+    // At the alarm, and then at most the rest of one run's budget.
+    val woke = c.powman.time_ms()
+    assert(!c.swcore_off && woke >= 500 && woke <= 520, s"woke by $woke ms")
+    assert(c.powman.read(pm.LAST_SWCORE_PWRUP_OFFSET, 4).unwrap() == 0x40 && c.powman.read(pm.STATE_OFFSET, 4).unwrap() == 0)
+    assert(c.powman.read(pm.CHIP_RESET_OFFSET, 4).unwrap() == pm.CHIP_RESET_HAD_SWCORE_PD_MASK | pm.CHIP_RESET_DOUBLE_TAP_MASK, "HAD_SWCORE_PD alone; DOUBLE_TAP kept")
+    assert(b.started[0] && !b.started[1] && b.chip.rcp.salted[0])
+    assert(b.mem.ram[b.rom_at + BOOT_INFO_AT + 1] == u8(BOOT_TYPE_NORMAL))
+    // The flash image runs: hello_serial prints.
+    for j in 0..<200 do b.run(10 * TENTH_MS)
+    assert(from_utf8_lossy(b.console.view()).contains("hello, serial 0"), from_utf8_lossy(b.console.view()))
+
+@test("while the switched core is down a GPIO power-up sees each pad as its isolation latch held it: a pad that drove keeps its level, one that did not follows what drives it from outside, and one whose input was off reads low")
+chip_gpio_power_up_through_latches()
+    var c = rp2350()
+    release_io(&c)
+    // GPIO 6 driven high by SIO, input on; GPIO 7 input off; GPIO 14 undriven, pulled down, input on.
+    c.write(0, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * 6, 4, io.GPIO0_CTRL_FUNCSEL_SIO_0).unwrap()
+    c.write(0, pads.BASE + pads.GPIO0_OFFSET + 4 * 6, 4, pads.GPIO0_IE_MASK).unwrap()
+    c.write(0, sio_reg.BASE + sio_reg.GPIO_OE_SET_OFFSET, 4, 1 << 6).unwrap()
+    c.write(0, sio_reg.BASE + sio_reg.GPIO_OUT_SET_OFFSET, 4, 1 << 6).unwrap()
+    input_enabled(&c, 14)
+    assert(c.pin(6).drives && c.pin(6).level && !c.pin(14).level)
+    wr(&c, PWRUP0, pwrup(14, true, true))
+    wr(&c, PWRUP0 + 4, pwrup(6, false, false))
+    wr(&c, PWRUP0 + 8, pwrup(7, false, true))
+    assert(rd(&c, PWRUP0 + 4) & pm.PWRUP0_RAW_STATUS_MASK != 0 && rd(&c, pm.BASE + pm.CURRENT_PWRUP_REQ_OFFSET) == 0)
+    wr(&c, STATE, 0xF << pm.STATE_REQ_SHIFT)
+    assert(c.power_down() == 0xF && c.pads.pads[6] == PAD_RESET && !c.pin(6).drives)
+    c.advance(1000)
+    c.drive_from_outside(6, Some(false))
+    c.advance(1000)
+    assert(c.take_power_up().is_none(), "GPIO 6's latch holds it high")
+    c.drive_from_outside(7, Some(true))
+    c.advance(1000)
+    assert(c.take_power_up().is_none(), "GPIO 7's input was off")
+    c.drive_from_outside(14, Some(true))
+    c.advance(1000)
+    assert(c.take_power_up().unwrap_or(99) == 0 && !c.swcore_off)
+    // PWRUP0 powered it up, and its edge stays latched.
+    assert(c.powman.read(pm.LAST_SWCORE_PWRUP_OFFSET, 4).unwrap() == 0x2 && c.powman.read(pm.PWRUP0_OFFSET, 4).unwrap() & pm.PWRUP0_STATUS_MASK != 0)
+
+@test("a power-up request asserted on a GPIO while the power-down waits cancels it: REQ back to CURRENT, PWRUP_WHILE_WAITING and POWMAN_IRQ_POW, cleared through the CLR alias")
+chip_power_up_while_waiting()
+    var c = rp2350()
+    input_enabled(&c, 5)
+    wr(&c, pm.BASE + pm.INTE_OFFSET, pm.INTE_PWRUP_WHILE_WAITING_MASK)
+    wr(&c, PWRUP0 + 12, pwrup(5, false, true))
+    wr(&c, STATE, 0xF << pm.STATE_REQ_SHIFT)
+    assert(c.power_down_due())
+    c.drive_from_outside(5, Some(true))
+    c.advance(100)
+    assert(!c.power_down_due() && rd(&c, STATE) == pm.STATE_PWRUP_WHILE_WAITING_MASK && c.powman.irq_pow())
+    assert(rd(&c, pm.BASE + pm.INTR_OFFSET) == pm.INTR_PWRUP_WHILE_WAITING_MASK && rd(&c, pm.BASE + pm.CURRENT_PWRUP_REQ_OFFSET) == 0x10)
+    wr(&c, STATE + CLR, pm.STATE_PWRUP_WHILE_WAITING_MASK)
+    assert(rd(&c, STATE) == 0 && !c.powman.irq_pow())
+    // Now the level is asserted, a new power-down request is ignored outright.
+    wr(&c, STATE, 0xF << pm.STATE_REQ_SHIFT)
+    assert(rd(&c, STATE) == pm.STATE_REQ_IGNORED_MASK && !c.power_down_due())
+
+@test("a request to power an SRAM bank down under the running switched core and a PWRUP enabled on a QSPI pin are refused by name, through every alias, and change nothing")
+chip_power_refusals()
+    var c = rp2350()
+    assert(c.write(0, STATE, 4, PW | 0x20).unwrap_err() == "POWMAN + 0x38: STATE.REQ 0x2 powers SRAM bank 0 down while the switched core stays up, which is not modelled: the cores reach SRAM on their fast path")
+    assert(c.write(0, STATE + SET, 4, PW | 0x10).unwrap_err() == "POWMAN + 0x2038: STATE.REQ 0x1 powers SRAM bank 1 down while the switched core stays up, which is not modelled: the cores reach SRAM on their fast path")
+    assert(c.write(0, STATE + 0x1000, 4, PW | 0x30).unwrap_err().contains("SRAM banks 0 and 1"))
+    assert(rd(&c, STATE) == 0)
+    // An invalid request is not made, so it is not refused; a P1 state with a bank off is a power-down.
+    wr(&c, STATE, 0x60)
+    assert(rd(&c, STATE) == 0x460)
+    wr(&c, STATE, 0xA0)
+    assert(rd(&c, STATE) == 0x10A0)
+    // Without the password the write is dropped, so it is not refused either.
+    c.write(0, STATE, 4, 0x20).unwrap()
+    assert(c.write(0, PWRUP0, 4, PW | pwrup(48, false, true)).unwrap_err() == "POWMAN + 0x8c: PWRUP0 enabled on SOURCE 48, a QSPI pin, whose level is not modelled")
+    assert(c.write(0, PWRUP0 + 12, 4, PW | pwrup(53, true, false)).unwrap_err() == "POWMAN + 0x98: PWRUP3 enabled on SOURCE 53, a QSPI pin, whose level is not modelled")
+    wr(&c, PWRUP0, 48)
+    assert(c.write(0, PWRUP0 + SET, 4, PW | pm.PWRUP0_ENABLE_MASK).is_err() && rd(&c, PWRUP0) == 48, "enabled later through SET")
+    wr(&c, PWRUP0, pwrup(54, false, false))
+    assert(rd(&c, PWRUP0) == pwrup(54, false, false) && rd(&c, pm.BASE + pm.CURRENT_PWRUP_REQ_OFFSET) == 0, "54 names nothing, and is ignored")
+
+@test("after a power-up the board boots as the ROM does without the ROM: BOOTDIS.NOW makes it ignore BOOT0-3 and is cleared; otherwise a BOOT0-3 vector, a blank flash and an SRAM bank left off end the run by name")
+arm_power_up_boots()
+    val v = powered_down(FLASH_HELLO, false)
+    v.chip.powman.write(pm.BOOT0_OFFSET, 4, 0x1234).unwrap()
+    assert(wake_on_gpio14(v) == RunEnd.Fault)
+    assert(v.refused == "core 0: POWMAN's BOOT0-3 (0x00001234 0x00000000 0x00000000 0x00000000) ask the boot ROM's power-up path for a boot vector, which is the ROM's own boot path, not modelled (docs/rp-coverage.md item 6)", v.refused)
+    val d = powered_down(FLASH_HELLO, true)
+    assert(d.chip.powman.read(pm.BOOTDIS_OFFSET, 4).unwrap() == pm.BOOTDIS_NOW_MASK, "NEXT moved into NOW")
+    d.chip.powman.write(pm.BOOT3_OFFSET, 4, 0x1234).unwrap()
+    assert(wake_on_gpio14(d) == RunEnd.Budget, d.refused)
+    assert(d.chip.powman.read(pm.BOOTDIS_OFFSET, 4).unwrap() == 0 && d.chip.powman.read(pm.BOOT3_OFFSET, 4).unwrap() == 0x1234)
+    assert(d.started[0] && d.cores[0].stop == Stop.Running && d.refused.is_empty())
+    val r = powered_down(RAM_HELLO, false)
+    assert(wake_on_gpio14(r) == RunEnd.Fault)
+    assert(r.refused == "core 0: POWMAN's power-up leaves the boot ROM a normal boot, and the flash holds no image (no block marker 0xffffded3 in its first 4 KB): the ROM would enter BOOTSEL's USB boot, which is not modelled", r.refused)
+    // P1 with SRAM bank 0 off, and SEQ_CFG keeping it off at the power-up.
+    val s = sleeper(FLASH_HELLO)
+    input_enabled(&s.chip, 14)
+    wr(&s.chip, PWRUP0, pwrup(14, false, true))
+    wr(&s.chip, pm.BASE + pm.SEQ_CFG_OFFSET + SET, pm.SEQ_CFG_HW_PWRUP_SRAM0_MASK)
+    wr(&s.chip, STATE, 0xA << pm.STATE_REQ_SHIFT)
+    assert(s.run(100 * TENTH_MS) == RunEnd.Asleep && s.chip.swcore_off)
+    assert(wake_on_gpio14(s) == RunEnd.Fault)
+    assert(s.refused == "core 0: POWMAN powers the switched core up with SRAM bank 0 still off (SEQ_CFG.HW_PWRUP_SRAM0/1), which is not modelled: the cores reach SRAM on their fast path", s.refused)
+
+@test("on the RISC-V board a power-down of the switched core ends the run by name once the harts sleep")
+riscv_power_down_refused()
+    val b = riscv_board(SRAM)
+    b.boot(RISCV_BLINK_IMAGE).unwrap()
+    wr(&b.chip, STATE, 0xF << pm.STATE_REQ_SHIFT)
+    assert(b.run(100000000) == RunEnd.Fault)
+    assert(b.refused == "the chip: POWMAN would power the switched core down with both harts asleep, and powering the RISC-V harts down and up through the boot ROM is not modelled (docs/rp-coverage.md Q13: Arm first)", b.refused)
+
+@test("the SDK's hardware_powman on a Pico 2 across three power-ups: an invalid request, one ignored for a pending GPIO, P1.7 until the alarm, P1 keeping SRAM bank 0 until GPIO 14 rises, BOOTDIS")
+arm_powman_program()
+    val b = arm_board(SRAM)
+    b.boot(POWMAN_PROGRAM).unwrap()
+    var end = RunEnd.Budget
+    var woke: u64 = 0
+    var driven = false
+    var steps = 0
+    while steps < 100000 && (end == RunEnd.Budget || (end == RunEnd.Asleep && !driven))
+        if end == RunEnd.Asleep
+            // P1 with only GPIO 14 to wake it: drive it high from outside.
+            b.chip.drive_from_outside(14, Some(true))
+            driven = true
+        end = b.run(10 * TENTH_MS)
+        if woke == 0 && b.chip.powman.read(pm.LAST_SWCORE_PWRUP_OFFSET, 4).unwrap() == 0x40 then woke = b.chip.powman.time_ms()
+        steps += 1
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}\n${from_utf8_lossy(b.console.view())}")
+    val text = from_utf8_lossy(b.console.view())
+    val want = "boot 1: state 0x0 last_swcore_pwrup 0x0 had_swcore_pd 0\r\n" +
+        "xip off: rc -5 state 0x440\r\n" +
+        "gpio 15 high: rc -14 state 0x540 current_pwrup_req 0x2\r\n" +
+        "sleeping until the alarm: valid 1 rc 0 state 0x10f0\r\n" +
+        "boot 2: state 0x0 last_swcore_pwrup 0x40 had_swcore_pd 1\r\n" +
+        "kept 0x0\r\n" +
+        "timer past the alarm: 1\r\n" +
+        "sleeping until gpio 14 rises: valid 1 rc 0 state 0x10d0\r\n" +
+        "boot 3: state 0x0 last_swcore_pwrup 0x2 had_swcore_pd 1\r\n" +
+        "kept 0xc0ffee\r\n" +
+        "bootdis 0x0 boot0 0x12345678 pwrup0 status 1\r\n" +
+        "done\r\n"
+    assert(text == want, text)
+    // The alarm was set 1 s on from a count started at 0, a few milliseconds into the first boot.
+    assert(woke >= 1000 && woke <= 1100, s"powered up at $woke ms")

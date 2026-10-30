@@ -3,13 +3,59 @@ module sh.sysl.benchtop.peripheral.rp2350
 import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, triggered, w1c, written}
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.powman as reg
+import sysl.fmt.hex
 import sysl.math.min
 
 // POWMAN, the power manager (datasheet 6): the voltage regulator, the brown-out detector, the
 // low-power oscillator and crystal settings, the sequencer's configuration, the debug settings, the
-// scratch and boot registers and the interrupt registers as a store, and the always-on timer. The
-// power states and the power-up requests (STATE, PWRUP0 to PWRUP3, CURRENT_PWRUP_REQ,
-// LAST_SWCORE_PWRUP, BOOTDIS) are refused by name: the chip never leaves its all-on state.
+// scratch and boot registers and the interrupt registers as a store, the always-on timer, and the
+// power states with their power-up requests.
+//
+// **The power state** (STATE, `hardware/regs/powman.h`): four domains, a bit each in CURRENT and REQ,
+// set where the domain is powered down — bit 3 the switched core (processors, bus fabric,
+// peripherals), bit 2 the XIP cache, bit 1 SRAM bank 0, bit 0 SRAM bank 1 — so P0.x has bit 3 clear
+// and P1.x set. The SDK reads it so (`powman_get_power_state` inverts CURRENT). CURRENT reads 0, every
+// domain up, from power-on: the header's reset value of 0xF is the state before the power-on sequence
+// has run, and benchtop's chip starts with it run. A write to REQ (plainly, or through an alias that
+// changes it) is a request, judged against CURRENT:
+//
+// - one that would power the switched core down while a power-up request is asserted
+//   (CURRENT_PWRUP_REQ) is ignored: REQ keeps what it held and REQ_IGNORED latches;
+// - one that both powers a domain up and another down, or leaves the switched core up with the XIP
+//   cache down, is invalid: REQ takes it, BAD_SW_REQ is set, its power-ups are made and its
+//   power-downs are not;
+// - one that powers the switched core down waits (WAITING) until the processors halt, which the board
+//   decides (`power_down_due`, `power_down`); rewriting REQ meanwhile changes or cancels it, and a
+//   power-up request asserting meanwhile cancels it and latches PWRUP_WHILE_WAITING;
+// - any other is made at once, so CHANGING never reads 1.
+//
+// A valid request that powers an SRAM bank down while the switched core stays up (P0.1 to P0.3) is
+// refused by name (`unmodelled`): the cores reach SRAM on their fast path, and a bank switched off
+// under them is not modelled. BAD_HW_REQ reads 0: the hardware's own request, the wake-up, only powers
+// domains up and is never invalid. REQ_IGNORED and PWRUP_WHILE_WAITING are write-1-to-clear, and are
+// INTR's STATE_REQ_IGNORED and PWRUP_WHILE_WAITING, which raise POWMAN_IRQ_POW through INTE.
+//
+// **Power-up requests**: PWRUP0 to PWRUP3 each watch a GPIO (SOURCE) while ENABLE is set, for a level
+// (MODE 0; DIRECTION 1 high, 0 low) or an edge (MODE 1; DIRECTION 1 rising, 0 falling), which latches
+// STATUS until a 1 is written to it. RAW_STATUS is the GPIO's level while enabled. A source the Pico
+// 2's QFN-60 package does not bond out (GPIO 30 to 47) or that names nothing (54 to 63) is ignored, as
+// the header says of an invalid selection; one of the QSPI pins (48 to 53) is refused by name. The
+// alarm is a sixth request while TIMER.PWRUP_ON_ALARM and ALARM_ENAB are set and ALARM has latched.
+// CURRENT_PWRUP_REQ is bit n for request n (1 to 4 PWRUP0 to PWRUP3, 6 the alarm; 5, the debugger's,
+// never asserts, as no debugger asks for power); LAST_SWCORE_PWRUP holds the requests that last
+// powered the switched core up, and 0 after a power-on, as the header's reset value has it (that
+// both registers are bit masks rather than numbers is an assumption: seven bits for seven sources).
+// The chip samples the GPIOs (`sample`) as time passes while a request is enabled, so a level held
+// between samples is seen and an edge is latched once.
+//
+// **Powering down and up**: when the switched core powers down (`power_down`), CURRENT takes REQ and
+// BOOTDIS.NEXT is ORed into NOW and cleared; everything in the switched core goes back to power-on, and
+// what the state switched off loses its contents (the chip and the board do that). While it is down a
+// power-up request powers it up again (`wake_due`, `power_up`): the switched core and the XIP cache
+// come up, an SRAM bank comes up unless SEQ_CFG.HW_PWRUP_SRAMn says it stays as it slept (as
+// `powman_configure_wakeup_state` sets it), REQ takes the new state, LAST_SWCORE_PWRUP the requests,
+// and CHIP_RESET's HAD_ bits say HAD_SWCORE_PD alone. BOOTDIS.NEXT can be set and never cleared by a
+// write; NOW clears on a 1.
 //
 // **A write needs a password.** Bits 31:16 of the data on the bus must be 0x5AFE (`POWMAN_PASSWORD_BITS`),
 // through any of the four aliases and at any width, and only the low 16 bits of the word are written.
@@ -33,8 +79,8 @@ import sysl.math.min
 //
 // The alarm fires while ALARM_ENAB is set and the count has reached the 64-bit ALARM_TIME: TIMER.ALARM
 // latches, which is INTR.TIMER and POWMAN_IRQ_TIMER through INTE. A cleared ALARM latches again at once
-// while the alarm is enabled and past, as `powman_clear_alarm` warns. PWRUP_ON_ALARM and NONSEC_WRITE are
-// stored; the chip never sleeps through POWMAN and runs Secure-only.
+// while the alarm is enabled and past, as `powman_clear_alarm` warns. PWRUP_ON_ALARM makes the alarm a
+// power-up request; NONSEC_WRITE is stored, as the chip runs Secure-only.
 //
 // The LPOSC runs at its nominal 32.768 kHz, whatever LPOSC.TRIM holds (TRIM and MODE are stored).
 //
@@ -45,12 +91,65 @@ import sysl.math.min
 // unless VREG_CTRL.DISABLE_VOLTAGE_LIMIT is set.
 //
 // CHIP_RESET reports the last reset, which at power-on is HAD_POR. Its RESCUE_FLAG clears on a write of 1.
-// INTS is (INTR | INTF) & INTE; the interrupts have no event behind them yet but the forced ones.
+// INTS is (INTR | INTF) & INTE.
 
 /** Every write's password, in bits 31:16. */
 const POWMAN_PASSWORD: u32 = 0x5AFE
 
 private const POWMAN_WORDS: usize = 60
+
+/** The power domains' bits in STATE.CURRENT and STATE.REQ, set where the domain is down. */
+const DOMAIN_SWCORE: u32 = 0x8
+const DOMAIN_XIP: u32 = 0x4
+const DOMAIN_SRAM0: u32 = 0x2
+const DOMAIN_SRAM1: u32 = 0x1
+
+/** CURRENT_PWRUP_REQ's and LAST_SWCORE_PWRUP's bit for PWRUP0 (PWRUP1 to 3 follow it) and for the alarm. */
+const PWRUP_REQ_GPIO0: u32 = 0x02
+const PWRUP_REQ_ALARM: u32 = 0x40
+
+// The GPIOs a PWRUP source may name on the Pico 2's QFN-60 RP2350A: GPIO 0 to 29 (SYSINFO.PACKAGE_SEL);
+// 30 to 47 are not bonded out. 48 to 53 are the QSPI pins.
+private const BONDED_GPIOS: u32 = 30
+private const QSPI_FIRST: u32 = 48
+private const QSPI_LAST: u32 = 53
+
+// STATE's write-1-to-clear flags.
+private const STATE_WC: u32 = reg.STATE_REQ_IGNORED_MASK | reg.STATE_PWRUP_WHILE_WAITING_MASK
+// PWRUPn's read-write fields: MODE, DIRECTION, ENABLE and SOURCE.
+private const PWRUP_RW: u32 = 0x1FF
+// CHIP_RESET's HAD_ flags, one for each kind of reset.
+private const CHIP_RESET_HAD: u32 = 0x1FEF0000
+
+/** What a write to STATE.REQ comes to, against the state it would leave. */
+enum Request
+    // Ignored: it would power the switched core down while a power-up request is asserted.
+    Ignored
+    // Invalid: its power-ups are made and its power-downs are not.
+    Bad
+    // It powers the switched core down, once the processors halt.
+    Waiting
+    // It is made at once.
+    Now
+
+/** How a request for `target` (STATE.REQ's bits) is judged from `current` while the power-up requests
+ * `pending` are asserted.
+ */
+judge(current: u32, target: u32, pending: u32) -> Request
+    val downs = target & ~current
+    val ups = current & ~target
+    if downs & DOMAIN_SWCORE != 0 && pending != 0 then return Request.Ignored
+    if (downs != 0 && ups != 0) || (target & DOMAIN_SWCORE == 0 && target & DOMAIN_XIP != 0) then return Request.Bad
+    if downs & DOMAIN_SWCORE != 0 then Request.Waiting else Request.Now
+
+// PWRUPn's offset.
+private pwrup_offset(n: u32) -> u32 = reg.PWRUP0_OFFSET + 4 * n
+
+// Whether a write to STATE at `offset`, taking it from `before` to `after`, is a request: a plain
+// write always is, and an alias write is where it changes REQ (the SDK's `powman_clear_bits` of
+// REQ_IGNORED is not).
+private is_request(offset: u32, before: u32, after: u32) -> bool =
+    (offset >> 12) & 3 == 0 || (before ^ after) & reg.STATE_REQ_MASK != 0
 
 /** One stored register: its power-on value, the bits a write changes, and the bits a write of 1 clears. */
 private struct PowmanReg
@@ -58,7 +157,7 @@ private struct PowmanReg
     rw: u32
     wc: u32
 
-// The stored registers, by offset; None for what this model leaves to the AON-timer item.
+// The registers, by offset; None where POWMAN has none.
 private spec(offset: u32) -> Option[PowmanReg] = offset match
     reg.BADPASSWD_OFFSET -> Some(PowmanReg(0, 0, 1))
     reg.VREG_CTRL_OFFSET -> Some(PowmanReg(0x8050, 0xB170, 0))
@@ -93,6 +192,12 @@ private spec(offset: u32) -> Option[PowmanReg] = offset match
     reg.ALARM_TIME_63TO48_OFFSET | reg.ALARM_TIME_47TO32_OFFSET | reg.ALARM_TIME_31TO16_OFFSET | reg.ALARM_TIME_15TO0_OFFSET -> Some(PowmanReg(0, 0xFFFF, 0))
     reg.READ_TIME_UPPER_OFFSET | reg.READ_TIME_LOWER_OFFSET -> Some(PowmanReg(0, 0, 0))
     reg.TIMER_OFFSET -> Some(PowmanReg(0, TIMER_RW, reg.TIMER_ALARM_MASK))
+    // REQ is written through `request`, not stored as written.
+    reg.STATE_OFFSET -> Some(PowmanReg(0, 0, STATE_WC))
+    reg.PWRUP0_OFFSET | reg.PWRUP1_OFFSET | reg.PWRUP2_OFFSET | reg.PWRUP3_OFFSET -> Some(PowmanReg(0x3F, PWRUP_RW, reg.PWRUP0_STATUS_MASK))
+    reg.CURRENT_PWRUP_REQ_OFFSET | reg.LAST_SWCORE_PWRUP_OFFSET -> Some(PowmanReg(0, 0, 0))
+    // NEXT is ORed in by `write`.
+    reg.BOOTDIS_OFFSET -> Some(PowmanReg(0, 0, reg.BOOTDIS_NOW_MASK))
     _ -> None
 
 // TIMER's read-write bits: NONSEC_WRITE, RUN, ALARM_ENAB, PWRUP_ON_ALARM and USE_GPIO_1HZ.
@@ -118,6 +223,15 @@ struct Powman
     source: u32
     // The reference GPIO's level at the last advance; a rising edge is a low followed by a high.
     level: bool
+    // Bit n for PWRUPn: its GPIO's level at the last sample, while the request is enabled, which is
+    // RAW_STATUS.
+    raw: u32
+    // Bit n for PWRUPn while it has been enabled and not yet sampled: its first sample sets RAW_STATUS
+    // and latches no edge.
+    fresh: u32
+    // Whether the chip must sample the power-up GPIOs as time passes: a PWRUP request is enabled, or a
+    // power-down is waiting.
+    watch: bool
 
     reset(*self)
         for i in 0..<POWMAN_WORDS
@@ -130,6 +244,9 @@ struct Powman
         self.rest = 0
         self.source = reg.TIMER_USING_LPOSC_MASK
         self.level = true
+        self.raw = 0
+        self.fresh = 0
+        self.watch = false
 
     private word(self, offset: u32) -> u32 = self.words[usize(offset / 4)]
 
@@ -248,9 +365,12 @@ struct Powman
         if t & reg.TIMER_RUN_MASK == 0 then return t
         t | self.source | (if self.synced() then reg.TIMER_USING_GPIO_1HZ_MASK else 0)
 
-    // INTR: the stored VREG_OUTPUT_LOW, and TIMER as the alarm has latched it.
-    private intr(self) -> u32 =
-        self.word(reg.INTR_OFFSET) | (if self.word(reg.TIMER_OFFSET) & reg.TIMER_ALARM_MASK != 0 then reg.INTR_TIMER_MASK else 0)
+    // INTR: the stored VREG_OUTPUT_LOW, TIMER as the alarm has latched it, and STATE's two flags.
+    private intr(self) -> u32
+        val s = self.word(reg.STATE_OFFSET)
+        self.word(reg.INTR_OFFSET) | (if self.word(reg.TIMER_OFFSET) & reg.TIMER_ALARM_MASK != 0 then reg.INTR_TIMER_MASK else 0) |
+            (if s & reg.STATE_REQ_IGNORED_MASK != 0 then reg.INTR_STATE_REQ_IGNORED_MASK else 0) |
+            (if s & reg.STATE_PWRUP_WHILE_WAITING_MASK != 0 then reg.INTR_PWRUP_WHILE_WAITING_MASK else 0)
 
     /** The interrupt status: forced or raised, and enabled. */
     ints(self) -> u32 = (self.intr() | self.word(reg.INTF_OFFSET)) & self.word(reg.INTE_OFFSET)
@@ -260,6 +380,154 @@ struct Powman
 
     /** Whether POWMAN_IRQ_TIMER is asserted. */
     irq_timer(self) -> bool = self.ints() & reg.INTR_TIMER_MASK != 0
+
+    /** STATE.CURRENT: a bit set for each domain powered down (`DOMAIN_SWCORE` and the rest). */
+    power_state(self) -> u32 = self.word(reg.STATE_OFFSET) & reg.STATE_CURRENT_MASK
+
+    /** Whether the switched core is powered down. */
+    swcore_off(self) -> bool = self.power_state() & DOMAIN_SWCORE != 0
+
+    /** Whether the chip must `sample` the power-up GPIOs as time passes: a PWRUP request is enabled, or
+     * a power-down is waiting for the processors.
+     */
+    watching(self) -> bool = self.watch
+
+    /** The GPIO PWRUPn watches: None while it is disabled or names a GPIO the package does not bond out
+     * (or no GPIO).
+     */
+    pwrup_gpio(self, n: u32) -> Option[u32]
+        val w = self.word(pwrup_offset(n))
+        val g = w & reg.PWRUP0_SOURCE_MASK
+        if w & reg.PWRUP0_ENABLE_MASK == 0 || g >= BONDED_GPIOS then None else Some(g)
+
+    /** The power-up requests asserted now, as CURRENT_PWRUP_REQ reads them. */
+    pwrup_requests(self) -> u32
+        var req: u32 = 0
+        for n in 0u32..<4
+            val w = self.word(pwrup_offset(n))
+            val watched = self.pwrup_gpio(n) match
+                Some(_) -> true
+                None -> false
+            if !watched then continue
+            val asserted =
+                if w & reg.PWRUP0_MODE_MASK != 0 then w & reg.PWRUP0_STATUS_MASK != 0
+                else (self.raw & (1 << n) != 0) == (w & reg.PWRUP0_DIRECTION_MASK != 0)
+            if asserted then req |= PWRUP_REQ_GPIO0 << n
+        val t = self.word(reg.TIMER_OFFSET)
+        if t & reg.TIMER_PWRUP_ON_ALARM_MASK != 0 && t & reg.TIMER_ALARM_ENAB_MASK != 0 && t & reg.TIMER_ALARM_MASK != 0 then req |= PWRUP_REQ_ALARM
+        req
+    end pwrup_requests
+
+    /** The GPIOs are at `levels` (bit n for GPIO n, as the pads present them to POWMAN): each enabled
+     * PWRUP's RAW_STATUS follows its GPIO, an edge one waits for latches its STATUS, and a power-down
+     * still waiting for the processors is cancelled by any power-up request now asserted.
+     */
+    sample(*self, levels: u64)
+        for n in 0u32..<4
+            val bit = 1u32 << n
+            val i = usize(pwrup_offset(n) / 4)
+            val w = self.words[i]
+            self.pwrup_gpio(n) match
+                Some(g) ->
+                    val now = (levels >> u64(g)) & 1 != 0
+                    val was = self.raw & bit != 0
+                    val edge = self.fresh & bit == 0 && now != was && now == (w & reg.PWRUP0_DIRECTION_MASK != 0)
+                    if w & reg.PWRUP0_MODE_MASK != 0 && edge then self.words[i] |= reg.PWRUP0_STATUS_MASK
+                    self.raw = if now then self.raw | bit else self.raw & ~bit
+                    self.fresh &= ~bit
+                None -> self.raw &= ~bit
+        self.cancel_if_woken()
+
+    // A power-down waiting for the processors while a power-up request is asserted is cancelled: REQ
+    // goes back to CURRENT and PWRUP_WHILE_WAITING latches.
+    private cancel_if_woken(*self)
+        val i = usize(reg.STATE_OFFSET / 4)
+        val s = self.words[i]
+        if s & reg.STATE_WAITING_MASK == 0 || self.pwrup_requests() == 0 then return
+        val current = s & reg.STATE_CURRENT_MASK
+        self.words[i] = (s & ~(reg.STATE_WAITING_MASK | reg.STATE_REQ_MASK)) | reg.STATE_PWRUP_WHILE_WAITING_MASK | (current << reg.STATE_REQ_SHIFT)
+        self.update_watch()
+
+    private update_watch(*self)
+        var any = self.word(reg.STATE_OFFSET) & reg.STATE_WAITING_MASK != 0
+        for n in 0u32..<4 do if self.word(pwrup_offset(n)) & reg.PWRUP0_ENABLE_MASK != 0 then any = true
+        self.watch = any
+
+    // REQ has been written with `target`, its value before the write `before`: the request judged and
+    // made (`judge`).
+    private request(*self, before: u32, target: u32)
+        val i = usize(reg.STATE_OFFSET / 4)
+        val s = self.words[i]
+        val current = s & reg.STATE_CURRENT_MASK
+        val kept = s & ~(reg.STATE_REQ_MASK | reg.STATE_WAITING_MASK | reg.STATE_BAD_SW_REQ_MASK | reg.STATE_CURRENT_MASK)
+        val req = target << reg.STATE_REQ_SHIFT
+        self.words[i] = judge(current, target, self.pwrup_requests()) match
+            Ignored -> (s & ~reg.STATE_REQ_MASK) | (before << reg.STATE_REQ_SHIFT) | reg.STATE_REQ_IGNORED_MASK
+            Bad -> kept | req | reg.STATE_BAD_SW_REQ_MASK | (current & target)
+            Waiting -> kept | req | reg.STATE_WAITING_MASK | current
+            Now -> kept | req | target
+        self.update_watch()
+
+    /** Whether a power-down of the switched core is waiting for the processors to halt (STATE.WAITING). */
+    power_down_due(self) -> bool = self.word(reg.STATE_OFFSET) & reg.STATE_WAITING_MASK != 0
+
+    /** The processors have halted, and the waiting power-down is made: CURRENT takes REQ, BOOTDIS.NEXT
+     * moves into NOW. Answers the state powered down to.
+     */
+    power_down(*self) -> u32
+        val i = usize(reg.STATE_OFFSET / 4)
+        val s = self.words[i]
+        val target = (s & reg.STATE_REQ_MASK) >> reg.STATE_REQ_SHIFT
+        self.words[i] = (s & ~(reg.STATE_WAITING_MASK | reg.STATE_CURRENT_MASK)) | target
+        val b = usize(reg.BOOTDIS_OFFSET / 4)
+        self.words[b] = (self.words[b] & reg.BOOTDIS_NOW_MASK) | ((self.words[b] & reg.BOOTDIS_NEXT_MASK) >> reg.BOOTDIS_NEXT_SHIFT)
+        self.update_watch()
+        target
+
+    /** Whether the switched core is down and a power-up request is asserted. */
+    wake_due(self) -> bool = self.swcore_off() && self.pwrup_requests() != 0
+
+    /** The switched core powers up for the requests now asserted: the switched core and the XIP cache
+     * come up, and each SRAM bank but one SEQ_CFG.HW_PWRUP_SRAMn keeps as it slept. Answers the state
+     * powered up to.
+     */
+    power_up(*self) -> u32
+        val requests = self.pwrup_requests()
+        val i = usize(reg.STATE_OFFSET / 4)
+        val s = self.words[i]
+        // HW_PWRUP_SRAM0 and SRAM1 sit at SRAM bank 0's and bank 1's bits in STATE.
+        val state = s & self.word(reg.SEQ_CFG_OFFSET) & (DOMAIN_SRAM0 | DOMAIN_SRAM1)
+        self.words[i] = (s & ~(reg.STATE_CURRENT_MASK | reg.STATE_REQ_MASK)) | state | (state << reg.STATE_REQ_SHIFT)
+        self.words[usize(reg.LAST_SWCORE_PWRUP_OFFSET / 4)] = requests
+        val c = usize(reg.CHIP_RESET_OFFSET / 4)
+        self.words[c] = (self.words[c] & ~CHIP_RESET_HAD) | reg.CHIP_RESET_HAD_SWCORE_PD_MASK
+        state
+
+    /** Why a write benchtop does not model is refused, by name; None for any other. Two are: a PWRUP
+     * enabled on a QSPI pin, and a request that powers an SRAM bank down while the switched core stays up.
+     */
+    unmodelled(self, offset: u32, width: u32, value: u32) -> Option[string]
+        access(offset, width, true) match
+            Ok(_) -> ()
+            Err(_) -> return None
+        val address = offset & 0xFFC
+        val data = replicated(value, width)
+        if (data >> 16) != POWMAN_PASSWORD then return None
+        val cur = self.word(address)
+        val next = written(cur, offset, data & 0xFFFF)
+        if address >= reg.PWRUP0_OFFSET && address <= reg.PWRUP3_OFFSET
+            val g = next & reg.PWRUP0_SOURCE_MASK
+            if next & reg.PWRUP0_ENABLE_MASK != 0 && g >= QSPI_FIRST && g <= QSPI_LAST
+                return Some(s"PWRUP${(address - reg.PWRUP0_OFFSET) / 4} enabled on SOURCE $g, a QSPI pin, whose level is not modelled")
+        if address == reg.STATE_OFFSET && is_request(offset, cur, next)
+            val current = cur & reg.STATE_CURRENT_MASK
+            val target = (next & reg.STATE_REQ_MASK) >> reg.STATE_REQ_SHIFT
+            val off = target & ~current & (DOMAIN_SRAM0 | DOMAIN_SRAM1)
+            if judge(current, target, self.pwrup_requests()) == Request.Now && off != 0
+                val banks = if off == (DOMAIN_SRAM0 | DOMAIN_SRAM1) then "SRAM banks 0 and 1" elif off == DOMAIN_SRAM0 then "SRAM bank 0" else "SRAM bank 1"
+                return Some(s"STATE.REQ 0x${hex(target)} powers $banks down while the switched core stays up, which is not modelled: the cores reach SRAM on their fast path")
+        None
+    end unmodelled
 
     /** Whether a write to the regulator's registers takes effect. */
     unlocked(self) -> bool = self.word(reg.VREG_CTRL_OFFSET) & reg.VREG_CTRL_UNLOCK_MASK != 0
@@ -283,6 +551,10 @@ struct Powman
             reg.TIMER_OFFSET -> self.timer()
             reg.READ_TIME_UPPER_OFFSET -> u32(self.time >> 32)
             reg.READ_TIME_LOWER_OFFSET -> u32.wrap(self.time)
+            reg.CURRENT_PWRUP_REQ_OFFSET -> self.pwrup_requests()
+            reg.PWRUP0_OFFSET | reg.PWRUP1_OFFSET | reg.PWRUP2_OFFSET | reg.PWRUP3_OFFSET ->
+                val n = (address - reg.PWRUP0_OFFSET) / 4
+                self.word(address) | (((self.raw >> n) & 1) << reg.PWRUP0_RAW_STATUS_SHIFT)
             _ -> self.word(address)
         Ok(read_lane(value, offset, width))
 
@@ -305,9 +577,17 @@ struct Powman
         var updated = w1c((cur & ~r.rw) | (next & r.rw), bits & r.wc)
         // UNLOCK, once set, stays set.
         if address == reg.VREG_CTRL_OFFSET then updated |= cur & reg.VREG_CTRL_UNLOCK_MASK
+        // BOOTDIS.NEXT ORs every write into what it holds, so nothing clears it.
+        if address == reg.BOOTDIS_OFFSET then updated |= next & reg.BOOTDIS_NEXT_MASK
         self.words[i] = updated
         if address == reg.TIMER_OFFSET then self.timer_written(cur, triggered(offset, bits) & TIMER_SC)
+        if address >= reg.PWRUP0_OFFSET && address <= reg.PWRUP3_OFFSET
+            if cur & reg.PWRUP0_ENABLE_MASK == 0 && updated & reg.PWRUP0_ENABLE_MASK != 0 then self.fresh |= 1u32 << ((address - reg.PWRUP0_OFFSET) / 4)
+            self.update_watch()
+        if address == reg.STATE_OFFSET && is_request(offset, cur, next)
+            self.request((cur & reg.STATE_REQ_MASK) >> reg.STATE_REQ_SHIFT, (next & reg.STATE_REQ_MASK) >> reg.STATE_REQ_SHIFT)
         self.check_alarm()
+        self.cancel_if_woken()
         Ok(())
 end Powman
 

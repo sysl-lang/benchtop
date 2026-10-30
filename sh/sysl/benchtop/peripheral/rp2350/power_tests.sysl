@@ -1,0 +1,280 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.rp2350.powman as pm
+
+// POWMAN's power states and power-up requests as registers, against `hardware/regs/powman.h` and the
+// SDK's `hardware_powman`: STATE's requests and flags, PWRUP0 to PWRUP3, CURRENT_PWRUP_REQ,
+// LAST_SWCORE_PWRUP, BOOTDIS, and the power-down and power-up the chip asks for.
+
+private const PW: u32 = 0x5AFE0000
+private const XOR: u32 = 0x1000
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const REQ_ALL_OFF: u32 = 0xF << pm.STATE_REQ_SHIFT
+
+private rd(p: *Powman, off: u32) -> u32 = p.read(off, 4).unwrap()
+private wr(p: *Powman, off: u32, x: u32) = p.write(off, 4, PW | x).unwrap()
+
+// PWRUPn's fields for a request on `gpio`: enabled, a level or an edge, high or low.
+private pwrup(gpio: u32, edge: bool, high: bool) -> u32 =
+    pm.PWRUP0_ENABLE_MASK | gpio | (if edge then pm.PWRUP0_MODE_MASK else 0) | (if high then pm.PWRUP0_DIRECTION_MASK else 0)
+
+private requests(p: *Powman) -> u32 = rd(p, pm.CURRENT_PWRUP_REQ_OFFSET)
+
+@test("POWMAN power states: reset values, read-only fields through every alias, and the password on STATE, PWRUPn and BOOTDIS")
+powman_power_reset_and_read_only()
+    var p = powman()
+    assert(rd(&p, pm.STATE_OFFSET) == 0 && p.power_state() == 0 && !p.swcore_off() && !p.power_down_due() && !p.watching())
+    for n in 0u32..<4 do assert(rd(&p, pm.PWRUP0_OFFSET + 4 * n) == 0x3F, s"PWRUP$n")
+    assert(requests(&p) == 0 && rd(&p, pm.LAST_SWCORE_PWRUP_OFFSET) == 0 && rd(&p, pm.BOOTDIS_OFFSET) == 0)
+    // CURRENT, WAITING, CHANGING and the BAD flags are read-only: only REQ is a request.
+    for alias in [0u32, XOR, SET]
+        wr(&p, pm.STATE_OFFSET + alias, 0x3C0F & ~pm.STATE_REQ_MASK)
+        assert(rd(&p, pm.STATE_OFFSET) == 0, s"alias 0x${alias}")
+    for alias in [0u32, XOR, SET, CLR]
+        wr(&p, pm.CURRENT_PWRUP_REQ_OFFSET + alias, 0x7F)
+        wr(&p, pm.LAST_SWCORE_PWRUP_OFFSET + alias, 0x7F)
+        assert(requests(&p) == 0 && rd(&p, pm.LAST_SWCORE_PWRUP_OFFSET) == 0, s"alias 0x${alias}")
+    // RAW_STATUS is read-only; the reserved bits read 0.
+    wr(&p, pm.PWRUP1_OFFSET, 0xFFFF & ~pm.PWRUP0_ENABLE_MASK)
+    assert(rd(&p, pm.PWRUP1_OFFSET) == 0x1BF, s"0x${rd(&p, pm.PWRUP1_OFFSET)}")
+    // Without the password nothing is written, through any alias, and BADPASSWD latches.
+    for off in [pm.STATE_OFFSET, pm.PWRUP0_OFFSET, pm.BOOTDIS_OFFSET]
+        for alias in [0u32, XOR, SET, CLR]
+            p.write(off + alias, 4, 0xFF).unwrap()
+    assert(rd(&p, pm.STATE_OFFSET) == 0 && rd(&p, pm.PWRUP0_OFFSET) == 0x3F && rd(&p, pm.BOOTDIS_OFFSET) == 0 && rd(&p, pm.BADPASSWD_OFFSET) == 1)
+    // A byte read of STATE takes its lane.
+    wr(&p, pm.STATE_OFFSET, REQ_ALL_OFF)
+    assert(p.read(pm.STATE_OFFSET + 1, 1).unwrap() == 0x10 && p.read(pm.STATE_OFFSET, 1).unwrap() == 0xF0)
+
+@test("POWMAN STATE: a request to power the switched core down waits, REQ rewritten changes or cancels it, and the power-down makes it")
+powman_state_waiting_and_power_down()
+    var p = powman()
+    wr(&p, pm.STATE_OFFSET, 0x8 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x1080 && p.power_down_due() && p.watching() && !p.swcore_off())
+    // Changed to P1.7 while it waits, then cancelled with the current state.
+    wr(&p, pm.STATE_OFFSET, REQ_ALL_OFF)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x10F0)
+    wr(&p, pm.STATE_OFFSET, 0)
+    assert(rd(&p, pm.STATE_OFFSET) == 0 && !p.power_down_due() && !p.watching(), "cancelled")
+    wr(&p, pm.STATE_OFFSET, 0xB << pm.STATE_REQ_SHIFT)
+    assert(p.power_down() == 0xB && rd(&p, pm.STATE_OFFSET) == 0xBB && p.swcore_off() && !p.power_down_due())
+
+@test("POWMAN STATE through the aliases: SET and XOR of REQ are requests, a CLR of REQ_IGNORED or one that leaves REQ as it was is not, and any alias clears a flag")
+powman_state_aliases()
+    var p = powman()
+    wr(&p, pm.STATE_OFFSET + SET, 0x8 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x1080, "SET is a request")
+    wr(&p, pm.STATE_OFFSET + XOR, 0x8 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0, "XOR back to 0 cancels it")
+    wr(&p, pm.STATE_OFFSET, 0x6 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x460)
+    // SET of bits REQ already holds leaves it as it was, and BAD_SW_REQ with it.
+    wr(&p, pm.STATE_OFFSET + SET, 0x2 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x460)
+    // A CLR of a flag alone is no request; a CLR that changes REQ is.
+    wr(&p, pm.STATE_OFFSET + CLR, pm.STATE_REQ_IGNORED_MASK)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x460)
+    wr(&p, pm.STATE_OFFSET + CLR, 0x6 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0, "REQ 0: valid, and BAD_SW_REQ clears")
+
+@test("POWMAN STATE: invalid requests set BAD_SW_REQ, keep REQ as written, make their power-ups and not their power-downs")
+powman_state_bad_requests()
+    var p = powman()
+    // The switched core up with the XIP cache down.
+    wr(&p, pm.STATE_OFFSET, 0x4 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x440 && !p.power_down_due())
+    wr(&p, pm.STATE_OFFSET, 0x7 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x470)
+    // Powered up from P1.7 with SRAM bank 0 kept off (SEQ_CFG), into 0x2.
+    wr(&p, pm.SEQ_CFG_OFFSET + SET, pm.SEQ_CFG_HW_PWRUP_SRAM0_MASK)
+    wr(&p, pm.STATE_OFFSET, REQ_ALL_OFF)
+    p.power_down()
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK | pm.TIMER_PWRUP_ON_ALARM_MASK | pm.TIMER_ALARM_ENAB_MASK)
+    assert(p.wake_due() && p.power_up() == 0x2 && rd(&p, pm.STATE_OFFSET) == 0x22)
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_ENAB_MASK)
+    // Bank 0 up and bank 1 down at once: mixed, so bank 0 comes up and bank 1 stays up.
+    wr(&p, pm.STATE_OFFSET, 0x1 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x410, s"0x${rd(&p, pm.STATE_OFFSET)}")
+    // Then a valid one: every domain up, BAD_SW_REQ cleared.
+    wr(&p, pm.STATE_OFFSET, 0)
+    assert(rd(&p, pm.STATE_OFFSET) == 0 && p.power_state() == 0)
+
+@test("POWMAN STATE: a power-down asked for while a power-up request is asserted is ignored (REQ kept, REQ_IGNORED, POWMAN_IRQ_POW); one that keeps the switched core up is not")
+powman_state_request_ignored()
+    var p = powman()
+    wr(&p, pm.INTE_OFFSET, pm.INTE_STATE_REQ_IGNORED_MASK)
+    wr(&p, pm.PWRUP2_OFFSET, pwrup(9, false, true))
+    p.sample(1u64 << 9)
+    assert(requests(&p) == 0x8)
+    wr(&p, pm.STATE_OFFSET, REQ_ALL_OFF)
+    assert(rd(&p, pm.STATE_OFFSET) == pm.STATE_REQ_IGNORED_MASK && !p.power_down_due())
+    assert(rd(&p, pm.INTR_OFFSET) == pm.INTR_STATE_REQ_IGNORED_MASK && p.irq_pow())
+    // INTR's copy is read-only; STATE's flag clears through CLR (`powman_clear_bits`) as through the plain address.
+    wr(&p, pm.INTR_OFFSET, pm.INTR_STATE_REQ_IGNORED_MASK)
+    assert(p.irq_pow())
+    wr(&p, pm.STATE_OFFSET + CLR, pm.STATE_REQ_IGNORED_MASK)
+    assert(rd(&p, pm.STATE_OFFSET) == 0 && !p.irq_pow())
+    wr(&p, pm.STATE_OFFSET, REQ_ALL_OFF)
+    wr(&p, pm.STATE_OFFSET, pm.STATE_REQ_IGNORED_MASK)
+    assert(rd(&p, pm.STATE_OFFSET) == 0, "a plain 1 clears it, and REQ 0 is a valid request")
+    // The XIP cache alone is not the switched core: the switched core stays up, so it is invalid, not ignored.
+    wr(&p, pm.STATE_OFFSET, 0x4 << pm.STATE_REQ_SHIFT)
+    assert(rd(&p, pm.STATE_OFFSET) == 0x440)
+
+@test("POWMAN STATE: a power-up request asserting while the power-down waits cancels it and latches PWRUP_WHILE_WAITING")
+powman_state_pwrup_while_waiting()
+    var p = powman()
+    wr(&p, pm.PWRUP0_OFFSET, pwrup(3, true, false))
+    p.sample(1u64 << 3)
+    wr(&p, pm.STATE_OFFSET, 0xC << pm.STATE_REQ_SHIFT)
+    assert(p.power_down_due())
+    p.sample(0)
+    assert(rd(&p, pm.STATE_OFFSET) == pm.STATE_PWRUP_WHILE_WAITING_MASK && !p.power_down_due())
+    assert(rd(&p, pm.INTR_OFFSET) == pm.INTR_PWRUP_WHILE_WAITING_MASK)
+    wr(&p, pm.INTE_OFFSET, pm.INTE_PWRUP_WHILE_WAITING_MASK)
+    assert(p.irq_pow())
+    wr(&p, pm.STATE_OFFSET + XOR, pm.STATE_PWRUP_WHILE_WAITING_MASK)
+    assert(rd(&p, pm.STATE_OFFSET) == 0 && !p.irq_pow(), "XOR of a 1 clears it too")
+    // The alarm as a request does the same.
+    wr(&p, pm.PWRUP0_OFFSET + CLR, pm.PWRUP0_ENABLE_MASK)
+    wr(&p, pm.STATE_OFFSET, REQ_ALL_OFF)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK | pm.TIMER_PWRUP_ON_ALARM_MASK | pm.TIMER_ALARM_ENAB_MASK)
+    assert(rd(&p, pm.STATE_OFFSET) == pm.STATE_PWRUP_WHILE_WAITING_MASK && requests(&p) == 0x40)
+
+@test("POWMAN PWRUPn: a level request asserts while its GPIO is at the level, RAW_STATUS follows it while enabled, and disabling it withdraws the request")
+powman_pwrup_level()
+    var p = powman()
+    wr(&p, pm.PWRUP1_OFFSET, pwrup(29, false, false))
+    assert(p.watching())
+    p.sample(0)
+    assert(requests(&p) == 0x4 && rd(&p, pm.PWRUP1_OFFSET) & pm.PWRUP0_RAW_STATUS_MASK == 0, "low: asserted")
+    p.sample(1u64 << 29)
+    assert(requests(&p) == 0 && rd(&p, pm.PWRUP1_OFFSET) & pm.PWRUP0_RAW_STATUS_MASK != 0, "high: not")
+    wr(&p, pm.PWRUP1_OFFSET + SET, pm.PWRUP0_DIRECTION_MASK)
+    assert(requests(&p) == 0x4, "now active high")
+    wr(&p, pm.PWRUP1_OFFSET + CLR, pm.PWRUP0_ENABLE_MASK)
+    p.sample(1u64 << 29)
+    assert(requests(&p) == 0 && rd(&p, pm.PWRUP1_OFFSET) & pm.PWRUP0_RAW_STATUS_MASK == 0 && !p.watching(), "disabled: no request, RAW_STATUS 0")
+    // All four at once, each its own bit.
+    for n in 0u32..<4 do wr(&p, pm.PWRUP0_OFFSET + 4 * n, pwrup(n, false, true))
+    p.sample(0xF)
+    assert(requests(&p) == 0x1E)
+
+@test("POWMAN PWRUPn: an edge request latches STATUS on its edge only, once, until a 1 clears it through any alias; enabling it at the edge's level latches nothing")
+powman_pwrup_edge()
+    var p = powman()
+    wr(&p, pm.PWRUP0_OFFSET, pwrup(14, true, true))
+    p.sample(1u64 << 14)
+    assert(requests(&p) == 0 && rd(&p, pm.PWRUP0_OFFSET) & pm.PWRUP0_STATUS_MASK == 0, "already high when enabled: no edge")
+    p.sample(0)
+    assert(requests(&p) == 0, "a falling edge is not the rising one")
+    p.sample(1u64 << 14)
+    p.sample(0)
+    assert(requests(&p) == 0x2 && rd(&p, pm.PWRUP0_OFFSET) & pm.PWRUP0_STATUS_MASK != 0, "latched, and held after the level falls")
+    // Writing the register with STATUS 0 does not clear it; a 1 through CLR does.
+    wr(&p, pm.PWRUP0_OFFSET, pwrup(14, true, true))
+    assert(requests(&p) == 0x2)
+    wr(&p, pm.PWRUP0_OFFSET + CLR, pm.PWRUP0_STATUS_MASK)
+    assert(requests(&p) == 0 && rd(&p, pm.PWRUP0_OFFSET) == pwrup(14, true, true))
+    // Falling-edge mode, and a latched edge kept while disabled but withdrawn as a request.
+    wr(&p, pm.PWRUP0_OFFSET + CLR, pm.PWRUP0_DIRECTION_MASK)
+    p.sample(1u64 << 14)
+    p.sample(0)
+    assert(requests(&p) == 0x2)
+    wr(&p, pm.PWRUP0_OFFSET + CLR, pm.PWRUP0_ENABLE_MASK)
+    assert(requests(&p) == 0 && rd(&p, pm.PWRUP0_OFFSET) & pm.PWRUP0_STATUS_MASK != 0)
+    wr(&p, pm.PWRUP0_OFFSET + SET, pm.PWRUP0_STATUS_MASK)
+    assert(rd(&p, pm.PWRUP0_OFFSET) & pm.PWRUP0_STATUS_MASK == 0, "SET of a 1 clears it as well")
+
+@test("POWMAN PWRUPn: a source the QFN-60 package does not bond out (30 to 47) or that names nothing (54 to 63) never asserts; GPIO 29 is the last that does")
+powman_pwrup_invalid_sources()
+    var p = powman()
+    for g in [30u32, 47, 54, 63]
+        wr(&p, pm.PWRUP0_OFFSET, pwrup(g, false, false))
+        p.sample(0)
+        assert(requests(&p) == 0 && rd(&p, pm.PWRUP0_OFFSET) == pwrup(g, false, false) && p.pwrup_gpio(0).is_none(), s"source $g")
+    wr(&p, pm.PWRUP0_OFFSET, pwrup(29, false, false))
+    p.sample(0)
+    assert(requests(&p) == 0x2)
+    // The QSPI sources are refused by name before the write, and plainly stored while disabled.
+    assert(p.unmodelled(pm.PWRUP0_OFFSET, 4, PW | pwrup(50, false, true)).unwrap_or("") == "PWRUP0 enabled on SOURCE 50, a QSPI pin, whose level is not modelled")
+    assert(p.unmodelled(pm.PWRUP0_OFFSET, 4, PW | 50).is_none() && p.unmodelled(pm.PWRUP0_OFFSET, 4, pwrup(50, false, true)).is_none())
+
+@test("POWMAN alarm power-up: a request while PWRUP_ON_ALARM and ALARM_ENAB are set and ALARM has latched; clearing ALARM_ENAB withdraws it")
+powman_alarm_request()
+    var p = powman()
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK | pm.TIMER_ALARM_ENAB_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) & pm.TIMER_ALARM_MASK != 0 && requests(&p) == 0, "no PWRUP_ON_ALARM")
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_PWRUP_ON_ALARM_MASK)
+    assert(requests(&p) == 0x40)
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_ENAB_MASK)
+    assert(requests(&p) == 0 && rd(&p, pm.TIMER_OFFSET) & pm.TIMER_ALARM_MASK != 0, "ALARM still latched, no request")
+
+@test("POWMAN BOOTDIS: NEXT is set by any write of 1 and cleared by none; the power-down ORs it into NOW and clears it; NOW clears on a 1 through any alias")
+powman_bootdis()
+    var p = powman()
+    wr(&p, pm.BOOTDIS_OFFSET, pm.BOOTDIS_NOW_MASK)
+    assert(rd(&p, pm.BOOTDIS_OFFSET) == 0, "NOW cannot be set")
+    for alias in [0u32, XOR, SET]
+        var q = powman()
+        wr(&q, pm.BOOTDIS_OFFSET + alias, pm.BOOTDIS_NEXT_MASK)
+        assert(rd(&q, pm.BOOTDIS_OFFSET) == pm.BOOTDIS_NEXT_MASK, s"alias 0x${alias}")
+    wr(&p, pm.BOOTDIS_OFFSET + SET, pm.BOOTDIS_NEXT_MASK)
+    wr(&p, pm.BOOTDIS_OFFSET + CLR, pm.BOOTDIS_NEXT_MASK)
+    wr(&p, pm.BOOTDIS_OFFSET, 0)
+    wr(&p, pm.BOOTDIS_OFFSET + XOR, pm.BOOTDIS_NEXT_MASK)
+    assert(rd(&p, pm.BOOTDIS_OFFSET) == pm.BOOTDIS_NEXT_MASK, "nothing clears NEXT")
+    wr(&p, pm.STATE_OFFSET, REQ_ALL_OFF)
+    p.power_down()
+    assert(rd(&p, pm.BOOTDIS_OFFSET) == pm.BOOTDIS_NOW_MASK)
+    // A second power-down with NEXT clear keeps NOW.
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK | pm.TIMER_PWRUP_ON_ALARM_MASK | pm.TIMER_ALARM_ENAB_MASK)
+    p.power_up()
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_ENAB_MASK)
+    wr(&p, pm.STATE_OFFSET, REQ_ALL_OFF)
+    p.power_down()
+    assert(rd(&p, pm.BOOTDIS_OFFSET) == pm.BOOTDIS_NOW_MASK)
+    for alias in [0u32, XOR, SET, CLR]
+        var q = p
+        wr(&q, pm.BOOTDIS_OFFSET + alias, pm.BOOTDIS_NOW_MASK)
+        assert(rd(&q, pm.BOOTDIS_OFFSET) == 0, s"alias 0x${alias}")
+
+@test("POWMAN power-up: the switched core and XIP cache come up, SEQ_CFG.HW_PWRUP_SRAMn keeps a bank as it slept, LAST_SWCORE_PWRUP and CHIP_RESET record it, and nothing wakes a switched core that is up")
+powman_power_up()
+    var p = powman()
+    wr(&p, pm.CHIP_RESET_OFFSET, pm.CHIP_RESET_DOUBLE_TAP_MASK)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK | pm.TIMER_PWRUP_ON_ALARM_MASK | pm.TIMER_ALARM_ENAB_MASK)
+    assert(!p.wake_due(), "up already")
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_ENAB_MASK)
+    // P1 with SRAM bank 0 off and bank 1 on: HW_PWRUP_SRAM0 keeps bank 0 off; HW_PWRUP_SRAM1 keeps bank 1 on.
+    wr(&p, pm.SEQ_CFG_OFFSET + SET, pm.SEQ_CFG_HW_PWRUP_SRAM0_MASK | pm.SEQ_CFG_HW_PWRUP_SRAM1_MASK)
+    wr(&p, pm.STATE_OFFSET, 0xE << pm.STATE_REQ_SHIFT)
+    assert(p.power_down() == 0xE && !p.wake_due())
+    wr(&p, pm.PWRUP3_OFFSET, pwrup(2, false, true))
+    p.sample(1u64 << 2)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_ALARM_ENAB_MASK)
+    assert(p.wake_due() && requests(&p) == 0x50)
+    assert(p.power_up() == 0x2 && rd(&p, pm.STATE_OFFSET) == 0x22 && !p.swcore_off())
+    assert(rd(&p, pm.LAST_SWCORE_PWRUP_OFFSET) == 0x50, "both requests")
+    assert(rd(&p, pm.CHIP_RESET_OFFSET) == pm.CHIP_RESET_HAD_SWCORE_PD_MASK | pm.CHIP_RESET_DOUBLE_TAP_MASK, "HAD_POR gone, DOUBLE_TAP kept")
+    // HW_PWRUP_SRAMn clear: the bank comes up.
+    wr(&p, pm.SEQ_CFG_OFFSET + CLR, pm.SEQ_CFG_HW_PWRUP_SRAM0_MASK)
+    wr(&p, pm.PWRUP3_OFFSET + CLR, pm.PWRUP0_ENABLE_MASK)
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_ENAB_MASK)
+    wr(&p, pm.STATE_OFFSET, 0xA << pm.STATE_REQ_SHIFT)
+    p.power_down()
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_ALARM_ENAB_MASK)
+    assert(p.power_up() == 0 && rd(&p, pm.LAST_SWCORE_PWRUP_OFFSET) == 0x40)
+
+@test("POWMAN STATE: a valid request powering an SRAM bank down with the switched core up is unmodelled by name; invalid, ignored, P1 or password-less ones are not")
+powman_state_unmodelled()
+    var p = powman()
+    val why = p.unmodelled(pm.STATE_OFFSET, 4, PW | 0x20).unwrap_or("")
+    assert(why == "STATE.REQ 0x2 powers SRAM bank 0 down while the switched core stays up, which is not modelled: the cores reach SRAM on their fast path", why)
+    assert(p.unmodelled(pm.STATE_OFFSET + SET, 4, PW | 0x30).unwrap_or("").contains("SRAM banks 0 and 1"))
+    assert(p.unmodelled(pm.STATE_OFFSET, 4, PW | 0x60).is_none(), "invalid")
+    assert(p.unmodelled(pm.STATE_OFFSET, 4, PW | 0xA0).is_none(), "P1")
+    assert(p.unmodelled(pm.STATE_OFFSET, 4, 0x20).is_none(), "no password")
+    assert(p.unmodelled(pm.STATE_OFFSET + 1, 4, PW | 0x20).is_none(), "unaligned: the access is refused anyway")
