@@ -1,0 +1,143 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.powman as reg
+
+// POWMAN, the power manager (datasheet 6), as a store: the voltage regulator, the brown-out detector,
+// the low-power oscillator and crystal settings, the sequencer's configuration, the debug
+// settings, the scratch and boot registers, and the interrupt registers. The power states, the
+// always-on timer and the power-up requests (STATE, the TIMER registers, PWRUP0 to PWRUP3,
+// CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP, BOOTDIS) are the AON-timer item's, and are refused by name.
+//
+// **A write needs a password.** Bits 31:16 of the data on the bus must be 0x5AFE (`POWMAN_PASSWORD_BITS`),
+// through any of the four aliases and at any width, and only the low 16 bits of the word are written.
+// Any other write is dropped and latches BADPASSWD. SCRATCH0 to SCRATCH7 and BOOT0 to BOOT3 are 32 bits wide and take
+// no password.
+//
+// **The regulator's interface is locked** until VREG_CTRL.UNLOCK is set, which nothing can clear again
+// but a power-on: VREG, VREG_LP_ENTRY and VREG_LP_EXIT drop writes while it is clear. An update completes at once,
+// so VREG.UPDATE_IN_PROGRESS reads 0 and VREG_STS.VOUT_OK reads 1 (the output is in range); VSEL is
+// stored as written, and `vreg_vsel` is the value the regulator drives, which is limited to 1.30 V (0xF)
+// unless VREG_CTRL.DISABLE_VOLTAGE_LIMIT is set.
+//
+// CHIP_RESET reports the last reset, which at power-on is HAD_POR. Its RESCUE_FLAG clears on a write of 1.
+// INTS is (INTR | INTF) & INTE; the interrupts have no event behind them yet but the forced ones.
+
+/** Every write's password, in bits 31:16. */
+const POWMAN_PASSWORD: u32 = 0x5AFE
+
+private const POWMAN_WORDS: usize = 60
+
+/** One stored register: its power-on value, the bits a write changes, and the bits a write of 1 clears. */
+private struct PowmanReg
+    reset: u32
+    rw: u32
+    wc: u32
+
+// The stored registers, by offset; None for what this model leaves to the AON-timer item.
+private spec(offset: u32) -> Option[PowmanReg] = offset match
+    reg.BADPASSWD_OFFSET -> Some(PowmanReg(0, 0, 1))
+    reg.VREG_CTRL_OFFSET -> Some(PowmanReg(0x8050, 0xB170, 0))
+    reg.VREG_STS_OFFSET -> Some(PowmanReg(0x1, 0, 0))
+    reg.VREG_OFFSET -> Some(PowmanReg(0xB0, 0x1F2, 0))
+    reg.VREG_LP_ENTRY_OFFSET -> Some(PowmanReg(0xB4, 0x1F6, 0))
+    reg.VREG_LP_EXIT_OFFSET -> Some(PowmanReg(0xB0, 0x1F6, 0))
+    reg.BOD_CTRL_OFFSET -> Some(PowmanReg(0, 0x1000, 0))
+    reg.BOD_OFFSET -> Some(PowmanReg(0xB1, 0x1F1, 0))
+    reg.BOD_LP_ENTRY_OFFSET -> Some(PowmanReg(0xB0, 0x1F1, 0))
+    reg.BOD_LP_EXIT_OFFSET -> Some(PowmanReg(0xB1, 0x1F1, 0))
+    reg.LPOSC_OFFSET -> Some(PowmanReg(0x203, 0x3F3, 0))
+    reg.CHIP_RESET_OFFSET -> Some(PowmanReg(reg.CHIP_RESET_HAD_POR_MASK, reg.CHIP_RESET_DOUBLE_TAP_MASK, reg.CHIP_RESET_RESCUE_FLAG_MASK))
+    reg.WDSEL_OFFSET -> Some(PowmanReg(0, 0x1111, 0))
+    reg.SEQ_CFG_OFFSET -> Some(PowmanReg(0x001011F0, 0x11F3, 0))
+    reg.POW_FASTDIV_OFFSET -> Some(PowmanReg(0x40, 0x7FF, 0))
+    reg.POW_DELAY_OFFSET -> Some(PowmanReg(0x2011, 0xFFFF, 0))
+    reg.EXT_CTRL0_OFFSET | reg.EXT_CTRL1_OFFSET -> Some(PowmanReg(0x3F, 0x713F, 0))
+    reg.EXT_TIME_REF_OFFSET -> Some(PowmanReg(0, 0x13, 0))
+    reg.LPOSC_FREQ_KHZ_INT_OFFSET -> Some(PowmanReg(0x20, 0x3F, 0))
+    reg.LPOSC_FREQ_KHZ_FRAC_OFFSET -> Some(PowmanReg(0xC49C, 0xFFFF, 0))
+    reg.XOSC_FREQ_KHZ_INT_OFFSET -> Some(PowmanReg(0x2EE0, 0xFFFF, 0))
+    reg.XOSC_FREQ_KHZ_FRAC_OFFSET -> Some(PowmanReg(0, 0xFFFF, 0))
+    reg.DBG_PWRCFG_OFFSET -> Some(PowmanReg(0, 0x1, 0))
+    reg.DBGCONFIG_OFFSET -> Some(PowmanReg(0, 0xF, 0))
+    reg.SCRATCH0_OFFSET | reg.SCRATCH1_OFFSET | reg.SCRATCH2_OFFSET | reg.SCRATCH3_OFFSET | reg.SCRATCH4_OFFSET | reg.SCRATCH5_OFFSET | reg.SCRATCH6_OFFSET | reg.SCRATCH7_OFFSET -> Some(PowmanReg(0, 0xFFFFFFFF, 0))
+    reg.BOOT0_OFFSET | reg.BOOT1_OFFSET | reg.BOOT2_OFFSET | reg.BOOT3_OFFSET -> Some(PowmanReg(0, 0xFFFFFFFF, 0))
+    reg.INTR_OFFSET -> Some(PowmanReg(0, 0, reg.INTR_VREG_OUTPUT_LOW_MASK))
+    reg.INTE_OFFSET | reg.INTF_OFFSET -> Some(PowmanReg(0, 0xF, 0))
+    reg.INTS_OFFSET -> Some(PowmanReg(0, 0, 0))
+    _ -> None
+
+// SCRATCH0 to BOOT3, the 32-bit registers that take no password.
+private unprotected(offset: u32) -> bool = offset >= reg.SCRATCH0_OFFSET && offset <= reg.BOOT3_OFFSET
+
+// The regulator's registers, which UNLOCK gates.
+private regulator(offset: u32) -> bool = offset == reg.VREG_OFFSET || offset == reg.VREG_LP_ENTRY_OFFSET || offset == reg.VREG_LP_EXIT_OFFSET
+
+struct Powman
+    words: [60]u32
+
+    reset(*self)
+        for i in 0..<POWMAN_WORDS
+            val found = spec(u32(i) * 4)
+            self.words[i] = found match
+                Some(r) -> r.reset
+                None -> 0
+
+    private word(self, offset: u32) -> u32 = self.words[usize(offset / 4)]
+
+    /** The interrupt status: forced or raised, and enabled. */
+    ints(self) -> u32 = (self.word(reg.INTR_OFFSET) | self.word(reg.INTF_OFFSET)) & self.word(reg.INTE_OFFSET)
+
+    /** Whether POWMAN_IRQ_POW is asserted: PWRUP_WHILE_WAITING, STATE_REQ_IGNORED or VREG_OUTPUT_LOW. */
+    irq_pow(self) -> bool = self.ints() & (reg.INTR_PWRUP_WHILE_WAITING_MASK | reg.INTR_STATE_REQ_IGNORED_MASK | reg.INTR_VREG_OUTPUT_LOW_MASK) != 0
+
+    /** Whether POWMAN_IRQ_TIMER is asserted. */
+    irq_timer(self) -> bool = self.ints() & reg.INTR_TIMER_MASK != 0
+
+    /** Whether a write to the regulator's registers takes effect. */
+    unlocked(self) -> bool = self.word(reg.VREG_CTRL_OFFSET) & reg.VREG_CTRL_UNLOCK_MASK != 0
+
+    /** The regulator's output select, as the regulator drives it: VSEL, limited to 0xF (1.30 V) while the
+     * voltage limit is on.
+     */
+    vreg_vsel(self) -> u32
+        val vsel = (self.word(reg.VREG_OFFSET) & reg.VREG_VSEL_MASK) >> reg.VREG_VSEL_SHIFT
+        if self.word(reg.VREG_CTRL_OFFSET) & reg.VREG_CTRL_DISABLE_VOLTAGE_LIMIT_MASK != 0 || vsel <= 0xF then vsel else 0xF
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        spec(address) match
+            Some(_) -> ()
+            None -> return Err(AccessError.Unmapped)
+        val value = if address == reg.INTS_OFFSET then self.ints() else self.word(address)
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        val r = spec(address) match
+            Some(found) -> found
+            None -> return Err(AccessError.Unmapped)
+        val data = replicated(value, width)
+        val i = usize(address / 4)
+        if !unprotected(address) && (data >> 16) != POWMAN_PASSWORD
+            self.words[0] |= 1
+            return Ok(())
+        if regulator(address) && !self.unlocked() then return Ok(())
+        val cur = self.words[i]
+        val bits = if unprotected(address) then data else data & 0xFFFF
+        val next = written(cur, offset, bits)
+        var updated = (cur & ~r.rw) | (next & r.rw)
+        // A write of 1 clears a write-1-to-clear bit; a clear alias writes no ones.
+        if (offset >> 12) & 3 != 3 then updated = updated & ~(bits & r.wc)
+        // UNLOCK, once set, stays set.
+        if address == reg.VREG_CTRL_OFFSET then updated |= cur & reg.VREG_CTRL_UNLOCK_MASK
+        self.words[i] = updated
+        Ok(())
+end Powman
+
+powman() -> Powman
+    var state: Powman
+    state.reset()
+    state

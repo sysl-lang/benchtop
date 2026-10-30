@@ -1,0 +1,99 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.accessctrl as reg
+
+// ACCESSCTRL (datasheet 10.6), stored: the registers hold what the security code writes and read it back,
+// and nothing else on the chip consults them, since the board runs Secure-only (docs/rp-coverage.md, cut
+// line Q3). The reset state grants Secure code everything.
+//
+// **A write needs a password.** Bits 31:16 of the data on the bus must be 0xACCE (`ACCESSCTRL_PASSWORD_BITS`)
+// for every register but GPIO_NSMASK0 and GPIO_NSMASK1, which take all 32 bits (the SDK's `gpio_set_ns` writes them
+// plain). A write with another password is dropped.
+//
+// **LOCK** is set a bit at a time and cannot be cleared: a bit written 1 stays 1 until ACCESSCTRL is reset
+// (a power-on). LOCK.DMA is hardwired 1. A core whose bit is set has all its later writes to ACCESSCTRL
+// dropped, the LOCK register's included. The debugger's bit has no master to lock here.
+//
+// **CFGRESET**, written 1, returns every register but LOCK and FORCE_CORE_NS to its reset value; it
+// reads 0.
+
+private const ACCESS_PASSWORD: u32 = 0xACCE
+private const LOCK_WRITABLE: u32 = 0xB
+private const LOCK_DMA: u32 = 0x4
+private const FORCE_CORE1: u32 = 0x2
+private const NSMASK1_WRITABLE: u32 = 0xFF00FFFF
+/** Each per-device register (ROM at 0x14 to XIP_AUX at 0xE8) holds eight access bits. */
+private const DEVICE_WORDS: usize = 54
+
+// A per-device register's reset value: the bits for each master and privilege level that may reach
+// the device.
+private device_reset(offset: u32) -> u32
+    if offset <= reg.SRAM9_OFFSET then return 0xFF
+    if offset <= reg.PIO2_OFFSET then return 0xFC
+    if offset <= reg.CORESIGHT_PERIPH_OFFSET then return 0xB8
+    if offset == reg.SYSINFO_OFFSET then return 0xFF
+    if offset == reg.SHA256_OFFSET || offset == reg.XIP_AUX_OFFSET then return 0xF8
+    if offset >= reg.RESETS_OFFSET && offset <= reg.TBMAN_OFFSET then return 0xFC
+    0xB8
+
+struct AccessCtrl
+    lock: u32
+    force_ns: u32
+    nsmask0: u32
+    nsmask1: u32
+    devices: [54]u32
+
+    reset(*self)
+        self.lock = LOCK_DMA
+        self.force_ns = 0
+        self.reset_config()
+
+    // Everything CFGRESET returns to its reset value.
+    private reset_config(*self)
+        self.nsmask0 = 0
+        self.nsmask1 = 0
+        for i in 0..<DEVICE_WORDS do self.devices[i] = device_reset(reg.ROM_OFFSET + u32(i) * 4)
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        val value = address match
+            reg.LOCK_OFFSET -> self.lock
+            reg.FORCE_CORE_NS_OFFSET -> self.force_ns
+            reg.CFGRESET_OFFSET -> 0
+            reg.GPIO_NSMASK0_OFFSET -> self.nsmask0
+            reg.GPIO_NSMASK1_OFFSET -> self.nsmask1
+            _ ->
+                if address < reg.ROM_OFFSET || address > reg.XIP_AUX_OFFSET then return Err(AccessError.Unmapped)
+                self.devices[usize((address - reg.ROM_OFFSET) / 4)]
+        Ok(read_lane(value, offset, width))
+
+    /** A write of `width` bytes by core `core`. */
+    write(*self, core: u32, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        if address > reg.XIP_AUX_OFFSET then return Err(AccessError.Unmapped)
+        val data = replicated(value, width)
+        // The unprotected registers keep all 32 bits; the rest take the low 16 behind the password.
+        val plain = address == reg.GPIO_NSMASK0_OFFSET || address == reg.GPIO_NSMASK1_OFFSET
+        if !plain && (data >> 16) != ACCESS_PASSWORD then return Ok(())
+        if core < 2 && self.lock & (1u32 << core) != 0 then return Ok(())
+        val bits = if plain then data else data & 0xFFFF
+        address match
+            reg.LOCK_OFFSET -> self.lock = self.lock | (written(0, offset, bits) & LOCK_WRITABLE)
+            reg.FORCE_CORE_NS_OFFSET -> self.force_ns = written(self.force_ns, offset, bits) & FORCE_CORE1
+            reg.CFGRESET_OFFSET -> if (offset >> 12) & 3 != 3 && bits & 1 != 0 then self.reset_config()
+            reg.GPIO_NSMASK0_OFFSET -> self.nsmask0 = written(self.nsmask0, offset, bits)
+            reg.GPIO_NSMASK1_OFFSET -> self.nsmask1 = written(self.nsmask1, offset, bits) & NSMASK1_WRITABLE
+            _ ->
+                if address < reg.ROM_OFFSET then return Err(AccessError.Unmapped)
+                val i = usize((address - reg.ROM_OFFSET) / 4)
+                self.devices[i] = written(self.devices[i], offset, bits) & 0xFF
+        Ok(())
+end AccessCtrl
+
+accessctrl() -> AccessCtrl
+    var state: AccessCtrl
+    state.reset()
+    state
