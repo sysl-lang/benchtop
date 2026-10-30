@@ -675,32 +675,46 @@ FPv5-SP, an 8-region MPU per security state (`M33_MPU_TYPE_DREGION_RESET 0x08`, 
 8-region SAU (`M33_SAU_TYPE_SREGION_RESET 0x08`, `m33.h:5490`). The reference is the ARMv8-M
 Architecture Reference Manual (DDI0553), cited by chapter title. Over §2.1's v7E-M:
 
-- **The security extension (TrustZone), Secure state only.** A Pico SDK image is an **ARM Secure**
-  image (`picotool info` prints `image type: ARM Secure`, `pico-scratch/CLAUDE.md`), and the SDK's
-  `crt0.S` never programs the SAU or leaves Secure state. So the minimum faithful model is:
-  - the core resets into Secure state and stays there. Every banked register (MSP, PSP, MSPLIM,
-    PSPLIM, CONTROL, PRIMASK, BASEPRI, FAULTMASK, VTOR, SysTick, the MPU, parts of the SCB) is its
-    Secure copy;
-  - the SAU (`SAU_CTRL`, `SAU_TYPE`, `SAU_RNR`, `SAU_RBAR`, `SAU_RLAR`) is stored, and with it
-    disabled and `ALLNS` clear every address is Secure, which is what the SDK runs under;
-  - `TT`/`TTT`/`TTA`/`TTAT` answer from the SAU and MPU as stored, since compilers emit them for
-    `cmse_check_address_range`;
-  - EXC_RETURN carries the v8-M bits (`S`, `DCRS`, `ES`, and `FType` in bit 4, which skiff reads) with
-    Secure values. Code compares these values, so they must be exact;
-  - SecureFault and `SFSR`/`SFAR` exist, and a Non-secure transition (`BXNS`, `BLXNS`, an
-    EXC_RETURN naming the Non-secure stack or callee-stacked frame, `MRS`/`MSR` of a `_NS` register)
-    **stops the run with a named diagnostic, "Non-secure state is not modelled"**, rather than doing
-    something plausible. `SG` is a NOP in Secure state, as the architecture has it, and an
-    EXC_RETURN whose ES names a Non-secure exception is the UsageFault INVPC (`v6m/t2secure.sysl`);
-  - the Non-secure alias of the PPB (`PPB_NONSEC_BASE 0xe0020000`) is refused by the core with the
-    same diagnostic, and the SIO's (`SIO_NONSEC_BASE 0xd0020000`, `regs/addressmap.h:106–108`) by
-    the chip, until something needs them;
-  - ACCESSCTRL (`0x40060000`) is stored. Its reset state grants Secure code everything (datasheet,
-    "Security" chapter, "Access control"), which is the state the SDK leaves it in.
-
-  Running Non-secure code (a Secure loader with a Non-secure application, the SDK's `kitchen_sink`
-  TrustZone examples) is a costed later item: banked state for both worlds, the integrity signature
-  on exception entry, secure gateways and the IDAU. The boot ROM itself is Secure code (§9.2).
+- **The security extension (TrustZone), both states** (`v6m/t2secure.sysl`, `v6m/t2nonsecure.sysl`).
+  A Pico SDK image is an **ARM Secure** image (`picotool info` prints `image type: ARM Secure`,
+  `pico-scratch/CLAUDE.md`); the core resets into Secure state, and a Secure image may make
+  Non-secure code of its own:
+  - **Banked registers.** MSP, PSP, MSPLIM, PSPLIM, CONTROL (but FPCA), PRIMASK, BASEPRI,
+    FAULTMASK, VTOR, CCR, CPACR, SCR and the MPU stay where the Secure-only core kept them, as the
+    copy of the state the core runs in; `Cpu.banked` holds the other state's, and a change of state
+    exchanges them, so nothing within a state pays for the second one. Both states' masks raise the
+    execution priority. `MRS`/`MSR` of the `_NS` registers reach the bank from Secure state, and read
+    zero from Non-secure state. The system control space's Non-secure alias (0xE002E000–0xE002EFFF) is
+    the Non-secure view: its own VTOR, CCR, SHPR, SHCSR, CFSR, CPACR (what NSACR gives it), MPU and
+    **SysTick, a second timer that counts while either state runs**; the NVIC registers of the IRQs
+    NVIC_ITNS gives it; the SAU, SFSR, SFAR and HFSR reading zero.
+  - **Attribution enforced, at no cost on a fast path.** The core runs Non-secure state on records
+    and a page table of its own: a page is on that table only where every byte is Non-secure, so any
+    other access takes the slow path, which makes it where the address is Non-secure and takes
+    SecureFault AUVIOL (with SFAR) where it is not. A record decoded in Non-secure state at a Secure
+    address is SecureFault INVEP, or at a Non-secure-callable `SG` the entry to Secure state; one
+    decoded in Secure state at a Non-secure address is INVTRAN. The SAU and the board's IDAU (the
+    RP2350's boot-ROM NSC region 0x7E00–0x7FFF) combine as the more secure answer. An SAU write, or a
+    board's page-table change, remakes the table and forgets the records before the next run.
+  - **The transitions:** `SG`; `BXNS` and `BLXNS` (BLXNS stacking the return address and partial
+    RETPSR on the Secure stack, FNC_RETURN in LR, IPSR 1 in handler mode); FNC_RETURN; exceptions to
+    the other state, with EXC_RETURN's S, DCRS and ES exact, the callee registers stacked under the
+    integrity signature (0xFEFA125B, or ...5A with FP) and R0–R12 cleared from Secure to Non-secure,
+    and the return checking the signature (INVIS) and ES (INVER from Non-secure state, INVPC from
+    Secure). `VLSTM`/`VLLDM`, which the compiler's Non-secure call sequence wraps around BLXNS, are
+    NOPs with no floating-point context active.
+  - **Banked exceptions** (MemManage, UsageFault, SVCall, PendSV, SysTick) have their Non-secure
+    copies at `NS_BANK` + n in the NVIC's sets, so one NVIC serves both; IRQs target the state
+    NVIC_ITNS names; HardFault, NMI, BusFault and SecureFault are Secure, and a Non-secure fault that
+    cannot be taken escalates to the Secure HardFault.
+  - **ACCESSCTRL** gates every bus access a core makes by master, security state and privilege
+    (FORCE_CORE_NS included); a denied access is refused by name, as silicon's bus fault.
+  - **Refused by name** (`Stop.NonSecure`, `Cpu.transition`): a change of state with a floating-point
+    context active (lazy preservation and SFPA), AIRCR.BFHFNMINS or PRIS set, a Non-secure PRIGROUP
+    other than the Secure one, the FP registers' Non-secure view, the PPB alias outside the system
+    control space; on the board, the SIO from Non-secure state and an ACCESSCTRL write restricting a
+    memory device. The MPU is stored and answered by `TT`, not enforced. The boot ROM itself is Secure
+    code (§9.2).
 - **The stack-limit registers.** `MSPLIM`/`PSPLIM` make a push, an `SP` write or exception stacking
   below the limit a UsageFault with `UFSR.STKOF`, with `SP` left at the limit, and
   `CCR.STKOFHFNMIGN` decides what happens at HardFault/NMI priority. `crt0.S:424–428` writes
@@ -732,8 +746,8 @@ Architecture Reference Manual (DDI0553), cited by chapter title. Over §2.1's v7
 
   In benchtop a coprocessor is a **board device on the core's coprocessor port**, as an MMIO device is
   on the bus, so the M33 stays generic and the RP2350 description supplies the three.
-- **Exceptions**: v8-M adds `AIRCR.BFHFNMINS`/`PRIS` and the Secure/Non-secure priority boosting,
-  which are inert in Secure-only mode. The RP2350 has 52 IRQ lines (`NUM_IRQS`,
+- **Exceptions**: v8-M adds `AIRCR.BFHFNMINS`/`PRIS`, refused set, and the Secure/Non-secure
+  priority boosting, which both states' masks give. The RP2350 has 52 IRQ lines (`NUM_IRQS`,
   `platform_defs.h:25`).
 
 ### 2.8 ARMv6-M: the RP2040's M0+s (and the micro:bit v1's M0)

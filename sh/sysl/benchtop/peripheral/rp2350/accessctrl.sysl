@@ -2,10 +2,16 @@ module sh.sysl.benchtop.peripheral.rp2350
 
 import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, triggered, written}
 import sh.sysl.rp2350.accessctrl as reg
+import sysl.fmt.hex
 
-// ACCESSCTRL (datasheet 10.6), stored: the registers hold what the security code writes and read it back,
-// and nothing else on the chip consults them, since the board runs Secure-only (docs/rp-coverage.md, cut
-// line Q3). The reset state grants Secure code everything.
+// ACCESSCTRL (datasheet 10.6): the registers hold what the security code writes and read it back, and
+// the Arm board asks it of every bus access a core makes (`need`, `refusal`). Each per-device register
+// grants its device to the masters whose bits are set — DBG (7), DMA (6), CORE1 (5), CORE0 (4) — at the
+// security and privilege levels whose bits are set: SP (3), SU (2), NSP (1), NSU (0). An access by a
+// core needs its core's bit and its level's; FORCE_CORE_NS makes core 1's accesses Non-secure.
+// ACCESSCTRL itself, BOOTRAM and GLITCH_DETECTOR are Secure-only. The reset state grants Secure
+// privileged code everything. A write that would take a memory device (the ROM, XIP or an SRAM bank)
+// from anyone is refused by name: memory is on the cores' fast path, where no grant is checked.
 //
 // **A write needs a password.** Bits 31:16 of the data on the bus must be 0xACCE (`ACCESSCTRL_PASSWORD_BITS`)
 // for every register but GPIO_NSMASK0 and GPIO_NSMASK1, which take all 32 bits (the SDK's `gpio_set_ns` writes them
@@ -43,6 +49,11 @@ struct AccessCtrl
     nsmask0: u32
     nsmask1: u32
     devices: [54]u32
+    // Each access bit some device clears: an access needing none of them needs no look-up.
+    denied: u32
+    // No device denies either core Secure privileged access, and FORCE_CORE_NS is clear: such an
+    // access needs no look-up at all.
+    secure_free: bool
 
     reset(*self)
         self.lock = LOCK_DMA
@@ -54,6 +65,50 @@ struct AccessCtrl
         self.nsmask0 = 0
         self.nsmask1 = 0
         for i in 0..<DEVICE_WORDS do self.devices[i] = device_reset(reg.ROM_OFFSET + u32(i) * 4)
+        self.summarise()
+
+    private summarise(*self)
+        self.denied = 0
+        for i in 0..<DEVICE_WORDS do self.denied |= ~self.devices[i] & 0xFF
+        // The Secure-only blocks deny Non-secure access whatever the devices grant.
+        self.denied |= 3
+        self.secure_free = self.denied & 0x38 == 0 && self.force_ns == 0
+
+    /** The bits an access by core `core` needs: its master's, and its level's — Non-secure (`ns`, or
+     * core 1 under FORCE_CORE_NS) or Secure, privileged or not.
+     */
+    need(self, core: u32, ns: bool, privileged: bool) -> u32
+        val non_secure = ns || (core == 1 && self.force_ns & FORCE_CORE1 != 0)
+        val master: u32 = if core == 0 then 0x10 else 0x20
+        val level: u32 = if non_secure then (if privileged then 2 else 1) else (if privileged then 8 else 4)
+        master | level
+
+    /** Why an access to `a` needing `need` is refused, or None where it is let through. */
+    refusal(self, a: u32, need: u32) -> Option[string]
+        val k = device_at(a)
+        if k == SECURE_ONLY
+            if need & 3 == 0 then return None
+            return Some(s"0x${hex(a, 8)} is Secure-only on the RP2350 and was reached by ${who(need)}: a bus fault on silicon")
+        if k < 0 then return None
+        val bits = self.devices[usize(k)]
+        if bits & need == need then return None
+        Some(s"ACCESSCTRL.${DEVICE_NAMES[usize(k)]} is 0x${hex(bits, 2)}, which does not let ${who(need)} reach 0x${hex(a, 8)}: a bus fault on silicon")
+
+    /** Why a write of `value` (`width` bytes at `offset`) is refused: it would take a memory device
+     * from a master or level that has it; None for any other write.
+     */
+    memory_restriction(self, core: u32, offset: u32, width: u32, value: u32) -> Option[string]
+        val address = offset & 0xFFC
+        if address < reg.ROM_OFFSET || address > reg.SRAM9_OFFSET then return None
+        access(offset, width, true) match
+            Err(_) -> return None
+            Ok(_) -> ()
+        val data = replicated(value, width)
+        if (data >> 16) != ACCESS_PASSWORD || (core < 2 && self.lock & (1u32 << core) != 0) then return None
+        val i = usize((address - reg.ROM_OFFSET) / 4)
+        val after = written(self.devices[i], offset, data & 0xFFFF) & 0xFF
+        if after & self.devices[i] == self.devices[i] then return None
+        Some(s"ACCESSCTRL.${DEVICE_NAMES[i]} written 0x${hex(after, 2)}: restricting a memory device is not modelled (its accesses are on the cores' fast path)")
 
     read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
         access(offset, width, true)?
@@ -82,7 +137,9 @@ struct AccessCtrl
         val bits = if plain then data else data & 0xFFFF
         address match
             reg.LOCK_OFFSET -> self.lock = self.lock | (written(0, offset, bits) & LOCK_WRITABLE)
-            reg.FORCE_CORE_NS_OFFSET -> self.force_ns = written(self.force_ns, offset, bits) & FORCE_CORE1
+            reg.FORCE_CORE_NS_OFFSET ->
+                self.force_ns = written(self.force_ns, offset, bits) & FORCE_CORE1
+                self.summarise()
             // CFGRESET is self-clearing: a 1 fires it through any alias but CLR (`access.sysl`).
             reg.CFGRESET_OFFSET -> if triggered(offset, bits) & reg.CFGRESET_CFGRESET_MASK != 0 then self.reset_config()
             reg.GPIO_NSMASK0_OFFSET -> self.nsmask0 = written(self.nsmask0, offset, bits)
@@ -91,8 +148,47 @@ struct AccessCtrl
                 if address < reg.ROM_OFFSET then return Err(AccessError.Unmapped)
                 val i = usize((address - reg.ROM_OFFSET) / 4)
                 self.devices[i] = written(self.devices[i], offset, bits) & 0xFF
+                self.summarise()
         Ok(())
 end AccessCtrl
+
+/** Each per-device register's name, in register order. */
+val DEVICE_NAMES: [54]string = ["ROM", "XIP_MAIN", "SRAM0", "SRAM1", "SRAM2", "SRAM3", "SRAM4", "SRAM5", "SRAM6", "SRAM7",
+    "SRAM8", "SRAM9", "DMA", "USBCTRL", "PIO0", "PIO1", "PIO2", "CORESIGHT_TRACE", "CORESIGHT_PERIPH", "SYSINFO", "RESETS",
+    "IO_BANK0", "IO_BANK1", "PADS_BANK0", "PADS_QSPI", "BUSCTRL", "ADC", "HSTX", "I2C0", "I2C1", "PWM", "SPI0", "SPI1",
+    "TIMER0", "TIMER1", "UART0", "UART1", "OTP", "TBMAN", "POWMAN", "TRNG", "SHA256", "SYSCFG", "CLOCKS", "XOSC", "ROSC",
+    "PLL_SYS", "PLL_USB", "TICKS", "WATCHDOG", "PSM", "XIP_CTRL", "XIP_QMI", "XIP_AUX"]
+
+private const SECURE_ONLY: int = -2
+private const NO_DEVICE: int = -1
+
+// The APB's 32 KB windows from 0x40000000, each its device's register index (`DEVICE_NAMES`):
+// SYSINFO, SYSCFG, CLOCKS, PSM, RESETS, IO_BANK0, IO_QSPI (IO_BANK1), PADS_BANK0, PADS_QSPI, XOSC,
+// PLL_SYS, PLL_USB, ACCESSCTRL, BUSCTRL, UART0, UART1, SPI0, SPI1, I2C0, I2C1, ADC, PWM, TIMER0, TIMER1,
+// HSTX_CTRL, XIP_CTRL, XIP_QMI, WATCHDOG, BOOTRAM, ROSC, TRNG, SHA256, POWMAN, TICKS, -, -, OTP, -,
+// OTP_DATA, -, CORESIGHT_PERIPH, -, -, GLITCH_DETECTOR, TBMAN.
+private val APB: [45]int = [19, 42, 43, 50, 20, 21, 22, 23, 24, 44, 46, 47, SECURE_ONLY, 25, 35, 36, 31, 32, 28, 29, 26, 30, 33, 34,
+    27, 51, 52, 49, SECURE_ONLY, 45, 40, 41, 39, 48, NO_DEVICE, NO_DEVICE, 37, NO_DEVICE, 37, NO_DEVICE, 18, NO_DEVICE, NO_DEVICE, SECURE_ONLY, 38]
+
+// The AHB's 1 MB windows from 0x50000000: DMA, USBCTRL, PIO0, PIO1, PIO2, XIP_AUX, HSTX_FIFO, CORESIGHT_TRACE.
+private val AHB: [8]int = [12, 13, 14, 15, 16, 53, 27, 17]
+
+// The device whose register governs `a`: an index, `SECURE_ONLY`, or `NO_DEVICE` (memory, which is
+// never restricted, and what no device answers).
+private device_at(a: u32) -> int
+    if a >= 0x40000000 && a < 0x40000000 + 45 * 0x8000 then return APB[usize((a - 0x40000000) >> 15)]
+    if a >= 0x50000000 && a < 0x50800000 then return AHB[usize((a - 0x50000000) >> 20)]
+    NO_DEVICE
+
+// The master and level of the bits `need`, as a person reads them.
+private who(need: u32) -> string
+    val master = if need & 0x10 != 0 then "core 0" else "core 1"
+    val level = (need & 0xF) match
+        8 -> "Secure privileged"
+        4 -> "Secure unprivileged"
+        2 -> "Non-secure privileged"
+        _ -> "Non-secure unprivileged"
+    s"$master, $level,"
 
 accessctrl() -> AccessCtrl
     var state: AccessCtrl

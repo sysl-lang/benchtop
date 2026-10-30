@@ -1,0 +1,819 @@
+module sh.sysl.benchtop.v6m
+
+import sh.sysl.benchtop.timing.NEVER
+import sysl.raw.ptr_cast
+import sysl.sync.*
+
+// The Security Extension's Non-secure state (ARMv8-M ARM, DDI0553: "The Security Extension",
+// "Security attribution", "Secure gateway", "Exception entry", "Exception return", "Function
+// return", "Fault handling"), on a core with `Cpu.security`.
+//
+// **Two states, one set of live registers.** The registers the architecture banks between the states
+// — MSP, PSP, MSPLIM, PSPLIM, CONTROL (but FPCA, which is shared), PRIMASK, BASEPRI, FAULTMASK, VTOR,
+// CCR, CPACR, SCR and the MPU — are kept where the Secure-only core keeps them, as the copy of the
+// state the core runs in, and `Cpu.banked` holds the other state's. A change of state exchanges the
+// two (`switch_state`), so nothing that runs within a state pays for the second one.
+//
+// **What a core in Non-secure state fetches and touches is checked against the SAU and the IDAU**,
+// without a test on any fast path: the core runs Non-secure state on records and a page table of its
+// own (`Cpu.ns_records`, `Cpu.ns_pages`). A page is on the Non-secure table only where every byte of
+// it is Non-secure, so a load or store anywhere else takes the slow path, which makes the access where
+// the address is Non-secure and takes SecureFault AUVIOL where it is not. A record decoded in
+// Non-secure state at a Secure address is SecureFault INVEP, or the entry to Secure state where the
+// address is Non-secure callable and holds `SG`; a record decoded in Secure state at a Non-secure
+// address is SecureFault INVTRAN. A change to the SAU, or to a page's mapping, remakes the table and
+// forgets the records before the next run (`refresh_attribution`).
+//
+// **The ways between the states:** `SG` at a Non-secure-callable address, from Non-secure state;
+// `BXNS` and `BLXNS` to an address with bit 0 clear, from Secure state, `BLXNS` stacking the return
+// address and the partial RETPSR on the Secure stack and leaving FNC_RETURN in LR; a branch to
+// FNC_RETURN from Non-secure state, which unstacks them; an exception that targets the other state;
+// and an exception return whose EXC_RETURN names the other state. An exception taken from Secure
+// state to a Non-secure handler also stacks the callee registers under the integrity signature and
+// clears R0–R12, and the return checks the signature (SecureFault INVIS).
+//
+// **Banked exceptions** — MemManage, UsageFault, SVCall, PendSV and SysTick — have their Non-secure
+// copies at `NS_BANK` plus their number in every set the NVIC keeps (pending, active, enabled,
+// priority), so the NVIC's machinery serves both states unchanged; IPSR and the vector use the
+// architectural number. An IRQ targets the state NVIC_ITNS names. HardFault, NMI, BusFault and
+// SecureFault are Secure: AIRCR.BFHFNMINS and AIRCR.PRIS are refused set by name, and a Non-secure
+// fault that cannot be taken escalates to the Secure HardFault.
+//
+// **Refused by name** (`Stop.NonSecure`, `Cpu.transition`): a change of state with a floating-point
+// context active (CONTROL.FPCA), whose lazy preservation and SFPA are not modelled; BFHFNMINS or PRIS
+// set; a Non-secure PRIGROUP other than the Secure one; the floating-point registers' Non-secure view;
+// and the PPB's Non-secure alias outside the system control space.
+
+/** The registers one security state has of its own, held for the state the core is not in. */
+struct Bank
+    msp: u32
+    psp: u32
+    msplim: u32
+    psplim: u32
+    control: u32
+    primask: u32
+    basepri: u32
+    faultmask: u32
+    vtor: u32
+    ccr: u32
+    cpacr: u32
+    scr: u32
+    mpu_ctrl: u32
+    mpu_rnr: u32
+    mpu_rbar: [MPU_REGIONS]u32
+    mpu_rlar: [MPU_REGIONS]u32
+    mpu_mair: [2]u32
+
+/** A SysTick's state, as the `tick_*` fields of `Cpu` hold the Secure one's. */
+struct Tick
+    ctrl: u32
+    flag: bool
+    reload: u32
+    value: u32
+    zero: u64
+    last: u64
+
+extern "calloc" c_calloc(count: usize, size: usize) -> *u8
+
+// Where the Non-secure copies of the banked exceptions sit among the exception numbers: above every
+// IRQ a model can have (`NVIC_MAX_IRQS`), in the NVIC's last word.
+const NS_BANK: u32 = 496
+// The bits of the NVIC's last word that are Non-secure copies, not IRQs.
+const NS_BANK_BITS: u64 = 0xFFFF000000000000
+
+// FNC_RETURN, as BLXNS leaves it in LR; a branch to it, with bit 0 either way, returns.
+const FNC_RETURN: u32 = 0xFEFFFFFF
+
+// The integrity signature an exception entry to Non-secure state stacks under the callee registers:
+// bit 0 is the frame's FType (1 for a frame without the floating-point context).
+const INTEGRITY: u32 = 0xFEFA125A
+
+// SFSR's bits.
+const SFSR_INVEP: u32 = 1 << 0
+const SFSR_INVIS: u32 = 1 << 1
+const SFSR_INVER: u32 = 1 << 2
+const SFSR_AUVIOL: u32 = 1 << 3
+const SFSR_INVTRAN: u32 = 1 << 4
+const SFSR_SFARVALID: u32 = 1 << 6
+
+// How the SAU and the IDAU together attribute an address: the more secure of their two answers.
+const ATTR_NS: u32 = 0
+const ATTR_NSC: u32 = 1
+const ATTR_S: u32 = 2
+
+const NVIC_ITNS: u32 = 0xE000E380
+const AIRCR_SYSRESETREQS: u32 = 1 << 3
+const AIRCR_BFHFNMINS: u32 = 1 << 13
+const AIRCR_PRIS: u32 = 1 << 14
+
+// The system control space's Non-secure alias, as Secure state reaches it.
+const SCS_NS: u32 = 0xE002E000
+const SCS_NS_END: u32 = 0xE002F000
+const SCS_ALIAS: u32 = SCS_NS - SCS
+
+const RECORDS: usize = 2621442
+
+// ---------------------------------------------------------------------------------------------------
+// Reset, and the core's own records and table for Non-secure state.
+
+// The two states as a reset leaves them: Secure, with the Non-secure bank at its reset values. The
+// records and table, once made, are kept for the core's next entry, made afresh then (`ns_ready`).
+clear_non_secure(cpu: *Cpu)
+    cpu.ns = false
+    cpu.trustzone = false
+    cpu.banked = fresh_bank(cpu.kind)
+    cpu.ns_records = null
+    cpu.ns_predicated = null
+    cpu.ns_pages = null
+    cpu.secure_records = null
+    cpu.secure_predicated = null
+    cpu.attribution_stale = false
+    cpu.ns_bounds_valid = false
+    cpu.access_faulted = false
+    for k in 0..<cpu.itns.len do cpu.itns[k] = 0
+    cpu.cfsr_ns = 0
+    cpu.aircr_secure = 0
+    cpu.ns_tick = Tick(0, false, 0, 0, NEVER, NEVER)
+    cpu.ns_ready = false
+
+private fresh_bank(kind: Kind) -> Bank =
+    Bank(0, 0, 0, 0, 0, 0, 0, 0, 0, ccr_reset(kind), 0, 0, 0, 0, [0; 8], [0; 8], [0, 0])
+
+// Make the core's Non-secure records and table where they are not yet, and bring them up to the SAU.
+// They are the memory's, one set per core number, made once: a core reset on the same memory fills
+// them afresh.
+@cold
+private prepare_ns(cpu: *Cpu)
+    val mem = cpu.mem
+    val k = usize(cpu.core & 1)
+    if mem.ns_decoded[k] == null
+        mem.ns_decoded[k] = ptr_cast(c_calloc(RECORDS, sizeof(Insn)))
+        mem.ns_predicated[k] = ptr_cast(c_calloc(RECORDS, sizeof(Handler)))
+        mem.ns_page_table[k] = ptr_cast(c_calloc(usize(PAGES), sizeof(usize)))
+    if !cpu.ns_ready
+        cpu.ns_records = mem.ns_decoded[k]
+        cpu.ns_predicated = mem.ns_predicated[k]
+        cpu.ns_pages = mem.ns_page_table[k]
+        val records = cpu.ns_records
+        for i in 0..(RAM_BYTES >> 1) do records[i] = undecoded()
+        for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + mem.flash_size) >> 1) do records[i] = undecoded()
+        records[NO_CODE >> 1] = undecoded()
+        mem.install_ram_guards(records)
+        cpu.ns_ready = true
+        cpu.attribution_stale = true
+    if cpu.attribution_stale then refresh_attribution(cpu)
+
+/** The SAU, the IDAU or a page's mapping has changed: the Non-secure page table is made again, and
+ * every record of the core's (both states') decodes again when control next reaches it, judged
+ * afresh. A record being executed keeps its operands (only its handler and operation change), so its
+ * handler finishes with them.
+ */
+@cold
+refresh_attribution(cpu: *Cpu)
+    cpu.attribution_stale = false
+    cpu.ns_bounds_valid = false
+    val mem = cpu.mem
+    if cpu.ns_ready
+        for p in 0..<PAGES
+            val e = mem.page_table[p]
+            cpu.ns_pages[p] = if e != 0 && page_non_secure(cpu, u32(p) << PAGE_SHIFT) then e else 0
+    val secure = if cpu.ns then cpu.secure_records else cpu.dec
+    forget_records(cpu, secure)
+    if cpu.ns_ready then forget_records(cpu, cpu.ns_records)
+
+// Only where a record has been decoded is there one to forget: the RAM lines marked as holding code,
+// and the flash pages marked so (`holds_code`), which keeps a change to the SAU cheap.
+private forget_records(cpu: *Cpu, records: *Insn)
+    if records == null then return
+    val mem = cpu.mem
+    for line in 0..<mem.code_lines.len
+        if atomic_load(&mem.code_lines[line], Relaxed) & LINE_CODE == 0 then continue
+        forget_range(records, u32(line) << (LINE_SHIFT - 1), 1 << (LINE_SHIFT - 1))
+    for w in 0..<mem.flash_code_pages.len
+        val bits = atomic_load(&mem.flash_code_pages[w], Relaxed)
+        if bits == 0 then continue
+        for k in 0u32..<64
+            if (bits >> u64(k)) & 1 != 0 then forget_range(records, (FLASH_OFFSET >> 1) + ((u32(w) * 64 + k) << (PAGE_SHIFT - 1)), PAGE_BYTES >> 1)
+
+// `count` records from record `first`, put back to "not decoded"; a guard record stays.
+private forget_range(records: *Insn, first: u32, count: u32)
+    for i in first..<(first + count)
+        if records[i].op != Op.Undecoded && records[i].h != &h_ram_boundary
+            records[i].h = &h_decode
+            records[i].op = Op.Undecoded
+
+/** A board has changed its page table (an XIP mode, a pinned line): the Non-secure table is made
+ * again before the core next runs Non-secure code, and at once if it runs there now.
+ */
+pages_changed(cpu: *Cpu)
+    if !cpu.ns_ready then return
+    cpu.attribution_stale = true
+    if cpu.ns then refresh_attribution(cpu)
+    set_limit(cpu, 0)
+
+// ---------------------------------------------------------------------------------------------------
+// Attribution.
+
+// The attribution of `a` from the SAU and the IDAU together: Non-secure, Non-secure callable or
+// Secure, the more secure of the two answers. The IDAU's region is Non-secure callable and every other
+// address Non-secure to it, so the SAU decides there.
+security_of(cpu: *Cpu, a: u32) -> u32
+    val at = attribution(cpu, a)
+    val sau = if at.non_secure then ATTR_NS elif at.nsc then ATTR_NSC else ATTR_S
+    val idau = if a >= cpu.idau.base && a <= cpu.idau.limit then ATTR_NSC else ATTR_NS
+    if sau > idau then sau else idau
+
+// Whether every byte of the 4 KB page at `base` is Non-secure.
+private page_non_secure(cpu: *Cpu, base: u32) -> bool
+    val last = base + PAGE_MASK
+    if base >= PPB && base < PPB_END then return false
+    if cpu.idau.limit >= cpu.idau.base && cpu.idau.base <= last && cpu.idau.limit >= base then return false
+    if cpu.sau_ctrl & 1 == 0 then return cpu.sau_ctrl & 2 != 0
+    var whole = false
+    for k in 0..<SAU_REGIONS
+        val limit = cpu.sau_rlar[k]
+        if limit & 1 == 0 then continue
+        val top = limit | 0x1F
+        if cpu.sau_rbar[k] > last || top < base then continue
+        // A second region over the page makes some of it Secure; a region short of it leaves the rest
+        // Secure; a Non-secure-callable region is Secure.
+        if whole || limit & 2 != 0 || cpu.sau_rbar[k] > base || top < last then return false
+        whole = true
+    whole
+
+// Whether the `width` bytes at `a` are all Non-secure.
+private non_secure_range(cpu: *Cpu, a: u32, width: u32) -> bool =
+    security_of(cpu, a) == ATTR_NS && security_of(cpu, a + width - 1) == ATTR_NS
+
+// The decoder's question, before it decodes the record at `pc` into `into`: where the address is not
+// one the core's state may execute, the record is the SecureFault it takes (INVEP from Non-secure
+// state, INVTRAN from Secure) or, at a Non-secure-callable `SG` from Non-secure state, the entry to
+// Secure state. Answers whether it made the record.
+@cold
+@noinline
+attribution_record(cpu: *Cpu, pc: u32, into: *Insn) -> bool
+    if !cpu.ns
+        if !cpu.ns_bounds_valid then make_ns_bounds(cpu)
+        if pc < cpu.ns_bounds[0] || pc > cpu.ns_bounds[1] then return false
+    val s = security_of(cpu, pc)
+    if !cpu.ns && s != ATTR_NS then return false
+    if cpu.ns && s == ATTR_NS then return false
+    holds_code(cpu, pc)
+    into.imm = pc
+    if cpu.ns && s == ATTR_NSC && secure_load16(cpu, pc) == 0xE97F && secure_load16(cpu, pc + 2) == 0xE97F
+        holds_code(cpu, pc + 2)
+        into.op = Op.SgEntry
+    else
+        into.op = Op.FetchFault
+        into.c = if cpu.ns then 0 else 1
+    into.h = handler_for(cpu, into)
+    true
+
+// The bounds of what the SAU may make Non-secure: everything under ALLNS with the SAU disabled,
+// nothing with it disabled otherwise, and else the enabled Non-secure regions' span. The IDAU makes
+// nothing Non-secure.
+private make_ns_bounds(cpu: *Cpu)
+    cpu.ns_bounds_valid = true
+    if cpu.sau_ctrl & 1 == 0
+        cpu.ns_bounds = if cpu.sau_ctrl & 2 != 0 then [0, 0xFFFFFFFF] else [1, 0]
+        return
+    var lo: u32 = 0xFFFFFFFF
+    var hi: u32 = 0
+    for k in 0..<SAU_REGIONS
+        val limit = cpu.sau_rlar[k]
+        if limit & 3 != 1 then continue
+        if cpu.sau_rbar[k] < lo then lo = cpu.sau_rbar[k]
+        if limit | 0x1F > hi then hi = limit | 0x1F
+    cpu.ns_bounds = if lo > hi then [1, 0] else [lo, hi]
+
+// A halfword read as Secure state reads it, whichever state the core is in.
+private secure_load16(cpu: *Cpu, a: u32) -> u32 = if cpu.ns then secure_view_read(cpu, a, 2) else load16(cpu, a)
+
+/** The host's read of the `width` bytes at `a` from a core in Non-secure state, made as Secure state
+ * makes it: no attribution check, and the whole page table.
+ */
+@cold
+secure_view_read(cpu: *Cpu, a: u32, width: u32) -> u32
+    secure_view(cpu, a, true)
+    val x = if width == 4 then read32(cpu, a, cpu.retired) elif width == 2 then read16(cpu, a, cpu.retired) else read8(cpu, a, cpu.retired)
+    secure_view(cpu, a, false)
+    x
+
+/** The same, written. */
+@cold
+secure_view_write(cpu: *Cpu, a: u32, width: u32, x: u32)
+    secure_view(cpu, a, true)
+    write(cpu, a, width, x, cpu.retired)
+    secure_view(cpu, a, false)
+
+// Take up (`on`) or put down Secure state's view for the host's access at `a`: the whole page table,
+// and for the private peripheral bus, whose registers the banks hold, the Secure bank live.
+private secure_view(cpu: *Cpu, a: u32, on: bool)
+    if a >= PPB && a < PPB_END then exchange_bank(cpu)
+    cpu.ns = !on
+    cpu.pages = if on then &cpu.mem.page_table[0] else cpu.ns_pages
+
+// A record made by `attribution_record`, run: SecureFault INVEP (c = 0) or INVTRAN (c = 1) at the
+// address in `imm`, pending, the instruction not executed. A record another core's attribution made
+// (cores of one machine may share records) is decoded again under this core's.
+fetch_fault(cpu: *Cpu, ip: *Insn, n: u64) -> bool
+    val at = ip.imm
+    val s = security_of(cpu, at)
+    if (ip.c == 0) == (s == ATTR_NS)
+        ip.h = &h_decode
+        ip.op = Op.Undecoded
+        return true
+    secure_fault(cpu, if ip.c == 0 then SFSR_INVEP else SFSR_INVTRAN, at)
+    cpu.pc = at
+    cpu.retired = n
+    false
+
+// SecureFault with `bits` recorded in SFSR, raised by the instruction at `at`.
+@cold
+secure_fault(cpu: *Cpu, bits: u32, at: u32)
+    cpu.sfsr |= bits
+    fault(cpu, SECURE_FAULT, at, Stop.Fault)
+
+// ---------------------------------------------------------------------------------------------------
+// Changing state.
+
+// Exchange the live banked registers with `banked`. The stack pointers are read and set through the
+// mode the core is in now, which a caller changing the mode too sets first.
+exchange_bank(cpu: *Cpu)
+    val b = &cpu.banked
+    val msp = main_sp(cpu)
+    val psp = process_sp(cpu)
+    val control = cpu.control
+
+    // FPCA is not banked: it stays.
+    cpu.control = (b.control & ~4) | (control & 4)
+    b.control = control & ~4
+    if on_process_stack(cpu)
+        cpu.r[13] = b.psp
+        cpu.sp_other = b.msp
+    else
+        cpu.r[13] = b.msp
+        cpu.sp_other = b.psp
+    b.msp = msp
+    b.psp = psp
+    swap(&cpu.msplim, &b.msplim)
+    swap(&cpu.psplim, &b.psplim)
+    swap(&cpu.primask, &b.primask)
+    swap(&cpu.basepri, &b.basepri)
+    swap(&cpu.faultmask, &b.faultmask)
+    swap(&cpu.vtor, &b.vtor)
+    swap(&cpu.ccr, &b.ccr)
+    swap(&cpu.cpacr, &b.cpacr)
+    swap(&cpu.scr, &b.scr)
+    swap(&cpu.mpu_ctrl, &b.mpu_ctrl)
+    swap(&cpu.mpu_rnr, &b.mpu_rnr)
+    for k in 0..<MPU_REGIONS
+        swap(&cpu.mpu_rbar[k], &b.mpu_rbar[k])
+        swap(&cpu.mpu_rlar[k], &b.mpu_rlar[k])
+    swap(&cpu.mpu_mair[0], &b.mpu_mair[0])
+    swap(&cpu.mpu_mair[1], &b.mpu_mair[1])
+    cpu.fp_ready = false
+
+@inline
+private swap(a: *u32, b: *u32)
+    val t = a[0]
+    a[0] = b[0]
+    b[0] = t
+
+/** Change the core to Non-secure state (`ns`) or Secure: the banks exchanged, and the records and page
+ * table the state runs on taken up.
+ */
+switch_state(cpu: *Cpu, ns: bool)
+    if cpu.ns == ns then return
+    if ns
+        cpu.trustzone = true
+        prepare_ns(cpu)
+        exchange_bank(cpu)
+        cpu.ns = true
+        cpu.secure_records = cpu.dec
+        cpu.secure_predicated = cpu.predicated
+        cpu.dec = cpu.ns_records
+        cpu.predicated = cpu.ns_predicated
+        cpu.pages = cpu.ns_pages
+    else
+        exchange_bank(cpu)
+        cpu.ns = false
+        cpu.dec = cpu.secure_records
+        cpu.predicated = cpu.secure_predicated
+        cpu.pages = &cpu.mem.page_table[0]
+    recheck(cpu)
+
+// A change of state with a floating-point context active is refused, at `at`: answers whether it was.
+private fp_context(cpu: *Cpu, at: u32) -> bool
+    if cpu.control & 4 == 0 then return false
+    non_secure(cpu, Transition.FpContext, at)
+    true
+
+// `BXNS` (c = 0) or `BLXNS` (c = 1) at `ip` to Rm = b with bit 0 clear, from Secure state: to
+// Non-secure state at the address. BLXNS first pushes the return address and the partial RETPSR (IPSR)
+// on the Secure stack, leaves FNC_RETURN in LR and, from handler mode, IPSR 1. None where it did not go:
+// a refusal, or the UsageFault STKOF its push takes.
+ns_call(cpu: *Cpu, ip: *Insn, n: u64) -> Option[*Insn]
+    val target = cpu.r[ip.b] & ~1
+    val at = addr_of(cpu, ip)
+    if fp_context(cpu, at) then return None
+    if ip.c != 0
+        val sp = cpu.r[13] -% 8
+        if sp < sp_limit(cpu) && stack_overflow(cpu, at) then return None
+        write32(cpu, sp, (at + 2) | 1, n)
+        write32(cpu, sp + 4, cpu.ipsr, n)
+        if cpu.stop != Stop.Running then return None
+        cpu.r[13] = sp
+        cpu.r[14] = FNC_RETURN
+        if cpu.ipsr != 0 then cpu.ipsr = 1
+    switch_state(cpu, true)
+    Some(insn_at(cpu, target))
+
+// A branch to FNC_RETURN at `from`, in Non-secure state: back to Secure state at the return address
+// BLXNS stacked, with its IPSR. A frame naming handler mode from thread mode, or the reverse, is the
+// UsageFault INVPC, taken in Non-secure state from the branch.
+function_return(cpu: *Cpu, from: u32, n: u64) -> *Insn
+    if fp_context(cpu, from) then return stopped_on(cpu, from, n)
+    switch_state(cpu, false)
+    val sp = cpu.r[13]
+    val ret = read32(cpu, sp, n)
+    val psr = read32(cpu, sp + 4, n)
+    val ipsr = psr & 0x1FF
+    if cpu.stop != Stop.Running || (cpu.ipsr == 0) != (ipsr == 0)
+        switch_state(cpu, true)
+        if cpu.stop == Stop.Running then usage_fault(cpu, CFSR_INVPC, from, Stop.Fault)
+        return stopped_on(cpu, from, n)
+    cpu.r[13] = sp + 8
+    cpu.ipsr = ipsr
+    insn_at(cpu, ret & ~1)
+
+// `SG` at a Non-secure-callable address `at`, from Non-secure state: to Secure state, LR's bit 0
+// cleared to say the caller is Non-secure, and on at the instruction after it. None where refused.
+sg_entry(cpu: *Cpu, at: u32) -> Option[*Insn]
+    if fp_context(cpu, at) then return None
+    cpu.r[14] &= ~1
+    switch_state(cpu, false)
+    Some(insn_at(cpu, at + 4))
+
+// `VLSTM` or `VLLDM` at `ip`, which the compiler's Non-secure call sequence (libgcc's
+// `__gnu_cmse_nonsecure_call`) wraps around BLXNS: in Secure state with no floating-point context
+// active they save and restore nothing, a NOP; with one active the lazy preservation they start is
+// not modelled, and is refused by name; in Non-secure state they are undefined. Answers whether the
+// instruction completed; where not, the core has stopped on it.
+x_vlstm(cpu: *Cpu, ip: *Insn) -> bool
+    val at = addr_of(cpu, ip)
+    if cpu.ns
+        halt(cpu, Stop.Undefined, at)
+        return false
+    !fp_context(cpu, at)
+
+// ---------------------------------------------------------------------------------------------------
+// Exceptions.
+
+// Whether exception `e` is one each state has its own copy of.
+@inline
+banked_exception(e: u32) -> bool = e == MEM_MANAGE || e == USAGE_FAULT || e == SVCALL || e == PENDSV || e == SYSTICK
+
+// The number the core's state uses for banked exception `e`.
+@inline
+in_state(cpu: *Cpu, e: u32) -> u32 = if cpu.ns && banked_exception(e) then e + NS_BANK else e
+
+// The architectural number of exception `e`: IPSR's, and its vector's.
+@inline
+architectural(e: u32) -> u32 = if e >= NS_BANK then e - NS_BANK else e
+
+// Whether exception `e` targets Non-secure state.
+targets_ns(cpu: *Cpu, e: u32) -> bool
+    if e >= NS_BANK then return true
+    if e < IRQ0 then return false
+    val irq = e - IRQ0
+    (cpu.itns[usize(irq >> 5)] >> (irq & 31)) & 1 != 0
+
+// Whether fault `e` is enabled: SHCSR's enable, kept in `enabled`.
+@inline
+fault_enabled(cpu: *Cpu, e: u32) -> bool = cpu.enabled[nvic_word(e)] & nvic_bit(e) != 0
+
+// The UsageFault of the core's state, with `bits` recorded in that state's CFSR.
+@cold
+usage_fault(cpu: *Cpu, bits: u32, at: u32, lockup: Stop)
+    if cpu.ns then cpu.cfsr_ns |= bits else cpu.cfsr |= bits
+    fault(cpu, in_state(cpu, USAGE_FAULT), at, lockup)
+
+// The priority the core runs at once Non-secure state is in use: the active exceptions' `p`, raised by
+// both states' masks. PRIS is clear, so the Non-secure ones are not remapped; with BFHFNMINS clear,
+// FAULTMASK_NS raises it to 0 and FAULTMASK_S to -1.
+banked_running(cpu: *Cpu, p: int, masked: bool) -> int
+    var r = p
+    val b = &cpu.banked
+    for basepri in [cpu.basepri, b.basepri] do if basepri != 0 && group(cpu, int(basepri)) < r then r = group(cpu, int(basepri))
+    if masked && (cpu.primask != 0 || b.primask != 0) && r > 0 then r = 0
+    val faultmask_ns = if cpu.ns then cpu.faultmask else b.faultmask
+    val faultmask_s = if cpu.ns then b.faultmask else cpu.faultmask
+    if faultmask_ns != 0 && r > 0 then r = 0
+    if faultmask_s != 0 && r > -1 then r = -1
+    r
+
+// The stacking an exception entry adds, from Secure state to a Non-secure handler: the integrity
+// signature, a reserved word and R4–R11 at `frame`, under the caller's frame; then R0–R12 and the flags
+// cleared, so Non-secure code sees nothing of Secure state's.
+callee_stack(cpu: *Cpu, frame: u32, floor: u32, extended: bool, n: u64)
+    val words: [10]u32 = [INTEGRITY | (if extended then 0 else 1), 0, cpu.r[4], cpu.r[5], cpu.r[6], cpu.r[7], cpu.r[8], cpu.r[9], cpu.r[10], cpu.r[11]]
+    for k in 0..<10 do if frame +% u32(k) * 4 >= floor then write32(cpu, frame +% u32(k) * 4, words[k], n)
+    for k in 0..<13 do cpu.r[k] = 0
+    set_apsr(cpu, 0)
+
+// The vector at `at`, read as the handler's state reads it: from Non-secure state, a Secure handler's
+// vector is read through the Secure table.
+vector_read(cpu: *Cpu, at: u32, n: u64) -> u32
+    if !cpu.ns then return read32(cpu, at, n)
+    cpu.ns = false
+    cpu.pages = &cpu.mem.page_table[0]
+    val v = read32(cpu, at, n)
+    cpu.ns = true
+    cpu.pages = cpu.ns_pages
+    v
+
+// ---------------------------------------------------------------------------------------------------
+// Data accesses from Non-secure state off the fast path.
+
+// A load from Non-secure state that the Non-secure table does not serve: SecureFault AUVIOL where any
+// byte is not Non-secure; else as Secure state makes it, through the whole table.
+@cold
+ns_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if !non_secure_range(cpu, a, width)
+        auviol(cpu, a)
+        return 0
+    cpu.pages = &cpu.mem.page_table[0]
+    val page = page_for(cpu, a, width)
+    cpu.pages = cpu.ns_pages
+    if page != 0 then return host_read(page, a, width)
+    // The board sees the access as the Non-secure one it is.
+    cpu.bus.read(cpu, a, width, n)
+
+@cold
+ns_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if !non_secure_range(cpu, a, width) then return auviol(cpu, a)
+    cpu.pages = &cpu.mem.page_table[0]
+    cpu.ns = false
+    val page = store_page(cpu, a, width)
+    if page != 0
+        host_write(page, a, width, x)
+        stored(cpu, a, width)
+    elif cpu.mem.flash_overlaps(a, width)
+        halt(cpu, Stop.Fault, a)
+    else
+        // The board sees the access as the Non-secure one it is.
+        cpu.ns = true
+        cpu.bus.write(cpu, a, width, x, n)
+    cpu.ns = true
+    cpu.pages = cpu.ns_pages
+
+// SecureFault AUVIOL for an access at `a`, SFAR holding it: the instruction does not complete.
+@cold
+auviol(cpu: *Cpu, a: u32)
+    cpu.sfar = a
+    cpu.access_faulted = true
+    secure_fault(cpu, SFSR_AUVIOL | SFSR_SFARVALID, a)
+
+// ---------------------------------------------------------------------------------------------------
+// The private peripheral bus from Non-secure state, and the system control space's Non-secure view.
+
+// Non-secure state's private peripheral bus: the system control space as Non-secure state sees it, the
+// Non-secure alias reading as zero and ignoring writes, and the rest the board's.
+ns_ppb_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if a < SCS_END then return ns_view_read(cpu, a, width, n)
+    if a >= PPB_NS then return 0
+    cpu.bus.read(cpu, a, width, n)
+
+ns_ppb_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if a < SCS_END then return ns_view_write(cpu, a, width, x, n)
+    if a >= PPB_NS then return
+    cpu.bus.write(cpu, a, width, x, n)
+
+// Secure state's reach into the Non-secure alias: its system control space is the Non-secure view;
+// anything else there is refused by name.
+alias_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if a >= SCS_NS && a < SCS_NS_END
+        val x = ns_view_read(cpu, a - SCS_ALIAS, width, n)
+        aliased_stop(cpu, a)
+        return x
+    non_secure(cpu, Transition.PpbAlias, a)
+    0
+
+alias_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if a >= SCS_NS && a < SCS_NS_END
+        ns_view_write(cpu, a - SCS_ALIAS, width, x, n)
+        return aliased_stop(cpu, a)
+    non_secure(cpu, Transition.PpbAlias, a)
+
+// A stop the view made at the register's own address names the alias the guest used.
+private aliased_stop(cpu: *Cpu, a: u32)
+    if cpu.stop != Stop.Running && cpu.stop_at == a - SCS_ALIAS then cpu.stop_at = a
+
+// Run `scs_read` with the Non-secure bank live, for the registers each state has a copy of.
+private banked_read(cpu: *Cpu, a: u32, n: u64) -> u32
+    if cpu.ns then return scs_read(cpu, a, 4, n)
+    exchange_bank(cpu)
+    val x = scs_read(cpu, a, 4, n)
+    exchange_bank(cpu)
+    x
+
+private banked_write(cpu: *Cpu, a: u32, x: u32, n: u64)
+    if cpu.ns then return scs_write(cpu, a, 4, x, n)
+    exchange_bank(cpu)
+    scs_write(cpu, a, 4, x, n)
+    exchange_bank(cpu)
+
+// The Non-secure SysTick, swapped into the `tick_*` fields for `scs_read` or `scs_write` to work on;
+// what it pends goes to the Non-secure SysTick exception, and the Secure one's pending bit is kept.
+private swap_tick(cpu: *Cpu)
+    val t = cpu.ns_tick
+    cpu.ns_tick = Tick(cpu.tick_ctrl, cpu.tick_flag, cpu.tick_reload, cpu.tick_value, cpu.tick_zero, cpu.tick_last)
+    cpu.tick_ctrl = t.ctrl
+    cpu.tick_flag = t.flag
+    cpu.tick_reload = t.reload
+    cpu.tick_value = t.value
+    cpu.tick_zero = t.zero
+    cpu.tick_last = t.last
+
+const TICK_BIT: u64 = 1 << SYSTICK
+
+private enter_ns_tick(cpu: *Cpu) -> u64
+    val had = cpu.pending[0] & TICK_BIT
+    cpu.pending[0] &= ~TICK_BIT
+    swap_tick(cpu)
+    had
+
+private leave_ns_tick(cpu: *Cpu, had: u64)
+    swap_tick(cpu)
+    if cpu.pending[0] & TICK_BIT != 0 then set_pending(cpu, NS_BANK + SYSTICK, true)
+    cpu.pending[0] = (cpu.pending[0] & ~TICK_BIT) | had
+
+/** Bring the Non-secure SysTick up to `now`; answers when it next reaches zero, `NEVER` for not. */
+ns_tick_up(cpu: *Cpu, now: u64) -> u64
+    if cpu.ns_tick.ctrl & TICK_ENABLE == 0 then return NEVER
+    val had = enter_ns_tick(cpu)
+    tick(cpu, now)
+    leave_ns_tick(cpu, had)
+    if cpu.ns_tick.ctrl == TICK_RUNNING then cpu.ns_tick.zero else NEVER
+
+private is_systick(a: u32) -> bool = a >= SYST_CSR && a <= SYST_CALIB
+
+// Whether `a` is one of the NVIC's per-IRQ registers or ITNS.
+private is_nvic(a: u32) -> bool = (a >= NVIC_ISER && a < NVIC_IABR + 64) || (a >= NVIC_ITNS && a < NVIC_ITNS + 64) || (a >= NVIC_IPR && a < NVIC_IPR + 512)
+
+// The IRQs of ISER-style register `a` (32 a word) that target Non-secure state, as a mask; for IPR, the
+// mask of its four bytes.
+private ns_irq_mask(cpu: *Cpu, a: u32) -> u32
+    if a >= NVIC_IPR
+        var m: u32 = 0
+        for k in 0u32..<4
+            val irq = a - NVIC_IPR + k
+            if irq < 480 && (cpu.itns[usize(irq >> 5)] >> (irq & 31)) & 1 != 0 then m |= 0xFF << (k * 8)
+        return m
+    cpu.itns[usize(((a - NVIC_ISER) % 128) / 4)]
+
+/** The system control space's Non-secure view, read: Non-secure state's own registers, and only what
+ * Non-secure state may see of the shared ones.
+ */
+ns_view_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if width != 4
+        if byte_wide(a, width) then return part_of(ns_view_read(cpu, a & ~3, 4, n), a, width)
+        halt(cpu, Stop.Unmapped, a)
+        return 0
+    if a & 3 != 0
+        halt(cpu, Stop.Unmapped, a)
+        return 0
+    if is_systick(a)
+        val had = enter_ns_tick(cpu)
+        val x = scs_read(cpu, a, 4, n)
+        leave_ns_tick(cpu, had)
+        return x
+    if is_nvic(a)
+        if a >= NVIC_ITNS && a < NVIC_ITNS + 64 then return 0
+        return scs_read(cpu, a, 4, n) & ns_irq_mask(cpu, a)
+    val ns = NS_BANK
+    a match
+        SCB_ICSR ->
+            val best = best_pending(cpu)
+            val pending: u32 = if best >= 0 && targets_ns(cpu, u32(best)) then architectural(u32(best)) else 0
+            (one_if(exception_pending(cpu, ns + PENDSV)) << 28) | (one_if(exception_pending(cpu, ns + SYSTICK)) << 26) | (pending << 12) | cpu.ipsr
+        SCB_AIRCR -> 0xFA050000 | (cpu.prigroup << 8) | (cpu.aircr_secure & AIRCR_BFHFNMINS)
+        SCB_SHPR1 -> u32(cpu.prio[ns + MEM_MANAGE]) | u32(cpu.prio[ns + USAGE_FAULT]) << 16
+        SCB_SHPR2 -> u32(cpu.prio[ns + SVCALL]) << 24
+        SCB_SHPR3 -> u32(cpu.prio[ns + PENDSV]) << 16 | u32(cpu.prio[ns + SYSTICK]) << 24
+        SCB_SHCSR -> ns_shcsr_value(cpu)
+        SCB_CFSR -> cpu.cfsr_ns
+        SCB_NSACR -> cpu.nsacr
+        // Secure state's alone: zero to Non-secure state.
+        SCB_HFSR | SCB_SFSR | SCB_SFAR | SAU_CTRL | SAU_TYPE | SAU_RNR | SAU_RBAR | SAU_RLAR -> 0
+        FP_FPCCR | FP_FPCAR | FP_FPDSCR ->
+            non_secure(cpu, Transition.NsFpRegister, a)
+            0
+        _ -> banked_read(cpu, a, n)
+
+/** The same, written. */
+ns_view_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if width != 4
+        if !byte_wide(a, width) then return halt(cpu, Stop.Unmapped, a)
+        val rest = if a & ~3 == SCB_CFSR then 0 else ns_view_read(cpu, a & ~3, 4, n)
+        return ns_view_write(cpu, a & ~3, 4, with_part(rest, a, width, x), n)
+    if a & 3 != 0 then return halt(cpu, Stop.Unmapped, a)
+    set_limit(cpu, 0)
+    // What can make a Non-secure exception pending, or start the Non-secure SysTick, puts Non-secure
+    // state in use; a register stored for it (VTOR, CPACR, the MPU) does not.
+    if is_systick(a) || a == SCB_ICSR || a == SCB_SHCSR then cpu.trustzone = true
+    if is_systick(a)
+        val had = enter_ns_tick(cpu)
+        scs_write(cpu, a, 4, x, n)
+        leave_ns_tick(cpu, had)
+        return
+    if is_nvic(a)
+        if a >= NVIC_ITNS && a < NVIC_ITNS + 64 then return
+        val m = ns_irq_mask(cpu, a)
+        if a >= NVIC_IPR
+            // The bytes of Secure IRQs keep their priorities.
+            val was = scs_read(cpu, a, 4, n)
+            return scs_write(cpu, a, 4, (x & m) | (was & ~m), n)
+        return scs_write(cpu, a, 4, x & m, n)
+    val ns = NS_BANK
+    val mask = prio_mask(cpu)
+    a match
+        SCB_ICSR ->
+            if (x >> 28) & 1 != 0 then set_pending(cpu, ns + PENDSV, true)
+            if (x >> 27) & 1 != 0 then set_pending(cpu, ns + PENDSV, false)
+            if (x >> 26) & 1 != 0 then set_pending(cpu, ns + SYSTICK, true)
+            if (x >> 25) & 1 != 0 then set_pending(cpu, ns + SYSTICK, false)
+        SCB_AIRCR ->
+            if x >> 16 != 0x05FA then return
+            if (x >> 8) & 7 != cpu.prigroup then return non_secure(cpu, Transition.PrigroupNs, a)
+            if x & 4 != 0 && cpu.aircr_secure & AIRCR_SYSRESETREQS == 0 then halt(cpu, Stop.Reset, a)
+        SCB_SHPR1 ->
+            cpu.prio[ns + MEM_MANAGE] = u8(x & mask)
+            cpu.prio[ns + USAGE_FAULT] = u8((x >> 16) & mask)
+        SCB_SHPR2 -> cpu.prio[ns + SVCALL] = u8((x >> 24) & mask)
+        SCB_SHPR3 ->
+            cpu.prio[ns + PENDSV] = u8((x >> 16) & mask)
+            cpu.prio[ns + SYSTICK] = u8((x >> 24) & mask)
+        SCB_SHCSR -> ns_shcsr_write(cpu, x)
+        // Write one to clear, over the MemManage and UsageFault bytes.
+        SCB_CFSR -> cpu.cfsr_ns &= ~(x & 0xFFFF00FF)
+        // A software trigger, for an IRQ that targets Non-secure state.
+        NVIC_STIR ->
+            val irq = x & 0x1FF
+            if irq < 480 && (cpu.itns[usize(irq >> 5)] >> (irq & 31)) & 1 != 0 then raise(cpu, irq)
+        SCB_HFSR | SCB_SFSR | SCB_SFAR | SCB_NSACR | SAU_CTRL | SAU_TYPE | SAU_RNR | SAU_RBAR | SAU_RLAR -> ()
+        FP_FPCCR | FP_FPCAR | FP_FPDSCR -> non_secure(cpu, Transition.NsFpRegister, a)
+        SCB_CPACR ->
+            banked_write(cpu, a, x & nsacr_access(cpu), n)
+        _ -> banked_write(cpu, a, x, n)
+
+// The CPACR fields NSACR gives Non-secure state: CP0–CP7's, and CP10's and CP11's.
+nsacr_access(cpu: *Cpu) -> u32
+    var m: u32 = 0
+    for i in 0u32..<8 do if cpu.nsacr & (1 << i) != 0 then m |= 3 << (2 * i)
+    if cpu.nsacr & (1 << 10) != 0 then m |= 3 << 20
+    if cpu.nsacr & (1 << 11) != 0 then m |= 3 << 22
+    m
+
+// The Non-secure SHCSR: its banked faults' and system handlers' active and pending bits, and the
+// MemManage and UsageFault enables.
+private ns_shcsr_value(cpu: *Cpu) -> u32
+    val ns = NS_BANK
+    var v = one_if(exception_active(cpu, ns + MEM_MANAGE)) | (one_if(exception_active(cpu, ns + USAGE_FAULT)) << 3)
+    v |= (one_if(exception_active(cpu, ns + SVCALL)) << 7) | (one_if(exception_active(cpu, ns + PENDSV)) << 10) | (one_if(exception_active(cpu, ns + SYSTICK)) << 11)
+    v |= (one_if(exception_pending(cpu, ns + USAGE_FAULT)) << 12) | (one_if(exception_pending(cpu, ns + MEM_MANAGE)) << 13) | (one_if(exception_pending(cpu, ns + SVCALL)) << 15)
+    v |= (one_if(fault_enabled(cpu, ns + MEM_MANAGE)) << 16) | (one_if(fault_enabled(cpu, ns + USAGE_FAULT)) << 18)
+    v
+
+@inline
+private one_if(b: bool) -> u32 = if b then 1 else 0
+
+private ns_shcsr_write(cpu: *Cpu, x: u32)
+    val ns = NS_BANK
+    val w = nvic_word(ns)
+    val mm = nvic_bit(ns + MEM_MANAGE)
+    val uf = nvic_bit(ns + USAGE_FAULT)
+    cpu.enabled[w] = (cpu.enabled[w] & ~(mm | uf)) | (if (x >> 16) & 1 != 0 then mm else 0) | (if (x >> 18) & 1 != 0 then uf else 0)
+    set_pending(cpu, ns + USAGE_FAULT, (x >> 12) & 1 != 0)
+    set_pending(cpu, ns + MEM_MANAGE, (x >> 13) & 1 != 0)
+    set_pending(cpu, ns + SVCALL, (x >> 15) & 1 != 0)
+
+// ---------------------------------------------------------------------------------------------------
+// The Non-secure special registers from Secure state.
+
+// `MRS` (c = 0, a = Rd) or `MSR` (c = 1, b = Rn) of a `_NS` register, SYSm in `imm`: in Secure state the
+// Non-secure copy, SP_NS the stack pointer Non-secure thread mode selects; in Non-secure state, reading
+// zero and ignoring writes.
+ns_register(cpu: *Cpu, ip: *Insn)
+    if cpu.ns
+        if ip.c == 0 then cpu.r[ip.a] = 0
+        return
+    val sysm = (ip.imm & 0xFF) - 0x80
+    exchange_bank(cpu)
+    // SP_NS: MSP_NS or PSP_NS, as CONTROL_NS.SPSEL selects.
+    val spsel = if cpu.control & 2 != 0 then 9u32 else 8
+    var r = Insn(ip.h, if sysm == 0x18 then spsel else sysm | (ip.imm & 0xF00), ip.op, ip.a, ip.b, ip.c)
+    if ip.c == 0 then mrs8(cpu, &r) else msr8(cpu, &r)
+    exchange_bank(cpu)
+    if ip.c != 0 then cpu.trustzone = true
