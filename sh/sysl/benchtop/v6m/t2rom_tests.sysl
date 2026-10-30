@@ -1,0 +1,236 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+import sysl.fmt.hex
+
+// What the RP2350's boot ROM needs of a Secure-only M33 beyond the SAU (t2secure.sysl): the MPU's
+// registers and `TT`'s MPU fields, the IDAU's region, NSACR, SCR and the Non-secure alias's CPACR, and
+// `WFE` and `SEV` with an event register (except.sysl's `hint`), against the ARMv8-M ARM ("TT, TTT,
+// TTA, TTAT", "MPU", "WFE", "SEV", "The Event Register") and `regs/m33.h` (M33_MPU_*, M33_NSACR_*,
+// M33_SCR_*). The ROM's own start-up checks two `TT` answers exactly; both are oracles here. Every
+// guest case runs under both executors (`run_both8`).
+
+const MPU_RLAR: u32 = 0xE000EDA0
+const TT_R: u32 = 1 << 18
+const TT_MRVALID: u32 = 1 << 16
+const TT_IRVALID: u32 = 1 << 23
+
+// The core a board with the ROM's IDAU region makes.
+with_idau(cpu: *Cpu)
+    secure(cpu)
+    cpu.idau = IdauRegion(0x7E00, 0x7FFF, 2)
+
+// MPU region `k`, RBAR and RLAR as written.
+mpu_region_at(cpu: *Cpu, k: u32, rbar: u32, rlar: u32)
+    store32(cpu, MPU_RNR, k)
+    store32(cpu, MPU_RBAR, rbar)
+    store32(cpu, MPU_RLAR, rlar)
+
+// The state the boot ROM's start-up leaves (`arm8_bootrom_rt0.S`, its `bootrom_mpu_regs`): SAU region
+// 7 from the end of its Secure-only text, Non-secure; the MPU on with PRIVDEFENA and four regions,
+// BOOTRAM, SRAM, XIP and the ROM, each privileged read-only and execute-never.
+rom_state(cpu: *Cpu)
+    with_idau(cpu)
+    store32(cpu, SAU_RNR, 7)
+    store32(cpu, SAU_RBAR, 0x4787)
+    store32(cpu, SAU_RLAR, 0x7FE1)
+    store32(cpu, SAU_CTRL, 1)
+    mpu_region_at(cpu, 0, 0x400E0225, 0x400E0311)
+    mpu_region_at(cpu, 1, 0x20000005, 0x20081FF1)
+    mpu_region_at(cpu, 2, 0x10000005, 0x1FFFFFF1)
+    mpu_region_at(cpu, 3, 0x00004785, 0x00007FD1)
+    store32(cpu, MPU_CTRL, 5)
+
+// The SAU as the ROM sets it, and the MPU off.
+rom_sau(cpu: *Cpu)
+    with_idau(cpu)
+    store32(cpu, SAU_RNR, 7)
+    store32(cpu, SAU_RBAR, 0x4787)
+    store32(cpu, SAU_RLAR, 0x7FE1)
+    store32(cpu, SAU_CTRL, 1)
+
+// Four MPU regions of 256 bytes from 0x1000, one per AP value (0 RW privileged, 1 RW any, 2 RO
+// privileged, 3 RO any); region 4 overlapping region 3's second half; region 5 disabled over 0x2000;
+// the MPU on, without PRIVDEFENA.
+ap_regions(cpu: *Cpu)
+    secure(cpu)
+    for ap in 0u32..<4 do mpu_region_at(cpu, ap, 0x1000 + ap * 0x100 + (ap << 1), 0x1000 + ap * 0x100 + 0xE1)
+    mpu_region_at(cpu, 4, 0x1380, 0x13E1)
+    mpu_region_at(cpu, 5, 0x2000, 0x20E0)
+    store32(cpu, MPU_CTRL, 1)
+
+// The same with PRIVDEFENA.
+ap_regions_default(cpu: *Cpu)
+    ap_regions(cpu)
+    store32(cpu, MPU_CTRL, 5)
+
+// The same regions with the MPU off.
+ap_regions_off(cpu: *Cpu)
+    ap_regions(cpu)
+    store32(cpu, MPU_CTRL, 0)
+
+// ---------------------------------------------------------------------------------------------------
+// The registers.
+
+@test("the MPU's registers: MPU_TYPE eight regions and read-only, CTRL's three bits, RNR's three, RBAR whole, RLAR without bit 4, the aliases at RNR + 1..3 wrapping at eight, MAIR0 and MAIR1; a reset clears them")
+sec_mpu_registers()
+    var c = secure_core()
+    assert(load32(&c, MPU_TYPE) == 0x800 && load32(&c, MPU_CTRL) == 0 && load32(&c, MPU_RNR) == 0, "reset")
+    assert(load32(&c, MPU_RBAR) == 0 && load32(&c, MPU_RLAR) == 0 && load32(&c, MPU_MAIR0) == 0 && load32(&c, MPU_MAIR1) == 0, "reset")
+    store32(&c, MPU_TYPE, 0)
+    assert(load32(&c, MPU_TYPE) == 0x800 && c.stop == Stop.Running, "MPU_TYPE ignores a write")
+    store32(&c, MPU_CTRL, 0xFFFFFFFF)
+    assert(load32(&c, MPU_CTRL) == 7, "PRIVDEFENA, HFNMIENA, ENABLE")
+    store32(&c, MPU_RNR, 0xF5)
+    assert(load32(&c, MPU_RNR) == 5, "REGION keeps three bits, as the ROM's check of 0xF0 expects")
+    store32(&c, MPU_RBAR, 0xFFFFFFFF)
+    store32(&c, MPU_RLAR, 0xFFFFFFFF)
+    assert(load32(&c, MPU_RBAR) == 0xFFFFFFFF && load32(&c, MPU_RLAR) == 0xFFFFFFEF, "BASE, SH, AP, XN; LIMIT, ATTRINDX, EN")
+    assert(c.mpu_rbar[5] == 0xFFFFFFFF && c.mpu_rlar[5] == 0xFFFFFFEF && c.mpu_rbar[4] == 0, "region 5 its own")
+    // Alias 1 is region 6, alias 3 region 0: RNR + 3 wraps.
+    store32(&c, MPU_RBAR + 8, 0x12345678)
+    store32(&c, MPU_RLAR + 8, 0x11)
+    store32(&c, MPU_RLAR + 24, 0x7FD1)
+    assert(c.mpu_rbar[6] == 0x12345678 && c.mpu_rlar[6] == 0x01 && c.mpu_rlar[0] == 0x7FC1, "the aliases")
+    assert(load32(&c, MPU_RBAR + 8) == 0x12345678 && load32(&c, MPU_RLAR + 24) == 0x7FC1 && load32(&c, MPU_RNR) == 5, "read through the aliases, RNR unmoved")
+    store32(&c, MPU_MAIR0, 0xFFEEDDCC)
+    store32(&c, MPU_MAIR1, 0x01020304)
+    assert(load32(&c, MPU_MAIR0) == 0xFFEEDDCC && load32(&c, MPU_MAIR1) == 0x01020304)
+    reset(&c, test_memory, [], 0)
+    c.security = true
+    assert(load32(&c, MPU_CTRL) == 0 && c.mpu_rbar[5] == 0 && c.mpu_rlar[0] == 0 && c.mpu_mair[0] == 0, "cleared")
+
+@test("NSACR keeps CP0-7, CP10 and CP11; SCR keeps SLEEPONEXIT, SLEEPDEEP, SLEEPDEEPS and SEVONPEND; a core without the extension has neither, nor the MPU")
+sec_nsacr_scr()
+    var c = secure_core()
+    assert(load32(&c, SCB_NSACR) == 0 && load32(&c, SCB_SCR) == 0, "reset")
+    store32(&c, SCB_NSACR, 0xFFFFFFFF)
+    store32(&c, SCB_SCR, 0xFFFFFFFF)
+    assert(load32(&c, SCB_NSACR) == 0xCFF && load32(&c, SCB_SCR) == 0x1E, s"0x${hex(load32(&c, SCB_NSACR))}")
+    store32(&c, SCB_SCR, 4)
+    assert(load32(&c, SCB_SCR) == 4, "the boot ROM's SLEEPDEEP")
+    var n: Cpu
+    n.kind = Kind.V8mMain
+    reset(&n, test_memory, [], 0)
+    for a in [SCB_NSACR, SCB_SCR, MPU_TYPE, MPU_CTRL, MPU_RBAR, MPU_MAIR1]
+        load32(&n, a)
+        assert(refused_at(&n, a), s"0x${hex(a)} without the extension")
+
+@test("the Non-secure alias's CPACR is stored with the fields CPACR keeps, by word only; every other address of the alias still stops at NonSecure by name")
+sec_cpacr_ns()
+    var c = secure_core()
+    c.fpu = Fpu.Single
+    c.coprocessors = 0x81
+    assert(load32(&c, CPACR_NS) == 0)
+    store32(&c, CPACR_NS, 0xFFFFFFFF)
+    assert(load32(&c, CPACR_NS) == 0x00F0C003 && c.stop == Stop.Running && load32(&c, SCB_CPACR) == 0, "its own copy, CP10/11, CP7 and CP0")
+    // str r0, [r1]; ldr r0, [r1] at CPACR_NS run; strh to it and str beside it stop.
+    var g = run_both8([0x6008, 0x6808, BKPT], [0xFFFFFFFF, CPACR_NS], 0, [], &secure)
+    assert(g.stop == Stop.Breakpoint && g.r[0] == 0x00F00000, s"0x${hex(g.r[0])}")
+    g = run_both8([0x8008], [0, CPACR_NS], 0, [], &secure)
+    assert(g.stop == Stop.NonSecure && g.stop_at == CPACR_NS, "a halfword")
+    for a in [CPACR_NS - 4, CPACR_NS + 4]
+        g = run_both8([0x6008], [0, a], 0, [], &secure)
+        assert(g.stop == Stop.NonSecure && g.stop_at == a && g.transition == Transition.PpbAlias, s"0x${hex(a)}")
+
+// ---------------------------------------------------------------------------------------------------
+// TT over the IDAU and the MPU.
+
+@test("TT with the IDAU's region: IREGION and IRVALID inside it, its ends inclusive, none outside; its Non-secure-callable region outranks the SAU's Non-secure")
+sec_tt_idau()
+    val idau = TT_S | TT_RW | TT_IRVALID | (2 << 24)
+    assert(answers(0x7E00, &with_idau, idau), "its base")
+    assert(answers(0x7FFF, &with_idau, idau), "its last byte")
+    assert(answers(0x7DFF, &with_idau, TT_S | TT_RW), "below")
+    assert(answers(0x8000, &with_idau, TT_S | TT_RW), "above")
+    // SAU region 7 over 0x4780-0x7FFF, Non-secure: inside the IDAU's region it stays Secure.
+    assert(answers(0x7E00, &rom_sau, idau | TT_SRVALID | (7 << 8)), "Secure, both regions named")
+    assert(answers(0x7000, &rom_sau, TT_NS_RW | TT_SRVALID | (7 << 8)), "Non-secure, the SAU's region alone")
+    assert(answers(0x4000, &rom_sau, TT_S | TT_RW), "the Secure-only text, in neither")
+
+@test("TT answers the boot ROM's own two checks exactly: 0x02ce0700 at 0x7fe1 before its MPU, 0x02c70703 at 0x7fc1 after it")
+sec_tt_rom_oracles()
+    // tt r0, r1 only: the ROM checks the privileged Secure form.
+    var c = run_both8([0xE841, 0xF000, LOG_R0], [0, 0x7FE1, 0, 0, LOG], 0, [], &rom_sau)
+    assert(logged(&c, [0x02CE0700]))
+    c = run_both8([0xE841, 0xF000, LOG_R0], [0, 0x7FC1, 0, 0, LOG], 0, [], &rom_state)
+    assert(logged(&c, [0x02C70703]))
+    // TTT: region 3 is privileged read-only, so unprivileged it reads nothing; TTA asks the
+    // Non-secure domain, whose MPU is not modelled, so the default map.
+    c = tt_all(0x7FC1, &rom_state)
+    assert(logged(&c, [0x02C70703, 0x02C30703, 0x02CE0700, 0x02CE0700]))
+
+@test("TT with the MPU on: each AP value's R and RW for TT and TTT, the region's ends, MRVALID and MREGION; an overlap names no region and allows nothing; a disabled region counts for nothing")
+sec_tt_mpu()
+    // AP 0: RW privileged only.
+    var c = tt_all(0x1000, &ap_regions)
+    assert(logged(&c, [TT_S | TT_RW | TT_MRVALID, TT_S | TT_MRVALID, TT_S | TT_RW, TT_S | TT_RW]), "AP 0")
+    // AP 1: RW for both; the region's last byte.
+    c = tt_all(0x11FF, &ap_regions)
+    assert(logged(&c, [TT_S | TT_RW | TT_MRVALID | 1, TT_S | TT_RW | TT_MRVALID | 1, TT_S | TT_RW, TT_S | TT_RW]), "AP 1")
+    // AP 2: read-only privileged.
+    c = tt_all(0x1200, &ap_regions)
+    assert(logged(&c, [TT_S | TT_R | TT_MRVALID | 2, TT_S | TT_MRVALID | 2, TT_S | TT_RW, TT_S | TT_RW]), "AP 2")
+    // AP 3: read-only for both, below region 4's overlap.
+    c = tt_all(0x1300, &ap_regions)
+    assert(logged(&c, [TT_S | TT_R | TT_MRVALID | 3, TT_S | TT_R | TT_MRVALID | 3, TT_S | TT_RW, TT_S | TT_RW]), "AP 3")
+    // Regions 3 and 4 overlap: no region, no access, whatever PRIVDEFENA says.
+    c = tt_all(0x1380, &ap_regions_default)
+    assert(logged(&c, [TT_S, TT_S, TT_S | TT_RW, TT_S | TT_RW]), "the overlap")
+    // In no region (and region 5's, disabled): nothing without PRIVDEFENA; the default map with it, for
+    // privileged queries only.
+    for a in [0x0FFFu32, 0x1400, 0x2000]
+        c = tt_all(a, &ap_regions)
+        assert(logged(&c, [TT_S, TT_S, TT_S | TT_RW, TT_S | TT_RW]), s"0x${hex(a)} without PRIVDEFENA")
+        c = tt_all(a, &ap_regions_default)
+        assert(logged(&c, [TT_S | TT_RW, TT_S, TT_S | TT_RW, TT_S | TT_RW]), s"0x${hex(a)} with PRIVDEFENA")
+    // The MPU off: its regions are not consulted.
+    assert(answers(0x1200, &ap_regions_off, TT_S | TT_RW), "the MPU off")
+
+// ---------------------------------------------------------------------------------------------------
+// WFE and SEV.
+
+const WFE: u16 = 0xBF20
+const SEV: u16 = 0xBF40
+const MOVS_R0_1: u16 = 0x2001
+
+// The board's `events`.
+with_events(cpu: *Cpu)
+    secure(cpu)
+    cpu.events = true
+
+with_event_set(cpu: *Cpu)
+    with_events(cpu)
+    cpu.event = true
+
+// IRQ 0 enabled and pending, PRIMASK set: it wakes a sleeper without being taken.
+events_and_masked_irq(cpu: *Cpu)
+    with_events(cpu)
+    cpu.primask = 1
+    irq0_pending(cpu)
+
+@test("without the board's events WFE and SEV are NOPs, narrow and wide")
+sec_wfe_nop()
+    var c = run_both8([WFE, SEV, WFE, 0xF3AF, 0x8002, 0xF3AF, 0x8004, MOVS_R0_1, BKPT], [], 0, [], &secure)
+    assert(c.stop == Stop.Breakpoint && c.r[0] == 1 && !c.event && !c.sleeping && c.slept == 0)
+
+@test("with events: SEV sets the core's own event register, which the next WFE consumes without sleeping; a second WFE then sleeps; narrow and wide")
+sec_sev_then_wfe()
+    var c = run_both8([SEV, WFE, MOVS_R0_1, BKPT], [], 0, [], &with_events)
+    assert(c.stop == Stop.Breakpoint && c.r[0] == 1 && !c.event && c.slept == 0, "SEV; WFE")
+    c = run_both8([0xF3AF, 0x8004, 0xF3AF, 0x8002, MOVS_R0_1, BKPT], [], 0, [], &with_events)
+    assert(c.stop == Stop.Breakpoint && c.r[0] == 1 && !c.event, "SEV.W; WFE.W")
+    c = run_both8([SEV, WFE, WFE, MOVS_R0_1, BKPT], [], 0, [], &with_events)
+    assert(c.stop == Stop.Asleep && c.r[0] == 0 && c.sleeping && c.on_event, "the second WFE sleeps, nothing to wake it")
+    c = run_both8([SEV, SEV, WFE, WFE, MOVS_R0_1, BKPT], [], 0, [], &with_events)
+    assert(c.stop == Stop.Asleep, "the register is one bit: two SEVs wake one WFE")
+
+@test("with events: WFE sleeps where no event is set; an event set before it is consumed; a pending interrupt wakes it, masked by PRIMASK, without being taken")
+sec_wfe_sleeps_and_wakes()
+    var c = run_both8([WFE, MOVS_R0_1, BKPT], [], 0, [], &with_events)
+    assert(c.stop == Stop.Asleep && c.r[0] == 0, "nothing wakes it")
+    c = run_both8([WFE, MOVS_R0_1, BKPT], [], 0, [], &with_event_set)
+    assert(c.stop == Stop.Breakpoint && c.r[0] == 1 && !c.event, "the event consumed")
+    c = run_both8([WFE, MOVS_R0_1, BKPT], [], 0, [], &events_and_masked_irq)
+    assert(c.stop == Stop.Breakpoint && c.r[0] == 1 && !c.on_event && c.active[0] == 0, "IRQ 0 woke it, not taken under PRIMASK")
+    assert(c.event == false, "an interrupt wakes WFE without setting the event register")

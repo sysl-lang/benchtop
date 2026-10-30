@@ -67,58 +67,59 @@ chip_psm_refusals()
     assert(c.take_core1_reset() && !c.take_core1_reset(), "one reset, reported once")
     assert(rd(&c, ps.BASE + ps.DONE_OFFSET) == 0x01FFFFFF & ~ps.DONE_PROC1_MASK)
 
-@test("FRCE_OFF on PROC1 stops core 1 and FRCE_OFF clear brings it back to the boot ROM with a 0 in core 0's FIFO, ready to be launched again")
+@test("FRCE_OFF on PROC1 stops core 1; clearing it starts core 1 from reset in the boot ROM, whose own code drains its mailbox, answers core 0 with a 0 and waits to be launched again")
 arm_core1_reset_and_relaunch()
     val b = arm_board(SRAM)
     b.boot(HELLO).unwrap()
     // Core 1 first loops forever (b .); then, after the reset, the second image sets r0 and stops.
     place(b, 0x20070000, [0xE7FE])
     place(b, 0x20070200, [0x202A, 0xBE00])
-    // Core 0: wfi, b .
-    place(b, 0x20070100, [0xBF30, 0xE7FD])
-    b.cores[0].pc = 0x20070100
+    park_core0(b)
     val fifo_wr = sio_reg.BASE + sio_reg.FIFO_WR_OFFSET
     val fifo_rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
     val fifo_st = sio_reg.BASE + sio_reg.FIFO_ST_OFFSET
-    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070001]
-        b.chip.write(0, fifo_wr, 4, x).unwrap()
-        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x)
-    assert(b.run(20000) == RunEnd.Budget && b.started[1], "core 1 runs its loop")
+    launch_from_test(b, 0x20000000, 0x20080000, 0x20070001)
+    assert(b.run(20000) == RunEnd.Budget && b.started[1] && b.cores[1].pc == 0x20070000, "core 1 runs its loop")
     // Held in reset: core 1 stops, and what core 0 sends it is not answered.
     b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x2000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
     assert(b.chip.read(0, ps.BASE + ps.FRCE_OFF_OFFSET, 4).unwrap() & ps.FRCE_OFF_PROC1_MASK != 0, "multicore_reset_core1 polls FRCE_OFF back")
     b.chip.write(0, fifo_wr, 4, 0x1234).unwrap()
-    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "no echo while it is held")
     b.run(1000)
     assert(!b.started[1], "core 1 is stopped")
-    // Released: the stale word is drained and core 1 reports with a 0.
+    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "no echo while it is held")
+    // Released: core 1 runs the ROM from its reset vector; the stale word is drained and the ROM
+    // reports with a 0. The salts survive a core's own reset, so it does not wait for them.
     b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x3000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
-    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0)
+    b.run(2000)
+    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0, s"core 1 at 0x${hex(b.cores[1].pc, 8)}")
     assert(b.chip.read(0, fifo_rd, 4).unwrap() == 0 && b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "exactly one 0")
     assert(b.chip.sio.fifos[1].empty(), "its mailbox was drained")
-    b.run(1000)
-    assert(!b.started[1], "back in the boot ROM, not running")
-    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070201]
-        b.chip.write(0, fifo_wr, 4, x).unwrap()
-        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x, "the ROM answers the launch again")
+    assert(waits_in_rom(b, 1), s"back in the boot ROM's wait: core 1 at 0x${hex(b.cores[1].pc, 8)}")
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070201] do assert(push_and_echo(b, x) == x, "the ROM answers the launch again")
     assert(b.run(100000) == RunEnd.Breakpoint, b.refused)
     assert(b.started[1] && b.cores[1].r[0] == 42, "the second image ran on core 1")
 
-@test("a write to PSM from core 1 resets core 1 too, and releasing it with nothing in flight changes nothing else")
+@test("a write to PSM from core 1 resets core 1 too, and its ROM answers with one 0; releasing it again changes nothing")
 arm_core1_reset_before_launch()
     val b = arm_board(SRAM)
     b.boot(HELLO).unwrap()
-    place(b, 0x20070100, [0xBF30, 0xE7FD])
-    b.cores[0].pc = 0x20070100
+    park_core0(b)
+    salted(b)
+    val st = sio_reg.BASE + sio_reg.FIFO_ST_OFFSET
+    val rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
+    // Core 1's ROM, past the salts, reports at power-on with a 0 of its own.
+    b.run(2000)
+    assert(b.chip.read(0, rd, 4).unwrap() == 0 && b.chip.read(0, st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0)
     b.chip.write(1, ps.BASE + ps.FRCE_OFF_OFFSET + 0x2000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
     b.chip.write(1, ps.BASE + ps.FRCE_OFF_OFFSET + 0x3000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
-    assert(b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_ST_OFFSET, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0, "the 0 is for core 0, whoever wrote")
-    assert(b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_RD_OFFSET, 4).unwrap() == 0)
-    // Releasing again (already released) is no new 0.
+    b.run(2000)
+    assert(b.chip.read(0, st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0, "the 0 is for core 0, whoever wrote")
+    assert(b.chip.read(0, rd, 4).unwrap() == 0)
+    // Releasing again (already released) is no reset and no new 0.
     b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x3000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
-    assert(b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_ST_OFFSET, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0)
     assert(b.run(5000) != RunEnd.Fault, b.refused)
-    assert(!b.started[1], "and core 1 is still in the boot ROM")
+    assert(b.chip.read(0, st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0)
+    assert(waits_in_rom(b, 1), "and core 1 is still in the boot ROM")
 
 @test("ROSC: disabling it stops clk_ref and clk_sys, which run from it at power-on; COUNT counts its cycles; DORMANT pauses it")
 chip_rosc_drives_the_clocks()
@@ -257,7 +258,22 @@ private put(b: &RiscvBoard, at: u32, code: []const u32)
     for i in 0..<code.len
         for j in 0..<4 do b.sram.set(usize(at - 0x20000000) + 4 * i + usize(j), u8.wrap(code[i] >> (8 * u32(j))))
 
-@test("on the RISC-V board too, FRCE_OFF on PROC1 stops hart 1, its release answers hart 0 with a 0, and hart 1 launches again")
+// Hart 0's side of one launch word, from the test, against the boot ROM's own RISC-V code on hart 1:
+// a 0 drains hart 0's FIFO first; the word goes into hart 1's with an h3.unblock's event, and the
+// board runs until the ROM answers it. The answer.
+private rv_push_and_echo(b: &RiscvBoard, x: u32) -> u32
+    val st = sio_reg.BASE + sio_reg.FIFO_ST_OFFSET
+    val rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
+    if x == 0 then while b.chip.read(0, st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0 do b.chip.read(0, rd, 4).unwrap()
+    b.chip.write(0, sio_reg.BASE + sio_reg.FIFO_WR_OFFSET, 4, x).unwrap()
+    b.harts[1].event = true
+    for i in 0..<100
+        if b.chip.read(0, st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0 then return b.chip.read(0, rd, 4).unwrap()
+        b.run(1000)
+    assert(false, s"hart 1's boot ROM never answered 0x${hex(x)}: hart 1 at 0x${hex(b.harts[1].pc, 8)}")
+    0
+
+@test("on the RISC-V board hart 1 runs the boot ROM's RISC-V wait: it launches through the ROM, FRCE_OFF on PROC1 stops it, its release restarts it in the ROM, which answers hart 0 with a 0, and it launches again")
 riscv_core1_reset_and_relaunch()
     val b = riscv_board(SramMap(0x20000000, 520 * 1024))
     b.boot(BLINK_RV).unwrap()
@@ -270,22 +286,34 @@ riscv_core1_reset_and_relaunch()
     val fifo_wr = sio_reg.BASE + sio_reg.FIFO_WR_OFFSET
     val fifo_rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
     val fifo_st = sio_reg.BASE + sio_reg.FIFO_ST_OFFSET
-    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070000]
-        b.chip.write(0, fifo_wr, 4, x).unwrap()
-        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x)
+    // Hart 1 starts at the ROM's RISC-V reset vector and blocks in its wait.
+    assert(b.harts[1].pc == RISCV_RESET_VECTOR && b.started[1])
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070000] do assert(rv_push_and_echo(b, x) == x, s"the ROM echoes 0x${hex(x)}")
     b.run(20000)
-    assert(b.started[1], "hart 1 runs its spin")
+    assert(b.started[1] && b.harts[1].pc == 0x20070000 && b.harts[1].cs.mtvec == 0x20000000 && b.harts[1].r[2] == 0x20080000, "hart 1 runs its spin, on the trap vector and stack it was sent")
     b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x2000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
     b.chip.write(0, fifo_wr, 4, 0x1234).unwrap()
-    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "no echo while held")
     b.run(1000)
     assert(!b.started[1], "hart 1 is stopped")
+    assert(b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "no echo while held")
     b.chip.write(0, ps.BASE + ps.FRCE_OFF_OFFSET + 0x3000, 4, ps.FRCE_OFF_PROC1_MASK).unwrap()
+    b.run(2000)
     assert(b.chip.read(0, fifo_rd, 4).unwrap() == 0 && b.chip.read(0, fifo_st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "exactly one 0")
-    b.run(1000)
-    assert(!b.started[1], "back in the boot ROM")
-    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070200]
-        b.chip.write(0, fifo_wr, 4, x).unwrap()
-        assert(b.chip.read(0, fifo_rd, 4).unwrap() == x, "the ROM answers the launch again")
+    assert(b.chip.sio.fifos[1].empty(), "its mailbox was drained")
+    assert(b.started[1] && b.harts[1].pc < ROM_BYTES && b.harts[1].stop == rv.Stop.Sleep, s"back in the boot ROM, blocked: 0x${hex(b.harts[1].pc, 8)}")
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070200] do assert(rv_push_and_echo(b, x) == x, "the ROM answers the launch again")
     assert(b.run(100000) == RunEnd.Breakpoint, b.refused)
     assert(b.started[1] && b.harts[1].r[10] == 42, "the second image ran on hart 1")
+
+@test("a hart's write to the boot ROM is refused by name, and the ROM reads back as Raspberry Pi's image through the RISC-V bus")
+riscv_rom_reads()
+    val b = riscv_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(BLINK_RV).unwrap()
+    // lw a0, 0x10(zero); lhu a1, 0x7dfc(zero) is out of reach of a 12-bit offset, so: lui a2, 8;
+    // lw a1, -516(a2) (0x7dfc); sw a0, 0x100(zero); ebreak.
+    put(b, 0x20070000, [0x01002503, 0x00008637, 0xDFC62583, 0x10A02023, 0x00100073])
+    b.harts[0].pc = 0x20070000
+    rv.forget_code(&b.harts[0])
+    assert(b.run(10000) == RunEnd.Fault)
+    assert(b.harts[0].r[10] == rom_word(0x10) && b.harts[0].r[11] == rom_word(RISCV_RESET_VECTOR), s"0x${hex(b.harts[0].r[10])} 0x${hex(b.harts[0].r[11])}")
+    assert(b.refused == "hart 0 at pc 0x2007000c: 0x00000100 is in the boot ROM, which is read-only", b.refused)

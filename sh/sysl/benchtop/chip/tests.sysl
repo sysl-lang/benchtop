@@ -5,10 +5,14 @@ import sh.sysl.benchtop.{library, load}
 import sh.sysl.benchtop.riscv as rv
 import sh.sysl.parsing.source_of
 import sh.sysl.rp2350.io_bank0 as io_reg
+import sh.sysl.rp2350.io_qspi as io_qspi_reg
 import sh.sysl.rp2350.pads_bank0 as pads_reg
+import sh.sysl.rp2350.pads_qspi as pads_qspi_reg
+import sh.sysl.rp2350.psm as psm_reg
 import sh.sysl.rp2350.resets as resets_reg
 import sh.sysl.rp2350.sio as sio_reg
 import sh.sysl.rp2350.uart0 as uart0_reg
+import sysl.fmt.hex
 import sysl.text.from_utf8_lossy
 
 private val BLINK = embed("../../../../examples/pico2-riscv/blink.elf")
@@ -19,7 +23,7 @@ private val PICO2_SRAM = SramMap(0x20000000, 520 * 1024)
 riscv_blink()
     val b = riscv_board(PICO2_SRAM)
     b.boot(BLINK).unwrap()
-    assert(!b.started[1], "core 1 waits in the boot ROM")
+    assert(b.started[1] && b.harts[1].pc == RISCV_RESET_VECTOR, "core 1 starts in the boot ROM, at the Hazard3 reset vector")
     var lit = 0
     var was = false
     var end = RunEnd.Budget
@@ -112,20 +116,41 @@ pins_and_cpuid()
     c.write(0, io_reg.BASE + 0x2000 + io_reg.GPIO25_CTRL_OFFSET, 4, io_reg.GPIO25_CTRL_OUTOVER_LOW << io_reg.GPIO25_CTRL_OUTOVER_SHIFT).unwrap()
     assert(c.pin(25).drives && !c.pin(25).level)
 
-@test("core 1's boot ROM echoes each launch word, restarts on one out of order, and launches after the sixth")
-rom_launch()
+@test("the QSPI bank's pins and the OTP's read windows sit at their datasheet bases: the pins behind their RESETS bits, which the boards' boot releases; the OTP reads blank and refuses a write, and its control block, by name")
+chip_rom_blocks()
+    var c = rp2350()
+    val pads = pads_qspi_reg.BASE + pads_qspi_reg.GPIO_QSPI_SCLK_OFFSET
+    assert(c.read(0, pads, 4).unwrap_err().contains("PADS_QSPI is held in reset"), c.read(0, pads, 4).unwrap_err())
+    assert(c.read(0, io_qspi_reg.BASE + io_qspi_reg.GPIO_QSPI_SS_CTRL_OFFSET, 4).unwrap_err().contains("IO_QSPI is held in reset"))
+    c.rom_boot_releases()
+    assert(c.read(0, pads, 4).unwrap() == 0x156 && c.read(0, io_qspi_reg.BASE + io_qspi_reg.GPIO_QSPI_SS_CTRL_OFFSET, 4).unwrap() == 0x1F)
+    assert(c.resets.held == 0x1FFFFFFF & ~(resets_reg.RESET_IO_QSPI_MASK | resets_reg.RESET_PADS_QSPI_MASK), "nothing else released")
+    c.write(0, pads + 0x2000, 4, 0x1).unwrap()
+    assert(c.read(0, pads, 4).unwrap() == 0x157, "the SET alias")
+    // Held again, the pads go back to their reset values.
+    c.write(0, resets_reg.BASE + 0x2000, 4, resets_reg.RESET_PADS_QSPI_MASK).unwrap()
+    c.rom_boot_releases()
+    assert(c.read(0, pads, 4).unwrap() == 0x156)
+    assert(c.read(0, io_qspi_reg.BASE + io_qspi_reg.GPIO_QSPI_SS_STATUS_OFFSET, 4).unwrap_err() == "IO_QSPI + 0x18 is not a register benchtop runs")
+    for base in [0x40130000u32, 0x40134000, 0x40138000, 0x4013C000]
+        assert(c.read(0, base, 4).unwrap() == 0 && c.read(0, base + 0x1FFC, 4).unwrap() == 0, s"0x${hex(base)}")
+        val w = c.write(0, base, 4, 0)
+        assert(w.unwrap_err().contains("read-only") && w.unwrap_err().contains("item 26"), w.unwrap_err())
+    assert(c.read(0, 0x40132000, 4).unwrap_err() == "OTP_DATA + 0x2000 is not a register benchtop runs", "past the ECC window's 4096 rows")
+    assert(c.read(0, 0x40137FFC, 4).unwrap() == 0, "the raw window's last row")
+    assert(c.read(0, 0x40120000, 4).unwrap_err().contains("not on the RP2350's bus"), "the OTP's control block is rp-coverage item 26")
+
+@test("the chip answers nothing for the boot ROM: core 1's FIFO keeps what core 0 sends, and PSM's hold and release are the board's to act on")
+chip_runs_no_rom()
     var c = rp2350()
     val wr = sio_reg.BASE + sio_reg.FIFO_WR_OFFSET
     val rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
-    // A stray word restarts the sequence; it is still echoed.
-    for x in [0u32, 7, 0, 0, 1, 0x20000100, 0x20081000]
-        c.write(0, wr, 4, x).unwrap()
-        assert(c.read(0, rd, 4).unwrap() == x, "echoed")
-        assert(c.take_launch().is_none())
-    c.write(0, wr, 4, 0x20000041).unwrap()
-    assert(c.read(0, rd, 4).unwrap() == 0x20000041)
-    val l = c.take_launch().unwrap()
-    assert(l.vector_table == 0x20000100 && l.stack_pointer == 0x20081000 && l.entry == 0x20000041)
-    // Out of the ROM, core 1's FIFO keeps what core 0 sends.
+    c.write(0, wr, 4, 0).unwrap()
     c.write(0, wr, 4, 9).unwrap()
-    assert(c.read(1, rd, 4).unwrap() == 9 && c.read(0, sio_reg.BASE + sio_reg.FIFO_ST_OFFSET, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0)
+    assert(c.read(0, sio_reg.BASE + sio_reg.FIFO_ST_OFFSET, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0, "no echo")
+    assert(c.read(1, rd, 4).unwrap() == 0 && c.read(1, rd, 4).unwrap() == 9)
+    val off = psm_reg.BASE + psm_reg.FRCE_OFF_OFFSET
+    c.write(0, off + 0x2000, 4, psm_reg.FRCE_OFF_PROC1_MASK).unwrap()
+    assert(c.take_core1_reset() && !c.take_core1_release())
+    c.write(0, off + 0x3000, 4, psm_reg.FRCE_OFF_PROC1_MASK).unwrap()
+    assert(!c.take_core1_reset() && c.take_core1_release() && !c.take_core1_release(), "one release, reported once")

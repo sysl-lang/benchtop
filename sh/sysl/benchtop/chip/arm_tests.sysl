@@ -18,6 +18,7 @@ private val HELLO_SERIAL = embed("../../../../examples/pico2/hello_serial.elf")
 private val ARM_BLINK = embed("../../../../examples/pico2/blink.elf")
 private val ARM_RCP = embed("../../../../examples/pico2/rcp.elf")
 private val ARM_GPIOC = embed("../../../../examples/pico2/gpioc.elf")
+private val ARM_ROM = embed("../../../../examples/pico2/rom.elf")
 
 private val PICO2_ARM_SRAM = SramMap(0x20000000, 520 * 1024)
 
@@ -44,7 +45,7 @@ arm_hello_serial()
     for k in 1..<lines.len()
         val gap = lines[k] - lines[k - 1]
         assert(gap >= 100 * MS && gap <= 100 * MS + 5 * TENTH_MS, s"line $k came ${gap} cycles after the one before")
-    assert(!b.started[1], "core 1 is still in the boot ROM")
+    assert(waits_in_rom(b, 1), s"core 1 is still in the boot ROM, asleep: pc 0x${hex(b.cores[1].pc, 8)}")
 
 @test("a Pico 2 on its Cortex-M33s runs the SDK's blink: GPIO 25 drives the LED and toggles every 250 ms of guest time")
 arm_blink()
@@ -109,6 +110,41 @@ private place(b: &ArmBoard, at: u32, code: []const u16)
         b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
         b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
 
+// Core 0 parked in `wfi; b .` at 0x20070100, out of the way of what the test does from outside it.
+private[chip] park_core0(b: &ArmBoard)
+    place(b, 0x20070100, [0xBF30, 0xE7FD])
+    b.cores[0].pc = 0x20070100
+
+// The RCP's salts set, as crt0's debugger entry sets both with an SEV, which lets core 1's boot ROM
+// past its wait for them.
+private[chip] salted(b: &ArmBoard)
+    b.chip.rcp.salted = [true, true]
+    b.cores[1].event = true
+
+// Core 0's side of one word of the SDK's launch (`multicore_launch_core1_raw`), made from the test:
+// a 0 drains core 0's FIFO first; the word goes into core 1's with an event, and the board runs until
+// the boot ROM's own code on core 1 answers it. The answer.
+private[chip] push_and_echo(b: &ArmBoard, x: u32) -> u32
+    val st = sio_reg.BASE + sio_reg.FIFO_ST_OFFSET
+    val rd = sio_reg.BASE + sio_reg.FIFO_RD_OFFSET
+    if x == 0 then while b.chip.read(0, st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0 do b.chip.read(0, rd, 4).unwrap()
+    b.chip.write(0, sio_reg.BASE + sio_reg.FIFO_WR_OFFSET, 4, x).unwrap()
+    b.cores[1].event = true
+    for i in 0..<100
+        if b.chip.read(0, st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0 then return b.chip.read(0, rd, 4).unwrap()
+        b.run(1000)
+    assert(false, s"core 1's boot ROM never answered 0x${hex(x)}: core 1 at 0x${hex(b.cores[1].pc, 8)}")
+    0
+
+// The whole launch, from the test, the salts set first: 0, 0, 1, the vector table, the stack pointer
+// and the entry, each echoed.
+private[chip] launch_from_test(b: &ArmBoard, vtor: u32, sp: u32, entry: u32)
+    salted(b)
+    for x in [0u32, 0, 1, vtor, sp, entry] do assert(push_and_echo(b, x) == x, s"the ROM echoes 0x${hex(x)}")
+
+// Whether core `k` waits in the boot ROM: started, asleep, at a ROM address.
+private[chip] waits_in_rom(b: &ArmBoard, k: usize) -> bool = b.started[k] && b.cores[k].sleeping && b.cores[k].pc < ROM_BYTES
+
 @test("a refused access ends the Arm run with the chip's reason, at the core's PC; a write to the read-only ROM is refused by name")
 arm_refused_access()
     val b = arm_board(PICO2_ARM_SRAM)
@@ -146,36 +182,52 @@ arm_non_secure()
     s.boot(ARM_BLINK).unwrap()
     // Core 1: mrs r0, msp_ns. Core 0: wfi, b . (asleep until core 1 ends the run).
     place(s, 0x20070000, [0xF3EF, 0x8088, 0xBE00])
-    place(s, 0x20070100, [0xBF30, 0xE7FD])
-    s.cores[0].pc = 0x20070100
-    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070001]
-        s.chip.write(0, sio_reg.BASE + sio_reg.FIFO_WR_OFFSET, 4, x).unwrap()
-        assert(s.chip.read(0, sio_reg.BASE + sio_reg.FIFO_RD_OFFSET, 4).unwrap() == x, "the ROM echoes")
+    park_core0(s)
+    launch_from_test(s, 0x20000000, 0x20080000, 0x20070001)
     assert(s.run(100000) == RunEnd.Fault)
     assert(s.refused == "core 1 at pc 0x20070000: MRS or MSR of a Non-secure register: Non-secure state is not modelled", s.refused)
 
-@test("core 1 leaves the boot ROM at the entry, stack pointer and VTOR core 0 sends it, and runs on the Arm board")
+@test("core 1 leaves the boot ROM's own wait at the entry, stack pointer and VTOR core 0 sends it, and runs on the Arm board")
 arm_core1_launch()
     val b = arm_board(PICO2_ARM_SRAM)
     b.boot(ARM_BLINK).unwrap()
     // Core 1: movs r0, #42; bkpt. Core 0: wfi, b . (asleep until core 1 ends the run).
     place(b, 0x20070000, [0x202A, 0xBE00])
-    place(b, 0x20070100, [0xBF30, 0xE7FD])
-    b.cores[0].pc = 0x20070100
-    for x in [0u32, 0, 1, 0x20000000, 0x20080000, 0x20070001]
-        b.chip.write(0, sio_reg.BASE + sio_reg.FIFO_WR_OFFSET, 4, x).unwrap()
-        assert(b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_RD_OFFSET, 4).unwrap() == x, "the ROM echoes")
+    park_core0(b)
+    launch_from_test(b, 0x20000000, 0x20080000, 0x20070001)
     assert(b.run(100000) == RunEnd.Breakpoint, s"${b.refused}")
     val c = &b.cores[1]
     assert(b.started[1] && c.r[0] == 42 && c.vtor == 0x20000000 && c.r[13] == 0x20080000 && c.stop_at == 0x20070002)
     assert(c.core == 1 && c.security && c.coprocessors == 0xB1 && c.nvic_irqs == 52)
-    // Called from the ROM: an entry that returns goes back to its wait.
-    assert(c.r[14] == ROM_PARK | 1, s"lr 0x${hex(c.r[14], 8)}")
+    // Called from the ROM's `core1_launch` (its BLX at 0x240): an entry that returns goes back into the
+    // ROM, to its `native_wait_rescue`.
+    assert(c.r[14] == 0x243, s"lr 0x${hex(c.r[14], 8)}")
+    // The ROM left its own security set-up on the core: CP7 in CPACR, NSACR and the Non-secure CPACR,
+    // and SAU region 7 enabled.
+    assert(c.cpacr == ROM_CPACR && c.nsacr == ROM_NSACR && c.cpacr_ns == ROM_CPACR, s"0x${hex(c.cpacr)} 0x${hex(c.nsacr)}")
+    assert(c.sau_ctrl == 1 && c.sau_rbar[7] == ROM_SAU_RBAR && c.sau_rlar[7] == ROM_SAU_RLAR)
 
-@test("the boot ROM's lookup at 0x16 finds bootrom_state_reset by its code for Secure and Non-secure callers, and answers 0 for another")
+@test("an image entered with the wrong echo restarts the ROM's handshake; an entry without its Thumb bit faults core 1 on its first instruction")
+arm_core1_launch_edges()
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(ARM_BLINK).unwrap()
+    park_core0(b)
+    salted(b)
+    // A stray word: echoed, and the sequence starts again from its first 0.
+    assert(push_and_echo(b, 7) == 7)
+    for x in [0u32, 0, 1, 0x20000000, 0x20080000]
+        assert(push_and_echo(b, x) == x, s"echo of 0x${hex(x)}")
+    assert(push_and_echo(b, 0x20070000) == 0x20070000)
+    b.run(100000)
+    val c = &b.cores[1]
+    assert(c.stop != Stop.Running && c.pc == 0x20070000, s"core 1 ${c.stop} at 0x${hex(c.pc, 8)}")
+
+@test("the boot ROM's lookup through 0x16 finds bootrom_state_reset for Arm Secure and for RISC-V callers, and answers 0 for a code it lacks")
 arm_rom_lookup()
     val b = arm_board(PICO2_ARM_SRAM)
     b.boot(ARM_BLINK).unwrap()
+    // The ROM's lookup checks itself with the RCP, whose salt crt0 sets.
+    salted(b)
     // movs r6, #0x16; ldrh r6, [r6]; then lookup('SR', Arm Secure) into r4, lookup('A', Arm Secure)
     // into r5, and lookup('SR', RISC-V) into r0; bkpt.
     place(b, 0x20070000, [0x2616, 0x8836, 0xF245, 0x2053, 0x2104, 0x47B0, 0x4604, 0x2041, 0x2104, 0x47B0, 0x4605,
@@ -184,11 +236,71 @@ arm_rom_lookup()
     c.pc = 0x20070000
     c.r[13] = 0x20080000
     assert(b.run(10000) == RunEnd.Breakpoint, s"${b.refused} ${c.stop} 0x${hex(c.stop_at, 8)}")
-    assert(c.r[4] & 1 == 1 && c.r[4] < 0x8000 && c.r[4] > 0x40, s"state_reset at 0x${hex(c.r[4])}")
-    // 'A' with the same flags: no such function. 'SR' asked for RISC-V: not one either.
-    assert(c.r[5] == 0 && c.r[0] == 0, s"${c.r[5]} ${c.r[0]}")
-    // The magic and the table's address are where the SDK reads them.
-    assert(b.mem.ram[b.rom_at + 0x10] == u8('M') && b.mem.ram[b.rom_at + 0x11] == u8('u') && b.mem.ram[b.rom_at + 0x12] == 2)
+    // The A4 ROM's own table: s_varm_step_safe_api_crit_bootrom_state_reset, and its RISC-V twin.
+    assert(c.r[4] == 0x28CD, s"state_reset at 0x${hex(c.r[4])}")
+    assert(c.r[5] == 0, s"'A' found at 0x${hex(c.r[5])}")
+    assert(c.r[0] != 0 && c.r[0] & 1 == 0 && c.r[0] != c.r[4], s"RISC-V state_reset at 0x${hex(c.r[0])}")
+    // The magic, version 2.4, and the well-known halfwords where the SDK reads them.
+    assert(rom_read(0x10, 2) == 0x754D && rom_read(0x12, 1) == 2 && rom_read(0x13, 1) == 4)
+    assert(b.mem.ram[b.rom_at + 0x16] == 0x8D && b.mem.ram[b.rom_at + 0x18] == 0x4D, "lookup_val and lookup_entry")
+
+@test("the SDK calling Raspberry Pi's ROM on a Pico 2: its header and git revision, the lookup found and not, BOOT_INFO, the flash erased, programmed and its unique ID read through the ROM's flash functions, and a PC/SP reboot through the ROM's own reboot")
+arm_rom_program()
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(ARM_ROM).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 200 * MS do end = b.run(MS)
+    val text = from_utf8_lossy(b.console.view())
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}: $text")
+    val want = "rom: magic Mu version 2.4, git revision 0xc6cdb171\r\n" +
+        "lookup: 10 of 10 found, 'ZZ' not found\r\n" +
+        "power-on: get_sys_info 5 words, flags 0x40, boot word 0x00ff02ff, diagnostic 0x00000000, params 0x0 0x0\r\n" +
+        "flash: erased ok, programmed ok, next page erased\r\n" +
+        "unique id: e6 60 58 38 83 2b 4a 2e\r\n" +
+        "rebooting to PC/SP\r\n" +
+        "reboot returned 0\r\n" +
+        "rebooted: reason 0x1, sp in the stack given 1\r\n" +
+        "after the reboot: get_sys_info 5 words, flags 0x40, boot word 0x00ff0dff, diagnostic 0x00000000, params 0x0 0x0\r\n" +
+        "done\r\n"
+    assert(text == want, text)
+    // The page the ROM programmed is in the flash's array, 1 MB in; the rest of its sector erased.
+    for i in 0u32..<256 do assert(b.mem.flash[0x100000 + i] == u8.wrap(i * 7 + 3), s"byte $i")
+    assert(b.mem.flash[0x100000 + 256] == 0xFF && b.mem.flash[0x100000 + 4095] == 0xFF)
+    // The ROM's reboot spares PROC_COLD, so the salts survived; core 1 went back to the ROM's wait.
+    assert(b.chip.rcp.salted[0] && b.chip.rcp.salted[1] && b.chip.psm.wdsel == 0x01FFFFFE, s"wdsel 0x${hex(b.chip.psm.wdsel)}")
+    assert(b.started[1] && b.cores[1].pc < ROM_BYTES, s"core 1 at 0x${hex(b.cores[1].pc, 8)}")
+
+@test("SEV on core 0 wakes core 1's boot ROM from its wait for the salts: core 1 then reports to core 0 with a 0")
+arm_sev_wakes_the_rom()
+    val b = arm_board(PICO2_ARM_SRAM)
+    b.boot(ARM_BLINK).unwrap()
+    park_core0(b)
+    b.run(5000)
+    assert(waits_in_rom(b, 1) && b.cores[1].pc < 0x1D8, s"core 1 waits for its salt: 0x${hex(b.cores[1].pc, 8)}")
+    // The salts set as crt0 sets them, but no event: core 1 sleeps on.
+    b.chip.rcp.salted = [true, true]
+    b.run(5000)
+    val st = sio_reg.BASE + sio_reg.FIFO_ST_OFFSET
+    assert(b.chip.read(0, st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK == 0 && waits_in_rom(b, 1), "asleep without an event")
+    // Core 0: sev; then its park.
+    place(b, 0x20070200, [0xBF40, 0xBF30, 0xE7FD])
+    b.cores[0].pc = 0x20070200
+    b.cores[0].sleeping = false
+    b.run(5000)
+    assert(b.chip.read(0, st, 4).unwrap() & sio_reg.FIFO_ST_VLD_MASK != 0, s"core 1 at 0x${hex(b.cores[1].pc, 8)}")
+    assert(b.chip.read(0, sio_reg.BASE + sio_reg.FIFO_RD_OFFSET, 4).unwrap() == 0 && waits_in_rom(b, 1), "its 0, then the wait for a launch")
+    assert(b.cores[0].event, "core 0's own SEV set its own register too, which its WFI does not consume")
+
+@test("the boot ROM image is the A4 release, whole: its size, the magic, its Arm and RISC-V reset vectors")
+arm_rom_image()
+    assert(ROM.len == usize(ROM_BYTES))
+    assert(rom_word(0) == 0xF0000000 && rom_word(4) == 0xA1, "the Arm vector table: SP, then s_arm8_entry_point with its Thumb bit")
+    // The RISC-V reset vector: `j riscv_entry_point` (0x7660).
+    assert(rom_word(RISCV_RESET_VECTOR) == 0x865FF06F, s"0x${hex(rom_word(RISCV_RESET_VECTOR), 8)}")
+    // The ROM's git revision, the tag's commit (ROM_DATA_SOFTWARE_GIT_REVISION).
+    var found = false
+    for at in 0u32..<(ROM_BYTES / 4) do if rom_word(4 * at) == 0xC6CDB171 then found = true
+    assert(found, "the A4 tag's commit is in the image")
 private gpioc(kind: CoprocessorKind, opc1: u32, crm: u32, low: u32, high: u32) -> CoprocessorOp = CoprocessorOp(kind, 0, opc1, 0, 0, crm, low, high, false)
 
 @test("the GPIO coprocessor is the SIO's GPIO registers: masks low, high and both, single bits, indexed writes and the reads")
