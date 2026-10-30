@@ -1,0 +1,597 @@
+module sh.sysl.benchtop.chip
+
+import sh.sysl.benchtop.v6m.{CoprocessorKind, CoprocessorOp}
+
+// CP4 and CP5, the double-precision coprocessor (DCP; datasheet 3.6.2), in full: every instruction of
+// the SDK's `hardware/dcp_instr.inc.S`, in its `R…` and `P…` (peek) forms, so that every canned
+// sequence of `hardware/dcp_canned.inc.S` — and `pico_double`'s `double_aeabi_dcp.S`,
+// `double_fma_dcp.S` and `pico_float`'s `float_aeabi_dcp.S`, which are built from them — gives its
+// result. Each core has two instances: CP4 is the one for the core's security state, which is always
+// Secure here, and CP5 the Non-secure one, which Secure code reaches directly.
+//
+// **The state is the datasheet's** (3.6.2.3): the 64-bit mantissas `xm` and `ym`, the 14-bit
+// exponents `xe` and `ye`, the 4-bit flags `xf` and `yf` (sign, zero, infinity, NaN), and the 9-bit
+// status: the alignment shift (bits 0–5), how |X| compares with |Y| (6–7) and the engaged flag (8).
+//
+// **What the datasheet gives only in outline, benchtop derives from the canned sequences**, which
+// fix every format the core computes with:
+//
+// - A value is unpacked with `01` and its fraction at the top of the mantissa (Q62, `1 ≤ m < 2`), and
+//   its biased exponent; a single's exponent is rebiased to a double's, so the two meet in one form
+//   (`WXYU`, `NRDD`, `RDDG` is `float2double`). An exponent field of 0 is a zero, whatever the
+//   fraction: the DCP flushes denormal operands, and a result IEEE 754 would give as a denormal is a
+//   zero of its sign.
+// - `RXMS`/`RYMS` with shift s read `m >> s` (Q62−s); `RXYH` reads the top words of `xm` (low) and
+//   `ym` (high), each Q30; `RYMR` reads a reciprocal estimate of Y (Q31, low) and `ym` Q31 (high);
+//   `RXMQ` a reciprocal square-root estimate of X (Q31, low) and `xm`'s top word (high). The two
+//   estimates come from a small table on the chip, which the datasheet does not publish; benchtop's
+//   are its own, to 9 bits (`recip_estimate`, `rsqrt_estimate`), so only the `_fast` divides and
+//   square roots, which do not round correctly, can differ from a chip's in their last bit.
+// - The writes that carry a result back say where its binary point is: `WXMO` and `WXFM` a product
+//   Q60, `WXDD` a quotient Q57, `WXFD` one Q61 (its word written twice, so the low copy is the sticky
+//   bit), `WXDQ` a square root Q60 and `WXFQ` one Q61. Each adds or subtracts the exponents and XORs
+//   the signs as the datasheet says.
+// - `NRDD` and `NRDF` normalise and round to nearest, ties to even, at 53 or 24 bits; the read that
+//   ends a sequence packs the result and applies the operation's special cases (NaN, infinities,
+//   zeros, overflow to infinity). A NaN result is the default quiet NaN (`0x7ff8000000000000`,
+//   `0x7fc00000`): the four flag bits carry no payload.
+// - The conversions add 2^52 + 2^32 (`WXUC`, `WXIC`, `WXDC`, `WXFC`); `NTDC` truncates towards zero and
+//   `NRDC` rounds to nearest even, and `RDIC`/`RDUC` saturate to the signed or unsigned word. A NaN
+//   converts to 0.
+// - `RCMP` reads N = the engaged flag, Z = equal, C = greater or equal, V = unordered (then Z and C
+//   clear), over the status bits; `RXVD` reads the X flags at bits 28–31 (N sign, Z zero, C infinity,
+//   V NaN) over a version of 0; `REFD` reads xe, the status and xf (bits 0–13, 14–22, 28–31) low and ye
+//   and yf high, the layout `double_fma_dcp.S` reads the flags from, and `WEFD` writes it back.
+//
+// **The engaged flag** is set by every write and operation, and by the reads in the middle of a
+// sequence; the reads that end one (`RXVD`, `RCMP`, the packed results, `RDIC`, `RDUC`, `RYMD`)
+// clear it, and the `P…` forms leave it as it was. `RXMD` and `REFD` leave it whatever the form.
+// `INIT` zeroes every register, the status included.
+//
+// An encoding outside this set (a `MCR`, a `…2` write or operation, another opcode or register) is
+// refused by name, since the datasheet does not say what the DCP does with one.
+
+/** The flag bits of `xf` and `yf`. */
+const DCP_SIGN: u32 = 8
+const DCP_ZERO: u32 = 4
+const DCP_INF: u32 = 2
+const DCP_NAN: u32 = 1
+const DCP_SPECIAL: u32 = 7
+/** The status's engaged bit, and the field that compares |X| with |Y|. */
+const DCP_ENGAGED: u32 = 0x100
+const DCP_LESS: u32 = 0
+const DCP_EQUAL: u32 = 1
+const DCP_GREATER: u32 = 2
+/** 2^52 + 2^32 unpacked: the value the integer conversions offset by. */
+const DCP_OFFSET_M: u64 = 0x4000040000000000
+const DCP_OFFSET_E: i32 = 1075
+const DCP_OFFSET: i128 = 0x10000100000000
+/** What `RXVD` reads below the flags. */
+const DCP_VERSION: u32 = 0
+
+/** One DCP instance's registers. */
+struct DcpUnit
+    xm: u64
+    ym: u64
+    xe: i32
+    ye: i32
+    xf: u32
+    yf: u32
+    status: u32
+
+dcp_unit() -> DcpUnit = DcpUnit(0, 0, 0, 0, 0, 0, 0)
+
+/** The DCPs of both cores: core 0's CP4 and CP5, then core 1's. */
+struct Dcp
+    units: [4]DcpUnit
+
+dcp() -> Dcp = Dcp([dcp_unit(), dcp_unit(), dcp_unit(), dcp_unit()])
+
+/** The DCP's instructions, each named as `hardware/dcp_instr.inc.S` names it (the `R…` form). */
+enum DcpInsn
+    WXMD
+    WYMD
+    WEFD
+    WXUP
+    WYUP
+    WXYU
+    WXMS
+    WXMO
+    WXDD
+    WXDQ
+    WXUC
+    WXIC
+    WXDC
+    WXFC
+    WXFM
+    WXFD
+    WXFQ
+    INIT
+    ADD0
+    ADD1
+    SUB1
+    SQR0
+    NORM
+    NRDF
+    NRDD
+    NTDC
+    NRDC
+    RXVD
+    RCMP
+    RDFA
+    RDFS
+    RDFM
+    RDFD
+    RDFQ
+    RDFG
+    RDIC
+    RDUC
+    RXMD
+    RYMD
+    REFD
+    RXMS
+    RYMS
+    RXYH
+    RYMR
+    RXMQ
+    RDDA
+    RDDS
+    RDDM
+    RDDD
+    RDDQ
+    RDDG
+
+// Which DCP instruction `op` is. A `CDP`'s CRd arrives in `low`.
+dcp_insn(op: CoprocessorOp) -> Option[DcpInsn]
+    op.kind match
+        WritePair ->
+            if op.second then return None
+            val w = op.opc1 << 4 | op.crm
+            val i = w match
+                0x00 -> DcpInsn.WXMD
+                0x01 -> DcpInsn.WYMD
+                0x02 -> DcpInsn.WEFD
+                0x10 -> DcpInsn.WXUP
+                0x11 -> DcpInsn.WYUP
+                0x12 -> DcpInsn.WXYU
+                0x20 -> DcpInsn.WXMS
+                0x30 -> DcpInsn.WXMO
+                0x40 -> DcpInsn.WXDD
+                0x50 -> DcpInsn.WXDQ
+                0x60 -> DcpInsn.WXUC
+                0x70 -> DcpInsn.WXIC
+                0x80 -> DcpInsn.WXDC
+                0x92 -> DcpInsn.WXFC
+                0xA0 -> DcpInsn.WXFM
+                0xB0 -> DcpInsn.WXFD
+                0xC0 -> DcpInsn.WXFQ
+                _ -> return None
+            Some(i)
+        Data ->
+            if op.second || op.crn != 0 || op.low != 0 then return None
+            val w = op.opc1 << 8 | op.crm << 4 | op.opc2
+            val i = w match
+                0x000 -> DcpInsn.INIT
+                0x010 -> DcpInsn.ADD0
+                0x110 -> DcpInsn.ADD1
+                0x111 -> DcpInsn.SUB1
+                0x210 -> DcpInsn.SQR0
+                0x820 -> DcpInsn.NORM
+                0x821 -> DcpInsn.NRDF
+                0x801 -> DcpInsn.NRDD
+                0x802 -> DcpInsn.NTDC
+                0x803 -> DcpInsn.NRDC
+                _ -> return None
+            Some(i)
+        Read ->
+            if op.opc1 != 0 || op.crn != 0 then return None
+            val w = op.crm << 4 | op.opc2
+            val i = w match
+                0x00 -> DcpInsn.RXVD
+                0x01 -> DcpInsn.RCMP
+                0x20 -> DcpInsn.RDFA
+                0x21 -> DcpInsn.RDFS
+                0x22 -> DcpInsn.RDFM
+                0x23 -> DcpInsn.RDFD
+                0x24 -> DcpInsn.RDFQ
+                0x25 -> DcpInsn.RDFG
+                0x30 -> DcpInsn.RDIC
+                0x31 -> DcpInsn.RDUC
+                _ -> return None
+            Some(i)
+        ReadPair ->
+            // RXMS and RYMS take their shift in opc1.
+            if op.crm == 4 then return Some(DcpInsn.RXMS)
+            if op.crm == 5 then return Some(DcpInsn.RYMS)
+            val w = op.opc1 << 4 | op.crm
+            val i = w match
+                0x08 -> DcpInsn.RXMD
+                0x09 -> DcpInsn.RYMD
+                0x0A -> DcpInsn.REFD
+                0x11 -> DcpInsn.RXYH
+                0x21 -> DcpInsn.RYMR
+                0x41 -> DcpInsn.RXMQ
+                0x10 -> DcpInsn.RDDA
+                0x30 -> DcpInsn.RDDS
+                0x50 -> DcpInsn.RDDM
+                0x70 -> DcpInsn.RDDD
+                0x90 -> DcpInsn.RDDQ
+                0xB0 -> DcpInsn.RDDG
+                _ -> return None
+            Some(i)
+        Write -> None
+end dcp_insn
+
+impl Dcp
+    /** Core `core`'s instruction `op` on CP4 or CP5: a read's value (Rt low, Rt2 high), 0 for the rest;
+     * or a refusal of an encoding outside the DCP's instruction set.
+     */
+    run(*self, core: u32, op: CoprocessorOp) -> Result[u64, CoprocessorStop]
+        val i = dcp_insn(op) match
+            Some(i) -> i
+            None ->
+                val which = if op.coprocessor == 5 then "Non-secure double-precision (DCP)" else "double-precision (DCP)"
+                return Err(refusal(unknown(which, op)))
+        Ok(self.units[usize(core * 2 + op.coprocessor - 4)].run(i, op))
+end Dcp
+
+impl DcpUnit
+    /** Instruction `i`, decoded from `op`: a read's value, 0 for the rest. */
+    run(*self, i: DcpInsn, op: CoprocessorOp) -> u64
+        val data = u64(op.low) | (u64(op.high) << 32)
+        val was = self.status & DCP_ENGAGED
+        // Every write and operation engages the DCP; a read leaves it to `read`.
+        self.status |= DCP_ENGAGED
+        i match
+            WXMD -> self.xm = data
+            WYMD -> self.ym = data
+            WEFD ->
+                self.xe = e14(i32(op.low & 0x3FFF))
+                self.status = (op.low >> 14) & 0x1FF
+                self.xf = op.low >> 28
+                self.ye = e14(i32(op.high & 0x3FFF))
+                self.yf = op.high >> 28
+            WXUP -> self.unpack_x(data)
+            WYUP -> self.unpack_y(data)
+            WXYU ->
+                self.unpack_x(single(op.low))
+                self.unpack_y(single(op.high))
+            WXMS -> self.xm = if data != 0 then 1 else 0
+            WXMO -> self.merge(data | (self.xm & 1), self.xe + self.ye - 1023 + 2)
+            WXDD -> self.merge(data, self.xe - self.ye + 1023 + 5)
+            WXDQ -> self.root_written(data, 2)
+            WXUC -> self.offset_x(DCP_OFFSET + i128(op.low))
+            WXIC -> self.offset_x(DCP_OFFSET + i128(i32.wrap(op.low)))
+            WXDC ->
+                self.unpack_x(data)
+                self.offset_y()
+            WXFC ->
+                self.unpack_x(single(op.low))
+                self.offset_y()
+            WXFM -> self.merge(data, self.xe + self.ye - 1023 + 2)
+            WXFD -> self.merge(data, self.xe - self.ye + 1023 + 1)
+            WXFQ -> self.root_written(data, 1)
+            INIT -> *self = dcp_unit()
+            ADD0 -> self.compare()
+            ADD1 -> self.add(false)
+            SUB1 -> self.add(true)
+            SQR0 ->
+                val e = self.xe - 1023
+                if e & 1 != 0 then self.xm = self.xm << 1
+                self.xe = e14(((e - (e & 1)) >> 1) + 1023)
+            NORM -> self.normalise()
+            NRDF -> self.round(39, 897)
+            NRDD -> self.round(10, 1)
+            NTDC -> self.to_integer(false)
+            NRDC -> self.to_integer(true)
+            _ ->
+                self.status = (self.status & ~DCP_ENGAGED) | was
+                return self.read(i, op)
+        0
+    end run
+
+    // A read: its value, and the engaged flag as the read leaves it.
+    private read(*self, i: DcpInsn, op: CoprocessorOp) -> u64
+        val was = self.status & DCP_ENGAGED
+        var ends = true
+        val x: u64 = i match
+            RXVD -> u64((self.xf << 28) | DCP_VERSION)
+            RCMP -> u64((was << 23) | self.order() | self.status)
+            RDFA | RDFS | RDFG -> u64(self.pack_single(self.xf))
+            RDFM -> u64(self.pack_single(self.product()))
+            RDFD -> u64(self.pack_single(self.quotient()))
+            RDFQ -> u64(self.pack_single(self.root()))
+            RDIC -> u64(self.integer(-0x80000000, 0x7FFFFFFF))
+            RDUC -> u64(self.integer(0, 0xFFFFFFFF))
+            RDDA | RDDS | RDDG -> self.pack_double(self.xf)
+            RDDM -> self.pack_double(self.product())
+            RDDD -> self.pack_double(self.quotient())
+            RDDQ -> self.pack_double(self.root())
+            RYMD -> self.ym
+            RXMD ->
+                ends = false
+                self.xm
+            REFD ->
+                ends = false
+                u64(u32(self.xe & 0x3FFF) | (self.status << 14) | (self.xf << 28)) |
+                    (u64(u32(self.ye & 0x3FFF) | (self.yf << 28)) << 32)
+            _ ->
+                // The reads in the middle of a sequence engage it.
+                if !op.second then self.status |= DCP_ENGAGED
+                ends = false
+                i match
+                    RXMS -> self.xm >> op.opc1
+                    RYMS -> self.ym >> op.opc1
+                    RXYH -> (self.xm >> 32) | (self.ym & 0xFFFFFFFF00000000)
+                    RYMR -> u64(recip_estimate(self.ym)) | (((self.ym >> 31) & 0xFFFFFFFF) << 32)
+                    _ -> u64(rsqrt_estimate(self.xm)) | (self.xm & 0xFFFFFFFF00000000)
+        if ends && !op.second then self.status &= ~DCP_ENGAGED
+        x
+    end read
+
+    // X from an IEEE double's bits: the fraction under `01` (Q62), the biased exponent, the flags. An
+    // exponent field of 0 is a zero.
+    private unpack_x(*self, bits: u64)
+        val m, e, f = unpack(bits)
+        self.set_x(m, e, f)
+
+    private unpack_y(*self, bits: u64)
+        val m, e, f = unpack(bits)
+        self.ym = m
+        self.ye = e
+        self.yf = f
+
+    private set_x(*self, m: u64, e: i32, f: u32)
+        self.xm = m
+        self.xe = e
+        self.xf = f
+
+    // X is `n` (positive and below 2^53, so exact with exponent 52); Y is 2^52 + 2^32.
+    private offset_x(*self, n: i128)
+        self.set_x(u64(n) << 10, DCP_OFFSET_E, 0)
+        self.offset_y()
+
+    private offset_y(*self)
+        self.ym = DCP_OFFSET_M
+        self.ye = DCP_OFFSET_E
+        self.yf = 0
+
+    // A square root written back, its binary point `point` places below X's.
+    private root_written(*self, m: u64, point: i32)
+        self.xm = m
+        self.xe = e14(self.xe + point)
+
+    // A product or quotient written back: its mantissa, its exponent (with the binary point already
+    // accounted for), and the sign of X XOR that of Y.
+    private merge(*self, m: u64, e: i32)
+        self.xm = m
+        self.xe = e14(e)
+        self.xf ^= self.yf & DCP_SIGN
+
+    // ADD0: how |X| compares with |Y|, and the shift that aligns the smaller.
+    private compare(*self)
+        val kx = class_rank(self.xf)
+        val ky = class_rank(self.yf)
+        var order = DCP_EQUAL
+        var shift: u32 = 0
+        if kx != ky
+            order = if kx > ky then DCP_GREATER else DCP_LESS
+        elif kx == 1
+            if self.xe != self.ye
+                order = if self.xe > self.ye then DCP_GREATER else DCP_LESS
+            elif self.xm != self.ym
+                order = if self.xm > self.ym then DCP_GREATER else DCP_LESS
+            val d = if self.xe > self.ye then self.xe - self.ye else self.ye - self.xe
+            shift = if d > 63 then 63 else u32(d)
+        self.status = (self.status & DCP_ENGAGED) | (order << 6) | shift
+
+    // ADD1 and SUB1: X ± Y into X, the smaller shifted by the status's shift with the bits it loses
+    // ORed into bit 0, and every special case resolved into X's flags.
+    private add(*self, subtract: bool)
+        val sx = self.xf & DCP_SIGN
+        val sy = (self.yf & DCP_SIGN) ^ (if subtract then DCP_SIGN else 0)
+        if (self.xf | self.yf) & DCP_NAN != 0
+            self.xf = DCP_NAN
+            return
+        if self.xf & DCP_INF != 0
+            self.xf = if self.yf & DCP_INF != 0 && sx != sy then DCP_NAN else DCP_INF | sx
+            return
+        if self.yf & DCP_INF != 0
+            self.xf = DCP_INF | sy
+            return
+        if self.yf & DCP_ZERO != 0
+            // Round to nearest: two zeros of different signs sum to +0.
+            if self.xf & DCP_ZERO != 0 then self.xf = DCP_ZERO | (sx & sy)
+            return
+        if self.xf & DCP_ZERO != 0
+            self.set_x(self.ym, self.ye, sy)
+            return
+        val shift = self.status & 63
+        val y_larger = (self.status >> 6) & 3 == DCP_LESS
+        val big, small, e, sign = if y_larger then (self.ym, self.xm, self.ye, sy) else (self.xm, self.ym, self.xe, sx)
+        val lost = small & ((1u64 << shift) - 1)
+        val aligned = (small >> shift) | (if lost != 0 then 1u64 else 0)
+        // Wrapping only where registers a program wrote directly overflow the 64 bits.
+        if sx == sy then self.set_x(big +% aligned, e, sign)
+        elif big == aligned then self.set_x(0, e, DCP_ZERO)
+        elif big > aligned then self.set_x(big - aligned, e, sign)
+        else self.set_x(aligned - big, e, sign ^ DCP_SIGN)
+    end add
+
+    // NORM: the leading 1 to bit 62, the exponent following it; nothing to round.
+    private normalise(*self)
+        if self.xm == 0 then return
+        val top = 63 - self.xm.leading_zeros()
+        if top == 63
+            self.xm = (self.xm >> 1) | (self.xm & 1)
+            self.xe = e14(self.xe + 1)
+        else
+            self.xm = self.xm << (62 - top)
+            self.xe = e14(self.xe - i32(62 - top))
+
+    // NRDD and NRDF: normalise, then round to nearest even at bit `unit` (10 for a double's last
+    // place, 39 for a single's). Below the normal range, whose least exponent is `least`, the last place
+    // is where a denormal's would be, so a result rounds exactly as IEEE 754 rounds it, and the read
+    // then flushes it to zero unless it rounded up into the normal range.
+    private round(*self, unit: u32, least: i32)
+        if self.xf & DCP_SPECIAL != 0 then return
+        if self.xm == 0
+            self.xf = DCP_ZERO | (self.xf & DCP_SIGN)
+            return
+        self.normalise()
+        val below = if self.xe < least then least - self.xe else 0
+        val one = 1u64 << (if i32(unit) + below > 63 then 63 else unit + u32(below))
+        val rest = self.xm & (one - 1)
+        var m = self.xm - rest
+        val half = one >> 1
+        if rest > half || (rest == half && m & one != 0) then m += one
+        if m >> 63 != 0
+            m = m >> 1
+            self.xe = e14(self.xe + 1)
+        self.xm = m
+
+    // NTDC and NRDC: X less 2^52 + 2^32 as an integer, truncated towards zero or rounded to nearest
+    // even, into xm as two's complement saturated to ±2^62.
+    private to_integer(*self, nearest: bool)
+        if self.xf & DCP_NAN != 0 then return
+        val limit: i128 = 1 << 62
+        val sign = self.xf & DCP_SIGN != 0
+        if self.xf & DCP_INF != 0
+            self.xm = u64.wrap(if sign then -limit else limit)
+            return
+        // |X| = whole + a fraction: `half` its top bit, `sticky` the rest.
+        var whole: i128 = 0
+        var half = false
+        var sticky = false
+        if self.xf & DCP_ZERO == 0 && self.xm != 0
+            val k = self.xe - 1023 - 62
+            if k >= 0
+                whole = if k > 62 then limit * 4 else i128(self.xm) << k
+            elif k > -64
+                whole = i128(self.xm >> u32(-k))
+                val frac = self.xm & ((1u64 << u32(-k)) - 1)
+                half = frac >> u32(-k - 1) != 0
+                sticky = frac & ((1u64 << u32(-k - 1)) - 1) != 0
+            else
+                half = k == -64 && self.xm >> 63 != 0
+                sticky = !half || self.xm << 1 != 0
+        val inexact = half || sticky
+        var n: i128 =
+            if nearest
+                val up = half && (sticky || whole & 1 != 0)
+                val r = whole + (if up then 1 else 0)
+                (if sign then -r else r) - DCP_OFFSET
+            elif sign then -whole - DCP_OFFSET
+            else
+                val v = whole - DCP_OFFSET
+                // Below zero, a fraction truncates up, towards zero.
+                if v < 0 && inexact then v + 1 else v
+        if n > limit then n = limit
+        if n < -limit then n = -limit
+        self.xm = u64.wrap(n)
+    end to_integer
+
+    // RDIC and RDUC: the converted integer saturated to [lo, hi]; a NaN converts to 0.
+    private integer(*self, lo: i64, hi: i64) -> u32
+        if self.xf & DCP_NAN != 0 then return 0
+        val n = i64.wrap(self.xm)
+        u32.wrap(if n < lo then lo elif n > hi then hi else n)
+
+    // RCMP's flags: Z equal, C greater or equal, V unordered.
+    private order(*self) -> u32
+        if (self.xf | self.yf) & DCP_NAN != 0 then return 0x10000000
+        if self.xf & self.yf & DCP_ZERO != 0 then return 0x60000000
+        val sx = self.xf & DCP_SIGN
+        val magnitude = (self.status >> 6) & 3
+        val signed =
+            if sx != self.yf & DCP_SIGN then (if sx == 0 then DCP_GREATER else DCP_LESS)
+            elif sx == 0 then magnitude
+            elif magnitude == DCP_GREATER then DCP_LESS
+            elif magnitude == DCP_LESS then DCP_GREATER
+            else DCP_EQUAL
+        if signed == DCP_GREATER then 0x20000000 elif signed == DCP_EQUAL then 0x60000000 else 0
+
+    // The flags of X × Y (the sign already XORed into xf): NaN where either is NaN or a zero meets an
+    // infinity, else an infinity or a zero where either is one, else X's own.
+    private product(*self) -> u32
+        val sign = self.xf & DCP_SIGN
+        val both = self.xf | self.yf
+        if both & DCP_NAN != 0 || (both & DCP_INF != 0 && both & DCP_ZERO != 0) then return DCP_NAN
+        if both & DCP_INF != 0 then return DCP_INF | sign
+        if both & DCP_ZERO != 0 then return DCP_ZERO | sign
+        self.xf
+
+    // The flags of X / Y: NaN for a NaN, ∞/∞ and 0/0; ∞ for ∞/y and x/0; 0 for x/∞ and 0/y.
+    private quotient(*self) -> u32
+        val sign = self.xf & DCP_SIGN
+        if (self.xf | self.yf) & DCP_NAN != 0 then return DCP_NAN
+        if self.xf & self.yf & (DCP_INF | DCP_ZERO) != 0 then return DCP_NAN
+        if self.xf & DCP_INF != 0 || self.yf & DCP_ZERO != 0 then return DCP_INF | sign
+        if self.xf & DCP_ZERO != 0 || self.yf & DCP_INF != 0 then return DCP_ZERO | sign
+        self.xf
+
+    // The flags of √X: NaN for a NaN and below zero, −0 for −0, +∞ for +∞.
+    private root(*self) -> u32
+        if self.xf & DCP_NAN != 0 then return DCP_NAN
+        if self.xf & DCP_ZERO != 0 then return self.xf
+        if self.xf & DCP_SIGN != 0 then return DCP_NAN
+        self.xf
+
+    // X packed as a double under flags `f`: out of range above is an infinity, below a zero.
+    private pack_double(*self, f: u32) -> u64
+        val sign = u64(f & DCP_SIGN) << 60
+        if f & DCP_NAN != 0 then return 0x7FF8000000000000
+        if f & DCP_INF != 0 then return sign | 0x7FF0000000000000
+        if f & DCP_ZERO != 0 || self.xe <= 0 then return sign
+        if self.xe >= 2047 then return sign | 0x7FF0000000000000
+        sign | (u64(self.xe) << 52) | ((self.xm >> 10) & 0xFFFFFFFFFFFFF)
+
+    // X packed as a single under flags `f`.
+    private pack_single(*self, f: u32) -> u32
+        val sign = (f & DCP_SIGN) << 28
+        val e = self.xe - 896
+        if f & DCP_NAN != 0 then return 0x7FC00000
+        if f & DCP_INF != 0 then return sign | 0x7F800000
+        if f & DCP_ZERO != 0 || e <= 0 then return sign
+        if e >= 255 then return sign | 0x7F800000
+        sign | (u32(e) << 23) | u32((self.xm >> 39) & 0x7FFFFF)
+end DcpUnit
+
+// An IEEE double's bits unpacked: mantissa Q62, biased exponent, flags.
+private unpack(bits: u64) -> (u64, i32, u32)
+    val e = i32((bits >> 52) & 0x7FF)
+    val frac = bits & 0xFFFFFFFFFFFFF
+    val sign = u32(bits >> 63) * DCP_SIGN
+    val f =
+        if e == 0 then DCP_ZERO
+        elif e == 0x7FF then (if frac == 0 then DCP_INF else DCP_NAN)
+        else 0
+    ((1u64 << 62) | (frac << 10), e, sign | f)
+
+// A single's bits as the double of the same value, its exponent rebiased (a zero, an infinity and a
+// NaN keep their kind, and a denormal is a zero).
+private single(bits: u32) -> u64
+    val sign = u64(bits >> 31) << 63
+    val e = (bits >> 23) & 0xFF
+    val frac = u64(bits & 0x7FFFFF) << 29
+    if e == 0 then return sign
+    if e == 0xFF then return sign | 0x7FF0000000000000 | frac
+    sign | (u64(e + 896) << 52) | frac
+
+// A 14-bit exponent register's value.
+private e14(e: i32) -> i32 = ((e & 0x3FFF) ^ 0x2000) - 0x2000
+
+// The size class ADD0 orders by: a zero, a finite value, an infinity or NaN.
+private class_rank(f: u32) -> u32 = if f & DCP_ZERO != 0 then 0 elif f & (DCP_INF | DCP_NAN) != 0 then 2 else 1
+
+// RYMR's reciprocal estimate of Y (`ym` Q62, 1 ≤ y < 2) as Q31, below 1: the reciprocal of the middle
+// of the interval of y's top eight fraction bits. Two Newton steps in `dcp_ddiv_m` take it to 31 bits.
+recip_estimate(ym: u64) -> u32
+    val i = (ym >> 54) & 0xFF
+    u32((1u64 << 40) / (513 + 2 * i))
+
+// RXMQ's reciprocal square-root estimate of X (`xm` Q62 after SQR0, 1 ≤ x < 4) as Q31, below 1: at the
+// middle of the interval of x's top nine bits (an `xm` below 1, which no sequence reads, as 1).
+rsqrt_estimate(xm: u64) -> u32
+    val i = if xm >> 62 == 0 then 128u64 else xm >> 55
+    u32(2147483648.0 / (f64(2 * i + 1) / 256.0).sqrt())
