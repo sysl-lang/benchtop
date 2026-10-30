@@ -1,7 +1,7 @@
 module sh.sysl.benchtop.peripheral.sai
 
 import sysl.container.ring.InlineRing
-import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.peripheral.ContextModel
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.stm32h747.sai1 as reg
 
@@ -82,16 +82,15 @@ global_register(offset: u32) -> bool =
 /** The offset from the SAI's base of sub-block `index`'s data register. */
 data_register(index: usize) -> u32 = (if index == 0 then BLOCK_A else BLOCK_B) + DR
 
-/** The serial line a block's slots cross: given the slot, the word the block sends in it (0 while
- * receiving) and its time, answer the word it receives (ignored while sending).
+/** The serial line a block's slots cross: given the board's context, the slot, the word the block
+ * sends in it (0 while receiving) and its time, answer the word it receives (ignored while sending).
  */
-type Endpoint = &Fn(u32,u32,u64) -> u32
+type Endpoint[C] = &Fn(*C,u32,u32,u64) -> u32
 
-/** A line with nothing on it: a receiving block hears zeros. */
-val no_endpoint: Endpoint = (slot,word,time) -> 0
-
-/** One sub-block. `endpoint` is set once by whoever puts the block on a board, and a reset keeps it. */
-struct Block
+/** One sub-block. `endpoint` is set once by whoever puts the block on a board, and a reset keeps it;
+ * it answers from a context of type C, which `advance` hands it.
+ */
+struct Block[C]
     hz: u64
     kernel_hz: u64
     cr1: u32
@@ -107,15 +106,16 @@ struct Block
     phase: u64
     last: u32
     started: bool
-    endpoint: Endpoint
+    endpoint: Endpoint[C]
 
 /** A block at reset with the given clocks — the one place its reset values are written. */
-private fresh(hz: u64, kernel_hz: u64, endpoint: Endpoint) -> Block
+private fresh[C](hz: u64, kernel_hz: u64, endpoint: Endpoint[C]) -> Block[C]
     var fifo: InlineRing[u32, 8]
     // CR1, CR2, FRCR (FRL 7 at reset), SLOTR, IMR, SR; the FIFO, the slot, the clock, no slot due.
     Block(hz, kernel_hz, 0, 0, 7, 0, 0, 0, fifo, 0, 0, NEVER, 0, 0, false, endpoint)
 
-block(hz: u64 = DEFAULT_HZ, kernel_hz: u64 = DEFAULT_KERNEL_HZ, endpoint: Endpoint = no_endpoint) -> Block
+/** A block; by default its line has nothing on it, so a receiving block hears zeros. */
+block[C](hz: u64 = DEFAULT_HZ, kernel_hz: u64 = DEFAULT_KERNEL_HZ, endpoint: Endpoint[C] = (ctx,slot,word,time) -> 0) -> Block[C]
     require hz > 0 && hz <= 1000000000 && kernel_hz > 0 && kernel_hz <= 1000000000, "valid SAI clocks"
     fresh(hz,kernel_hz,endpoint)
 
@@ -128,7 +128,7 @@ private data_bits(cr1: u32) -> u32 = field(cr1,reg.SAI_ACR1_DS_MASK,reg.SAI_ACR1
     7 -> 32
     _ -> 0
 
-impl Block
+impl[C] Block[C]
     enabled(*self) -> bool = self.cr1 & ENABLE != 0
     receiving(*self) -> bool = self.cr1 & MODE_RECEIVE != 0
     slots(*self) -> u32 = field(self.slotr,reg.SAI_ASLOTR_NBSLOT_MASK,reg.SAI_ASLOTR_NBSLOT_SHIFT) + 1
@@ -165,14 +165,14 @@ impl Block
         self.slot = (self.slot + 1) % self.slots()
         output
 
-private mask(b: *Block) -> u32
+private mask[C](b: *Block[C]) -> u32
     val bits = data_bits(b.cr1)
     if bits == 32 then 0xffffffff else (1u32 << bits) - 1
 
-private autonomous(b: *Block) -> bool = b.cr1 & MODE_SLAVE == 0 && b.cr1 & reg.SAI_ACR1_SYNCEN_MASK == 0
+private autonomous[C](b: *Block[C]) -> bool = b.cr1 & MODE_SLAVE == 0 && b.cr1 & reg.SAI_ACR1_SYNCEN_MASK == 0
 // FRCR FRL + 1: the frame's length in bit clocks.
-private frame_length(b: *Block) -> u32 = (b.frcr & reg.SAI_AFRCR_FRL_MASK) + 1
-private frame_factor(b: *Block, cr1: u32) -> u64 =
+private frame_length[C](b: *Block[C]) -> u32 = (b.frcr & reg.SAI_AFRCR_FRL_MASK) + 1
+private frame_factor[C](b: *Block[C], cr1: u32) -> u64 =
     if cr1 & reg.SAI_ACR1_NOMCK_MASK != 0 then u64(frame_length(b))
     else (if cr1 & reg.SAI_ACR1_OSR_MASK != 0 then 512 else 256)
 
@@ -180,7 +180,7 @@ private divider(cr1: u32) -> u64
     val div = field(cr1,MCKDIV_MASK,MCKDIV_SHIFT)
     if div == 0 then 1 else u64(div)
 
-private valid(b: *Block, cr1: u32) -> bool
+private valid[C](b: *Block[C], cr1: u32) -> bool
     val bits = data_bits(cr1)
     // SLOTSZ: 0 the data size, 1 16 bits, 2 32 bits, 3 reserved.
     val size_code = field(b.slotr,reg.SAI_ASLOTR_SLOTSZ_MASK,reg.SAI_ASLOTR_SLOTSZ_SHIFT)
@@ -197,7 +197,7 @@ private valid(b: *Block, cr1: u32) -> bool
     if b.cr2 & COMPANDING != 0 then return false
     b.hz * frame_factor(b,cr1) * divider(cr1) >= b.kernel_hz * u64(n)
 
-private schedule(b: *Block)
+private schedule[C](b: *Block[C])
     val numerator = b.hz * frame_factor(b,b.cr1) * divider(b.cr1)
     val denominator = b.kernel_hz * u64(b.slots())
     var ticks = numerator / denominator
@@ -207,7 +207,7 @@ private schedule(b: *Block)
         b.phase -= denominator
     b.next_slot += ticks
 
-private start(b: *Block)
+private start[C](b: *Block[C])
     if b.started || !b.enabled() || !autonomous(b) || (!b.receiving() && b.fifo.is_empty()) then return
     b.started = true
     b.slot = 0
@@ -216,7 +216,7 @@ private start(b: *Block)
     schedule(b)
 
 // Offsets are a sub-block's own; every register is a word, which the bus checks.
-impl Model for Block
+impl[C] ContextModel[C] for Block[C]
     read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = offset match
         CR1 -> Some(self.cr1)
         CR2 -> Some(self.cr2)
@@ -228,7 +228,7 @@ impl Model for Block
         DR -> if self.receiving() then Some(self.fifo.pop_front().unwrap_or(0)) else Some(0)
         _ -> None
 
-    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool
+    write(*self, ctx: *C, offset: u32, width: u32, value: u32, time: u64) -> bool
         offset match
             CR1 ->
                 val next = if self.enabled() then (self.cr1 & ~(ENABLE | DMA_ENABLE)) | (value & (ENABLE | DMA_ENABLE)) else value & CR1_WRITABLE
@@ -253,15 +253,15 @@ impl Model for Block
 
     // Exact rational slot timing: advancing in one chunk or many emits the same
     // events. The caller serializes accesses and advances before MMIO operations.
-    override advance(*self, time: u64)
+    override advance(*self, ctx: *C, time: u64)
         if time <= self.time then return
         while self.next_slot != NEVER && self.next_slot <= time
             self.time = self.next_slot
             val slot = self.slot
-            if self.receiving() then self.clock_slot((self.endpoint)(slot,0,self.time))
+            if self.receiving() then self.clock_slot((self.endpoint)(ctx,slot,0,self.time))
             else
                 val word = self.clock_slot(0)
-                (self.endpoint)(slot,word,self.time)
+                (self.endpoint)(ctx,slot,word,self.time)
             schedule(self)
         self.time = time
 
