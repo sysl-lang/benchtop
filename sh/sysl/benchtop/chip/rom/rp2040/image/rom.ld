@@ -60,15 +60,15 @@ SECTIONS
         SHORT(0x4453) SHORT(rom_sd_table)                    /* 'S', 'D' */
         SHORT(0)
 
-        /* Each soft float table with its size in words in the byte two before it. The compiler aligns
-         * each table, 128 bytes, to 16, so the size goes in the last two bytes before a 16-byte
-         * boundary, and the ASSERT below checks that each table follows its size directly.
+        /* Each soft float table with its size in words in the halfword two before it: the size is a
+         * word-aligned word, the table is word-aligned, and the ASSERT below checks that each table
+         * follows its size word directly.
          */
-        . = ALIGN(16) + 14;
+        . = ALIGN(4);
         rom_sf_size = .;
         KEEP(*(.rom.sf_size))
         KEEP(*(.rom.sf))
-        . = ALIGN(16) + 14;
+        . = ALIGN(4);
         rom_sd_size = .;
         KEEP(*(.rom.sd_size))
         KEEP(*(.rom.sd))
@@ -93,7 +93,7 @@ SECTIONS
      */
     .data : { *(.data*) *(.bss*) *(COMMON) } > ROM
     ASSERT(SIZEOF(.data) == 0, "the ROM image has writable storage, which a ROM cannot hold")
-    ASSERT(rom_sf_table == rom_sf_size + 2 && rom_sd_table == rom_sd_size + 2, "a soft float table does not follow its size")
+    ASSERT(rom_sf_table == rom_sf_size + 4 && rom_sd_table == rom_sd_size + 4, "a soft float table does not follow its size")
 
     /DISCARD/ : { *(.ARM.exidx*) *(.ARM.extab*) *(.comment) }
 }
