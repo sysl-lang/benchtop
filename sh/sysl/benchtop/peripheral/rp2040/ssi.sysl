@@ -1,0 +1,526 @@
+module sh.sysl.benchtop.peripheral.rp2040
+
+import sh.sysl.benchtop.parts.qspi_flash.QspiFlash
+import sh.sysl.rp2040.ssi as reg
+import sh.sysl.rp2040.xip_ctrl as xip_reg
+import sysl.fmt.hex
+
+// The RP2040's flash interface (RP2040 datasheet 4.10, "SSI", Synopsys's DW_apb_ssi, and 2.6.3,
+// "Flash"): the SSI's registers and FIFOs, its transfers to the flash on chip select 0 one byte at a
+// time (`parts/qspi_flash`), the XIP reads it makes as the second stage configures them, and XIP_CTRL.
+//
+// **Transfers are timed, and evaluated lazily.** A frame takes its bits over the lanes it travels on,
+// times SCKDV clk_sys cycles; the SSI is brought up to the present (`catch_up`) whenever it, IO_QSPI
+// or XIP is touched, and nothing is scheduled, since its interrupt is refused. The timing is what
+// decides where chip select rises: the SSI holds it low while its TX FIFO keeps the transfer fed and
+// raises it when the FIFO runs dry, so a command pushed byte by byte is one frame to the flash, as on
+// silicon. The modes run: transmit-and-receive and transmit-only on one lane, and the EEPROM read on
+// one, two or four lanes, with its instruction, address, wait cycles and NDF + 1 data frames. The
+// receive-only mode, Microwire and TI frame formats, loopback, DDR, DMA, the interrupt, and an
+// overflow or underflow of either FIFO are refused by name.
+//
+// **Chip select** is IO_QSPI's SS override (`CS_NORMAL`, `CS_LOW`, `CS_HIGH`), which the chip passes
+// in: normal is the SSI's own, which a transfer drives; forced low or high is what the SDK's
+// `flash_do_cmd` uses. A byte clocked with chip select high reaches no device and reads back FFh.
+//
+// **XIP.** A memory-mapped read is an EEPROM read of one 32-bit frame: XIP_CMD as an 8-bit
+// instruction and a 24-bit address, or no instruction and a 32-bit address whose low byte is XIP_CMD
+// (the continuous-read mode bits), then the wait cycles, then the data, little-endian. Whether that
+// reads the flash's bytes at the address is decided by running it through a copy of the flash over a
+// pattern (`xip_ready`), so the second stage's configuration is honoured exactly where the flash would
+// answer it, and a configuration it would not answer (a wrong command, wait count or mode) is
+// refused with the registers named. A read that is honoured leaves the flash as it found it, so the
+// board serves it from the array directly, on the cores' fast path.
+//
+// **XIP_CTRL**: CTRL, FLUSH and STAT, and the streaming FIFO. The cache is functional, as on the
+// RP2350: no lookup is simulated, so a read is never stale, a flush completes at once, and the hit and
+// access counters are refused by name. With the cache disabled its 16 KB are SRAM at 0x1500_0000,
+// which the board maps.
+
+/** IO_QSPI's SS OUTOVER: chip select is the SSI's, or forced low, or forced high. Invert is refused. */
+const CS_NORMAL: u32 = 0
+const CS_LOW: u32 = 2
+const CS_HIGH: u32 = 3
+
+/** The SSI's register window at XIP_SSI_BASE. */
+const SSI_WINDOW: u32 = 0x100
+
+private const FIFO_DEPTH: u32 = 16
+private const IDLE: u32 = 0
+private const SENDING: u32 = 1
+private const RECEIVING: u32 = 2
+
+// The writable bits of CTRLR0 and SPI_CTRLR0, and SPI_CTRLR0's reset value (XIP_CMD 03h).
+private const CTRLR0_BITS: u32 = 0x017FFFFF
+private const SPI_CTRLR0_BITS: u32 = 0xFF07FB3F
+private const SPI_CTRLR0_RESET: u32 = 0x03000000
+private const SSI_IDR: u32 = 0x51535049
+private const SSI_VERSION: u32 = 0x3430312A
+
+// The address and pattern a configuration is tried on (`xip_ready`): the word at 0x44 of a 256-byte
+// array holding 0, 1, 2, ...
+private const PROBE_AT: u32 = 0x44
+private const PROBE_WORD: u32 = 0x47464544
+
+struct Ssi
+    ctrlr0: u32
+    ctrlr1: u32
+    enabled: bool
+    ser: u32
+    baudr: u32
+    txftlr: u32
+    rxftlr: u32
+    dmatdlr: u32
+    dmardlr: u32
+    rx_sample_dly: u32
+    spi_ctrlr0: u32
+    txd_drive_edge: u32
+    // The FIFOs, oldest first from each head.
+    tx: [16]u32
+    tx_head: u32
+    tx_count: u32
+    rx: [16]u32
+    rx_head: u32
+    rx_count: u32
+    // The transfer in progress: IDLE, SENDING or RECEIVING; the TX entries it has shifted; the data
+    // frames still to receive; the frame in flight's received word, pushed when it ends; and when, in
+    // clk_sys cycles, that frame ends.
+    phase: u32
+    shifted: u32
+    rx_left: u32
+    pending: bool
+    pending_word: u32
+    frame_end: u64
+
+    reset(*self)
+        self.ctrlr0 = 0
+        self.ctrlr1 = 0
+        self.enabled = false
+        self.ser = 0
+        self.baudr = 0
+        self.txftlr = 0
+        self.rxftlr = 0
+        self.dmatdlr = 0
+        self.dmardlr = 0
+        self.rx_sample_dly = 0
+        self.spi_ctrlr0 = SPI_CTRLR0_RESET
+        self.txd_drive_edge = 0
+        self.clear()
+    end reset
+
+    // The FIFOs emptied and the transfer dropped.
+    private clear(*self)
+        self.tx_head = 0
+        self.tx_count = 0
+        self.rx_head = 0
+        self.rx_count = 0
+        self.phase = IDLE
+        self.shifted = 0
+        self.rx_left = 0
+        self.pending = false
+        self.pending_word = 0
+        self.frame_end = 0
+
+    /** Whether a transfer is in progress, which holds the SSI's own chip select low. */
+    active(self) -> bool = self.phase != IDLE
+
+    private tmod(self) -> u32 = (self.ctrlr0 & reg.CTRLR0_TMOD_MASK) >> reg.CTRLR0_TMOD_SHIFT
+    private frame_bits(self) -> u32 = ((self.ctrlr0 & reg.CTRLR0_DFS_32_MASK) >> reg.CTRLR0_DFS_32_SHIFT) + 1
+    private spi_frf(self) -> u32 = (self.ctrlr0 & reg.CTRLR0_SPI_FRF_MASK) >> reg.CTRLR0_SPI_FRF_SHIFT
+    private lanes(self) -> u32 = self.spi_frf() match
+        reg.CTRLR0_SPI_FRF_DUAL -> 2
+        reg.CTRLR0_SPI_FRF_QUAD -> 4
+        _ -> 1
+    private inst_bits(self) -> u32 = ((self.spi_ctrlr0 & reg.SPI_CTRLR0_INST_L_MASK) >> reg.SPI_CTRLR0_INST_L_SHIFT) match
+        reg.SPI_CTRLR0_INST_L_4B -> 4
+        reg.SPI_CTRLR0_INST_L_8B -> 8
+        reg.SPI_CTRLR0_INST_L_16B -> 16
+        _ -> 0
+    private addr_bits(self) -> u32 = ((self.spi_ctrlr0 & reg.SPI_CTRLR0_ADDR_L_MASK) >> reg.SPI_CTRLR0_ADDR_L_SHIFT) * 4
+    private wait_cycles(self) -> u32 = (self.spi_ctrlr0 & reg.SPI_CTRLR0_WAIT_CYCLES_MASK) >> reg.SPI_CTRLR0_WAIT_CYCLES_SHIFT
+    private trans_type(self) -> u32 = (self.spi_ctrlr0 & reg.SPI_CTRLR0_TRANS_TYPE_MASK) >> reg.SPI_CTRLR0_TRANS_TYPE_SHIFT
+    private xip_cmd(self) -> u32 = (self.spi_ctrlr0 & reg.SPI_CTRLR0_XIP_CMD_MASK) >> reg.SPI_CTRLR0_XIP_CMD_SHIFT
+    // SCKDV, whose bit 0 the SSI ignores: clk_sys cycles a serial clock.
+    private divisor(self) -> u32 = self.baudr & 0xFFFE
+    // Whether the frame format moves addresses and data on more than one lane.
+    private enhanced(self) -> bool = self.spi_frf() != reg.CTRLR0_SPI_FRF_STD
+    // The lanes an instruction and an address travel on, by TRANS_TYPE.
+    private inst_lanes(self) -> u32 = if self.trans_type() == reg.SPI_CTRLR0_TRANS_TYPE_2C2A then self.lanes() else 1
+    private addr_lanes(self) -> u32 = if self.trans_type() == reg.SPI_CTRLR0_TRANS_TYPE_1C1A then 1 else self.lanes()
+
+    /** A register read at `offset` at clk_sys cycle `now`, or why it is refused. */
+    read(*self, offset: u32, width: u32, now: u64, flash: *QspiFlash, cs: u32) -> Result[u32, string]
+        access(offset, width, false).map_err(e -> ssi_refusal(offset, e))?
+        self.catch_up(now, flash, cs)?
+        val at = offset & 0xFFC
+        if at >= reg.DR0_OFFSET && at < reg.RX_SAMPLE_DLY_OFFSET then return Ok(read_lane(self.pop_rx(offset)?, offset, width))
+        val value = at match
+            reg.CTRLR0_OFFSET -> self.ctrlr0
+            reg.CTRLR1_OFFSET -> self.ctrlr1
+            reg.SSIENR_OFFSET -> if self.enabled then 1 else 0
+            reg.SER_OFFSET -> self.ser
+            reg.BAUDR_OFFSET -> self.baudr
+            reg.TXFTLR_OFFSET -> self.txftlr
+            reg.RXFTLR_OFFSET -> self.rxftlr
+            reg.TXFLR_OFFSET -> self.tx_count
+            reg.RXFLR_OFFSET -> self.rx_count
+            reg.SR_OFFSET -> self.sr()
+            reg.RISR_OFFSET -> self.risr()
+            // No interrupt is unmasked (`write` refuses one), and no overflow or underflow is ever
+            // flagged, so there is nothing to mask in or clear.
+            reg.MWCR_OFFSET | reg.IMR_OFFSET | reg.ISR_OFFSET | reg.DMACR_OFFSET -> 0
+            reg.TXOICR_OFFSET | reg.RXOICR_OFFSET | reg.RXUICR_OFFSET | reg.MSTICR_OFFSET | reg.ICR_OFFSET -> 0
+            reg.DMATDLR_OFFSET -> self.dmatdlr
+            reg.DMARDLR_OFFSET -> self.dmardlr
+            reg.IDR_OFFSET -> SSI_IDR
+            reg.SSI_VERSION_ID_OFFSET -> SSI_VERSION
+            reg.RX_SAMPLE_DLY_OFFSET -> self.rx_sample_dly
+            reg.SPI_CTRLR0_OFFSET -> self.spi_ctrlr0
+            reg.TXD_DRIVE_EDGE_OFFSET -> self.txd_drive_edge
+            _ -> return Err(ssi_refusal(offset, AccessError.Unmapped))
+        Ok(read_lane(value, offset, width))
+    end read
+
+    /** A register write at `offset` at clk_sys cycle `now`, or why it is refused; `pins` is why the
+     * QSPI pins do not reach the SSI, empty where they do. A refused write leaves the SSI as it was.
+     */
+    write(*self, offset: u32, width: u32, value: u32, now: u64, flash: *QspiFlash, cs: u32, pins: string) -> Result[unit, string]
+        access(offset, width, false).map_err(e -> ssi_refusal(offset, e))?
+        self.catch_up(now, flash, cs)?
+        val at = offset & 0xFFC
+        val x = replicated(value, width)
+        if at >= reg.DR0_OFFSET && at < reg.RX_SAMPLE_DLY_OFFSET then return self.push(x, now, flash, cs, pins)
+        if at == reg.SSIENR_OFFSET
+            if x & reg.SSIENR_SSI_EN_MASK != 0
+                self.enabled = true
+                return Ok(())
+            // Disabling stops a transfer where it is, raises the SSI's chip select and empties both FIFOs.
+            val was = self.active()
+            self.clear()
+            self.enabled = false
+            if was && cs == CS_NORMAL then flash.deselect()?
+            return Ok(())
+        // The frame format, timing and XIP registers take a write only while the SSI is disabled
+        // (DW_apb_ssi); a write while it is enabled is dropped, as on silicon.
+        val fixed = at == reg.CTRLR0_OFFSET || at == reg.CTRLR1_OFFSET || at == reg.BAUDR_OFFSET || at == reg.SPI_CTRLR0_OFFSET ||
+            at == reg.TXD_DRIVE_EDGE_OFFSET || at == reg.RX_SAMPLE_DLY_OFFSET || at == reg.MWCR_OFFSET
+        if fixed && self.enabled then return Ok(())
+        at match
+            reg.CTRLR0_OFFSET ->
+                if x & reg.CTRLR0_FRF_MASK != 0 then return Err(s"SSI CTRLR0 = 0x${hex(x)}: the TI and Microwire frame formats (FRF ${(x & reg.CTRLR0_FRF_MASK) >> reg.CTRLR0_FRF_SHIFT}) are not modelled")
+                if x & reg.CTRLR0_SRL_MASK != 0 then return Err(s"SSI CTRLR0 = 0x${hex(x)}: the shift register loop (SRL) is not modelled")
+                if (x & reg.CTRLR0_SPI_FRF_MASK) >> reg.CTRLR0_SPI_FRF_SHIFT == 3 then return Err(s"SSI CTRLR0 = 0x${hex(x)}: SPI_FRF 3 is reserved")
+                self.ctrlr0 = x & CTRLR0_BITS
+            reg.CTRLR1_OFFSET -> self.ctrlr1 = x & reg.CTRLR1_NDF_MASK
+            reg.MWCR_OFFSET -> if x & 7 != 0 then return Err(s"SSI MWCR = 0x${hex(x)}: Microwire is not modelled")
+            reg.SER_OFFSET -> self.ser = x & reg.SER_SER_MASK
+            reg.BAUDR_OFFSET -> self.baudr = x & reg.BAUDR_SCKDV_MASK
+            reg.TXFTLR_OFFSET -> self.txftlr = x & reg.TXFTLR_TFT_MASK
+            reg.RXFTLR_OFFSET -> self.rxftlr = x & reg.RXFTLR_RFT_MASK
+            reg.IMR_OFFSET -> if x & 0x3F != 0 then return Err(s"SSI IMR = 0x${hex(x)}: the SSI's interrupt (XIP_IRQ) is not modelled")
+            reg.DMACR_OFFSET -> if x & 3 != 0 then return Err(s"SSI DMACR = 0x${hex(x)}: the SSI's DMA requests are not modelled (docs/rp-coverage.md item 11)")
+            reg.DMATDLR_OFFSET -> self.dmatdlr = x & reg.DMATDLR_DMATDL_MASK
+            reg.DMARDLR_OFFSET -> self.dmardlr = x & reg.DMARDLR_DMARDL_MASK
+            reg.RX_SAMPLE_DLY_OFFSET -> self.rx_sample_dly = x & reg.RX_SAMPLE_DLY_RSD_MASK
+            reg.SPI_CTRLR0_OFFSET ->
+                val ddr = reg.SPI_CTRLR0_SPI_RXDS_EN_MASK | reg.SPI_CTRLR0_INST_DDR_EN_MASK | reg.SPI_CTRLR0_SPI_DDR_EN_MASK
+                if x & ddr != 0 then return Err(s"SSI SPI_CTRLR0 = 0x${hex(x)}: DDR transfers and the read data strobe are not modelled")
+                self.spi_ctrlr0 = x & SPI_CTRLR0_BITS
+            reg.TXD_DRIVE_EDGE_OFFSET -> self.txd_drive_edge = x & reg.TXD_DRIVE_EDGE_TDE_MASK
+            // The status and interrupt-clear registers, IDR and the version are read-only.
+            reg.TXFLR_OFFSET | reg.RXFLR_OFFSET | reg.SR_OFFSET | reg.ISR_OFFSET | reg.RISR_OFFSET | reg.TXOICR_OFFSET | reg.RXOICR_OFFSET -> ()
+            reg.RXUICR_OFFSET | reg.MSTICR_OFFSET | reg.ICR_OFFSET | reg.IDR_OFFSET | reg.SSI_VERSION_ID_OFFSET -> ()
+            _ -> return Err(ssi_refusal(offset, AccessError.Unmapped))
+        Ok(())
+    end write
+
+    // SR: BUSY while a transfer runs, and the FIFOs' levels.
+    private sr(self) -> u32
+        var v: u32 = 0
+        if self.active() then v |= reg.SR_BUSY_MASK
+        if self.tx_count < FIFO_DEPTH then v |= reg.SR_TFNF_MASK
+        if self.tx_count == 0 then v |= reg.SR_TFE_MASK
+        if self.rx_count > 0 then v |= reg.SR_RFNE_MASK
+        if self.rx_count == FIFO_DEPTH then v |= reg.SR_RFF_MASK
+        v
+
+    // RISR: the TX FIFO at or below its threshold, the RX FIFO above its own.
+    private risr(self) -> u32
+        var v: u32 = 0
+        if self.tx_count <= self.txftlr then v |= reg.RISR_TXEIR_MASK
+        if self.rx_count > self.rxftlr then v |= reg.RISR_RXFIR_MASK
+        v
+
+    // A word into the TX FIFO, which starts a transfer where none is running.
+    private push(*self, x: u32, now: u64, flash: *QspiFlash, cs: u32, pins: string) -> Result[unit, string]
+        if !self.enabled then return Err(s"SSI DR0 = 0x${hex(x)} with the SSI disabled (SSIENR 0): the word is dropped on silicon, which is not modelled")
+        if self.tx_count == FIFO_DEPTH then return Err(s"SSI DR0 = 0x${hex(x)} with the TX FIFO full: an overflow, which is not modelled")
+        if !self.active()
+            val why = self.unrunnable(pins)
+            if !why.is_empty() then return Err(s"SSI DR0 = 0x${hex(x)} starts a transfer, but $why")
+        self.tx[(self.tx_head + self.tx_count) % FIFO_DEPTH] = x
+        self.tx_count += 1
+        if self.active() then return Ok(())
+        if cs == CS_NORMAL then flash.select()
+        self.phase = SENDING
+        self.shifted = 0
+        self.begin_send(now, flash)
+
+    // Why a transfer cannot start as the SSI and the pins are set; empty where it can.
+    private unrunnable(self, pins: string) -> string
+        if !pins.is_empty() then return pins
+        if self.ser & reg.SER_SER_MASK == 0 then return "SER selects no slave, so on silicon it never starts, which is not modelled"
+        if self.divisor() == 0 then return s"BAUDR (SCKDV ${self.baudr}) stops the serial clock"
+        if self.frame_bits() % 8 != 0 then return s"its data frames are ${self.frame_bits()} bits, not whole bytes, which the flash does not take"
+        val mode = self.tmod()
+        if mode == reg.CTRLR0_TMOD_RX_ONLY then return "the receive-only mode (TMOD 2) is not modelled"
+        if self.enhanced()
+            if mode != reg.CTRLR0_TMOD_EEPROM_READ then return s"a transfer on ${self.lanes()} lanes in TMOD $mode is not modelled: only the EEPROM read moves more than one lane"
+            if self.inst_bits() == 4 then return "a 4-bit instruction is not whole bytes, which the flash does not take"
+            if self.addr_bits() % 8 != 0 || self.addr_bits() > 32 then return s"a ${self.addr_bits()}-bit address is not one to four whole bytes"
+            if self.wait_cycles() * self.addr_lanes() % 8 != 0 then return s"${self.wait_cycles()} wait cycles on ${self.addr_lanes()} lanes are not whole bytes of dummy clocks"
+        ""
+
+    /** Bring transfers up to clk_sys cycle `now`: each frame that has ended delivers its word, and the
+     * next starts; a transfer whose TX FIFO has run dry ends, raising the SSI's chip select.
+     */
+    catch_up(*self, now: u64, flash: *QspiFlash, cs: u32) -> Result[unit, string]
+        while self.phase != IDLE && self.frame_end <= now
+            val t = self.frame_end
+            if self.pending
+                if self.rx_count == FIFO_DEPTH then return Err("the SSI received a frame with its RX FIFO full: an overflow, which is not modelled")
+                self.rx[(self.rx_head + self.rx_count) % FIFO_DEPTH] = self.pending_word
+                self.rx_count += 1
+                self.pending = false
+            if self.phase == SENDING && self.tx_count > 0
+                self.begin_send(t, flash)?
+            elif self.phase == SENDING && self.tmod() == reg.CTRLR0_TMOD_EEPROM_READ
+                self.phase = RECEIVING
+                self.rx_left = self.ctrlr1 + 1
+                self.begin_receive(t, flash, true)?
+            elif self.phase == RECEIVING && self.rx_left > 0
+                self.begin_receive(t, flash, false)?
+            else
+                self.phase = IDLE
+                if cs == CS_NORMAL then flash.deselect()?
+        Ok(())
+
+    // The oldest TX entry shifted out from cycle `t`: a data frame, or in an enhanced EEPROM read the
+    // instruction and then the address.
+    private begin_send(*self, t: u64, flash: *QspiFlash) -> Result[unit, string]
+        val entry = self.tx[self.tx_head]
+        self.tx_head = (self.tx_head + 1) % FIFO_DEPTH
+        self.tx_count -= 1
+        var bits = self.frame_bits()
+        var lanes: u32 = 1
+        if self.enhanced()
+            val inst = self.inst_bits()
+            val first_address: u32 = if inst > 0 then 1 else 0
+            if self.shifted == 0 && inst > 0
+                bits = inst
+                lanes = self.inst_lanes()
+            elif self.shifted == first_address && self.addr_bits() > 0
+                bits = self.addr_bits()
+                lanes = self.addr_lanes()
+            else
+                return Err(s"the SSI's EEPROM read on ${self.lanes()} lanes was given a TX entry (0x${hex(entry)}) after its instruction and address, which is not modelled")
+        val got = exchange_bits(flash, entry, bits)?
+        if self.tmod() == reg.CTRLR0_TMOD_TX_AND_RX
+            self.pending = true
+            self.pending_word = got
+        self.shifted += 1
+        self.frame_end = t + u64(bits / lanes) * u64(self.divisor())
+        Ok(())
+
+    // A data frame received from cycle `t`, after the wait cycles where it is the first.
+    private begin_receive(*self, t: u64, flash: *QspiFlash, first: bool) -> Result[unit, string]
+        var clocks: u32 = 0
+        val lanes = if self.enhanced() then self.lanes() else 1
+        if first && self.enhanced()
+            val dummy = self.wait_cycles() * self.addr_lanes() / 8
+            for k in 0..<dummy do exchange_byte(flash, 0xFF)?
+            clocks = self.wait_cycles()
+        val bits = self.frame_bits()
+        self.pending_word = exchange_bits(flash, 0xFFFFFFFF, bits)?
+        self.pending = true
+        self.rx_left -= 1
+        clocks += bits / lanes
+        self.frame_end = t + u64(clocks) * u64(self.divisor())
+        Ok(())
+
+    // The oldest RX entry, refused where the FIFO is empty.
+    private pop_rx(*self, offset: u32) -> Result[u32, string]
+        if self.rx_count == 0 then return Err(s"SSI + 0x${hex(offset)}: DR0 read with the RX FIFO empty, an underflow, which is not modelled")
+        val got = self.rx[self.rx_head]
+        self.rx_head = (self.rx_head + 1) % FIFO_DEPTH
+        self.rx_count -= 1
+        Ok(got)
+
+    /** Why an XIP read through the SSI as it is configured now would not read the flash's bytes at its
+     * address; Ok where it would. `flash` is not changed: the read is tried on a copy of it over a
+     * pattern, and must leave the copy in the state it started in, so every read after it is the same.
+     */
+    xip_ready(self, flash: *QspiFlash, cs: u32, pins: string) -> Result[unit, string]
+        if !self.enabled then return Err("the SSI is disabled (SSIENR 0)")
+        if self.tmod() != reg.CTRLR0_TMOD_EEPROM_READ then return Err(s"the SSI is set for direct transfers (CTRLR0 TMOD ${self.tmod()}), not the EEPROM read XIP makes")
+        if self.frame_bits() != 32 then return Err(s"the SSI's data frames are ${self.frame_bits()} bits, and XIP reads one 32-bit frame")
+        if self.active() then return Err("a direct transfer is in progress on the SSI")
+        if self.tx_count != 0 then return Err(s"the SSI's TX FIFO holds ${self.tx_count} entries")
+        if cs != CS_NORMAL then return Err(s"IO_QSPI forces the flash's chip select ${if cs == CS_LOW then "low" else "high"} (GPIO_QSPI_SS_CTRL OUTOVER $cs)")
+        val why = self.unrunnable(pins)
+        if !why.is_empty() then return Err(why)
+        var pattern: [256]u8
+        for i in 0..<256 do pattern[i] = u8(i)
+        var probe = *flash
+        probe.connect(&pattern[0], 256)
+        val got = self.xip_frame(&probe, PROBE_AT)?
+        if got != PROBE_WORD || probe.continuous != flash.continuous
+            return Err(s"an XIP read as the SSI is set (CTRLR0 0x${hex(self.ctrlr0, 8)}, SPI_CTRLR0 0x${hex(self.spi_ctrlr0, 8)}) does not read the flash's bytes at its address, or leaves the flash in another state for the next")
+        Ok(())
+
+    // One XIP read of the word at flash address `a` through `f`, as the SSI frames it.
+    private xip_frame(self, f: *QspiFlash, a: u32) -> Result[u32, string]
+        val inst = self.inst_bits()
+        val addr = self.addr_bits()
+        if !((inst == 8 && addr == 24) || (inst == 0 && addr == 32))
+            return Err(s"an XIP read with a $inst-bit instruction and a $addr-bit address (SPI_CTRLR0 0x${hex(self.spi_ctrlr0, 8)}) is not modelled: benchtop runs XIP_CMD as an 8-bit instruction before a 24-bit address, or as the mode bits of a 32-bit one")
+        f.select()
+        if inst == 8 then exchange_byte(f, u8.wrap(self.xip_cmd()))?
+        exchange_bits(f, if addr == 32 then (a << 8) | self.xip_cmd() else a, addr)?
+        for k in 0..<(self.wait_cycles() * self.addr_lanes() / 8) do exchange_byte(f, 0xFF)?
+        var word: u32 = 0
+        for k in 0u32..<4 do word |= u32(exchange_byte(f, 0xFF)?) << (8 * k)
+        f.deselect()?
+        Ok(word)
+end Ssi
+
+ssi() -> Ssi
+    var s: Ssi
+    s.reset()
+    s
+
+// `bits` of `out`, most significant byte first, to the flash; what came back, the same way round.
+private exchange_bits(flash: *QspiFlash, out: u32, bits: u32) -> Result[u32, string]
+    var got: u32 = 0
+    for k in 0u32..<(bits / 8) do got = (got << 8) | u32(exchange_byte(flash, u8.wrap(out >> (bits - 8 * (k + 1))))?)
+    Ok(got)
+
+// One byte to the flash where its chip select is low; with it high no device answers, and FFh is read.
+private exchange_byte(flash: *QspiFlash, out: u8) -> Result[u8, string]
+    if !flash.selected then return Ok(0xFF)
+    flash.exchange(out)
+
+private ssi_refusal(offset: u32, e: AccessError) -> string = e match
+    Unmapped -> s"SSI + 0x${hex(offset)} is not a register of the SSI"
+    InvalidWidth -> s"SSI + 0x${hex(offset)} is not an access width the SSI takes"
+    Unaligned -> s"SSI + 0x${hex(offset)} is not aligned to its width"
+    UnsupportedAlias -> s"SSI + 0x${hex(offset)}: the SSI has no atomic aliases"
+
+// XIP_CTRL's writable bits (POWER_DOWN, ERR_BADWRITE, EN) and its reset value.
+private const XIP_CTRL_BITS: u32 = 0xB
+private const XIP_CTRL_RESET: u32 = 0x3
+
+/** XIP_CTRL: the cache's control, its flush, and the streaming FIFO (two words deep). */
+struct XipCtrl
+    ctrl: u32
+    stream_addr: u32
+    stream_ctr: u32
+    fifo: [2]u32
+    fifo_count: u32
+
+    reset(*self)
+        self.ctrl = XIP_CTRL_RESET
+        self.stream_addr = 0
+        self.stream_ctr = 0
+        self.fifo_count = 0
+
+    /** Whether the cache's 16 KB are SRAM at 0x1500_0000: the cache disabled, and powered up. */
+    sram_open(self) -> bool = self.ctrl & (xip_reg.CTRL_EN_MASK | xip_reg.CTRL_POWER_DOWN_MASK) == 0
+
+    /** Why the cache's 16 KB are not SRAM now. */
+    sram_closed(self) -> string =
+        if self.ctrl & xip_reg.CTRL_POWER_DOWN_MASK != 0 then "the XIP cache is powered down (XIP_CTRL CTRL.POWER_DOWN), and an access to it as SRAM is a bus error"
+        else "the XIP cache is enabled (XIP_CTRL CTRL.EN): its 16 KB hold cache lines, and an access through 0x1500_0000 then is not modelled"
+
+    /** Whether a write to the uncached aliases is a bus error (ERR_BADWRITE) rather than dropped. */
+    bad_write_faults(self) -> bool = self.ctrl & xip_reg.CTRL_ERR_BADWRITE_MASK != 0
+
+    /** A register read; STREAM_FIFO pops the stream, refilled through `ssi` from `flash`. */
+    read(*self, offset: u32, width: u32, ssi: Ssi, flash: *QspiFlash, cs: u32, pins: string) -> Result[u32, string]
+        access(offset, width, true).map_err(e -> xip_ctrl_refusal(offset, e))?
+        val value = offset & 0xFFC match
+            xip_reg.CTRL_OFFSET -> self.ctrl
+            xip_reg.FLUSH_OFFSET -> 0
+            xip_reg.STAT_OFFSET -> self.stat()
+            xip_reg.CTR_HIT_OFFSET | xip_reg.CTR_ACC_OFFSET -> return Err(s"XIP_CTRL + 0x${hex(offset)}: the cache's hit and access counters are not counted, since benchtop does not simulate the cache's lookups")
+            xip_reg.STREAM_ADDR_OFFSET -> self.stream_addr
+            xip_reg.STREAM_CTR_OFFSET -> self.stream_ctr
+            xip_reg.STREAM_FIFO_OFFSET ->
+                if self.fifo_count == 0 then return Err("XIP_CTRL STREAM_FIFO read with the streaming FIFO empty: the bus stalls on silicon until a word arrives, and none will")
+                val got = self.fifo[0]
+                self.fifo[0] = self.fifo[1]
+                self.fifo_count -= 1
+                self.refill(ssi, flash, cs, pins)?
+                got
+            _ -> return Err(xip_ctrl_refusal(offset, AccessError.Unmapped))
+        Ok(read_lane(value, offset, width))
+
+    /** A register write; a refused one leaves XIP_CTRL as it was. */
+    write(*self, offset: u32, width: u32, value: u32, ssi: Ssi, flash: *QspiFlash, cs: u32, pins: string) -> Result[unit, string]
+        access(offset, width, true).map_err(e -> xip_ctrl_refusal(offset, e))?
+        val data = replicated(value, width)
+        offset & 0xFFC match
+            xip_reg.CTRL_OFFSET ->
+                self.ctrl = written(self.ctrl, offset, data) & XIP_CTRL_BITS
+                // Powering the cache down disables it.
+                if self.ctrl & xip_reg.CTRL_POWER_DOWN_MASK != 0 then self.ctrl &= ~xip_reg.CTRL_EN_MASK
+            // A flush completes at once: no line is held to forget.
+            xip_reg.FLUSH_OFFSET | xip_reg.STAT_OFFSET | xip_reg.STREAM_FIFO_OFFSET -> ()
+            xip_reg.CTR_HIT_OFFSET | xip_reg.CTR_ACC_OFFSET -> return Err(s"XIP_CTRL + 0x${hex(offset)}: the cache's hit and access counters are not counted, since benchtop does not simulate the cache's lookups")
+            xip_reg.STREAM_ADDR_OFFSET | xip_reg.STREAM_CTR_OFFSET ->
+                val before = *self
+                if offset & 0xFFC == xip_reg.STREAM_ADDR_OFFSET
+                    self.stream_addr = written(self.stream_addr, offset, data) & xip_reg.STREAM_ADDR_STREAM_ADDR_MASK
+                else
+                    self.stream_ctr = written(self.stream_ctr, offset, data) & xip_reg.STREAM_CTR_STREAM_CTR_MASK
+                    // A new count abandons the stream in flight.
+                    self.fifo_count = 0
+                self.refill(ssi, flash, cs, pins) match
+                    Ok(_) -> ()
+                    Err(why) ->
+                        *self = before
+                        return Err(why)
+            _ -> return Err(xip_ctrl_refusal(offset, AccessError.Unmapped))
+        Ok(())
+
+    private stat(self) -> u32 =
+        xip_reg.STAT_FLUSH_READY_MASK | (if self.fifo_count == 2 then xip_reg.STAT_FIFO_FULL_MASK else 0) | (if self.fifo_count == 0 then xip_reg.STAT_FIFO_EMPTY_MASK else 0)
+
+    // The stream reads words from the flash through the SSI into the FIFO while it has room and a count.
+    private refill(*self, ssi: Ssi, flash: *QspiFlash, cs: u32, pins: string) -> Result[unit, string]
+        while self.fifo_count < 2 && self.stream_ctr > 0
+            self.fifo[self.fifo_count] = xip_word(ssi, flash, cs, pins, self.stream_addr).map_err(why -> s"the XIP stream reads 0x${hex(self.stream_addr, 8)} through the SSI, but $why")?
+            self.fifo_count += 1
+            self.stream_addr += 4
+            self.stream_ctr -= 1
+        Ok(())
+end XipCtrl
+
+xip_ctrl() -> XipCtrl
+    var x: XipCtrl
+    x.reset()
+    x
+
+/** The word an XIP read of address `a` returns through the SSI, or why it reads no flash. */
+xip_word(ssi: Ssi, flash: *QspiFlash, cs: u32, pins: string, a: u32) -> Result[u32, string]
+    ssi.xip_ready(flash, cs, pins)?
+    val at = a & 0xFFFFFC
+    var v: u32 = 0
+    for k in 0u32..<4 do v |= u32(flash.byte(at + k)) << (8 * k)
+    Ok(v)
+
+private xip_ctrl_refusal(offset: u32, e: AccessError) -> string = e match
+    Unmapped -> s"XIP_CTRL + 0x${hex(offset)} is not a register of XIP_CTRL"
+    InvalidWidth -> s"XIP_CTRL + 0x${hex(offset)} is not an access width XIP_CTRL takes"
+    Unaligned -> s"XIP_CTRL + 0x${hex(offset)} is not aligned to its width"
+    UnsupportedAlias -> s"XIP_CTRL + 0x${hex(offset)} is not one of XIP_CTRL's aliases"

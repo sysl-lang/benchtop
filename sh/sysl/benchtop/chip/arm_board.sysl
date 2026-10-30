@@ -87,7 +87,9 @@ import sysl.math.min
 // core 1 starts from reset in benchtop's stand-in ROM (`Rp2040`, `rom/rp2040-standin.S`), whose only
 // code is the launch wait. The cores are ARMv6-M with an NVIC of 26 lines and two priority bits. SRAM's
 // non-striped aliases at 0x2100_0000 are reached off the fast path, each word at its striped address
-// (`striped`). A UF2, which the RP2040 takes into flash, is refused (item 24).
+// (`striped`). An ELF or a UF2 may also write the Pico's 2 MB flash, which is on the fast path while
+// the SSI is set for XIP and the chip's otherwise (`sync_pico_xip`), with the XIP cache's 16 KB as SRAM
+// at 0x1500_0000 while the cache is disabled; an image that starts in flash needs the ROM's boot path.
 
 /** The RP2350's external interrupt lines, IRQ 0 to 51. */
 const RP2350_IRQS: u32 = 52
@@ -120,6 +122,7 @@ private const UF2_PAYLOAD_MAX: u32 = 476
 private const FAMILY_ABSOLUTE: u32 = 0xE48BFF57
 private const FAMILY_DATA: u32 = 0xE48BFF58
 private const FAMILY_RP2350_ARM_S: u32 = 0xE48BFF59
+private const FAMILY_RP2040: u32 = 0xE48BFF56
 private const RP2350_E10_BLOCK: u32 = 0x10FFFF00
 
 /** Where an image starts: core 0's PC and SP, the VTOR it starts with, whether the XIP cache's lines
@@ -191,6 +194,8 @@ struct ArmBoard[C: ArmChip = Rp2350]
     xip_epoch: u32
     // One bit per 8-byte cache line of XIP_SRAM, set where the line was live when last mapped.
     sram_lines: [32]u64
+    // The Pico's XIP cache is mapped as SRAM, the cache disabled.
+    sram_open: bool
     // The OTP's array, a row in the low 24 bits of each word: the chip's, kept here for the run as the
     // flash's is (`factory_otp`).
     otp_rows: [4096]u32
@@ -203,17 +208,19 @@ arm_board(map: SramMap) -> &ArmBoard
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
     val sram_at = rom_at + ROM_BYTES + arm.GUARD_BYTES
-    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], [0; 4096], usb_host())
+    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host())
 
 /** A Pico, an RP2040 on its two Cortex-M0+ cores, with `map`'s SRAM, powered on, holding no image. */
 pico_board(map: SramMap) -> &ArmBoard[Rp2040]
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
-    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, 0, false, 0, [0; 32], [0; 4096], usb_host())
+    val sram_at = rom_at + ROM_BYTES_RP2040 + arm.GUARD_BYTES
+    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host())
 
 impl[C: ArmChip] ArmBoard[C]
     /** Power on with `image`, written where its addresses say: core 0 at its entry, core 1 in the boot
-     * ROM. On the Pico 2 an ELF or a UF2, into SRAM, flash and XIP_SRAM; on the Pico an ELF, into SRAM.
+     * ROM. On the Pico 2 an ELF or a UF2, into SRAM, flash and XIP_SRAM; on the Pico an ELF or a UF2,
+     * into SRAM and flash, starting in SRAM.
      */
     boot(*self, image: []const u8) -> Result[unit, string]
         if const C.rp2350()
@@ -910,7 +917,11 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
                     for k in 0..<width do v |= u32(self.mem.ram[at + k]) << (8 * k)
                     return v
                 None -> ()
-        self.chip.load(cpu.core, a, width) match
+        val got = self.chip.load(cpu.core, a, width)
+        // On the Pico a read of the SSI can end a transfer, which changes the flash.
+        if const !C.rp2350()
+            if self.chip.take_xip_changed() then sync_pico_xip(self)
+        got match
             Ok(v) -> v
             Err(why) ->
                 self.refuse(cpu, a, why)
@@ -942,6 +953,8 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
         val r = self.chip.store(cpu.core, a, width, x)
         if const C.rp2350()
             if self.chip.take_xip_changed() then self.sync_xip()
+        else
+            if self.chip.take_xip_changed() then sync_pico_xip(self)
         r match
             Ok(_) ->
                 self.settle()
@@ -989,32 +1002,44 @@ private const NO_USB_RP2040: string = "the RP2040's USB controller is not on the
 const SRAM_ALIAS_RP2040: u32 = 0x21000000
 const SRAM_BANK_RP2040: u32 = 0x10000
 
-// The Pico's boot: an ELF's segments written into SRAM, core 0 at its entry with SP at SRAM's top as a
-// debugger leaves it, and core 1 from reset in the stand-in ROM, whose first 4 KB are mapped read-only
-// at 0. A UF2, for the RP2040's flash, is refused: the flash is read through the SSI (item 24).
+// The Pico's boot: an image written where its addresses say, into SRAM and the 2 MB flash (erased
+// first, and the chip's for the run); core 0 at the image's entry in SRAM with SP at SRAM's top, as a
+// debugger leaves it or as the boot ROM enters a RAM UF2 (at its first byte); and core 1 from reset in
+// the stand-in ROM, whose first 4 KB are mapped read-only at 0. An image that starts in flash is
+// booted through the ROM's boot path (boot2 from flash), which is item 23's, and is refused by name.
+// The flash is behind the SSI, which is not set for XIP at power-on, so it starts off the fast path
+// (`sync_pico_xip`); the XIP cache is enabled, so its 16 KB of SRAM are unmapped.
 private boot_pico(b: *ArmBoard[Rp2040], image: []const u8) -> Result[unit, string]
-    if is_uf2(image) then return Err("a UF2 for the RP2040 is written into its flash, which it reads through the SSI: not on the chip yet (docs/rp-coverage.md item 24)")
-    if b.rom_at + ROM_BYTES_RP2040 + arm.GUARD_BYTES > arm.RAM_BYTES then return Err("the SRAM leaves no room for the boot ROM in the cores' memory")
+    if b.sram_at + XIP_SRAM_BYTES_RP2040 + arm.GUARD_BYTES > arm.RAM_BYTES then return Err("the SRAM leaves no room for the boot ROM and the XIP cache in the cores' memory")
     var packed: Buf[u8] = buf()
     for i in 0..<arm.RAM_BYTES do packed.push(0)
     for i in 0..<ROM_RP2040.len do packed.set(usize(b.rom_at) + i, ROM_RP2040[i])
+    for i in 0..<FLASH_BYTES_RP2040 do packed.push(0xFF)
     val all = packed.view()
-    var regions = [elf.Region(u64(b.map.base), all[..<usize(b.map.size)])]
-    val e = elf.read(image).map_err(why -> s"$why")?
-    val entry = elf.load(e, regions[..]).map_err(why -> s"$why: every segment must be in the RP2040's SRAM")?
+    var regions = [elf.Region(u64(b.map.base), all[..<usize(b.map.size)]), elf.Region(u64(XIP_BASE_RP2040), all[usize(arm.RAM_BYTES)..])]
+    val entry = if is_uf2(image) then load_uf2_pico(b, image, regions[..])? else load_elf_pico(image, regions[..])?
+    if entry < b.map.base || entry >= b.map.base + b.map.size
+        return Err(s"the image starts at 0x${hex(entry, 8)}, not in SRAM: an image that starts in flash boots through the RP2040's boot ROM (boot2 from flash), which is docs/rp-coverage.md item 23")
     var banks: Buf[RamBank] = buf()
     // The ROM's whole window is code the cores may fetch; only the stand-in's page is on the fast path,
     // so a fetch from the rest goes to the bus, which names it (`rom_refusal`).
     banks.push(RamBank(0, ROM_BYTES_RP2040, b.rom_at))
+    banks.push(RamBank(XIP_SRAM_BASE_RP2040, XIP_SRAM_BYTES_RP2040, b.sram_at))
     val first = &b.cores[0]
     first.kind = Kind.V6m
-    arm.reset_mapped(first, b.mem, packed.view(), MemoryMap(b.map.base, b.map.size, XIP_BASE_RP2040, 0, banks.freeze()))
+    arm.reset_mapped(first, b.mem, packed.view(), MemoryMap(b.map.base, b.map.size, XIP_BASE_RP2040, FLASH_BYTES_RP2040, banks.freeze()))
     arm.read_only(b.mem, 0)
     for p in (ROM_MAPPED_RP2040 >> 12)..<(ROM_BYTES_RP2040 >> 12) do b.mem.page_table[p] = 0
     b.chip.reset()
+    b.chip.flash.connect(&b.mem.flash[0], FLASH_BYTES_RP2040)
+    // reset_mapped put the flash and the cache's SRAM on the fast path; the sync takes off what the
+    // chip at power-on does not offer.
+    b.direct = false
+    b.sram_open = true
+    sync_pico_xip(b)
     arm.attach_memory(&b.cores[1], b.mem)
     val c = &b.cores[0]
-    arm.clear(c, u32(entry) & ~1)
+    arm.clear(c, entry & ~1)
     b.configure(c, 0)
     c.r[13] = b.map.base + b.map.size
     b.started[0] = true
@@ -1023,8 +1048,63 @@ private boot_pico(b: *ArmBoard[Rp2040], image: []const u8) -> Result[unit, strin
     b.why = ""
     b.refused = ""
     b.console.clear()
-    if entry & 1 == 0 then return Err(s"the entry 0x${hex(u32(entry), 8)} is not a Thumb address")
+    if entry & 1 == 0 then return Err(s"the entry 0x${hex(entry, 8)} is not a Thumb address")
     Ok(())
+
+// An ELF's loadable segments, each at its physical address; its entry.
+private load_elf_pico(image: []const u8, regions: []elf.Region) -> Result[u32, string]
+    val e = elf.read(image).map_err(why -> s"$why")?
+    val entry = elf.load(e, regions).map_err(why -> s"$why: every segment must be in the RP2040's SRAM or its flash")?
+    Ok(u32(entry))
+
+// A UF2 for the RP2040 (family 0xe48bff56), each block at its target in SRAM or flash; its first
+// address, where the boot ROM enters a RAM image.
+private load_uf2_pico(b: *ArmBoard[Rp2040], image: []const u8, regions: []elf.Region) -> Result[u32, string]
+    if image.len % UF2_BLOCK != 0 then return Err(s"a UF2 is whole 512-byte blocks, and this one is ${image.len} bytes")
+    var lowest: u32 = 0xFFFFFFFF
+    for k in 0..<(image.len / UF2_BLOCK)
+        val block = image[k * UF2_BLOCK..<(k + 1) * UF2_BLOCK]
+        if word(block, 0) != UF2_MAGIC_START0 || word(block, 4) != UF2_MAGIC_START1 || word(block, 508) != UF2_MAGIC_END
+            return Err(s"UF2 block $k: its magic numbers are wrong")
+        val flags = word(block, 8)
+        if flags & UF2_NOT_MAIN_FLASH != 0 then continue
+        if flags & UF2_FAMILY_PRESENT == 0 then return Err(s"UF2 block $k names no family: benchtop takes the RP2040's blocks by their family ID")
+        val family = word(block, 28)
+        if family != FAMILY_RP2040 then return Err(s"UF2 block $k is for family 0x${hex(family, 8)}, not the RP2040's (0xe48bff56)")
+        val target = word(block, 12)
+        val size = word(block, 16)
+        if size > UF2_PAYLOAD_MAX then return Err(s"UF2 block $k carries $size bytes, more than a block holds")
+        val r = region_holding(regions, target, size) match
+            Some(found) -> found
+            None -> return Err(s"UF2 block $k writes 0x${hex(target, 8)}, which is not in the RP2040's SRAM or its flash")
+        val at = usize(u64(target) - r.base)
+        for i in 0..<usize(size) do r.bytes[at + i] = block[32 + i]
+        if target < lowest then lowest = target
+    if lowest == 0xFFFFFFFF then return Err("the UF2 has no block for the main memory")
+    Ok(lowest | 1)
+
+// The Pico's cores' memory map brought into step with its XIP state: code decoded from flash bytes a
+// program or erase changed decodes again; the flash is on the fast path exactly while an XIP read
+// reaches it through the SSI (`Rp2040.xip_ready`), and the cache's 16 KB exactly while they are SRAM.
+// Code decoded from either decodes again when it leaves the cores' memory or comes back, so a core
+// executing there fetches through the bus, which names why the read reaches nothing.
+private sync_pico_xip(b: *ArmBoard[Rp2040])
+    loop
+        b.chip.flash.take_changed() match
+            Some((from, length)) -> arm.flash_changed(b.mem, from, length)
+            None -> break
+    val off = !b.chip.xip_ready()
+    if off != b.direct
+        b.direct = off
+        for p in 0u32..<(FLASH_BYTES_RP2040 >> 12) do b.mem.page_table[(XIP_BASE_RP2040 >> 12) + p] = if off then 0 else usize(&b.mem.flash[p << 12])
+        arm.flash_unmapped(b.mem)
+        b.pages_changed()
+    val open = b.chip.xip.sram_open()
+    if open != b.sram_open
+        b.sram_open = open
+        for p in 0u32..<(XIP_SRAM_BYTES_RP2040 >> 12) do b.mem.page_table[(XIP_SRAM_BASE_RP2040 >> 12) + p] = if open then usize(&b.mem.ram[b.sram_at + (p << 12)]) else 0
+        arm.fetch_changed(b.mem, XIP_SRAM_BASE_RP2040, XIP_SRAM_BYTES_RP2040)
+        b.pages_changed()
 
 // Whether the four words are a boot vector the ROM's `try_vector` takes: the magic, then the PC XORed
 // with the magic's negation.

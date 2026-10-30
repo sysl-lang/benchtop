@@ -1,0 +1,506 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.rp2040.clocks as clocks40
+import sh.sysl.rp2040.io_qspi as ioq40
+import sh.sysl.rp2040.pads_qspi as padsq40
+import sh.sysl.rp2040.resets as resets40
+import sh.sysl.rp2040.rtc as rtc40
+import sh.sysl.rp2040.ssi as ssi40
+import sh.sysl.rp2040.vreg_and_chip_reset as vreg40
+import sh.sysl.rp2040.xip_ctrl as xipc40
+import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// The Pico's flash path, RTC and regulator (docs/rp-coverage.md item 24): examples/pico's
+// `ssi_flash` (the SSI's direct commands as the SDK's hardware_flash sends them, the SDK's boot2 for
+// XIP, XIP_CTRL, the cache as SRAM), pico-examples' `rtc/hello_rtc` and `rtc/rtc_alarm`, and a RAM UF2,
+// end to end; and each register-level behaviour and refusal of the SSI, XIP_CTRL, IO_QSPI, PADS_QSPI,
+// the RTC and VREG_AND_CHIP_RESET.
+
+private val XIP_SSI_FLASH = embed("../../../../examples/pico/ssi_flash.elf")
+private val XIP_HELLO_RTC = embed("../../../../examples/pico/hello_rtc.elf")
+private val XIP_RTC_ALARM = embed("../../../../examples/pico/rtc_alarm.elf")
+private val XIP_BLINK = embed("../../../../examples/pico/blink.elf")
+private val XIP_BLINK_UF2 = embed("../../../../examples/pico/blink.uf2")
+
+private val XIP_SRAM40 = SramMap(0x20000000, 264 * 1024)
+private const XIP_TENTH_MS: u64 = 12500
+private const XIP_MS: u64 = 125000
+
+private const SSI: u32 = 0x18000000
+private const RESETS_CLR: u32 = 0x4000C000 + 0x3000
+private const RESETS_SET: u32 = 0x4000C000 + 0x2000
+
+private st(b: &ArmBoard[Rp2040], a: u32, x: u32) = b.chip.store(0, a, 4, x).unwrap()
+private ld(b: &ArmBoard[Rp2040], a: u32) -> u32 = b.chip.load(0, a, 4).unwrap()
+
+private store_err(b: &ArmBoard[Rp2040], a: u32, x: u32) -> string
+    val r = b.chip.store(0, a, 4, x)
+    assert(r.is_err(), s"a store of 0x${hex(x)} to 0x${hex(a, 8)} was taken")
+    r.unwrap_err()
+
+private load_err(b: &ArmBoard[Rp2040], a: u32) -> string
+    val r = b.chip.load(0, a, 4)
+    assert(r.is_err(), s"a load of 0x${hex(a, 8)} was answered")
+    r.unwrap_err()
+
+// A Pico with blink booted and run 5 ms (the SDK's start-up has set the clocks: clk_sys 125 MHz,
+// clk_rtc 46875 Hz), and core 0 parked in `wfi; b .` so the test drives the chip from outside.
+private xip_board() -> &ArmBoard[Rp2040]
+    val b = pico_board(XIP_SRAM40)
+    b.boot(XIP_BLINK).unwrap()
+    while b.chip.now < 5 * XIP_MS do assert(b.run(XIP_TENTH_MS) == RunEnd.Budget, b.refused)
+    xip_place(b, 0x20040100, [0xBF30, 0xE7FD])
+    b.run(XIP_MS)
+    b
+
+// Thumb halfwords into SRAM at `at`, and core 0 there next.
+private xip_place(b: &ArmBoard[Rp2040], at: u32, code: []const u16)
+    for i in 0..<code.len
+        b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
+        b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
+    b.cores[0].pc = at
+    b.cores[0].sleeping = false
+
+// IO_QSPI and PADS_QSPI out of reset and every QSPI pin on the SSI (FUNCSEL 0), as the ROM's
+// `connect_internal_flash` leaves them; the SSI set for direct transfers: 8-bit frames, transmit and
+// receive, slave 0, SCKDV 4 (32 clk_sys cycles a byte).
+private ssi_direct(b: &ArmBoard[Rp2040])
+    st(b, RESETS_CLR, resets40.RESET_IO_QSPI_MASK | resets40.RESET_PADS_QSPI_MASK)
+    for i in 0u32..<6 do st(b, ioq40.BASE + 8 * i + 4, 0)
+    st(b, SSI + ssi40.SSIENR_OFFSET, 0)
+    st(b, SSI + ssi40.BAUDR_OFFSET, 4)
+    st(b, SSI + ssi40.CTRLR0_OFFSET, 7 << ssi40.CTRLR0_DFS_32_SHIFT)
+    st(b, SSI + ssi40.SER_OFFSET, 1)
+    st(b, SSI + ssi40.SSIENR_OFFSET, 1)
+
+// One command frame with chip select forced low through IO_QSPI, a byte at a time, as `flash_do_cmd`.
+private ssi_cmd(b: &ArmBoard[Rp2040], out: []const u8) -> Buf[u8]
+    st(b, ioq40.BASE + ioq40.GPIO_QSPI_SS_CTRL_OFFSET, 2 << 8)
+    var back: Buf[u8] = buf()
+    for x in out
+        st(b, SSI + ssi40.DR0_OFFSET, u32(x))
+        b.chip.pass(32)
+        back.push(u8(ld(b, SSI + ssi40.DR0_OFFSET)))
+    st(b, ioq40.BASE + ioq40.GPIO_QSPI_SS_CTRL_OFFSET, 3 << 8)
+    back
+
+// The SSI set for XIP reads with `ctrlr0` and `spi_ctrlr0`, chip select back to the SSI's.
+private ssi_xip(b: &ArmBoard[Rp2040], ctrlr0: u32, spi_ctrlr0: u32)
+    st(b, ioq40.BASE + ioq40.GPIO_QSPI_SS_CTRL_OFFSET, 0)
+    st(b, SSI + ssi40.SSIENR_OFFSET, 0)
+    st(b, SSI + ssi40.CTRLR0_OFFSET, ctrlr0)
+    st(b, SSI + ssi40.CTRLR1_OFFSET, 0)
+    st(b, SSI + ssi40.SPI_CTRLR0_OFFSET, spi_ctrlr0)
+    st(b, SSI + ssi40.SSIENR_OFFSET, 1)
+
+// Standard SPI, 32-bit frames, the EEPROM read: what boot2_generic_03h sets.
+private const STD_EEPROM32: u32 = (31 << 16) | (3 << 8)
+
+// `image` run until core 0 reaches the SDK's exit BKPT, at most `ms` of guest time, then UART0's line
+// let finish: everything it printed.
+private xip_run_to_exit(image: []const u8, ms: u64) -> (&ArmBoard[Rp2040], string)
+    val b = pico_board(XIP_SRAM40)
+    b.boot(image).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < ms * XIP_MS do end = b.run(XIP_TENTH_MS)
+    assert(end == RunEnd.Breakpoint, s"main returns to the SDK's exit BKPT: ${end} '${b.refused}' core 0 ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}; printed '${from_utf8_lossy(b.console.view())}'")
+    b.started[0] = false
+    assert(b.finish_sending(), b.refused)
+    (b, from_utf8_lossy(b.console.view()))
+
+@test("ssi_flash on the Pico: the W25Q16JV's IDs through the SSI, a sector erased and two pages programmed in direct mode, the SDK's boot2 entering quad XIP, the four aliases, code run from flash and run again after reprogramming, the stream, the cache as SRAM, and the regulator")
+pico_ssi_flash()
+    val (b, text) = xip_run_to_exit(XIP_SSI_FLASH, 400)
+    val want = "ssi_flash\r\n" +
+        "JEDEC ID ef 40 15\r\n" +
+        "unique ID e6 60 58 38 83 2b 4a 2e\r\n" +
+        "status 00 00\r\n" +
+        "direct read 5a 5b 58 59 5e 5f 5c 5d\r\n" +
+        "XIP 10100000: 59585b5a\r\n" +
+        "XIP 11100000: 59585b5a\r\n" +
+        "XIP 12100000: 59585b5a\r\n" +
+        "XIP 13100000: 59585b5a\r\n" +
+        "call from flash: 42\r\n" +
+        "status 2 after boot2: 02\r\n" +
+        "after erase: ffffffff\r\n" +
+        "call from flash: 7\r\n" +
+        "stream 47702007 ffffffff, stat 03\r\n" +
+        "call from XIP SRAM: 99, last word 00c0ffee\r\n" +
+        "XIP ctrl 03 stat 03\r\n" +
+        "vreg 000010b1 bod 00000091 chip_reset 00000100\r\n" +
+        "vreg 000010c1\r\n" +
+        "done\r\n"
+    assert(text == want, text)
+    // boot2 left the SSI in quad continuous-read XIP, so the flash is on the cores' fast path, and the
+    // cache, enabled again, is not SRAM.
+    assert(!b.direct && b.chip.xip_ready() && b.chip.flash.continuous, "the flash on the fast path")
+    assert(!b.sram_open, "the cache's SRAM unmapped")
+    assert(b.chip.flash.status[1] == 0x02, "boot2 set QE")
+
+@test("the SSI's transfers take SCKDV cycles a bit: chip select stays low while the TX FIFO keeps a command fed, so 9Fh and three bytes are one frame, and rises when it runs dry, so a byte pushed after is a new instruction")
+pico_ssi_frames()
+    val b = xip_board()
+    ssi_direct(b)
+    for x in [0x9Fu32, 0, 0, 0] do st(b, SSI + ssi40.DR0_OFFSET, x)
+    assert(ld(b, SSI + ssi40.TXFLR_OFFSET) == 3, "one byte shifting, three waiting")
+    assert(b.chip.flash.selected, "the SSI's chip select is low")
+    b.chip.pass(127)
+    assert(ld(b, SSI + ssi40.SR_OFFSET) & ssi40.SR_BUSY_MASK != 0, "busy until the fourth byte's 32nd cycle")
+    b.chip.pass(1)
+    val sr = ld(b, SSI + ssi40.SR_OFFSET)
+    assert(sr & ssi40.SR_BUSY_MASK == 0 && sr & ssi40.SR_TFE_MASK != 0 && sr & ssi40.SR_RFNE_MASK != 0, s"SR 0x${hex(sr)}")
+    assert(ld(b, SSI + ssi40.RXFLR_OFFSET) == 4 && !b.chip.flash.selected, "four frames in, chip select up")
+    for want in [0xFFu32, 0xEF, 0x40, 0x15] do assert(ld(b, SSI + ssi40.DR0_OFFSET) == want)
+    // Status register 1 by itself, then a byte too late for the frame: the flash takes it as an
+    // instruction, 00h, which it does not run.
+    st(b, SSI + ssi40.DR0_OFFSET, 0x05)
+    b.chip.pass(40)
+    ld(b, SSI + ssi40.DR0_OFFSET)
+    val late = store_err(b, SSI + ssi40.DR0_OFFSET, 0)
+    assert(late.contains("instruction 0x00 is not one the flash runs"), late)
+
+@test("the SSI refuses by name what it does not model: its interrupt, DMA, the TI and Microwire formats, loopback, DDR, the receive-only mode, part-byte frames, more lanes outside the EEPROM read, no slave, a stopped clock, DR0 while disabled, both FIFOs' overflow and underflow, and pins not on it")
+pico_ssi_refusals()
+    val b = xip_board()
+    // The QSPI pins are IO_QSPI's: held in reset, every FUNCSEL is 0x1f.
+    st(b, RESETS_SET, resets40.RESET_IO_QSPI_MASK)
+    st(b, SSI + ssi40.BAUDR_OFFSET, 4)
+    st(b, SSI + ssi40.SER_OFFSET, 1)
+    st(b, SSI + ssi40.CTRLR0_OFFSET, 7 << 16)
+    st(b, SSI + ssi40.SSIENR_OFFSET, 1)
+    val held = store_err(b, SSI + ssi40.DR0_OFFSET, 0x9F)
+    assert(held.contains("GPIO_QSPI_SCLK has FUNCSEL 0x1f") && held.contains("RESETS holds IO_QSPI in reset"), held)
+    ssi_direct(b)
+    assert(ld(b, SSI + ssi40.IDR_OFFSET) == 0x51535049 && ld(b, SSI + ssi40.SSI_VERSION_ID_OFFSET) == 0x3430312A)
+    assert(store_err(b, SSI + ssi40.IMR_OFFSET, 1).contains("XIP_IRQ"))
+    assert(store_err(b, SSI + ssi40.DMACR_OFFSET, 3).contains("DMA"))
+    assert(ld(b, SSI + ssi40.IMR_OFFSET) == 0 && ld(b, SSI + ssi40.DMACR_OFFSET) == 0, "the refused writes left them")
+    // Frame-format registers take writes only while the SSI is disabled: this one is dropped.
+    st(b, SSI + ssi40.CTRLR0_OFFSET, 31 << 16)
+    assert(ld(b, SSI + ssi40.CTRLR0_OFFSET) == 7 << 16, "CTRLR0 kept while enabled")
+    val underflow = load_err(b, SSI + ssi40.DR0_OFFSET)
+    assert(underflow.contains("underflow"), underflow)
+    // Overflow: one byte shifts, sixteen wait, the eighteenth has no room.
+    st(b, ioq40.BASE + ioq40.GPIO_QSPI_SS_CTRL_OFFSET, 2 << 8)
+    st(b, SSI + ssi40.DR0_OFFSET, 0x05)
+    for i in 0..<16 do st(b, SSI + ssi40.DR0_OFFSET, 0)
+    assert(store_err(b, SSI + ssi40.DR0_OFFSET, 0).contains("TX FIFO full"))
+    // The RX FIFO holds sixteen; the seventeenth frame to arrive overflows it.
+    b.chip.pass(17 * 32)
+    val over = load_err(b, SSI + ssi40.SR_OFFSET)
+    assert(over.contains("RX FIFO full"), over)
+    val b2 = xip_board()
+    ssi_direct(b2)
+    st(b2, SSI + ssi40.SSIENR_OFFSET, 0)
+    assert(store_err(b2, SSI + ssi40.DR0_OFFSET, 0x9F).contains("SSIENR 0"))
+    for (ctrlr0, what) in [(1u32 << 4, "TI and Microwire"), (1 << 11, "shift register loop"), (3 << 21, "reserved")]
+        assert(store_err(b2, SSI + ssi40.CTRLR0_OFFSET, ctrlr0).contains(what), what)
+    assert(store_err(b2, SSI + ssi40.SPI_CTRLR0_OFFSET, 1 << 16).contains("DDR"))
+    assert(store_err(b2, SSI + ssi40.MWCR_OFFSET, 1).contains("Microwire"))
+    for (ctrlr0, baud, ser, what) in [(7u32 << 16 | 2 << 8, 4u32, 1u32, "receive-only"), (11 << 16, 4, 1, "12 bits"),
+            (7 << 16 | 2 << 21, 4, 1, "only the EEPROM read moves more than one lane"), (7 << 16, 0, 1, "stops the serial clock"), (7 << 16, 4, 0, "SER selects no slave")]
+        st(b2, SSI + ssi40.SSIENR_OFFSET, 0)
+        st(b2, SSI + ssi40.CTRLR0_OFFSET, ctrlr0)
+        st(b2, SSI + ssi40.BAUDR_OFFSET, baud)
+        st(b2, SSI + ssi40.SER_OFFSET, ser)
+        st(b2, SSI + ssi40.SSIENR_OFFSET, 1)
+        val why = store_err(b2, SSI + ssi40.DR0_OFFSET, 0x9F)
+        assert(why.contains(what), why)
+        assert(ld(b2, SSI + ssi40.TXFLR_OFFSET) == 0, "a refused push leaves the FIFO empty")
+    // OUTOVER invert on SS is refused and leaves IO_QSPI as it was.
+    val invert = store_err(b2, ioq40.BASE + ioq40.GPIO_QSPI_SS_CTRL_OFFSET, 1 << 8)
+    assert(invert.contains("inverts"), invert)
+    assert(ld(b2, ioq40.BASE + ioq40.GPIO_QSPI_SS_CTRL_OFFSET) == 0)
+
+@test("direct mode: the W25Q16JV's JEDEC ID and unique ID, a sector erased and a page programmed with chip select forced through IO_QSPI; forced high, a byte reaches no device and reads FFh")
+pico_ssi_direct()
+    val b = xip_board()
+    ssi_direct(b)
+    val id = ssi_cmd(b, [0x9F, 0, 0, 0])
+    assert(id[1] == 0xEF && id[2] == 0x40 && id[3] == 0x15)
+    ssi_cmd(b, [0x06])
+    ssi_cmd(b, [0x20, 0x01, 0x00, 0x00])
+    ssi_cmd(b, [0x06])
+    ssi_cmd(b, [0x02, 0x01, 0x00, 0x10, 0x12, 0x34])
+    assert(b.mem.flash[0x10010] == 0x12 && b.mem.flash[0x10011] == 0x34 && b.mem.flash[0x10012] == 0xFF)
+    val back = ssi_cmd(b, [0x03, 0x01, 0x00, 0x10, 0, 0])
+    assert(back[4] == 0x12 && back[5] == 0x34)
+    // Chip select forced high: the bytes go nowhere, and FFh comes back.
+    st(b, SSI + ssi40.DR0_OFFSET, 0x9F)
+    b.chip.pass(32)
+    assert(ld(b, SSI + ssi40.DR0_OFFSET) == 0xFF && !b.chip.flash.selected)
+
+@test("XIP through the SSI as boot2_generic_03h sets it: 03h and a 24-bit address read the flash through every alias, wrapping at 2 MB; 0Bh without its dummy byte, a 32-bit address before the flash is in continuous mode, the SSI disabled or the pins taken away are refused by name")
+pico_xip_configs()
+    val b = xip_board()
+    ssi_direct(b)
+    for k in 0u32..<4 do b.mem.flash[0x100 + k] = u8(k + 1)
+    ssi_xip(b, STD_EEPROM32, (0x03 << 24) | (2 << 8) | (6 << 2))
+    assert(b.chip.xip_ready())
+    for a in [0x10000100u32, 0x11000100, 0x12000100, 0x13000100, 0x10200100, 0x13E00100]
+        assert(ld(b, a) == 0x04030201, s"0x${hex(a, 8)}")
+    assert(b.chip.load(0, 0x10000102, 2).unwrap() == 0x0403)
+    // 0Bh needs a dummy byte (8 wait cycles on one lane) between address and data.
+    ssi_xip(b, STD_EEPROM32, (0x0B << 24) | (2 << 8) | (6 << 2))
+    val fast = load_err(b, 0x10000100)
+    assert(fast.contains("does not read the flash's bytes") && fast.contains("SPI_CTRLR0 0x0b000218"), fast)
+    ssi_xip(b, STD_EEPROM32, (0x0B << 24) | (8 << 11) | (2 << 8) | (6 << 2))
+    assert(ld(b, 0x10000100) == 0x04030201, "0Bh with its 8 wait cycles")
+    // No instruction and a 32-bit address assume continuous read mode, which the flash is not in.
+    ssi_xip(b, (2 << 21) | STD_EEPROM32, (0xA0 << 24) | (4 << 11) | (8 << 2) | 2)
+    val cont = load_err(b, 0x10000100)
+    assert(cont.contains("instruction 0x00"), cont)
+    ssi_xip(b, (2 << 21) | STD_EEPROM32, (0xEB << 24) | (4 << 11) | (2 << 8) | (8 << 2) | 1)
+    assert(load_err(b, 0x10000100).contains("8-bit instruction and a 32-bit address"))
+    ssi_xip(b, STD_EEPROM32, (0x03 << 24) | (2 << 8) | (6 << 2))
+    st(b, SSI + ssi40.SSIENR_OFFSET, 0)
+    assert(load_err(b, 0x10000100).contains("the SSI is disabled"))
+    st(b, SSI + ssi40.SSIENR_OFFSET, 1)
+    st(b, ioq40.BASE + ioq40.GPIO_QSPI_SD2_CTRL_OFFSET, 5)
+    assert(load_err(b, 0x10000100).contains("GPIO_QSPI_SD2 has FUNCSEL 0x5"))
+
+@test("a core reading the flash before anything has set the SSI for XIP stops there, the reason named")
+pico_xip_unset()
+    val b = xip_board()
+    // ldr r1, [r0]; b .
+    xip_place(b, 0x20040200, [0x6801, 0xE7FE])
+    b.cores[0].r[0] = 0x10000000
+    val end = b.run(XIP_MS)
+    assert(end == RunEnd.Fault && b.refused.contains("the SSI is disabled") && b.refused.contains("0x10000000"), s"${end} '${b.refused}'")
+    assert(b.direct, "the flash is off the fast path")
+
+@test("XIP_CTRL: CTRL, FLUSH and STAT; the counters refused; a write to an uncached alias a bus fault under ERR_BADWRITE and dropped without; the cache as SRAM only while disabled and powered, POWER_DOWN disabling it; the stream refused where the SSI reads no flash or its FIFO is empty")
+pico_xip_ctrl()
+    val b = xip_board()
+    val x = xipc40.BASE
+    assert(ld(b, x + xipc40.CTRL_OFFSET) == 3 && ld(b, x + xipc40.STAT_OFFSET) == 3, "EN and ERR_BADWRITE; flush ready, stream empty")
+    st(b, x + xipc40.FLUSH_OFFSET, 1)
+    assert(load_err(b, x + xipc40.CTR_HIT_OFFSET).contains("hit and access counters"))
+    assert(store_err(b, x + xipc40.CTR_ACC_OFFSET, 0).contains("hit and access counters"))
+    st(b, 0x10000000, 0)
+    assert(store_err(b, 0x12000000, 0).contains("ERR_BADWRITE"))
+    st(b, x + 0x3000 + xipc40.CTRL_OFFSET, xipc40.CTRL_ERR_BADWRITE_MASK)
+    st(b, 0x12000000, 0)
+    assert(load_err(b, 0x15000000).contains("enabled"))
+    st(b, x + 0x3000 + xipc40.CTRL_OFFSET, xipc40.CTRL_EN_MASK)
+    assert(b.chip.xip.sram_open(), "the cache is SRAM, which the board maps")
+    st(b, x + 0x2000 + xipc40.CTRL_OFFSET, xipc40.CTRL_POWER_DOWN_MASK | xipc40.CTRL_EN_MASK)
+    assert(ld(b, x + xipc40.CTRL_OFFSET) == xipc40.CTRL_POWER_DOWN_MASK, "POWER_DOWN clears EN")
+    assert(!b.chip.xip.sram_open() && load_err(b, 0x15000000).contains("powered down"))
+    assert(load_err(b, 0x15004000).contains("where nothing is") && load_err(b, 0x16000000).contains("where nothing is"))
+    assert(load_err(b, x + xipc40.STREAM_FIFO_OFFSET).contains("empty"))
+    st(b, x + xipc40.STREAM_ADDR_OFFSET, 0x10000100)
+    val stream = store_err(b, x + xipc40.STREAM_CTR_OFFSET, 2)
+    assert(stream.contains("XIP stream") && stream.contains("SSI is disabled"), stream)
+    assert(ld(b, x + xipc40.STREAM_CTR_OFFSET) == 0, "the refused count left it")
+
+@test("IO_QSPI and PADS_QSPI in the RP2040's shape: six pins with CTRL's bits at the RP2040's places, INTR at 0x30 and the dormant wake's INTS at 0x54, STATUS refused; the pads' resets and eight bits")
+pico_qspi_pins()
+    val b = xip_board()
+    st(b, RESETS_CLR, resets40.RESET_IO_QSPI_MASK | resets40.RESET_PADS_QSPI_MASK)
+    assert(ld(b, ioq40.BASE + ioq40.GPIO_QSPI_SD3_CTRL_OFFSET) == 0x1F)
+    st(b, ioq40.BASE + ioq40.GPIO_QSPI_SD3_CTRL_OFFSET, 0xFFFFFFFF)
+    assert(ld(b, ioq40.BASE + ioq40.GPIO_QSPI_SD3_CTRL_OFFSET) == 0x3003331F)
+    st(b, ioq40.BASE + ioq40.PROC0_INTE_OFFSET, 0x5)
+    assert(ld(b, ioq40.BASE + ioq40.PROC0_INTE_OFFSET) == 0x5 && ld(b, ioq40.BASE + ioq40.INTR_OFFSET) == 0)
+    assert(b.chip.load(0, ioq40.BASE + ioq40.DORMANT_WAKE_INTS_OFFSET, 4).is_ok() && b.chip.load(0, ioq40.BASE + 0x58, 4).is_err())
+    assert(b.chip.load(0, ioq40.BASE + ioq40.GPIO_QSPI_SS_STATUS_OFFSET, 4).is_err())
+    for (o, reset) in [(padsq40.GPIO_QSPI_SCLK_OFFSET, 0x56u32), (padsq40.GPIO_QSPI_SD0_OFFSET, 0x52), (padsq40.GPIO_QSPI_SS_OFFSET, 0x5A), (padsq40.VOLTAGE_SELECT_OFFSET, 0)]
+        assert(ld(b, padsq40.BASE + o) == reset, s"pad 0x${hex(o)}")
+    st(b, padsq40.BASE + padsq40.GPIO_QSPI_SD1_OFFSET, 0x1FF)
+    assert(ld(b, padsq40.BASE + padsq40.GPIO_QSPI_SD1_OFFSET) == 0xFF)
+    // IO_QSPI's reset puts a forced chip select back to the SSI's.
+    st(b, ioq40.BASE + ioq40.GPIO_QSPI_SS_CTRL_OFFSET, 2 << 8)
+    assert(b.chip.flash.selected)
+    st(b, RESETS_SET, resets40.RESET_IO_QSPI_MASK)
+    assert(!b.chip.flash.selected)
+    assert(load_err(b, ioq40.BASE).contains("held in reset"))
+
+// The RTC out of reset, counting a second a clk_rtc cycle (CLKDIV_M1 0), from the date and time given.
+private rtc_start(b: &ArmBoard[Rp2040], year: u32, month: u32, day: u32, dotw: u32, hour: u32, min: u32, sec: u32)
+    st(b, RESETS_CLR, resets40.RESET_RTC_MASK)
+    st(b, rtc40.BASE + rtc40.CTRL_OFFSET, 0)
+    st(b, rtc40.BASE + rtc40.CLKDIV_M1_OFFSET, 0)
+    st(b, rtc40.BASE + rtc40.SETUP_0_OFFSET, (year << 12) | (month << 8) | day)
+    st(b, rtc40.BASE + rtc40.SETUP_1_OFFSET, (dotw << 24) | (hour << 16) | (min << 8) | sec)
+    st(b, rtc40.BASE + rtc40.CTRL_OFFSET, rtc40.CTRL_LOAD_MASK)
+    st(b, rtc40.BASE + rtc40.CTRL_OFFSET, rtc40.CTRL_RTC_ENABLE_MASK)
+
+// `n` seconds of the RTC at CLKDIV_M1 0: n clk_rtc cycles of 46875 Hz in clk_sys at 125 MHz.
+private rtc_step(b: &ArmBoard[Rp2040], n: u64)
+    val need = u128(n) * 125000000 - u128(b.chip.rtc_rest)
+    b.chip.pass(u64((need + 46874) / 46875))
+
+// The calendar as the SDK reads it, RTC_0 and then RTC_1: the date, and the time.
+private rtc_date(b: &ArmBoard[Rp2040]) -> u32
+    ld(b, rtc40.BASE + rtc40.RTC_0_OFFSET)
+    ld(b, rtc40.BASE + rtc40.RTC_1_OFFSET)
+
+private rtc_time(b: &ArmBoard[Rp2040]) -> u32 = ld(b, rtc40.BASE + rtc40.RTC_0_OFFSET)
+
+@test("the RTC's calendar: seconds into minutes, hours, days, the day of the week wrapping at 7, months of 30 and 31 days, February of 29 every fourth year unless FORCE_NOTLEAPYEAR, the year wrapping at 4095")
+pico_rtc_calendar()
+    val b = xip_board()
+    st(b, RESETS_SET, resets40.RESET_RTC_MASK)
+    assert(load_err(b, rtc40.BASE).contains("held in reset"))
+    rtc_start(b, 2024, 2, 28, 3, 23, 59, 58)
+    assert(ld(b, rtc40.BASE + rtc40.CTRL_OFFSET) == rtc40.CTRL_RTC_ENABLE_MASK | rtc40.CTRL_RTC_ACTIVE_MASK)
+    rtc_step(b, 1)
+    assert(rtc_date(b) == (2024 << 12) | (2 << 8) | 28 && rtc_time(b) == (3 << 24) | (23 << 16) | (59 << 8) | 59)
+    rtc_step(b, 1)
+    assert(rtc_date(b) == (2024 << 12) | (2 << 8) | 29 && rtc_time(b) == 4 << 24, "a leap day, and Thursday")
+    for (year, month, day, after) in [(2023u32, 2u32, 28u32, (2023u32 << 12) | (3 << 8) | 1), (2020, 4, 30, (2020 << 12) | (5 << 8) | 1),
+            (2020, 12, 31, (2021 << 12) | (1 << 8) | 1), (4095, 12, 31, (1 << 8) | 1), (2020, 1, 31, (2020 << 12) | (2 << 8) | 1)]
+        rtc_start(b, year, month, day, 6, 23, 59, 59)
+        rtc_step(b, 1)
+        assert(rtc_date(b) == after && rtc_time(b) == 0, s"$year-$month-$day")
+    // 2100 is not a leap year; the RTC needs telling.
+    rtc_start(b, 2100, 2, 28, 0, 23, 59, 59)
+    st(b, rtc40.BASE + 0x2000 + rtc40.CTRL_OFFSET, rtc40.CTRL_FORCE_NOTLEAPYEAR_MASK)
+    rtc_step(b, 1)
+    assert(rtc_date(b) == (2100 << 12) | (3 << 8) | 1)
+    // A thousand seconds: 16 minutes 40.
+    rtc_start(b, 2020, 6, 5, 5, 15, 45, 0)
+    rtc_step(b, 1000)
+    assert(rtc_time(b) == (5 << 24) | (16 << 16) | (1 << 8) | 40)
+
+@test("the RTC: RTC_0 latches RTC_1; LOAD of a date the calendar does not hold, and CLKDIV_M1 changed while it runs, refused by name; RTC_ACTIVE and the count need clk_rtc")
+pico_rtc_registers()
+    val b = xip_board()
+    rtc_start(b, 2020, 12, 31, 4, 23, 59, 59)
+    ld(b, rtc40.BASE + rtc40.RTC_0_OFFSET)
+    rtc_step(b, 1)
+    assert(ld(b, rtc40.BASE + rtc40.RTC_1_OFFSET) == (2020 << 12) | (12 << 8) | 31, "RTC_1 as the last RTC_0 read latched it")
+    assert(rtc_date(b) == (2021 << 12) | (1 << 8) | 1)
+    for (setup_0, setup_1, what) in [((2020u32 << 12) | (13 << 8) | 1, 0u32, "month 13"), ((2023 << 12) | (2 << 8) | 29, 0, "day 29"),
+            ((2020 << 12) | (4 << 8) | 31, 0, "day 31"), ((2020 << 12) | (1 << 8), 0, "day 0"), ((2020 << 12) | (1 << 8) | 1, 24 << 16, "hour"),
+            ((2020 << 12) | (1 << 8) | 1, 60, "second"), ((2020 << 12) | (1 << 8) | 1, 60 << 8, "minute"), ((2020 << 12) | (1 << 8) | 1, 7 << 24, "day of the week")]
+        st(b, rtc40.BASE + rtc40.SETUP_0_OFFSET, setup_0)
+        st(b, rtc40.BASE + rtc40.SETUP_1_OFFSET, setup_1)
+        val why = store_err(b, rtc40.BASE + rtc40.CTRL_OFFSET, rtc40.CTRL_LOAD_MASK | rtc40.CTRL_RTC_ENABLE_MASK)
+        assert(why.contains(what) && why.contains("LOAD"), why)
+    assert(rtc_date(b) == (2021 << 12) | (1 << 8) | 1, "a refused LOAD loads nothing")
+    assert(store_err(b, rtc40.BASE + rtc40.CLKDIV_M1_OFFSET, 46874).contains("while the RTC runs"))
+    st(b, rtc40.BASE + rtc40.CLKDIV_M1_OFFSET, 0)
+    // clk_rtc stopped: RTC_ENABLE stays set, RTC_ACTIVE falls, and the calendar stands still.
+    st(b, clocks40.BASE + 0x3000 + clocks40.CLK_RTC_CTRL_OFFSET, clocks40.CLK_RTC_CTRL_ENABLE_MASK)
+    assert(ld(b, rtc40.BASE + rtc40.CTRL_OFFSET) == rtc40.CTRL_RTC_ENABLE_MASK)
+    val before = rtc_time(b)
+    b.chip.pass(10 * XIP_MS)
+    assert(rtc_time(b) == before)
+
+@test("the RTC's alarm: a match of every enabled field as the time changes raises INTR, held until MATCH_ENA clears; re-enabled within the matching second it waits for the next match; the chip schedules the next second only while it is armed; INTF forces it")
+pico_rtc_alarm()
+    val b = xip_board()
+    rtc_start(b, 2020, 1, 13, 3, 11, 20, 0)
+    val r = rtc40.BASE
+    st(b, r + rtc40.IRQ_SETUP_1_OFFSET, rtc40.IRQ_SETUP_1_SEC_ENA_MASK | 5)
+    st(b, r + rtc40.INTE_OFFSET, 1)
+    assert(b.chip.rtc_due().is_none(), "not armed without MATCH_ENA")
+    st(b, r + 0x2000 + rtc40.IRQ_SETUP_0_OFFSET, rtc40.IRQ_SETUP_0_MATCH_ENA_MASK)
+    assert(ld(b, r + rtc40.IRQ_SETUP_0_OFFSET) & rtc40.IRQ_SETUP_0_MATCH_ACTIVE_MASK != 0)
+    // The next second, within one clk_rtc cycle (2666.7 clk_sys cycles), part of which has passed.
+    val due = b.chip.rtc_due().unwrap()
+    assert(due >= 1 && due <= 2667, s"the next second, ${due} cycles on")
+    b.chip.pass(due - 1)
+    assert(rtc_time(b) & 0x3F == 0, "not yet")
+    b.chip.pass(1)
+    assert(rtc_time(b) & 0x3F == 1, "on the cycle scheduled")
+    rtc_step(b, 3)
+    assert(!b.chip.rtc.irq() && ld(b, r + rtc40.INTR_OFFSET) == 0)
+    rtc_step(b, 1)
+    assert(b.chip.rtc.irq() && ld(b, r + rtc40.INTS_OFFSET) == 1, "11:20:05")
+    assert(b.chip.rtc_due().is_none(), "nothing more to schedule while it is raised")
+    rtc_step(b, 1)
+    assert(b.chip.rtc.irq(), "held after the second")
+    // The SDK's handler: MATCH_ENA cleared, then set again for a repeating alarm.
+    st(b, r + 0x3000 + rtc40.IRQ_SETUP_0_OFFSET, rtc40.IRQ_SETUP_0_MATCH_ENA_MASK)
+    assert(!b.chip.rtc.irq())
+    rtc_start(b, 2020, 1, 13, 3, 11, 20, 5)
+    st(b, r + 0x2000 + rtc40.IRQ_SETUP_0_OFFSET, rtc40.IRQ_SETUP_0_MATCH_ENA_MASK)
+    assert(!b.chip.rtc.irq(), "enabled within the matching second: not raised")
+    rtc_step(b, 59)
+    assert(!b.chip.rtc.irq())
+    rtc_step(b, 1)
+    assert(b.chip.rtc.irq(), "11:21:05, a minute on")
+    // A year that never comes masks every other match.
+    st(b, r + 0x3000 + rtc40.IRQ_SETUP_0_OFFSET, rtc40.IRQ_SETUP_0_MATCH_ENA_MASK)
+    st(b, r + rtc40.IRQ_SETUP_0_OFFSET, rtc40.IRQ_SETUP_0_YEAR_ENA_MASK | (2021 << 12) | rtc40.IRQ_SETUP_0_MATCH_ENA_MASK)
+    rtc_step(b, 120)
+    assert(!b.chip.rtc.irq())
+    // Day of the week, hour and minute: Wednesday 11:24 matches at its first second.
+    st(b, r + rtc40.IRQ_SETUP_0_OFFSET, 0)
+    st(b, r + rtc40.IRQ_SETUP_1_OFFSET, rtc40.IRQ_SETUP_1_DOTW_ENA_MASK | rtc40.IRQ_SETUP_1_HOUR_ENA_MASK | rtc40.IRQ_SETUP_1_MIN_ENA_MASK | (3 << 24) | (11 << 16) | (24 << 8))
+    st(b, r + rtc40.IRQ_SETUP_0_OFFSET, rtc40.IRQ_SETUP_0_DAY_ENA_MASK | rtc40.IRQ_SETUP_0_MONTH_ENA_MASK | (1 << 8) | 13 | rtc40.IRQ_SETUP_0_MATCH_ENA_MASK)
+    val t = rtc_time(b)
+    assert(t == (3 << 24) | (11 << 16) | (23 << 8) | 5, s"0x${hex(t)}")
+    rtc_step(b, 54)
+    assert(!b.chip.rtc.irq())
+    rtc_step(b, 1)
+    assert(b.chip.rtc.irq(), "11:24:00")
+    st(b, r + 0x3000 + rtc40.IRQ_SETUP_0_OFFSET, rtc40.IRQ_SETUP_0_MATCH_ENA_MASK)
+    st(b, r + rtc40.INTF_OFFSET, 1)
+    assert(b.chip.rtc.irq() && ld(b, r + rtc40.INTS_OFFSET) == 1 && ld(b, r + rtc40.INTR_OFFSET) == 0, "forced")
+
+@test("pico-examples' rtc/hello_rtc: Friday 5 June 2020 15:45:00 set, read back in the SDK's order every 100 ms, a second each second of guest time")
+pico_hello_rtc()
+    val b = pico_board(XIP_SRAM40)
+    b.boot(XIP_HELLO_RTC).unwrap()
+    var first: [3]u64 = [0, 0, 0]
+    while b.chip.now < 2300 * XIP_MS
+        assert(b.run(XIP_TENTH_MS) == RunEnd.Budget, b.refused)
+        val text = from_utf8_lossy(b.console.view())
+        for s in 0..<3
+            if first[s] == 0 && text.contains(s"\rFriday 5 June 15:45:0$s 2020      ") then first[s] = b.chip.now
+    val text = from_utf8_lossy(b.console.view())
+    assert(text.starts_with("Hello RTC!\r\n\rFriday 5 June 15:45:00 2020      \rFriday 5 June 15:45:00 2020      "), text)
+    assert(!text.contains("15:45:03") && first[0] != 0, text)
+    for s in 1..<3
+        val gap = first[s] - first[s - 1]
+        assert(gap >= 900 * XIP_MS && gap <= 1100 * XIP_MS, s"second $s came ${gap} cycles after the one before")
+
+@test("pico-examples' rtc/rtc_alarm: the alarm at 11:20:05 fires through the NVIC five seconds of guest time after the RTC starts, and the callback reads the time")
+pico_rtc_alarm_example()
+    val (b, text) = xip_run_to_exit(XIP_RTC_ALARM, 6000)
+    assert(text == "RTC Alarm!\r\nAlarm Fired At Wednesday 13 January 11:20:05 2020\r\n", text)
+    assert(b.chip.now >= 5000 * XIP_MS && b.chip.now < 5100 * XIP_MS, s"fired at ${b.chip.now}")
+
+@test("VREG_AND_CHIP_RESET: VREG and BOD stored through the aliases, ROK in regulation, CHIP_RESET reporting the power-on reset; turning the regulator off or into high impedance refused by name")
+pico_vreg()
+    val b = xip_board()
+    val v = vreg40.BASE
+    assert(ld(b, v + vreg40.VREG_OFFSET) == 0x10B1 && ld(b, v + vreg40.BOD_OFFSET) == 0x91 && ld(b, v + vreg40.CHIP_RESET_OFFSET) == 0x100)
+    st(b, v + 0x1000 + vreg40.VREG_OFFSET, 0x70)
+    assert(ld(b, v + vreg40.VREG_OFFSET) == 0x10C1, "VSEL 0b1100 through the XOR alias")
+    assert(store_err(b, v + 0x3000 + vreg40.VREG_OFFSET, vreg40.VREG_EN_MASK).contains("DVDD"))
+    assert(store_err(b, v + 0x2000 + vreg40.VREG_OFFSET, vreg40.VREG_HIZ_MASK).contains("high impedance"))
+    assert(ld(b, v + vreg40.VREG_OFFSET) == 0x10C1, "the refused writes left it")
+    st(b, v + vreg40.BOD_OFFSET, 0xFFFFFFFF)
+    assert(ld(b, v + vreg40.BOD_OFFSET) == 0xF1)
+    st(b, v + vreg40.CHIP_RESET_OFFSET, 0xFFFFFFFF)
+    assert(ld(b, v + vreg40.CHIP_RESET_OFFSET) == 0x100, "the reasons are read-only")
+    assert(load_err(b, v + 0xC).contains("VREG_AND_CHIP_RESET"))
+
+@test("a RAM UF2 for the RP2040 boots as the ROM enters one, at its first byte, and blinks; a foreign family, no family, a bad magic, a block off the memory and an image starting in flash are refused by name")
+pico_uf2()
+    val b = pico_board(XIP_SRAM40)
+    b.boot(XIP_BLINK_UF2).unwrap()
+    var edges = 0
+    var level = false
+    while b.chip.now < 600 * XIP_MS
+        assert(b.run(XIP_TENTH_MS) == RunEnd.Budget, b.refused)
+        if b.chip.pin(25).level != level
+            level = !level
+            edges += 1
+    assert(edges >= 2, s"the LED changed $edges times")
+    for (at, value, what) in [(28usize, 0xE48BFF59u32, "not the RP2040's"), (8, 0, "names no family"), (508, 0, "magic"), (12, 0x30000000, "not in the RP2040's SRAM or its flash"),
+            (12, 0x10000000, "item 23")]
+        var copy: Buf[u8] = buf()
+        for x in XIP_BLINK_UF2 do copy.push(x)
+        for k in 0..<4 do copy.set(at + k, u8.wrap(value >> u32(8 * k)))
+        val r = pico_board(XIP_SRAM40).boot(copy.view())
+        assert(r.is_err() && r.unwrap_err().contains(what), s"$what: ${r}")

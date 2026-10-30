@@ -25,7 +25,15 @@ function(benchtop_program target source)
     pico_set_mem_ops_implementation(${target} compiler)
 endfunction()
 
-foreach(prog hello_serial blink hello_multicore)
+foreach(prog hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash)
     benchtop_program(${prog} ${prog}.c)
 endforeach()
 target_link_libraries(hello_multicore pico_multicore)
+# blink also as a UF2, the RAM image the boot ROM's USB drive takes and enters at its first byte.
+pico_add_uf2_output(blink)
+target_link_libraries(hello_rtc hardware_rtc)
+target_link_libraries(rtc_alarm hardware_rtc)
+# ssi_flash enters XIP through the SDK's own second stage, assembled into the RAM image and called.
+target_sources(ssi_flash PRIVATE $ENV{PICO_SDK_PATH}/src/rp2040/boot_stage2/boot2_w25q080.S)
+target_include_directories(ssi_flash PRIVATE $ENV{PICO_SDK_PATH}/src/rp2040/boot_stage2/asminclude)
+target_link_libraries(ssi_flash hardware_vreg)

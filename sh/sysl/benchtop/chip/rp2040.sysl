@@ -1,9 +1,10 @@
 module sh.sysl.benchtop.chip
 
+import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, w25q16jv}
 import sh.sysl.benchtop.peripheral.rp2040 as r40
-import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Divider, Resets, divider, replicated, written}
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, CS_HIGH, CS_LOW, Divider, Resets, divider, replicated, written}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
-import sh.sysl.benchtop.peripheral.rp2350.{ClocksRp2040, Drive, GPIO_COUNT, GPIO_COUNT_RP2040, IoBank0, Pads, Pin, Pll, Psm, Rosc, Sio, Sources, SysInfo, Uart, Xosc}
+import sh.sysl.benchtop.peripheral.rp2350.{ClocksRp2040, Drive, GPIO_COUNT, GPIO_COUNT_RP2040, IoBank0, IoQspi, Pads, Pin, Pll, Psm, QspiPads, Rosc, Sio, Sources, SysInfo, Uart, Xosc}
 import sh.sysl.benchtop.peripheral.rp2350.{UART_UNITS_PER_CYCLE, psm_stage_name_rp2040, uart_of}
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
@@ -59,16 +60,27 @@ import sysl.math.min
 // - **The SIO** has FIFOs eight deep, interpolators that shift right rather than rotate, each core's
 //   hardware divider at 0x060–0x078 (`rp2040.Divider`, eight clk_sys cycles a division), and its GPIO
 //   registers at the RP2040's offsets; each core's FIFO interrupt is a line of its own (SIO_IRQ_PROC0,
-//   IRQ 15, into core 0; SIO_IRQ_PROC1, IRQ 16, into core 1). Its GPIO_HI bank, which is the QSPI pins,
-//   is refused by name.
+//   IRQ 15, into core 0; SIO_IRQ_PROC1, IRQ 16, into core 1). Its GPIO_HI bank, which is the QSPI pins
+//   as levels, is refused by name.
 // - **26 interrupt lines** into each M0+'s NVIC: the TIMER's four (0–3), IO_IRQ_BANK0 (13), the SIO's
-//   (15, 16) and the UARTs' (20, 21) are driven; the rest belong to blocks not on the chip yet.
+//   (15, 16), the UARTs' (20, 21) and the RTC's (25) are driven; the rest belong to blocks not on the
+//   chip yet.
+// - **The flash is behind the SSI** (`rp2040.Ssi`), not a QMI: the Pico's W25Q16JV, 2 MB, the RP2350's
+//   flash model with its own ID (`parts/qspi_flash`). XIP reads it through four 16 MB aliases from
+//   0x1000_0000 where the SSI is set for them, as a second stage sets it; the SSI's direct transfers
+//   reach it with chip select from IO_QSPI's SS override. XIP_CTRL (`rp2040.XipCtrl`) has no QMI's
+//   windows and its cache is SRAM at 0x1500_0000 while disabled. IO_QSPI and PADS_QSPI are the RP2350's
+//   models in the RP2040's shape.
+// - **The RTC** (`rp2040.Rtc`) counts clk_rtc, and **VREG_AND_CHIP_RESET** (`rp2040.Vreg`) stores the
+//   regulator and reports a power-on reset.
 // - **PSM** has 17 stages; only PROC1 can be forced off, which stops core 1, and its release starts
 //   core 1 from reset in the boot ROM, whose wait drains its FIFO and answers core 0 with a 0.
 // - **XOSC's COUNT** is at 0x1C; **ROSC** has no RANDOM register and runs at a nominal 6.5 MHz.
-// - **The memory map**: the ROM at 0 (16 KB), XIP at 0x1000_0000 through the SSI (item 24, refused by
-//   name), the 264 KB of SRAM at 0x2000_0000 (the board's, striped over banks 0–3 with banks 4 and 5
-//   after them) and its non-striped aliases at 0x2100_0000 (the board's, off the fast path).
+// - **The memory map**: the ROM at 0 (16 KB), XIP at 0x1000_0000 through the SSI (the board's fast path
+//   while the SSI is set for XIP, the chip's otherwise), XIP_CTRL at 0x1400_0000, the cache as SRAM at
+//   0x1500_0000 (the board's), the SSI at 0x1800_0000, the 264 KB of SRAM at 0x2000_0000 (the board's,
+//   striped over banks 0–3 with banks 4 and 5 after them) and its non-striped aliases at 0x2100_0000
+//   (the board's, off the fast path).
 //
 // **The watchdog's reset** of the RP2040 runs its boot ROM's boot path again, which benchtop's
 // stand-in ROM does not carry: when the watchdog fires, by its counter or by TRIGGER, the run ends with
@@ -91,6 +103,7 @@ private const SIO_IRQ_PROC0: u32 = 15
 private const SIO_IRQ_PROC1: u32 = 16
 private const UART0_IRQ_RP2040: u32 = 20
 private const UART1_IRQ_RP2040: u32 = 21
+private const RTC_IRQ_RP2040: u32 = 25
 
 /** The boot ROM's window, and the part of it benchtop's stand-in image fills (`rom/rp2040-standin.S`):
  * the board maps that 4 KB page, and an access to the rest reaches the chip, which names it.
@@ -110,6 +123,14 @@ private const ROM_HARD_FAULT: u32 = 0x1500
 /** The XIP address space, through the SSI; XIP_CTRL, the cache as SRAM and the SSI follow it. */
 const XIP_BASE_RP2040: u32 = 0x10000000
 private const XIP_END_RP2040: u32 = 0x20000000
+/** The Pico's flash: the W25Q16JV's 2 MB, which each of XIP's 16 MB aliases repeats. */
+const FLASH_BYTES_RP2040: u32 = 2 * 1024 * 1024
+/** The XIP cache's 16 KB, SRAM while the cache is disabled. */
+const XIP_SRAM_BASE_RP2040: u32 = 0x15000000
+const XIP_SRAM_BYTES_RP2040: u32 = 16384
+// The cached alias's end, where the uncached ones start, and where XIP_CTRL starts.
+private const XIP_NOALLOC_RP2040: u32 = 0x11000000
+private const XIP_ALIASES_END: u32 = 0x14000000
 
 // Each APB device's window: its registers and their XOR, SET and CLR aliases.
 private const WINDOW_RP2040: u32 = 0x4000
@@ -130,6 +151,10 @@ enum Block40
     Psm
     Rosc
     SysInfo
+    Rtc
+    Vreg
+    IoQspi
+    PadsQspi
 
 /** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
 struct Placed40
@@ -138,7 +163,7 @@ struct Placed40
     name: string
     reset: u32
 
-val BLOCKS_RP2040: [14]Placed40 = [
+val BLOCKS_RP2040: [18]Placed40 = [
     Placed40(Block40.Resets, resets_reg.BASE, "RESETS", 0),
     Placed40(Block40.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed40(Block40.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -153,6 +178,10 @@ val BLOCKS_RP2040: [14]Placed40 = [
     Placed40(Block40.Psm, psm_reg.BASE, "PSM", 0),
     Placed40(Block40.Rosc, rosc_reg.BASE, "ROSC", 0),
     Placed40(Block40.SysInfo, sysinfo_reg.BASE, "SYSINFO", resets_reg.RESET_SYSINFO_MASK),
+    Placed40(Block40.Rtc, rtc_reg.BASE, "RTC", resets_reg.RESET_RTC_MASK),
+    Placed40(Block40.Vreg, vreg_reg.BASE, "VREG_AND_CHIP_RESET", 0),
+    Placed40(Block40.IoQspi, io_qspi_reg.BASE, "IO_QSPI", resets_reg.RESET_IO_QSPI_MASK),
+    Placed40(Block40.PadsQspi, pads_qspi_reg.BASE, "PADS_QSPI", resets_reg.RESET_PADS_QSPI_MASK),
 ]
 
 /** A block on the RP2040's bus that benchtop does not run yet: its window, its name and why. */
@@ -162,12 +191,8 @@ struct Absent40
     name: string
     why: string
 
-val ABSENT_RP2040: [21]Absent40 = [
+val ABSENT_RP2040: [14]Absent40 = [
     Absent40(syscfg_reg.BASE, WINDOW_RP2040, "SYSCFG", "not on the chip yet: its NMI masks and the processors' DAP instance IDs are RP2040 registers no item has built (docs/rp-coverage.md §2)"),
-    Absent40(vreg_reg.BASE, WINDOW_RP2040, "VREG_AND_CHIP_RESET", "not on the chip yet (docs/rp-coverage.md item 24)"),
-    Absent40(rtc_reg.BASE, WINDOW_RP2040, "RTC", "not on the chip yet (docs/rp-coverage.md item 24)"),
-    Absent40(io_qspi_reg.BASE, WINDOW_RP2040, "IO_QSPI", "the QSPI pins are the SSI's, not on the chip yet (docs/rp-coverage.md item 24)"),
-    Absent40(pads_qspi_reg.BASE, WINDOW_RP2040, "PADS_QSPI", "the QSPI pins are the SSI's, not on the chip yet (docs/rp-coverage.md item 24)"),
     Absent40(busctrl_reg.BASE, WINDOW_RP2040, "BUSCTRL", "not on the chip yet (docs/rp-coverage.md item 28)"),
     Absent40(tbman_reg.BASE, WINDOW_RP2040, "TBMAN", "not on the chip yet (docs/rp-coverage.md item 28)"),
     Absent40(spi0_reg.BASE, WINDOW_RP2040, "SPI0", "not on the chip yet (docs/rp-coverage.md item 16)"),
@@ -181,10 +206,10 @@ val ABSENT_RP2040: [21]Absent40 = [
     Absent40(pio1_reg.BASE, 0x1000, "PIO1", "not on the chip yet (docs/rp-coverage.md items 13 and 14)"),
     Absent40(usb_reg.BASE, WINDOW_RP2040, "USBCTRL", "the RP2040's USB controller is not on the chip yet beyond SIE_CTRL, which the SDK's runtime_init stores (docs/rp-coverage.md item 20 built the RP2350's)"),
     Absent40(usb_dpram_reg.BASE, 0x1000, "USBCTRL_DPRAM", "the RP2040's USB controller is not on the chip yet (docs/rp-coverage.md item 20 built the RP2350's)"),
-    Absent40(xip_ctrl_reg.BASE, 0x01000000, "XIP_CTRL", "the RP2040's XIP cache and its control are not on the chip yet (docs/rp-coverage.md item 24)"),
-    Absent40(0x15000000, 0x03000000, "XIP_SRAM", "the RP2040's XIP cache as SRAM is not on the chip yet (docs/rp-coverage.md item 24)"),
-    Absent40(ssi_reg.BASE, 0x01000000, "SSI", "the RP2040's flash interface is not on the chip yet (docs/rp-coverage.md item 24)"),
 ]
+
+// IO_QSPI's pins, in register order.
+private val QSPI_PIN_NAMES: [6]string = ["SCLK", "SS", "SD0", "SD1", "SD2", "SD3"]
 
 // The SIO's GPIO registers on the RP2040 (OUT, OUT_SET, OUT_CLR, OUT_XOR, OE, OE_SET, OE_CLR, OE_XOR
 // from 0x010, a word apart) at the shared model's offsets, which interleave the high bank.
@@ -212,6 +237,19 @@ struct Rp2040
     // USBCTRL's SIE_CTRL, stored: the SDK's `runtime_init_usb_power_down` reads it and powers the
     // transceiver down, before it has released USBCTRL from reset, so it is not gated by RESETS.
     usb_sie_ctrl: u32
+    // The flash and the path to it: the SSI, XIP_CTRL, the QSPI pins and pads.
+    ssi: r40.Ssi
+    xip: r40.XipCtrl
+    flash: QspiFlash
+    io_qspi: IoQspi
+    pads_qspi: QspiPads
+    vreg: r40.Vreg
+    rtc: r40.Rtc
+    // The remainder carried into the next clk_rtc cycle.
+    rtc_rest: u64
+    // Something that decides whether XIP reaches the flash, or the cache is SRAM, may have changed
+    // since the board last asked (`take_xip_changed`).
+    xip_changed: bool
     // Core 1 has been put in reset by PSM since the board last asked, or taken out of it.
     core1_reset: bool
     core1_release: bool
@@ -261,12 +299,95 @@ struct Rp2040
             self.rosc_rest += cycles * ROSC_HZ_RP2040
             self.rosc.advance(self.rosc_rest / sys)
             self.rosc_rest %= sys
+        if self.rtc.enabled() then self.advance_rtc(cycles, sys)
         // No debugger halts a core, so no PAUSE applies.
         val ticks = self.watchdog.advance(ref_cycles)
         self.timer.advance(ticks, 0)
         self.watchdog_fired()
         if self.uarts[0].active() || self.uarts[1].active() then self.advance_lines(cycles, sys)
     end advance
+
+    // `cycles` of clk_sys at `sys` Hz pass for the RTC, as clk_rtc's cycles.
+    private advance_rtc(*self, cycles: u64, sys: u64)
+        val hz = self.clocks.rtc_hz(self.sources())
+        if hz == 0 then return
+        val total = u128(self.rtc_rest) + u128(cycles) * u128(hz)
+        self.rtc.advance(u64(total / u128(sys)))
+        self.rtc_rest = u64(total % u128(sys))
+
+    /** The clk_sys cycles until the RTC's next second, while its alarm could raise its interrupt then. */
+    rtc_due(*self) -> Option[u64]
+        if !self.rtc.alarm_armed() then return None
+        val hz = self.clocks.rtc_hz(self.sources())
+        val sys = self.sys_hz()
+        if hz == 0 || sys == 0 then return None
+        val need = u128(self.rtc.cycles_to_second()) * u128(sys) - u128(self.rtc_rest)
+        Some(u64((need + u128(hz) - 1) / u128(hz)))
+
+    /** Whether something that decides the XIP mapping has changed since the last call. */
+    take_xip_changed(*self) -> bool
+        val changed = self.xip_changed
+        self.xip_changed = false
+        changed
+
+    /** Whether an XIP read reaches the flash now: the board's fast path follows it. */
+    xip_ready(*self) -> bool = self.ssi.xip_ready(&self.flash, self.qspi_cs(), self.qspi_pins()).is_ok()
+
+    // IO_QSPI's SS OUTOVER: the SSI's chip select, or forced low or high.
+    private qspi_cs(*self) -> u32 = (self.io_qspi.ctrl[1] & io_qspi_reg.GPIO_QSPI_SS_CTRL_OUTOVER_MASK) >> io_qspi_reg.GPIO_QSPI_SS_CTRL_OUTOVER_SHIFT
+
+    // Why the QSPI pins do not reach the SSI; empty where every one has FUNCSEL 0 (XIP).
+    private qspi_pins(*self) -> string
+        val held = if self.resets.held & resets_reg.RESET_IO_QSPI_MASK != 0 then ", as RESETS holds IO_QSPI in reset" else ""
+        for i in 0..<6
+            val f = self.io_qspi.ctrl[i] & io_qspi_reg.GPIO_QSPI_SS_CTRL_FUNCSEL_MASK
+            if f != 0 then return s"IO_QSPI's GPIO_QSPI_${QSPI_PIN_NAMES[i]} has FUNCSEL 0x${hex(f)}$held, not XIP (0), so the pin is not the SSI's"
+        ""
+
+    // The SSI brought up to now.
+    private ssi_catch_up(*self) -> Result[unit, string]
+        self.xip_changed = true
+        self.ssi.catch_up(self.now, &self.flash, self.qspi_cs())
+
+    // The flash's chip select follows IO_QSPI's override, or the SSI's transfer where it is normal.
+    private cs_changed(*self) -> Result[unit, string]
+        val cs = self.qspi_cs()
+        val low = if cs == CS_LOW then true elif cs == CS_HIGH then false else self.ssi.active()
+        if low && !self.flash.selected
+            self.flash.select()
+        elif !low && self.flash.selected
+            self.flash.deselect()?
+        Ok(())
+
+    // An access to the XIP address space, read: the flash through any of its four aliases, XIP_CTRL,
+    // the cache as SRAM while it is not (the board maps it while it is), and the SSI.
+    private xip_load(*self, a: u32, width: u32) -> Result[u32, string]
+        if a < XIP_ALIASES_END
+            self.ssi_catch_up()?
+            val got = r40.xip_word(self.ssi, &self.flash, self.qspi_cs(), self.qspi_pins(), a).map_err(why -> s"0x${hex(a, 8)} is the flash through XIP, read through the SSI, but $why")?
+            return Ok(r40.read_lane(got, a, width))
+        if a >= xip_ctrl_reg.BASE && a < xip_ctrl_reg.BASE + WINDOW_RP2040
+            return self.xip.read(a - xip_ctrl_reg.BASE, width, self.ssi, &self.flash, self.qspi_cs(), self.qspi_pins())
+        if a >= ssi_reg.BASE && a < ssi_reg.BASE + 0x1000
+            self.xip_changed = true
+            return self.ssi.read(a - ssi_reg.BASE, width, self.now, &self.flash, self.qspi_cs())
+        Err(xip_refusal40(a, self.xip.sram_closed()))
+
+    // An access to the XIP address space, written.
+    private xip_store(*self, a: u32, width: u32, x: u32) -> Result[unit, string]
+        if a < XIP_NOALLOC_RP2040
+            // A write to the cached alias deallocates the line it hits; no line is held to forget.
+            return Ok(())
+        if a < XIP_ALIASES_END
+            if self.xip.bad_write_faults() then return Err(s"0x${hex(a, 8)} is an uncached XIP alias, a write to which is a bus fault while XIP_CTRL CTRL.ERR_BADWRITE is set, as it is at reset: not modelled")
+            return Ok(())
+        if a >= xip_ctrl_reg.BASE && a < xip_ctrl_reg.BASE + WINDOW_RP2040
+            self.xip_changed = true
+            return self.xip.write(a - xip_ctrl_reg.BASE, width, x, self.ssi, &self.flash, self.qspi_cs(), self.qspi_pins())
+        if a >= ssi_reg.BASE && a < ssi_reg.BASE + 0x1000
+            self.xip_changed = true
+            return self.ssi.write(a - ssi_reg.BASE, width, x, self.now, &self.flash, self.qspi_cs(), self.qspi_pins())
+        Err(xip_refusal40(a, self.xip.sram_closed()))
 
     // The watchdog has fired, by its counter or by TRIGGER: the reset the RP2040 makes then (its PSM
     // stages per WDSEL, and the boot ROM's boot path for core 0) is the real ROM's, item 23's.
@@ -360,6 +481,10 @@ struct Rp2040
             Psm -> self.psm.read(o, width)
             Rosc -> self.rosc.read(rosc_offset(o), width)
             SysInfo -> sysinfo_read(o, width)
+            Rtc -> self.rtc.read(o, width, self.clocks.rtc_hz(self.sources()) != 0)
+            Vreg -> self.vreg.read(o, width)
+            IoQspi -> self.io_qspi.read(o, width)
+            PadsQspi -> self.pads_qspi.read(o, width)
         got.map_err(e -> refusal40(p, o, e))
 
     // A write the chip takes, or why it refuses it.
@@ -375,7 +500,11 @@ struct Rp2040
             Resets ->
                 val before = self.resets.held
                 val r = self.resets.write(o, width, x)
-                self.reset_blocks(self.resets.held & ~before)
+                val asserted = self.resets.held & ~before
+                if asserted & resets_reg.RESET_IO_QSPI_MASK != 0 then self.ssi_catch_up()?
+                self.reset_blocks(asserted)
+                // IO_QSPI's reset puts chip select back to the SSI's.
+                if asserted & resets_reg.RESET_IO_QSPI_MASK != 0 then self.cs_changed()?
                 // Every released block is ready at once.
                 self.resets.complete(~self.resets.held)
                 if (self.resets.held ^ before) & (resets_reg.RESET_IO_BANK0_MASK | resets_reg.RESET_PADS_BANK0_MASK) != 0 then self.gpio_changed()
@@ -432,7 +561,22 @@ struct Rp2040
                 if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
                 r
             SysInfo -> sysinfo_write(o, width)
+            Rtc -> return self.rtc.write(o, width, x)
+            Vreg -> return self.vreg.write(o, width, x)
+            IoQspi -> return self.io_qspi_write(p, o, width, x)
+            PadsQspi -> self.pads_qspi.write(o, width, x)
         got.map_err(e -> refusal40(p, o, e))
+
+    // A write to IO_QSPI, after the SSI is brought up to now: chip select follows SS's override at once.
+    // Inverting the SSI's chip select is refused, leaving IO_QSPI as it was.
+    private io_qspi_write(*self, p: Placed40, o: u32, width: u32, x: u32) -> Result[unit, string]
+        self.ssi_catch_up()?
+        val before = self.io_qspi
+        self.io_qspi.write(o, width, x).map_err(e -> refusal40(p, o, e))?
+        if self.qspi_cs() == io_qspi_reg.GPIO_QSPI_SS_CTRL_OUTOVER_INVERT
+            self.io_qspi = before
+            return Err(s"${p.name} + 0x${hex(o)}: GPIO_QSPI_SS_CTRL OUTOVER 1 inverts the SSI's chip select, which is not modelled")
+        self.cs_changed()
 
     // The SIO at the RP2040's offsets: the shared model's FIFOs, spinlocks, interpolators and low GPIO
     // bank, and each core's own divider.
@@ -482,6 +626,9 @@ struct Rp2040
                 PadsBank0 -> self.pads.reset()
                 Uart0 -> self.uarts[0].reset()
                 Uart1 -> self.uarts[1].reset()
+                Rtc -> self.rtc.reset()
+                IoQspi -> self.io_qspi.reset()
+                PadsQspi -> self.pads_qspi.reset()
                 _ -> ()
 
     // A write to UART `k`, refused where it asks for something benchtop does not model; a refused write
@@ -560,7 +707,8 @@ end Rp2040
 rp2040() -> Rp2040 =
     Rp2040(r40.resets(), rp.clocks_rp2040(), rp.xosc(), rp.pll(), rp.pll(), r40.watchdog(), r40.timer(), rp.sio_rp2040(),
         [divider(), divider()], rp.io_bank0_rp2040(), rp.pads_bank0_rp2040(), [rp.uart(), rp.uart()], rp.psm_rp2040(), rp.rosc(),
-        rp.sysinfo(), 0, false, false, 0, 0, 0, 0, 0, 0, 0, "")
+        rp.sysinfo(), 0, r40.ssi(), r40.xip_ctrl(), w25q16jv(), rp.io_qspi_rp2040(), rp.qspi_pads_rp2040(), r40.vreg(), r40.rtc(), 0, true,
+        false, false, 0, 0, 0, 0, 0, 0, 0, "")
 
 impl ArmChip for Rp2040
     const rp2350() -> bool = false
@@ -569,7 +717,7 @@ impl ArmChip for Rp2040
     pass(*self, cycles: u64) = self.advance(cycles)
 
     /** The clk_sys cycles until the next device event that could wake a core: a timer alarm, the
-     * watchdog firing, or a UART line's next event.
+     * watchdog firing, a UART line's next event, or the RTC's next second while its alarm is armed.
      */
     due(*self) -> Option[u64]
         var due: Option[u64] = None
@@ -579,16 +727,16 @@ impl ArmChip for Rp2040
         self.timer.next_alarm(0) match
             Some(n) -> due = earliest(due, self.ticks_to_cycles(n))
             None -> ()
-        earliest(due, self.line_due())
+        earliest(earliest(due, self.line_due()), self.rtc_due())
 
     load(*self, core: u32, a: u32, width: u32) -> Result[u32, string]
         if a < ROM_BYTES_RP2040 then return Err(rom_refusal(a))
-        if a >= XIP_BASE_RP2040 && a < XIP_END_RP2040 then return Err(xip_refusal40(a))
+        if a >= XIP_BASE_RP2040 && a < XIP_END_RP2040 then return self.xip_load(a, width)
         self.read(core, a, width)
 
     store(*self, core: u32, a: u32, width: u32, x: u32) -> Result[unit, string]
         if a < ROM_BYTES_RP2040 then return Err(s"0x${hex(a, 8)} is the boot ROM, which is read-only: what a write there does on silicon is not modelled")
-        if a >= XIP_BASE_RP2040 && a < XIP_END_RP2040 then return Err(xip_refusal40(a))
+        if a >= XIP_BASE_RP2040 && a < XIP_END_RP2040 then return self.xip_store(a, width, x)
         self.write(core, a, width, x)
 
     /** Drive `p`'s interrupt inputs: the TIMER's alarms and IO_IRQ_BANK0 into both cores, each core's
@@ -603,6 +751,7 @@ impl ArmChip for Rp2040
         p.interrupt(SIO_IRQ_PROC1, k == 1 && self.sio.fifo_irq(1))
         p.interrupt(UART0_IRQ_RP2040, self.uarts[0].irq())
         p.interrupt(UART1_IRQ_RP2040, self.uarts[1].irq())
+        p.interrupt(RTC_IRQ_RP2040, self.rtc.irq())
 
     core1_stopped(*self) -> bool
         val held = self.core1_reset
@@ -653,7 +802,7 @@ private sio_offset(o: u32) -> Result[u32, string]
     if address >= sio_reg.GPIO_OUT_OFFSET && address <= sio_reg.GPIO_OE_XOR_OFFSET
         return Ok(SIO_GPIO_RP2350[(address - sio_reg.GPIO_OUT_OFFSET) / 4] | (o & 3))
     if address == sio_reg.GPIO_HI_IN_OFFSET || (address >= sio_reg.GPIO_HI_OUT_OFFSET && address <= sio_reg.GPIO_HI_OE_XOR_OFFSET)
-        return Err(s"SIO + 0x${hex(o)}: the GPIO_HI bank is the QSPI pins, which are the SSI's, not on the chip yet (docs/rp-coverage.md item 24)")
+        return Err(s"SIO + 0x${hex(o)}: the GPIO_HI bank drives and reads the QSPI pins as levels, which benchtop does not model: the pins are the flash's, reached through the SSI")
     if address > sio_reg.SPINLOCK31_OFFSET then return Err(s"SIO + 0x${hex(o)} is not a register of the RP2040's SIO")
     Ok(o)
 
@@ -698,10 +847,11 @@ rom_refusal(a: u32) -> string
         else "the rest of the ROM"
     s"0x${hex(a, 8)} is $what: benchtop's stand-in RP2040 ROM carries only core 1's launch wait, and Raspberry Pi's ROM is docs/rp-coverage.md item 23"
 
-// An access to the XIP address space, refused by name.
-private xip_refusal40(a: u32) -> string
-    for b in ABSENT_RP2040 do if a >= b.base && a - b.base < b.size then return s"0x${hex(a, 8)} is ${b.name}: ${b.why}"
-    s"0x${hex(a, 8)} is the RP2040's XIP window, read through the SSI, which is not on the chip yet (docs/rp-coverage.md item 24)"
+// An access to the XIP address space that reaches nothing: XIP_SRAM while the cache is not SRAM
+// (`closed` says why), or an address between the blocks.
+private xip_refusal40(a: u32, closed: string) -> string
+    if a >= XIP_SRAM_BASE_RP2040 && a < XIP_SRAM_BASE_RP2040 + XIP_SRAM_BYTES_RP2040 then return s"0x${hex(a, 8)} is XIP_SRAM: $closed"
+    s"0x${hex(a, 8)} is in the RP2040's XIP address space, where nothing is: not the flash's aliases, XIP_CTRL, XIP_SRAM or the SSI"
 
 // An access that no running block takes: a named block not on the chip yet, or nothing at all.
 private absent_refusal(a: u32) -> string
