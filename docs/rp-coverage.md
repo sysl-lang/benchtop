@@ -104,7 +104,7 @@ day. An L is split before it is handed out (§6).
 | GPIO interrupts (PROC0/1 INTE/INTF/INTS, edge latch, IO_IRQ_BANK0, dormant wake) | 9 GPIO | full | INTR's levels and latched edges (write 1 to clear through any alias), INTE/INTF/INTS for processor 0, processor 1 and the dormant wake, IRQSUMMARY (Secure only, Q3); processor k's line is IO_IRQ_BANK0 (21) in core k on both boards, the dormant wake's wakes a DORMANT ROSC. Edges latch whenever a GPIO's input can move: a function, override, pad or SIO write, the GPIO coprocessor, or a level driven from outside; none while IO_BANK0 is held (`peripheral/rp2350/gpio_irq.sysl`, shared with the RP2040's layout; item 9). IO_IRQ_BANK0_NS is never raised (Q3). | `rp2350/gpio_irq_tests.sysl`, `chip/gpio_tests.sysl` (`hello_gpio_irq.elf`, `gpio_irq.elf`, `pico2-riscv/gpio_irq.elf`) | — | — |
 | PADS_BANK0 (ISO, IE, OD, pulls, drive, slew) | 9.8 Pads | full | `gpio.sysl:82–131`. Drive and slew are stored. | `rp2350/tests.sysl:169` | — | — |
 | IO_QSPI, PADS_QSPI (including the BOOTSEL read via QSPI_SS) | 9 GPIO | partial (stored) | PADS_QSPI's seven registers and IO_QSPI's eight CTRLs and interrupt registers stored with their reset values and aliases, behind their RESETS bits, which the boards' boot releases (`peripheral/rp2350/qspi_pins.sysl`, item 6). The pins drive nothing (the flash is the QMI's); each STATUS, and so the BOOTSEL read, refused by name. | `peripheral/rp2350/rom_blocks_tests.sysl`, `chip/tests.sysl` | S (levels, BOOTSEL) | XIP for the shared pins |
-| UART0/1 (PL011) | 12.1 UART | partial | DR both ways, FR, the divisors, LCR_H/CR stored, 32-entry FIFOs, RX/TX interrupts (`peripheral/rp2350/uart.sysl:6–12`). Not modelled: byte timing from clk_peri and the baud, modem lines, break and errors, FIFO-level interrupts beyond RX/TX, RT timeout, DMA DREQs (DMACR is stored), and the bit stream on the pin. Atomic aliases of DR and ICR are refused (`uart.sysl:84,112`). | `rp2350/tests.sysl:196`, `chip/tests.sysl:18` | M | CLOCKS (clk_peri), DMA |
+| UART0/1 (PL011) | 12.1 UART | full | Item 8: frames timed from clk_peri at the divisor LCR_H latched, through `next_event`; the bits on the TX pin through the mux, frames over wires between GPIOs and from off the chip; FIFOs or holding registers, the IFLS trigger levels, the RT timeout, break both ways, FE/PE/BE/OE, LBE loopback, the TX and RX DREQs (`peripheral/rp2350/uart.sysl`, `chip/rp2350.sysl` `advance_lines`). Refused by name: IrDA, hardware flow control (CTSEN/RTSEN, and the CTS and RTS functions in the mux), reserved IFLS levels, a character with IBRD 0 latched, and a frame its pins cannot show. Modem status reads 0. | `rp2350/uart_tests.sysl`, `chip/uart_tests.sysl` | — | DMA consumes the DREQs (item 11) |
 | SPI0/1 (PL022) | 12.3 SPI | missing | Not on the chip's bus. The PL022 model exists (`peripheral/spi/spi.sysl`) and runs on STM32 and virtual boards. | `peripheral/spi/tests.sysl` (6) | S (place) + S (DREQ) | mux, DMA |
 | I2C0/1 (DW_apb_i2c) | 12.2 I2C | missing | `dw-i2c` has `modelled = false` (`registry.sysl:322`). The device callbacks exist (`peripheral/i2c/i2c.sysl`). | — | M (master), S (slave) | mux, DMA |
 | PWM (12 slices) | 12.5 PWM | missing | Only `virt-pwm` (`peripheral/pwm/pwm.sysl`). | — | M | mux, DMA, IRQ |
@@ -169,7 +169,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 31 | 9 | 0 | 18 | 58 |
+| RP2350 | 32 | 8 | 0 | 18 | 58 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
@@ -196,8 +196,8 @@ every program in the org is.
    ROSC, BOOTRAM (boot locks), SYSINFO, SYSCFG, the POWMAN/VREG store and FC0 are not. Each one
    missing is a refusal at start-up. The census in item 1 below lists them from a real run instead of
    from memory.
-3. **UART/stdio.** `hello_serial` and every `printf` go through UART0. The model works, but bytes leave
-   at once instead of at the baud rate, and there is no DREQ.
+3. **UART/stdio.** `hello_serial` and every `printf` go through UART0, at the baud rate, with DREQs
+   for the DMA (item 8, done).
 4. **GPIO and IRQ.** GPIO interrupts and the function mux. Every button example needs the
    interrupts. The mux is what every later peripheral drives pins through, so it comes before them.
 5. **Timers and watchdog.** The timers are done. The watchdog's counter and the chip reset it makes
@@ -319,7 +319,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 5 | **Start-up register blocks** (done, see "Item 5, done"): PSM (FRCE_OFF and DONE), ROSC with RANDOMBIT, BOOTRAM, SYSINFO, SYSCFG, the POWMAN/VREG store, ACCESSCTRL stored, and CLOCKS FC0 measuring the tree. Every refusal in item 1's census is either answered here or named. | M | 1 |
 | 6 | **Boot ROM function table**: per Q1, Raspberry Pi's real ROM, mapped on both boards; core 1's wait and every ROM function run as its code. The core-0 boot path is item 30's. **Done** (below). | L | 4, 5 |
 | 7 | **DCP (CP4/5)**: the double coprocessor. `pico_float_test` and a `printf("%f")` program are its oracles. **Done** (below). | M | 3 |
-| 8 | **UART completion**: baud-timed bytes from clk_peri, both UARTs' pins correct, RT timeout, FIFO-level IRQs, break and errors, DREQ outputs. | M | 6 |
+| 8 | **UART completion**: baud-timed bytes from clk_peri, both UARTs' pins correct, RT timeout, FIFO-level IRQs, break and errors, DREQ outputs. **Done** (below). | M | 6 |
 | 9 | **GPIO function mux and GPIO interrupts**: one routing layer where every producer offers level and OE, IO_IRQ_BANK0, and per-core INTE/INTF/INTS. `gpio/hello_gpio_irq` is its oracle. **Done** (below). | M | 6 |
 | 10 | **Watchdog counter and chip reset path**: countdown, TRIGGER, REASON, SCRATCH surviving, and the machine restarting through the boot path. **Done** (below). | M | 5 |
 | 11 | **DMA core**: channels, DREQ inputs, pacing timers, chaining, ring, IRQs. The register model is shared by both chips' channel counts. | L | 9 |
@@ -856,7 +856,7 @@ and the SDK's `hardware_gpio`; the chip routes and samples (`chip/rp2350.sysl` `
 
 - **One routing layer**: FUNCSEL picks a producer (`route`), the producer offers a level and an output
   enable, OUTOVER and OEOVER override them, and the pad decides. Producers today: SIO, NULL, and each
-  UART's TX (idles high and drives; bytes still leave at once, item 8) and RX, on F2 and on F11. A peripheral
+  UART's TX (drives its line: idle high, a frame's bits, a break low; item 8) and RX, on F2 and on F11. A peripheral
   item adds its producer to `route` and drops its refusal.
 - **Refused by name** (`unmodelled_function`), when the FUNCSEL is written, through any alias, CTRL kept:
   SPI (item 16), I²C (17), PWM (18), PIO0–2 (13, 14), HSTX (29), JTAG and CoreSight trace (Q5), UART CTS and
@@ -885,9 +885,8 @@ and the SDK's `hardware_gpio`; the chip routes and samples (`chip/rp2350.sysl` `
   quantum (`ArmBoard.run`). The RISC-V board likewise returned `Asleep` with a hart's interrupt pending
   (a GPIO edge driven between runs); `RiscvBoard.asleep` now asks `riscv.wakes_now`.
 
-The oracles: `examples/pico2/hello_gpio_irq.c` is pico-examples' `gpio/hello_gpio_irq` (pico-examples is
-not cloned in this tree; the source is reproduced from the upstream program and should be checked against
-the checkout once it is), run on the Arm board with GPIO 2 driven high, low, high and released;
+The oracles: `examples/pico2/hello_gpio_irq.c` is pico-examples' `gpio/hello_gpio_irq`, identical to
+`pico-scratch/pico-examples` at commit 0d62f75 apart from its two-line header comment, run on the Arm board with GPIO 2 driven high, low, high and released;
 `examples/pico2/gpio_irq.c` covers both cores, levels, a force, both overrides and the dormant wake with
 nothing outside; `examples/pico2-riscv/gpio_irq.c` is its RISC-V twin, through Hazard3's Xh3irq.
 `chip/gpio_tests.sysl` asserts each program's output line by line, and the mux, overrides, edge sources,
@@ -1022,3 +1021,78 @@ board (16 KB) and the OTP block's registers inside `Rp2350` first cost 1.5% on t
 (`row_at`, `row_bits`) and SW_LOCK as bytes. With that: `bench --core cortex-m33 kernel33.bin` 37.17 G to
 37.17 G; `sram_loop.elf` 5.207 G to 5.105 G and `xip_loop.elf` 5.428 G to 5.323 G (2% fewer); `dcp.elf`
 0.961 G to 0.694 G (28% fewer).
+
+### Item 8, done: the UARTs
+
+`peripheral/rp2350/uart.sysl` against the PL011 TRM and the field descriptions of `hardware/regs/uart.h`;
+the chip times the lines and carries their frames (`chip/rp2350.sysl` `advance_lines`, `deliver`,
+`line_in`, `wire`, `uart_write`).
+
+- **Timed lines**: one bit is 16 periods of clk_peri over IBRD + FBRD/64, counted exactly as 64 × IBRD +
+  FBRD quarter clk_peri cycles; IBRD and FBRD take effect at the next LCR_H write. A frame is a start bit,
+  5 to 8 data bits, the parity bit (even, odd or stuck) and one or two stop bits. The chip hands the UARTs
+  clk_peri's time only while a line is busy (a frame, a break, an arriving frame, the receive timeout),
+  event by event, and offers the next of those as a `next_event`, so a sleeping board wakes for it and an
+  idle UART costs nothing. A frame in progress finishes after UARTEN or TXE is cleared.
+- **Pins and wires**: a TX function drives its pin with the line's level (idle high, the frame's bits, low
+  through a break), on F2 and F11. `Rp2350.wire(a, b)` puts a wire between two GPIOs on the workbench:
+  each sees the other's level where it drives, and a frame sent from a GPIO whose function is a UART's TX
+  and whose pad drives reaches the UART whose RX is the other end's function. `line_in(n, frame)` sends a
+  frame into GPIO `n` from off the chip, arriving a frame later at that UART's rate (false while the line
+  still carries the last). The console is UART0's TX, whatever pin carries it, as before.
+- **FIFOs and interrupts**: 32 deep, or a 1-deep holding register without FEN; a character written while
+  the UART is off waits in the FIFO (BUSY set, as the TRM says). RX asserts as the receive FIFO reaches
+  its IFLS level and clears as reads take it below; TX asserts as the transmit FIFO falls to its level (the
+  holding register empties, without FEN) and clears as writes take it above; RT 32 bit periods after the
+  last character, with one waiting; ICR clears each. UARTRIS reads 0 at power-on (uart.h), where the old
+  model latched TX.
+- **Errors and break**: FE, PE and BE ride with their character into UARTDR and UARTRSR and set their
+  interrupts; a full FIFO loses the character, sets OE in UARTRSR and the interrupt, and marks the next
+  character in with UARTDR.OE; UARTECR clears UARTRSR. LCR_H.BRK holds the line low after the frame in
+  progress, and a receiver at the other end takes it as one break character (0 with BE and FE) a frame
+  later; no frame starts until BRK clears. CR.LBE feeds the UART's frames and breaks to its own receiver
+  and ignores the line from outside.
+- **DMA requests**: `Uart.dreq_tx` (TXDMAE and room in the transmit FIFO) and `dreq_rx` (RXDMAE and a
+  character waiting, stopped by DMAONERR while an error interrupt is asserted); `Rp2350.uart_dreq(n)`
+  answers DREQ 28 to 31 (`DREQ_UART0_TX` on) for item 11.
+- **Refused by name**: CR.SIREN (IrDA), CR.CTSEN and CR.RTSEN (hardware flow control: the CTS and RTS
+  functions stay refused in the mux, so there is no pin for either), the reserved IFLS levels, a character
+  to send with IBRD 0 latched, and a frame its pins cannot show as benchtop models them: one starting on a
+  pin, or the far end of its wire, whose GPIO interrupts are enabled (the interrupts do not sample a
+  frame's bits), and one going over a wire through OUTOVER or OEOVER. Over a wire, a receiver at another
+  divisor, word length or parity, an RX pad that does not read its input, and an INOVER on the RX pin stop
+  the run with the reason (`take_line_fault`). Each refused register write leaves the UART as it was.
+  Modem status reads 0 in UARTFR.
+- **Assumptions**, since the headers do not say: the DREQs are the PL011's single requests; with LBE set
+  the frame still drives the TX pin; a break needs UARTEN.
+- **Two board changes.** A run that ends at a breakpoint or a fault now hands over what the chip did in
+  that last part of a quantum (`settle`): before, those characters reached the console only on the next
+  run. `ArmBoard.finish_sending` and `RiscvBoard.finish_sending` let UART0 send what it holds with the
+  cores stopped, as a chip runs on while a debugger holds its cores; `benchtop run` does that at a
+  breakpoint, so the console still ends with every character the program wrote.
+- **What the console now shows differently**: the same text, at the line's pace. The SDK's `printf` waits
+  until UART0 has sent each line (`stdio_uart`'s flush polls UARTFR.BUSY), so a program's own clock moves
+  on by its characters' time: `aon_timer.elf` now reads 1700000000.252 and 1700000001.754 where it read
+  .250 and .750, `hello_serial` puts 100 ms plus its line's 17 characters between lines, and `watchdog.elf`'s
+  boot lines come their characters later. Every other `examples/pico2` program prints exactly as before.
+- **A finding in `rom.c`**: after the ROM's PC/SP reboot, which resets CLOCKS, `rebooted()` printed through
+  a UART whose clk_peri was off; the instant UART let it, and a Pico 2 would have hung there, as the timed
+  one now does. It now releases the PLLs and runs `runtime_init_clocks()` first.
+
+The oracles: `examples/pico2/hello_uart.c` and `uart_advanced.c` are pico-examples' `uart/hello_uart` and
+`uart/uart_advanced`, identical to `pico-scratch/pico-examples` at commit 0d62f75 apart from their header
+comment. `hello_uart` returns from `main` with characters still in the FIFO; `uart_advanced` echoes `HAL`,
+sent into GPIO 1, as `IBM`, through its RX interrupt with the FIFOs off. `examples/pico2/uart_loopback.c`
+puts UART0 and UART1 on two wires (GPIO 12 to 5, 4 to 13): UART1 hears the console's `ping`, its receive
+timeout raised after 804 µs by the 1 µs timer (798.6 µs on the line, the rest printf's own work and the
+interrupt taken at the end of a 1000-cycle quantum), `pong` back, a break read as 0x500, and an overrun
+of UART0's FIFO. `chip/uart_tests.sysl` asserts each program's output and, at register level, the timing
+through `next_event`, a halved clk_peri, the pins bit by bit, the wires and every refusal;
+`rp2350/uart_tests.sysl` the model alone.
+
+**Cost**, host instructions retired, three interleaved runs each against the branch's base (`/usr/bin/time
+-l`, `benchtop run --board pico2`): `bench --core cortex-m33 kernel33.bin` 120.43–120.45 G to
+120.43–120.45 G, unchanged. The Pico 2 programs rise by the guest's own waiting, not by a cost per
+instruction: `sram_loop.elf` 5.11–5.12 G to 5.46–5.47 G and `xip_loop.elf` 5.33 G to 5.67–5.68 G (+7%,
+their 58 characters now waited for through UARTFR polls), and `dcp.elf` 0.70 G to 6.84 G, whose ~2,000
+characters are now 27 ms of guest time spent polling UART0 on both cores where they took none.
