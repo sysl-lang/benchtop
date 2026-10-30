@@ -1,10 +1,11 @@
 module sh.sysl.benchtop.chip
 
-import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_SRAM_BASE, XIP_SRAM_BYTES}
+import sh.sysl.benchtop.peripheral.rp2350.{DOMAIN_SRAM0, DOMAIN_SRAM1, DOMAIN_XIP, POWMAN_PASSWORD, XIP_BASE, XIP_SRAM_BASE, XIP_SRAM_BYTES}
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.benchtop.v6m as arm
 import sh.sysl.benchtop.v6m.{CoprocessorOp, Fpu, Kind, MemoryMap, RamBank, Stop}
 import sh.sysl.elf
+import sh.sysl.rp2350.powman as powman_reg
 import sh.sysl.rp2350.psm as psm_reg
 import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
@@ -46,6 +47,14 @@ import sysl.math.min
 // debugger entered; NORMAL or PC_SP after a watchdog reset. The RCP's salts belong to PROC_COLD, which
 // a core's own reset (and the ROM's `reboot`) spares.
 //
+// **POWMAN's low-power states** (Q7, a time skip): once POWMAN waits to power the switched core down
+// and every started core sleeps with nothing pending, the board makes the power-down (`power_down`):
+// both cores stop, and SRAM banks and the XIP cache the state switches off are cleared. Time then skips
+// to the always-on alarm, or the run ends asleep until something outside drives a power-up GPIO
+// (`Rp2350.drive_from_outside`). The power-up boots core 0 as the boot ROM's boot path does after any
+// reset (`rom_boot_path`: POWMAN's BOOT0–3 vector, then the watchdog's, unless BOOTDIS.NOW, which it
+// clears; else the flash image), and starts core 1 from reset in the ROM.
+//
 // **Memory** is on the cores' fast path: SRAM; the flash, read and executed in place from the cached
 // window's first 4 MB (the other windows and the rest of it reach the chip, `Rp2350.read`); the boot
 // ROM, read-only; and the XIP_SRAM page whose every cache line is pinned. The board keeps the map in
@@ -71,6 +80,10 @@ const RP2350_IRQS: u32 = 52
 const COPROCESSORS: u32 = 0xB1
 /** The Pico 2's flash: 4 MB on QSPI chip select 0. */
 const FLASH_BYTES: u32 = 4 * 1024 * 1024
+// SRAM's two power domains (the SDK's `powman_power_domains`): bank 0 is its bottom 256 KB, bank 1
+// the rest, SRAM8 and SRAM9 with it.
+private const SRAM_BASE: u32 = 0x20000000
+private const SRAM_BANK1_BASE: u32 = 0x20040000
 // XIP_SRAM's 8-byte cache lines, and a line number no line has.
 private const SRAM_LINES: u32 = XIP_SRAM_BYTES / 8
 private const NO_LINE: u32 = 0xFFFFFFFF
@@ -236,25 +249,43 @@ impl ArmBoard
         words[usize(BOOTRAM_REBOOT_PARAMS / 4)] = 0
         words[usize(BOOTRAM_REBOOT_PARAMS / 4) + 1] = 0
 
-    /** The boot ROM's boot of core 0 after a watchdog reset: the request in SCRATCH4–7, or the normal
-     * boot of the flash image; or why benchtop cannot make it.
+    /** The boot ROM's boot of core 0 after a reset that `cause` names ("the watchdog's reset",
+     * "POWMAN's power-up"), as its boot path makes it (`varm_boot_path.c`, steps 7 to 9): unless
+     * BOOTDIS.NOW disables vectors, POWMAN's BOOT0–3 and then the watchdog's SCRATCH4–7 are tried as a
+     * boot vector (`try_vector`); BOOTDIS.NOW is cleared; otherwise it is the normal boot of the flash
+     * image. Or why benchtop cannot make it.
      */
-    private watchdog_boot(*self) -> Result[Start, string]
-        val s = self.chip.watchdog.scratch
-        if s[4] == WATCHDOG_BOOT_MAGIC && s[5] == s[7] ^ (0 -% WATCHDOG_BOOT_MAGIC)
-            self.chip.watchdog.scratch[4] = 0
-            if s[7] == WATCHDOG_BOOT_MAGIC
-                return Err(s"the watchdog's reset asks the boot ROM for a boot of type ${s[6]} (SCRATCH6), which is the ROM's own boot path, not run (docs/rp-coverage.md items 25, 26 and 30)")
-            self.write_boot_info(BOOT_TYPE_PC_SP)
-            return Ok(Start(s[7], s[6], 0, false, true))
+    private rom_boot_path(*self, cause: string) -> Result[Start, string]
+        val p = &self.chip.powman
+        val disabled = p.read(powman_reg.BOOTDIS_OFFSET, 4).unwrap() & powman_reg.BOOTDIS_NOW_MASK != 0
+        if !disabled
+            var v: [4]u32
+            for i in 0u32..<4 do v[i] = p.read(powman_reg.BOOT0_OFFSET + 4 * i, 4).unwrap()
+            if is_vector(v)
+                p.write(powman_reg.BOOT0_OFFSET, 4, 0).unwrap()
+                return self.vector_start(v, s"POWMAN's BOOT0-3 ask", "BOOT2")
+            val s = self.chip.watchdog.scratch
+            if is_vector([s[4], s[5], s[6], s[7]])
+                self.chip.watchdog.scratch[4] = 0
+                return self.vector_start([s[4], s[5], s[6], s[7]], "the watchdog's reset asks", "SCRATCH6")
+        p.write(powman_reg.BOOTDIS_OFFSET, 4, (POWMAN_PASSWORD << 16) | powman_reg.BOOTDIS_NOW_MASK).unwrap()
         if !self.flash_image()
-            return Err("the watchdog's reset leaves the boot ROM a normal boot, and the flash holds no image (no block marker 0xffffded3 in its first 4 KB): the ROM would enter BOOTSEL's USB boot, which is not modelled")
+            return Err(s"$cause leaves the boot ROM a normal boot, and the flash holds no image (no block marker 0xffffded3 in its first 4 KB): the ROM would enter BOOTSEL's USB boot, which is not modelled")
         self.write_boot_info(BOOT_TYPE_NORMAL)
         Ok(Start(self.flash_word(4), self.flash_word(0), XIP_BASE, false, true))
 
+    // The boot a vector (magic, check, SP, PC) asks for: a PC/SP boot, which BOOT_INFO reports; a PC of
+    // the magic asks for a boot of the type in the SP's word, the ROM's own boot path, refused by name
+    // (`who` asks, its type in `type_word`). The vector is consumed, its magic cleared (an assumption).
+    private vector_start(*self, v: [4]u32, who: string, type_word: string) -> Result[Start, string]
+        if v[3] == WATCHDOG_BOOT_MAGIC
+            return Err(s"$who the boot ROM for a boot of type ${v[2]} ($type_word), which is the ROM's own boot path, not run (docs/rp-coverage.md items 25, 26 and 30)")
+        self.write_boot_info(BOOT_TYPE_PC_SP)
+        Ok(Start(v[3], v[2], 0, false, true))
+
     // The watchdog's reset has taken down the PSM `stages`: the XIP block's mapping follows it; core 1,
     // where its stage was among them, starts again from reset in the boot ROM, and core 0 boots through
-    // `watchdog_boot`. The RCP's salts are the cold processor domain's (PROC_COLD), which a core's own
+    // `rom_boot_path`. The RCP's salts are the cold processor domain's (PROC_COLD), which a core's own
     // reset keeps. A boot benchtop cannot make ends the run with its reason.
     private restart(*self, stages: u32) -> Result[unit, string]
         if self.chip.take_xip_changed()
@@ -263,7 +294,7 @@ impl ArmBoard
         if stages & psm_reg.WDSEL_PROC_COLD_MASK != 0 then self.chip.rcp = rcp()
         if stages & psm_reg.WDSEL_PROC1_MASK != 0 then self.rom_reset(1)
         if stages & psm_reg.WDSEL_PROC0_MASK == 0 then return Ok(())
-        val start = self.watchdog_boot()?
+        val start = self.rom_boot_path("the watchdog's reset")?
         self.chip.rom_boot_releases()
         self.start_core0(start)
         // The ROM salts an RCP whose salts are unset before it hands over, as at power-on.
@@ -343,6 +374,9 @@ impl ArmBoard
             self.settle()
             if !self.take_restart() then return RunEnd.Fault
             if self.asleep()
+                // A core the power-down finds with an interrupt pending wakes, and runs the next quantum.
+                if self.chip.power_down_due() && !self.halted() then continue
+                if self.chip.power_down_due() then self.power_down()
                 val next = self.next_wake() match
                     Some(n) -> min(n, limit - self.chip.now)
                     None -> return RunEnd.Asleep
@@ -354,6 +388,14 @@ impl ArmBoard
     // Restart what a watchdog reset since the last call took down; false, with `refused` saying why,
     // where the boot it asks for is not one benchtop makes. Only between quanta: no core is running.
     private take_restart(*self) -> bool
+        self.chip.take_power_up() match
+            Some(state) ->
+                self.power_up(state) match
+                    Ok(_) -> ()
+                    Err(why) ->
+                        self.refused = s"core 0: $why"
+                        return false
+            None -> ()
         val stages = self.chip.take_restart() match
             Some(s) -> s
             None -> return true
@@ -362,6 +404,55 @@ impl ArmBoard
             Err(why) ->
                 self.refused = s"core 0: $why"
                 false
+
+    // Whether every started core has halted for POWMAN: each is asleep with nothing pending that would
+    // wake it now. One that would wakes, and the power-down waits on.
+    private halted(*self) -> bool
+        for k in 0..<2
+            if !self.started[k] then continue
+            val c = &self.cores[k]
+            if arm.wake_by(c, arm.clock(c, c.retired)) then return false
+        true
+
+    // POWMAN powers the switched core down (`Rp2350.power_down`): both cores stop, core 1 back in the
+    // boot ROM's wait for when it powers up; an SRAM bank the state switches off loses its contents
+    // (they read 0 when it powers up again), and so does the XIP cache, as cache-as-SRAM. Code decoded
+    // from what was cleared decodes again.
+    private power_down(*self)
+        val state = self.chip.power_down()
+        self.started = [false, false]
+        val top = self.map.base + self.map.size
+        if state & DOMAIN_SRAM0 != 0 then self.clear_sram(SRAM_BASE, min(top, SRAM_BANK1_BASE))
+        if state & DOMAIN_SRAM1 != 0 then self.clear_sram(SRAM_BANK1_BASE, top)
+        if state & DOMAIN_XIP != 0
+            for i in 0u32..<XIP_SRAM_BYTES do self.mem.ram[self.sram_at + i] = 0
+            arm.fetch_changed(self.mem, XIP_SRAM_BASE, XIP_SRAM_BYTES)
+
+    // SRAM from `from` to `end`, where the map has it, cleared.
+    private clear_sram(*self, from: u32, end: u32)
+        val lo = if from > self.map.base then from else self.map.base
+        if end <= lo then return
+        for a in lo..<end do self.mem.ram[a - self.map.base] = 0
+        arm.fetch_changed(self.mem, lo, end - lo)
+
+    // The switched core has powered up to `state`: the XIP block's mapping follows its reset, core 1
+    // starts from reset in the boot ROM, and core 0 boots through `rom_boot_path`. A boot benchtop cannot make ends
+    // the run with its reason.
+    private power_up(*self, state: u32) -> Result[unit, string]
+        if self.chip.take_xip_changed()
+            self.xip_epoch = self.chip.xip.epoch +% 1
+            self.sync_xip()
+        if state & (DOMAIN_SRAM0 | DOMAIN_SRAM1) != 0
+            return Err(s"POWMAN powers the switched core up with SRAM bank${if state & DOMAIN_SRAM0 != 0 && state & DOMAIN_SRAM1 != 0 then "s 0 and 1" elif state & DOMAIN_SRAM0 != 0 then " 0" else " 1"} still off (SEQ_CFG.HW_PWRUP_SRAM0/1), which is not modelled: the cores reach SRAM on their fast path")
+        // Everything in the switched core is at power-on, the RCP's salts with it: the ROM salts them.
+        self.chip.rcp = rcp()
+        self.chip.rcp.salted = [true, true]
+        val start = self.rom_boot_path("POWMAN's power-up")?
+        self.chip.rom_boot_releases()
+        self.start_core0(start)
+        self.rom_reset(1)
+        if start.pc & 1 == 0 then arm.halt(&self.cores[0], Stop.Fault, start.pc)
+        Ok(())
 
     // Core `k` through `q` cycles of the quantum: run while awake, sleep the rest.
     private run_core(*self, k: usize, q: u64) -> RunEnd
@@ -564,6 +655,10 @@ impl arm.Bus for ArmBoard
                 else
                     self.refuse(cpu, 0, e.why)
                 Some(0)
+
+// Whether the four words are a boot vector the ROM's `try_vector` takes: the magic, then the PC XORed
+// with the magic's negation.
+private is_vector(v: [4]u32) -> bool = v[0] == WATCHDOG_BOOT_MAGIC && v[1] == v[3] ^ (0 -% WATCHDOG_BOOT_MAGIC)
 
 // Whether `a` is in XIP_SRAM, the 16 KB of the XIP cache's lines pinned as SRAM.
 private in_xip_sram(a: u64) -> bool = a >= u64(XIP_SRAM_BASE) && a < u64(XIP_SRAM_BASE) + u64(XIP_SRAM_BYTES)

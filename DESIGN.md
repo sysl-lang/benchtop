@@ -2147,8 +2147,7 @@ Each points at the name or value it is about; `<x>` is the name in the file.
 
 ### 12.11 The chip as a description
 
-**Built, except where marked**: a product with no `view` laying its boards out side by side is
-design, and the questions at the end are open.
+**Built**; the questions at the end are open.
 
 **The MCU is a level of its own between the cores and the board**, and it is where everything on
 the cores' bus lives. Each level has one kind of content:
@@ -2245,15 +2244,32 @@ product's view is what is drawn, and its elements may show a board instance as a
 show = pico, at = [124, 54] }` draws the board's own view there at its own size, with the board's elements in it,
 turned by `look { rotate }` as a display is. A board left out of the product's view is not drawn,
 and its parts appear only as the product shows them one by one (`led { show = pico.led }`), as a
-case's window shows an LED. *(Design:)* a product with no `view` shows each board's view, side by
-side in the order the boards are written.
+case's window shows an LED.
+
+**A product with no `view` lays its boards out side by side**: each board with a view of its own is
+shown whole, left to right in the order the boards are written, tops aligned, 24 px apart and 24 px
+from the edge, on black (`side_by_side`, `drawing.sysl`). A board with no view is left out, and a
+product none of whose boards has one is refused, naming its file: `` kit.hocon: the product `k` has
+no view, and none of its boards has one to lay out side by side ``.
+
+**A board shown whole brings its input with it.** Its key and pointer bindings are the window's too,
+named as the product names them — `a = btn` becomes `a = pico.btn`, and `pointer { display = touch
+}` hits `pico.display` where the board sits — and drive the board's parts (`window_keys`,
+`window_pointers`). Its parts join the side panel's list and its potentiometers the sliders, named
+the same way, and turn the board's own inputs (`window_parts`, `knob_elements`, `ui/scene.sysl`).
+The product's own come first and win: a key the product binds is the product's alone, a board's
+pointer binding whose element overlaps an element the product binds is left out, a board's part
+with the name of one of the product's own (or an earlier board's) is left out, and a board's knob
+that one of the product's own knobs overlaps is not turned by a drag. A product's key may name a board's part, with or without its control (`a = pico.btn`,
+`a = pico.btn.press`).
 
 The element's size is the board's view turned, and is left out; a size written is held to it (``
 the element `p` shows `pico` whole, so its size is the board's own, 168 × 408, not 9 × 9 ``). A
 board with no view has nothing to show whole (`` shows the board `n` whole, but it has no view ``).
 A board shown whole draws each of its parts, so one of its parts shown alone beside it is refused,
 `` `pico.led` is already drawn in `pico`'s view ``, and so is the board shown whole twice, `` `pico`
-is already drawn whole by the element `p` ``. The window draws the board as its own view is drawn —
+is already drawn whole by the element `p` ``; each names the board and points at its line in the file
+(`` kit.hocon:8:… ``). The window draws the board as its own view is drawn —
 its background with the board's edge, the element's label under it — and then the board's elements,
 moved and turned with it and named as the product names them (`pico.led`), so a click on the
 board's LED selects `pico.led` (`drawing.sysl`).

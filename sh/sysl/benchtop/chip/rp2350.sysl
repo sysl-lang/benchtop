@@ -51,6 +51,10 @@ import sysl.math.min
 // runs its cores in it, so core 1's wait for a launch is the ROM's own code on the SIO FIFOs. The chip
 // tells the board when PSM holds core 1 in reset and when it lets it go (`take_core1_reset`,
 // `take_core1_release`); an access that reaches the chip at the ROM's addresses is refused by name.
+//
+// **POWMAN powers the switched core down and up** (`power_down`, `take_power_up`): down, every block
+// but POWMAN is at power-on and only POWMAN advances, its power-up requests seeing the pads through their
+// isolation latches; a request powers it up again, for the board to boot.
 
 /** The Pico 2's crystal. */
 const XOSC_HZ: u64 = 12000000
@@ -206,6 +210,19 @@ struct Rp2350
     ref_rest: u64
     xosc_rest: u64
     rosc_rest: u64
+    // Whether POWMAN has powered the switched core down (`power_down`), and the state it has powered it
+    // up to since the board last asked (`take_power_up`).
+    swcore_off: bool
+    woke: Option[u32]
+    // What drives each GPIO from off the chip, bit n for GPIO n: whether something does, and the level
+    // (`drive_from_outside`).
+    outside_driven: u64
+    outside_level: u64
+    // What the pads' isolation latches hold while the switched core is down, as each pad was at the
+    // power-down: whether it drove, its level, and whether its input was enabled.
+    held_driven: u64
+    held_level: u64
+    held_ie: u64
 
     /** Power-on, with core 1 in the boot ROM; the flash keeps its array, as the board's part. */
     reset(*self)
@@ -237,6 +254,12 @@ struct Rp2350
         val sys = self.sys_hz()
         self.now += cycles
         if sys == 0 then return
+        if self.swcore_off
+            // Only the always-on domain runs: POWMAN's timer from the LPOSC, and its power-up requests.
+            self.powman.advance(cycles, sys, LPOSC_HZ, 0, false)
+            self.powman.sample(self.pwrup_levels())
+            if self.powman.wake_due() then self.power_up()
+            return
         self.ref_rest += cycles * self.ref_hz()
         val ref_cycles = self.ref_rest / sys
         self.ref_rest %= sys
@@ -258,6 +281,7 @@ struct Rp2350
                 Some(n) -> self.pin(n).input
                 None -> false
             self.powman.advance(cycles, sys, LPOSC_HZ, self.crystal_hz(), level)
+        if self.powman.watching() then self.powman.sample(self.pwrup_levels())
         // No debugger halts a core or drives JTAG, so no PAUSE applies.
         self.watchdog.advance(made[usize(Tick.Watchdog)], 0)
         self.watchdog_reset()
@@ -270,10 +294,13 @@ struct Rp2350
     catch_up(*self, t: u64) = if t > self.now then self.advance(t - self.now)
 
     /** The clk_sys cycles until the next device event that could wake a core: an alarm (a TIMER's or the
-     * always-on timer's), MTIMECMP, or the watchdog firing, whose reset the board takes.
+     * always-on timer's), MTIMECMP, or the watchdog firing, whose reset the board takes. While the
+     * switched core is down only the always-on timer's alarm is one; a power-up GPIO changes only when
+     * something outside drives it.
      */
     next_event(self) -> Option[u64]
         var due = self.powman.next_alarm(self.sys_hz(), LPOSC_HZ, self.crystal_hz())
+        if self.swcore_off then return due
         self.watchdog.ticks_to_fire(0) match
             Some(n) -> due = earliest(due, self.ticks_to_cycles(Tick.Watchdog, n))
             None -> ()
@@ -322,7 +349,9 @@ struct Rp2350
             Rosc -> self.rosc.read(o, width)
             SysInfo -> self.sysinfo.read(o, width)
             SysCfg -> self.syscfg.read(o, width)
-            Powman -> self.powman.read(o, width)
+            Powman ->
+                if self.powman.watching() then self.powman.sample(self.pwrup_levels())
+                self.powman.read(o, width)
             AccessCtrl -> self.accessctrl.read(o, width)
             IoQspiBlock -> self.io_qspi.read(o, width)
             PadsQspi -> self.pads_qspi.read(o, width)
@@ -390,7 +419,16 @@ struct Rp2350
             Rosc -> self.rosc.write(o, width, x)
             SysInfo -> self.sysinfo.write(o, width, x)
             SysCfg -> self.syscfg.write(o, width, x)
-            Powman -> self.powman.write(o, width, x)
+            Powman ->
+                self.powman.unmodelled(o, width, x) match
+                    Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
+                    None -> ()
+                // The power-up requests as they stand, for a STATE request to be judged against; then
+                // a request just enabled takes its GPIO's level, latching no edge.
+                if self.powman.watching() then self.powman.sample(self.pwrup_levels())
+                val r = self.powman.write(o, width, x)
+                if self.powman.watching() then self.powman.sample(self.pwrup_levels())
+                r
             AccessCtrl -> self.accessctrl.write(core, o, width, x)
             IoQspiBlock -> self.io_qspi.write(o, width, x)
             PadsQspi -> self.pads_qspi.write(o, width, x)
@@ -501,6 +539,95 @@ struct Rp2350
         self.core1_release = false
         released
 
+    /** Whether a power-down of the switched core waits for the processors to halt (POWMAN's
+     * STATE.WAITING); the board, which knows when they have, makes it (`power_down`).
+     */
+    power_down_due(self) -> bool = self.powman.power_down_due()
+
+    /** The processors have halted, and POWMAN powers the switched core down to the state STATE.REQ asked
+     * for (datasheet 6, "Power management"; Q7: the time it spends there is skipped). Everything in the
+     * switched core goes back to power-on, as at a power-on with the always-on domain kept: POWMAN with
+     * its timer, the flash part, and what drives the pins from outside. The pads' isolation latches hold
+     * each pad as it was (`held_*`), for POWMAN's power-up requests to see. Answers the state powered
+     * down to (STATE.CURRENT's bits), whose SRAM banks and XIP cache the board clears where they are
+     * off. Until it powers up again only the always-on domain runs (`advance`).
+     */
+    power_down(*self) -> u32
+        var driven: u64 = 0
+        var level: u64 = 0
+        var ie: u64 = 0
+        for n in 0..<GPIO_COUNT
+            val p = self.pin(n)
+            val bit = 1u64 << u64(n)
+            if p.drives then driven |= bit
+            if p.level then level |= bit
+            if self.pads.pads[n] & pads_reg.GPIO0_IE_MASK != 0 then ie |= bit
+        val state = self.powman.power_down()
+        val powman = self.powman
+        val now = self.now
+        val outside = (self.outside_driven, self.outside_level)
+        val bytes = self.flash.bytes
+        val size = self.flash.size
+        *self = rp2350()
+        if size != 0 then self.flash.connect(bytes, size)
+        self.powman = powman
+        self.now = now
+        self.outside_driven = outside.0
+        self.outside_level = outside.1
+        self.held_driven = driven
+        self.held_level = level
+        self.held_ie = ie
+        self.swcore_off = true
+        self.xip_changed = true
+        state
+    end power_down
+
+    // A power-up request while the switched core is down: it powers up, with core 1 in the boot ROM and
+    // every block at power-on, and the board boots core 0 (`take_power_up`).
+    private power_up(*self)
+        self.woke = Some(self.powman.power_up())
+        self.swcore_off = false
+
+    /** The state POWMAN has powered the switched core up to since the last call (STATE.CURRENT's bits),
+     * where it has; the board boots core 0 through the boot ROM's power-up path.
+     */
+    take_power_up(*self) -> Option[u32]
+        val w = self.woke
+        self.woke = None
+        w
+
+    /** Drive GPIO `n` from off the chip at `level`, or leave it undriven with None: the level its pad
+     * sees where it does not drive itself, and the level a power-up request sees while the switched core
+     * is down.
+     */
+    drive_from_outside(*self, n: u32, level: Option[bool])
+        val bit = 1u64 << u64(n)
+        level match
+            Some(v) ->
+                self.outside_driven |= bit
+                self.outside_level = if v then self.outside_level | bit else self.outside_level & ~bit
+            None -> self.outside_driven &= ~bit
+
+    // What POWMAN's power-up requests see on the GPIOs they watch, bit n for GPIO n: the pad's level
+    // where its input is enabled. While the switched core is down, a pad's isolation latch holds it: a
+    // pad that drove keeps its level, and one that did not follows what drives it from outside, or
+    // keeps the level its pulls gave it.
+    private pwrup_levels(self) -> u64
+        var levels: u64 = 0
+        for k in 0u32..<4
+            self.powman.pwrup_gpio(k) match
+                Some(g) ->
+                    val bit = 1u64 << u64(g)
+                    val high =
+                        if self.swcore_off
+                            val from_outside = self.held_driven & bit == 0 && self.outside_driven & bit != 0
+                            self.held_ie & bit != 0 && (if from_outside then self.outside_level & bit != 0 else self.held_level & bit != 0)
+                        else self.pads.pads[g] & pads_reg.GPIO0_IE_MASK != 0 && self.pin(g).level
+                    if high then levels |= bit
+                None -> ()
+        levels
+    end pwrup_levels
+
     // A read of the XIP address space outside XIP_SRAM, which the board runs: the flash through a
     // window, or why it is a bus error.
     private xip_read(self, a: u32, width: u32) -> Result[u32, string]
@@ -555,7 +682,10 @@ struct Rp2350
         self.io.after_overrides(n, d)
 
     /** What GPIO `n` is doing: whether its pad drives, and its level. */
-    pin(self, n: u32) -> Pin = self.pads.pin(n, self.drive(n), None)
+    pin(self, n: u32) -> Pin
+        val bit = 1u64 << u64(n)
+        if self.outside_driven & bit == 0 then return self.pads.pin(n, self.drive(n), None)
+        self.pads.pin(n, self.drive(n), Some(self.outside_level & bit != 0))
 
     private drives(self) -> [GPIO_COUNT]Drive
         var all: [GPIO_COUNT]Drive
@@ -594,7 +724,7 @@ rp2350() -> Rp2350 =
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
         rp.xip(), rp.qmi(), qspi_flash(), false,
-        rcp(), dcp(), false, false, None, 0, 0, 0, 0)
+        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0)
 
 private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
     Some(x) -> b match

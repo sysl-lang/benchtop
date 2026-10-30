@@ -75,6 +75,11 @@ struct Lockstep
     held_at: [2]u64
     // 1 once a core has stopped.
     ended: u32
+    // How many times each core has dozed; the doze the other core last woke it from, which only a
+    // holder of `Scheduler.board` changes; and how many times the other has woken it so (`alert`).
+    naps: [2]u64
+    told: [2]u64
+    alerts: [2]u64
 
 /** The board's clock and the cores' threads. Each machine owns one (`Machine.scheduler`), so two
  * machines in one process run on clocks and threads of their own; a product of several boards will
@@ -110,7 +115,7 @@ struct Scheduler
 
 /** A scheduler as at power-on, with no worker started. */
 private[virt] scheduler() -> Scheduler = Scheduler(0, QUANTUM, ALONE, false, false, false, false, false, NEVER, false,
-    Lockstep([0, 0], [0, 0], [NEVER, NEVER], [0, 0], [0, 0], 0),
+    Lockstep([0, 0], [0, 0], [NEVER, NEVER], [0, 0], [0, 0], 0, [0, 0], [0, 0], [0, 0]),
     Mutex.new(0), Condvar.new(), no_workers(), dsi_worker())
 
 /** Every field of `s` as at power-on, keeping the CPU workers' threads where they run. */
@@ -408,10 +413,29 @@ private after_run(s: *Scheduler, o: int, t: u64)
     alert(s, o, t)
     if atomic_load(&l.holding[o], SeqCst) != 0 && atomic_load(&l.held_at[o], SeqCst) < t + LAG_QUANTA * s.quantum then nudge(s)
 
-// Wake core o where it sleeps until a SysTick expiry that the clock `t` has passed.
+// Wake core o where it sleeps until a SysTick expiry that the clock `t` has passed, once a doze. A
+// core held back spins on this, and runs it after every run of its own, while the sleeper's thread
+// is still on its way up; telling it again would only take the board's lock from under it. Each doze
+// is a wait of its own (`doze`), made under the lock with `naps` counted first, and `told` is set
+// under the same lock, so the one wake-up reaches the wait it was meant for.
 private alert(s: *Scheduler, o: int, t: u64)
     val l = &s.lockstep
-    if atomic_load(&l.dozing[o], SeqCst) != 0 && t >= atomic_load(&l.wake_at[o], SeqCst) then nudge(s)
+    if !alert_due(l, o, t) then return
+    s.board.lock_raw()
+    if alert_due(l, o, t)
+        atomic_store(&l.told[o], atomic_load(&l.naps[o], SeqCst), SeqCst)
+        atomic_add(&l.alerts[o], 1, Relaxed)
+        s.wakeup.notify_all()
+    s.board.unlock_raw()
+
+// Whether core o dozes until a clock `t` has reached, and has not been woken from this doze.
+private alert_due(l: *Lockstep, o: int, t: u64) -> bool =
+    atomic_load(&l.dozing[o], SeqCst) != 0 && t >= atomic_load(&l.wake_at[o], SeqCst) && atomic_load(&l.told[o], SeqCst) != atomic_load(&l.naps[o], SeqCst)
+
+// How many times core k has dozed on its thread, and how many times the other core's clock has woken
+// it from a doze.
+private[virt] lockstep_naps(m: *Machine, k: int) -> u64 = atomic_load(&m.scheduler.lockstep.naps[k], SeqCst)
+private[virt] lockstep_alerts(m: *Machine, k: int) -> u64 = atomic_load(&m.scheduler.lockstep.alerts[k], SeqCst)
 
 // Wake every core's thread blocked on the board's lock. The UI's controls call it only after
 // releasing the workers' control lock.
@@ -454,6 +478,7 @@ private doze(m: *Machine, cpu: *Cpu, k: int)
         // A bounded job must wake at its horizon even when the next device
         // event is later: its peer may already have returned from this job.
         atomic_store(&l.wake_at[k], min(min(min(board_next_wake(cpu), device_wake(m, cpu)),worker_clock_limit(s, cpu)),s.horizon), SeqCst)
+        atomic_add(&l.naps[k], 1, SeqCst)
         atomic_store(&l.dozing[k], 1, SeqCst)
 
         // A core held back by this one's clock is held back no longer.
