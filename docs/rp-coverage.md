@@ -679,10 +679,22 @@ function that records the boot type (PC_SP) and `watchdog_caused_reboot` (no) be
   INTR.TIMER and, through INTE, POWMAN_IRQ_TIMER (45). Cleared while still enabled and past, it latches
   again (the warning on `powman_clear_alarm`). `next_event` includes the alarm while it counts from the
   LPOSC or the crystal, exact to the clk_sys cycle, so cores asleep in WFI skip straight to it (Q7).
-- **The password** covers every timer register; a 1 clears a write-1-to-clear bit through any alias,
-  the CLR alias included, because the SDK clears TIMER.ALARM and STATE.REQ_IGNORED with
-  `powman_clear_bits` and TinyUSB clears SIE_STATUS through USB's CLR alias. (ROSC's STATUS.BADWRITE and
-  ACCESSCTRL still treat a CLR alias as writing no ones.)
+- **The password** covers every timer register, through every alias.
+- **Atomic aliases on fields a write acts on** — one rule for every RP2040 and RP2350 model
+  (`peripheral/rp2040/access.sysl`, `w1c` and `triggered`). The datasheet's "Atomic register access" has
+  the peripheral perform SET, CLR or XOR in place on the bus data, which arrives unchanged (an alias write
+  to POWMAN or ACCESSCTRL must carry the password). A **write-1-to-clear** flag clears on a 1 in the data
+  through the plain address and all three aliases: TinyUSB clears USB's SIE_STATUS and BUF_STATUS with
+  `usb_hw_clear`, and the SDK clears POWMAN's TIMER.ALARM and STATE.REQ_IGNORED with `powman_clear_bits`
+  and SHA-256's ERR_WDATA_NOT_RDY with `hw_clear_bits` — were the write CLR's result, each would clear
+  every other pending flag and never its own. Modelled: POWMAN's BADPASSWD, CHIP_RESET.RESCUE_FLAG,
+  TIMER.ALARM and INTR.VREG_OUTPUT_LOW; ROSC's STATUS.BADWRITE; TIMER0/1's ARMED and INTR (and the
+  RP2040's TIMER). A **self-clearing** control is a stored bit that falls back to 0, so it fires on a 1
+  written plainly or through SET or XOR and not through CLR: POWMAN's TIMER.CLEAR and USE_*,
+  ACCESSCTRL's CFGRESET, the watchdog's CTRL.TRIGGER; USB's SIE_CTRL controls read back 0. Unobserved
+  by any SDK or TinyUSB code, so inferred from that mechanism: a WC flag through SET or XOR, and an SC
+  control through CLR. UART's ICR and DR sit behind the bus interposer, which turns an alias write into
+  a read-modify-write, and their aliases are refused.
 - **The LPOSC** runs at its nominal 32.768 kHz; TRIM and MODE are stored and change nothing (Q8).
 - **Assumptions**, since the headers do not say: a write naming several sources takes the GPIO over the
   crystal over the LPOSC; SET_TIME and the frequency registers written while running take effect at the

@@ -64,9 +64,12 @@ of the interrupt-enable mask.
 
 RESETS, TIMER and the watchdog implement RP2040 replicated byte/halfword writes, little-endian
 narrow reads, and the +0x1000/+0x2000/+0x3000 XOR/SET/CLR aliases for ordinary RW registers. Reads
-through these aliases have the same effects as a base read. To avoid inventing unverified hardware
-behavior, atomic-alias writes to TIMER's write-only time registers and write-one-to-clear
-ARMED/INTR return `UnsupportedAlias`. Normal writes to those registers are implemented. Read-only
+through these aliases have the same effects as a base read. A write-1-to-clear flag (TIMER's
+ARMED and INTR) clears on a 1 in the data through the plain address and every alias, and a
+self-clearing control (the watchdog's CTRL.TRIGGER) fires on a 1 through any alias but CLR — one
+rule for every model on both chips, stated with its evidence in `access.sysl` (`w1c`, `triggered`).
+To avoid inventing unverified hardware behavior, atomic-alias writes to TIMER's write-only time
+registers return `UnsupportedAlias`; normal writes to them are implemented. Read-only
 writes are ignored; write-only time reads return zero. Unknown registers, invalid widths and
 unaligned transfers return explicit errors without changing state. SIO has no bus atomic aliases.
 
