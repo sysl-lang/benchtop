@@ -60,6 +60,10 @@ target_link_libraries(qmi_flash hardware_xip_cache)
 benchtop_program(powman powman.c default)
 target_link_libraries(powman hardware_powman)
 
+# USB device mode: stdio over the SDK's TinyUSB CDC device as well as UART0.
+benchtop_program(usb_device usb_device.c no_flash)
+pico_enable_stdio_usb(usb_device 1)
+
 # The whole program in the XIP cache's 16 KB, as the SDK's own `pico_xip_sram_test` is built.
 benchtop_program(xip_sram xip_sram.c xip_ram)
 pico_minimize_runtime(xip_sram INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
