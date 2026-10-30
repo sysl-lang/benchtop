@@ -73,7 +73,7 @@ day. An L is split before it is handed out (§6).
 | M33 coprocessors: GPIOC (CP0), DCP (CP4/5), RCP (CP7) | 3.6 Cortex-M33 coprocessors | full | `MCR`, `MRC`, `MCRR`, `MRRC`, `CDP` and their `…2` forms reach the board through `Bus.coprocessor`, gated by CPACR, which keeps the fields of the ports the board fills (`v6m/coproc.sysl`). **GPIOC is full**: every instruction of `gpio_coproc.h` is its SIO equivalent (`chip/coprocessors.sysl`). **RCP is full** (item 3): salts, canaries, boolean and integer checks, the sequence counter, the random byte and `rcp_panic`, each core its own state; a failed check stops the core at `Fault` with the check named (`chip/rcp.sysl`). **DCP is full** (item 7): every instruction of `dcp_instr.inc.S` in its `R…` and `P…` forms on CP4 and CP5, each core's two instances its own, so every canned sequence gives its IEEE result (`chip/dcp.sysl`). Any encoding outside a coprocessor's set is refused by name. | `v6m/coproc_tests.sysl`, `chip/rcp_tests.sysl`, `chip/dcp_tests.sysl` (`dcp.elf`), `chip/arm_tests.sysl` (`rcp.elf`, `gpioc.elf`) | — | — |
 | Hazard3 ×2 (RV32IMAC + Zb*/Zc*/Zcmp, PMP, Xh3pmpm, Xh3power) | 3.8 Hazard3 | full | `riscv/rp2350.sysl:6–22` and `riscv/HAZARD3-COVERAGE.md`. | `riscv/hazard3_*_tests`, `chip/tests.sysl:18` | — | — |
 | Hazard3 interrupt controller (Xh3irq) | 3.8 | full | MEIEA, MEIPA, MEINEXT and MEICONTEXT (`riscv/csr.sysl:34–42`). Only the lines `signal` drives ever pend (see "Interrupt routing"). | `riscv/hazard3_tests` | — | — |
-| Architecture switching (ARCHSEL, both pairs) | 3.9 Architecture switching | missing | The board fixes the cores (`boards/pico2-riscv.hocon` against `pico2`). | — | S | Arm board, boot path |
+| Architecture switching (ARCHSEL, both pairs) | 3.9 Architecture switching | missing | The board fixes the cores (`boards/pico2-riscv.hocon` against `pico2`). OTP's ARCHSEL and ARCHSEL_STATUS report the board's architecture; an ARCHSEL write naming the other is refused by name (item 26). | `chip/otp_tests.sysl` | S | Arm board, boot path |
 | Interrupt routing (52 lines) | 3.2 Interrupts | partial | Wired: TIMER0/1 ×4, SIO_FIFO, SIO_BELL, POWMAN_IRQ_POW and POWMAN_IRQ_TIMER, UART0 and UART1, plus MTIME and the soft IRQ (`chip/rp2350.sysl:325–336`). Every other source is absent with its block. | `chip/tests.sysl:18` | grows with each block | — |
 | SIO: CPUID, GPIO (both banks), FIFOs (4-deep), spinlocks, FIFO IRQ | 3.1 SIO | full | `peripheral/rp2350/sio.sysl:6–11,13,39–60`. The E2 erratum option (DESIGN.md §9.3) is not built. | `peripheral/rp2350/tests.sysl:129`, `chip/tests.sysl:94,115` | — | — |
 | SIO RISC-V platform timer (MTIME, MTIMECMP, soft IRQ) | 3.1.8 / 3.1 SIO | full | `peripheral/rp2350/sio.sysl:15–16,48–51`. | `rp2350/tests.sysl:129` | — | — |
@@ -83,13 +83,13 @@ day. An L is split before it is handed out (§6).
 | BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | missing | Not decoded. | — | S (counters) | DMA/cores for events |
 | ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. Nothing else on the chip consults it (Secure-only, Q3). | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | ROM: core-1 launch protocol | 5.3 / 5 Bootrom | full | The real ROM's own code, on both boards: each M33's and Hazard3's core 1 starts from reset in it and waits there (salts, then the FIFO handshake, asleep in `WFE` / `h3.block`); PSM's release restarts it (item 6). | `chip/arm_tests.sysl`, `chip/startup_tests.sysl` | — | — |
-| ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | partial | Raspberry Pi's A4 image, whole, at 0 on both boards (`chip/rom/`); every function runs as the ROM's code. Run end to end: the lookup, `get_sys_info`'s BOOT_INFO, `connect_internal_flash`, `flash_exit_xip`, `flash_range_erase`/`_program`, `flash_flush_cache`, the unique ID, `bootrom_state_reset` and `reboot` (PC/SP). Each other function runs until it reaches a block not modelled, which refuses it by name: OTP's control registers (`otp_access`, `get_sys_info`'s CPU_INFO and CRITICAL), USB (`reset_usb_boot`), the partition and image calls (item 30). | `chip/arm_tests.sysl` (`rom.elf`) | M | OTP (26), USB (20), item 30 |
-| Boot path: IMAGE_DEF, partition tables, UF2, secure-boot flags, signature check | 5 Bootrom, 10 Security | missing | Core 0 does not run the ROM's boot path: power-on and the watchdog's reset hand an image over as it would (`chip/arm_board.sysl`), writing BOOT_INFO where the ROM keeps it. It needs TRNG and SHA-256 (the boot salts), OTP and the image parsing. | — | L | ROM, OTP, XIP, SHA-256 |
+| ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | partial | Raspberry Pi's A4 image, whole, at 0 on both boards (`chip/rom/`); every function runs as the ROM's code. Run end to end: the lookup, `get_sys_info`'s BOOT_INFO, CHIP_INFO, CRITICAL and CPU_INFO, `connect_internal_flash`, `flash_exit_xip`, `flash_range_erase`/`_program`, `flash_flush_cache`, the unique ID, `otp_access` (reads and writes, raw and ECC, its lock and argument checks; item 26), `bootrom_state_reset` and `reboot` (PC/SP). Each other function runs until it reaches a block not modelled, which refuses it by name: USB (`reset_usb_boot`), the partition and image calls (item 30). | `chip/arm_tests.sysl` (`rom.elf`), `chip/otp_tests.sysl` (`otp.elf`) | M | USB (20), item 30 |
+| Boot path: IMAGE_DEF, partition tables, UF2, secure-boot flags, signature check | 5 Bootrom, 10 Security | missing | Core 0 does not run the ROM's boot path: power-on and the watchdog's reset hand an image over as it would (`chip/arm_board.sysl`), writing BOOT_INFO and the chip ID it copies from the OTP where the ROM keeps them. It needs TRNG and SHA-256 (the boot salts) and the image parsing; the OTP's boot flags and critical flags it reads are modelled (item 26). | — | L | ROM, XIP, SHA-256 |
 | SRAM 0–9 (520 KB) | 4.2 SRAM | full | `mcus/rp2350.hocon:19`. Striping does not matter to a program. | every chip test | — | — |
 | BOOTRAM (with boot locks) | 4.3 Boot RAM | full | 1 KB of SRAM, WRITE_ONCE0/1 and the eight boot locks with BOOTLOCK_STAT (`peripheral/rp2350/startup.sysl`). | `peripheral/rp2350/startup_tests.sysl` | — | — |
 | XIP: flash window, aliases, cache, cache-as-SRAM, XIP_CTRL, streaming FIFO | 4.4 XIP | full | One 4 MB flash array (`parts/qspi_flash`, a W25Q32RV) behind the cached, uncached and untranslated windows, read and executed in place on the cores' fast path from the cached window's first 4 MB (`chip/arm_board.sysl`); the rest through the chip, translated by ATRANS and wrapping at the device's size (`peripheral/rp2350/xip.sysl`). XIP_CTRL in full, the cache's tags with every maintenance operation, lines pinned over XIP_SRAM holding their bytes (a fully pinned page on the fast path, a partly pinned one checked line by line), the streaming FIFO and XIP_AUX. Fidelity limits: the cache is functional, not timed (no lookups, so CTR_HIT/CTR_ACC are refused by name and a read is never stale); a pin over flash, a write through XIP with WRITABLE_M0 set, and code fetched from flash in direct mode or from an unpinned XIP_SRAM line are the cases not run or not refused (item 4 below). | `peripheral/rp2350/xip_tests.sysl`, `chip/xip_tests.sysl` | — | — |
 | QMI (flash and PSRAM interface; direct mode) | 12.14 QMI | full | Direct mode with both FIFOs, NOPUSH, 16-bit entries, ASSERT and AUTO chip selects, RX-full stall and BUSY, all to the flash on CS0; the window, timing and ATRANS registers stored. Instantaneous: no clock divider timing. CS1 (no PSRAM on the Pico 2) and a non-identity ATRANS0-3 are refused by name. Clocks with no chip select reach no device, and a frame whose instruction comes at dual or quad width is ignored by the SPI-mode flash, as the ROM's `flash_exit_xip` relies on (item 6); the ROM's flash routines run on it. | `peripheral/rp2350/xip_tests.sysl`, `chip/xip_tests.sysl` (`qmi_flash`) | — | — |
-| OTP | 13 OTP | partial | The four read windows (OTP_DATA, _RAW, _GUARDED, _RAW_GUARDED) over a blank array: every row reads 0, which the ROM's guarded reads of its flash settings take (`peripheral/rp2350/otp.sysl`, item 6). Writes refused by name; the OTP block's registers (SBPI, locks, CRITICAL, ARCHSEL, keys) not decoded. | `peripheral/rp2350/rom_blocks_tests.sysl`, `chip/tests.sysl` | M (programmed rows, ROM access); L (ECC, locks, keys) | ROM |
+| OTP | 13 OTP | full | The array of 4096 rows, the board's for the run (a factory image of CHIPID and RANDID; a boot starts it again, a reset keeps it); the four read windows with the ECC (SECDED, one wrong bit corrected, BRBP inversion) and the guarded windows' bus faults refused by name; SW_LOCK0–63, loaded from the PAGEn_LOCK1 rows by majority and only advanced; the SBPI bridge as the ROM's `otp_access` drives it, programming a row's bits from 0 to 1; USR; CRITICAL and KEY_VALID (0); ARCHSEL and ARCHSEL_STATUS (`peripheral/rp2350/otp.sysl`, item 26). Refused by name: programming the critical flag rows, the hardware keys and key locks, any other SBPI instruction, an uncorrectable row through the unguarded window, ARCHSEL naming another architecture, DBG, BIST, CRT_KEY, DEBUGEN(_LOCK), BOOTDIS and the interrupt registers. | `peripheral/rp2350/otp_tests.sysl`, `chip/otp_tests.sysl` (`otp.elf`), `chip/tests.sysl` | S (keys, debug enables, its interrupts) | — |
 | POWMAN: the AON timer, LPOSC, VREG and BOD control | 6 Power | full | The store: VREG (locked until UNLOCK, VSEL limit), BOD, LPOSC (TRIM, MODE) and XOSC settings, SEQ_CFG, CHIP_RESET (HAD_POR), WDSEL, SCRATCH/BOOT, the interrupt registers into IRQs 44 and 45, all behind the 0x5AFE password; a 1 clears a W1C bit through any alias. The AON timer (item 27): 64-bit milliseconds loaded from SET_TIME by RUN, CLEAR, READ_TIME live (the SDK's re-read catches the carry); from the LPOSC (nominal 32.768 kHz) or the crystal at the rate LPOSC_/XOSC_FREQ_KHZ state, from GPIO 12/20/14/22 one millisecond per rising edge, or synchronised to a 1 Hz edge; the 64-bit alarm latching TIMER.ALARM into INTR.TIMER and IRQ 45, and a sleeping core skipping to it (`peripheral/rp2350/powman.sysl`). | `rp2350/aon_tests.sysl`, `rp2350/sysctl_tests.sysl`, `chip/aon_tests.sysl` (`aon_timer.elf`), `chip/startup_tests.sysl` | — | — |
 | POWMAN power states and power-up requests | 6.2 Power management | full | STATE's requests judged as the header describes (WAITING for the processors, BAD_SW_REQ, REQ_IGNORED, PWRUP_WHILE_WAITING into POWMAN_IRQ_POW), PWRUP0–3 level and edge requests with RAW_STATUS and STATUS, the alarm request, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP, BOOTDIS; P1.x entered once every core halts, the switched core back at power-on and the SRAM banks and XIP cache it switches off cleared, time skipped to the alarm (Q7), GPIO power-ups through the pads' isolation latches and from outside the chip, and core 0 booted again as the ROM's power-up path does without the ROM (item 34). Refused by name: an SRAM bank switched off under the running switched core (P0 with a bank off), a PWRUP on a QSPI pin, a BOOT0–3 power-up vector (item 6), and the RISC-V harts' power-down (Q13). | `rp2350/power_tests.sysl`, `chip/power_tests.sysl` (`powman.elf`) | — | — |
 | GLITCH_DETECTOR | 10.9 Glitch detector | missing | Not decoded. | — | S (store) | — |
@@ -169,7 +169,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 30 | 10 | 0 | 18 | 58 |
+| RP2350 | 31 | 9 | 0 | 18 | 58 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
@@ -337,7 +337,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 23 | **RP2040 ROM**, following Q1: the float, double and mem tables plus the lookup. | L | 22 |
 | 24 | **RP2040 SSI, VREG_AND_CHIP_RESET and RTC**. | M | 22 |
 | 25 | **TRNG and SHA-256**. | S | 11 |
-| 26 | **OTP** (a stored array with ROM access; beyond that per Q10). | M | 6 |
+| 26 | **OTP** (a stored array with ROM access; beyond that per Q10). **Done** (below). | M | 6 |
 | 27 | **POWMAN AON timer and LPOSC**. **Done** (below). | M | 5 |
 | 28 | **BUSCTRL performance counters, TBMAN, GLITCH_DETECTOR stores**. | S | 11 |
 | 29 | **HSTX and the SIO TMDS encoder** (per Q9). | M | 11 |
@@ -827,7 +827,7 @@ oracle for how software drives it); the chip powers the switched core down and u
   the normal boot of the flash image, with BOOT_INFO NORMAL. Words that are no vector (what
   `pico_low_power` writes) are ignored.
 - **Where this meets the boot ROM (item 6)**: core 0's boot path through the ROM is not run (it needs
-  TRNG, SHA-256 and OTP: items 25, 26 and 30), so `rom_boot_path` makes its vector and BOOTDIS steps for
+  TRNG, SHA-256 and the image parsing: items 25 and 30), so `rom_boot_path` makes its vector and BOOTDIS steps for
   both the watchdog's reset and POWMAN's power-up.
 - **Refused by name**: a valid request switching an SRAM bank off under the running switched core (P0
   with a bank off), and a power-up into one (SEQ_CFG keeping a bank off) — the cores reach SRAM on their
@@ -952,7 +952,8 @@ in a 9-byte and an 84-byte read, string descriptors 0 to 4, SET_CONFIGURATION; e
 ELF's own `usbd_desc_device` and `usbd_desc_cfg` and the strings in `stdio_usb_descriptors.c` (the
 serial number with the one the program prints). Then SET_CONTROL_LINE_STATE raises DTR, the program's
 line arrives on bulk IN 0x82 with alternating PIDs, and a byte written to bulk OUT 0x02 reaches its
-`getchar`. The serial number reads 0000000000000000: the unique ID comes from OTP (item 26).
+`getchar`. The serial number is the OTP's chip ID, 1B970E427A015CD3, through `get_sys_info`'s CHIP_INFO
+(item 26).
 
 **Cost**, host instructions retired, three runs each against the branch's base. DPRAM's 4 KB inside
 `Rp2350` first cost 3% on the loops and 10% on `dcp.elf` (`sram_loop.elf` 5.645 G to 5.831 G): the
@@ -961,3 +962,63 @@ chip's read-only methods took `self` by value, which copies the whole chip, and 
 pin and drive queries) and the controller's own (`irq` on every signal) now take `*self`. With that:
 `bench --core cortex-m33 kernel33.bin` 37.14 G to 37.14 G; `sram_loop.elf` 5.645 G to 5.201 G and
 `xip_loop.elf` 5.868 G to 5.421 G (8% fewer); `dcp.elf` 1.110 G to 0.960 G (14% fewer).
+
+### Item 26, done: the OTP
+
+Q10 decided "OTP with ECC": the array with its ECC, the read windows, the control registers, and access
+from Raspberry Pi's boot ROM (`peripheral/rp2350/otp.sysl`, wired in `chip/rp2350.sysl`).
+
+**Persistence: per run, as the flash is.** The array (4096 words, a row in the low 24 bits of each) is
+the board's (`ArmBoard.otp_rows`, `RiscvBoard.otp_rows`), connected to the chip as the flash's array is.
+Each `boot` starts it from the factory image (`factory_otp`): CHIPID0–3 and RANDID0–7 programmed with
+their ECC, benchtop's own fixed values (no real chip's), the rest blank. A chip reset, the watchdog's and
+POWMAN's power-up keep it; nothing is written to a file.
+
+**What is modelled:**
+
+| what | model |
+|---|---|
+| the four windows | OTP_DATA and _GUARDED: 16 bits a row through the ECC, two rows a word; _RAW and _RAW_GUARDED: 24 bits a row; every width and lane |
+| the ECC | the datasheet's SECDED: data bit j at the j-th Hamming position that is not a power of two, ECC bit 5 the parity of the rest; one wrong bit of 22 corrected; a row with both BRBP bits set is its codeword inverted |
+| SW_LOCK0–63 | a write ORs in (plain, SET, XOR; CLR clears nothing); the OTP's reset loads each from PAGEn_LOCK1 by a 3-way majority of its bytes; a Secure read of an INACCESSIBLE page (or the reserved 2) is a bus fault through a guarded window and reads 0 through the others; the lock rows always read |
+| SBPI | as the ROM's `otp_access` drives it: one-byte register writes to the macro's DAP (0x02) and PMC (0x3a); the row in DAP 0xfc/0xfd, its bits in 0xc0/0xc1/0xe0, PMC 0x01 programs (0 to 1 only), the one-byte PMC 0xbf read, PMC 0x02; INSTR_DONE and RDATA_VLD write-one-to-clear; only while USR.DCTRL is clear |
+| USR | DCTRL and PD; the windows are the bus error while DCTRL is clear or PD set |
+| CRITICAL, KEY_VALID | 0: no critical flag row or key can be programmed |
+| ARCHSEL, ARCHSEL_STATUS | the board's architecture (Arm 0, RISC-V 3) |
+| the boot path's chip ID | `write_boot_info` copies OTP_DATA's first two words to BOOTRAM 0x3f8, as the ROM's boot path does (ROM 0x39fc), which `get_sys_info`'s CHIP_INFO answers and the SDK's unique board ID (and so the USB serial number) reads |
+| the watchdog's reset | OTP's PSM stage (WDSEL bit 1) puts the registers back, reloading SW_LOCK |
+
+The SBPI protocol is the ROM's own: the instruction stream `otp_access` sent (traced once from
+`examples/pico2/otp.c`) is what the model decodes; the macro's timing registers are stored and mean
+nothing here.
+
+**Refused by name:** any other SBPI instruction; programming a row SW_LOCK leaves not writable (a lock
+row by its own page's lock; the ROM checks first and never sends one), a critical flag row (CRIT0, CRIT1:
+the boot, debug and core enables are not run), a hardware key or its valid flags, and key locks in a
+PAGEn_LOCK0; an uncorrectable row through the unguarded ECC window; one BRBP bit of two; ARCHSEL naming
+the other architecture; DBG, BIST, CRT_KEY_W0–3, DEBUGEN, DEBUGEN_LOCK, BOOTDIS, INTR/INTE/INTF/INTS.
+
+**Assumptions**, since the headers do not say: an unguarded read of an inaccessible page reads 0 (the
+ROM's `otp_access` reads the row through OTP_DATA_RAW before checking its lock, ROM 0xa60, so silicon
+cannot fault there, and the value is discarded); a CLR-alias write to SW_LOCK clears nothing; the 0xbf
+status read answers 0, which the ROM takes as success.
+
+**The oracle**, `examples/pico2/otp.c` (built by `build.sh`), through the ROM: the chip ID through
+OTP_DATA, `get_sys_info` (CHIP_INFO, CRITICAL, CPU_INFO) and `otp_access`; two user rows written with ECC
+and read back through the ROM, the ECC window and the raw window; a raw row; a write clearing a bit (-18,
+UNSUPPORTED_MODIFICATION); the codeword of each data bit alone; an ECC write over a row with a bit set,
+which the ROM stores inverted with both BRBP bits (c20001); a page SW_LOCK makes read-only (write -4,
+read 0) and one it makes inaccessible (both -4); a lock that does not go back; a row past the end (-5)
+and an odd length (-11). `chip/otp_tests.sysl` asserts every line, the rows in the array, and each
+codeword the ROM's encoder made against benchtop's own `ecc_encode` (built from the construction, not
+from the ROM's output; changing the parity rule turns it red). `peripheral/rp2350/otp_tests.sysl` covers
+the model register by register.
+
+**Cost**, host instructions retired, three runs each against the branch's base. The array inside each
+board (16 KB) and the OTP block's registers inside `Rp2350` first cost 1.5% on the loops and 20% on
+`dcp.elf`: the boards' read-only methods took `self` by value, copying the whole board, and the hot ones
+(`at` on every device access, `asleep`, `reset_first`, `sram_line`) and the chip's `restarting` and
+`power_down_due` now take `*self`; the OTP block keeps only the macro's address and data registers
+(`row_at`, `row_bits`) and SW_LOCK as bytes. With that: `bench --core cortex-m33 kernel33.bin` 37.17 G to
+37.17 G; `sram_loop.elf` 5.207 G to 5.105 G and `xip_loop.elf` 5.428 G to 5.323 G (2% fewer); `dcp.elf`
+0.961 G to 0.694 G (28% fewer).

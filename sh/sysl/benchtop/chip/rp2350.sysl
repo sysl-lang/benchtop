@@ -3,13 +3,14 @@ module sh.sysl.benchtop.chip
 import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Resets, replicated, written}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
 import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, qspi_flash}
-import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, OtpWindow, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
+import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, Otp, OtpFault, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
 import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_MAINTENANCE_BASE, XIP_WINDOWS_END, read_xip, xip_aux_read, xip_aux_write, xip_target}
 import sh.sysl.benchtop.peripheral.rp2350.{DREQ_UART0_TX, Frame, Sent, UART_UNITS_PER_CYCLE, uart_of}
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
 import sh.sysl.rp2350.bootram as bootram_reg
+import sh.sysl.rp2350.otp as otp_reg
 import sh.sysl.rp2350.qmi as qmi_reg
 import sh.sysl.rp2350.xip_aux as xip_aux_reg
 import sh.sysl.rp2350.xip_ctrl as xip_ctrl_reg
@@ -116,6 +117,7 @@ enum Block
     OtpDataRaw
     OtpDataGuarded
     OtpDataRawGuarded
+    OtpBlock
 
 /** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
 struct Placed
@@ -125,7 +127,7 @@ struct Placed
     reset: u32
 
 /** Every block the chip runs, with the SVD's base addresses. */
-val BLOCKS: [32]Placed = [
+val BLOCKS: [33]Placed = [
     Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
     Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -164,6 +166,8 @@ val BLOCKS: [32]Placed = [
     Placed(Block.OtpDataRaw, OTP_DATA_BASE + 0x4000, "OTP_DATA_RAW", 0),
     Placed(Block.OtpDataGuarded, OTP_DATA_BASE + 0x8000, "OTP_DATA_GUARDED", 0),
     Placed(Block.OtpDataRawGuarded, OTP_DATA_BASE + 0xC000, "OTP_DATA_RAW_GUARDED", 0),
+    // The OTP block's registers, with their atomic aliases; on no RESETS bit.
+    Placed(Block.OtpBlock, otp_reg.BASE, "OTP", 0),
 ]
 
 /** OTP_DATA_BASE (`hardware/regs/addressmap.h`); the raw, guarded and raw guarded windows follow it
@@ -203,6 +207,8 @@ struct Rp2350
     qmi: Qmi
     // The flash on QSPI chip select 0, the board's part, whose array the board connects.
     flash: QspiFlash
+    // The OTP: the board's array, as the part's flash is, and the OTP block's registers.
+    otp: Otp
     // Something a board mirrors in its memory map has changed: the flash's contents, direct mode, or
     // which XIP_SRAM lines are pinned (`take_xip_changed`).
     xip_changed: bool
@@ -247,9 +253,11 @@ struct Rp2350
         val bytes = self.flash.bytes
         val size = self.flash.size
         val wires = self.wires
+        val array = self.otp
         val fresh = rp2350()
         *self = fresh
         if size != 0 then self.flash.connect(bytes, size)
+        self.otp.power_on(array)
         self.wires = wires
 
     /** Whether the flash's contents, direct mode or the pinned XIP_SRAM lines have changed since the last
@@ -514,8 +522,7 @@ struct Rp2350
             AccessCtrl -> self.accessctrl.read(o, width)
             IoQspiBlock -> self.io_qspi.read(o, width)
             PadsQspi -> self.pads_qspi.read(o, width)
-            OtpData | OtpDataGuarded -> OtpWindow(false).read(o, width)
-            OtpDataRaw | OtpDataRawGuarded -> OtpWindow(true).read(o, width)
+            OtpData | OtpDataRaw | OtpDataGuarded | OtpDataRawGuarded | OtpBlock -> return self.otp_read(p, o, width)
             XipCtrl -> return self.xip.read(o, width, &self.qmi, &self.flash).map_err(f -> xip_refusal(p, o, f))
             QmiBlock -> return self.qmi.read(o, width, &self.flash).map_err(f -> xip_refusal(p, o, f))
             XipAux -> return xip_aux_read(&self.xip, &self.qmi, &self.flash, o, width).map_err(f -> xip_refusal(p, o, f))
@@ -617,7 +624,8 @@ struct Rp2350
             IoQspiBlock -> self.io_qspi.write(o, width, x)
             PadsQspi -> self.pads_qspi.write(o, width, x)
             OtpData | OtpDataRaw | OtpDataGuarded | OtpDataRawGuarded ->
-                return Err(s"${p.name} + 0x${hex(o)}: the OTP's read windows are read-only, and programming a row is not modelled (docs/rp-coverage.md item 26)")
+                return Err(s"${p.name} + 0x${hex(o)}: the OTP's read windows are read-only; a row is programmed through the OTP block's SBPI bridge")
+            OtpBlock -> return self.otp.write(o, width, x).map_err(f -> otp_refusal(p, o, f))
             XipCtrl | QmiBlock | XipAux ->
                 val r = p.block match
                     XipCtrl -> self.xip.write(o, width, x, &self.qmi, &self.flash)
@@ -644,8 +652,9 @@ struct Rp2350
     // selects every stage but ROSC and XOSC. Where RESETS' own stage is not selected, the peripherals
     // RESETS.WDSEL names go into reset instead. What survives is what no selected stage holds: the
     // watchdog's REASON and SCRATCH registers, POWMAN, PSM's own registers, the SRAM's contents (a
-    // stage's reset is of its controller, not its array) and BOOTRAM's, and the flash part. Stages with
-    // no state benchtop keeps (PROC_COLD, OTP, PSM_READY, BUSFABRIC, ROM, SRAM0–9) change nothing here;
+    // stage's reset is of its controller, not its array) and BOOTRAM's, the flash part and the OTP's
+    // array (OTP's stage resets its registers, reloading the locks from the array). Stages with no
+    // state benchtop keeps (PROC_COLD, PSM_READY, BUSFABRIC, ROM, SRAM0–9) change nothing here;
     // PROC0 and PROC1 are the board's to restart (`take_restart`). TICKS goes with CLOCKS, an assumption:
     // the headers give TICKS no stage of its own.
     private watchdog_reset(*self)
@@ -658,6 +667,11 @@ struct Rp2350
         if sel & psm_reg.WDSEL_XOSC_MASK != 0
             self.xosc = fresh.xosc
             self.xosc_rest = 0
+        if sel & psm_reg.WDSEL_OTP_MASK != 0
+            // The OTP's registers go back to power-on, the locks loaded again from the array.
+            val was = self.otp
+            self.otp = fresh.otp
+            self.otp.power_on(was)
         if sel & psm_reg.WDSEL_RESETS_MASK != 0
             self.resets = fresh.resets
             self.reset_blocks(self.resets.held)
@@ -698,7 +712,7 @@ struct Rp2350
         r
 
     /** Whether a watchdog reset the board has not yet taken has reset core `k`'s PSM stage. */
-    restarting(self, k: u32) -> bool = self.restart match
+    restarting(*self, k: u32) -> bool = self.restart match
         Some(s) -> s & (if k == 0 then psm_reg.WDSEL_PROC0_MASK else psm_reg.WDSEL_PROC1_MASK) != 0
         None -> false
 
@@ -726,7 +740,7 @@ struct Rp2350
     /** Whether a power-down of the switched core waits for the processors to halt (POWMAN's
      * STATE.WAITING); the board, which knows when they have, makes it (`power_down`).
      */
-    power_down_due(self) -> bool = self.powman.power_down_due()
+    power_down_due(*self) -> bool = self.powman.power_down_due()
 
     /** The processors have halted, and POWMAN powers the switched core down to the state STATE.REQ asked
      * for (datasheet 6, "Power management"; Q7: the time it spends there is skipped). Everything in the
@@ -753,8 +767,10 @@ struct Rp2350
         val bytes = self.flash.bytes
         val size = self.flash.size
         val wires = self.wires
+        val array = self.otp
         *self = rp2350()
         if size != 0 then self.flash.connect(bytes, size)
+        self.otp.power_on(array)
         self.wires = wires
         self.powman = powman
         self.now = now
@@ -830,6 +846,16 @@ struct Rp2350
         xip_target(self.xip.ctrl, self.qmi, a).map_err(f -> xip_why(f))?
         if self.xip.ctrl & xip_ctrl_reg.CTRL_WRITABLE_M0_MASK == 0 then return Ok(())
         Err(s"0x${hex(a, 8)}: a write through XIP with XIP_CTRL.WRITABLE_M0 set becomes a QMI write command, which benchtop does not send (the Pico 2's flash is not written through XIP)")
+
+    // A read of the OTP: one of its four windows, or the OTP block's registers.
+    private otp_read(*self, p: Placed, o: u32, width: u32) -> Result[u32, string]
+        val got = p.block match
+            OtpData -> self.otp.read_window(false, false, o, width)
+            OtpDataRaw -> self.otp.read_window(true, false, o, width)
+            OtpDataGuarded -> self.otp.read_window(false, true, o, width)
+            OtpDataRawGuarded -> self.otp.read_window(true, true, o, width)
+            _ -> self.otp.read(o, width)
+        got.map_err(f -> otp_refusal(p, o, f))
 
     // The block an access lands in, refused where none is there, or where RESETS holds it: on silicon
     // that access hangs the bus.
@@ -952,7 +978,7 @@ rp2350() -> Rp2350 =
     Rp2350(rp.rp2350_resets(), rp.clocks(), rp.xosc(), rp.pll(), rp.pll(), rp.ticks(), [rp.timer(), rp.timer()], rp.watchdog(),
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
-        rp.xip(), rp.qmi(), qspi_flash(), false,
+        rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), false,
         rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "")
 
 private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
@@ -963,6 +989,11 @@ private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
 
 // Why the XIP or QMI blocks refused an access, as a person reads it.
 private xip_refusal(p: Placed, o: u32, f: XipFault) -> string = f match
+    Access(e) -> refusal(p, o, e)
+    Refused(why) -> s"${p.name} + 0x${hex(o)}: $why"
+
+// Why the OTP refused an access, as a person reads it.
+private otp_refusal(p: Placed, o: u32, f: OtpFault) -> string = f match
     Access(e) -> refusal(p, o, e)
     Refused(why) -> s"${p.name} + 0x${hex(o)}: $why"
 
