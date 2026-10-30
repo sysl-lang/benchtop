@@ -1,0 +1,345 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2350.Frame
+import sh.sysl.rp2350.clocks as clk
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.uart0 as ur
+import sh.sysl.rp2350.uart1 as ur1
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+
+// The UARTs on the chip: their lines timed from clk_peri through `advance` and `next_event`, their pins
+// through the GPIO mux, frames over wires between GPIOs (`wire`) and from off the chip (`line_in`), what
+// the chip refuses about them, and the DMA requests; then pico-examples' uart/hello_uart and
+// uart/uart_advanced, and examples/pico2/uart_loopback.c, on the Arm board.
+
+private val HELLO_UART = embed("../../../../examples/pico2/hello_uart.elf")
+private val UART_ADVANCED = embed("../../../../examples/pico2/uart_advanced.elf")
+private val UART_LOOPBACK = embed("../../../../examples/pico2/uart_loopback.elf")
+private val SRAM = SramMap(0x20000000, 520 * 1024)
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+// clk_sys cycles in a 115200-baud 8N1 frame at the SDK's 150 MHz: 10 bits of 16 × (81 + 24/64) clk_peri
+// cycles.
+private const SDK_FRAME: u64 = 13020
+
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+private ctrl_at(n: u32) -> u32 = io.BASE + io.GPIO0_CTRL_OFFSET + 8 * n
+private uart_base(k: u32) -> u32 = if k == 0 then ur.BASE else ur1.BASE
+
+// The pads and both UARTs out of reset, and clk_peri on from clk_sys (the ring oscillator at power-on).
+private released() -> Rp2350
+    var c = rp2350()
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK | rr.RESET_UART0_MASK | rr.RESET_UART1_MASK)
+    wr(&c, clk.BASE + clk.CLK_PERI_CTRL_OFFSET, clk.CLK_PERI_CTRL_ENABLE_MASK)
+    c
+
+// GPIO `n` given to function `f` as the SDK's gpio_set_function leaves it: input on, out of isolation.
+private function(c: *Rp2350, n: u32, f: u32)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + CLR, pads.GPIO0_OD_MASK | pads.GPIO0_ISO_MASK)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET, pads.GPIO0_IE_MASK)
+    wr(c, ctrl_at(n), f)
+
+// UART `k` at divisor IBRD `ibrd` (FBRD 0), 8N1 with its FIFOs, enabled: a bit is 16 × `ibrd` clk_peri
+// cycles.
+private setup(c: *Rp2350, k: u32, ibrd: u32)
+    wr(c, uart_base(k) + ur.UARTIBRD_OFFSET, ibrd)
+    wr(c, uart_base(k) + ur.UARTFBRD_OFFSET, 0)
+    wr(c, uart_base(k) + ur.UARTLCR_H_OFFSET, 0x70)
+    wr(c, uart_base(k) + ur.UARTCR_OFFSET, 0x301)
+
+// UART0 TX on GPIO 12 wired to UART1 RX on GPIO 5, both at IBRD 6 (a 960-cycle frame at clk_peri =
+// clk_sys).
+private wired() -> Rp2350
+    var c = released()
+    setup(&c, 0, 6)
+    setup(&c, 1, 6)
+    function(&c, 12, 2)
+    function(&c, 5, 2)
+    c.wire(12, Some(5))
+    c
+
+@test("a frame takes ten bits of 16 × the divisor in clk_peri cycles, timed through next_event; halving clk_peri doubles it; idle UARTs ask for no event")
+chip_uart_line_timing()
+    var c = released()
+    assert(c.next_event().is_none(), "nothing pending at power-on")
+    setup(&c, 0, 6)
+    assert(c.clocks.peri_hz(c.sources()) == c.sys_hz(), "clk_peri from clk_sys")
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, u32('H'))
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, u32('i'))
+    assert(c.next_event() == Some(960), s"${c.next_event()}")
+    c.advance(959)
+    assert(c.uarts[0].take().is_none(), "not a cycle early")
+    c.advance(1)
+    assert(c.uarts[0].take() == Some(u8('H')) && c.next_event() == Some(960))
+    c.advance(5000)
+    assert(c.uarts[0].take() == Some(u8('i')) && c.next_event().is_none(), "sent everything, idle again")
+    // clk_peri at half clk_sys.
+    wr(&c, clk.BASE + clk.CLK_PERI_DIV_OFFSET, 2 << clk.CLK_PERI_DIV_INT_SHIFT)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 1)
+    assert(c.next_event() == Some(1920), s"${c.next_event()}")
+    // Time in odd pieces, as a core's accesses cut it, comes to the same.
+    for i in 0..<19 do c.advance(101)
+    assert(c.uarts[0].take().is_none())
+    c.advance(1)
+    assert(c.uarts[0].take() == Some(1))
+    // clk_peri stopped: the line stops, and asks for no event.
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 2)
+    wr(&c, clk.BASE + clk.CLK_PERI_CTRL_OFFSET, 0)
+    c.advance(100000)
+    assert(c.uarts[0].take().is_none() && c.next_event().is_none())
+
+@test("a UART's TX pin carries its frame bit by bit through the mux, F2 and F11, and over a wire; its RX pin drives nothing")
+chip_uart_pins()
+    var c = wired()
+    function(&c, 2, 11)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 0x01)
+    // Start bit, then 1 then zeros, at 96 cycles a bit.
+    assert(!c.pin(12).level && !c.pin(2).level && !c.pin(5).input, "the start bit, on both TX pins and across the wire")
+    c.advance(96)
+    assert(c.pin(12).level && c.pin(5).input, "data bit 0")
+    c.advance(96)
+    assert(!c.pin(12).level)
+    c.advance(8 * 96)
+    assert(c.pin(12).level && c.pin(2).level && c.pin(5).input, "idle high")
+    assert(!c.drive(5).oe, "RX drives nothing")
+    // Break: low, and still low a frame later.
+    wr(&c, ur.BASE + ur.UARTLCR_H_OFFSET, 0x71)
+    assert(!c.pin(12).level)
+    c.advance(2000)
+    assert(!c.pin(12).level && !c.pin(5).input)
+
+@test("a frame UART0 sends from GPIO 12 reaches UART1's RX at GPIO 5 over a wire, at the frame's end; a break arrives as a break")
+chip_uart_wire()
+    var c = wired()
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, u32('Z'))
+    c.advance(959)
+    assert(rd(&c, ur1.BASE + ur.UARTFR_OFFSET) & ur.UARTFR_RXFE_MASK != 0)
+    c.advance(1)
+    assert(rd(&c, ur1.BASE + ur.UARTDR_OFFSET) == u32('Z') && c.uarts[0].take() == Some(u8('Z')), "UART1 and the console both have it")
+    wr(&c, ur.BASE + ur.UARTLCR_H_OFFSET, 0x71)
+    c.advance(960)
+    assert(rd(&c, ur1.BASE + ur.UARTDR_OFFSET) == 0x500 && rd(&c, ur1.BASE + ur.UARTRIS_OFFSET) & ur.UARTRIS_BERIS_MASK != 0)
+    wr(&c, ur.BASE + ur.UARTLCR_H_OFFSET, 0x70)
+    // The wire either way round, and gone once taken down.
+    c.wire(5, None)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 1)
+    c.advance(960)
+    assert(rd(&c, ur1.BASE + ur.UARTFR_OFFSET) & ur.UARTFR_RXFE_MASK != 0, "no wire, nothing heard")
+    c.wire(5, Some(12))
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 2)
+    c.advance(960)
+    assert(rd(&c, ur1.BASE + ur.UARTDR_OFFSET) == 2)
+    assert(c.take_line_fault().is_none())
+
+@test("a frame goes over a wire only from a GPIO whose function is the UART's TX and whose pad drives, to one whose function is a UART's RX")
+chip_uart_wire_needs_the_mux()
+    var c = wired()
+    function(&c, 12, 31)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 1)
+    c.advance(960)
+    assert(rd(&c, ur1.BASE + ur.UARTFR_OFFSET) & ur.UARTFR_RXFE_MASK != 0, "GPIO 12 is NULL")
+    function(&c, 12, 2)
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 12 + SET, pads.GPIO0_ISO_MASK)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 2)
+    c.advance(960)
+    assert(rd(&c, ur1.BASE + ur.UARTFR_OFFSET) & ur.UARTFR_RXFE_MASK != 0, "GPIO 12's pad is isolated")
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 12 + CLR, pads.GPIO0_ISO_MASK)
+    // UART1's TX on GPIO 4 wired to GPIO 5, UART1's own RX: UART1 hears itself.
+    c.wire(12, None)
+    function(&c, 4, 2)
+    c.wire(4, Some(5))
+    wr(&c, ur1.BASE + ur.UARTDR_OFFSET, 3)
+    c.advance(960)
+    assert(rd(&c, ur1.BASE + ur.UARTDR_OFFSET) == 3)
+    // Wired to a GPIO that is SIO, nothing receives it, and nothing is refused.
+    function(&c, 5, 5)
+    wr(&c, ur1.BASE + ur.UARTDR_OFFSET, 4)
+    c.advance(960)
+    assert(c.take_line_fault().is_none())
+
+@test("refused over a wire: a receiver at another divisor or word shape, an RX pad that does not read, an INOVER on the RX pin, an OUTOVER on the TX pin; each named, for the board to stop on")
+chip_uart_wire_refusals()
+    var c = wired()
+    setup(&c, 1, 7)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 1)
+    c.advance(960)
+    val why = c.take_line_fault().unwrap()
+    assert(why.contains("UART0's TX on GPIO 12, wired to GPIO 5") && why.contains("another rate"), why)
+    assert(c.take_line_fault().is_none(), "taken once")
+    setup(&c, 1, 6)
+    wr(&c, ur1.BASE + ur.UARTLCR_H_OFFSET, 0x72)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 1)
+    c.advance(960)
+    assert(c.take_line_fault().unwrap().contains("another rate or in another shape"), "parity on one side only")
+    setup(&c, 1, 6)
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 5 + CLR, pads.GPIO0_IE_MASK)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 1)
+    c.advance(960)
+    assert(c.take_line_fault().unwrap().contains("does not read its input"))
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 5 + SET, pads.GPIO0_IE_MASK)
+    wr(&c, ctrl_at(5), 2 | (io.GPIO0_CTRL_INOVER_INVERT << io.GPIO0_CTRL_INOVER_SHIFT))
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 1)
+    c.advance(960)
+    assert(c.take_line_fault().unwrap().contains("INOVER"))
+    wr(&c, ctrl_at(5), 2)
+    wr(&c, ctrl_at(12), 2 | (io.GPIO0_CTRL_OUTOVER_INVERT << io.GPIO0_CTRL_OUTOVER_SHIFT))
+    val r = c.write(0, ur.BASE + ur.UARTDR_OFFSET, 4, 1)
+    assert(r.unwrap_err().contains("OUTOVER"), "refused as the frame starts")
+
+@test("refused by name at the register write: a frame on a pin whose GPIO interrupts are enabled, either end of a wire; a character with IBRD 0 latched; IrDA and flow control; each leaves the UART as it was")
+chip_uart_write_refusals()
+    var c = wired()
+    wr(&c, io.BASE + io.PROC0_INTE0_OFFSET + 4, 0xF << 16)
+    var why = c.write(0, ur.BASE + ur.UARTDR_OFFSET, 4, 1).unwrap_err()
+    assert(why.contains("UART0") && why.contains("GPIO 12, whose interrupts"), why)
+    assert(!c.uarts[0].active() && rd(&c, ur.BASE + ur.UARTFR_OFFSET) & ur.UARTFR_TXFE_MASK != 0, "the write did not happen")
+    wr(&c, io.BASE + io.PROC0_INTE0_OFFSET + 4, 0)
+    wr(&c, io.BASE + io.PROC1_INTE0_OFFSET, 0x4 << 20)
+    why = c.write(0, ur.BASE + ur.UARTDR_OFFSET, 4, 1).unwrap_err()
+    assert(why.contains("to GPIO 5 over a wire"), why)
+    wr(&c, io.BASE + io.PROC1_INTE0_OFFSET, 0)
+    // IBRD 0 latched: the character is refused, and so is enabling a UART that holds one.
+    var d = released()
+    wr(&d, ur.BASE + ur.UARTLCR_H_OFFSET, 0x70)
+    wr(&d, ur.BASE + ur.UARTDR_OFFSET, 1)
+    why = d.write(0, ur.BASE + ur.UARTCR_OFFSET, 4, 0x301).unwrap_err()
+    assert(why.contains("IBRD 0"), why)
+    assert(rd(&d, ur.BASE + ur.UARTCR_OFFSET) == 0x300)
+    wr(&d, ur.BASE + ur.UARTIBRD_OFFSET, 6)
+    why = d.write(0, ur.BASE + ur.UARTCR_OFFSET, 4, 0x301).unwrap_err()
+    assert(why.contains("IBRD takes effect at an LCR_H write"), "IBRD is not latched yet")
+    wr(&d, ur.BASE + ur.UARTLCR_H_OFFSET, 0x70)
+    wr(&d, ur.BASE + ur.UARTCR_OFFSET, 0x301)
+    assert(d.uarts[0].sending())
+    why = d.write(0, ur.BASE + ur.UARTCR_OFFSET + SET, 4, ur.UARTCR_SIREN_MASK).unwrap_err()
+    assert(why.contains("UART0 + 0x2030") && why.contains("IrDA"), why)
+    why = d.write(0, ur1.BASE + ur.UARTCR_OFFSET, 4, ur.UARTCR_CTSEN_MASK | 0x301).unwrap_err()
+    assert(why.contains("UART1") && why.contains("flow control"), why)
+    // The flow-control pins stay refused in the mux.
+    assert(d.write(0, ctrl_at(2), 4, 2).unwrap_err().contains("UART0_CTS"))
+    assert(d.write(0, ctrl_at(7), 4, 2).unwrap_err().contains("UART1_RTS"))
+
+@test("a frame from off the chip into a UART's RX pin arrives a frame later, one at a time; a break and errors ride along; a pin that is no RX, or one wired to a driver, is refused")
+chip_uart_line_in()
+    var c = wired()
+    function(&c, 1, 2)
+    assert(c.line_in(1, Frame(u8('q'), 0)) == Ok(true))
+    assert(c.line_in(1, Frame(u8('r'), 0)) == Ok(false), "the line still carries q")
+    assert(c.next_event() == Some(960))
+    c.advance(960)
+    assert(rd(&c, ur.BASE + ur.UARTDR_OFFSET) == u32('q'))
+    assert(c.line_in(1, Frame(0, ur.UARTDR_FE_MASK | ur.UARTDR_BE_MASK)) == Ok(true))
+    c.advance(960)
+    assert(rd(&c, ur.BASE + ur.UARTDR_OFFSET) == 0x500 && rd(&c, ur.BASE + ur.UARTRSR_OFFSET) == 5)
+    assert(c.line_in(1, Frame(9, ur.UARTDR_PE_MASK)) == Ok(true))
+    c.advance(960)
+    assert(rd(&c, ur.BASE + ur.UARTRIS_OFFSET) & ur.UARTRIS_PERIS_MASK != 0 && rd(&c, ur.BASE + ur.UARTDR_OFFSET) == 0x209)
+    assert(c.line_in(12, Frame(1, 0)).unwrap_err().contains("is not a UART's RX"))
+    assert(c.line_in(48, Frame(1, 0)).is_err())
+    assert(c.line_in(5, Frame(1, 0)).unwrap_err().contains("wired to GPIO 12, which drives it"))
+    var d = released()
+    function(&d, 1, 2)
+    assert(d.line_in(1, Frame(1, 0)).unwrap_err().contains("IBRD 0"))
+
+@test("the UARTs' DMA requests, DREQ 28 to 31: TX with room, RX with a character waiting, each only where DMACR enables it")
+chip_uart_dreqs()
+    var c = wired()
+    for n in 28u32..<32 do assert(c.uart_dreq(n) == Some(false), s"$n")
+    assert(c.uart_dreq(27).is_none() && c.uart_dreq(32).is_none(), "not a UART's")
+    wr(&c, ur.BASE + ur.UARTDMACR_OFFSET, 3)
+    wr(&c, ur1.BASE + ur.UARTDMACR_OFFSET, 3)
+    assert(c.uart_dreq(28) == Some(true) && c.uart_dreq(29) == Some(false) && c.uart_dreq(30) == Some(true))
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 1)
+    c.advance(960)
+    assert(c.uart_dreq(31) == Some(true) && c.uart_dreq(29) == Some(false), "UART1 heard it over the wire")
+
+@test("a UART's interrupt reaches both cores: RX and the receive timeout as the PL011 raises them")
+chip_uart_irq()
+    var c = wired()
+    wr(&c, ur1.BASE + ur.UARTIMSC_OFFSET, ur.UARTIMSC_RTIM_MASK)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 1)
+    c.advance(960)
+    assert(!c.uarts[1].irq(), "under the RX level, not timed out")
+    assert(c.next_event() == Some(32 * 96), s"${c.next_event()}")
+    c.advance(32 * 96)
+    assert(c.uarts[1].irq() && rd(&c, ur1.BASE + ur.UARTMIS_OFFSET) == ur.UARTRIS_RTRIS_MASK)
+
+// The Arm board run in quanta of `step` cycles until `text` is on the console, at most `limit` steps;
+// the console's length and the chip's time after each step.
+private run_until(b: &ArmBoard, text: string, step: u64, limit: int) -> Result[Buf[(usize, u64)], string]
+    var seen: Buf[(usize, u64)] = buf()
+    for i in 0..<limit
+        val end = b.run(step)
+        seen.push((b.console.len(), b.chip.now))
+        if from_utf8_lossy(b.console.view()).contains(text) then return Ok(seen)
+        if end != RunEnd.Budget then return Err(s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    Err(s"never printed \"$text\": ${from_utf8_lossy(b.console.view())}")
+
+@test("pico-examples' uart/hello_uart on the Arm Pico 2: its line exactly, one character per 115200-baud frame, the rest sent at the breakpoint")
+arm_hello_uart()
+    val b = arm_board(SRAM)
+    b.boot(HELLO_UART).unwrap()
+    var end = RunEnd.Budget
+    var arrivals: Buf[u64] = buf()
+    for i in 0..<2000
+        val before = b.console.len()
+        end = b.run(1000)
+        for j in before..<b.console.len() do arrivals.push(b.chip.now)
+        if end != RunEnd.Budget then break
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}")
+    val at_break = b.console.len()
+    assert(at_break < 16, s"main returned with characters still in the FIFO: $at_break")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == "AB Hello, UART!\n", text)
+    assert(!b.chip.uarts[0].sending() && !b.chip.uarts[0].active(), "UART0's line is idle")
+    // Consecutive characters a frame apart, to within the quantum the console is read at.
+    for i in 1..<arrivals.len()
+        val gap = arrivals[i] - arrivals[i - 1]
+        assert(gap + 1000 >= SDK_FRAME && gap <= SDK_FRAME + 1000, s"character $i: $gap cycles")
+
+@test("pico-examples' uart/uart_advanced on the Arm Pico 2: its greeting, then each character sent into GPIO 1 comes back one higher through its RX interrupt, with the FIFOs off")
+arm_uart_advanced()
+    val b = arm_board(SRAM)
+    b.boot(UART_ADVANCED).unwrap()
+    run_until(b, "interrupts\n", 10000, 200) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, why)
+    for ch in "HAL".bytes
+        loop
+            b.chip.line_in(1, Frame(ch, 0)) match
+                Ok(true) -> break
+                Ok(false) -> assert(b.run(1000) == RunEnd.Budget, b.refused)
+                Err(why) -> assert(false, why)
+    run_until(b, "IBM", 1000, 200) match
+        Ok(_) -> ()
+        Err(why) -> assert(false, why)
+    assert(from_utf8_lossy(b.console.view()) == "\nHello, uart interrupts\nIBM", from_utf8_lossy(b.console.view()))
+    assert(b.chip.uarts[0].lcr_h & ur.UARTLCR_H_FEN_MASK == 0 && b.chip.uarts[0].latched_divisor() == 64 * 81 + 24, "FIFOs off, 115200 baud")
+
+@test("examples/pico2/uart_loopback.c on the Arm Pico 2: UART0 and UART1 over two wires, the receive timeout timed by the 1 µs timer, a break and an overrun")
+arm_uart_loopback()
+    val b = arm_board(SRAM)
+    b.chip.wire(12, Some(5))
+    b.chip.wire(4, Some(13))
+    b.boot(UART_LOOPBACK).unwrap()
+    val end = b.run(150000000)
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    // Six characters (stdio's CR LF) of 86.8 µs, then 32 bit periods of 8.68 µs: 798.6 µs on the line;
+    // printf's own work before the first character, and the interrupt taken at the end of the board's
+    // 1000-cycle quantum (6.7 µs at most), make the rest.
+    val want = "uart loopback\r\n" +
+        "ping\r\n" +
+        "uart1 heard 6: ping 0x0d 0x0a, mis 0x040 after 804 us\r\n" +
+        "uart0 heard pong\r\n" +
+        "break: dr 0x500 rsr 0x5 errors 0x280\r\n" +
+        "overrun: read 32, last f, rsr 0x8, oe 1\r\n" +
+        "done\r\n"
+    assert(text == want, text)

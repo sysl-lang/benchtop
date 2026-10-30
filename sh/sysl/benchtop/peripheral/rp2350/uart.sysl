@@ -2,37 +2,113 @@ module sh.sysl.benchtop.peripheral.rp2350
 
 import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
 import sh.sysl.rp2350.uart0 as reg
+import sysl.math.min
 
-// UART0 and UART1: Arm PL011s (datasheet, "UART"; the PL011 TRM). Modelled: the data register both
-// ways, the flags, the baud divisors, line and control registers stored as written, and the receive
-// and transmit interrupts with their mask, raw, masked and clear registers. A byte written while the
-// UART and its transmitter are enabled joins the 32-entry transmit FIFO, which the chip drains to the
-// host (`take`) as the line would send it; the line's byte rate is not modelled, so the FIFO empties
-// whenever the chip drains it. Received bytes wait in the 32-entry receive FIFO (`receive`). The
-// modem lines, IrDA, break and the error flags are not modelled; the DMA control register is stored.
+// UART0 and UART1: Arm PL011s (datasheet, "UART"; the PL011 TRM; the field descriptions of the SDK's
+// `hardware/regs/uart.h`).
+//
+// **The line is timed.** One bit lasts 16 periods of the baud clock, clk_peri over IBRD + FBRD / 64, so
+// 64 × IBRD + FBRD quarter clk_peri cycles: the UART counts its line in quarter cycles (`pass`) and the
+// chip hands it clk_peri's time, event by event (`until_event`). A frame is a start bit, 5 to 8 data
+// bits, an optional parity bit and one or two stop bits. IBRD and FBRD take effect at the next LCR_H
+// write, as on the PL011 (the SDK writes LCR_H for that alone).
+//
+// Modelled: the transmit FIFO draining one frame at a time while the UART and its transmitter are
+// enabled, a frame in progress finishing after either is cleared; the receive FIFO filling from the
+// line (`arrive`, or the chip delivering another UART's frame with `receive`); the FIFOs one entry deep
+// with LCR_H.FEN clear; the receive timeout (32 bit periods with no character and the FIFO not empty);
+// the FIFO-level interrupts at the IFLS trigger points; break, both sent (LCR_H.BRK) and received; the
+// framing, parity, break and overrun errors in UARTDR, UARTRSR and the interrupts; the internal loopback
+// (CR.LBE); and the two DMA requests (`dreq_tx`, `dreq_rx`). Refused by name (`unmodelled`): IrDA
+// (CR.SIREN), hardware flow control (CR.CTSEN, CR.RTSEN; the CTS and RTS pins are refused in the mux
+// too), and the reserved IFLS levels. The modem status lines read 0 in UARTFR, and their interrupts never
+// assert.
 
 /** The PL011's FIFOs are 32 entries deep. */
 const UART_FIFO: usize = 32
 
-/** One of the PL011's byte FIFOs. */
-struct ByteFifo
-    bytes: [UART_FIFO]u8
+/** The UART times its line in quarter clk_peri cycles; one bit is 64 × IBRD + FBRD of them. */
+const UART_UNITS_PER_CYCLE: u64 = 4
+
+/** The DMA request numbers of the UARTs' FIFOs (the SDK's `dreq.h`): UART0 TX, then RX, then UART1's. */
+const DREQ_UART0_TX: u32 = 28
+
+/** The error bits a received character carries in UARTDR. */
+const UART_ERRORS: u32 = reg.UARTDR_FE_MASK | reg.UARTDR_PE_MASK | reg.UARTDR_BE_MASK
+
+/** What LCR_H says of a frame's shape: word length, parity and its kind, and the stop bits. */
+const UART_FORMAT: u32 = reg.UARTLCR_H_WLEN_MASK | reg.UARTLCR_H_PEN_MASK | reg.UARTLCR_H_EPS_MASK | reg.UARTLCR_H_SPS_MASK | reg.UARTLCR_H_STP2_MASK
+
+// Nothing is counting.
+private const IDLE: u64 = 0xffffffffffffffff
+
+// The error interrupts, which DMACR.DMAONERR lets stop the receive DMA request.
+private const ERROR_RIS: u32 = reg.UARTRIS_FERIS_MASK | reg.UARTRIS_PERIS_MASK | reg.UARTRIS_BERIS_MASK | reg.UARTRIS_OERIS_MASK
+
+// The raw interrupts that latch in the model: all but the four modem-status ones.
+private const LATCHED_RIS: u32 = 0x7F0
+
+/** One frame on a UART line: a character, and the errors a receiver finds in it (UARTDR's FE, PE and BE
+ * bits). A break is 0 with FE and BE: the line held low for longer than a frame.
+ */
+struct Frame
+    data: u8
+    errors: u32
+
+/** A frame as a UART sent it: the frame, and the divisor (64 × IBRD + FBRD) and LCR_H format it was sent
+ * with, which a receiver at the other end of a wire must share.
+ */
+struct Sent
+    frame: Frame
+    divisor: u32
+    format: u32
+
+/** A PL011 FIFO: characters, with the error bits UARTDR reads beside them on the receive side. */
+struct UartFifo
+    entries: [UART_FIFO]u16
     first: usize
     count: usize
 
-    full(self) -> bool = self.count == UART_FIFO
-    empty(self) -> bool = self.count == 0
-
-    push(*self, b: u8)
-        self.bytes[(self.first + self.count) % UART_FIFO] = b
+    push(*self, e: u16)
+        self.entries[(self.first + self.count) % UART_FIFO] = e
         self.count += 1
 
-    pop(*self) -> u8
-        val b = self.bytes[self.first]
+    pop(*self) -> u16
+        val e = self.entries[self.first]
         self.first = (self.first + 1) % UART_FIFO
         self.count -= 1
-        b
-end ByteFifo
+        e
+end UartFifo
+
+private uart_fifo() -> UartFifo = UartFifo([0; UART_FIFO], 0, 0)
+
+// The FIFO level IFLS's field `sel` names: 1/8, 1/4, 1/2, 3/4 or 7/8 of 32.
+private fifo_level(sel: u32) -> usize = sel match
+    0 -> 4
+    1 -> 8
+    2 -> 16
+    3 -> 24
+    _ -> 28
+
+/** Bits in a frame of LCR_H `format`: start, data, parity, stop. */
+frame_bits(format: u32) -> u64
+    val data = 5 + ((format & reg.UARTLCR_H_WLEN_MASK) >> reg.UARTLCR_H_WLEN_SHIFT)
+    val parity: u32 = if format & reg.UARTLCR_H_PEN_MASK != 0 then 1 else 0
+    val stop: u32 = if format & reg.UARTLCR_H_STP2_MASK != 0 then 2 else 1
+    u64(1 + data + parity + stop)
+
+/** The level of bit `i` of a frame of `data` in LCR_H `format`: the start bit low, data from its least
+ * significant bit, the parity bit, the stop bits high.
+ */
+frame_bit(data: u8, format: u32, i: u64) -> bool
+    if i == 0 then return false
+    val bits = u64(5 + ((format & reg.UARTLCR_H_WLEN_MASK) >> reg.UARTLCR_H_WLEN_SHIFT))
+    if i <= bits then return (data >> u8(i - 1)) & 1 != 0
+    if format & reg.UARTLCR_H_PEN_MASK == 0 || i != bits + 1 then return true
+    // Stick parity sends EPS's inverse; even parity makes the ones even, odd parity odd.
+    if format & reg.UARTLCR_H_SPS_MASK != 0 then return format & reg.UARTLCR_H_EPS_MASK == 0
+    val ones = (u32(data) & ((1u32 << u32(bits)) - 1)).count_ones() % 2 == 1
+    if format & reg.UARTLCR_H_EPS_MASK != 0 then ones else !ones
 
 struct Uart
     ibrd: u32
@@ -42,55 +118,237 @@ struct Uart
     ifls: u32
     imsc: u32
     dmacr: u32
-    // The transmit interrupt, which is latched until cleared rather than a level.
-    tx_raw: bool
-    rx: ByteFifo
-    tx: ByteFifo
+    // The divisor the last LCR_H write latched, 64 × IBRD + FBRD.
+    divisor: u32
+    // The raw interrupts: each latches where it is set, and clears as the PL011 says (`read`, UARTICR).
+    ris: u32
+    // UARTRSR: FE, PE and BE of the character last read, OE since the last clear.
+    rsr: u32
+    // A character was lost to a full receive FIFO; the next one in carries OE.
+    overrun: bool
+    rx: UartFifo
+    tx: UartFifo
+    // The last 32 characters the line sent, oldest first, until something takes them (`take`).
+    sent: UartFifo
+    // The transmitter: the frame on the line, and the quarter cycles left of it.
+    shifting: bool
+    shift: Sent
+    shift_left: u64
+    // A frame has started since the chip last asked (`take_started`).
+    started: bool
+    // LCR_H.BRK holds the line low: since when it has (`breaking`), and the quarter cycles until the low
+    // has lasted a frame, which is when a receiver takes it as a break.
+    breaking: bool
+    break_left: u64
+    // The receive line from outside: the frame arriving, and the quarter cycles left of it.
+    arriving: bool
+    arrival: Frame
+    arrival_left: u64
+    // The receive timeout: quarter cycles left of 32 bit periods since the last character came in.
+    rt_left: u64
 
     reset(*self)
-        self.ibrd = 0
-        self.fbrd = 0
-        self.lcr_h = 0
-        // The receiver and transmitter enables power up set; the UART itself does not.
-        self.cr = reg.UARTCR_RXE_MASK | reg.UARTCR_TXE_MASK
-        // Both FIFO levels power up at half full.
-        self.ifls = (2 << reg.UARTIFLS_RXIFLSEL_SHIFT) | (2 << reg.UARTIFLS_TXIFLSEL_SHIFT)
-        self.imsc = 0
-        self.dmacr = 0
-        self.tx_raw = true
-        self.rx = ByteFifo([0; UART_FIFO], 0, 0)
-        self.tx = ByteFifo([0; UART_FIFO], 0, 0)
+        val sent = self.sent
+        *self = uart()
+        // What the line has sent has left the chip.
+        self.sent = sent
 
-    private enabled(self, which: u32) -> bool = self.cr & reg.UARTCR_UARTEN_MASK != 0 && self.cr & which != 0
+    // Every method takes `*self`: the UART is large enough that a copy on each call shows in the chip's
+    // hot path.
+    private enabled(*self, which: u32) -> bool = self.cr & reg.UARTCR_UARTEN_MASK != 0 && self.cr & which != 0
+    private depth(*self) -> usize = if self.lcr_h & reg.UARTLCR_H_FEN_MASK != 0 then UART_FIFO else 1
+    private format(*self) -> u32 = self.lcr_h & UART_FORMAT
+    private frame_units(*self) -> u64 = frame_bits(self.format()) * u64(self.divisor)
+    private rx_level(*self) -> usize = if self.lcr_h & reg.UARTLCR_H_FEN_MASK != 0 then fifo_level((self.ifls & reg.UARTIFLS_RXIFLSEL_MASK) >> reg.UARTIFLS_RXIFLSEL_SHIFT) else 1
+    private tx_level(*self) -> usize = if self.lcr_h & reg.UARTLCR_H_FEN_MASK != 0 then fifo_level(self.ifls & reg.UARTIFLS_TXIFLSEL_MASK) else 0
 
-    /** A byte arrives on the receive line; false where the FIFO is full or the receiver is off. */
-    receive(*self, b: u8) -> bool
-        if !self.enabled(reg.UARTCR_RXE_MASK) || self.rx.full() then return false
-        self.rx.push(b)
+    /** The divisor LCR_H latched: 64 × IBRD + FBRD, under 64 where IBRD is 0, which times no frame. */
+    latched_divisor(*self) -> u32 = self.divisor
+
+    /** Something on the line is under way, so time matters to the UART. */
+    active(*self) -> bool = self.shifting || self.arriving || self.rt_left != IDLE || self.break_left != IDLE
+
+    /** The transmitter has a frame on the line, or one waiting that it will send. */
+    sending(*self) -> bool = self.shifting || (self.tx.count > 0 && self.enabled(reg.UARTCR_TXE_MASK) && self.lcr_h & reg.UARTLCR_H_BRK_MASK == 0 && self.divisor >= 64)
+
+    /** A character waits to go, the transmitter is on and no break holds it, but the latched divisor
+     * (IBRD 0) times no frame.
+     */
+    unclocked(*self) -> bool = !self.shifting && self.tx.count > 0 && self.enabled(reg.UARTCR_TXE_MASK) && self.lcr_h & reg.UARTLCR_H_BRK_MASK == 0 && self.divisor < 64
+
+    /** Quarter clk_peri cycles until the line next does something: a frame ends, a break has lasted a
+     * frame, the receive timeout expires. IDLE (all ones) while nothing is under way.
+     */
+    until_event(*self) -> u64
+        var due = min(self.rt_left, self.break_left)
+        if self.shifting then due = min(due, self.shift_left)
+        if self.arriving then due = min(due, self.arrival_left)
+        due
+
+    /** The level the transmitter puts on its line now: high while idle, a frame's bits as it sends
+     * them, low through a break.
+     */
+    line_level(*self) -> bool
+        if self.shifting
+            val d = u64(self.shift.divisor)
+            return frame_bit(self.shift.frame.data, self.shift.format, (frame_bits(self.shift.format) * d - self.shift_left) / d)
+        !self.breaking
+
+    /** Whether a frame has started since the last call. */
+    take_started(*self) -> bool
+        val s = self.started
+        self.started = false
+        s
+
+    /** `units` quarter clk_peri cycles pass, no more than `until_event`: the frame the line has finished
+     * sending, if one ends now, or the break the line has held for a frame, for the chip to carry over
+     * a wire. Under CR.LBE the UART also receives it itself.
+     */
+    pass(*self, units: u64) -> Option[Sent]
+        if self.rt_left != IDLE
+            self.rt_left -= units
+            if self.rt_left == 0
+                self.rt_left = IDLE
+                if self.rx.count > 0 then self.ris |= reg.UARTRIS_RTRIS_MASK
+        if self.arriving
+            self.arrival_left -= units
+            if self.arrival_left == 0
+                self.arriving = false
+                if self.cr & reg.UARTCR_LBE_MASK == 0 then self.receive(self.arrival)
+        var out: Option[Sent] = None
+        if self.break_left != IDLE
+            self.break_left -= units
+            if self.break_left == 0
+                self.break_left = IDLE
+                out = Some(Sent(Frame(0, reg.UARTDR_FE_MASK | reg.UARTDR_BE_MASK), self.divisor, self.format()))
+        if self.shifting
+            self.shift_left -= units
+            if self.shift_left == 0
+                self.shifting = false
+                out = Some(self.shift)
+                if self.sent.count == UART_FIFO then self.sent.pop()
+                self.sent.push(u16(self.shift.frame.data))
+                self.resume()
+        out match
+            Some(s) -> if self.cr & reg.UARTCR_LBE_MASK != 0 then self.receive(s.frame)
+            None -> ()
+        out
+    end pass
+
+    // The transmitter starts its next frame, or holds the line in a break, as LCR_H.BRK says.
+    private resume(*self)
+        if self.lcr_h & reg.UARTLCR_H_BRK_MASK != 0 && self.cr & reg.UARTCR_UARTEN_MASK != 0
+            // BRK takes the line low once the frame in progress has gone.
+            if !self.shifting && !self.breaking && self.divisor >= 64
+                self.breaking = true
+                self.break_left = self.frame_units()
+            return
+        self.breaking = false
+        self.break_left = IDLE
+        if self.shifting || self.tx.count == 0 || !self.enabled(reg.UARTCR_TXE_MASK) || self.divisor < 64 then return
+        val before = self.tx.count
+        val b = u8(self.tx.pop())
+        // The transmit interrupt asserts as the FIFO falls to its trigger level (the holding register
+        // empties, without the FIFO).
+        if before > self.tx_level() && self.tx.count <= self.tx_level() then self.ris |= reg.UARTRIS_TXRIS_MASK
+        self.shift = Sent(Frame(b, 0), self.divisor, self.format())
+        self.shift_left = self.frame_units()
+        self.shifting = true
+        self.started = true
+    end resume
+
+    /** A frame arrives from the line: into the receive FIFO, with its errors, where the UART and its
+     * receiver are enabled; lost, with OE, where the FIFO is full.
+     */
+    receive(*self, f: Frame)
+        if !self.enabled(reg.UARTCR_RXE_MASK) then return
+        if self.rx.count >= self.depth()
+            self.rsr |= reg.UARTRSR_OE_MASK
+            self.ris |= reg.UARTRIS_OERIS_MASK
+            self.overrun = true
+            return
+        val oe = if self.overrun then reg.UARTDR_OE_MASK else 0
+        self.rx.push(u16(u32(f.data) | (f.errors & UART_ERRORS) | oe))
+        self.overrun = false
+        // UARTDR's FE, PE and BE are RIS's FERIS, PERIS and BERIS a place higher.
+        self.ris |= (f.errors & UART_ERRORS) >> 1
+        if self.rx.count >= self.rx_level() then self.ris |= reg.UARTRIS_RXRIS_MASK
+        self.rt_left = 32 * u64(self.divisor)
+
+    /** A frame starts on the receive line from outside, to end a frame later at the UART's own rate and
+     * format; false while the line still carries the last one. The UART must have a divisor
+     * (`latched_divisor` 64 or more).
+     */
+    arrive(*self, f: Frame) -> bool
+        if self.arriving then return false
+        self.arriving = true
+        self.arrival = f
+        self.arrival_left = self.frame_units()
         true
 
-    /** The next byte the line sends, if one waits. */
-    take(*self) -> Option[u8] = if self.tx.empty() then None else Some(self.tx.pop())
+    /** Whether a frame `s` sent from elsewhere is one this UART reads as it was sent: the same divisor,
+     * word length and parity (the receiver checks only the first stop bit).
+     */
+    hears(*self, s: Sent) -> bool
+        val shape = UART_FORMAT & ~reg.UARTLCR_H_STP2_MASK
+        s.divisor == self.divisor && s.format & shape == self.format() & shape
 
-    /** The raw interrupt status: receive while a byte waits, transmit while it is latched. */
-    raw(self) -> u32 = (if self.rx.empty() then 0 else reg.UARTRIS_RXRIS_MASK) | (if self.tx_raw then reg.UARTRIS_TXRIS_MASK else 0)
+    /** The next character the line has sent, oldest first. */
+    take(*self) -> Option[u8] = if self.sent.count == 0 then None else Some(u8(self.sent.pop()))
+
+    /** The raw interrupt status. */
+    raw(*self) -> u32 = self.ris
 
     /** The UART's interrupt line. */
-    irq(self) -> bool = self.raw() & self.imsc != 0
+    irq(*self) -> bool = self.ris & self.imsc != 0
+
+    /** The transmit DMA request: TXDMAE, and room in the transmit FIFO. */
+    dreq_tx(*self) -> bool = self.dmacr & reg.UARTDMACR_TXDMAE_MASK != 0 && self.tx.count < self.depth()
+
+    /** The receive DMA request: RXDMAE, and a character waiting, unless DMAONERR stops it while an
+     * error interrupt is asserted.
+     */
+    dreq_rx(*self) -> bool
+        if self.dmacr & reg.UARTDMACR_RXDMAE_MASK == 0 || self.rx.count == 0 then return false
+        self.dmacr & reg.UARTDMACR_DMAONERR_MASK == 0 || self.ris & self.imsc & ERROR_RIS == 0
+
+    /** Why writing `value` at `offset` is refused: a setting benchtop does not model. */
+    unmodelled(*self, offset: u32, width: u32, value: u32) -> Option[string]
+        if access(offset, width, true).is_err() then return None
+        val address = offset & 0xFFC
+        val data = replicated(value, width)
+        if address == reg.UARTCR_OFFSET
+            val cr = written(self.cr, offset, data)
+            if cr & reg.UARTCR_SIREN_MASK != 0 then return Some("CR.SIREN: the IrDA SIR encoder is not modelled")
+            if cr & (reg.UARTCR_CTSEN_MASK | reg.UARTCR_RTSEN_MASK) != 0 then return Some("CR.CTSEN or CR.RTSEN: hardware flow control is not modelled (the CTS and RTS pins are not either)")
+        if address == reg.UARTIFLS_OFFSET
+            val ifls = written(self.ifls, offset, data)
+            if (ifls & reg.UARTIFLS_RXIFLSEL_MASK) >> reg.UARTIFLS_RXIFLSEL_SHIFT > 4 || ifls & reg.UARTIFLS_TXIFLSEL_MASK > 4 then return Some("IFLS selects a reserved FIFO level (5 to 7)")
+        None
 
     read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
         access(offset, width, true)?
         val address = offset & 0xFFC
         if address == reg.UARTDR_OFFSET && offset & 0x3000 != 0 then return Err(AccessError.UnsupportedAlias)
         val value = address match
-            reg.UARTDR_OFFSET -> if self.rx.empty() then 0 else u32(self.rx.pop())
-            reg.UARTRSR_OFFSET -> 0
+            reg.UARTDR_OFFSET ->
+                if self.rx.count == 0 then return Ok(0)
+                val e = u32(self.rx.pop())
+                self.rsr = (self.rsr & reg.UARTRSR_OE_MASK) | ((e & UART_ERRORS) >> reg.UARTDR_FE_SHIFT)
+                if self.rx.count < self.rx_level() then self.ris &= ~reg.UARTRIS_RXRIS_MASK
+                if self.rx.count == 0
+                    // The timeout needs a character waiting, and only a new one starts it again.
+                    self.ris &= ~reg.UARTRIS_RTRIS_MASK
+                    self.rt_left = IDLE
+                e
+            reg.UARTRSR_OFFSET -> self.rsr
             reg.UARTFR_OFFSET ->
-                val rx_empty = if self.rx.empty() then reg.UARTFR_RXFE_MASK else 0
-                val rx_full = if self.rx.full() then reg.UARTFR_RXFF_MASK else 0
-                val tx_empty = if self.tx.empty() then reg.UARTFR_TXFE_MASK else 0
-                val tx_full = if self.tx.full() then reg.UARTFR_TXFF_MASK else 0
-                rx_empty | rx_full | tx_empty | tx_full
+                val rx_empty = if self.rx.count == 0 then reg.UARTFR_RXFE_MASK else 0
+                val rx_full = if self.rx.count >= self.depth() then reg.UARTFR_RXFF_MASK else 0
+                val tx_empty = if self.tx.count == 0 then reg.UARTFR_TXFE_MASK else 0
+                val tx_full = if self.tx.count >= self.depth() then reg.UARTFR_TXFF_MASK else 0
+                val busy = if self.shifting || self.tx.count > 0 then reg.UARTFR_BUSY_MASK else 0
+                rx_empty | rx_full | tx_empty | tx_full | busy
             reg.UARTILPR_OFFSET -> 0
             reg.UARTIBRD_OFFSET -> self.ibrd
             reg.UARTFBRD_OFFSET -> self.fbrd
@@ -98,37 +356,52 @@ struct Uart
             reg.UARTCR_OFFSET -> self.cr
             reg.UARTIFLS_OFFSET -> self.ifls
             reg.UARTIMSC_OFFSET -> self.imsc
-            reg.UARTRIS_OFFSET -> self.raw()
-            reg.UARTMIS_OFFSET -> self.raw() & self.imsc
+            reg.UARTRIS_OFFSET -> self.ris
+            reg.UARTMIS_OFFSET -> self.ris & self.imsc
             reg.UARTICR_OFFSET -> 0
             reg.UARTDMACR_OFFSET -> self.dmacr
             _ -> return Err(AccessError.Unmapped)
         Ok(read_lane(value, offset, width))
+    end read
 
     write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
         access(offset, width, true)?
         val address = offset & 0xFFC
         val data = replicated(value, width)
-        if (address == reg.UARTDR_OFFSET || address == reg.UARTICR_OFFSET) && offset & 0x3000 != 0 then return Err(AccessError.UnsupportedAlias)
+        if (address == reg.UARTDR_OFFSET || address == reg.UARTICR_OFFSET || address == reg.UARTRSR_OFFSET) && offset & 0x3000 != 0 then return Err(AccessError.UnsupportedAlias)
         address match
             reg.UARTDR_OFFSET ->
-                // A byte written to a full FIFO is lost, as on the PL011.
-                if self.enabled(reg.UARTCR_TXE_MASK) && !self.tx.full() then self.tx.push(u8(data & reg.UARTDR_DATA_MASK))
-                self.tx_raw = true
-            reg.UARTRSR_OFFSET | reg.UARTILPR_OFFSET | reg.UARTFR_OFFSET | reg.UARTRIS_OFFSET | reg.UARTMIS_OFFSET -> ()
+                // The FIFO takes a character whether or not the UART is enabled; one written to a full
+                // FIFO is lost.
+                if self.tx.count < self.depth() then self.tx.push(u16(data & reg.UARTDR_DATA_MASK))
+                if self.tx.count > self.tx_level() then self.ris &= ~reg.UARTRIS_TXRIS_MASK
+                self.resume()
+            // A write to UARTECR clears every error flag.
+            reg.UARTRSR_OFFSET -> self.rsr = 0
+            reg.UARTILPR_OFFSET | reg.UARTFR_OFFSET | reg.UARTRIS_OFFSET | reg.UARTMIS_OFFSET -> ()
             reg.UARTIBRD_OFFSET -> self.ibrd = written(self.ibrd, offset, data) & reg.UARTIBRD_BAUD_DIVINT_MASK
             reg.UARTFBRD_OFFSET -> self.fbrd = written(self.fbrd, offset, data) & reg.UARTFBRD_BAUD_DIVFRAC_MASK
-            reg.UARTLCR_H_OFFSET -> self.lcr_h = written(self.lcr_h, offset, data) & ((reg.UARTLCR_H_SPS_MASK << 1) - 1)
-            reg.UARTCR_OFFSET -> self.cr = written(self.cr, offset, data) & ((reg.UARTCR_CTSEN_MASK << 1) - 1)
+            reg.UARTLCR_H_OFFSET ->
+                self.lcr_h = written(self.lcr_h, offset, data) & ((reg.UARTLCR_H_SPS_MASK << 1) - 1)
+                // An LCR_H write latches IBRD and FBRD.
+                self.divisor = 64 * self.ibrd + self.fbrd
+                self.resume()
+            reg.UARTCR_OFFSET ->
+                self.cr = written(self.cr, offset, data) & ((reg.UARTCR_CTSEN_MASK << 1) - 1)
+                self.resume()
             reg.UARTIFLS_OFFSET -> self.ifls = written(self.ifls, offset, data) & (reg.UARTIFLS_RXIFLSEL_MASK | reg.UARTIFLS_TXIFLSEL_MASK)
             reg.UARTIMSC_OFFSET -> self.imsc = written(self.imsc, offset, data) & ((reg.UARTIMSC_OEIM_MASK << 1) - 1)
-            reg.UARTICR_OFFSET -> if data & reg.UARTICR_TXIC_MASK != 0 then self.tx_raw = false
+            reg.UARTICR_OFFSET -> self.ris &= ~(data & LATCHED_RIS)
             reg.UARTDMACR_OFFSET -> self.dmacr = written(self.dmacr, offset, data) & (reg.UARTDMACR_DMAONERR_MASK | reg.UARTDMACR_TXDMAE_MASK | reg.UARTDMACR_RXDMAE_MASK)
             _ -> return Err(AccessError.Unmapped)
         Ok(())
+    end write
 end Uart
 
+/** A UART at power-on: the receiver and transmitter enables set, the UART itself not; both FIFO levels
+ * at half; nothing latched.
+ */
 uart() -> Uart
-    var state: Uart
-    state.reset()
-    state
+    val nothing = Sent(Frame(0, 0), 0, 0)
+    Uart(0, 0, 0, reg.UARTCR_RXE_MASK | reg.UARTCR_TXE_MASK, (2 << reg.UARTIFLS_RXIFLSEL_SHIFT) | (2 << reg.UARTIFLS_TXIFLSEL_SHIFT),
+        0, 0, 0, 0, 0, false, uart_fifo(), uart_fifo(), uart_fifo(), false, nothing, 0, false, false, IDLE, false, Frame(0, 0), 0, IDLE)
