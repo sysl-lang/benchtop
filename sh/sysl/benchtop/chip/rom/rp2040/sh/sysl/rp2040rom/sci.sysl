@@ -1,0 +1,329 @@
+module sh.sysl.rp2040rom
+
+// The scientific functions of the soft float and double tables: sine, cosine, tangent, eˣ, ln and
+// atan2. Each is computed in extended floats (`xf.sysl`) and rounded once, to a double or to a float,
+// so a result is within a hair of half a unit in the last place.
+//
+// **The documented ranges**: the RP2040's ROM takes sine, cosine and tangent of a float only for
+// −128 < x < 128 and of a double only for −1024 < x < 1024; the SDK's `sinf`, `sin` and the rest
+// reduce a larger angle themselves before calling it. This ROM computes them for |x| < 2048 in both,
+// and answers the default NaN beyond, as for ∞.
+//
+// **Argument reduction** is exact enough for any double in that range: x, as a 64-bit fixed-point
+// number, is multiplied by 2/π (or 1/ln 2) held to 192 bits, so the remainder keeps at least 110
+// significant bits however close x lies to a multiple of π/2.
+
+// 2/π × 2^192, three 64-bit limbs from the most significant.
+private val TWO_OVER_PI: [3]u64 = [0xA2F9836E4E441529, 0xFC2757D1F534DDC0, 0xDB6295993C439041]
+// 1/ln 2 × 2^191.
+private val INV_LN2: [3]u64 = [0xB8AA3B295C17F0BB, 0xBE87FED0691D3E88, 0xEB577AA8DD695A58]
+
+/** π/2. */
+val XF_PIO2 = Xf(false, 0, 0xC90FDAA22168C235)
+/** π. */
+val XF_PI = Xf(false, 1, 0xC90FDAA22168C235)
+/** ln 2. */
+val XF_LN2 = Xf(false, -1, 0xB17217F7D1CF79AC)
+// √2's significand.
+private const SQRT2_M: u64 = 0xB504F333F9DE6484
+
+// sin r / r as a series in r²: (−1)^k / (2k + 1)!.
+private val SIN_C: [12]Xf = [
+    Xf(false, 0, 0x8000000000000000), Xf(true, -3, 0xAAAAAAAAAAAAAAAB),
+    Xf(false, -7, 0x8888888888888889), Xf(true, -13, 0xD00D00D00D00D00D),
+    Xf(false, -19, 0xB8EF1D2AB6399C7D), Xf(true, -26, 0xD7322B3FAA271C7F),
+    Xf(false, -33, 0xB092309D43684BE5), Xf(true, -41, 0xD73F9F399DC0F88F),
+    Xf(false, -49, 0xCA963B81856A5359), Xf(true, -57, 0x97A4DA340A0AB926),
+    Xf(false, -66, 0xB8DC77B6E7AB8C5F), Xf(true, -75, 0xBB0DA098B1C0CECC)]
+
+// cos r as a series in r²: (−1)^k / (2k)!.
+private val COS_C: [12]Xf = [
+    Xf(false, 0, 0x8000000000000000), Xf(true, -1, 0x8000000000000000),
+    Xf(false, -5, 0xAAAAAAAAAAAAAAAB), Xf(true, -10, 0xB60B60B60B60B60B),
+    Xf(false, -16, 0xD00D00D00D00D00D), Xf(true, -22, 0x93F27DBBC4FAE397),
+    Xf(false, -29, 0x8F76C77FC6C4BDAA), Xf(true, -37, 0xC9CBA54603E4E906),
+    Xf(false, -45, 0xD73F9F399DC0F88F), Xf(true, -53, 0xB413C31DCBECBBDE),
+    Xf(false, -62, 0xF2A15D201011283D), Xf(true, -70, 0x8671CB6DBFC294A3)]
+
+// eʳ as a series in r: 1 / n!.
+private val EXP_C: [18]Xf = [
+    Xf(false, 0, 0x8000000000000000), Xf(false, 0, 0x8000000000000000),
+    Xf(false, -1, 0x8000000000000000), Xf(false, -3, 0xAAAAAAAAAAAAAAAB),
+    Xf(false, -5, 0xAAAAAAAAAAAAAAAB), Xf(false, -7, 0x8888888888888889),
+    Xf(false, -10, 0xB60B60B60B60B60B), Xf(false, -13, 0xD00D00D00D00D00D),
+    Xf(false, -16, 0xD00D00D00D00D00D), Xf(false, -19, 0xB8EF1D2AB6399C7D),
+    Xf(false, -22, 0x93F27DBBC4FAE397), Xf(false, -26, 0xD7322B3FAA271C7F),
+    Xf(false, -29, 0x8F76C77FC6C4BDAA), Xf(false, -33, 0xB092309D43684BE5),
+    Xf(false, -37, 0xC9CBA54603E4E906), Xf(false, -41, 0xD73F9F399DC0F88F),
+    Xf(false, -45, 0xD73F9F399DC0F88F), Xf(false, -49, 0xCA963B81856A5359)]
+
+// atanh(s) / s as a series in s²: 1 / (2k + 1).
+private val LN_C: [14]Xf = [
+    Xf(false, 0, 0x8000000000000000), Xf(false, -2, 0xAAAAAAAAAAAAAAAB),
+    Xf(false, -3, 0xCCCCCCCCCCCCCCCD), Xf(false, -3, 0x9249249249249249),
+    Xf(false, -4, 0xE38E38E38E38E38E), Xf(false, -4, 0xBA2E8BA2E8BA2E8C),
+    Xf(false, -4, 0x9D89D89D89D89D8A), Xf(false, -4, 0x8888888888888889),
+    Xf(false, -5, 0xF0F0F0F0F0F0F0F1), Xf(false, -5, 0xD79435E50D79435E),
+    Xf(false, -5, 0xC30C30C30C30C30C), Xf(false, -5, 0xB21642C8590B2164),
+    Xf(false, -5, 0xA3D70A3D70A3D70A), Xf(false, -5, 0x97B425ED097B425F)]
+
+// atan u / u as a series in u²: (−1)^k / (2k + 1).
+private val ATAN_C: [10]Xf = [
+    Xf(false, 0, 0x8000000000000000), Xf(true, -2, 0xAAAAAAAAAAAAAAAB),
+    Xf(false, -3, 0xCCCCCCCCCCCCCCCD), Xf(true, -3, 0x9249249249249249),
+    Xf(false, -4, 0xE38E38E38E38E38E), Xf(true, -4, 0xBA2E8BA2E8BA2E8C),
+    Xf(false, -4, 0x9D89D89D89D89D8A), Xf(true, -4, 0x8888888888888889),
+    Xf(false, -5, 0xF0F0F0F0F0F0F0F1), Xf(true, -5, 0xD79435E50D79435E)]
+
+// atan(k / 8) for k = 1 to 8.
+private val ATAN_K: [8]Xf = [
+    Xf(false, -4, 0xFEADD4D5617B6E33), Xf(false, -3, 0xFADBAFC96406EB15),
+    Xf(false, -2, 0xB7B0CA0F26F78474), Xf(false, -2, 0xED63382B0DDA7B45),
+    Xf(false, -1, 0x8F005D5EF7F59F9B), Xf(false, -1, 0xA4BC7D1934F70924),
+    Xf(false, -1, 0xB8053E2BC2319E74), Xf(false, -1, 0xC90FDAA22168C235)]
+
+// The magnitudes from which the reduction is needed, and the bound of the arguments taken, as bits.
+private const PIO4_BITS: u64 = 0x3FE921FB54442D18
+private const HALF_BITS: u64 = 0x3FE0000000000000
+private const LIMIT_BITS: u64 = 0x40A0000000000000
+
+// `x × c`, x a 64-bit fixed-point number with 53 fractional bits and c a constant scaled by 2^(s − 53 +
+// 64), split into the integer nearest (k) and what is left over: a 128-bit fraction of one, and
+// whether it is negative.
+private reduce(x: u64, c: []const u64, s: u32) -> (u64, bool, u128)
+    val t0 = mul128(x, c[2]) >> 64
+    val s1 = mul128(x, c[1]) + t0
+    val lo = u64.wrap(s1)
+    val s2 = mul128(x, c[0]) + (s1 >> 64)
+    val mid = u64.wrap(s2)
+    val hi = u64.wrap(s2 >> 64)
+    val k = hi >> (s - 128)
+    val f = (u128(hi) << (256 - s)) | (u128(mid) << (192 - s)) | u128(lo >> (s - 128))
+    if f >> 127 != 0 then return (k + 1, true, 0 -% f)
+    (k, false, f)
+
+// x as the fixed-point number `reduce` takes: x × 2^53, for 0.5 ≤ |x| < 2048.
+private fixed53(ax: u64) -> u64 = sig64(ax) << u32(exp64(ax) - 1022)
+
+/** The sine and cosine of a finite double with 0 < |x| < 2048. */
+sincos_xf(x: u64) -> (Xf, Xf)
+    val ax = x & 0x7FFFFFFFFFFFFFFF
+    var r = xf_of64(ax)
+    var q: u64 = 0
+    if ax >= PIO4_BITS
+        val k, neg, f = reduce(fixed53(ax), TWO_OVER_PI, 181)
+        r = xmul(xf_of128(neg, f, 128), XF_PIO2)
+        q = k & 3
+    val z = xmul(r, r)
+    val s = xmul(r, xpoly(z, SIN_C))
+    val c = xpoly(z, COS_C)
+    val sin, cos = q match
+        0 -> (s, c)
+        1 -> (c, s.negated())
+        2 -> (s.negated(), c.negated())
+        _ -> (c.negated(), s)
+    (if x >> 63 != 0 then sin.negated() else sin, cos)
+
+// What a sine, cosine or tangent answers without computing: (done, its value) for a NaN, ∞, a zero
+// or an angle out of range, as a double.
+private trig_special(x: u64, cosine: bool) -> (bool, u64)
+    if is_nan64(x) then return (true, x | 0x8000000000000)
+    val ax = x & 0x7FFFFFFFFFFFFFFF
+    if ax >= LIMIT_BITS then return (true, F64_QNAN)
+    if ax == 0 then return (true, if cosine then 0x3FF0000000000000 else x)
+    (false, 0)
+
+/** `sin` of a double. */
+dsin(x0: u64) -> u64
+    val x = flush64(x0)
+    val done, v = trig_special(x, false)
+    if done then return v
+    sincos_xf(x).0.to64()
+
+/** `cos` of a double. */
+dcos(x0: u64) -> u64
+    val x = flush64(x0)
+    val done, v = trig_special(x, true)
+    if done then return v
+    sincos_xf(x).1.to64()
+
+/** `sin` and `cos` of a double at once. */
+dsincos(x0: u64) -> (u64, u64)
+    val x = flush64(x0)
+    val done, v = trig_special(x, false)
+    if done then return (v, trig_special(x, true).1)
+    val s, c = sincos_xf(x)
+    (s.to64(), c.to64())
+
+/** `tan` of a double. */
+dtan(x0: u64) -> u64
+    val x = flush64(x0)
+    val done, v = trig_special(x, false)
+    if done then return v
+    val s, c = sincos_xf(x)
+    xdiv(s, c).to64()
+
+/** eˣ for a finite double with |x| < 2048, nonzero. */
+exp_xf(x: u64) -> Xf
+    val ax = x & 0x7FFFFFFFFFFFFFFF
+    if ax < HALF_BITS then return xpoly(xf_of64(x), EXP_C)
+    val k, neg, f = reduce(fixed53(ax), INV_LN2, 180)
+    val r = xmul(xf_of128(neg, f, 128), XF_LN2)
+    if x >> 63 != 0 then return xpoly(r.negated(), EXP_C).scaled(-i32(k))
+    xpoly(r, EXP_C).scaled(i32(k))
+
+// What eˣ answers without computing, as (done, value).
+private exp_special(x: u64) -> (bool, u64)
+    if is_nan64(x) then return (true, x | 0x8000000000000)
+    val ax = x & 0x7FFFFFFFFFFFFFFF
+    if ax == 0 then return (true, 0x3FF0000000000000)
+    if ax >= LIMIT_BITS then return (true, if x >> 63 != 0 then 0 else 0x7FF0000000000000)
+    (false, 0)
+
+/** eˣ of a double. */
+dexp(x0: u64) -> u64
+    val x = flush64(x0)
+    val done, v = exp_special(x)
+    if done then return v
+    exp_xf(x).to64()
+
+/** ln x for a finite, positive, normal double other than 1. */
+ln_xf(x: u64) -> Xf
+    var e = exp64(x) - 1023
+    val m = sig64(x) << 11
+    var y = Xf(false, 0, m)
+    if m > SQRT2_M
+        y = Xf(false, -1, m)
+        e += 1
+    val s = xdiv(xsub(y, XF_ONE), xadd(y, XF_ONE))
+    val lny = xmul(s.scaled(1), xpoly(xmul(s, s), LN_C))
+    xadd(xmul(xf_of_int(i64(e)), XF_LN2), lny)
+
+// What ln answers without computing, as (done, value).
+private ln_special(x: u64) -> (bool, u64)
+    if is_nan64(x) then return (true, x | 0x8000000000000)
+    if x & 0x7FFFFFFFFFFFFFFF == 0 then return (true, 0xFFF0000000000000)
+    if x >> 63 != 0 then return (true, F64_QNAN)
+    if x == 0x7FF0000000000000 then return (true, x)
+    if x == 0x3FF0000000000000 then return (true, 0)
+    (false, 0)
+
+/** ln x of a double. */
+dln(x0: u64) -> u64
+    val x = flush64(x0)
+    val done, v = ln_special(x)
+    if done then return v
+    ln_xf(x).to64()
+
+// atan t for 0 < t ≤ 1: atan(k/8) from the table, plus the series for the rest.
+private atan01(t: Xf) -> Xf
+    val w = xadd(t.scaled(3), Xf(false, -1, 0x8000000000000000))
+    val k = if w.e < 0 then 0 else i64(w.m >> u32(63 - w.e))
+    if k == 0 then return xmul(t, xpoly(xmul(t, t), ATAN_C))
+    val c = xf_of_int(k).scaled(-3)
+    val u = xdiv(xsub(t, c), xadd(XF_ONE, xmul(t, c)))
+    xadd(ATAN_K[usize(k - 1)], xmul(u, xpoly(xmul(u, u), ATAN_C)))
+
+/** atan2(y, x) of two doubles, finite and nonzero, as an extended float. */
+atan2_xf(y: u64, x: u64) -> Xf
+    val ay = y & 0x7FFFFFFFFFFFFFFF
+    val ax = x & 0x7FFFFFFFFFFFFFFF
+    val swap = ay > ax
+    val a = xf_of64(ay)
+    val b = xf_of64(ax)
+    var th = if swap then xsub(XF_PIO2, atan01(xdiv(b, a))) else atan01(xdiv(a, b))
+    if x >> 63 != 0 then th = xsub(XF_PI, th)
+    if y >> 63 != 0 then th.negated() else th
+
+// What atan2 answers for a NaN, an infinity or a zero, as IEEE 754 (C's Annex F) gives it: (done, the
+// value as an extended float; the NaN as a double).
+private atan2_special(y: u64, x: u64) -> (bool, Xf, u64)
+    if is_nan64(y) then return (true, XF_ZERO, y | 0x8000000000000)
+    if is_nan64(x) then return (true, XF_ZERO, x | 0x8000000000000)
+    val yneg = y >> 63 != 0
+    val xneg = x >> 63 != 0
+    val ay = y & 0x7FFFFFFFFFFFFFFF
+    val ax = x & 0x7FFFFFFFFFFFFFFF
+    val inf: u64 = 0x7FF0000000000000
+    val quarter = XF_PIO2.scaled(-1)
+    var v = XF_ZERO
+    if ay == 0
+        v = if xneg then XF_PI else XF_ZERO
+    elif ay == inf
+        v = if ax == inf then (if xneg then xadd(XF_PIO2, quarter) else quarter) else XF_PIO2
+    elif ax == 0
+        v = XF_PIO2
+    elif ax == inf
+        v = if xneg then XF_PI else XF_ZERO
+    else
+        return (false, XF_ZERO, 0)
+    (true, if yneg then v.negated() else v, 0)
+
+/** atan2(y, x) of two doubles. */
+datan2(y0: u64, x0: u64) -> u64
+    val y = flush64(y0)
+    val x = flush64(x0)
+    val done, v, nan = atan2_special(y, x)
+    if done then return if nan != 0 then nan else exact64(v)
+    atan2_xf(y, x).to64()
+
+// A special value's double: zero exactly, the rest rounded.
+private exact64(v: Xf) -> u64 = if v.is_zero() then (if v.neg then 0x8000000000000000 else 0) else v.to64()
+private exact32(v: Xf) -> u32 = if v.is_zero() then (if v.neg then 0x80000000 else 0) else v.to32()
+
+// The float versions: the argument widened exactly, computed as for a double, rounded once to a float.
+
+// A float's NaN answer, from the double one.
+private nan32(x: u64) -> u32 = double2float(x)
+
+/** `sin` of a float. */
+fsin(x: u32) -> u32
+    val d = float2double(x)
+    val done, v = trig_special(d, false)
+    if done then return nan32(v)
+    sincos_xf(d).0.to32()
+
+/** `cos` of a float. */
+fcos(x: u32) -> u32
+    val d = float2double(x)
+    val done, v = trig_special(d, true)
+    if done then return nan32(v)
+    sincos_xf(d).1.to32()
+
+/** `sin` and `cos` of a float at once. */
+fsincos(x: u32) -> (u32, u32)
+    val d = float2double(x)
+    val done, v = trig_special(d, false)
+    if done then return (nan32(v), nan32(trig_special(d, true).1))
+    val s, c = sincos_xf(d)
+    (s.to32(), c.to32())
+
+/** `tan` of a float. */
+ftan(x: u32) -> u32
+    val d = float2double(x)
+    val done, v = trig_special(d, false)
+    if done then return nan32(v)
+    val s, c = sincos_xf(d)
+    xdiv(s, c).to32()
+
+/** eˣ of a float. */
+fexp(x: u32) -> u32
+    val d = float2double(x)
+    val done, v = exp_special(d)
+    if done then return nan32(v)
+    exp_xf(d).to32()
+
+/** ln x of a float. */
+fln(x: u32) -> u32
+    val d = float2double(x)
+    val done, v = ln_special(d)
+    if done then return nan32(v)
+    ln_xf(d).to32()
+
+/** atan2(y, x) of two floats. */
+fatan2(y: u32, x: u32) -> u32
+    val dy = float2double(y)
+    val dx = float2double(x)
+    val done, v, nan = atan2_special(dy, dx)
+    if done then return if nan != 0 then nan32(nan) else exact32(v)
+    atan2_xf(dy, dx).to32()

@@ -91,6 +91,10 @@ struct Ssi
     pending: bool
     pending_word: u32
     frame_end: u64
+    // What the flash sees on its data pins while their pads are output-disabled (PADS_QSPI OD, which the
+    // chip keeps here): DRIVEN, PULLED_LOW, PULLED_HIGH or FLOATING. Pad state, not the SSI's, so its
+    // reset leaves it.
+    undriven: u32
 
     reset(*self)
         self.ctrlr0 = 0
@@ -324,7 +328,7 @@ struct Ssi
                 lanes = self.addr_lanes()
             else
                 return Err(s"the SSI's EEPROM read on ${self.lanes()} lanes was given a TX entry (0x${hex(entry)}) after its instruction and address, which is not modelled")
-        val got = exchange_bits(flash, entry, bits)?
+        val got = exchange_bits(flash, entry, bits, self.undriven)?
         if self.tmod() == reg.CTRLR0_TMOD_TX_AND_RX
             self.pending = true
             self.pending_word = got
@@ -338,10 +342,10 @@ struct Ssi
         val lanes = if self.enhanced() then self.lanes() else 1
         if first && self.enhanced()
             val dummy = self.wait_cycles() * self.addr_lanes() / 8
-            for k in 0..<dummy do exchange_byte(flash, 0xFF)?
+            for k in 0..<dummy do exchange_byte(flash, 0xFF, self.undriven)?
             clocks = self.wait_cycles()
         val bits = self.frame_bits()
-        self.pending_word = exchange_bits(flash, 0xFFFFFFFF, bits)?
+        self.pending_word = exchange_bits(flash, 0xFFFFFFFF, bits, self.undriven)?
         self.pending = true
         self.rx_left -= 1
         clocks += bits / lanes
@@ -385,11 +389,11 @@ struct Ssi
         if !((inst == 8 && addr == 24) || (inst == 0 && addr == 32))
             return Err(s"an XIP read with a $inst-bit instruction and a $addr-bit address (SPI_CTRLR0 0x${hex(self.spi_ctrlr0, 8)}) is not modelled: benchtop runs XIP_CMD as an 8-bit instruction before a 24-bit address, or as the mode bits of a 32-bit one")
         f.select()
-        if inst == 8 then exchange_byte(f, u8.wrap(self.xip_cmd()))?
-        exchange_bits(f, if addr == 32 then (a << 8) | self.xip_cmd() else a, addr)?
-        for k in 0..<(self.wait_cycles() * self.addr_lanes() / 8) do exchange_byte(f, 0xFF)?
+        if inst == 8 then exchange_byte(f, u8.wrap(self.xip_cmd()), self.undriven)?
+        exchange_bits(f, if addr == 32 then (a << 8) | self.xip_cmd() else a, addr, self.undriven)?
+        for k in 0..<(self.wait_cycles() * self.addr_lanes() / 8) do exchange_byte(f, 0xFF, self.undriven)?
         var word: u32 = 0
-        for k in 0u32..<4 do word |= u32(exchange_byte(f, 0xFF)?) << (8 * k)
+        for k in 0u32..<4 do word |= u32(exchange_byte(f, 0xFF, self.undriven)?) << (8 * k)
         f.deselect()?
         Ok(word)
 end Ssi
@@ -399,16 +403,33 @@ ssi() -> Ssi
     s.reset()
     s
 
+/** The flash's data pins as the SSI drives them (`Ssi.undriven`). */
+const DRIVEN: u32 = 0
+/** Output-disabled and pulled down: the flash sees 0s. */
+const PULLED_LOW: u32 = 1
+/** Output-disabled and pulled up: the flash sees 1s. */
+const PULLED_HIGH: u32 = 2
+/** Output-disabled with neither pull: a level benchtop does not model. */
+const FLOATING: u32 = 3
+
 // `bits` of `out`, most significant byte first, to the flash; what came back, the same way round.
-private exchange_bits(flash: *QspiFlash, out: u32, bits: u32) -> Result[u32, string]
+private exchange_bits(flash: *QspiFlash, out: u32, bits: u32, undriven: u32) -> Result[u32, string]
     var got: u32 = 0
-    for k in 0u32..<(bits / 8) do got = (got << 8) | u32(exchange_byte(flash, u8.wrap(out >> (bits - 8 * (k + 1))))?)
+    for k in 0u32..<(bits / 8) do got = (got << 8) | u32(exchange_byte(flash, u8.wrap(out >> (bits - 8 * (k + 1))), undriven)?)
     Ok(got)
 
 // One byte to the flash where its chip select is low; with it high no device answers, and FFh is read.
-private exchange_byte(flash: *QspiFlash, out: u8) -> Result[u8, string]
+// With the data pads output-disabled the flash sees their pull, not `out`: that is how the boot ROM's
+// `flash_exit_xip` clocks mode bits of 0 into a flash in continuous read mode, ending it, and then FFh
+// (continuous read mode reset). A flash in SPI mode that sees 00h as an instruction ignores the frame,
+// as an unrecognised instruction is ignored until chip select rises.
+private exchange_byte(flash: *QspiFlash, out: u8, undriven: u32) -> Result[u8, string]
     if !flash.selected then return Ok(0xFF)
-    flash.exchange(out)
+    if undriven == DRIVEN then return flash.exchange(out)
+    if undriven == FLOATING then return Err("the flash's data pins are output-disabled in PADS_QSPI with neither pull enabled: the level the flash sees is not modelled")
+    val seen: u8 = if undriven == PULLED_LOW then 0x00 else 0xFF
+    if seen == 0x00 && !flash.continuous && flash.count == 0 then return Ok(seen)
+    flash.exchange(seen)
 
 private ssi_refusal(offset: u32, e: AccessError) -> string = e match
     Unmapped -> s"SSI + 0x${hex(offset)} is not a register of the SSI"
