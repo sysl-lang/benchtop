@@ -1,0 +1,79 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.v6m as arm
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.rp2350.powman as pm
+import sysl.fmt.hex
+
+// POWMAN's always-on timer on the chip: its registers from the M33 under both executors, the alarm
+// waking a sleeping core through a time skip and POWMAN_IRQ_TIMER, and the SDK's pico_aon_timer end
+// to end (examples/pico2/aon_timer.c).
+
+private val ARM_AON = embed("../../../../examples/pico2/aon_timer.elf")
+private val AON_HELLO = embed("../../../../examples/pico2/hello_serial.elf")
+
+private val SRAM = SramMap(0x20000000, 520 * 1024)
+
+// Thumb halfwords into SRAM at `at`.
+private place(b: &ArmBoard, at: u32, code: []const u16)
+    for i in 0..<code.len
+        b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
+        b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
+
+private const PW: u32 = 0x5AFE0000
+// POWMAN_IRQ_TIMER (`intctrl.h`).
+private const AON_IRQ: u32 = 45
+
+private aon_pending(c: *arm.Cpu) -> bool = c.pending[arm.nvic_word(arm.IRQ0 + AON_IRQ)] & arm.nvic_bit(arm.IRQ0 + AON_IRQ) != 0
+
+@test("under both executors core 0's stores reach SET_TIME and TIMER behind the password, its loads read the count back, and a store without the password is dropped")
+arm_aon_registers_executors()
+    for exec in [&arm.run_match, &arm.run_threaded]
+        // str r1, [r0]; str r3, [r2]; ldr r5, [r4]; str r7, [r6] (a CLR of RUN without the password); ldr r6, [r4]
+        val code = [0x6001u16, 0x6013, 0x6825, 0x6037, 0x6826]
+        val regs = [pm.BASE + pm.SET_TIME_15TO0_OFFSET, PW | 0x1234, pm.BASE + pm.TIMER_OFFSET + 0x2000, PW | pm.TIMER_RUN_MASK,
+            pm.BASE + pm.READ_TIME_LOWER_OFFSET, 0, pm.BASE + pm.TIMER_OFFSET + 0x3000, pm.TIMER_RUN_MASK]
+        val b = on_core0(exec, code, regs)
+        val c = &b.cores[0]
+        assert(c.stop == Stop.Breakpoint && c.retired == 5 && b.why.is_empty(), s"${c.stop} at 0x${hex(c.stop_at, 8)}: ${b.why}")
+        assert(c.r[5] == 0x1234 && c.r[6] == 0x1234, s"r5 ${c.r[5]} r6 ${c.r[6]}")
+        assert(b.chip.powman.counting(), "the CLR without the password left RUN set")
+        assert(b.chip.read(0, pm.BASE + pm.BADPASSWD_OFFSET, 4).unwrap() == 1)
+
+@test("a core asleep in WFI with the always-on alarm set sleeps straight to it: the board skips to the alarm's clk_sys cycle and POWMAN_IRQ_TIMER is pending")
+arm_aon_alarm_time_skip()
+    val b = arm_board(SRAM)
+    b.boot(AON_HELLO).unwrap()
+    place(b, 0x20070100, [0xBF30, 0xE7FD])
+    b.cores[0].pc = 0x20070100
+    val c = &b.chip
+    // The LPOSC at power-on, 32 kHz stated: 1.024 ms a millisecond of real time; the alarm at 5120 ms is 5 s away.
+    c.write(0, pm.BASE + pm.LPOSC_FREQ_KHZ_FRAC_OFFSET, 4, PW).unwrap()
+    c.write(0, pm.BASE + pm.TIMER_OFFSET + 0x2000, 4, PW | pm.TIMER_RUN_MASK).unwrap()
+    c.write(0, pm.BASE + pm.INTE_OFFSET, 4, PW | pm.INTE_TIMER_MASK).unwrap()
+    c.write(0, pm.BASE + pm.ALARM_TIME_15TO0_OFFSET, 4, PW | 5120).unwrap()
+    c.write(0, pm.BASE + pm.TIMER_OFFSET + 0x2000, 4, PW | pm.TIMER_ALARM_ENAB_MASK).unwrap()
+    val hz = c.sys_hz()
+    val start = c.now
+    val end = b.run(60 * hz)
+    assert(end == RunEnd.Asleep, s"$end ${b.refused}")
+    assert(c.powman.time_ms() == 5120 && aon_pending(&b.cores[0]))
+    val slept = c.now - start
+    assert(slept >= 5 * hz - hz / 1000 && slept <= 5 * hz + hz / 1000, s"$slept cycles at $hz Hz")
+
+@test("the SDK's pico_aon_timer on a Pico 2: started from the crystal at a wall-clock time, read after sleep_ms, an alarm waited for with WFI, a past alarm, a stop and the 32-bit carry")
+arm_aon_timer_program()
+    val text = run_to_breakpoint(ARM_AON, 3000)
+    val want = "running 1 using_xosc 1\r\n" +
+        "after 250 ms: 1700000000.250\r\n" +
+        "alarm fired at 1700000001.750\r\n" +
+        "alarm latched 1 irq pending 1\r\n" +
+        "cleared while enabled: alarm 1\r\n" +
+        "disabled and cleared: alarm 0\r\n" +
+        "past alarm fired 2\r\n" +
+        "stopped: running 0 held 1\r\n" +
+        // 0xFFFFFFF0 ms and 25 more, against TIMER0's microseconds over the same span.
+        "carry: upper 1 lower 9 after 25001 us\r\n" +
+        "done\r\n"
+    assert(text == want, text)

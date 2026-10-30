@@ -1,0 +1,402 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2040.AccessError
+import sh.sysl.rp2350.powman as pm
+
+// POWMAN's always-on timer and the LPOSC, against `hardware/regs/powman.h` and the SDK's
+// `hardware_powman` and `pico_aon_timer`.
+
+private const PW: u32 = 0x5AFE0000
+private const SYS: u64 = 150000000
+private const LPOSC: u64 = 32768
+private const XOSC: u64 = 12000000
+// clk_sys cycles in a millisecond and a second at 150 MHz.
+private const MS: u64 = 150000
+private const SECOND: u64 = 150000000
+// The register aliases.
+private const XOR: u32 = 0x1000
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+
+private rd(p: *Powman, off: u32) -> u32 = p.read(off, 4).unwrap()
+private wr(p: *Powman, off: u32, x: u32) = p.write(off, 4, PW | x).unwrap()
+
+// The count from the two READ_TIME registers, upper first, as `powman_timer_get_ms` reads it once.
+private now(p: *Powman) -> u64 = (u64(rd(p, pm.READ_TIME_UPPER_OFFSET)) << 32) | u64(rd(p, pm.READ_TIME_LOWER_OFFSET))
+
+// SET_TIME, as `powman_timer_set_ms` writes it.
+private set_time(p: *Powman, t: u64)
+    wr(p, pm.SET_TIME_15TO0_OFFSET, u32(t & 0xFFFF))
+    wr(p, pm.SET_TIME_31TO16_OFFSET, u32((t >> 16) & 0xFFFF))
+    wr(p, pm.SET_TIME_47TO32_OFFSET, u32((t >> 32) & 0xFFFF))
+    wr(p, pm.SET_TIME_63TO48_OFFSET, u32(t >> 48))
+
+// ALARM_TIME, as `powman_timer_enable_alarm_at_ms` writes it: alarm disabled, the time, enabled.
+private alarm_at(p: *Powman, t: u64)
+    wr(p, pm.INTE_OFFSET + SET, pm.INTE_TIMER_MASK)
+    wr(p, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_ENAB_MASK)
+    wr(p, pm.ALARM_TIME_15TO0_OFFSET, u32(t & 0xFFFF))
+    wr(p, pm.ALARM_TIME_31TO16_OFFSET, u32((t >> 16) & 0xFFFF))
+    wr(p, pm.ALARM_TIME_47TO32_OFFSET, u32((t >> 32) & 0xFFFF))
+    wr(p, pm.ALARM_TIME_63TO48_OFFSET, u32(t >> 48))
+    wr(p, pm.TIMER_OFFSET + SET, pm.TIMER_ALARM_ENAB_MASK)
+
+// A timer started at `t` from the crystal, as `aon_timer_start` leaves it.
+private on_crystal(t: u64) -> Powman
+    var p = powman()
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_USE_XOSC_MASK)
+    set_time(&p, t)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    p
+
+// `cycles` of clk_sys pass with every source running and the reference GPIO low.
+private run(p: *Powman, cycles: u64) = p.advance(cycles, SYS, LPOSC, XOSC, false)
+
+@test("AON timer: every timer register's power-on value; stopped, nothing counts")
+aon_reset_values()
+    var p = powman()
+    for off in [pm.SET_TIME_63TO48_OFFSET, pm.SET_TIME_47TO32_OFFSET, pm.SET_TIME_31TO16_OFFSET, pm.SET_TIME_15TO0_OFFSET,
+            pm.READ_TIME_UPPER_OFFSET, pm.READ_TIME_LOWER_OFFSET, pm.ALARM_TIME_63TO48_OFFSET, pm.ALARM_TIME_47TO32_OFFSET,
+            pm.ALARM_TIME_31TO16_OFFSET, pm.ALARM_TIME_15TO0_OFFSET, pm.TIMER_OFFSET]
+        assert(rd(&p, off) == 0, s"0x${off}")
+    assert(rd(&p, pm.LPOSC_OFFSET) == 0x203 && rd(&p, pm.EXT_TIME_REF_OFFSET) == 0)
+    assert(rd(&p, pm.LPOSC_FREQ_KHZ_INT_OFFSET) == 32 && rd(&p, pm.LPOSC_FREQ_KHZ_FRAC_OFFSET) == 0xC49C, "32.768 kHz")
+    assert(rd(&p, pm.XOSC_FREQ_KHZ_INT_OFFSET) == 12000 && rd(&p, pm.XOSC_FREQ_KHZ_FRAC_OFFSET) == 0, "12 MHz")
+    assert(!p.counting() && p.reference_gpio().is_none() && p.next_alarm(SYS, LPOSC, XOSC).is_none())
+    run(&p, 10 * SECOND)
+    assert(now(&p) == 0 && p.time_ms() == 0, "stopped at power-on")
+
+@test("AON timer: every write needs the password; READ_TIME is read-only; SET_TIME and ALARM_TIME are 16 bits")
+aon_password_and_widths()
+    var p = powman()
+    p.write(pm.TIMER_OFFSET, 4, pm.TIMER_RUN_MASK).unwrap()
+    assert(!p.counting() && rd(&p, pm.BADPASSWD_OFFSET) == 1, "RUN without the password is dropped")
+    p.write(pm.TIMER_OFFSET + SET, 4, 0x5AFF0000 | pm.TIMER_RUN_MASK).unwrap()
+    assert(!p.counting(), "nor through an alias, nor with a near miss")
+    p.write(pm.SET_TIME_15TO0_OFFSET, 4, 0x1234).unwrap()
+    assert(rd(&p, pm.SET_TIME_15TO0_OFFSET) == 0)
+    p.write(pm.ALARM_TIME_15TO0_OFFSET, 4, 0x1234).unwrap()
+    assert(rd(&p, pm.ALARM_TIME_15TO0_OFFSET) == 0)
+    p.write(pm.SET_TIME_31TO16_OFFSET, 4, 0xFFFFFFFF).unwrap()
+    assert(rd(&p, pm.SET_TIME_31TO16_OFFSET) == 0, "0xFFFF is not the password")
+    wr(&p, pm.SET_TIME_31TO16_OFFSET, 0xFFFF)
+    wr(&p, pm.ALARM_TIME_63TO48_OFFSET, 0xFFFF)
+    assert(rd(&p, pm.SET_TIME_31TO16_OFFSET) == 0xFFFF && rd(&p, pm.ALARM_TIME_63TO48_OFFSET) == 0xFFFF)
+    p.write(pm.SET_TIME_47TO32_OFFSET, 2, 0x5AFE).unwrap()
+    assert(rd(&p, pm.SET_TIME_47TO32_OFFSET) == 0x5AFE, "a halfword write carries its own password, replicated")
+    wr(&p, pm.BADPASSWD_OFFSET + CLR, 1)
+    assert(rd(&p, pm.BADPASSWD_OFFSET) == 0, "a 1 through the CLR alias clears a write-1-to-clear bit")
+    // READ_TIME takes no write, password or not.
+    var t = on_crystal(0x0001000200030004)
+    wr(&t, pm.READ_TIME_LOWER_OFFSET, 0xFFFF)
+    wr(&t, pm.READ_TIME_UPPER_OFFSET, 0xFFFF)
+    assert(now(&t) == 0x0001000200030004 && rd(&t, pm.BADPASSWD_OFFSET) == 0)
+    t.write(pm.READ_TIME_LOWER_OFFSET, 4, 0).unwrap()
+    assert(rd(&t, pm.BADPASSWD_OFFSET) == 1, "a write without it still latches BADPASSWD")
+    assert(t.read(pm.READ_TIME_LOWER_OFFSET, 2).unwrap() == 4 && t.read(pm.READ_TIME_LOWER_OFFSET + 2, 2).unwrap() == 3, "halfword reads")
+    assert(t.read(pm.READ_TIME_UPPER_OFFSET + 3, 1).unwrap() == 0 && t.read(pm.READ_TIME_UPPER_OFFSET, 1).unwrap() == 2, "byte reads")
+
+@test("AON timer: RUN loads SET_TIME and counts from the LPOSC by default; TIMER's read-only, read-write and self-clearing bits")
+aon_timer_register()
+    var p = powman()
+    set_time(&p, 0x0001000200030004)
+    assert(now(&p) == 0, "SET_TIME is not the count until RUN")
+    wr(&p, pm.TIMER_OFFSET, 0xFFFF)
+    // NONSEC_WRITE, RUN, ALARM_ENAB, PWRUP_ON_ALARM, USE_GPIO_1HZ stored; CLEAR and the USE_* read 0, the
+    // last of them choosing the GPIO; USING_* follow the source while running (no USING_GPIO_1HZ while
+    // the GPIO is the tick); and ALARM_ENAB with the alarm at 0 has latched ALARM.
+    val want = 0x2033 | pm.TIMER_ALARM_MASK | pm.TIMER_USING_GPIO_1KHZ_MASK
+    assert(rd(&p, pm.TIMER_OFFSET) == want, s"0x${rd(&p, pm.TIMER_OFFSET)}")
+    assert(now(&p) == 0, "CLEAR in the same write zeroes the loaded count")
+    wr(&p, pm.TIMER_OFFSET, 0)
+    assert(rd(&p, pm.TIMER_OFFSET) == pm.TIMER_ALARM_MASK, "stopped, no USING bit; a 0 does not clear ALARM")
+    wr(&p, pm.TIMER_OFFSET, pm.TIMER_ALARM_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) == 0, "a 1 does")
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_USE_LPOSC_MASK)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    assert(now(&p) == 0x0001000200030004, "loaded")
+    assert(rd(&p, pm.TIMER_OFFSET) == pm.TIMER_RUN_MASK | pm.TIMER_USING_LPOSC_MASK)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_USE_GPIO_1HZ_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) == pm.TIMER_RUN_MASK | pm.TIMER_USE_GPIO_1HZ_MASK | pm.TIMER_USING_LPOSC_MASK | pm.TIMER_USING_GPIO_1HZ_MASK)
+    wr(&p, pm.TIMER_OFFSET + XOR, pm.TIMER_USE_GPIO_1HZ_MASK | pm.TIMER_USE_XOSC_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) == pm.TIMER_RUN_MASK | pm.TIMER_USING_XOSC_MASK, "XOR clears USE_GPIO_1HZ and strobes USE_XOSC")
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_USE_LPOSC_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) & pm.TIMER_USING_XOSC_MASK != 0, "a CLR alias strobes nothing")
+    p.write(pm.TIMER_OFFSET, 4, 0xFFFF0000).unwrap()
+    assert(rd(&p, pm.TIMER_OFFSET) == pm.TIMER_RUN_MASK | pm.TIMER_USING_XOSC_MASK && rd(&p, pm.BADPASSWD_OFFSET) == 1,
+        "the USING bits cannot be written: the top half is the password")
+
+@test("AON timer from the crystal: 12000 kHz stated counts one millisecond per 12000 crystal cycles, exactly")
+aon_crystal_rate()
+    var p = on_crystal(1000)
+    run(&p, MS - 1)
+    assert(now(&p) == 1000, "not quite a millisecond")
+    run(&p, 1)
+    assert(now(&p) == 1001)
+    run(&p, 3600 * SECOND)
+    assert(now(&p) == 1001 + 3600000, "an hour, to the millisecond")
+    // Not running, the crystal counts nothing.
+    p.advance(SECOND, SYS, LPOSC, 0, false)
+    assert(now(&p) == 1001 + 3600000)
+    // A stated frequency off the real one runs fast or slow by its ratio: 6000 kHz stated, 12 MHz real.
+    wr(&p, pm.XOSC_FREQ_KHZ_INT_OFFSET, 6000)
+    run(&p, SECOND)
+    assert(now(&p) == 1001 + 3600000 + 2000)
+    // 12000.5 kHz stated: 2000 ms of real time is 1999.9 stated ms.
+    wr(&p, pm.XOSC_FREQ_KHZ_INT_OFFSET, 12000)
+    wr(&p, pm.XOSC_FREQ_KHZ_FRAC_OFFSET, 0x8000)
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_RUN_MASK)
+    set_time(&p, 0)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    run(&p, 2 * SECOND)
+    assert(now(&p) == 1999, s"${now(&p)}")
+    // 0 kHz stated stops the count rather than dividing by it.
+    wr(&p, pm.XOSC_FREQ_KHZ_INT_OFFSET, 0)
+    wr(&p, pm.XOSC_FREQ_KHZ_FRAC_OFFSET, 0)
+    run(&p, SECOND)
+    assert(now(&p) == 1999)
+    assert(p.next_alarm(SYS, LPOSC, XOSC).is_none())
+
+@test("AON timer from the LPOSC: 32.768 kHz real against the 32.768005 kHz the reset values state, and against 32 kHz stated")
+aon_lposc_rate()
+    var p = powman()
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) & pm.TIMER_USING_LPOSC_MASK != 0, "the LPOSC at power-on")
+    // A second is 32768 LPOSC cycles; at 0x20.C49C kHz stated that is 999.9998 ms.
+    run(&p, SECOND)
+    assert(now(&p) == 999)
+    // One more LPOSC cycle (150 MHz / 32768 = 4577.6 clk_sys cycles) makes the thousandth.
+    run(&p, 4577)
+    assert(now(&p) == 999, "not yet a whole LPOSC cycle")
+    run(&p, 1)
+    assert(now(&p) == 1000)
+    // 32 kHz stated: 1024 ms to the second.
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_RUN_MASK)
+    wr(&p, pm.LPOSC_FREQ_KHZ_INT_OFFSET, 32)
+    wr(&p, pm.LPOSC_FREQ_KHZ_FRAC_OFFSET, 0)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    assert(now(&p) == 0, "RUN reloads SET_TIME, still 0")
+    run(&p, SECOND)
+    assert(now(&p) == 1024)
+    // LPOSC_FREQ_KHZ_INT is six bits.
+    wr(&p, pm.LPOSC_FREQ_KHZ_INT_OFFSET, 0xFFFF)
+    assert(rd(&p, pm.LPOSC_FREQ_KHZ_INT_OFFSET) == 0x3F)
+    // A different clk_sys does not change the LPOSC's rate.
+    wr(&p, pm.LPOSC_FREQ_KHZ_INT_OFFSET, 32)
+    p.advance(12000000, 12000000, LPOSC, XOSC, false)
+    assert(now(&p) == 2048, "a second at 12 MHz clk_sys")
+
+@test("LPOSC: TRIM and MODE are stored, behind the password, and the oscillator stays at its nominal 32.768 kHz")
+aon_lposc_trim()
+    var p = powman()
+    assert(rd(&p, pm.LPOSC_OFFSET) & pm.LPOSC_TRIM_MASK == 0x20 << 4 && rd(&p, pm.LPOSC_OFFSET) & pm.LPOSC_MODE_MASK == 3)
+    p.write(pm.LPOSC_OFFSET, 4, 0x3F0).unwrap()
+    assert(rd(&p, pm.LPOSC_OFFSET) == 0x203, "no password")
+    wr(&p, pm.LPOSC_OFFSET, 0x3F << 4)
+    assert(rd(&p, pm.LPOSC_OFFSET) == 0x3F0, "TRIM at its maximum, MODE 0")
+    wr(&p, pm.LPOSC_OFFSET, 0xFFFF)
+    assert(rd(&p, pm.LPOSC_OFFSET) == 0x3F3, "bits 3:2 and 15:10 are not there")
+    wr(&p, pm.LPOSC_OFFSET + CLR, pm.LPOSC_TRIM_MASK)
+    assert(rd(&p, pm.LPOSC_OFFSET) == 0x003)
+    wr(&p, pm.LPOSC_FREQ_KHZ_FRAC_OFFSET, 0)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    run(&p, SECOND)
+    assert(now(&p) == 1024, "trimmed to 0, the timer still sees 32768 cycles a second")
+
+@test("AON timer: the 64-bit count carries from READ_TIME_LOWER into READ_TIME_UPPER, a read racing the carry is caught by the SDK's re-read, and 2^64 ms wraps to 0")
+aon_carry()
+    var p = on_crystal(0xFFFFFFFF)
+    assert(rd(&p, pm.READ_TIME_UPPER_OFFSET) == 0 && rd(&p, pm.READ_TIME_LOWER_OFFSET) == 0xFFFFFFFF)
+    run(&p, MS)
+    assert(rd(&p, pm.READ_TIME_UPPER_OFFSET) == 1 && rd(&p, pm.READ_TIME_LOWER_OFFSET) == 0)
+    // powman_timer_get_ms: UPPER, LOWER, UPPER again; the carry lands between the first two reads.
+    var q = on_crystal(0x00000005FFFFFFFF)
+    val hi = rd(&q, pm.READ_TIME_UPPER_OFFSET)
+    run(&q, MS)
+    var lo = rd(&q, pm.READ_TIME_LOWER_OFFSET)
+    val again = rd(&q, pm.READ_TIME_UPPER_OFFSET)
+    assert(hi == 5 && lo == 0 && again == 6, "torn: 5:0 would be 2^32 ms early")
+    lo = rd(&q, pm.READ_TIME_LOWER_OFFSET)
+    assert((u64(again) << 32) | u64(lo) == 0x0000000600000000, "the re-read")
+    var w = on_crystal(0xFFFFFFFFFFFFFFFF)
+    run(&w, MS)
+    assert(now(&w) == 0, "the count wraps")
+    run(&w, 5 * MS)
+    assert(now(&w) == 5)
+
+@test("AON timer: RUN cleared holds the count, RUN set again reloads SET_TIME, a second RUN does not; CLEAR zeroes a running count and keeps it running")
+aon_stop_start_clear()
+    var p = on_crystal(500)
+    run(&p, 100 * MS)
+    assert(now(&p) == 600)
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_RUN_MASK)
+    assert(!p.counting() && rd(&p, pm.TIMER_OFFSET) == 0, "stopped: not USING anything")
+    run(&p, 100 * MS)
+    assert(now(&p) == 600, "held")
+    // powman_timer_pause's resume: SET_TIME from the held count, then RUN.
+    set_time(&p, now(&p))
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    run(&p, 10 * MS)
+    assert(now(&p) == 610)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    assert(now(&p) == 610, "RUN already set: no reload")
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_CLEAR_MASK)
+    assert(now(&p) == 0 && p.counting() && rd(&p, pm.TIMER_OFFSET) & pm.TIMER_CLEAR_MASK == 0, "cleared, running, CLEAR reads 0")
+    run(&p, 3 * MS)
+    assert(now(&p) == 3)
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_RUN_MASK)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_CLEAR_MASK)
+    assert(now(&p) == 0 && !p.counting(), "CLEAR while stopped")
+    // Switching source mid-count keeps the count.
+    var s = on_crystal(0)
+    run(&s, 2 * MS)
+    wr(&s, pm.TIMER_OFFSET + SET, pm.TIMER_USE_LPOSC_MASK)
+    assert(rd(&s, pm.TIMER_OFFSET) & (pm.TIMER_USING_LPOSC_MASK | pm.TIMER_USING_XOSC_MASK) == pm.TIMER_USING_LPOSC_MASK && now(&s) == 2)
+    wr(&s, pm.LPOSC_FREQ_KHZ_FRAC_OFFSET, 0)
+    run(&s, SECOND)
+    assert(now(&s) == 2 + 1024)
+    // Several USE_* in one write: GPIO 1 kHz, then the crystal, then the LPOSC.
+    wr(&s, pm.TIMER_OFFSET + SET, pm.TIMER_USE_LPOSC_MASK | pm.TIMER_USE_XOSC_MASK)
+    assert(rd(&s, pm.TIMER_OFFSET) & pm.TIMER_USING_XOSC_MASK != 0)
+    wr(&s, pm.TIMER_OFFSET + SET, pm.TIMER_USE_LPOSC_MASK | pm.TIMER_USE_XOSC_MASK | pm.TIMER_USE_GPIO_1KHZ_MASK)
+    assert(rd(&s, pm.TIMER_OFFSET) & pm.TIMER_USING_GPIO_1KHZ_MASK != 0)
+
+@test("AON alarm: one in the future fires when the count reaches it, exactly as next_alarm predicts, and raises POWMAN_IRQ_TIMER through INTE")
+aon_alarm_future()
+    var p = on_crystal(100)
+    wr(&p, pm.INTE_OFFSET, 0)
+    alarm_at(&p, 150)
+    wr(&p, pm.INTE_OFFSET + CLR, pm.INTE_TIMER_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) & pm.TIMER_ALARM_MASK == 0 && !p.irq_timer())
+    assert(p.next_alarm(SYS, LPOSC, XOSC) == Some(50 * MS))
+    run(&p, 50 * MS - 1)
+    assert(rd(&p, pm.TIMER_OFFSET) & pm.TIMER_ALARM_MASK == 0 && now(&p) == 149 && p.next_alarm(SYS, LPOSC, XOSC) == Some(1))
+    run(&p, 1)
+    assert(rd(&p, pm.TIMER_OFFSET) & pm.TIMER_ALARM_MASK != 0 && now(&p) == 150)
+    assert(rd(&p, pm.INTR_OFFSET) == pm.INTR_TIMER_MASK && rd(&p, pm.INTS_OFFSET) == 0 && !p.irq_timer() && !p.irq_pow(), "raised but not enabled")
+    assert(p.next_alarm(SYS, LPOSC, XOSC).is_none(), "already fired")
+    wr(&p, pm.INTE_OFFSET + SET, pm.INTE_TIMER_MASK)
+    assert(rd(&p, pm.INTS_OFFSET) == pm.INTR_TIMER_MASK && p.irq_timer() && !p.irq_pow())
+    // INTR.TIMER is ALARM: a write to INTR does not clear it.
+    wr(&p, pm.INTR_OFFSET, pm.INTR_TIMER_MASK)
+    assert(p.irq_timer())
+    // The alarm's 64 bits all count: one 2^32 ms ahead is not one 0 ms ahead.
+    var q = on_crystal(0)
+    alarm_at(&q, 0x0000000100000000)
+    run(&q, MS)
+    assert(!q.irq_timer() && q.next_alarm(SYS, LPOSC, XOSC) == Some((0x100000000 - 1) * MS))
+
+@test("AON alarm: at now and in the past it fires at once; cleared while enabled and past it latches again; disabled it clears and stays clear")
+aon_alarm_now_and_past()
+    var p = on_crystal(1000)
+    alarm_at(&p, 1000)
+    assert(p.irq_timer(), "at now")
+    var q = on_crystal(1000)
+    alarm_at(&q, 999)
+    assert(q.irq_timer(), "past")
+    var stopped = powman()
+    alarm_at(&stopped, 0)
+    assert(stopped.irq_timer(), "a stopped timer at 0 has reached an alarm at 0")
+    // powman_clear_alarm is the CLR alias.
+    wr(&q, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_MASK)
+    assert(q.irq_timer(), "still enabled and past")
+    wr(&q, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_ENAB_MASK)
+    wr(&q, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_MASK)
+    assert(!q.irq_timer() && rd(&q, pm.TIMER_OFFSET) & pm.TIMER_ALARM_MASK == 0 && rd(&q, pm.INTR_OFFSET) == 0)
+    run(&q, SECOND)
+    assert(!q.irq_timer(), "disabled, it never fires")
+    // A plain write of 1 clears it too; a write of 0 does not.
+    alarm_at(&q, 0)
+    wr(&q, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_ENAB_MASK)
+    wr(&q, pm.TIMER_OFFSET, pm.TIMER_RUN_MASK)
+    assert(q.irq_timer(), "0 in ALARM")
+    wr(&q, pm.TIMER_OFFSET, pm.TIMER_RUN_MASK | pm.TIMER_ALARM_MASK)
+    assert(!q.irq_timer())
+    // Moving the alarm ahead does not unlatch it; it waits for the clear.
+    alarm_at(&q, 0)
+    wr(&q, pm.TIMER_OFFSET + CLR, pm.TIMER_ALARM_ENAB_MASK)
+    wr(&q, pm.ALARM_TIME_31TO16_OFFSET, 0xFFFF)
+    assert(q.irq_timer())
+
+@test("AON alarm: next_alarm from the LPOSC's fractional rate is exact to the clk_sys cycle, and None where nothing predictable counts")
+aon_alarm_lposc_prediction()
+    var p = powman()
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    run(&p, 12345)
+    alarm_at(&p, 2500)
+    val n = p.next_alarm(SYS, LPOSC, XOSC).unwrap()
+    run(&p, n - 1)
+    assert(!p.irq_timer() && now(&p) == 2499, s"${now(&p)} after ${n - 1}")
+    run(&p, 1)
+    assert(p.irq_timer() && now(&p) == 2500)
+    // None: crystal not running, clk_sys stopped, the timer stopped, a GPIO tick.
+    var x = on_crystal(0)
+    alarm_at(&x, 10)
+    assert(x.next_alarm(SYS, LPOSC, 0).is_none() && x.next_alarm(0, LPOSC, XOSC).is_none())
+    wr(&x, pm.TIMER_OFFSET + CLR, pm.TIMER_RUN_MASK)
+    assert(x.next_alarm(SYS, LPOSC, XOSC).is_none())
+    wr(&x, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK | pm.TIMER_USE_GPIO_1KHZ_MASK)
+    assert(x.next_alarm(SYS, LPOSC, XOSC).is_none())
+    // An alarm 2^64 - 1 ms ahead saturates rather than overflowing.
+    var far = on_crystal(0)
+    alarm_at(&far, 0xFFFFFFFFFFFFFFFF)
+    assert(far.next_alarm(SYS, LPOSC, XOSC) == Some(0xFFFFFFFFFFFFFFFF))
+
+@test("AON timer from a GPIO: EXT_TIME_REF picks GPIO 12, 20, 14 or 22, and each rising edge is a millisecond")
+aon_gpio_1khz()
+    var p = powman()
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_USE_GPIO_1KHZ_MASK)
+    assert(p.reference_gpio().is_none(), "stopped")
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) == pm.TIMER_RUN_MASK | pm.TIMER_USING_GPIO_1KHZ_MASK)
+    val gpios = [12u32, 20, 14, 22]
+    for sel in 0u32..<4
+        wr(&p, pm.EXT_TIME_REF_OFFSET, sel)
+        assert(p.reference_gpio() == Some(gpios[sel]), s"SOURCE_SEL $sel")
+    // High from the start is not an edge; low, high is; high, high is not; time alone counts nothing.
+    p.advance(MS, SYS, LPOSC, XOSC, true)
+    assert(now(&p) == 0)
+    p.advance(1, SYS, LPOSC, XOSC, false)
+    p.advance(1, SYS, LPOSC, XOSC, true)
+    assert(now(&p) == 1)
+    p.advance(SECOND, SYS, LPOSC, XOSC, true)
+    assert(now(&p) == 1)
+    for i in 0..<999
+        p.advance(MS / 2, SYS, LPOSC, XOSC, false)
+        p.advance(MS / 2, SYS, LPOSC, XOSC, true)
+    assert(now(&p) == 1000)
+    // DRIVE_LPCK is stored beside SOURCE_SEL.
+    wr(&p, pm.EXT_TIME_REF_OFFSET, 0xFF)
+    assert(rd(&p, pm.EXT_TIME_REF_OFFSET) == 0x13)
+
+@test("AON timer with USE_GPIO_1HZ: the milliseconds come from the crystal, holding at 999 until the 1 Hz edge starts the next second")
+aon_gpio_1hz()
+    var p = on_crystal(0)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_USE_GPIO_1HZ_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) & pm.TIMER_USING_GPIO_1HZ_MASK != 0 && p.reference_gpio() == Some(12))
+    p.advance(SECOND + SECOND / 2, SYS, LPOSC, XOSC, false)
+    assert(now(&p) == 999, "held at the second's last millisecond")
+    p.advance(1, SYS, LPOSC, XOSC, true)
+    assert(now(&p) == 1000)
+    p.advance(300 * MS, SYS, LPOSC, XOSC, true)
+    assert(now(&p) == 1300)
+    p.advance(1, SYS, LPOSC, XOSC, false)
+    p.advance(1, SYS, LPOSC, XOSC, true)
+    assert(now(&p) == 2000, "an early edge starts the next second")
+    wr(&p, pm.TIMER_OFFSET + CLR, pm.TIMER_USE_GPIO_1HZ_MASK)
+    assert(p.reference_gpio().is_none() && rd(&p, pm.TIMER_OFFSET) & pm.TIMER_USING_GPIO_1HZ_MASK == 0)
+    run(&p, 1500 * MS)
+    assert(now(&p) == 3500, "free running again")
+
+@test("AON timer: a power-on stops it and zeroes the count, SET_TIME, ALARM_TIME and the source")
+aon_power_on()
+    var p = on_crystal(77)
+    alarm_at(&p, 1)
+    run(&p, MS)
+    p.reset()
+    assert(!p.counting() && now(&p) == 0 && rd(&p, pm.TIMER_OFFSET) == 0 && !p.irq_timer())
+    assert(rd(&p, pm.SET_TIME_15TO0_OFFSET) == 0 && rd(&p, pm.ALARM_TIME_15TO0_OFFSET) == 0)
+    wr(&p, pm.TIMER_OFFSET + SET, pm.TIMER_RUN_MASK)
+    assert(rd(&p, pm.TIMER_OFFSET) & pm.TIMER_USING_LPOSC_MASK != 0)
+    assert(p.read(pm.STATE_OFFSET, 4).unwrap_err() == AccessError.Unmapped, "the power states stay refused")
