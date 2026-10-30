@@ -2255,9 +2255,12 @@ no view, and none of its boards has one to lay out side by side ``.
 **A board shown whole brings its input with it.** Its key and pointer bindings are the window's too,
 named as the product names them — `a = btn` becomes `a = pico.btn`, and `pointer { display = touch
 }` hits `pico.display` where the board sits — and drive the board's parts (`window_keys`,
-`window_pointers`). The product's own bindings come first and win: a key the product binds is the
-product's alone, and a board's pointer binding whose element overlaps an element the product binds
-is left out. A product's key may name a board's part, with or without its control (`a = pico.btn`,
+`window_pointers`). Its parts join the side panel's list and its potentiometers the sliders, named
+the same way, and turn the board's own inputs (`window_parts`, `knob_elements`, `ui/scene.sysl`).
+The product's own come first and win: a key the product binds is the product's alone, a board's
+pointer binding whose element overlaps an element the product binds is left out, a board's part
+with the name of one of the product's own (or an earlier board's) is left out, and a board's knob
+that one of the product's own knobs overlaps is not turned by a drag. A product's key may name a board's part, with or without its control (`a = pico.btn`,
 `a = pico.btn.press`).
 
 The element's size is the board's view turned, and is left out; a size written is held to it (``
