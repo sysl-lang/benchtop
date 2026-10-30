@@ -97,4 +97,4 @@ said), or **n.a.** with the reason. Each one marked fixed was checked against th
 | ui-firmware#23 | inconsistent formatting suggests no formatter | fixed in `2e37aec`; earlier in `f576c96`: `touch.sysl`, `tft.sysl`, `audio.sysl`, `desktop.sysl`, `clock_tests.sysl` and `pacing_notice_tests.sysl` (`advance` and `sync_pots` had already been tidied); the other `ui/*_tests.sysl` files are spaced in `2e37aec` (a grep for a comma followed by a non-space is empty in them) |
 | ui-firmware#24 | stale notes, development-step wording | fixed in `f576c96`: `sysl-wav-notes.md` is gone, and the remaining "future work" sentences are "Not modelled" lists; no development-step wording is left in the `ui/` or `examples/` sources (grep for phase/chunk/slice/currently/not yet is empty) |
 
-**Counts:** 88 findings — 86 fixed, 2 partly fixed, 0 open, 0 n.a.
+**Counts:** 88 findings — 87 fixed, 1 partly fixed, 0 open, 0 n.a.
