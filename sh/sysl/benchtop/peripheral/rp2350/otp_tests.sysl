@@ -1,0 +1,259 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2040.AccessError
+import sh.sysl.rp2350.otp as otp_reg
+import sysl.fmt.hex
+
+// The OTP model (otp.sysl) against `hardware/regs/otp.h` and `otp_data.h`: the read windows, the ECC,
+// the locks, the SBPI programming the boot ROM's `otp_access` drives (its instruction stream as the
+// ROM sends it, examples/pico2/otp.c end to end in chip/otp_tests.sysl), and each register refused by
+// name.
+
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const XOR: u32 = 0x1000
+private const EXEC: u32 = 0x40000000
+
+// An OTP over `rows`, connected.
+private connected(rows: *[4096]u32) -> Otp
+    var o = otp()
+    o.connect(&rows[0])
+    o
+
+// One SBPI instruction, executed.
+private sbpi(o: *Otp, instr: u32) -> Result[unit, OtpFault] = o.write(otp_reg.SBPI_INSTR_OFFSET, 4, instr | EXEC)
+
+// A one-byte register write to the macro's DAP.
+private dap(o: *Otp, reg: u32, v: u32) -> Result[unit, OtpFault] = sbpi(o, 0x30020000 | (reg << 8) | (v & 0xFF))
+
+// Row `r` programmed with `bits`, as the boot ROM's `otp_access` does it: the array handed to SBPI,
+// the address and data into the DAP, PMC 0x01, the status read, PMC 0x02, and the array handed back.
+private program(o: *Otp, r: u32, bits: u32) -> Result[unit, OtpFault]
+    o.write(otp_reg.USR_OFFSET + CLR, 4, otp_reg.USR_DCTRL_MASK)?
+    dap(o, 0xFC, r & 0xFF)?
+    dap(o, 0xFD, r >> 8)?
+    dap(o, 0xC0, bits)?
+    dap(o, 0xC1, bits >> 8)?
+    dap(o, 0xE0, bits >> 16)?
+    sbpi(o, 0x203A0100)?
+    sbpi(o, 0x103ABF00)?
+    sbpi(o, 0x203A0200)?
+    o.write(otp_reg.USR_OFFSET + SET, 4, otp_reg.USR_DCTRL_MASK)
+
+private refused(r: Result[u32, OtpFault]) -> string = r match
+    Ok(v) -> s"read 0x${hex(v)}"
+    Err(f) -> f match
+        Access(_) -> "an access error"
+        Refused(why) -> why
+
+private write_refused(r: Result[unit, OtpFault]) -> string = r match
+    Ok(_) -> "written"
+    Err(f) -> f match
+        Access(_) -> "an access error"
+        Refused(why) -> why
+
+private access_error(r: Result[u32, OtpFault]) -> Option[AccessError] = r match
+    Err(f) -> f match
+        Access(e) -> Some(e)
+        Refused(_) -> None
+    Ok(_) -> None
+
+@test("the OTP's windows: the factory rows through ECC (a row a half-word, two a word) and raw (24 bits a word), every width and lane; past the last row, unaligned and odd widths refused; no array connected, refused by name")
+otp_windows()
+    var rows: [4096]u32
+    factory_otp(&rows)
+    val o = connected(&rows)
+    for guarded in [false, true]
+        assert(o.read_window(false, guarded, 0, 4).unwrap() == 0x7A015CD3, "CHIPID1:CHIPID0")
+        assert(o.read_window(false, guarded, 6, 2).unwrap() == 0x1B97 && o.read_window(false, guarded, 5, 1).unwrap() == 0x0E, "a half-word, a byte")
+        assert(o.read_window(true, guarded, 4, 4).unwrap() == ecc_encode(0x7A01), "raw: the codeword")
+        assert(o.read_window(true, guarded, 6, 2).unwrap() == ecc_encode(0x7A01) >> 16 && o.read_window(true, guarded, 7, 1).unwrap() == 0, "raw: its top lanes")
+        assert(o.read_window(false, guarded, OTP_ROWS * 2 - 4, 4).unwrap() == 0 && o.read_window(true, guarded, OTP_ROWS * 4 - 4, 4).unwrap() == 0, "the last rows, blank")
+    assert(access_error(o.read_window(false, false, OTP_ROWS * 2, 2)) == Some(AccessError.Unmapped), "ECC: two bytes a row")
+    assert(access_error(o.read_window(true, false, OTP_ROWS * 4, 4)) == Some(AccessError.Unmapped), "raw: four")
+    assert(access_error(o.read_window(false, false, 1, 2)) == Some(AccessError.Unaligned) && access_error(o.read_window(true, false, 2, 4)) == Some(AccessError.Unaligned))
+    assert(access_error(o.read_window(false, false, 0, 3)) == Some(AccessError.InvalidWidth))
+    val bare = otp()
+    assert(refused(bare.read_window(false, false, 0, 4)) == "no OTP array is connected to this chip")
+
+@test("the ECC is the datasheet's: data bit j at the j-th Hamming position that is not a power of two, ECC bit 5 the parity of the rest; all 22 columns distinct and nonzero, the data columns of odd weight")
+otp_ecc_construction()
+    val positions = [3u32, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21]
+    for j in 0u32..<16 do assert(ecc_position(j) == positions[j], s"position of bit $j")
+    for j in 0u32..<16
+        assert(ecc_column(j) & 0x1F == positions[j] && ecc_column(j).count_ones() % 2 == 1, s"column $j")
+        for k in 0u32..<16 do if k != j then assert(ecc_column(k) != ecc_column(j))
+    // Each codeword's 22 bits have even parity over bit 5's span: the overall parity bit.
+    for d in [0u32, 1, 0x1234, 0xBEEF, 0xFFFF, 0x8000]
+        assert(ecc_encode(d) & 0xFFFF == d && (ecc_encode(d) & 0x3FFFFF).count_ones() % 2 == 0, s"0x${hex(d)}")
+
+@test("the ECC windows correct any one wrong bit of 22 (data or ECC), in the plain and the inverted (BRBP) form; two wrong bits are a bus fault through the guarded window and refused by name through the unguarded one; one BRBP bit alone is refused by name")
+otp_ecc_reads()
+    var rows: [4096]u32
+    var o = connected(&rows)
+    for d in [0u32, 1, 0x1234, 0xBEEF, 0xFFFF, 0x8000]
+        val word = ecc_encode(d)
+        for form in [word, 0xC00000 | (~word & 0x3FFFFF)]
+            rows[0x100] = form
+            assert(o.read_window(false, true, 0x200, 2).unwrap() == d, s"0x${hex(form)} as stored")
+            for b in 0u32..<22
+                rows[0x100] = form ^ (1u32 << b)
+                assert(o.read_window(false, false, 0x200, 2).unwrap() == d && o.read_window(false, true, 0x200, 2).unwrap() == d, s"0x${hex(d)}, bit $b wrong")
+            for pair in [(0u32, 1u32), (3, 17), (16, 21), (15, 20), (2, 9)]
+                rows[0x100] = form ^ (1u32 << pair.0) ^ (1u32 << pair.1)
+                assert(refused(o.read_window(false, true, 0x200, 2)) == "row 0x100 has an error the ECC cannot correct: a bus fault through the guarded window", s"0x${hex(d)}, bits ${pair.0} and ${pair.1}")
+                assert(refused(o.read_window(false, false, 0x200, 4)) == "row 0x100 has an error the ECC cannot correct, and what the unguarded window answers for it is not modelled")
+                assert(o.read_window(true, false, 0x400, 4).unwrap() == rows[0x100], "raw reads it as it is")
+                assert(o.read_window(false, false, 0x202, 2).unwrap() == 0, "the other row of the word reads on its own")
+    rows[0x100] = 0x400000 | ecc_encode(0x1234)
+    assert(refused(o.read_window(false, false, 0x200, 2)) == "row 0x100 has one BRBP bit of two set (0x591234), which is not modelled")
+    rows[0x100] = 0x800000 | ecc_encode(0x1234)
+    assert(refused(o.read_window(false, true, 0x200, 2)).contains("one BRBP bit"))
+
+@test("SW_LOCK: a write ORs in, plainly and through SET and XOR, CLR clears nothing; reset loads each from its page's PAGEn_LOCK1 row by majority of three; an inaccessible page (3, or the reserved 2) is a bus fault through the guarded windows and reads 0 through the others; the lock rows always read")
+otp_locks()
+    var rows: [4096]u32
+    rows[0xF80 + 2 * 5 + 1] = 0x010100
+    rows[0xF80 + 2 * 6 + 1] = 0x000001
+    rows[0xF80 + 2 * 7 + 1] = 0x0C0F03
+    rows[0x1C0] = ecc_encode(0x5555)
+    var o = connected(&rows)
+    assert(o.read(4 * 5, 4).unwrap() == 1 && o.read(4 * 6, 4).unwrap() == 0, "two of three copies lock page 5 read-only; one of three leaves page 6")
+    assert(o.read(4 * 7, 4).unwrap() == 0xF, "page 7: Secure 3, Non-secure 3 by majority")
+    o.write(4, 4, 1).unwrap()
+    o.write(4, 4, 0).unwrap()
+    assert(o.read(4, 4).unwrap() == 1, "0 clears nothing")
+    o.write(4 + CLR, 4, 0xF).unwrap()
+    assert(o.read(4, 4).unwrap() == 1, "nor does CLR")
+    o.write(4 + SET, 4, 0x4).unwrap()
+    o.write(4 + XOR, 4, 0x1).unwrap()
+    assert(o.read(4, 4).unwrap() == 5, "SET and XOR OR in")
+    o.write(4, 4, 0xFFFFFFF0).unwrap()
+    assert(o.read(4, 4).unwrap() == 5, "four bits")
+    // Page 7 (rows 0x1c0-0x1ff): inaccessible.
+    assert(refused(o.read_window(false, true, 0x380, 2)) == "row 0x1c0 is in page 7, which SW_LOCK7 makes inaccessible to Secure reads: a bus fault through the guarded window")
+    assert(refused(o.read_window(true, true, 0x700, 4)).contains("SW_LOCK7"))
+    assert(o.read_window(false, false, 0x380, 2).unwrap() == 0 && o.read_window(true, false, 0x700, 4).unwrap() == 0, "unguarded: 0")
+    assert(o.read_window(false, true, 0x37C, 4).unwrap() == 0, "page 6's last two rows, beside it")
+    // The reserved 2 behaves as INACCESSIBLE.
+    o.write(4 * 8, 4, 2).unwrap()
+    assert(refused(o.read_window(true, true, 0x200 * 4, 4)).contains("SW_LOCK8"))
+    // Pages 62 and 63 hold the lock rows, readable whatever their locks.
+    o.write(4 * 62, 4, 3).unwrap()
+    o.write(4 * 63, 4, 3).unwrap()
+    assert(o.read_window(true, true, (0xF80 + 2 * 5 + 1) * 4, 4).unwrap() == 0x010100 && o.read_window(true, true, 0xFFF * 4, 4).unwrap() == 0)
+    // The OTP's reset reloads them from the rows.
+    val was = o
+    o = otp()
+    o.power_on(was)
+    assert(o.read(4, 4).unwrap() == 0 && o.read(4 * 5, 4).unwrap() == 1 && o.read(4 * 62, 4).unwrap() == 0, "reloaded")
+    assert(refused(o.read_window(false, true, 0x380, 2)).contains("SW_LOCK7"), "page 7 still locked by its row")
+
+@test("USR: DCTRL at 1 and PD at 0 from reset; with DCTRL clear the windows are refused as the bus error they are and SBPI runs; with it set SBPI is refused; with PD set the windows are refused")
+otp_usr()
+    var rows: [4096]u32
+    var o = connected(&rows)
+    assert(o.read(otp_reg.USR_OFFSET, 4).unwrap() == 1)
+    assert(write_refused(dap(&o, 0xFC, 0)) == "an SBPI instruction while USR.DCTRL keeps the array on the read windows")
+    o.write(otp_reg.USR_OFFSET + XOR, 4, 1).unwrap()
+    assert(o.read(otp_reg.USR_OFFSET, 4).unwrap() == 0, "the ROM toggles DCTRL through XOR")
+    assert(refused(o.read_window(false, false, 0, 2)) == "the read windows are a bus error while USR.DCTRL hands the array to the SBPI bridge")
+    dap(&o, 0xFC, 0).unwrap()
+    o.write(otp_reg.USR_OFFSET, 4, 0xFFFFFFFF).unwrap()
+    assert(o.read(otp_reg.USR_OFFSET, 4).unwrap() == 0x11, "two bits")
+    assert(refused(o.read_window(true, false, 0, 4)) == "the read windows are a bus error while USR.PD powers the array down")
+
+@test("SBPI programs a row as the boot ROM does: DAP 0xfc/0xfd the row, 0xc0/0xc1/0xe0 its bits, PMC 0x01; bits only go 0 to 1; INSTR_DONE and RDATA_VLD set and cleared by a write of 1; every other instruction refused by name")
+otp_sbpi_program()
+    var rows: [4096]u32
+    var o = connected(&rows)
+    program(&o, 0x400, ecc_encode(0x1234)).unwrap()
+    assert(rows[0x400] == 0x191234 && o.read_window(false, true, 0x800, 2).unwrap() == 0x1234)
+    program(&o, 0xFFF, 0x000001).unwrap()
+    program(&o, 0xFFF, 0x800002).unwrap()
+    assert(rows[0xFFF] == 0x800003, "the last row, ORed")
+    program(&o, 0x401, 0).unwrap()
+    assert(rows[0x401] == 0, "nothing set, nothing programmed")
+    assert(o.read(otp_reg.SBPI_STATUS_OFFSET, 4).unwrap() == 0x11, "done, and the 0xbf read's data valid")
+    assert(o.read(otp_reg.SBPI_RDATA_0_OFFSET, 4).unwrap() == 0)
+    o.write(otp_reg.SBPI_STATUS_OFFSET, 4, 0x10).unwrap()
+    assert(o.read(otp_reg.SBPI_STATUS_OFFSET, 4).unwrap() == 1, "write one to clear")
+    o.write(otp_reg.SBPI_STATUS_OFFSET, 4, 0xFFFFFFFF).unwrap()
+    assert(o.read(otp_reg.SBPI_STATUS_OFFSET, 4).unwrap() == 0)
+    // EXEC clears itself; the rest of the instruction stays.
+    assert(o.read(otp_reg.SBPI_INSTR_OFFSET, 4).unwrap() == 0x203A0200)
+    o.write(otp_reg.SBPI_INSTR_OFFSET, 4, 0x203A0100).unwrap()
+    assert(o.read(otp_reg.SBPI_STATUS_OFFSET, 4).unwrap() == 0, "without EXEC nothing runs")
+    o.write(otp_reg.SBPI_WDATA_0_OFFSET + 8, 4, 0xCAFE).unwrap()
+    assert(o.read(otp_reg.SBPI_WDATA_2_OFFSET, 4).unwrap() == 0xCAFE, "the payload words are stored")
+    o.write(otp_reg.USR_OFFSET, 4, 0).unwrap()
+    for instr in [0x003A0300u32, 0x31020000, 0x10020000, 0x30100000, 0x103ABE00, 0x113ABF00, 0x30000000]
+        assert(write_refused(sbpi(&o, instr)).contains(s"SBPI instruction 0x${hex(instr, 8)} "), s"0x${hex(instr)}")
+    dap(&o, 0xFC, 0).unwrap()
+    dap(&o, 0xFD, 0x10).unwrap()
+    assert(write_refused(sbpi(&o, 0x203A0100)) == "SBPI programs row 0x1000, past the array's last")
+
+@test("SBPI refuses by name what benchtop does not run: a row in a page SW_LOCK leaves not writable (a lock row by its own page's lock), a critical flag row, a hardware key or its valid flags, and key locks in a PAGEn_LOCK0; the rows beside each program")
+otp_sbpi_refusals()
+    var rows: [4096]u32
+    var o = connected(&rows)
+    o.write(4 * 16, 4, 1).unwrap()
+    assert(write_refused(program(&o, 0x400, 1)) == "SBPI programs row 0x400, which SW_LOCK16 does not leave writable: what the macro does then is not modelled")
+    program(&o, 0x3FF, 1).unwrap()
+    program(&o, 0x440, 1).unwrap()
+    o.write(4 * 5, 4, 3).unwrap()
+    assert(write_refused(program(&o, 0xF8B, 0x010101)).contains("SW_LOCK5"), "page 5's lock row, by page 5's lock")
+    program(&o, 0xF8D, 0x010101).unwrap()
+    assert(rows[0xF8D] == 0x010101, "page 6's lock row")
+    for r in [0x38u32, 0x3F, 0x40, 0x47]
+        assert(write_refused(program(&o, r, 1)) == s"programming row 0x${hex(r)}, a critical flag row (CRIT0, CRIT1), is not modelled: the boot, debug and core enables it sets are not run")
+    program(&o, 0x37, 1).unwrap()
+    program(&o, 0x48, 1).unwrap()
+    for r in [0xF48u32, 0xF79, 0xF7E]
+        assert(write_refused(program(&o, r, 1)) == s"programming row 0x${hex(r)}, a hardware key or its valid flags, is not modelled")
+    program(&o, 0xF47, 1).unwrap()
+    program(&o, 0xF7F, 1).unwrap()
+    assert(write_refused(program(&o, 0xF80 + 2 * 9, 0x404040)) == "programming row 0xf92 with key locks (PAGE9_LOCK0's KEY_R, KEY_W and NO_KEY_STATE) is not modelled")
+    program(&o, 0xF80 + 2 * 9, 0x000040).unwrap()
+    assert(rows[0xF92] == 0x40, "one copy of three is no key lock")
+
+@test("the OTP block's other registers: CRITICAL and KEY_VALID read 0 and ignore writes; ARCHSEL holds the board's architecture and refuses another; ARCHSEL_STATUS reports it; DBG, BIST, the CRT_KEY words, DEBUGEN, DEBUGEN_LOCK, BOOTDIS and the interrupts refused by name; widths and alignment")
+otp_registers()
+    var rows: [4096]u32
+    var o = connected(&rows)
+    for a in [otp_reg.CRITICAL_OFFSET, otp_reg.KEY_VALID_OFFSET, otp_reg.ARCHSEL_OFFSET, otp_reg.ARCHSEL_STATUS_OFFSET]
+        assert(o.read(a, 4).unwrap() == 0, s"0x${hex(a)}")
+    o.write(otp_reg.CRITICAL_OFFSET, 4, 0xFFFFFFFF).unwrap()
+    o.write(otp_reg.ARCHSEL_STATUS_OFFSET, 4, 3).unwrap()
+    assert(o.read(otp_reg.CRITICAL_OFFSET, 4).unwrap() == 0 && o.read(otp_reg.ARCHSEL_STATUS_OFFSET, 4).unwrap() == 0, "read-only")
+    o.write(otp_reg.ARCHSEL_OFFSET, 4, 0).unwrap()
+    assert(write_refused(o.write(otp_reg.ARCHSEL_OFFSET, 4, 2)) == "ARCHSEL = 2 picks an architecture other than the one each core runs (0), a switch at the next reset that is not modelled")
+    o.runs(ARCH_RISCV)
+    assert(o.read(otp_reg.ARCHSEL_STATUS_OFFSET, 4).unwrap() == 3 && o.read(otp_reg.ARCHSEL_OFFSET, 4).unwrap() == 3)
+    o.write(otp_reg.ARCHSEL_OFFSET + SET, 4, 3).unwrap()
+    assert(write_refused(o.write(otp_reg.ARCHSEL_OFFSET + CLR, 4, 1)).contains("ARCHSEL = 2"))
+    val names = ["DBG", "BIST", "CRT_KEY_W0", "CRT_KEY_W3", "DEBUGEN", "DEBUGEN_LOCK", "BOOTDIS", "INTR", "INTE", "INTF", "INTS", "OTP + 0x130 (no register)", "OTP + 0x174 (no register)"]
+    val at = [otp_reg.DBG_OFFSET, otp_reg.BIST_OFFSET, otp_reg.CRT_KEY_W0_OFFSET, otp_reg.CRT_KEY_W3_OFFSET, otp_reg.DEBUGEN_OFFSET, otp_reg.DEBUGEN_LOCK_OFFSET,
+        otp_reg.BOOTDIS_OFFSET, otp_reg.INTR_OFFSET, otp_reg.INTE_OFFSET, otp_reg.INTF_OFFSET, otp_reg.INTS_OFFSET, 0x130u32, 0x174]
+    for i in 0..<13
+        assert(refused(o.read(at[i], 4)) == s"${names[i]} is not modelled", names[i])
+        assert(write_refused(o.write(at[i] + SET, 4, 0)) == s"${names[i]} is not modelled")
+    assert(access_error(o.read(1, 2)) == Some(AccessError.Unaligned) && access_error(o.read(0, 3)) == Some(AccessError.InvalidWidth))
+    assert(access_error(o.read(0x4000, 4)) == Some(AccessError.Unmapped))
+    assert(o.read(otp_reg.USR_OFFSET, 1).unwrap() == 1 && o.read(otp_reg.USR_OFFSET + 2, 2).unwrap() == 0, "narrow reads take their lane")
+
+@test("the OTP's reset: every register to power-on (USR, SBPI, the macro's registers, SW_LOCK from the rows), the array and the board's architecture kept")
+otp_power_on()
+    var rows: [4096]u32
+    var o = connected(&rows)
+    o.runs(ARCH_RISCV)
+    program(&o, 0x10, 0x7).unwrap()
+    o.write(otp_reg.USR_OFFSET, 4, 0x10).unwrap()
+    o.write(0, 4, 3).unwrap()
+    val was = o
+    o = otp()
+    o.power_on(was)
+    assert(o.read(otp_reg.USR_OFFSET, 4).unwrap() == 1 && o.read(0, 4).unwrap() == 0 && o.read(otp_reg.SBPI_STATUS_OFFSET, 4).unwrap() == 0)
+    assert(o.read(otp_reg.SBPI_INSTR_OFFSET, 4).unwrap() == 0 && o.dap[0xFC] == 0 && o.dap[0xE0] == 0)
+    assert(o.read_window(true, false, 0x40, 4).unwrap() == 7 && o.read(otp_reg.ARCHSEL_STATUS_OFFSET, 4).unwrap() == 3)

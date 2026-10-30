@@ -23,6 +23,7 @@ Pico SDK programs that the `pico2` board runs on its Cortex-M33s, and that
 | `interp.c` | `hardware_interp` in each mode (counter, blend unsigned and signed, clamp, rotate, FORCE_MSB, ADD_RAW, cross, save/restore); core 1 counting on its own INTERP0 at the same time; the multicore doorbells, each core's SIO_IRQ_BELL handler acknowledging | each line's values, worked from the datasheet (`chip/interp_tests.sysl`) |
 
 | `rom.c` | Raspberry Pi's boot ROM called as the SDK calls it: its magic, version and git revision, `rom_func_lookup` of ten codes and one it lacks, `get_sys_info`'s BOOT_INFO, a sector erased and a page programmed 1 MB into the flash and the flash's unique ID read through the ROM's flash functions (`hardware_flash`), then a PC/SP reboot through the ROM's `reboot` into a function that reads BOOT_INFO again | every line printed over UART0, the programmed bytes in the flash, the salts kept over the reboot (`chip/arm_tests.sysl`) |
+| `otp.c` | the OTP through the ROM: the chip ID through OTP_DATA, `get_sys_info` (CHIP_INFO, CRITICAL, CPU_INFO) and `otp_access`; user rows written with ECC and read back through the ROM, the ECC window and the raw window; a raw row; a write that would clear a bit; each data bit's codeword; an ECC write over a set bit; pages locked read-only and inaccessible by SW_LOCK; the ROM's argument checks | every line, the rows the ROM programmed, and each codeword against benchtop's own ECC (`chip/otp_tests.sysl`) |
 
 ```sh
 ./benchtop run --board pico2 examples/pico2/hello_serial.elf

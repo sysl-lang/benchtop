@@ -1,34 +1,349 @@
 module sh.sysl.benchtop.peripheral.rp2350
 
-import sh.sysl.benchtop.peripheral.rp2040.AccessError
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.otp as otp_reg
+import sysl.fmt.hex
 
-// The OTP's read windows (datasheet 13.6, "OTP"; `hardware/regs/addressmap.h`'s OTP_DATA_* bases): the
-// array of 4096 rows of 24 bits, as the boot ROM's functions read it (its `otp_access` and the guarded
-// reads its flash and boot code make). The Pico 2's OTP as benchtop runs it is **blank**: no row has
-// been programmed, so every row reads 0 through every window, the ECC ones included (an erased row is a
-// valid codeword of 0, so the guarded windows raise no error either).
+// The OTP (datasheet 13, "OTP"): the array of 4096 rows of 24 bits, its four read windows at
+// 0x40130000, and the OTP block's registers at 0x40120000, as far as Raspberry Pi's boot ROM drives
+// them for `otp_access` and `get_sys_info`.
 //
-// - OTP_DATA and OTP_DATA_GUARDED: each row's 16 ECC-corrected bits, two rows to a word.
-// - OTP_DATA_RAW and OTP_DATA_RAW_GUARDED: each row's 24 raw bits, a row to a word.
+// **The array** is the board's, connected as the flash's is (`connect`), and lives for the run: each
+// `boot` starts it from the factory image (`factory_otp`), and a chip reset keeps it.
 //
-// Programming a row (the OTP block's SBPI bridge, or `otp_access` writing) and the OTP block's own
-// registers (locks, the critical flags, ARCHSEL, keys) are rp-coverage item 26; an access to them is
-// refused by name.
+// **The read windows.** OTP_DATA and OTP_DATA_GUARDED give each row's 16 data bits through the ECC
+// (two rows to a word); OTP_DATA_RAW and OTP_DATA_RAW_GUARDED give each row's 24 bits (a row to a
+// word). A row with one bit wrong reads corrected through either ECC window. A row the ECC cannot
+// correct is a bus fault through the guarded window, refused by name; what the unguarded window
+// answers for it is not modelled, and refused too. A row whose BRBP bits (23:22) are both set is the
+// inverse of its codeword; one set alone is refused by name. The windows are off, refused as the bus
+// error they are on silicon, while USR hands the array to the SBPI bridge (DCTRL clear) or powers it
+// down (PD).
+//
+// **Locks.** SW_LOCK0–63 hold each page's lock, Secure in bits 1:0 and Non-secure in bits 3:2; a
+// write ORs in, so a lock only advances. The OTP's reset loads them from each page's PAGEn_LOCK1 row,
+// a 3-way majority vote of its three bytes. A Secure read of a page whose Secure lock is
+// INACCESSIBLE (or the reserved 2, which behaves the same) through a guarded window is the bus fault,
+// refused by name; through an unguarded one it reads 0. That 0 is an assumption: the ROM's
+// `otp_access` reads a row through OTP_DATA_RAW before it checks the row's lock (ROM 0xa60), so
+// silicon cannot fault there, and what the read answers is discarded. The lock rows themselves are
+// always readable. benchtop's cores run Secure, so the Non-secure lock is stored and checked by
+// nothing.
+//
+// **Programming** goes through the SBPI bridge as the boot ROM's `otp_access` drives it: register
+// writes to the macro's DAP (0x02) and PMC (0x3a) targets, the row's address in DAP registers 0xfc
+// and 0xfd and its 24 bits in DAP 0xc0, 0xc1 and 0xe0, then PMC command 0x01, which programs the row
+// (a bit can only go from 0 to 1), a one-byte read of PMC 0xbf, and PMC command 0x02. The macro's
+// timing registers are stored and mean nothing here. Any other SBPI instruction is refused by name.
+// Programming a page whose Secure lock is not READ_WRITE through SBPI directly is refused (the ROM
+// checks the lock first and never sends it), as is programming the rows whose effect benchtop does not
+// run: the critical flags (CRIT0, CRIT1), the hardware keys, their valid flags and the key fields of
+// each page's PAGEn_LOCK0.
+//
+// **The other registers.** CRITICAL reads 0 (no critical row can be programmed); KEY_VALID reads 0
+// (no key can be); ARCHSEL is stored, and a value naming an architecture other than the one each core
+// runs is refused, since the switch it makes at the next reset is not modelled; ARCHSEL_STATUS
+// reports each core's architecture (`arch`, set by the board). DBG, BIST, the CRT_KEY words, DEBUGEN,
+// DEBUGEN_LOCK, BOOTDIS and the interrupt registers are refused by name.
 
 /** The OTP's rows. */
 const OTP_ROWS: u32 = 4096
+/** Rows to a page; a page is what a lock covers. */
+const OTP_PAGE_ROWS: u32 = 64
+const OTP_PAGES: u32 = 64
+/** A row's bits. */
+const OTP_ROW_MASK: u32 = 0xFFFFFF
 
-/** One of the OTP's read windows: ECC (two bytes a row) or raw (four), guarded or not. */
-struct OtpWindow
-    raw: bool
+/** The first page lock row (PAGE0_LOCK0); page n's two follow at 2n and 2n + 1. */
+const OTP_LOCK_ROWS: u32 = 0xF80
+/** The critical flag rows, CRIT0 and its seven copies then CRIT1 and its. */
+const OTP_CRIT_ROWS: u32 = 0x38
+const OTP_CRIT_END: u32 = 0x48
+/** The hardware keys KEY1_0 to KEY6_7, and their valid rows, through KEY6_VALID. */
+const OTP_KEY_ROWS: u32 = 0xF48
+const OTP_KEY_END: u32 = 0xF7E
 
-    /** A read of `width` bytes at `offset`: 0, the blank array, wherever a row is. Each window is
-     * read-only.
+/** ARCHSEL's values for both cores: Arm, or RISC-V (a 1 for each core). */
+const ARCH_ARM: u32 = 0
+const ARCH_RISCV: u32 = 3
+
+/** The SBPI targets: the macro's DAP and PMC. */
+const SBPI_DAP: u32 = 0x02
+const SBPI_PMC: u32 = 0x3A
+
+/** Why the OTP refuses an access: a register rule, or a behaviour benchtop does not run. */
+enum OtpFault
+    Access(e: AccessError)
+    Refused(why: string)
+
+/** What reading a row through the ECC gives: the 16 data bits, or why there are none. */
+enum EccRead
+    Good(data: u32)
+    Uncorrectable
+    HalfInverted
+
+/** The OTP: the array (the board's, reached through `connect`) and the block's registers. */
+struct Otp
+    rows: *u32
+    connected: bool
+    // Each core's architecture, as ARCHSEL_STATUS reports it: 0 for both Arm, 3 for both RISC-V.
+    arch: u32
+    // Each page's lock, as SW_LOCKn holds it: Secure in bits 1:0, Non-secure in bits 3:2.
+    sw_lock: [64]u32
+    usr: u32
+    archsel: u32
+    // SBPI: the instruction register, the payloads, and the macro's DAP and PMC registers.
+    instr: u32
+    wdata: [4]u32
+    rdata: [4]u32
+    status: u32
+    dap: [256]u8
+    pmc: [256]u8
+
+    /** Connect the array: `OTP_ROWS` rows from `rows`, each in the low 24 bits of a word, and load
+     * the locks from it.
      */
-    read(self, offset: u32, width: u32) -> Result[u32, AccessError]
-        if width != 1 && width != 2 && width != 4 then return Err(AccessError.InvalidWidth)
-        if offset & (width - 1) != 0 then return Err(AccessError.Unaligned)
-        val bytes_per_row: u32 = if self.raw then 4 else 2
-        if offset >= OTP_ROWS * bytes_per_row then return Err(AccessError.Unmapped)
-        Ok(0)
-end OtpWindow
+    connect(*self, rows: *u32)
+        self.rows = rows
+        self.connected = true
+        self.load_locks()
+
+    /** Which architecture both cores run, ARCH_ARM or ARCH_RISCV, as the board has them: ARCHSEL_STATUS
+     * reports it, and ARCHSEL holds it.
+     */
+    runs(*self, arch: u32)
+        self.arch = arch
+        self.archsel = arch
+
+    /** The OTP's reset: its registers at power-on, the locks loaded from the array `was` connected. */
+    power_on(*self, was: Otp)
+        self.rows = was.rows
+        self.connected = was.connected
+        self.arch = was.arch
+        self.archsel = was.arch
+        if self.connected then self.load_locks()
+
+    /** Row `r`'s 24 bits. */
+    row(self, r: u32) -> u32 = self.rows[usize(r)] & OTP_ROW_MASK
+
+    // SW_LOCKn from each page's PAGEn_LOCK1 row: LOCK_S into SEC, LOCK_NS into NSEC, each bit the
+    // majority of its three copies.
+    private load_locks(*self)
+        for p in 0u32..<OTP_PAGES
+            val bits = majority3(self.row(OTP_LOCK_ROWS + 2 * p + 1))
+            self.sw_lock[usize(p)] = bits & 0xF
+
+    // Page `p`'s Secure lock, the reserved 2 read as INACCESSIBLE.
+    private secure_lock(self, p: u32) -> u32
+        val s = self.sw_lock[usize(p)] & 3
+        if s == 2 then 3 else s
+
+    /** A read of `width` bytes at `offset` in one of the four windows: raw (a row a word) or through
+     * the ECC (a row a half-word), guarded or not.
+     */
+    read_window(self, raw: bool, guarded: bool, offset: u32, width: u32) -> Result[u32, OtpFault]
+        if width != 1 && width != 2 && width != 4 then return Err(OtpFault.Access(AccessError.InvalidWidth))
+        if offset & (width - 1) != 0 then return Err(OtpFault.Access(AccessError.Unaligned))
+        val bytes_per_row: u32 = if raw then 4 else 2
+        if offset >= OTP_ROWS * bytes_per_row then return Err(OtpFault.Access(AccessError.Unmapped))
+        if !self.connected then return Err(OtpFault.Refused("no OTP array is connected to this chip"))
+        if self.usr & otp_reg.USR_DCTRL_MASK == 0 then return Err(OtpFault.Refused("the read windows are a bus error while USR.DCTRL hands the array to the SBPI bridge"))
+        if self.usr & otp_reg.USR_PD_MASK != 0 then return Err(OtpFault.Refused("the read windows are a bus error while USR.PD powers the array down"))
+        if raw
+            val r = offset >> 2
+            if !self.readable(r, guarded)? then return Ok(0)
+            return Ok(read_lane(self.row(r), offset, width))
+        // Through the ECC, a half-word a row: a word read covers two, the even row in its low half.
+        var word: u32 = 0
+        for r in (offset >> 1)..<((offset + width - 1) >> 1) + 1
+            if !self.readable(r, guarded)? then continue
+            val data = ecc_decode(self.row(r)) match
+                Good(d) -> d
+                Uncorrectable ->
+                    return Err(OtpFault.Refused(if guarded then s"row 0x${hex(r)} has an error the ECC cannot correct: a bus fault through the guarded window" else s"row 0x${hex(r)} has an error the ECC cannot correct, and what the unguarded window answers for it is not modelled"))
+                HalfInverted -> return Err(OtpFault.Refused(s"row 0x${hex(r)} has one BRBP bit of two set (0x${hex(self.row(r), 6)}), which is not modelled"))
+            word |= data << (16 * (r & 1))
+        Ok(read_lane(word, offset, width))
+
+    // Whether a Secure read of row `r` reads it: not where its page's lock makes it inaccessible, which
+    // is a bus fault through a guarded window and reads 0 through the others.
+    private readable(self, r: u32, guarded: bool) -> Result[bool, OtpFault]
+        if r >= OTP_LOCK_ROWS then return Ok(true)
+        val p = r / OTP_PAGE_ROWS
+        if self.secure_lock(p) != 3 then return Ok(true)
+        if guarded then return Err(OtpFault.Refused(s"row 0x${hex(r)} is in page $p, which SW_LOCK$p makes inaccessible to Secure reads: a bus fault through the guarded window"))
+        Ok(false)
+
+    /** A read of the OTP block's registers. */
+    read(self, offset: u32, width: u32) -> Result[u32, OtpFault]
+        access(offset, width, true).map_err(e -> OtpFault.Access(e))?
+        val a = offset & 0xFFC
+        val v =
+            if a < 0x100 then self.sw_lock[usize(a >> 2)]
+            elif a == otp_reg.SBPI_INSTR_OFFSET then self.instr
+            elif a >= otp_reg.SBPI_WDATA_0_OFFSET && a <= otp_reg.SBPI_WDATA_3_OFFSET then self.wdata[usize((a - otp_reg.SBPI_WDATA_0_OFFSET) >> 2)]
+            elif a >= otp_reg.SBPI_RDATA_0_OFFSET && a <= otp_reg.SBPI_RDATA_3_OFFSET then self.rdata[usize((a - otp_reg.SBPI_RDATA_0_OFFSET) >> 2)]
+            elif a == otp_reg.SBPI_STATUS_OFFSET then self.status
+            elif a == otp_reg.USR_OFFSET then self.usr
+            elif a == otp_reg.CRITICAL_OFFSET || a == otp_reg.KEY_VALID_OFFSET then 0
+            elif a == otp_reg.ARCHSEL_OFFSET then self.archsel
+            elif a == otp_reg.ARCHSEL_STATUS_OFFSET then self.arch
+            else return Err(OtpFault.Refused(s"${register_name(a)} is not modelled"))
+        Ok(read_lane(v, offset, width))
+
+    /** A write of the OTP block's registers, through any alias. */
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, OtpFault]
+        access(offset, width, true).map_err(e -> OtpFault.Access(e))?
+        val a = offset & 0xFFC
+        val data = replicated(value, width)
+        if a < 0x100
+            // A lock only advances: the bits written are ORed in, through every alias but CLR's, which
+            // clears nothing.
+            if (offset >> 12) & 3 != 3 then self.sw_lock[usize(a >> 2)] |= data & 0xF
+        elif a == otp_reg.SBPI_INSTR_OFFSET
+            self.instr = written(self.instr, offset, data) & 0x7FFFFFFF
+            if self.instr & otp_reg.SBPI_INSTR_EXEC_MASK != 0
+                self.instr &= ~otp_reg.SBPI_INSTR_EXEC_MASK
+                self.execute()?
+        elif a >= otp_reg.SBPI_WDATA_0_OFFSET && a <= otp_reg.SBPI_WDATA_3_OFFSET
+            val i = usize((a - otp_reg.SBPI_WDATA_0_OFFSET) >> 2)
+            self.wdata[i] = written(self.wdata[i], offset, data)
+        elif a == otp_reg.SBPI_STATUS_OFFSET
+            // INSTR_MISS, INSTR_DONE and RDATA_VLD are write-one-to-clear.
+            self.status &= ~(data & 0x111)
+        elif a == otp_reg.USR_OFFSET
+            self.usr = written(self.usr, offset, data) & 0x11
+        elif a == otp_reg.ARCHSEL_OFFSET
+            val sel = written(self.archsel, offset, data) & 3
+            if sel != self.arch then return Err(OtpFault.Refused(s"ARCHSEL = $sel picks an architecture other than the one each core runs (${self.arch}), a switch at the next reset that is not modelled"))
+            self.archsel = sel
+        elif a >= otp_reg.SBPI_RDATA_0_OFFSET && a <= otp_reg.SBPI_RDATA_3_OFFSET || a == otp_reg.CRITICAL_OFFSET || a == otp_reg.KEY_VALID_OFFSET || a == otp_reg.ARCHSEL_STATUS_OFFSET
+            // Read-only.
+            ()
+        else
+            return Err(OtpFault.Refused(s"${register_name(a)} is not modelled"))
+        Ok(())
+
+    // The SBPI instruction just written, as the macro carries it out; done at once.
+    private execute(*self) -> Result[unit, OtpFault]
+        val i = self.instr
+        if self.usr & otp_reg.USR_DCTRL_MASK != 0 then return Err(OtpFault.Refused("an SBPI instruction while USR.DCTRL keeps the array on the read windows"))
+        val target = (i & otp_reg.SBPI_INSTR_TARGET_MASK) >> otp_reg.SBPI_INSTR_TARGET_SHIFT
+        val cmd = (i & otp_reg.SBPI_INSTR_CMD_MASK) >> otp_reg.SBPI_INSTR_CMD_SHIFT
+        val payload = i & otp_reg.SBPI_INSTR_HAS_PAYLOAD_MASK != 0
+        val is_wr = i & otp_reg.SBPI_INSTR_IS_WR_MASK != 0
+        val size = ((i & otp_reg.SBPI_INSTR_PAYLOAD_SIZE_M1_MASK) >> otp_reg.SBPI_INSTR_PAYLOAD_SIZE_M1_SHIFT) + 1
+        val short = i & otp_reg.SBPI_INSTR_SHORT_WDATA_MASK
+        if payload && is_wr && size == 1 && (target == SBPI_DAP || target == SBPI_PMC)
+            // A register write to the macro.
+            if target == SBPI_DAP then self.dap[usize(cmd)] = u8(short) else self.pmc[usize(cmd)] = u8(short)
+        elif target == SBPI_PMC && !payload && cmd == 0x01
+            self.program()?
+        elif target == SBPI_PMC && !payload && cmd == 0x02
+            ()
+        elif target == SBPI_PMC && payload && !is_wr && size == 1 && cmd == 0xBF
+            self.rdata[0] = 0
+            self.status |= otp_reg.SBPI_STATUS_RDATA_VLD_MASK
+        else
+            return Err(OtpFault.Refused(s"SBPI instruction 0x${hex(i, 8)} (target 0x${hex(target)}, command 0x${hex(cmd)}) is not one the boot ROM's programming uses, and not modelled"))
+        self.status |= otp_reg.SBPI_STATUS_INSTR_DONE_MASK
+        Ok(())
+
+    // PMC command 0x01: the row DAP 0xfc and 0xfd name takes the 1 bits in DAP 0xc0, 0xc1 and 0xe0.
+    private program(*self) -> Result[unit, OtpFault]
+        val r = u32(self.dap[0xFC]) | (u32(self.dap[0xFD]) << 8)
+        val bits = u32(self.dap[0xC0]) | (u32(self.dap[0xC1]) << 8) | (u32(self.dap[0xE0]) << 16)
+        if r >= OTP_ROWS then return Err(OtpFault.Refused(s"SBPI programs row 0x${hex(r)}, past the array's last"))
+        if !self.connected then return Err(OtpFault.Refused("no OTP array is connected to this chip"))
+        // A page's lock rows are protected by that page's own lock.
+        val p = if r >= OTP_LOCK_ROWS then (r - OTP_LOCK_ROWS) / 2 else r / OTP_PAGE_ROWS
+        if self.secure_lock(p) != 0 then return Err(OtpFault.Refused(s"SBPI programs row 0x${hex(r)}, which SW_LOCK$p does not leave writable: what the macro does then is not modelled"))
+        if r >= OTP_CRIT_ROWS && r < OTP_CRIT_END then return Err(OtpFault.Refused(s"programming row 0x${hex(r)}, a critical flag row (CRIT0, CRIT1), is not modelled: the boot, debug and core enables it sets are not run"))
+        if r >= OTP_KEY_ROWS && r <= OTP_KEY_END then return Err(OtpFault.Refused(s"programming row 0x${hex(r)}, a hardware key or its valid flags, is not modelled"))
+        if r >= OTP_LOCK_ROWS && r & 1 == 0 && majority3(bits) & 0x7F != 0 then return Err(OtpFault.Refused(s"programming row 0x${hex(r)} with key locks (PAGE${(r - OTP_LOCK_ROWS) / 2}_LOCK0's KEY_R, KEY_W and NO_KEY_STATE) is not modelled"))
+        self.rows[usize(r)] |= bits
+        Ok(())
+end Otp
+
+/** The OTP at power-on, with no array connected. */
+otp() -> Otp
+    var o: Otp
+    o.usr = otp_reg.USR_DCTRL_MASK
+    o
+
+/** Each bit of a row's low byte, the majority of its three copies (bits 7:0, 15:8, 23:16). */
+majority3(x: u32) -> u32
+    val a = x & 0xFF
+    val b = (x >> 8) & 0xFF
+    val c = (x >> 16) & 0xFF
+    (a & b) | (a & c) | (b & c)
+
+// The ECC (datasheet 13.6, "Error correction code"): a Hamming code over the 16 data bits, extended
+// by an overall parity bit, which corrects one wrong bit of the 22 and detects two. Data bit j sits at
+// the j-th Hamming position that is not a power of two (3, 5, 6, 7, 9, ... 21); ECC bit k (k < 5) is
+// the parity of the data bits whose position has bit k set, and ECC bit 5 the parity of all 21 bits
+// before it. So data bit j's column, the ECC bits it alone sets, is its position, with bit 5 where the
+// position has an even number of 1s.
+
+/** The Hamming position of data bit `j`: the `j`-th integer from 3 that is not a power of two. */
+ecc_position(j: u32) -> u32
+    var p: u32 = 2
+    var left = j + 1
+    while left > 0
+        p += 1
+        if p & (p - 1) != 0 then left -= 1
+    p
+
+/** The ECC bits data bit `j` sets on its own. */
+ecc_column(j: u32) -> u32
+    val p = ecc_position(j)
+    if p.count_ones() % 2 == 0 then p | 0x20 else p
+
+/** The 6 ECC bits of `data`'s codeword: for each data bit set, its column, XORed. */
+ecc_parity(data: u32) -> u32
+    var p: u32 = 0
+    for j in 0u32..<16 do if data & (1u32 << j) != 0 then p ^= ecc_column(j)
+    p
+
+/** The 22-bit codeword the OTP stores for 16 bits of data: the data, then its 6 ECC bits. */
+ecc_encode(data: u32) -> u32 = (data & 0xFFFF) | (ecc_parity(data & 0xFFFF) << 16)
+
+/** A row read through the ECC: inverted first where both BRBP bits are set; then a single wrong bit,
+ * data or parity, corrected, and anything else uncorrectable.
+ */
+ecc_decode(raw: u32) -> EccRead
+    val brbp = raw >> 22
+    if brbp == 1 || brbp == 2 then return EccRead.HalfInverted
+    val word = if brbp == 3 then ~raw & 0x3FFFFF else raw & 0x3FFFFF
+    val data = word & 0xFFFF
+    val syndrome = ecc_parity(data) ^ (word >> 16)
+    if syndrome == 0 then return EccRead.Good(data)
+    // One parity bit wrong: the data is right.
+    if syndrome & (syndrome - 1) == 0 then return EccRead.Good(data)
+    for j in 0u32..<16 do if ecc_column(j) == syndrome then return EccRead.Good(data ^ (1u32 << j))
+    EccRead.Uncorrectable
+
+/** Each OTP block register's name, for a refusal. */
+register_name(a: u32) -> string
+    if a < 0x100 then return s"SW_LOCK${a >> 2}"
+    if a >= otp_reg.CRT_KEY_W0_OFFSET && a <= otp_reg.CRT_KEY_W0_OFFSET + 12 then return s"CRT_KEY_W${(a - otp_reg.CRT_KEY_W0_OFFSET) >> 2}"
+    if a == otp_reg.DBG_OFFSET then return "DBG"
+    if a == otp_reg.BIST_OFFSET then return "BIST"
+    if a == otp_reg.DEBUGEN_OFFSET then return "DEBUGEN"
+    if a == otp_reg.DEBUGEN_LOCK_OFFSET then return "DEBUGEN_LOCK"
+    if a == otp_reg.BOOTDIS_OFFSET then return "BOOTDIS"
+    if a == otp_reg.INTR_OFFSET then return "INTR"
+    if a == otp_reg.INTE_OFFSET then return "INTE"
+    if a == otp_reg.INTF_OFFSET then return "INTF"
+    if a == otp_reg.INTS_OFFSET then return "INTS"
+    s"OTP + 0x${hex(a)} (no register)"
+
+/** The OTP as benchtop's chips leave the factory: blank, but for CHIPID0–3 and RANDID0–7, each with
+ * its ECC. The values are benchtop's own, fixed so a run is repeatable; they are no real chip's.
+ */
+factory_otp(rows: *[4096]u32)
+    for i in 0..<OTP_ROWS do rows[i] = 0
+    for i in 0..<12 do rows[i] = ecc_encode(FACTORY_IDS[i])
+
+/** CHIPID0–3 (rows 0–3) and RANDID0–7 (rows 4–11) as `factory_otp` programs them. */
+val FACTORY_IDS: [12]u32 = [0x5CD3, 0x7A01, 0x0E42, 0x1B97, 0x9F3A, 0x26C4, 0xD815, 0x4B70, 0xE1A9, 0x3C5E, 0x8726, 0x60FB]
