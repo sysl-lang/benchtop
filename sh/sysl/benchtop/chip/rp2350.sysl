@@ -1,6 +1,6 @@
 module sh.sysl.benchtop.chip
 
-import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Resets}
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Resets, replicated, written}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
 import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, qspi_flash}
 import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, OtpWindow, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
@@ -373,6 +373,7 @@ struct Rp2350
                 self.reset_blocks(self.resets.held & ~before)
                 // Every released block is ready at once.
                 self.resets.complete(~self.resets.held)
+                if (self.resets.held ^ before) & (resets_reg.RESET_IO_BANK0_MASK | resets_reg.RESET_PADS_BANK0_MASK) != 0 then self.gpio_changed()
                 r
             Clocks ->
                 val before = self.clocks
@@ -387,7 +388,10 @@ struct Rp2350
                         return Err(s"CLOCKS FC0_SRC = $wrote is not modelled: $why")
                     self.clocks.measure(self.sources())
                 r
-            Xosc -> self.xosc.write(o, width, x)
+            Xosc ->
+                if o & 0xFFC == xosc_reg.DORMANT_OFFSET && written(self.xosc.dormant, o, replicated(x, width)) == xosc_reg.DORMANT_DORMANT_DORMANT
+                    return Err(s"${p.name} + 0x${hex(o)}: DORMANT, the crystal stopped until a dormant wake, is not modelled (the ROSC's DORMANT is)")
+                self.xosc.write(o, width, x)
             PllSys -> self.pll_sys.write(o, width, x)
             PllUsb -> self.pll_usb.write(o, width, x)
             Ticks -> self.ticks.write(o, width, x)
@@ -398,11 +402,23 @@ struct Rp2350
                 val r = self.watchdog.write(o, width, x)
                 self.watchdog_reset()
                 r
-            IoBank0 -> self.io.write(o, width, x)
-            PadsBank0 -> self.pads.write(o, width, x)
+            IoBank0 ->
+                self.io.unmodelled(o, width, x) match
+                    Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
+                    None -> ()
+                val r = self.io.write(o, width, x)
+                self.gpio_changed()
+                r
+            PadsBank0 ->
+                val r = self.pads.write(o, width, x)
+                self.gpio_changed()
+                r
             Uart0 -> self.uarts[0].write(o, width, x)
             Uart1 -> self.uarts[1].write(o, width, x)
-            Sio -> self.sio.write(core, o, width, x)
+            Sio ->
+                val r = self.sio.write(core, o, width, x)
+                if o & 0xFFC >= sio_reg.GPIO_OUT_OFFSET && o & 0xFFC <= sio_reg.GPIO_HI_OE_XOR_OFFSET then self.gpio_changed()
+                r
             BootRam -> self.bootram.write(o, width, x)
             UsbCtrl -> self.usb.write(o, width, x)
             Psm ->
@@ -416,7 +432,11 @@ struct Rp2350
                     return Err(s"PSM FRCE_OFF of ${psm_stage_name(newly & ~psm_reg.FRCE_OFF_PROC1_MASK)} is not modelled: only PROC1 can be forced off")
                 self.core1_held(before.held(), self.psm.held())
                 r
-            Rosc -> self.rosc.write(o, width, x)
+            Rosc ->
+                val r = self.rosc.write(o, width, x)
+                // DORMANT with a dormant-wake interrupt already asserted wakes again at once.
+                if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
+                r
             SysInfo -> self.sysinfo.write(o, width, x)
             SysCfg -> self.syscfg.write(o, width, x)
             Powman ->
@@ -607,6 +627,7 @@ struct Rp2350
                 self.outside_driven |= bit
                 self.outside_level = if v then self.outside_level | bit else self.outside_level & ~bit
             None -> self.outside_driven &= ~bit
+        if !self.swcore_off then self.gpio_changed()
 
     // What POWMAN's power-up requests see on the GPIOs they watch, bit n for GPIO n: the pad's level
     // where its input is enabled. While the switched core is down, a pad's isolation latch holds it: a
@@ -671,14 +692,13 @@ struct Rp2350
                 PadsQspi -> self.pads_qspi.reset()
                 _ -> ()
 
-    /** What the function selected on GPIO `n` drives it with, after CTRL's overrides. */
+    /** What the producer FUNCSEL routes to GPIO `n` drives it with, after CTRL's overrides. */
     drive(self, n: u32) -> Drive
-        val f = self.io.function(n)
-        // A UART's TX idles high and drives; bytes leave at once.
-        val d =
-            if f == io_reg.GPIO0_CTRL_FUNCSEL_SIO_0 then Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
-            elif f == io_reg.GPIO0_CTRL_FUNCSEL_UART0_TX && n % 4 == 0 then Drive(true, true)
-            else Drive(false, false)
+        val d = rp.route(n, self.io.function(n)) match
+            Sio -> Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
+            // A UART's TX idles high and drives; bytes leave at once.
+            UartTx -> Drive(true, true)
+            UartRx | Null -> Drive(false, false)
         self.io.after_overrides(n, d)
 
     /** What GPIO `n` is doing: whether its pad drives, and its level. */
@@ -697,11 +717,25 @@ struct Rp2350
         for n in 0..<GPIO_COUNT do all[n] = self.pin(n)
         all
 
-    // GPIO_IN: each pad's input, bit n for GPIO n.
+    // GPIO_IN: what the SIO reads of each GPIO, its pad's input after INOVER, bit n for GPIO n.
     private[chip] inputs(self) -> u64
         var bits: u64 = 0
-        for n in 0..<GPIO_COUNT do if self.pin(n).input then bits |= 1u64 << n
+        for n in 0..<GPIO_COUNT do if self.io.peripheral_input(n, self.pin(n).input) then bits |= 1u64 << n
         bits
+
+    // What the GPIO interrupts see: each pad's input after IRQOVER, bit n for GPIO n.
+    private irq_inputs(self) -> u64
+        var bits: u64 = 0
+        for n in 0..<GPIO_COUNT do if self.io.irq_input(n, self.pin(n).input) then bits |= 1u64 << n
+        bits
+
+    /** Something that decides a GPIO's level may have changed (a function, an override, a pad, the SIO,
+     * or what drives it from outside): the GPIO interrupts sample their inputs again, latching each
+     * edge, except while RESETS holds IO_BANK0. A dormant-wake interrupt wakes a dormant ROSC.
+     */
+    gpio_changed(*self)
+        self.io.irq.sample(self.irq_inputs(), self.resets.held & resets_reg.RESET_IO_BANK0_MASK == 0)
+        if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
 
     /** Drive `p`'s interrupt inputs from the devices' levels. */
     signal(self, p: *Processor)
@@ -709,6 +743,7 @@ struct Rp2350
         for i in 0u32..<2
             val lines = self.timers[i].irqs()
             for j in 0u32..<4 do p.interrupt(TIMER0_IRQ_0 + 4 * i + j, lines & (1 << j) != 0)
+        p.interrupt(rp.IO_IRQ_BANK0, self.io.irq.line(k))
         p.interrupt(SIO_IRQ_FIFO, self.sio.fifo_irq(k))
         p.interrupt(SIO_IRQ_BELL, self.sio.bell_irq(k))
         p.interrupt(POWMAN_IRQ_POW, self.powman.irq_pow())

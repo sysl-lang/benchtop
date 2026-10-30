@@ -96,12 +96,12 @@ day. An L is split before it is handed out (§6).
 | RESETS (29 outputs) | 7.5 Subsystem resets | full | `peripheral/rp2350/timing.sysl:15–22` over `rp2040/resets.sysl:7–11`. Release completes at once. | `rp2350/tests.sysl:15`, `chip/tests.sysl:43,81` | — | — |
 | PSM (power-on state machine; FRCE_ON/FRCE_OFF/DONE) | 7.4 Power-on state machine | full | The 25-stage sequence: FRCE_OFF holds a stage and those after it, FRCE_ON releases from a later stage, DONE is computed, WDSEL stored. PROC1 forced off stops core 1 and its release re-enters the ROM wait with a 0 for core 0 (`multicore_reset_core1`). Forcing any other stage off is refused by name. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | CLOCKS | 8.1 Clocks | partial | CTRL and DIV are stored. clk_ref and clk_sys follow their muxes and drive time. SELECTED is one-hot (`peripheral/rp2350/clocks.sysl:25–30`). The frequency counter FC0 is run (it measures the modelled tree, finishing at once); resus is stored. clk_peri, clk_usb, clk_adc and clk_hstx have frequencies from their AUXSRC and DIV, which FC0 reads, but no consumer. GPOUT is not driven on a pin. | `rp2350/tests.sysl:112`, `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | S | consumers |
-| XOSC | 8.2 Crystal oscillator | partial | STABLE after STARTUP.DELAY×256 (`clocks.sysl:97–105`). DORMANT and COUNT are not modelled. | `rp2350/tests.sysl:81` | S | — |
+| XOSC | 8.2 Crystal oscillator | partial | STABLE after STARTUP.DELAY×256 (`clocks.sysl:97–105`). DORMANT and COUNT are not modelled; writing DORMANT's dormant value is refused by name (item 9). | `rp2350/tests.sysl:81` | S | — |
 | ROSC (including RANDOMBIT) | 8.3 Ring oscillator | full | Every register, the code-protected fields with BADWRITE, DORMANT, COUNT. Frequency stays the nominal 11 MHz (Q8) and follows ENABLE and DORMANT. RANDOMBIT is a seeded LFSR (seed 0x3F04B16D at power-on, reloaded by RANDOM, one step per read). | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | TICKS (6 generators) | 8.4 Tick generators | full | `peripheral/rp2350/timing.sysl:24–90`. | `rp2350/tests.sysl:25` | — | — |
 | PLL_SYS, PLL_USB | 8.6 PLL | full | LOCK once powered with an FBDIV. The output frequency is computed (`clocks.sysl:167–225`). Lock is instant. | `rp2350/tests.sysl:81` | — | — |
-| IO_BANK0: FUNCSEL, overrides, STATUS | 9 GPIO | partial | 48 GPIOs with overrides (`peripheral/rp2350/gpio.sysl:7–80`). Only SIO is a real driver. UART TX is "idles high" on `n % 4 == 0` (`chip/rp2350.sysl:299–303`), and no peripheral's bit stream reaches a pin. There is no mux layer for PIO, PWM, SPI or I²C (`docs/peripheral-models.md:17–22`). | `chip/tests.sysl:94`, `rp2350/tests.sysl:183` | M (mux layer) | each peripheral |
-| GPIO interrupts (PROC0/1 INTE/INTF/INTS, edge latch, IO_IRQ_BANK0, dormant wake) | 9 GPIO | missing | Refused (`gpio.sysl:9–10`). | — | M | IRQ routing |
+| IO_BANK0: FUNCSEL, overrides, STATUS | 9 GPIO | full | 48 GPIOs, one routing layer (item 9): FUNCSEL picks a producer (`route`), each offers a level and an output enable, OUTOVER/OEOVER then the pad decide; INOVER feeds the functions (SIO's GPIO_IN), IRQOVER the interrupts; STATUS with IRQTOPROC (`peripheral/rp2350/gpio.sysl`, `chip/rp2350.sysl` `drive`). Producers: SIO, NULL, and each UART's TX (idling high; bytes leave at once, item 8) and RX on F2 and F11. Every other function, and a FUNCSEL that is no function of its GPIO, is refused by name when selected, naming the item that builds it (`unmodelled_function`). | `chip/gpio_tests.sysl`, `rp2350/tests.sysl:183` | — | each peripheral adds its producer |
+| GPIO interrupts (PROC0/1 INTE/INTF/INTS, edge latch, IO_IRQ_BANK0, dormant wake) | 9 GPIO | full | INTR's levels and latched edges (write 1 to clear through any alias), INTE/INTF/INTS for processor 0, processor 1 and the dormant wake, IRQSUMMARY (Secure only, Q3); processor k's line is IO_IRQ_BANK0 (21) in core k on both boards, the dormant wake's wakes a DORMANT ROSC. Edges latch whenever a GPIO's input can move: a function, override, pad or SIO write, the GPIO coprocessor, or a level driven from outside; none while IO_BANK0 is held (`peripheral/rp2350/gpio_irq.sysl`, shared with the RP2040's layout; item 9). IO_IRQ_BANK0_NS is never raised (Q3). | `rp2350/gpio_irq_tests.sysl`, `chip/gpio_tests.sysl` (`hello_gpio_irq.elf`, `gpio_irq.elf`, `pico2-riscv/gpio_irq.elf`) | — | — |
 | PADS_BANK0 (ISO, IE, OD, pulls, drive, slew) | 9.8 Pads | full | `gpio.sysl:82–131`. Drive and slew are stored. | `rp2350/tests.sysl:169` | — | — |
 | IO_QSPI, PADS_QSPI (including the BOOTSEL read via QSPI_SS) | 9 GPIO | partial (stored) | PADS_QSPI's seven registers and IO_QSPI's eight CTRLs and interrupt registers stored with their reset values and aliases, behind their RESETS bits, which the boards' boot releases (`peripheral/rp2350/qspi_pins.sysl`, item 6). The pins drive nothing (the flash is the QMI's); each STATUS, and so the BOOTSEL read, refused by name. | `peripheral/rp2350/rom_blocks_tests.sysl`, `chip/tests.sysl` | S (levels, BOOTSEL) | XIP for the shared pins |
 | UART0/1 (PL011) | 12.1 UART | partial | DR both ways, FR, the divisors, LCR_H/CR stored, 32-entry FIFOs, RX/TX interrupts (`peripheral/rp2350/uart.sysl:6–12`). Not modelled: byte timing from clk_peri and the baud, modem lines, break and errors, FIFO-level interrupts beyond RX/TX, RT timeout, DMA DREQs (DMACR is stored), and the bit stream on the pin. Atomic aliases of DR and ICR are refused (`uart.sysl:84,112`). | `rp2350/tests.sysl:196`, `chip/tests.sysl:18` | M | CLOCKS (clk_peri), DMA |
@@ -150,7 +150,7 @@ day. An L is split before it is handed out (§6).
 | PLL_SYS, PLL_USB | 2.18 PLL | missing | Shared with the RP2350 (same registers). | — | S | — |
 | IO_BANK0, PADS_BANK0 (30 GPIOs, no ISO bit) | 2.19 GPIO | missing | The RP2350 model is the base (DESIGN.md §10.1). | — | S | chip layer |
 | IO_QSPI, PADS_QSPI | 2.19 GPIO | missing | — | — | S | — |
-| GPIO interrupts (PROC0/1, DORMANT_WAKE) | 2.19 GPIO | missing | Shared with the RP2350 item. | — | S (after RP2350) | — |
+| GPIO interrupts (PROC0/1, DORMANT_WAKE) | 2.19 GPIO | missing | The model is built and tested at this chip's layout (`GpioIrq`, 30 GPIOs from INTR0 at 0xF0, `rp2350/gpio_irq_tests.sysl`); not on an RP2040 bus yet (item 22). | — | S | chip layer |
 | SYSINFO | 2.20 Sysinfo | missing | `rp2040_chip_version()` and `running_on_fpga()` read it. | — | S | — |
 | SYSCFG | 2.21 Syscfg | missing | — | — | S | — |
 | TBMAN | 2.22 TBMAN | missing | — | — | S | — |
@@ -169,7 +169,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 28 | 10 | 1 | 19 | 58 |
+| RP2350 | 30 | 9 | 1 | 18 | 58 |
 | RP2040 | 5 | 4 | 0 | 28 | 37 |
 
 One RP2350 block is a register-stub today (its row says which). Every block that is not modelled is refused by the bus, which is
@@ -320,7 +320,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 6 | **Boot ROM function table**: per Q1, Raspberry Pi's real ROM, mapped on both boards; core 1's wait and every ROM function run as its code. The core-0 boot path is item 30's. **Done** (below). | L | 4, 5 |
 | 7 | **DCP (CP4/5)**: the double coprocessor. `pico_float_test` and a `printf("%f")` program are its oracles. **Done** (below). | M | 3 |
 | 8 | **UART completion**: baud-timed bytes from clk_peri, both UARTs' pins correct, RT timeout, FIFO-level IRQs, break and errors, DREQ outputs. | M | 6 |
-| 9 | **GPIO function mux and GPIO interrupts**: one routing layer where every producer offers level and OE, IO_IRQ_BANK0, and per-core INTE/INTF/INTS. `gpio/hello_gpio_irq` is its oracle. | M | 6 |
+| 9 | **GPIO function mux and GPIO interrupts**: one routing layer where every producer offers level and OE, IO_IRQ_BANK0, and per-core INTE/INTF/INTS. `gpio/hello_gpio_irq` is its oracle. **Done** (below). | M | 6 |
 | 10 | **Watchdog counter and chip reset path**: countdown, TRIGGER, REASON, SCRATCH surviving, and the machine restarting through the boot path. **Done** (below). | M | 5 |
 | 11 | **DMA core**: channels, DREQ inputs, pacing timers, chaining, ring, IRQs. The register model is shared by both chips' channel counts. | L | 9 |
 | 12 | **DMA sniff/CRC and security attributes**. | S | 11 |
@@ -847,3 +847,52 @@ SRAM bank 0 lost), it sets BOOTDIS.NEXT and BOOT0 and sleeps keeping SRAM bank 0
 which the test drives from outside; woken by PWRUP0 (bit 1), the word kept, BOOTDIS consumed and BOOT0
 ignored, PWRUP0's edge still latched. `chip/power_tests.sysl` asserts every line and that the alarm's
 power-up came between 1000 and 1100 ms on the timer.
+
+### Item 9, done: the GPIO function mux and the GPIO interrupts
+
+`peripheral/rp2350/gpio.sysl` (the mux) and `gpio_irq.sysl` (the interrupts) against `hardware/regs/io_bank0.h`
+and the SDK's `hardware_gpio`; the chip routes and samples (`chip/rp2350.sysl` `drive`, `gpio_changed`,
+`signal`).
+
+- **One routing layer**: FUNCSEL picks a producer (`route`), the producer offers a level and an output
+  enable, OUTOVER and OEOVER override them, and the pad decides. Producers today: SIO, NULL, and each
+  UART's TX (idles high and drives; bytes still leave at once, item 8) and RX, on F2 and on F11. A peripheral
+  item adds its producer to `route` and drops its refusal.
+- **Refused by name** (`unmodelled_function`), when the FUNCSEL is written, through any alias, CTRL kept:
+  SPI (item 16), I²C (17), PWM (18), PIO0–2 (13, 14), HSTX (29), JTAG and CoreSight trace (Q5), UART CTS and
+  RTS (item 8), CLOCKS GPIN and GPOUT, the QMI's second chip select, USB_MUXING (20), and any FUNCSEL that
+  is no function of its GPIO. XOSC's DORMANT is refused by name too: the crystal stopping until a wake is
+  not modelled, where the ROSC's DORMANT is.
+- **Inputs**: INOVER changes what the functions read (SIO's GPIO_IN); IRQOVER what the interrupts see,
+  which STATUS.IRQTOPROC reports. Both read the pad's input, 0 while it is isolated or its input is off.
+- **Interrupts**: INTR's LEVEL_LOW and LEVEL_HIGH follow the input; EDGE_LOW and EDGE_HIGH latch until a 1
+  clears them, through any alias. Processor 0, processor 1 and the dormant wake each have INTE and INTF and
+  read INTS = (INTR | INTF) & INTE; IRQSUMMARY lists the GPIOs asserted for each, all Secure (Q3), the
+  Non-secure words 0. Processor k's line is IO_IRQ_BANK0 (21) in core k on both boards; IO_IRQ_BANK0_NS is
+  never raised. The dormant wake's line takes the ROSC out of DORMANT, at once if it is already asserted.
+- **When edges latch**: the chip samples the inputs whenever one can move, never per cycle: a write to
+  IO_BANK0, PADS_BANK0 or the SIO's GPIO registers, a GPIO coprocessor write, a RESETS change of either
+  bank, and a level driven from outside (`drive_from_outside`). Nothing latches while RESETS holds
+  IO_BANK0, whose reset clears the latches, enables and forces. No producer changes level with time yet,
+  so nothing is sampled as time passes.
+- **Shared with the RP2040** (item 22): `GpioIrq` takes the GPIO count and INTR0's offset; it is tested at
+  both layouts (48 from 0x230, 30 from 0xF0).
+- **Assumptions**, since the headers do not say: IRQOVER sits between the pad and the edge detector (so
+  an override can latch an edge), and IRQTOPROC is that overridden input.
+- **Two board fixes the programs found.** The Arm board slept the rest of a run's budget away when both
+  cores were asleep at the end of a quantum though one had been woken by the other's `SEV` during it (the
+  boot ROM's launch handshake, when no alarm was pending); now a core that would wake runs the next
+  quantum (`ArmBoard.run`). The RISC-V board likewise returned `Asleep` with a hart's interrupt pending
+  (a GPIO edge driven between runs); `RiscvBoard.asleep` now asks `riscv.wakes_now`.
+
+The oracles: `examples/pico2/hello_gpio_irq.c` is pico-examples' `gpio/hello_gpio_irq` (pico-examples is
+not cloned in this tree; the source is reproduced from the upstream program and should be checked against
+the checkout once it is), run on the Arm board with GPIO 2 driven high, low, high and released;
+`examples/pico2/gpio_irq.c` covers both cores, levels, a force, both overrides and the dormant wake with
+nothing outside; `examples/pico2-riscv/gpio_irq.c` is its RISC-V twin, through Hazard3's Xh3irq.
+`chip/gpio_tests.sysl` asserts each program's output line by line, and the mux, overrides, edge sources,
+per-core lines and dormant wake at register level; `rp2350/gpio_irq_tests.sysl` the interrupt registers.
+
+**Cost**, host instructions retired, three interleaved runs each against the branch's base: `sram_loop.elf`
+5.644–5.664 G to 5.652–5.660 G, `xip_loop.elf` 5.864–5.872 G to 5.875–5.883 G, `bench --core cortex-m33
+kernel33.bin` 37.140–37.143 G to 37.139–37.145 G: within run-to-run noise.

@@ -1,0 +1,261 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.rosc as rosc_reg
+import sh.sysl.rp2350.sio as sio_reg
+import sh.sysl.rp2350.xosc as xosc_reg
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// The GPIO function mux and the GPIO interrupts on the chip (`Rp2350.drive`, `gpio_changed`, `signal`)
+// and on both boards: every FUNCSEL routed to its producer or refused by name, INOVER and IRQOVER, edges
+// from every source that moves a pin, IO_IRQ_BANK0 into each core, the dormant wake; then pico-examples'
+// hello_gpio_irq on the Arm board, examples/pico2/gpio_irq.c on both cores, and its RISC-V twin
+// (examples/pico2-riscv/gpio_irq.c) on the Hazard3 harts.
+
+private val HELLO_GPIO_IRQ = embed("../../../../examples/pico2/hello_gpio_irq.elf")
+private val GPIO_IRQ_PROGRAM = embed("../../../../examples/pico2/gpio_irq.elf")
+private val RISCV_GPIO_IRQ = embed("../../../../examples/pico2-riscv/gpio_irq.elf")
+private val SRAM = SramMap(0x20000000, 520 * 1024)
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const TENTH_MS: u64 = 15000
+
+private ctrl_at(n: u32) -> u32 = io.BASE + io.GPIO0_CTRL_OFFSET + 8 * n
+private status_at(n: u32) -> u32 = io.BASE + io.GPIO0_STATUS_OFFSET + 8 * n
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+
+// IO_BANK0 and PADS_BANK0 out of reset, as the SDK's runtime takes them.
+private released() -> Rp2350
+    var c = rp2350()
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK)
+    c
+
+// GPIO `n` given to function `f` as the SDK's gpio_set_function leaves it: input on, out of isolation.
+private function(c: *Rp2350, n: u32, f: u32)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + CLR, pads.GPIO0_OD_MASK | pads.GPIO0_ISO_MASK)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET, pads.GPIO0_IE_MASK)
+    wr(c, ctrl_at(n), f)
+
+// Why selecting function `f` on GPIO `n` is refused.
+private refused(c: *Rp2350, n: u32, f: u32) -> string = c.write(0, ctrl_at(n), 4, f).unwrap_err()
+
+// INTR's nibble for GPIO `n`.
+private intr(c: *Rp2350, n: u32) -> u32 = (rd(c, io.BASE + io.INTR0_OFFSET + 4 * (n / 8)) >> (4 * (n % 8))) & 0xF
+
+@test("each FUNCSEL routes its producer: SIO's OUT and OE, a UART's TX idling high on F2 and on F11, its RX and NULL driving nothing; OUTOVER and OEOVER still apply; STATUS reads what reaches the pad")
+chip_gpio_mux_routes()
+    var c = released()
+    wr(&c, sio_reg.BASE + sio_reg.GPIO_OE_SET_OFFSET, 1 << 4)
+    wr(&c, sio_reg.BASE + sio_reg.GPIO_OUT_SET_OFFSET, 1 << 4)
+    for n in 0u32..<8 do function(&c, n, 31)
+    assert(!c.drive(4).oe && !c.pin(4).drives, "NULL drives nothing, whatever the SIO holds")
+    function(&c, 4, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    assert(c.drive(4).oe && c.drive(4).out && c.pin(4).level && c.pin(4).input)
+    function(&c, 0, 2)
+    function(&c, 1, 2)
+    function(&c, 2, 11)
+    function(&c, 3, 11)
+    assert(c.drive(0).oe && c.drive(0).out && c.drive(2).oe && c.drive(2).out, "UART0_TX on GPIO 0 (F2) and on GPIO 2 (F11)")
+    assert(!c.drive(1).oe && !c.drive(3).oe, "UART0_RX on GPIO 1 and 3 drives nothing")
+    wr(&c, ctrl_at(4), io.GPIO0_CTRL_FUNCSEL_SIO_0 | (io.GPIO0_CTRL_OUTOVER_LOW << io.GPIO0_CTRL_OUTOVER_SHIFT))
+    assert(c.drive(4).oe && !c.drive(4).out)
+    wr(&c, ctrl_at(4), io.GPIO0_CTRL_FUNCSEL_SIO_0 | (io.GPIO0_CTRL_OEOVER_DISABLE << io.GPIO0_CTRL_OEOVER_SHIFT))
+    assert(!c.drive(4).oe && !c.pin(4).drives)
+    val status = rd(&c, status_at(2))
+    assert(status & io.GPIO0_STATUS_OUTTOPAD_MASK != 0 && status & io.GPIO0_STATUS_OETOPAD_MASK != 0 && status & io.GPIO0_STATUS_INFROMPAD_MASK != 0, s"0x${hex(status)}")
+    assert(status & io.GPIO0_STATUS_IRQTOPROC_MASK != 0, "the interrupts see it high")
+
+@test("a FUNCSEL whose producer benchtop does not model, or that is no function of its GPIO, is refused by name through every alias and leaves CTRL as it was; SIO, NULL and the UARTs' TX and RX are taken on every GPIO")
+chip_gpio_mux_refusals()
+    var c = released()
+    for n in 0u32..<48
+        for f in 0u32..<32
+            wr(&c, ctrl_at(n), 31 | (io.GPIO0_CTRL_INOVER_HIGH << io.GPIO0_CTRL_INOVER_SHIFT))
+            val taken = f == 5 || f == 31 || (f == 2 && n % 4 < 2) || (f == 11 && n % 4 >= 2)
+            val r = c.write(0, ctrl_at(n), 4, f)
+            r match
+                Ok(_) -> assert(taken && rd(&c, ctrl_at(n)) == f, s"GPIO $n FUNCSEL $f taken")
+                Err(why) ->
+                    assert(!taken && why.starts_with(s"IO_BANK0 + 0x${hex(8 * n + 4)}: GPIO $n "), why)
+                    assert(rd(&c, ctrl_at(n)) == 31 | (io.GPIO0_CTRL_INOVER_HIGH << io.GPIO0_CTRL_INOVER_SHIFT), "CTRL unchanged")
+    // The names.
+    val why = (n: u32, f: u32) -> refused(&c, n, f)
+    assert(why(2, 1) == "IO_BANK0 + 0x14: GPIO 2 FUNCSEL 1 selects SPI0, which is not on the chip yet (docs/rp-coverage.md item 16)", why(2, 1))
+    assert(why(6, 2) == "IO_BANK0 + 0x34: GPIO 6 FUNCSEL 2 selects UART1_CTS: UART flow control is not modelled (docs/rp-coverage.md item 8)", why(6, 2))
+    assert(why(4, 0) == "IO_BANK0 + 0x24: GPIO 4 has no function 0", why(4, 0))
+    for (n, f, name) in [(25u32, 6u32, "PIO0"), (25, 4, "PWM"), (5, 3, "I2C0"), (13, 0, "HSTX_1"), (21, 9, "CLOCKS_GPOUT"), (20, 9, "CLOCKS_GPIN"),
+            (19, 9, "XIP_SS_N_1"), (1, 9, "CORESIGHT"), (17, 10, "USB_MUXING"), (0, 0, "JTAG")]
+        assert(why(n, f).contains(name), why(n, f))
+    assert(why(4, 11) == "IO_BANK0 + 0x24: GPIO 4 has no function 11" && why(9, 20) == "IO_BANK0 + 0x4c: GPIO 9 has no function 20", why(9, 20))
+    // Through an alias: SET of FUNCSEL bits on NULL keeps 31, so it is taken; CLR of them makes 0.
+    wr(&c, ctrl_at(5), 31)
+    c.write(0, ctrl_at(5) + SET, 4, 1).unwrap()
+    assert(c.write(0, ctrl_at(5) + CLR, 4, 0x1F).is_err() && rd(&c, ctrl_at(5)) == 31)
+    assert(c.write(0, ctrl_at(5) + CLR, 4, 0x1A).is_ok() && rd(&c, ctrl_at(5)) == 5, "31 & ~0x1A is SIO")
+
+@test("INOVER changes what the SIO reads and not what the interrupts see; IRQOVER the reverse, latching the edge it makes; STATUS.IRQTOPROC follows IRQOVER")
+chip_gpio_input_overrides()
+    var c = released()
+    function(&c, 9, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    c.drive_from_outside(9, Some(true))
+    wr(&c, io.BASE + io.INTR0_OFFSET + 4, 0xF0)
+    assert(c.inputs() & (1 << 9) != 0 && intr(&c, 9) == 0x2)
+    wr(&c, ctrl_at(9), 5 | (io.GPIO0_CTRL_INOVER_LOW << io.GPIO0_CTRL_INOVER_SHIFT))
+    assert(c.inputs() & (1 << 9) == 0 && intr(&c, 9) == 0x2 && rd(&c, status_at(9)) & io.GPIO0_STATUS_IRQTOPROC_MASK != 0)
+    wr(&c, ctrl_at(9), 5 | (io.GPIO0_CTRL_IRQOVER_INVERT << io.GPIO0_CTRL_IRQOVER_SHIFT))
+    assert(c.inputs() & (1 << 9) != 0 && intr(&c, 9) == 0x5 && rd(&c, status_at(9)) & io.GPIO0_STATUS_IRQTOPROC_MASK == 0, "inverted: low, a falling edge")
+    wr(&c, ctrl_at(9), 5 | (io.GPIO0_CTRL_IRQOVER_HIGH << io.GPIO0_CTRL_IRQOVER_SHIFT))
+    assert(intr(&c, 9) == 0xE, "forced high: a rising edge too")
+
+@test("edges latch from everything that moves a pin: driven from outside, the SIO's own output read back, a pad's input enabled, a function changed; none while IO_BANK0 is held, whose reset clears the enables and latches")
+chip_gpio_edge_sources()
+    var c = released()
+    wr(&c, io.BASE + io.PROC0_INTE0_OFFSET, 0xC << 12)
+    // GPIO 3: an input, pulled down, driven from outside.
+    function(&c, 3, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    c.drive_from_outside(3, Some(true))
+    assert(intr(&c, 3) == 0xA && c.io.irq.line(0) && !c.io.irq.line(1))
+    c.drive_from_outside(3, None)
+    assert(intr(&c, 3) == 0xD, "undriven: pulled down")
+    wr(&c, io.BASE + io.INTR0_OFFSET, 0xC << 12)
+    assert(!c.io.irq.line(0))
+    // GPIO 4 through the SIO: out and enabled, its pad reading it back.
+    function(&c, 4, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    wr(&c, sio_reg.BASE + sio_reg.GPIO_OUT_SET_OFFSET, 1 << 4)
+    assert(intr(&c, 4) == 0x1, "not yet enabled")
+    wr(&c, sio_reg.BASE + sio_reg.GPIO_OE_SET_OFFSET, 1 << 4)
+    assert(intr(&c, 4) == 0xA)
+    wr(&c, sio_reg.BASE + sio_reg.GPIO_OUT_XOR_OFFSET, 1 << 4)
+    assert(intr(&c, 4) == 0xD)
+    // GPIO 6 driven high from outside, its input off until the pad enables it; then its function moves
+    // nothing, since the pad's input does not depend on it.
+    c.drive_from_outside(6, Some(true))
+    assert(intr(&c, 6) == 0x1, "the input is off")
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 6 + CLR, pads.GPIO0_ISO_MASK)
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 6 + SET, pads.GPIO0_IE_MASK)
+    assert(intr(&c, 6) == 0xA)
+    // GPIO 7 with a pull-up, which SIO then drives low.
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 7, pads.GPIO0_IE_MASK | pads.GPIO0_PUE_MASK)
+    assert(intr(&c, 7) == 0xA)
+    wr(&c, sio_reg.BASE + sio_reg.GPIO_OE_SET_OFFSET, 1 << 7)
+    wr(&c, ctrl_at(7), io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    assert(intr(&c, 7) == 0xD, "the function takes the pin low")
+    // Held in reset: the levels follow, nothing latches, and the reset cleared INTE.
+    wr(&c, rr.BASE + rr.RESET_OFFSET + SET, rr.RESET_IO_BANK0_MASK)
+    c.drive_from_outside(3, Some(true))
+    c.drive_from_outside(3, Some(false))
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK)
+    assert(intr(&c, 3) == 0x1 && intr(&c, 4) == 0x1 && rd(&c, io.BASE + io.PROC0_INTE0_OFFSET) == 0, s"0x${hex(intr(&c, 3))}")
+
+@test("IO_IRQ_BANK0 follows each core's own INTS: processor 0's into core 0, processor 1's into core 1; IRQSUMMARY says which GPIO, Secure only")
+chip_gpio_irq_into_cores()
+    var c = released()
+    function(&c, 10, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    function(&c, 40, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    wr(&c, io.BASE + io.PROC1_INTE0_OFFSET + 4, 0x8 << 8)
+    wr(&c, io.BASE + io.PROC0_INTE0_OFFSET + 20, 0x2)
+    c.drive_from_outside(10, Some(true))
+    assert(!c.io.irq.line(0) && c.io.irq.line(1))
+    assert(rd(&c, io.BASE + io.IRQSUMMARY_PROC1_SECURE0_OFFSET) == 1 << 10 && rd(&c, io.BASE + io.IRQSUMMARY_PROC0_SECURE0_OFFSET) == 0)
+    c.drive_from_outside(40, Some(true))
+    assert(c.io.irq.line(0) && rd(&c, io.BASE + io.IRQSUMMARY_PROC0_SECURE1_OFFSET) == 1 << 8)
+    assert(rd(&c, io.BASE + io.IRQSUMMARY_PROC0_NONSECURE1_OFFSET) == 0 && rd(&c, io.BASE + io.IRQSUMMARY_PROC1_NONSECURE0_OFFSET) == 0)
+    c.write(0, io.BASE + io.IRQSUMMARY_PROC0_SECURE1_OFFSET, 4, 0).unwrap()
+    assert(rd(&c, io.BASE + io.IRQSUMMARY_PROC0_SECURE1_OFFSET) == 1 << 8, "read-only")
+
+@test("the dormant wake: an asserted DORMANT_WAKE interrupt brings the ROSC out of DORMANT, at once if it is already asserted; the crystal's DORMANT is refused by name")
+chip_gpio_dormant_wake()
+    var c = released()
+    function(&c, 11, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    wr(&c, io.BASE + io.DORMANT_WAKE_INTE0_OFFSET + 4, 0x8 << 12)
+    wr(&c, rosc_reg.BASE + rosc_reg.DORMANT_OFFSET, rosc_reg.DORMANT_DORMANT_DORMANT)
+    assert(!c.rosc.running() && rd(&c, rosc_reg.BASE + rosc_reg.DORMANT_OFFSET) == rosc_reg.DORMANT_DORMANT_DORMANT)
+    c.drive_from_outside(11, Some(true))
+    assert(c.rosc.running() && rd(&c, rosc_reg.BASE + rosc_reg.DORMANT_OFFSET) == rosc_reg.DORMANT_DORMANT_WAKE, "GPIO 11 rose")
+    wr(&c, rosc_reg.BASE + rosc_reg.DORMANT_OFFSET, rosc_reg.DORMANT_DORMANT_DORMANT)
+    assert(c.rosc.running(), "the edge is still latched")
+    wr(&c, io.BASE + io.INTR0_OFFSET + 4, 0x8 << 12)
+    wr(&c, rosc_reg.BASE + rosc_reg.DORMANT_OFFSET, rosc_reg.DORMANT_DORMANT_DORMANT)
+    assert(!c.rosc.running(), "acknowledged")
+    // A processor's enables wake nothing.
+    wr(&c, io.BASE + io.PROC0_INTE0_OFFSET + 4, 0x4 << 12)
+    c.drive_from_outside(11, Some(false))
+    assert(!c.rosc.running() && c.io.irq.line(0))
+    val why = c.write(0, xosc_reg.BASE + xosc_reg.DORMANT_OFFSET, 4, xosc_reg.DORMANT_DORMANT_DORMANT).unwrap_err()
+    assert(why == "XOSC + 0x8: DORMANT, the crystal stopped until a dormant wake, is not modelled (the ROSC's DORMANT is)", why)
+    wr(&c, xosc_reg.BASE + xosc_reg.DORMANT_OFFSET, xosc_reg.DORMANT_DORMANT_WAKE)
+
+@test("pico-examples' hello_gpio_irq on the Arm Pico 2: each edge driven onto GPIO 2 from outside reaches the SDK's callback through IO_IRQ_BANK0, one line each; nothing is reported while the pin rests")
+arm_hello_gpio_irq()
+    val b = arm_board(SRAM)
+    b.boot(HELLO_GPIO_IRQ).unwrap()
+    var end = RunEnd.Budget
+    for i in 0u32..<24
+        // High, low, high, then let go: the pad's pull-down takes it low.
+        if i == 10 then b.chip.drive_from_outside(2, Some(true))
+        if i == 14 then b.chip.drive_from_outside(2, Some(false))
+        if i == 18 then b.chip.drive_from_outside(2, Some(true))
+        if i == 20 then b.chip.drive_from_outside(2, None)
+        end = b.run(10 * TENTH_MS)
+        if end != RunEnd.Budget then break
+    val text = from_utf8_lossy(b.console.view())
+    assert(end == RunEnd.Budget, s"$end ${b.refused}\n$text")
+    val want = "Hello GPIO IRQ\r\n" +
+        "GPIO 2 EDGE_RISE\r\n" +
+        "GPIO 2 EDGE_FALL\r\n" +
+        "GPIO 2 EDGE_RISE\r\n" +
+        "GPIO 2 EDGE_FALL\r\n"
+    assert(text == want, text)
+
+@test("examples/pico2/gpio_irq.c on the Arm Pico 2: edges one at a time and both in one interrupt, levels, a force, IRQOVER and INOVER, core 1's own enables and callback, and the dormant wake of the ROSC")
+arm_gpio_irq_program()
+    val b = arm_board(SRAM)
+    b.boot(GPIO_IRQ_PROGRAM).unwrap()
+    // One run, so that both cores asleep in the launch handshake, each woken by the other's SEV within a
+    // quantum, must run on rather than sleep the budget away.
+    val end = b.run(400 * TENTH_MS)
+    val text = from_utf8_lossy(b.console.view())
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused} core 0 at 0x${hex(b.cores[0].pc)} core 1 at 0x${hex(b.cores[1].pc)}\n$text")
+    val want = "gpio irq\r\n" +
+        "raw: gpio 5 0x1 gpio 6 0x1\r\n" +
+        "edges: core 0 gpio 5 0x8 core 0 gpio 5 0x4\r\n" +
+        "masked: ints 0xc\r\n" +
+        "unmasked: core 0 gpio 5 0xc\r\n" +
+        "levels: core 0 gpio 5 0x2 core 0 gpio 6 0x1\r\n" +
+        "forced: core 0 gpio 6 0x8\r\n" +
+        "irqover invert: irqtoproc 0 gpio_get 1 raw 0x5\r\n" +
+        "inover low: irqtoproc 1 gpio_get 0 raw 0x2\r\n" +
+        "gpio 7 enables: core 1 0x8 core 0 0x0\r\n" +
+        "core 1: core 1 gpio 7 0x8\r\n" +
+        "dormant with gpio 5 high: ints 0x2 rosc awake\r\n" +
+        "dormant: rosc dormant\r\n" +
+        "gpio 5 falls: rosc awake\r\n" +
+        "done\r\n"
+    assert(text == want, text)
+
+@test("the RISC-V twin of hello_gpio_irq on the Hazard3 harts: IO_IRQ_BANK0 through Xh3irq for GPIO 5's own edges, then each edge driven onto GPIO 2 from outside while the hart waits in WFI")
+riscv_gpio_irq_program()
+    val b = riscv_board(SRAM)
+    b.boot(RISCV_GPIO_IRQ).unwrap()
+    var end = RunEnd.Budget
+    for i in 0u32..<12
+        if i >= 2 && i < 6 then b.chip.drive_from_outside(2, Some(i % 2 == 0))
+        end = b.run(10 * TENTH_MS)
+        if end != RunEnd.Budget && end != RunEnd.Asleep then break
+    val text = from_utf8_lossy(b.console.view())
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}\n$text")
+    val want = "Hello GPIO IRQ\n" +
+        "GPIO 5 EDGE_RISE\n" +
+        "GPIO 5 EDGE_FALL\n" +
+        "watching GPIO 2\n" +
+        "GPIO 2 EDGE_RISE\n" +
+        "GPIO 2 EDGE_FALL\n" +
+        "GPIO 2 EDGE_RISE\n" +
+        "GPIO 2 EDGE_FALL\n" +
+        "done\n"
+    assert(text == want, text)
