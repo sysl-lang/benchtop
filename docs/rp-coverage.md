@@ -1260,7 +1260,7 @@ firing, by counter or TRIGGER (its reset is the ROM's boot path, item 23); SYSCF
 I2C, PWM, ADC, DMA, PIO and the rest of USBCTRL, each with its item; a UF2 (flash, item 24); a write to
 the ROM; `--usb` on the Pico; PSM FRCE_OFF of any stage but PROC1; FC0 on GPIN.
 
-`chip/pico_tests.sysl` (20 cases) runs the three programs and checks each difference at its registers;
+`chip/pico_tests.sysl` (19 cases) runs the three programs and checks each difference at its registers;
 breaking the FIFO depth, the M0+'s timing or the WFE decode turns them red.
 
 **Cost**, host instructions retired, three interleaved runs each against the branch's base (dev at
