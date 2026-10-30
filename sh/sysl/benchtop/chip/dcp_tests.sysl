@@ -1,0 +1,835 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.v6m.{CoprocessorKind, CoprocessorOp, Stop}
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// The double-precision coprocessor (dcp.sysl): every instruction against the datasheet's outline, and
+// every canned sequence of the SDK's `hardware/dcp_canned.inc.S` — with the core's half of each (the
+// long multiplies, the Newton steps, the rounding fix-ups) written out here instruction by
+// instruction — against the host's IEEE 754 arithmetic, bit for bit, on the special values, the edges
+// of the range and pseudo-random operands.
+
+// ---- the instructions, as the core hands them over ----
+
+private mcrr(d: *Dcp, opc1: u32, crm: u32, lo: u32, hi: u32) =
+    assert(d.run(0, CoprocessorOp(CoprocessorKind.WritePair, 4, opc1, 0, 0, crm, lo, hi, false)).unwrap() == 0)
+private cdp(d: *Dcp, opc1: u32, crm: u32, opc2: u32) =
+    assert(d.run(0, CoprocessorOp(CoprocessorKind.Data, 4, opc1, opc2, 0, crm, 0, 0, false)).unwrap() == 0)
+private mrc(d: *Dcp, crm: u32, opc2: u32, peek: bool = false) -> u32 =
+    u32(d.run(0, CoprocessorOp(CoprocessorKind.Read, 4, 0, opc2, 0, crm, 0, 0, peek)).unwrap())
+// An MRRC: (Rt, Rt2).
+private mrrc(d: *Dcp, opc1: u32, crm: u32, peek: bool = false) -> (u32, u32)
+    val x = d.run(0, CoprocessorOp(CoprocessorKind.ReadPair, 4, opc1, 0, 0, crm, 0, 0, peek)).unwrap()
+    (u32.wrap(x), u32(x >> 32))
+private mrrc64(d: *Dcp, opc1: u32, crm: u32) -> u64
+    val lo, hi = mrrc(d, opc1, crm)
+    u64(lo) | (u64(hi) << 32)
+
+private lo(x: u64) -> u32 = u32.wrap(x)
+private hi(x: u64) -> u32 = u32(x >> 32)
+
+private wxup(d: *Dcp, x: u64) = mcrr(d, 1, 0, lo(x), hi(x))
+private wyup(d: *Dcp, y: u64) = mcrr(d, 1, 1, lo(y), hi(y))
+private wxyu(d: *Dcp, x: u32, y: u32) = mcrr(d, 1, 2, x, y)
+private add0(d: *Dcp) = cdp(d, 0, 1, 0)
+private add1(d: *Dcp) = cdp(d, 1, 1, 0)
+private sub1(d: *Dcp) = cdp(d, 1, 1, 1)
+private sqr0(d: *Dcp) = cdp(d, 2, 1, 0)
+private nrdf(d: *Dcp) = cdp(d, 8, 2, 1)
+private nrdd(d: *Dcp) = cdp(d, 8, 0, 1)
+private engaged(d: *Dcp) -> bool = d.units[0].status & DCP_ENGAGED != 0
+
+// ---- the core's instructions the sequences use ----
+
+private umull(a: u32, b: u32) -> (u32, u32)
+    val p = u64(a) * u64(b)
+    (u32.wrap(p), u32(p >> 32))
+// UMLAL: {hi:lo} + a × b.
+private umlal(lo: u32, hi: u32, a: u32, b: u32) -> (u32, u32)
+    val s = (u64(lo) | (u64(hi) << 32)) +% u64(a) * u64(b)
+    (u32.wrap(s), u32(s >> 32))
+private sp(a: u32) -> i64 = i64(i32.wrap(a))
+private smmulr(a: u32, b: u32) -> u32 = u32.wrap((sp(a) * sp(b) + 0x80000000) >> 32)
+private smmlar(a: u32, b: u32, acc: u32) -> u32 = u32.wrap(((sp(acc) << 32) + sp(a) * sp(b) + 0x80000000) >> 32)
+private smmlsr(a: u32, b: u32, acc: u32) -> u32 = u32.wrap(((sp(acc) << 32) - sp(a) * sp(b) + 0x80000000) >> 32)
+private asr(a: u32, n: u32) -> u32 = u32.wrap(i32.wrap(a) >> n)
+
+// ---- the canned sequences, as dcp_canned.inc.S writes them ----
+
+private dadd(d: *Dcp, x: u64, y: u64, subtract: bool) -> u64
+    wxup(d, x)
+    wyup(d, y)
+    add0(d)
+    if subtract then sub1(d) else add1(d)
+    nrdd(d)
+    mrrc64(d, if subtract then 3 else 1, 0)
+
+private dmul(d: *Dcp, x: u64, y: u64) -> u64
+    wxup(d, x)
+    wyup(d, y)
+    val ra, rb = mrrc(d, 0, 4)
+    val rc, rd = mrrc(d, 0, 5)
+    val re, rf0 = umull(ra, rc)
+    val rf1, rg1 = umlal(rf0, 0, ra, rd)
+    val rf, rg = umlal(rf1, rg1, rb, rc)
+    mcrr(d, 2, 0, re, rf)
+    val rg2, re2 = umlal(rg, 0, rb, rd)
+    mcrr(d, 3, 0, rg2, re2)
+    nrdd(d)
+    mrrc64(d, 5, 0)
+
+// The reciprocal of Y refined twice from RYMR's estimate: (r Q31, RYMR's ym).
+private refined_reciprocal(d: *Dcp) -> u32
+    var ra, rb = mrrc(d, 2, 1)
+    val _, rc0 = umull(ra, rb)
+    var rc = ~(rc0 << 2)
+    ra = smmlar(rc, ra, ra)
+    rc = smmulr(rc, rc)
+    smmlar(rc, ra, ra)
+
+private ddiv(d: *Dcp, x: u64, y: u64, fast: bool) -> u64
+    wxup(d, x)
+    wyup(d, y)
+    val r = refined_reciprocal(d)
+    val re = r - (r >> 31)
+    var rc, rd = mrrc(d, 0, 4)
+    var rb = smmulr(re, rd)
+    rc, rd = mrrc(d, 1, 5)
+    var rc2, ra = umull(rb, rc)
+    rc = rc2
+    ra = rb *% rd +% ra
+    rc, rd = mrrc(d, 4, 4)
+    ra = rc -% ra
+    rc = smmulr(ra, re)
+    rd = rb >> 4
+    val low = u64(rc) + u64(rb << 28)
+    ra = u32.wrap(low)
+    rb = rd +% asr(rc, 31) +% u32(low >> 32)
+    if !fast
+        ra = ra | (rb >> 21)
+        ra = ra & ~(rb >> 22)
+        ra = ra & ~7u32
+        rc, rd = mrrc(d, 7, 5)
+        var re2: u32 = 0
+        rd, re2 = umull(ra, rc)
+        rc, rd = mrrc(d, 7, 5)
+        re2 = ra *% rd +% re2
+        re2 = rb *% rc +% re2
+        rc, rd = mrrc(d, 0, 4)
+        re2 = re2 -% (rc << 18)
+        ra = ra | (re2 >> 29)
+        ra = ra -% 1
+    mcrr(d, 4, 0, ra, rb)
+    nrdd(d)
+    mrrc64(d, 7, 0)
+end ddiv
+
+// RXMQ's estimate refined twice: (r Q31, xm's top word).
+private refined_rsqrt(d: *Dcp) -> (u32, u32)
+    var rc, rd = mrrc(d, 4, 1)
+    var ra, rb = umull(rc, rc)
+    ra, rb = umull(rb, rd)
+    rb = (rb << 3) -% 0x80000000
+    rc = smmlsr(rc, rb, rc)
+    ra, rb = umull(rc, rc)
+    ra, rb = umull(rb, rd)
+    val carry = (ra >> 27) & 1
+    rb = (ra >> 28) +% (rb << 4) +% carry
+    ra = smmulr(rb, rc)
+    rc = rc -% asr(ra, 1)
+    (rc, rd)
+
+private dsqrt(d: *Dcp, x: u64, fast: bool) -> u64
+    wxup(d, x)
+    sqr0(d)
+    val rc, rd = refined_rsqrt(d)
+    var ra, rb = umull(rc, rd)
+    rb = rb >> 1
+    // rb² Q56: only its low word is wanted, against xm's (Q56) low word.
+    val square, _ = umull(rb, rb)
+    ra = mrrc(d, 6, 4).0
+    if fast
+        ra = smmulr(ra -% square, rc)
+        rb = rb +% asr(ra, 28)
+        mcrr(d, 5, 0, ra << 4, rb)
+    else
+        var t = smmulr(ra -% square, rc)
+        rb = rb +% asr(t, 28)
+        t = ((t << 4) & ~255u32) | 128
+        var c0 = umull(t, t).1
+        var e0 = rb *% rb
+        c0, e0 = umlal(c0, e0, rb, t)
+        c0, e0 = umlal(c0, e0, rb, t)
+        e0 = e0 -% ra
+        t = (t | (e0 >> 24)) -% 11
+        mcrr(d, 5, 0, t, rb)
+    nrdd(d)
+    mrrc64(d, 9, 0)
+end dsqrt
+
+private fadd(d: *Dcp, x: u32, y: u32, subtract: bool) -> u32
+    wxyu(d, x, y)
+    add0(d)
+    if subtract then sub1(d) else add1(d)
+    nrdf(d)
+    mrc(d, 2, if subtract then 1 else 0)
+
+private fmul(d: *Dcp, x: u32, y: u32) -> u32
+    wxyu(d, x, y)
+    val ra, rb = mrrc(d, 1, 1)
+    val pl, ph = umull(ra, rb)
+    mcrr(d, 10, 0, pl, ph)
+    nrdf(d)
+    mrc(d, 2, 2)
+
+// dcp_fxprod_m: two singles' exact product as a double.
+private fxprod(d: *Dcp, x: u32, y: u32) -> u64
+    wxyu(d, x, y)
+    val ra, rb = mrrc(d, 1, 1)
+    val pl, ph = umull(ra, rb)
+    mcrr(d, 3, 0, pl, ph)
+    nrdd(d)
+    mrrc64(d, 5, 0)
+
+private fdiv(d: *Dcp, x: u32, y: u32, fast: bool) -> u32
+    wxyu(d, x, y)
+    var ra = refined_reciprocal(d)
+    val rb, rc = mrrc(d, 1, 1)
+    if fast
+        val _, q = umull(ra, rb)
+        mcrr(d, 11, 0, q, q)
+    else
+        val _, q = umull(ra, rb)
+        ra = q | (q >> 24)
+        ra = ra & ~(ra >> 25)
+        ra = ra & ~15u32
+        val rd = (rb << 22) -% ra *% (rc >> 7)
+        ra = ra -% (rd >> 31)
+        mcrr(d, 11, 0, ra, ra)
+    nrdf(d)
+    mrc(d, 2, 3)
+
+private fsqrt(d: *Dcp, x: u32, fast: bool) -> u32
+    wxyu(d, x, x)
+    sqr0(d)
+    val rc, rd = refined_rsqrt(d)
+    var ra, rb = umull(rc, rd)
+    if !fast
+        rb = rb | 63
+        ra = rb >> 5
+        ra = ra *% ra
+        ra = (rd << 18) -% ra
+        rb = rb & ~(ra >> 26)
+    mcrr(d, 12, 0, ra, rb)
+    nrdf(d)
+    mrc(d, 2, 4)
+
+// dcp_dcmp_m and dcp_fcmp_m: RCMP's flags, as `apsr_nzcv` takes them.
+private dcmp(d: *Dcp, x: u64, y: u64) -> u32
+    wxup(d, x)
+    wyup(d, y)
+    add0(d)
+    mrc(d, 0, 1) & 0xF0000000
+
+private fcmp(d: *Dcp, x: u32, y: u32) -> u32
+    wxyu(d, x, y)
+    add0(d)
+    mrc(d, 0, 1) & 0xF0000000
+
+private float2double(d: *Dcp, x: u32) -> u64
+    wxyu(d, x, x)
+    nrdd(d)
+    mrrc64(d, 11, 0)
+
+private double2float(d: *Dcp, x: u64) -> u32
+    wxup(d, x)
+    nrdf(d)
+    mrc(d, 2, 5)
+
+// int2double, uint2double, int2float, uint2float.
+private from_int(d: *Dcp, n: u32, signed: bool, single: bool) -> u64
+    mcrr(d, if signed then 7 else 6, 0, n, n)
+    add0(d)
+    sub1(d)
+    if single
+        nrdf(d)
+        return u64(mrc(d, 2, 1))
+    nrdd(d)
+    mrrc64(d, 3, 0)
+
+// double2int and the rest: `from` WXDC (a double) or WXFC (a single), NTDC or NRDC, RDIC or RDUC.
+private to_int(d: *Dcp, x: u64, single: bool, nearest: bool, signed: bool) -> u32
+    if single then mcrr(d, 9, 2, lo(x), lo(x)) else mcrr(d, 8, 0, lo(x), hi(x))
+    add0(d)
+    add1(d)
+    cdp(d, 8, 0, if nearest then 3 else 2)
+    mrc(d, 3, if signed then 0 else 1)
+
+// ---- the host's answers, with the DCP's flushing of denormals ----
+
+private ftz(x: u64) -> f64 = f64.from_bits(if x & 0x7FF0000000000000 == 0 then x & 0x8000000000000000 else x)
+private ftz32(x: u32) -> f32 = f32.from_bits(if x & 0x7F800000 == 0 then x & 0x80000000 else x)
+private out(r: f64) -> u64
+    if r != r then return 0x7FF8000000000000
+    val b = r.bits()
+    if b & 0x7FF0000000000000 == 0 then b & 0x8000000000000000 else b
+private out32(r: f32) -> u32
+    if r != r then return 0x7FC00000
+    val b = r.bits()
+    if b & 0x7F800000 == 0 then b & 0x80000000 else b
+
+// The flags RCMP gives for x against y (bit 31, engaged, set: a sequence is under way).
+private want_cmp(x: f64, y: f64) -> u32 =
+    if x != x || y != y then 0x90000000 elif x == y then 0xE0000000 elif x > y then 0xA0000000 else 0x80000000
+
+// Truncation and rounding to a word, saturating; a NaN is 0.
+private want_int(x: f64, nearest: bool, signed: bool) -> u32
+    if x != x then return 0
+    var t = if nearest then x.round_even() else x.trunc()
+    val lo = if signed then -2147483648.0 else 0.0
+    val top = if signed then 2147483647.0 else 4294967295.0
+    if t < lo then t = lo
+    if t > top then t = top
+    if signed then u32.wrap(i64(t)) else u32(t)
+
+// ---- the operands ----
+
+// Doubles that sit on every edge: zeros, the least and greatest normals, denormals, infinities,
+// NaNs, one and its neighbours, and powers of two around the conversions' 2^31, 2^32 and 2^52.
+private val EDGES: [32]u64 = [0x0000000000000000, 0x8000000000000000, 0x0010000000000000, 0x8010000000000000,
+    0x000FFFFFFFFFFFFF, 0x0000000000000001, 0x7FEFFFFFFFFFFFFF, 0xFFEFFFFFFFFFFFFF, 0x7FF0000000000000, 0xFFF0000000000000,
+    0x7FF8000000000000, 0x7FF0000000000001, 0xFFF8000000000123, 0x3FF0000000000000, 0xBFF0000000000000, 0x3FEFFFFFFFFFFFFF,
+    0x3FF0000000000001, 0x4000000000000000, 0x3FE0000000000000, 0xBFE0000000000000, 0x3FF8000000000000, 0xC004000000000000,
+    0x41E0000000000000, 0xC1E0000000000000, 0x41DFFFFFFFC00000, 0x41EFFFFFFFE00000, 0x41F0000000000000, 0x4330000000000000,
+    0xC330000000000000, 0x0020000000000000, 0x3CB0000000000000, 0x4340000000000000]
+
+// A xorshift generator: operands with every exponent, but mostly ones near each other or near the
+// edges, where rounding, cancellation, overflow and underflow happen.
+struct Operands
+    s: u64
+
+impl Operands
+    next(*self) -> u64
+        self.s ^= self.s << 13
+        self.s ^= self.s >> 7
+        self.s ^= self.s << 17
+        self.s
+
+    double(*self) -> u64
+        val r = self.next()
+        val pick = self.next() % 8
+        if pick == 0 then return EDGES[usize(r % 32)]
+        val e: u64 =
+            if pick == 1 then r >> 53 & 0x7FF
+            elif pick == 2 then 1 + (r >> 53) % 60
+            elif pick == 3 then 2046 - (r >> 53) % 60
+            else 1023 - 40 + (r >> 53) % 80
+        val frac = if pick == 4 then r & 0xFFFFF00000000 elif pick == 5 then r & 0xFFFFFFFFFFFFF | 0xFFFFFFFFFFF00 else r & 0xFFFFFFFFFFFFF
+        (r & 0x8000000000000000) | (e << 52) | frac
+
+    single(*self) -> u32
+        val x = self.double()
+        val r = self.next()
+        val pick = r % 4
+        if pick == 0 then return u32.wrap(x >> 32)
+        val e: u64 = if pick == 1 then 1 + (r >> 50) % 30 elif pick == 2 then 254 - (r >> 50) % 30 else 127 - 20 + (r >> 50) % 40
+        u32.wrap((x >> 32 & 0x80000000) | (e << 23) | (x & 0x7FFFFF))
+end Operands
+
+private const ROUNDS: u32 = 20000
+
+private check64(what: string, x: u64, y: u64, got: u64, want: u64)
+    assert(got == want, s"$what(0x${hex(x, 16)}, 0x${hex(y, 16)}) = 0x${hex(got, 16)}, not 0x${hex(want, 16)}")
+
+private check32(what: string, x: u32, y: u32, got: u32, want: u32)
+    assert(got == want, s"$what(0x${hex(x, 8)}, 0x${hex(y, 8)}) = 0x${hex(got, 8)}, not 0x${hex(want, 8)}")
+
+// Within one unit in the last place, where the `_fast` forms promise no more.
+private near64(what: string, x: u64, y: u64, got: u64, want: u64)
+    val close = got == want || (got ^ want) >> 63 == 0 && (if got > want then got - want else want - got) <= 1
+    assert(close, s"$what(0x${hex(x, 16)}, 0x${hex(y, 16)}) = 0x${hex(got, 16)}, not within an ulp of 0x${hex(want, 16)}")
+
+private near32(what: string, x: u32, y: u32, got: u32, want: u32)
+    val close = got == want || (got ^ want) >> 31 == 0 && (if got > want then got - want else want - got) <= 1
+    assert(close, s"$what(0x${hex(x, 8)}, 0x${hex(y, 8)}) = 0x${hex(got, 8)}, not within an ulp of 0x${hex(want, 8)}")
+
+private all_operands(f: *extern(*Dcp, u64, u64) -> unit)
+    var d = dcp()
+    for x in EDGES do for y in EDGES do f(&d, x, y)
+    var g = Operands(0x9E3779B97F4A7C15)
+    for _ in 0..<ROUNDS
+        val x = g.double()
+        // Half the time the second operand is near the first, so sums cancel and quotients sit near 1.
+        val y = if g.next() & 1 == 0 then g.double() else x ^ (g.next() & 0x800FFFFFFFFFFFFF) ^ (g.next() & 0x0030000000000000)
+        f(&d, x, y)
+
+private all_singles(f: *extern(*Dcp, u32, u32) -> unit)
+    var d = dcp()
+    for x in EDGES do for y in EDGES do f(&d, u32.wrap(x >> 32), u32.wrap(y >> 32))
+    val singles = [0u32, 0x80000000, 0x00800000, 0x007FFFFF, 0x7F7FFFFF, 0x7F800000, 0xFF800000, 0x7FC00000, 0x7F800001,
+        0x3F800000, 0xBF800000, 0x3F7FFFFF, 0x3F800001, 0x4F000000, 0xCF000000, 0x4F800000, 0x4EFFFFFF, 0x00000001]
+    for x in singles do for y in singles do f(&d, x, y)
+    var g = Operands(0xD1B54A32D192ED03)
+    for _ in 0..<ROUNDS
+        val x = g.single()
+        val y = if g.next() & 1 == 0 then g.single() else x ^ u32.wrap(g.next() & 0x807FFFFF) ^ u32.wrap(g.next() & 0x01800000)
+        f(&d, x, y)
+
+// ---- the canned sequences against the host ----
+
+private add_case(d: *Dcp, x: u64, y: u64)
+    check64("dadd", x, y, dadd(d, x, y, false), out(ftz(x) + ftz(y)))
+    check64("dsub", x, y, dadd(d, x, y, true), out(ftz(x) - ftz(y)))
+    assert(!engaged(d), "RDDA and RDDS end the sequence")
+
+@test("dcp_dadd_m and dcp_dsub_m are IEEE addition and subtraction, round to nearest even, bit for bit, denormals flushed, on the edges and 20000 pseudo-random pairs")
+dcp_add_canned()
+    all_operands(&add_case)
+
+private mul_case(d: *Dcp, x: u64, y: u64) = check64("dmul", x, y, dmul(d, x, y), out(ftz(x) * ftz(y)))
+
+@test("dcp_dmul_m, the core multiplying the mantissas, is IEEE multiplication bit for bit, overflow to infinity and underflow to zero included")
+dcp_mul_canned()
+    all_operands(&mul_case)
+
+private div_case(d: *Dcp, x: u64, y: u64)
+    val want = out(ftz(x) / ftz(y))
+    check64("ddiv", x, y, ddiv(d, x, y, false), want)
+    near64("ddiv_fast", x, y, ddiv(d, x, y, true), want)
+
+@test("dcp_ddiv_m, from RYMR's reciprocal estimate, is correctly rounded IEEE division bit for bit; dcp_ddiv_fast_m is within an ulp")
+dcp_div_canned()
+    all_operands(&div_case)
+
+private sqrt_case(d: *Dcp, x: u64, y: u64)
+    val want = out(ftz(x).sqrt())
+    check64("dsqrt", x, 0, dsqrt(d, x, false), want)
+    near64("dsqrt_fast", x, 0, dsqrt(d, x, true), want)
+    if x == y then return
+    check64("dsqrt", y, 0, dsqrt(d, y & 0x7FFFFFFFFFFFFFFF, false), out(ftz(y & 0x7FFFFFFFFFFFFFFF).sqrt()))
+
+@test("dcp_dsqrt_m, from RXMQ's estimate, is correctly rounded IEEE square root bit for bit, -0 to -0 and below zero to NaN; dcp_dsqrt_fast_m is within an ulp")
+dcp_sqrt_canned()
+    all_operands(&sqrt_case)
+
+@test("dcp_dcmp_m's RCMP is Z equal, C greater or equal, V unordered, N the engaged flag, against the host's comparison")
+dcp_cmp_canned()
+    var d = dcp()
+    for x in EDGES do for y in EDGES do check32("dcmp", lo(x), lo(y), dcmp(&d, x, y), want_cmp(ftz(x), ftz(y)))
+    var g = Operands(77)
+    for _ in 0..<ROUNDS
+        val x = g.double()
+        val y = if g.next() & 3 == 0 then x elif g.next() & 1 == 0 then g.double() else x ^ (g.next() & 0x800000000000000F)
+        check32("dcmp", lo(x), lo(y), dcmp(&d, x, y), want_cmp(ftz(x), ftz(y)))
+        assert(!engaged(&d), "RCMP ends the sequence")
+
+private single_case(d: *Dcp, x: u32, y: u32)
+    val a = ftz32(x)
+    val b = ftz32(y)
+    check32("fadd", x, y, fadd(d, x, y, false), out32(a + b))
+    check32("fsub", x, y, fadd(d, x, y, true), out32(a - b))
+    check32("fmul", x, y, fmul(d, x, y), out32(a * b))
+    check64("fxprod", u64(x), u64(y), fxprod(d, x, y), out(f64(a) * f64(b)))
+    val q = out32(a / b)
+    check32("fdiv", x, y, fdiv(d, x, y, false), q)
+    near32("fdiv_fast", x, y, fdiv(d, x, y, true), q)
+    val r = out32(a.sqrt())
+    check32("fsqrt", x, 0, fsqrt(d, x, false), r)
+    near32("fsqrt_fast", x, 0, fsqrt(d, x, true), r)
+    check32("fcmp", x, y, fcmp(d, x, y), want_cmp(f64(a), f64(b)))
+    check64("float2double", u64(x), 0, float2double(d, x), out(f64(a)))
+    assert(!engaged(d))
+
+@test("the single-precision sequences — fadd, fsub, fmul, fxprod, fdiv, fsqrt, fcmp, float2double — against the host's binary32, bit for bit; the _fast forms within an ulp")
+dcp_single_canned()
+    all_singles(&single_case)
+
+private conversion_case(d: *Dcp, x: u64, y: u64)
+    check32("double2float", lo(x), hi(x), double2float(d, x), out32(f32(ftz(x))))
+    for nearest in [false, true] do for signed in [false, true]
+        check32(s"double2int nearest $nearest signed $signed", lo(x), hi(x), to_int(d, x, false, nearest, signed), want_int(ftz(x), nearest, signed))
+    val s = u32.wrap(y >> 32)
+    for nearest in [false, true] do for signed in [false, true]
+        check32(s"float2int nearest $nearest signed $signed", s, 0, to_int(d, u64(s), true, nearest, signed), want_int(f64(ftz32(s)), nearest, signed))
+    val n = u32.wrap(x)
+    check64("int2double", u64(n), 0, from_int(d, n, true, false), f64(i32.wrap(n)).bits())
+    check64("uint2double", u64(n), 0, from_int(d, n, false, false), f64(n).bits())
+    check32("int2float", n, 0, u32.wrap(from_int(d, n, true, true)), f32(i32.wrap(n)).bits())
+    check32("uint2float", n, 0, u32.wrap(from_int(d, n, false, true)), f32(n).bits())
+    assert(!engaged(d))
+
+@test("the conversions: double to float rounded, to int and uint truncated and rounded to nearest even and saturated, NaN to 0; int and uint to double exact and to float rounded")
+dcp_conversion_canned()
+    all_operands(&conversion_case)
+    var d = dcp()
+    // The integers at the edges of the words.
+    for n in [0u32, 1, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x00FFFFFF, 0x01000001, 0xFFFFFF7F]
+        check64("int2double", u64(n), 0, from_int(&d, n, true, false), f64(i32.wrap(n)).bits())
+        check32("uint2float", n, 0, u32.wrap(from_int(&d, n, false, true)), f32(n).bits())
+    // Half-way cases round to even: 2.5 to 2, 3.5 to 4, -2.5 to -2; truncation is towards zero.
+    assert(to_int(&d, 0x4004000000000000, false, true, true) == 2 && to_int(&d, 0x400C000000000000, false, true, true) == 4)
+    assert(to_int(&d, 0xC004000000000000, false, true, true) == u32.wrap(-2i32) && to_int(&d, 0xC004000000000000, false, false, true) == u32.wrap(-2i32))
+    assert(to_int(&d, 0xBFE0000000000000, false, false, true) == 0 && to_int(&d, 0xBFF8000000000000, false, false, true) == u32.wrap(-1i32))
+    // Saturation at both ends of both words, and a NaN and the infinities.
+    assert(to_int(&d, 0x41E0000000000000, false, false, true) == 0x7FFFFFFF && to_int(&d, 0xC1E0000000200000, false, false, true) == 0x80000000)
+    assert(to_int(&d, 0x41F0000000000000, false, false, false) == 0xFFFFFFFF && to_int(&d, 0xBFF0000000000000, false, false, false) == 0)
+    assert(to_int(&d, 0x7FF0000000000000, false, true, true) == 0x7FFFFFFF && to_int(&d, 0xFFF0000000000000, false, false, true) == 0x80000000)
+    assert(to_int(&d, 0x7FF8000000000000, false, false, true) == 0 && to_int(&d, 0x7FF8000000000000, false, true, false) == 0)
+
+// ---- each instruction against the datasheet's outline ----
+
+private refd(d: *Dcp) -> (u32, u32) = mrrc(d, 0, 10)
+private rxmd(d: *Dcp) -> u64 = mrrc64(d, 0, 8)
+private rymd(d: *Dcp, peek: bool) -> u64
+    val l, h = mrrc(d, 0, 9, peek)
+    u64(l) | (u64(h) << 32)
+
+@test("WXUP, WYUP and WXYU unpack: 01 and the fraction at the top of the mantissa, the biased exponent, the flags; REFD lays xe, the status and xf out low and ye and yf high")
+dcp_unpack()
+    var d = dcp()
+    wxup(&d, 0x3FF8000000000000)
+    assert(rxmd(&d) == 0x6000000000000000)
+    val l, h = refd(&d)
+    assert(l == 1023 | (DCP_ENGAGED << 14) && h == 0, s"0x${hex(l, 8)}")
+    // -inf, a denormal (a zero), a NaN with its payload in the mantissa.
+    wxup(&d, 0xFFF0000000000000)
+    assert(refd(&d).0 == 0x7FF | (DCP_ENGAGED << 14) | 0xA0000000)
+    wyup(&d, 0x800FFFFFFFFFFFFF)
+    assert(refd(&d).1 == 0xC0000000 && rymd(&d, true) == 0x7FFFFFFFFFFFFC00)
+    wxup(&d, 0x7FF0000000000123)
+    assert(refd(&d).0 >> 28 == 1 && rxmd(&d) == 0x4000000000048C00)
+    // Two singles: 1.5f into X, -2f into Y, rebiased to a double's exponent; a single denormal is a zero.
+    wxyu(&d, 0x3FC00000, 0xC0000000)
+    assert(rxmd(&d) == 0x6000000000000000 && rymd(&d, true) == 0x4000000000000000)
+    val l2, h2 = refd(&d)
+    assert(l2 & 0x3FFF == 1023 && h2 == 1024 | 0x80000000, s"0x${hex(h2, 8)}")
+    wxyu(&d, 0x00000001, 0x7F800000)
+    assert(refd(&d).0 >> 28 == 4 && refd(&d).1 >> 28 == 2)
+
+@test("RXVD reads xf at bits 28-31 (N sign, Z zero, C infinity, V NaN) over version 0, and ends the sequence; PXVD leaves the engaged flag")
+dcp_classify()
+    var d = dcp()
+    val cases: [8](u64, u32) = [(0x0000000000000000, 0x4), (0x8000000000000000, 0xC), (0x000FFFFFFFFFFFFF, 0x4), (0x3FF0000000000000, 0),
+        (0xBFF0000000000000, 0x8), (0x7FF0000000000000, 0x2), (0xFFF0000000000000, 0xA), (0xFFF8000000000000, 0x9)]
+    for (x, f) in cases
+        wxup(&d, x)
+        assert(mrc(&d, 0, 0, true) == f << 28 && engaged(&d), s"0x${hex(x, 16)}")
+        assert(mrc(&d, 0, 0) == f << 28 && !engaged(&d))
+
+@test("the engaged flag: set by every write, operation and middle read; cleared by the reads that end a sequence and by RYMD; the P forms, RXMD and REFD leave it")
+dcp_engaged()
+    var d = dcp()
+    assert(!engaged(&d))
+    // A peek of a middle read, RXMD and REFD leave it clear, and PCMP reads N clear.
+    mrrc(&d, 0, 4, true)
+    rxmd(&d)
+    refd(&d)
+    assert(!engaged(&d) && mrc(&d, 0, 1, true) >> 31 == 0)
+    mrrc(&d, 3, 4)
+    assert(engaged(&d), "RXMS engages")
+    // PCMP reads N set and leaves it; RCMP reads N set and clears it; the next RCMP reads N clear.
+    assert(mrc(&d, 0, 1, true) >> 31 == 1 && engaged(&d))
+    assert(mrc(&d, 0, 1) >> 31 == 1 && !engaged(&d))
+    assert(mrc(&d, 0, 1) >> 31 == 0)
+    for setter in [0u32, 1, 2, 3]
+        d = dcp()
+        if setter == 0 then wxup(&d, 0) elif setter == 1 then add0(&d) elif setter == 2 then nrdd(&d) else mrrc(&d, 2, 1)
+        assert(engaged(&d), s"setter $setter")
+    // The reads that end a sequence, each in both forms.
+    val ends: [16](u32, u32, bool) = [(0, 0, false), (2, 0, false), (2, 1, false), (2, 2, false), (2, 3, false), (2, 4, false), (2, 5, false),
+        (3, 0, false), (3, 1, false), (1, 0, true), (3, 0, true), (5, 0, true), (7, 0, true), (9, 0, true), (11, 0, true), (0, 9, true)]
+    for (a, b, pair) in ends
+        for peek in [true, false]
+            wxup(&d, 0x3FF0000000000000)
+            if pair then mrrc(&d, a, b, peek) else mrc(&d, a, b, peek)
+            assert(engaged(&d) == peek, s"read $a $b pair $pair peek $peek")
+    // RXMD and REFD leave it set too.
+    wxup(&d, 0)
+    rxmd(&d)
+    refd(&d)
+    assert(engaged(&d))
+    // INIT zeroes every register, the engaged flag with them.
+    cdp(&d, 0, 0, 0)
+    assert(rxmd(&d) == 0 && refd(&d) == (0u32, 0u32) && rymd(&d, true) == 0 && !engaged(&d))
+
+@test("the state saved with PXMD, PYMD and REFD and restored with WXMD, WYMD and WEFD mid-sequence round-trips, so an interrupting operation leaves the interrupted one's result intact")
+dcp_save_restore()
+    var d = dcp()
+    wxup(&d, 0x400921FB54442D18)
+    wyup(&d, 0xC005BF0A8B145769)
+    add0(&d)
+    // The interrupt: save, run a whole multiplication, restore.
+    val xm = rxmd(&d)
+    val ym = rymd(&d, true)
+    val l, h = refd(&d)
+    assert(dmul(&d, 0x4000000000000000, 0x4008000000000000) == 0x4018000000000000 && !engaged(&d))
+    mcrr(&d, 0, 0, lo(xm), hi(xm))
+    mcrr(&d, 0, 1, lo(ym), hi(ym))
+    mcrr(&d, 0, 2, l, h)
+    assert(engaged(&d) && refd(&d) == (l, h))
+    add1(&d)
+    nrdd(&d)
+    assert(mrrc64(&d, 1, 0) == (f64.from_bits(0x400921FB54442D18) + f64.from_bits(0xC005BF0A8B145769)).bits())
+    // RYMD, the R form, ends a sequence.
+    wxup(&d, 0)
+    rymd(&d, false)
+    assert(!engaged(&d))
+    // Exponents are 14 bits: the most negative and most positive round-trip, and WEFD ignores bits 23-27.
+    mcrr(&d, 0, 2, 0x2000 | 0x0F800000 | 0x5 << 28, 0x1FFF | 0x0F800000)
+    assert(refd(&d) == (0x2000u32 | 0x5 << 28, 0x1FFFu32) && !engaged(&d))
+
+@test("NORM moves the leading 1 to bit 62 and the exponent with it, in 14 bits; SQR0 halves the unbiased exponent, doubling the mantissa where it is odd")
+dcp_norm_sqr0()
+    var d = dcp()
+    mcrr(&d, 0, 0, 3, 0)
+    mcrr(&d, 0, 2, 0, 0)
+    cdp(&d, 8, 2, 0)
+    assert(rxmd(&d) == 0x6000000000000000 && refd(&d).0 & 0x3FFF == u32(0x4000 - 61))
+    // A carry into bit 63 shifts right once, keeping the lost bit as a sticky bit.
+    mcrr(&d, 0, 0, 3, 0x80000000)
+    cdp(&d, 8, 2, 0)
+    assert(rxmd(&d) == 0x4000000000000001 && refd(&d).0 & 0x3FFF == u32(0x4000 - 60))
+    // Zero stays zero.
+    mcrr(&d, 0, 0, 0, 0)
+    cdp(&d, 8, 2, 0)
+    assert(rxmd(&d) == 0)
+    // 4.0, 2.0, 0.5 and 0.25: even, odd, odd and even unbiased exponents.
+    val cases: [4](u64, u64, u32) = [(0x4010000000000000, 0x4000000000000000, 1024), (0x4000000000000000, 0x8000000000000000, 1023),
+        (0x3FE0000000000000, 0x8000000000000000, 1022), (0x3FD0000000000000, 0x4000000000000000, 1022)]
+    for (x, m, e) in cases
+        wxup(&d, x)
+        sqr0(&d)
+        assert(rxmd(&d) == m && refd(&d).0 & 0x3FFF == e, s"SQR0 of 0x${hex(x, 16)}")
+
+@test("RXMS and RYMS read the mantissa shifted right by opc1, 0 to 15; RXYH both top words; RYMR ym Q31 and RXMQ xm's top word over their estimates")
+dcp_middle_reads()
+    var d = dcp()
+    wxup(&d, 0x3FF123456789ABCD)
+    wyup(&d, 0xBFFFEDCBA9876543)
+    val xm = rxmd(&d)
+    val ym = rymd(&d, true)
+    for s in 0u32..15
+        assert(mrrc64(&d, s, 4) == xm >> s && mrrc64(&d, s, 5) == ym >> s, s"shift $s")
+    assert(mrrc64(&d, 1, 1) == (xm >> 32) | (ym & 0xFFFFFFFF00000000))
+    val r, yq = mrrc(&d, 2, 1)
+    assert(yq == u32.wrap(ym >> 31) && r == recip_estimate(ym))
+    val q, xh = mrrc(&d, 4, 1)
+    assert(xh == u32(xm >> 32) && q == rsqrt_estimate(xm))
+
+@test("the estimates: RYMR's reciprocal and RXMQ's reciprocal square root are below 1 (Q31) and within 2^-8 of the true value across every interval of the table")
+dcp_estimates()
+    for i in 0u64..<1024
+        // y across [1, 2): the bottom, middle and top of each of the 256 intervals, four points each.
+        val ym = (1u64 << 62) | (i << 52)
+        val y = f64(ym) / 4611686018427387904.0
+        val r = recip_estimate(ym)
+        assert(r < 0x80000000 && (f64(r) / 2147483648.0 * y - 1.0).abs() < 1.0 / 256.0, s"recip at $y")
+    for i in 0u64..<1536
+        // x across [1, 4) after SQR0.
+        val xm = (1u64 << 62) + i * (1u64 << 53)
+        val x = f64(xm) / 4611686018427387904.0
+        val r = rsqrt_estimate(xm)
+        assert(r < 0x80000000 && (f64(r) / 2147483648.0 * x.sqrt() - 1.0).abs() < 1.0 / 256.0, s"rsqrt at $x")
+
+@test("WXMS keeps one sticky bit of the low product; WXMO ORs it in, adds the exponents and XORs the signs; WXDD, WXFM, WXFD, WXDQ and WXFQ write xm direct with their exponents")
+dcp_result_writes()
+    var d = dcp()
+    mcrr(&d, 2, 0, 0, 0)
+    assert(rxmd(&d) == 0)
+    mcrr(&d, 2, 0, 0, 0x80000000)
+    assert(rxmd(&d) == 1)
+    wxup(&d, 0xC000000000000000)
+    wyup(&d, 0x3FF0000000000000)
+    mcrr(&d, 2, 0, 1, 0)
+    mcrr(&d, 3, 0, 0, 0x10000000)
+    // -2 × 1: 2^60 Q60 is 1, with sticky bit 0 set, at exponent 1 + 0 (unbiased).
+    assert(rxmd(&d) == 0x1000000000000001)
+    val l, _ = refd(&d)
+    assert(l & 0x3FFF == 1023 + 1 + 2 && l >> 28 == 8, s"0x${hex(l, 8)}")
+    nrdd(&d)
+    assert(mrrc64(&d, 5, 0) == 0xC000000000000000)
+    // The quotient and root writes, each read back exact: 6 / -3, √4.
+    wxup(&d, 0x4018000000000000)
+    wyup(&d, 0xC008000000000000)
+    mcrr(&d, 4, 0, 0, 1 << 25)
+    nrdd(&d)
+    assert(mrrc64(&d, 7, 0) == 0xC000000000000000)
+    wxup(&d, 0x4010000000000000)
+    sqr0(&d)
+    mcrr(&d, 5, 0, 0, 1 << 28)
+    nrdd(&d)
+    assert(mrrc64(&d, 9, 0) == 0x4000000000000000)
+    wxyu(&d, 0x40C00000, 0xC0400000)
+    mcrr(&d, 11, 0, 0x20000000, 0x20000000)
+    nrdf(&d)
+    assert(mrc(&d, 2, 3) == 0xC0000000)
+    wxyu(&d, 0x40C00000, 0xC0400000)
+    mcrr(&d, 10, 0, 0, 0x24000000)
+    nrdf(&d)
+    assert(mrc(&d, 2, 2) == 0xC1900000)
+    wxyu(&d, 0x40800000, 0)
+    sqr0(&d)
+    mcrr(&d, 12, 0, 0, 0x20000000)
+    nrdf(&d)
+    assert(mrc(&d, 2, 4) == 0x40000000)
+
+@test("the special values: NaNs of any payload are the default NaN; inf-inf, 0*inf, 0/0, inf/inf and the root of a negative are NaN; signed zeros follow IEEE; overflow is infinity")
+dcp_special_values()
+    var d = dcp()
+    val nan: u64 = 0x7FF8000000000000
+    assert(dadd(&d, 0xFFF0000000000001, 0x3FF0000000000000, false) == nan && dmul(&d, 0xFFF8000000000123, 0) == nan)
+    assert(dadd(&d, 0x7FF0000000000000, 0xFFF0000000000000, false) == nan && dadd(&d, 0x7FF0000000000000, 0x7FF0000000000000, true) == nan)
+    assert(dadd(&d, 0x7FF0000000000000, 0x7FF0000000000000, false) == 0x7FF0000000000000)
+    assert(dmul(&d, 0, 0xFFF0000000000000) == nan && ddiv(&d, 0, 0x8000000000000000, false) == nan)
+    assert(ddiv(&d, 0x7FF0000000000000, 0xFFF0000000000000, false) == nan && dsqrt(&d, 0xBFF0000000000000, false) == nan)
+    assert(dsqrt(&d, 0xFFF0000000000000, false) == nan && dsqrt(&d, 0x7FF0000000000000, false) == 0x7FF0000000000000)
+    // Zeros: x - x is +0, -0 + -0 is -0, -0 - +0 is -0, √-0 is -0, a denormal is a zero of its sign.
+    assert(dadd(&d, 0x3FF0000000000000, 0x3FF0000000000000, true) == 0 && dadd(&d, 0xBFF0000000000000, 0xBFF0000000000000, true) == 0)
+    assert(dadd(&d, 0x8000000000000000, 0x8000000000000000, false) == 0x8000000000000000 && dadd(&d, 0x8000000000000000, 0, true) == 0x8000000000000000)
+    assert(dadd(&d, 0x8000000000000000, 0, false) == 0 && dsqrt(&d, 0x8000000000000000, false) == 0x8000000000000000)
+    assert(dsqrt(&d, 0x800FFFFFFFFFFFFF, false) == 0x8000000000000000 && dmul(&d, 0x800FFFFFFFFFFFFF, 0x3FF0000000000000) == 0x8000000000000000)
+    // x / 0 is a signed infinity, x / inf a signed zero.
+    assert(ddiv(&d, 0xBFF0000000000000, 0, false) == 0xFFF0000000000000 && ddiv(&d, 0x3FF0000000000000, 0xFFF0000000000000, false) == 0x8000000000000000)
+    // Overflow to infinity; underflow to a signed zero; the product (1 - 2^-53) * 2^-1022 rounds, as IEEE
+    // rounds it, up into the normal range rather than being flushed.
+    assert(dmul(&d, 0x7FEFFFFFFFFFFFFF, 0x4000000000000000) == 0x7FF0000000000000 && dadd(&d, 0x7FEFFFFFFFFFFFFF, 0x7FEFFFFFFFFFFFFF, false) == 0x7FF0000000000000)
+    assert(dmul(&d, 0x8010000000000000, 0x3FE0000000000000) == 0x8000000000000000)
+    assert(dmul(&d, 0x3FEFFFFFFFFFFFFF, 0x0010000000000000) == 0x0010000000000000)
+    assert(dadd(&d, 0x0010000000000001, 0x8010000000000000, false) == 0)
+    // The single-precision default NaN.
+    assert(fadd(&d, 0x7F800001, 0, false) == 0x7FC00000 && fdiv(&d, 0, 0, false) == 0x7FC00000 && fsqrt(&d, 0xBF800000, false) == 0x7FC00000)
+
+@test("each instance is its own: core 0's and core 1's CP4 and CP5 hold four separate states")
+dcp_instances()
+    var d = dcp()
+    for k in 0u32..<4
+        val op = CoprocessorOp(CoprocessorKind.WritePair, 4 + (k & 1), 0, 0, 0, 0, k + 1, 0, false)
+        assert(d.run(k >> 1, op).unwrap() == 0)
+    for k in 0u32..<4
+        val op = CoprocessorOp(CoprocessorKind.ReadPair, 4 + (k & 1), 0, 0, 0, 8, 0, 0, false)
+        assert(d.run(k >> 1, op).unwrap() == u64(k + 1) && d.units[usize(k)].xm == u64(k + 1), s"instance $k")
+
+@test("an encoding outside the DCP's instruction set is refused by name: MCR, the …2 writes and operations, CRd or CRn not c0, an opcode or register it lacks, on CP4 and on CP5")
+dcp_refusals()
+    var d = dcp()
+    val outside = [CoprocessorOp(CoprocessorKind.Write, 4, 0, 0, 0, 0, 0, 0, false),
+        CoprocessorOp(CoprocessorKind.WritePair, 4, 1, 0, 0, 0, 0, 0, true),
+        CoprocessorOp(CoprocessorKind.Data, 4, 0, 0, 0, 1, 0, 0, true),
+        CoprocessorOp(CoprocessorKind.Data, 4, 0, 0, 0, 1, 1, 0, false),
+        CoprocessorOp(CoprocessorKind.Data, 4, 0, 0, 1, 1, 0, 0, false),
+        CoprocessorOp(CoprocessorKind.Data, 4, 3, 0, 0, 1, 0, 0, false),
+        CoprocessorOp(CoprocessorKind.WritePair, 4, 9, 0, 0, 0, 0, 0, false),
+        CoprocessorOp(CoprocessorKind.WritePair, 4, 13, 0, 0, 0, 0, 0, false),
+        CoprocessorOp(CoprocessorKind.Read, 4, 1, 0, 0, 0, 0, 0, false),
+        CoprocessorOp(CoprocessorKind.Read, 4, 0, 0, 1, 0, 0, 0, false),
+        CoprocessorOp(CoprocessorKind.Read, 4, 0, 6, 0, 2, 0, 0, false),
+        CoprocessorOp(CoprocessorKind.ReadPair, 4, 0, 0, 0, 2, 0, 0, false),
+        CoprocessorOp(CoprocessorKind.ReadPair, 4, 2, 0, 0, 0, 0, 0, false)]
+    for op in outside
+        val e = d.run(0, op).unwrap_err()
+        assert(!e.fault && e.why.ends_with("is not a double-precision (DCP) coprocessor instruction benchtop runs"), e.why)
+    val cp5 = d.run(1, CoprocessorOp(CoprocessorKind.Write, 5, 0, 0, 0, 0, 0, 0, false)).unwrap_err()
+    assert(cp5.why == "MCR p5, #0, c0, c0, #0 is not a Non-secure double-precision (DCP) coprocessor instruction benchtop runs", cp5.why)
+    // A refusal changes nothing.
+    for u in d.units do assert(u.xm == 0 && u.ym == 0 && u.xe == 0 && u.ye == 0 && u.xf == 0 && u.yf == 0 && u.status == 0)
+
+// ---- the SDK program, examples/pico2/dcp.c ----
+
+private val ARM_DCP = embed("../../../../examples/pico2/dcp.elf")
+
+// dcp.c's second operands: half the time a fresh one, half the time one near the first.
+private near(g: *Operands, x: u64) -> u64
+    if g.next() & 1 == 0 then return g.double()
+    val a = g.next()
+    val c = g.next()
+    x ^ (a & 0x800FFFFFFFFFFFFF) ^ (c & 0x0030000000000000)
+
+private near_single(g: *Operands, x: u32) -> u32
+    if g.next() & 1 == 0 then return g.single()
+    val a = g.next()
+    val c = g.next()
+    x ^ u32.wrap(a & 0x807FFFFF) ^ u32.wrap(c & 0x01800000)
+
+private mix(h: u64, x: u64) -> u64 = (h ^ x) *% 0x100000001B3
+private const FNV: u64 = 0xCBF29CE484222325
+private const PROGRAM_ROUNDS: u32 = 3000
+
+// RXVD's word for x: its flags at bits 28-31.
+private classify(x: u64) -> u64
+    val e = (x >> 52) & 0x7FF
+    val kind: u64 = if e == 0 then 4 elif e == 0x7FF then (if x & 0xFFFFFFFFFFFFF == 0 then 2 else 1) else 0
+    ((x >> 63) << 3 | kind) << 28
+
+// pico_double's fma (double_fma_dcp.S): with every operand finite and non-zero, the fused result;
+// otherwise its "mla path", the DCP's product (rounded, a result below the normal range flushed to a
+// signed zero) and then the DCP's sum, so that, for one, -tiny × tiny + 0 is +0 where the fused -0 is.
+private fma(x: f64, y: f64, z: f64) -> u64
+    val ordinary = (a: f64) -> a == a && a != 0.0 && a.abs() != f64.from_bits(0x7FF0000000000000)
+    if ordinary(x) && ordinary(y) && ordinary(z) then return out(x.mul_add(y, z))
+    out(f64.from_bits(out(x * y)) + z)
+
+// C's six comparisons and isunordered, one bit each, as dcp.c packs them.
+private compare(x: f64, y: f64) -> u64
+    val bit = (b: bool, k: u32) -> if b then 1u64 << k else 0
+    val un = x != x || y != y
+    bit(x < y, 0) | bit(x <= y, 1) | bit(x == y, 2) | bit(x != y, 3) | bit(x >= y, 4) | bit(x > y, 5) | bit(un, 6)
+
+// What dcp.c prints for its hashes: each operation over the same operands, with the host's arithmetic
+// (denormals flushed), or for the `_fast` forms with this file's canned sequences on the model.
+private program_hashes() -> string
+    val names = ["dadd", "dsub", "dmul", "ddiv", "dsqrt", "dsqrt_fast", "ddiv_fast", "dfma", "dcmp_c", "dcmp_raw", "dclassify",
+        "d2iz", "d2uiz", "i2d", "ui2d", "d2f", "d2i_r", "d2ui_r", "fadd", "fsub", "fmul", "fdiv", "fdiv_fast", "fsqrt", "fsqrt_fast",
+        "fcmp", "fxprod", "f2d", "i2f", "ui2f", "f2i", "f2ui", "f2i_r", "f2ui_r"]
+    var h = [FNV; 34]
+    var d = dcp()
+    var g = Operands(0x9E3779B97F4A7C15)
+    for _ in 0..<PROGRAM_ROUNDS
+        val x = g.double()
+        val y = near(&g, x)
+        val z = g.double()
+        val fx = g.single()
+        val fy = near_single(&g, fx)
+        val n = u32.wrap(g.next())
+        val dx = ftz(x)
+        val dy = ftz(y)
+        val sx = ftz32(fx)
+        val sy = ftz32(fy)
+        val r: [34]u64 = [out(dx + dy), out(dx - dy), out(dx * dy), out(dx / dy), out(dx.sqrt()), dsqrt(&d, y & 0x7FFFFFFFFFFFFFFF, true),
+            ddiv(&d, x, y, true), fma(dx, dy, ftz(z)), compare(dx, dy), u64(want_cmp(dx, dy) >> 28), classify(x),
+            u64(want_int(dx, false, true)), u64(want_int(dx, false, false)), f64(i32.wrap(n)).bits(), f64(n).bits(), u64(out32(f32(dx))),
+            u64(want_int(dx, true, true)), u64(want_int(dx, true, false)), u64(out32(sx + sy)), u64(out32(sx - sy)), u64(out32(sx * sy)),
+            u64(out32(sx / sy)), u64(fdiv(&d, fx, fy, true)), u64(out32(sx.sqrt())), u64(fsqrt(&d, fx, true)), u64(want_cmp(f64(sx), f64(sy)) >> 28),
+            out(f64(sx) * f64(sy)), out(f64(sx)), u64(f32(i32.wrap(n)).bits()), u64(f32(n).bits()), u64(want_int(f64(sx), false, true)),
+            u64(want_int(f64(sx), false, false)), u64(want_int(f64(sx), true, true)), u64(want_int(f64(sx), true, false))]
+        for k in 0..<34 do h[k] = mix(h[k], r[k])
+    var text = ""
+    for k in 0..<34 do text = text + s"${names[k]} ${hex(h[k], 16)}\r\n"
+    var core1 = FNV
+    var c = Operands(0x0123456789ABCDEF)
+    for _ in 0..<PROGRAM_ROUNDS
+        val x = c.double()
+        val y = near(&c, x)
+        core1 = mix(mix(mix(core1, out(ftz(x) + ftz(y))), out(ftz(x) * ftz(y))), out(ftz(x) / ftz(y)))
+    text + s"core1 ${hex(core1, 16)}\r\n"
+end program_hashes
+
+@test("the SDK's own DCP code on a Pico 2: pico_double's arithmetic, sqrt, fma, comparisons and casts, and every canned sequence, hash for hash with the host over 3000 operand sets; core 1 alongside; interrupts inside sequences saved and restored; printf's %f, %e and %g")
+dcp_program()
+    val b = arm_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(ARM_DCP).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 5000 * 150000 do end = b.run(150000)
+    val text = from_utf8_lossy(b.console.view())
+    val c0 = &b.cores[0]
+    val c1 = &b.cores[1]
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused} ${b.why}; core 0 ${c0.stop} at 0x${hex(c0.stop_at, 8)}, core 1 ${c1.stop} at 0x${hex(c1.stop_at, 8)} pc 0x${hex(c1.pc, 8)} lr 0x${hex(c1.r[14], 8)} sp 0x${hex(c1.r[13], 8)} cpacr 0x${hex(c1.cpacr, 8)} vtor 0x${hex(c1.vtor, 8)} ipsr ${c1.ipsr} retired ${c1.retired}: $text")
+    val want = program_hashes() + "interrupts many, some inside a sequence, 0 wrong\r\n" +
+        "3.141593 -0.100000 123456789.125000\r\n" +
+        "0.33333333333333331 1.4142135623730951\r\n" +
+        "1.000000e+300 2.225074e-308 1e-05\r\n" +
+        "2.001 2 4 1000000000000000.250000\r\n"
+    assert(text == want, s"the program printed\n$text\nnot\n$want")
+    // Core 1's entry returned into the boot ROM, which waits there as the chip's does.
+    assert(c1.stop == Stop.Running && c1.pc >= ROM_PARK && c1.pc < ROM_PARK + 4, s"core 1 at 0x${hex(c1.pc, 8)}")
