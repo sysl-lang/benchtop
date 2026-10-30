@@ -1,0 +1,1094 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, triggered, w1c, written}
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.rp2350.pio0 as reg
+import sysl.fmt.hex
+import sysl.math.min
+
+// PIO0, PIO1 and PIO2: the RP2350's programmable I/O blocks, four state machines each (datasheet,
+// "PIO"; the field descriptions of the SDK's `hardware/regs/pio.h`; the encodings of
+// `hardware/pio_instructions.h` and the SDK's `pioasm`).
+//
+// **Time is clk_sys cycles**, the chip's `now`. Each state machine runs one instruction cycle on each
+// cycle its fractional divider fires: the divider adds 256 each clk_sys cycle to a phase that fires and
+// wraps at 256 × INT + FRAC (INT 0 is 65536), so INT.FRAC = 1.0 runs every cycle and 2.5 runs 2, 3, 2, 3
+// cycles apart. CLKDIV_RESTART puts the phase at 0, and the first cycle after it then fires once the
+// divisor's cycles have passed. The dividers run whether or not their state machines do; their phase is
+// worked out from the time when it is needed, so a block whose state machines are all off costs nothing.
+//
+// **Only what changes is run.** A state machine is visited on the cycle it next does something: the end
+// of a delay, the next attempt at an instruction, an autopull refill. One stalled on a condition only
+// something else can change (an empty TX FIFO, a full RX FIFO, a pin, an IRQ flag) is not visited
+// again until that something happens: a FIFO access by the system, a register write, a level driven
+// onto the inputs, an IRQ flag changing. Then it tries again on its next cycle, as it would have.
+//
+// **The pins are a vector**, not GPIOs through the mux (item 14 connects them): each block drives a
+// 32-bit level and direction in its own numbering, which GPIOBASE (0 or 16) places on GPIO 0–31 or
+// 16–47 (`pad_out`, `pad_oe`, DBG_PADOUT and DBG_PADOE), and reads the levels `drive` gives it for
+// GPIO 0–47, through a two-cycle input synchroniser per pin that INPUT_SYNC_BYPASS removes. Within a
+// block a higher-numbered state machine's write to a pin wins on the cycle it is made, a side-set wins
+// over its own state machine's OUT, SET or MOV, and the block holds each pin as last written.
+//
+// Modelled: the whole instruction set of PIO version 1 (JMP with every condition, WAIT on GPIO, PIN,
+// IRQ and JMPPIN, IN, OUT, PUSH and PULL with IfFull, IfEmpty and Block, MOV with every source,
+// destination and operation including PINDIRS and the RX FIFO's entries, IRQ set, wait and clear with
+// PREV, REL and NEXT, SET), delay and side-set (optional, and to pin directions), the FIFOs joined
+// either way or given over to the RX entries (FJOIN_RX_GET and FJOIN_RX_PUT), the shift registers with
+// their autopush and autopull thresholds, wrap, STATUS_SEL, OUT_STICKY, INLINE_OUT_EN, SM_RESTART,
+// CLKDIV_RESTART and their PREV/NEXT forms, SMx_INSTR, the eight IRQ flags, INTR and the two interrupt
+// lines of each block (`irq_line`; item 14 takes them to the NVIC), FDEBUG, FLEVEL and FSTAT. Blocks
+// that ACCESSCTRL makes one Non-secure and the other not are disconnected from each other's PREV and
+// NEXT, as the datasheet says (status 0, controls ignored). Refused by name (`PioFault.Refused`, or
+// `take_fault` while running): every reserved encoding and setting, an empty TX FIFO's write path
+// read, and the RX entries reached in a mode that does not give them to the reader. The DMA requests are
+// item 14's.
+//
+// **Assumptions**, where the datasheet does not say: SM_RESTART leaves the output shift register empty
+// (count 32) and the input one empty (count 0); an OUT that finds the OSR empty under autopull stalls
+// that cycle while the refill happens at its end, and runs the next; under autopull a PULL is a no-op
+// only while the OSR is full (count 0); a non-blocking PUSH to a full FIFO still clears the ISR; MOV OSR,
+// RXFIFO[] leaves the OSR full; a system-written instruction runs on the state machine's next divider
+// cycle, after any delay in progress, whether or not it is enabled; INLINE_OUT_EN gates OUT and MOV to
+// PINS and PINDIRS; an IRQ flag set and cleared on one cycle ends set, and flags change at the end of the
+// cycle, so a state machine sees another's IRQ on its next cycle; the RX FIFO given over to its entries
+// reads as both empty and full; changing any of the four join bits flushes both FIFOs.
+
+/** The RP2350's PIO blocks, and the state machines in each. */
+const PIO_BLOCKS: u32 = 3
+const PIO_SMS: u32 = 4
+
+/** What the PIO answers to an access it does not take: the shared access rules, or a reason. */
+enum PioFault
+    Access(e: AccessError)
+    Refused(why: string)
+
+// Each state machine's six registers repeat every 0x18 bytes from SM0_CLKDIV; the RX entries every 0x10.
+private const SM_STRIDE: u32 = reg.SM1_CLKDIV_OFFSET - reg.SM0_CLKDIV_OFFSET
+private const PUTGET_STRIDE: u32 = reg.RXF1_PUTGET0_OFFSET - reg.RXF0_PUTGET0_OFFSET
+// DBG_CFGINFO: version 1, 32 instructions, 4 state machines, FIFOs 4 deep.
+private const CFGINFO: u32 = (reg.DBG_CFGINFO_VERSION_V1 << reg.DBG_CFGINFO_VERSION_SHIFT) | (32 << reg.DBG_CFGINFO_IMEM_SIZE_SHIFT) | (4 << reg.DBG_CFGINFO_SM_COUNT_SHIFT) | 4
+// The join bits, any change of which flushes the FIFOs.
+private const JOINS: u32 = reg.SM0_SHIFTCTRL_FJOIN_RX_MASK | reg.SM0_SHIFTCTRL_FJOIN_TX_MASK | reg.SM0_SHIFTCTRL_FJOIN_RX_PUT_MASK | reg.SM0_SHIFTCTRL_FJOIN_RX_GET_MASK
+private const SHIFTCTRL_BITS: u32 = 0xffffc01f
+private const PUT_GET: u32 = reg.SM0_SHIFTCTRL_FJOIN_RX_PUT_MASK | reg.SM0_SHIFTCTRL_FJOIN_RX_GET_MASK
+
+// The low `n` bits, n up to 32.
+private low(n: u32) -> u32 = if n >= 32 then 0xffffffff else (1u32 << n) - 1
+// A 5-bit count field, where 0 means 32.
+private count32(field: u32) -> u32 = if field == 0 then 32 else field
+
+/** One FIFO's storage: up to eight words, first in first out. */
+struct PioFifo
+    entries: [8]u32
+    first: u32
+    count: u32
+
+    push(*self, x: u32)
+        self.entries[(self.first + self.count) % 8] = x
+        self.count += 1
+
+    pop(*self) -> u32
+        val x = self.entries[self.first]
+        self.first = (self.first + 1) % 8
+        self.count -= 1
+        x
+
+    flush(*self)
+        self.first = 0
+        self.count = 0
+
+/** A pin write: levels or directions, the bits it sets, and which pins it touches. */
+struct PinWrite
+    value: u32
+    mask: u32
+    dirs: bool
+
+/** One state machine: its registers, its datapath, and where it stands in time. */
+struct PioSm
+    clkdiv: u32
+    execctrl: u32
+    shiftctrl: u32
+    pinctrl: u32
+    pc: u32
+    x: u32
+    y: u32
+    isr: u32
+    osr: u32
+    isr_count: u32
+    osr_count: u32
+    tx: PioFifo
+    rx: PioFifo
+    // An instruction to run in place of the one at the PC: written to SMx_INSTR (`exec_system`), or by
+    // OUT EXEC and MOV EXEC. `exec_stalled` is EXECCTRL.EXEC_STALLED.
+    exec_pending: bool
+    exec_instr: u32
+    exec_system: bool
+    exec_stalled: bool
+    // The current instruction has been issued: its side-set made, an IRQ WAIT's flag raised.
+    issued: bool
+    // An IRQ WAIT has raised its flag and waits for it to be cleared.
+    waiting: bool
+    // The current instruction is stalled on something only an event changes.
+    blocked: bool
+    // Stopped on an instruction benchtop does not model (`halt`), until SM_RESTART or SMx_INSTR.
+    halted: bool
+    // The divider's phase, in 1/256 cycles, as it stood at the end of clk_sys cycle `div_at`.
+    acc: u64
+    div_at: u64
+    // While running: the cycle of the next instruction attempt (NEVER while blocked), of a pending
+    // autopull refill, and the sooner of the two.
+    attempt_at: u64
+    refill_at: u64
+    wake: u64
+    // While not running: the delay cycles still to pass before the next attempt.
+    delay_left: u32
+    // OUT_STICKY: the last OUT, SET or MOV pin write, asserted again on every cycle.
+    sticky: PinWrite
+    // This cycle's writes: the instruction's, and its side-set.
+    out_write: PinWrite
+    side_write: PinWrite
+    wrote: bool
+
+    // The divisor in 1/256 cycles.
+    private divisor(*self) -> u64
+        val int = u64(self.clkdiv >> reg.SM0_CLKDIV_INT_SHIFT)
+        val frac = u64((self.clkdiv & reg.SM0_CLKDIV_FRAC_MASK) >> reg.SM0_CLKDIV_FRAC_SHIFT)
+        if int == 0 then 65536 * 256 else int * 256 + frac
+
+    /** Bring the divider's phase to the end of cycle `t`. */
+    settle(*self, t: u64)
+        if t <= self.div_at then return
+        self.acc = (self.acc + 256 * (t - self.div_at)) % self.divisor()
+        self.div_at = t
+
+    /** The cycle of the `k`th divider fire after cycle `t`. */
+    fire(*self, t: u64, k: u64) -> u64
+        self.settle(t)
+        t + (k * self.divisor() - self.acc + 255) / 256
+
+    // The divider fires in cycles `t` + 1 to `b`.
+    private fires(*self, t: u64, b: u64) -> u64
+        self.settle(t)
+        (self.acc + 256 * (b - t)) / self.divisor()
+
+    // The configuration fields.
+    side_count(*self) -> u32 = self.pinctrl >> reg.SM0_PINCTRL_SIDESET_COUNT_SHIFT
+    set_count(*self) -> u32 = (self.pinctrl & reg.SM0_PINCTRL_SET_COUNT_MASK) >> reg.SM0_PINCTRL_SET_COUNT_SHIFT
+    out_count(*self) -> u32 = (self.pinctrl & reg.SM0_PINCTRL_OUT_COUNT_MASK) >> reg.SM0_PINCTRL_OUT_COUNT_SHIFT
+    in_base(*self) -> u32 = (self.pinctrl & reg.SM0_PINCTRL_IN_BASE_MASK) >> reg.SM0_PINCTRL_IN_BASE_SHIFT
+    side_base(*self) -> u32 = (self.pinctrl & reg.SM0_PINCTRL_SIDESET_BASE_MASK) >> reg.SM0_PINCTRL_SIDESET_BASE_SHIFT
+    set_base(*self) -> u32 = (self.pinctrl & reg.SM0_PINCTRL_SET_BASE_MASK) >> reg.SM0_PINCTRL_SET_BASE_SHIFT
+    out_base(*self) -> u32 = self.pinctrl & reg.SM0_PINCTRL_OUT_BASE_MASK
+    push_thresh(*self) -> u32 = count32((self.shiftctrl & reg.SM0_SHIFTCTRL_PUSH_THRESH_MASK) >> reg.SM0_SHIFTCTRL_PUSH_THRESH_SHIFT)
+    pull_thresh(*self) -> u32 = count32((self.shiftctrl & reg.SM0_SHIFTCTRL_PULL_THRESH_MASK) >> reg.SM0_SHIFTCTRL_PULL_THRESH_SHIFT)
+    in_mask(*self) -> u32 = low(count32(self.shiftctrl & reg.SM0_SHIFTCTRL_IN_COUNT_MASK))
+    autopush(*self) -> bool = self.shiftctrl & reg.SM0_SHIFTCTRL_AUTOPUSH_MASK != 0
+    autopull(*self) -> bool = self.shiftctrl & reg.SM0_SHIFTCTRL_AUTOPULL_MASK != 0
+    jmp_pin(*self) -> u32 = (self.execctrl & reg.SM0_EXECCTRL_JMP_PIN_MASK) >> reg.SM0_EXECCTRL_JMP_PIN_SHIFT
+    private shift(*self, bit: u32) -> bool = self.shiftctrl & bit != 0
+
+    /** The TX FIFO's depth: 8 joined, 0 while the RX FIFO has taken its storage. */
+    tx_depth(*self) -> u32 = if self.shift(reg.SM0_SHIFTCTRL_FJOIN_RX_MASK) then 0 elif self.shift(reg.SM0_SHIFTCTRL_FJOIN_TX_MASK) then 8 else 4
+    /** The RX FIFO's depth: 8 joined, 0 while the TX FIFO has its storage or it is given to its entries. */
+    rx_depth(*self) -> u32
+        if self.shift(reg.SM0_SHIFTCTRL_FJOIN_TX_MASK) || self.shiftctrl & PUT_GET != 0 then return 0
+        if self.shift(reg.SM0_SHIFTCTRL_FJOIN_RX_MASK) then 8 else 4
+    // A disabled FIFO reads as both full and empty.
+    tx_full(*self) -> bool = self.tx.count >= self.tx_depth()
+    tx_empty(*self) -> bool = self.tx_depth() == 0 || self.tx.count == 0
+    rx_full(*self) -> bool = self.rx.count >= self.rx_depth()
+    rx_empty(*self) -> bool = self.rx_depth() == 0 || self.rx.count == 0
+    tx_level(*self) -> u32 = if self.tx_depth() == 0 then 0 else self.tx.count
+    rx_level(*self) -> u32 = if self.rx_depth() == 0 then 0 else self.rx.count
+
+    /** The PC after the instruction at it, wrapping at WRAP_TOP. */
+    next_pc(*self) -> u32
+        val top = (self.execctrl & reg.SM0_EXECCTRL_WRAP_TOP_MASK) >> reg.SM0_EXECCTRL_WRAP_TOP_SHIFT
+        if self.pc == top then (self.execctrl & reg.SM0_EXECCTRL_WRAP_BOTTOM_MASK) >> reg.SM0_EXECCTRL_WRAP_BOTTOM_SHIFT else (self.pc + 1) % 32
+
+    /** SM_RESTART: the shift counters, the ISR, the delay, an IRQ wait, a stalled system instruction and
+     * a sticky write cleared; OSR, X and Y kept.
+     */
+    restart(*self)
+        self.isr = 0
+        self.isr_count = 0
+        self.osr_count = 32
+        self.delay_left = 0
+        self.issued = false
+        self.waiting = false
+        self.halted = false
+        self.exec_pending = false
+        self.exec_system = false
+        self.exec_stalled = false
+        self.sticky = PinWrite(0, 0, false)
+
+    /** Record a pin write made this cycle. */
+    out_pins(*self, w: PinWrite)
+        self.out_write = w
+        self.wrote = true
+        if self.execctrl & reg.SM0_EXECCTRL_OUT_STICKY_MASK != 0 then self.sticky = w
+end PioSm
+
+/** A state machine at power-on. */
+pio_sm(now: u64) -> PioSm
+    var s: PioSm
+    s.clkdiv = 1 << reg.SM0_CLKDIV_INT_SHIFT
+    s.execctrl = reg.SM0_EXECCTRL_WRAP_TOP_MASK
+    s.shiftctrl = reg.SM0_SHIFTCTRL_OUT_SHIFTDIR_MASK | reg.SM0_SHIFTCTRL_IN_SHIFTDIR_MASK
+    s.pinctrl = 5 << reg.SM0_PINCTRL_SET_COUNT_SHIFT
+    s.osr_count = 32
+    s.div_at = now
+    s.attempt_at = NEVER
+    s.refill_at = NEVER
+    s.wake = NEVER
+    s
+
+/** One PIO block: four state machines, the instruction memory, the IRQ flags, and the pins it drives. */
+struct PioBlock
+    sms: [4]PioSm
+    mem: [32]u32
+    // CTRL.SM_ENABLE.
+    enabled: u32
+    irq: u32
+    fdebug: u32
+    sync_bypass: u32
+    gpiobase: u32
+    inte: [2]u32
+    intf: [2]u32
+    // The pins as the block drives them, in its own numbering: levels and output enables.
+    pad_out: u32
+    pad_oe: u32
+    // The next clk_sys cycle on which a sticky write is asserted again after another's, or NEVER.
+    recompose_at: u64
+    // This cycle's IRQ flag changes, made at its end.
+    irq_set: u32
+    irq_clr: u32
+
+    /** INTR: RXNEMPTY for each state machine, TXNFULL for each, then the eight IRQ flags. */
+    intr(*self) -> u32
+        var bits = self.irq << reg.INTR_SM0_SHIFT
+        for s in 0u32..<PIO_SMS
+            val m = &self.sms[s]
+            if !m.rx_empty() then bits |= 1 << s
+            if !m.tx_full() then bits |= 1 << (4 + s)
+        bits
+
+    /** Interrupt line `k` (0 or 1): (INTR | INTF) & INTE. */
+    irq_line(*self, k: u32) -> bool = (self.intr() | self.intf[k]) & self.inte[k] != 0
+end PioBlock
+
+/** A PIO block at power-on, at clk_sys cycle `now`. */
+pio_block(now: u64) -> PioBlock
+    var b: PioBlock
+    for s in 0u32..<PIO_SMS do b.sms[s] = pio_sm(now)
+    b.recompose_at = NEVER
+    b
+
+/** The three PIO blocks, the levels they read, and the time they run to. */
+struct Pio
+    blocks: [3]PioBlock
+    // GPIO 0–47 as the inputs see them, newest first, and the cycle from which each held: three, so the
+    // synchronisers' two-cycle-old view is always among them.
+    levels: [3]u64
+    since: [3]u64
+    // The blocks ACCESSCTRL lets Non-secure code reach, bit k for PIO k.
+    ns: u32
+    // Some state machine has a cycle to run, or a block a pin write to make again.
+    running: bool
+    // Why a state machine stopped while time passed, for the chip to stop on (`take_fault`).
+    fault: string
+    // OUT EXEC or MOV EXEC ran this cycle: its own delay is not taken.
+    drop_delay: bool
+
+    /** Power-on for block `b` at cycle `now` (its RESETS bit). */
+    reset_block(*self, b: u32, now: u64)
+        self.blocks[b] = pio_block(now)
+        self.refresh()
+
+    /** Why a state machine stopped since the last call, if one did. */
+    take_fault(*self) -> Option[string]
+        if self.fault.is_empty() then return None
+        val why = self.fault
+        self.fault = ""
+        Some(why)
+
+    /** Block `b`'s pins in its own numbering: the levels, and the output enables. */
+    pins(*self, b: u32) -> (u32, u32) = (self.blocks[b].pad_out, self.blocks[b].pad_oe)
+
+    /** Block `b`'s interrupt line `k`. */
+    irq_line(*self, b: u32, k: u32) -> bool = self.blocks[b].irq_line(k)
+
+    // Blocks `a` and `c` are connected: the same, or alike in being reachable from Non-secure code.
+    private connected(*self, a: u32, c: u32) -> bool = a == c || (self.ns >> a) & 1 == (self.ns >> c) & 1
+
+    // The GPIO levels as they stood in cycle `t`.
+    private level_at(*self, t: u64) -> u64
+        for i in 0..<3 do if t >= self.since[i] then return self.levels[i]
+        0
+
+    /** The levels on GPIO 0–47 change at the end of cycle `now`, as something outside drives them. */
+    drive(*self, now: u64, levels: u64)
+        if levels == self.levels[0] then return
+        val t = now + 1
+        if self.since[0] == t
+            self.levels[0] = levels
+        else
+            self.levels[2] = self.levels[1]
+            self.since[2] = self.since[1]
+            self.levels[1] = self.levels[0]
+            self.since[1] = self.since[0]
+            self.levels[0] = levels
+            self.since[0] = t
+        self.wake_blocked(now)
+
+    // What block `b` reads of its 32 pins on cycle `f`: through the synchronisers, two cycles late,
+    // except where INPUT_SYNC_BYPASS takes them out.
+    private input(*self, b: u32, f: u64) -> u32
+        val base = u64(self.blocks[b].gpiobase)
+        val now = u32((self.level_at(f) >> base) & 0xffffffff)
+        val late = u32((self.level_at(if f >= 2 then f - 2 else 0) >> base) & 0xffffffff)
+        val bypass = self.blocks[b].sync_bypass
+        (now & bypass) | (late & ~bypass)
+
+    // Something a stalled state machine waits on may have changed at cycle `now`: each tries again on
+    // its next cycle.
+    private wake_blocked(*self, now: u64)
+        for b in 0u32..<PIO_BLOCKS
+            for s in 0u32..<PIO_SMS
+                val m = &self.blocks[b].sms[s]
+                if !m.blocked || m.halted || !self.sm_running(b, s) then continue
+                m.blocked = false
+                m.attempt_at = m.fire(now, 1)
+                m.wake = min(m.attempt_at, m.refill_at)
+        self.refresh()
+
+    // State machine `s` of block `b` runs: enabled, or with an instruction the system wrote to run.
+    private sm_running(*self, b: u32, s: u32) -> bool
+        val m = &self.blocks[b].sms[s]
+        self.blocks[b].enabled & (1 << s) != 0 || (m.exec_pending && m.exec_system)
+
+    // Whether anything is left to run, after a change.
+    private refresh(*self)
+        self.running = false
+        for b in 0u32..<PIO_BLOCKS
+            if self.blocks[b].recompose_at != NEVER then self.running = true
+            for s in 0u32..<PIO_SMS do if self.blocks[b].sms[s].wake != NEVER then self.running = true
+
+    // State machine `s` of block `b` starts running at cycle `now`, where it was not.
+    private start(*self, b: u32, s: u32, now: u64)
+        val m = &self.blocks[b].sms[s]
+        if m.halted then return
+        m.blocked = false
+        m.attempt_at = m.fire(now, u64(m.delay_left) + 1)
+        m.delay_left = 0
+        m.refill_at = NEVER
+        m.wake = m.attempt_at
+
+    // State machine `s` of block `b` stops running at cycle `now`: what is left of its delay waits.
+    private stop(*self, b: u32, s: u32, now: u64)
+        val m = &self.blocks[b].sms[s]
+        if m.attempt_at != NEVER then m.delay_left = u32(m.fires(now, m.attempt_at) - 1)
+        m.attempt_at = NEVER
+        m.refill_at = NEVER
+        m.wake = NEVER
+
+    // Rework state machine `s`'s schedule around a change to its divider at `now` (`change` makes it):
+    // the same number of its cycles to its next attempt.
+    private redivide(*self, b: u32, s: u32, now: u64, clkdiv: u32, restart: bool)
+        val m = &self.blocks[b].sms[s]
+        val left = if m.attempt_at != NEVER then m.fires(now, m.attempt_at) else 0
+        m.settle(now)
+        if restart then m.acc = 0
+        m.clkdiv = clkdiv
+        m.acc = m.acc % m.divisor()
+        if m.attempt_at != NEVER then m.attempt_at = m.fire(now, left)
+        if m.refill_at != NEVER then m.refill_at = m.fire(now, 1)
+        m.wake = min(m.attempt_at, m.refill_at)
+
+    // SM_ENABLE becomes `enabled` for block `b` at `now`.
+    private enable(*self, b: u32, enabled: u32, now: u64)
+        for s in 0u32..<PIO_SMS
+            val was = self.sm_running(b, s)
+            if enabled & (1 << s) != 0 then self.blocks[b].enabled |= 1 << s else self.blocks[b].enabled &= ~(1u32 << s)
+            val is = self.sm_running(b, s)
+            if is && !was then self.start(b, s, now)
+            if was && !is then self.stop(b, s, now)
+
+    /** Run every state machine to the end of clk_sys cycle `t`. */
+    advance_to(*self, t: u64)
+        while self.running
+            var w = NEVER
+            for b in 0u32..<PIO_BLOCKS
+                w = min(w, self.blocks[b].recompose_at)
+                for s in 0u32..<PIO_SMS do w = min(w, self.blocks[b].sms[s].wake)
+            if w == NEVER
+                self.running = false
+                break
+            if w > t then break
+            self.cycle(w)
+
+    // Clk_sys cycle `w`: each state machine with something to do then does it, in block and state
+    // machine order; each block then drives its pins, and the IRQ flags change.
+    private cycle(*self, w: u64)
+        for b in 0u32..<PIO_BLOCKS
+            var any = false
+            for s in 0u32..<PIO_SMS
+                if self.blocks[b].sms[s].wake == w
+                    self.step(b, s, w)
+                    any = true
+            if any || self.blocks[b].recompose_at == w then self.compose(b, w)
+        var changed = false
+        for b in 0u32..<PIO_BLOCKS
+            val k = &self.blocks[b]
+            if k.irq_set == 0 && k.irq_clr == 0 then continue
+            val before = k.irq
+            k.irq = (k.irq & ~k.irq_clr) | k.irq_set
+            k.irq_set = 0
+            k.irq_clr = 0
+            if k.irq != before then changed = true
+        if changed then self.wake_blocked(w) else self.refresh()
+
+    // Block `b` drives its pins at the end of cycle `w`: each state machine's writes in order, so the
+    // highest-numbered wins, a side-set over its own state machine's other write, and a sticky write
+    // asserted again by a state machine that made none.
+    private compose(*self, b: u32, w: u64)
+        val k = &self.blocks[b]
+        var wrote = false
+        var sticky = false
+        for s in 0u32..<PIO_SMS
+            val m = &k.sms[s]
+            if m.wrote
+                wrote = true
+                apply_write(k, m.out_write)
+                apply_write(k, m.side_write)
+                m.out_write = PinWrite(0, 0, false)
+                m.side_write = PinWrite(0, 0, false)
+                m.wrote = false
+            elif m.sticky.mask != 0
+                apply_write(k, m.sticky)
+            if m.sticky.mask != 0 then sticky = true
+        k.recompose_at = if wrote && sticky then w + 1 else NEVER
+
+    // State machine `s` of block `b` on cycle `w`, one of its divider's: the instruction it is due to
+    // try, then an autopull refill where the OSR is empty and the TX FIFO is not.
+    private step(*self, b: u32, s: u32, w: u64)
+        self.blocks[b].sms[s].settle(w)
+        if self.blocks[b].sms[s].attempt_at == w then self.attempt(b, s, w)
+        val m = &self.blocks[b].sms[s]
+        if self.blocks[b].enabled & (1 << s) != 0 && m.autopull() && m.osr_count >= m.pull_thresh() && !m.tx_empty()
+            m.osr = m.tx.pop()
+            m.osr_count = 0
+            // An OUT stalled on the empty OSR runs on the next cycle.
+            if m.blocked
+                m.blocked = false
+                m.attempt_at = m.fire(w, 1)
+        m.refill_at = NEVER
+        m.wake = m.attempt_at
+
+    // State machine `s` of block `b` tries its next instruction on cycle `w`.
+    private attempt(*self, b: u32, s: u32, w: u64)
+        val from_exec = self.blocks[b].sms[s].exec_pending
+        val system = self.blocks[b].sms[s].exec_system
+        val instr = if from_exec then self.blocks[b].sms[s].exec_instr else self.blocks[b].mem[self.blocks[b].sms[s].pc]
+        val (delay, side) = self.decode_side(b, s, instr) match
+            Ok(d) -> d
+            Err(why) -> return self.halt(b, s, instr, why)
+        if !self.blocks[b].sms[s].issued
+            self.blocks[b].sms[s].issued = true
+            side match
+                Some(sw) ->
+                    self.blocks[b].sms[s].side_write = sw
+                    self.blocks[b].sms[s].wrote = true
+                None -> ()
+        if from_exec then self.blocks[b].sms[s].exec_pending = false
+        self.drop_delay = false
+        val outcome = self.execute(b, s, instr, w)
+        val m = &self.blocks[b].sms[s]
+        outcome match
+            Err(why) ->
+                if from_exec then m.exec_pending = true
+                return self.halt(b, s, instr, why)
+            Ok(Ran.Stalled) ->
+                if from_exec
+                    // A new EXEC made by the stalled instruction cannot have happened: it stalled.
+                    m.exec_pending = true
+                    m.exec_instr = instr
+                    if system then m.exec_stalled = true
+                m.blocked = true
+                m.attempt_at = NEVER
+            Ok(Ran.OnPins) ->
+                if from_exec
+                    m.exec_pending = true
+                    m.exec_instr = instr
+                    if system then m.exec_stalled = true
+                // The synchronisers may still be bringing a change through.
+                val settled = self.since[0] + 2
+                if w < settled
+                    m.attempt_at = m.fire(settled - 1, 1)
+                else
+                    m.blocked = true
+                    m.attempt_at = NEVER
+            Ok(done) ->
+                m.issued = false
+                if from_exec
+                    // An instruction it made to run next (OUT or MOV EXEC) runs as it did: one the
+                    // system wrote runs its EXEC even with the state machine off.
+                    m.exec_stalled = false
+                    m.exec_system = system && m.exec_pending
+                elif done == Ran.Next
+                    m.pc = m.next_pc()
+                val d = if self.drop_delay then 0u32 else delay
+                if self.sm_running(b, s)
+                    m.attempt_at = m.fire(w, u64(d) + 1)
+                else
+                    m.delay_left = d
+                    m.attempt_at = NEVER
+    end attempt
+
+    // State machine `s` of block `b` stops on an instruction benchtop does not model, and says why.
+    private halt(*self, b: u32, s: u32, instr: u32, why: string)
+        val m = &self.blocks[b].sms[s]
+        m.blocked = true
+        m.halted = true
+        m.attempt_at = NEVER
+        if self.fault.is_empty() then self.fault = s"PIO$b SM$s at ${m.pc}: instruction 0x${hex(instr, 4)}: $why"
+
+    // The delay and the side-set of `instr` under state machine `s`'s SIDESET_COUNT and SIDE_EN.
+    private decode_side(*self, b: u32, s: u32, instr: u32) -> Result[(u32, Option[PinWrite]), string]
+        val m = &self.blocks[b].sms[s]
+        val count = m.side_count()
+        if count > 5 then return Err(s"PINCTRL.SIDESET_COUNT $count is more than 5")
+        val field = (instr >> 8) & 31
+        val optional = m.execctrl & reg.SM0_EXECCTRL_SIDE_EN_MASK != 0
+        if optional && count == 0 then return Err("EXECCTRL.SIDE_EN with PINCTRL.SIDESET_COUNT 0 leaves no enable bit")
+        val delay = field & low(5 - count)
+        if count == 0 then return Ok((delay, None))
+        val data_bits = if optional then count - 1 else count
+        if optional && field & 16 == 0 then return Ok((delay, None))
+        val data = (field >> (5 - count)) & low(data_bits)
+        val base = m.side_base()
+        val w = PinWrite(data.rotate_left(base), low(data_bits).rotate_left(base), m.execctrl & reg.SM0_EXECCTRL_SIDE_PINDIR_MASK != 0)
+        Ok((delay, Some(w)))
+
+    // The IRQ flag an IRQ or WAIT IRQ instruction's index field names, from state machine `s` of block
+    // `b`: the block, and the flag.
+    private irq_target(*self, b: u32, s: u32, field: u32) -> (u32, u32)
+        val index = field & 7
+        (field >> 3) & 3 match
+            1 -> ((b + PIO_BLOCKS - 1) % PIO_BLOCKS, index)
+            2 -> (b, (index & 4) | ((index + s) & 3))
+            3 -> ((b + 1) % PIO_BLOCKS, index)
+            _ -> (b, index)
+
+    // Flag `n` of block `c`, as block `b` sees it: 0 where the two are disconnected.
+    private flag(*self, b: u32, c: u32, n: u32) -> bool = self.connected(b, c) && self.blocks[c].irq & (1 << n) != 0
+
+    // MOV's STATUS source for state machine `s` of block `b`.
+    private status(*self, b: u32, s: u32) -> Result[u32, string]
+        val m = &self.blocks[b].sms[s]
+        val n = m.execctrl & reg.SM0_EXECCTRL_STATUS_N_MASK
+        val yes = (m.execctrl & reg.SM0_EXECCTRL_STATUS_SEL_MASK) >> reg.SM0_EXECCTRL_STATUS_SEL_SHIFT match
+            reg.SM0_EXECCTRL_STATUS_SEL_TXLEVEL ->
+                if n > m.tx_depth() then return Err(s"EXECCTRL.STATUS_N $n is more than the TX FIFO's depth ${m.tx_depth()}, which is reserved")
+                m.tx_level() < n
+            reg.SM0_EXECCTRL_STATUS_SEL_RXLEVEL ->
+                if n > m.rx_depth() then return Err(s"EXECCTRL.STATUS_N $n is more than the RX FIFO's depth ${m.rx_depth()}, which is reserved")
+                m.rx_level() < n
+            _ ->
+                if n >= 24 then return Err(s"EXECCTRL.STATUS_N $n names no IRQ flag (0–7 this block, 8–15 the previous, 16–23 the next)")
+                val c = if n < 8 then b elif n < 16 then (b + PIO_BLOCKS - 1) % PIO_BLOCKS else (b + 1) % PIO_BLOCKS
+                self.flag(b, c, n % 8)
+        Ok(if yes then 0xffffffff else 0)
+
+    // A write of `data` through the OUT mapping (OUT and MOV to PINS or PINDIRS), gated by INLINE_OUT_EN.
+    private write_out(*self, b: u32, s: u32, data: u32, count: u32, dirs: bool)
+        val m = &self.blocks[b].sms[s]
+        if m.execctrl & reg.SM0_EXECCTRL_INLINE_OUT_EN_MASK != 0
+            val sel = (m.execctrl & reg.SM0_EXECCTRL_OUT_EN_SEL_MASK) >> reg.SM0_EXECCTRL_OUT_EN_SEL_SHIFT
+            if (data >> sel) & 1 == 0
+                // No write; a sticky one is let go.
+                m.sticky = PinWrite(0, 0, false)
+                return
+        val base = m.out_base()
+        m.out_pins(PinWrite((data & low(count)).rotate_left(base), low(count).rotate_left(base), dirs))
+
+    // Run `instr` on state machine `s` of block `b` on cycle `w`: what became of it, or why benchtop
+    // does not run it.
+    private execute(*self, b: u32, s: u32, instr: u32, w: u64) -> Result[Ran, string]
+        val op = instr >> 13
+        val arg = (instr >> 5) & 7
+        val low5 = instr & 31
+        op match
+            0 -> self.jmp(b, s, arg, low5, w)
+            1 -> self.wait(b, s, instr, w)
+            2 -> self.shift_in(b, s, arg, count32(low5), w)
+            3 -> self.shift_out(b, s, arg, count32(low5))
+            4 -> self.fifo_op(b, s, instr)
+            5 -> self.mov(b, s, instr, w)
+            6 -> self.irq_op(b, s, instr)
+            _ -> self.set(b, s, arg, low5)
+
+    private jmp(*self, b: u32, s: u32, cond: u32, target: u32, w: u64) -> Result[Ran, string]
+        val m = &self.blocks[b].sms[s]
+        val take = cond match
+            0 -> true
+            1 -> m.x == 0
+            2 ->
+                val nonzero = m.x != 0
+                m.x = m.x -% 1
+                nonzero
+            3 -> m.y == 0
+            4 ->
+                val nonzero = m.y != 0
+                m.y = m.y -% 1
+                nonzero
+            5 -> m.x != m.y
+            6 -> (self.input(b, w) >> self.blocks[b].sms[s].jmp_pin()) & 1 != 0
+            _ -> m.osr_count < m.pull_thresh()
+        if !take then return Ok(Ran.Next)
+        self.blocks[b].sms[s].pc = target
+        Ok(Ran.Jumped)
+
+    private wait(*self, b: u32, s: u32, instr: u32, w: u64) -> Result[Ran, string]
+        val polarity = instr & 0x80 != 0
+        val index = instr & 31
+        val m = &self.blocks[b].sms[s]
+        val pins = self.input(b, w)
+        (instr >> 5) & 3 match
+            0 ->
+                // GPIO, relative to GPIOBASE.
+                return Ok(if ((pins >> index) & 1 != 0) == polarity then Ran.Next else Ran.OnPins)
+            1 ->
+                // A pin of the IN mapping, masked by IN_COUNT.
+                val bit = ((pins.rotate_right(m.in_base()) & m.in_mask()) >> index) & 1 != 0
+                return Ok(if bit == polarity then Ran.Next else Ran.OnPins)
+            3 ->
+                if index > 3 then return Err(s"WAIT JMPPIN + $index: only 0 to 3 are defined")
+                val bit = (pins >> ((m.jmp_pin() + index) % 32)) & 1 != 0
+                return Ok(if bit == polarity then Ran.Next else Ran.OnPins)
+            _ -> ()
+        // IRQ: a polarity-1 wait clears the flag it was waiting for.
+        val (c, n) = self.irq_target(b, s, index)
+        if self.flag(b, c, n) != polarity then return Ok(Ran.Stalled)
+        if polarity && self.connected(b, c) then self.blocks[c].irq_clr |= 1 << n
+        Ok(Ran.Next)
+    end wait
+
+    private shift_in(*self, b: u32, s: u32, source: u32, n: u32, w: u64) -> Result[Ran, string]
+        val m = &self.blocks[b].sms[s]
+        val data = source match
+            0 -> self.input(b, w).rotate_right(m.in_base()) & m.in_mask()
+            1 -> m.x
+            2 -> m.y
+            3 -> 0
+            6 -> m.isr
+            7 -> m.osr
+            _ -> return Err(s"IN source $source is reserved")
+        val count = min(32u32, m.isr_count + n)
+        val push = m.autopush() && count >= m.push_thresh()
+        if push && m.rx_full()
+            self.blocks[b].fdebug |= 1 << (reg.FDEBUG_RXSTALL_SHIFT + s)
+            return Ok(Ran.Stalled)
+        val bits = data & low(n)
+        if n == 32
+            m.isr = bits
+        elif m.shiftctrl & reg.SM0_SHIFTCTRL_IN_SHIFTDIR_MASK != 0
+            m.isr = (m.isr >> n) | (bits << (32 - n))
+        else
+            m.isr = (m.isr << n) | bits
+        m.isr_count = count
+        if push
+            m.rx.push(m.isr)
+            m.isr = 0
+            m.isr_count = 0
+        Ok(Ran.Next)
+
+    private shift_out(*self, b: u32, s: u32, dest: u32, n: u32) -> Result[Ran, string]
+        val m = &self.blocks[b].sms[s]
+        if m.autopull() && m.osr_count >= m.pull_thresh()
+            if m.tx_empty() then self.blocks[b].fdebug |= 1 << (reg.FDEBUG_TXSTALL_SHIFT + s)
+            return Ok(Ran.Stalled)
+        var data: u32 = 0
+        if n == 32
+            data = m.osr
+            m.osr = 0
+        elif m.shiftctrl & reg.SM0_SHIFTCTRL_OUT_SHIFTDIR_MASK != 0
+            data = m.osr & low(n)
+            m.osr = m.osr >> n
+        else
+            data = m.osr >> (32 - n)
+            m.osr = m.osr << n
+        m.osr_count = min(32u32, m.osr_count + n)
+        dest match
+            0 -> self.write_out(b, s, data, m.out_count(), false)
+            1 -> m.x = data
+            2 -> m.y = data
+            3 -> ()
+            4 -> self.write_out(b, s, data, m.out_count(), true)
+            5 ->
+                m.pc = data & 31
+                return Ok(Ran.Jumped)
+            6 ->
+                m.isr = data
+                m.isr_count = n
+            _ ->
+                m.exec_pending = true
+                m.exec_instr = data & 0xffff
+                self.drop_delay = true
+        Ok(Ran.Next)
+    end shift_out
+
+    // PUSH, PULL, and the RP2350's MOV to and from the RX FIFO's entries.
+    private fifo_op(*self, b: u32, s: u32, instr: u32) -> Result[Ran, string]
+        val m = &self.blocks[b].sms[s]
+        val pull = instr & 0x80 != 0
+        if instr & 0x10 != 0
+            // MOV RXFIFO[], ISR or MOV OSR, RXFIFO[]: the index from Y or the instruction.
+            if instr & 0x64 != 0 then return Err("a MOV to or from the RX FIFO with reserved bits set")
+            val i = (if instr & 8 != 0 then instr else m.y) & 3
+            if pull
+                if m.shiftctrl & reg.SM0_SHIFTCTRL_FJOIN_RX_GET_MASK == 0 then return Err("MOV OSR, RXFIFO[] needs SHIFTCTRL.FJOIN_RX_GET")
+                m.osr = m.rx.entries[i]
+                m.osr_count = 0
+            else
+                if m.shiftctrl & reg.SM0_SHIFTCTRL_FJOIN_RX_PUT_MASK == 0 then return Err("MOV RXFIFO[], ISR needs SHIFTCTRL.FJOIN_RX_PUT")
+                m.rx.entries[i] = m.isr
+            return Ok(Ran.Next)
+        if instr & 0x1f != 0 then return Err("a PUSH or PULL with reserved bits set")
+        val conditional = instr & 0x40 != 0
+        val block = instr & 0x20 != 0
+        if pull
+            if conditional && m.osr_count < m.pull_thresh() then return Ok(Ran.Next)
+            if m.autopull() && m.osr_count == 0 then return Ok(Ran.Next)
+            if m.tx_empty()
+                if block
+                    self.blocks[b].fdebug |= 1 << (reg.FDEBUG_TXSTALL_SHIFT + s)
+                    return Ok(Ran.Stalled)
+                m.osr = m.x
+            else
+                m.osr = m.tx.pop()
+            m.osr_count = 0
+            return Ok(Ran.Next)
+        if conditional && m.isr_count < m.push_thresh() then return Ok(Ran.Next)
+        if m.rx_full()
+            self.blocks[b].fdebug |= 1 << (reg.FDEBUG_RXSTALL_SHIFT + s)
+            if block then return Ok(Ran.Stalled)
+        else
+            m.rx.push(m.isr)
+        m.isr = 0
+        m.isr_count = 0
+        Ok(Ran.Next)
+    end fifo_op
+
+    private mov(*self, b: u32, s: u32, instr: u32, w: u64) -> Result[Ran, string]
+        val dest = (instr >> 5) & 7
+        val operation = (instr >> 3) & 3
+        val source = instr & 7
+        val m = &self.blocks[b].sms[s]
+        val raw = source match
+            0 -> self.input(b, w).rotate_right(m.in_base()) & m.in_mask()
+            1 -> m.x
+            2 -> m.y
+            3 -> 0
+            5 -> self.status(b, s)?
+            6 -> m.isr
+            7 -> m.osr
+            _ -> return Err("MOV source 4 is reserved")
+        val value = operation match
+            0 -> raw
+            1 -> ~raw
+            2 -> raw.reverse_bits()
+            _ -> return Err("MOV operation 3 is reserved")
+        val sm = &self.blocks[b].sms[s]
+        dest match
+            0 -> self.write_out(b, s, value, sm.out_count(), false)
+            1 -> sm.x = value
+            2 -> sm.y = value
+            3 -> self.write_out(b, s, value, sm.out_count(), true)
+            4 ->
+                sm.exec_pending = true
+                sm.exec_instr = value & 0xffff
+                self.drop_delay = true
+            5 ->
+                sm.pc = value & 31
+                return Ok(Ran.Jumped)
+            6 ->
+                sm.isr = value
+                sm.isr_count = 0
+            _ ->
+                sm.osr = value
+                sm.osr_count = 0
+        Ok(Ran.Next)
+    end mov
+
+    private irq_op(*self, b: u32, s: u32, instr: u32) -> Result[Ran, string]
+        if instr & 0x80 != 0 then return Err("IRQ with bit 7 set is reserved")
+        val clear = instr & 0x40 != 0
+        val wait = instr & 0x20 != 0
+        val (c, n) = self.irq_target(b, s, instr & 31)
+        val m = &self.blocks[b].sms[s]
+        if clear
+            if self.connected(b, c) then self.blocks[c].irq_clr |= 1 << n
+            return Ok(Ran.Next)
+        // Raised once, as the instruction issues; a wait then holds until the flag is clear again.
+        if !wait || !m.waiting
+            if self.connected(b, c) then self.blocks[c].irq_set |= 1 << n
+            if !wait then return Ok(Ran.Next)
+            m.waiting = true
+            return Ok(Ran.Stalled)
+        if self.flag(b, c, n) then return Ok(Ran.Stalled)
+        m.waiting = false
+        Ok(Ran.Next)
+
+    private set(*self, b: u32, s: u32, dest: u32, data: u32) -> Result[Ran, string]
+        val m = &self.blocks[b].sms[s]
+        val base = m.set_base()
+        val count = min(5u32, m.set_count())
+        dest match
+            0 -> m.out_pins(PinWrite((data & low(count)).rotate_left(base), low(count).rotate_left(base), false))
+            1 -> m.x = data
+            2 -> m.y = data
+            4 -> m.out_pins(PinWrite((data & low(count)).rotate_left(base), low(count).rotate_left(base), true))
+            _ -> return Err(s"SET destination $dest is reserved")
+        Ok(Ran.Next)
+
+    /** A read of `width` bytes at `offset` in block `b` at cycle `now`. */
+    read(*self, b: u32, now: u64, offset: u32, width: u32) -> Result[u32, PioFault]
+        access(offset, width, true).map_err(e -> PioFault.Access(e))?
+        val address = offset & 0xFFC
+        val alias = offset & 0x3000 != 0
+        val k = &self.blocks[b]
+        if address >= reg.TXF0_OFFSET && address <= reg.RXF3_OFFSET && alias then return Err(PioFault.Access(AccessError.UnsupportedAlias))
+        val value = address match
+            reg.CTRL_OFFSET -> k.enabled
+            reg.FSTAT_OFFSET ->
+                var bits: u32 = 0
+                for s in 0u32..<PIO_SMS
+                    val m = &k.sms[s]
+                    if m.tx_empty() then bits |= 1 << (reg.FSTAT_TXEMPTY_SHIFT + s)
+                    if m.tx_full() then bits |= 1 << (reg.FSTAT_TXFULL_SHIFT + s)
+                    if m.rx_empty() then bits |= 1 << (reg.FSTAT_RXEMPTY_SHIFT + s)
+                    if m.rx_full() then bits |= 1 << (reg.FSTAT_RXFULL_SHIFT + s)
+                bits
+            reg.FDEBUG_OFFSET -> k.fdebug
+            reg.FLEVEL_OFFSET ->
+                var bits: u32 = 0
+                for s in 0u32..<PIO_SMS do bits |= (k.sms[s].tx_level() | (k.sms[s].rx_level() << 4)) << (8 * s)
+                bits
+            reg.IRQ_OFFSET -> k.irq
+            reg.IRQ_FORCE_OFFSET -> 0
+            reg.INPUT_SYNC_BYPASS_OFFSET -> k.sync_bypass
+            reg.DBG_PADOUT_OFFSET -> k.pad_out
+            reg.DBG_PADOE_OFFSET -> k.pad_oe
+            reg.DBG_CFGINFO_OFFSET -> CFGINFO
+            reg.GPIOBASE_OFFSET -> k.gpiobase
+            reg.INTR_OFFSET -> k.intr()
+            reg.IRQ0_INTE_OFFSET -> k.inte[0]
+            reg.IRQ0_INTF_OFFSET -> k.intf[0]
+            reg.IRQ0_INTS_OFFSET -> (k.intr() | k.intf[0]) & k.inte[0]
+            reg.IRQ1_INTE_OFFSET -> k.inte[1]
+            reg.IRQ1_INTF_OFFSET -> k.intf[1]
+            reg.IRQ1_INTS_OFFSET -> (k.intr() | k.intf[1]) & k.inte[1]
+            _ ->
+                if address >= reg.TXF0_OFFSET && address <= reg.TXF3_OFFSET then return Err(PioFault.Refused(s"TXF${(address - reg.TXF0_OFFSET) / 4} is write-only: what a read returns is not modelled"))
+                if address >= reg.RXF0_OFFSET && address <= reg.RXF3_OFFSET
+                    val s = (address - reg.RXF0_OFFSET) / 4
+                    val m = &k.sms[s]
+                    if m.rx_empty()
+                        // Undefined data; the flag is the defined part.
+                        k.fdebug |= 1 << (reg.FDEBUG_RXUNDER_SHIFT + s)
+                        return Ok(0)
+                    val x = m.rx.pop()
+                    self.wake_blocked(now)
+                    return Ok(read_lane(x, offset, width))
+                // The instruction memory is write-only, and reads 0 as the UART's write-only registers do.
+                if address >= reg.INSTR_MEM0_OFFSET && address <= reg.INSTR_MEM31_OFFSET then return Ok(0)
+                if address >= reg.RXF0_PUTGET0_OFFSET && address <= reg.RXF3_PUTGET3_OFFSET
+                    val s = (address - reg.RXF0_PUTGET0_OFFSET) / PUTGET_STRIDE
+                    self.putget_mode(b, s, address)?
+                    return Ok(read_lane(k.sms[s].rx.entries[entry_of(address)], offset, width))
+                if address < reg.SM0_CLKDIV_OFFSET || address >= reg.RXF0_PUTGET0_OFFSET then return Err(PioFault.Access(AccessError.Unmapped))
+                val m = &k.sms[(address - reg.SM0_CLKDIV_OFFSET) / SM_STRIDE]
+                (address - reg.SM0_CLKDIV_OFFSET) % SM_STRIDE match
+                    0 -> m.clkdiv
+                    4 -> m.execctrl | (if m.exec_stalled then reg.SM0_EXECCTRL_EXEC_STALLED_MASK else 0)
+                    8 -> m.shiftctrl
+                    12 -> m.pc
+                    16 -> k.mem[m.pc]
+                    _ -> m.pinctrl
+        Ok(read_lane(value, offset, width))
+    end read
+
+    // The RX entries of state machine `s` are the processor's: exactly one of FJOIN_RX_PUT and _GET.
+    private putget_mode(*self, b: u32, s: u32, address: u32) -> Result[unit, PioFault]
+        val m = &self.blocks[b].sms[s]
+        val bits = m.shiftctrl & PUT_GET
+        if bits == 0 || bits == PUT_GET then return Err(PioFault.Refused(s"RXF${s}_PUTGET${entry_of(address)} needs exactly one of SM${s}_SHIFTCTRL.FJOIN_RX_PUT and FJOIN_RX_GET set (SHIFTCTRL 0x${hex(m.shiftctrl, 8)})"))
+        Ok(())
+
+    /** Why a write of `value` at `offset` in block `b` asks for something benchtop does not model;
+     * None where it is modelled. A refused write changes nothing.
+     */
+    unmodelled(*self, b: u32, offset: u32, width: u32, value: u32) -> Option[string]
+        if access(offset, width, true).is_err() then return None
+        val address = offset & 0xFFC
+        val data = replicated(value, width)
+        if address < reg.SM0_CLKDIV_OFFSET || address >= reg.RXF0_PUTGET0_OFFSET then return None
+        val s = (address - reg.SM0_CLKDIV_OFFSET) / SM_STRIDE
+        val m = &self.blocks[b].sms[s]
+        (address - reg.SM0_CLKDIV_OFFSET) % SM_STRIDE match
+            0 ->
+                val c = written(m.clkdiv, offset, data)
+                if c >> 16 == 0 && c & reg.SM0_CLKDIV_FRAC_MASK != 0 then return Some(s"SM${s}_CLKDIV: INT 0 (65536) with FRAC ${(c & reg.SM0_CLKDIV_FRAC_MASK) >> 8}, which the datasheet does not allow")
+            4 ->
+                val e = written(m.execctrl, offset, data)
+                if (e & reg.SM0_EXECCTRL_STATUS_SEL_MASK) >> reg.SM0_EXECCTRL_STATUS_SEL_SHIFT == 3 then return Some(s"SM${s}_EXECCTRL.STATUS_SEL 3 is reserved")
+            20 ->
+                val p = written(m.pinctrl, offset, data)
+                if p >> reg.SM0_PINCTRL_SIDESET_COUNT_SHIFT > 5 then return Some(s"SM${s}_PINCTRL.SIDESET_COUNT ${p >> reg.SM0_PINCTRL_SIDESET_COUNT_SHIFT} is more than 5")
+                if (p & reg.SM0_PINCTRL_SET_COUNT_MASK) >> reg.SM0_PINCTRL_SET_COUNT_SHIFT > 5 then return Some(s"SM${s}_PINCTRL.SET_COUNT ${(p & reg.SM0_PINCTRL_SET_COUNT_MASK) >> reg.SM0_PINCTRL_SET_COUNT_SHIFT} is more than 5")
+                if (p & reg.SM0_PINCTRL_OUT_COUNT_MASK) >> reg.SM0_PINCTRL_OUT_COUNT_SHIFT > 32 then return Some(s"SM${s}_PINCTRL.OUT_COUNT ${(p & reg.SM0_PINCTRL_OUT_COUNT_MASK) >> reg.SM0_PINCTRL_OUT_COUNT_SHIFT} is more than 32")
+            _ -> ()
+        None
+
+    /** A write of `width` bytes of `value` at `offset` in block `b` at cycle `now`. */
+    write(*self, b: u32, now: u64, offset: u32, width: u32, value: u32) -> Result[unit, PioFault]
+        access(offset, width, true).map_err(e -> PioFault.Access(e))?
+        self.unmodelled(b, offset, width, value) match
+            Some(why) -> return Err(PioFault.Refused(why))
+            None -> ()
+        val address = offset & 0xFFC
+        val alias = offset & 0x3000 != 0
+        val data = replicated(value, width)
+        val fifo = (address >= reg.TXF0_OFFSET && address <= reg.RXF3_OFFSET) || (address >= reg.RXF0_PUTGET0_OFFSET && address <= reg.RXF3_PUTGET3_OFFSET)
+        val instr = address >= reg.SM0_CLKDIV_OFFSET && address < reg.RXF0_PUTGET0_OFFSET && (address - reg.SM0_CLKDIV_OFFSET) % SM_STRIDE == 16
+        if alias && (fifo || instr) then return Err(PioFault.Access(AccessError.UnsupportedAlias))
+        if address >= reg.RXF0_PUTGET0_OFFSET && address <= reg.RXF3_PUTGET3_OFFSET
+            val s = (address - reg.RXF0_PUTGET0_OFFSET) / PUTGET_STRIDE
+            self.putget_mode(b, s, address)?
+            self.blocks[b].sms[s].rx.entries[entry_of(address)] = data
+            return Ok(())
+        address match
+            reg.CTRL_OFFSET -> self.write_ctrl(b, now, offset, data)
+            reg.FDEBUG_OFFSET -> self.blocks[b].fdebug = w1c(self.blocks[b].fdebug, data)
+            reg.IRQ_OFFSET -> self.blocks[b].irq = w1c(self.blocks[b].irq, data & 0xff)
+            reg.IRQ_FORCE_OFFSET -> self.blocks[b].irq |= triggered(offset, data) & 0xff
+            reg.INPUT_SYNC_BYPASS_OFFSET -> self.blocks[b].sync_bypass = written(self.blocks[b].sync_bypass, offset, data)
+            reg.GPIOBASE_OFFSET -> self.blocks[b].gpiobase = written(self.blocks[b].gpiobase, offset, data) & reg.GPIOBASE_GPIOBASE_MASK
+            reg.IRQ0_INTE_OFFSET -> self.blocks[b].inte[0] = written(self.blocks[b].inte[0], offset, data) & 0xffff
+            reg.IRQ0_INTF_OFFSET -> self.blocks[b].intf[0] = written(self.blocks[b].intf[0], offset, data) & 0xffff
+            reg.IRQ1_INTE_OFFSET -> self.blocks[b].inte[1] = written(self.blocks[b].inte[1], offset, data) & 0xffff
+            reg.IRQ1_INTF_OFFSET -> self.blocks[b].intf[1] = written(self.blocks[b].intf[1], offset, data) & 0xffff
+            reg.FSTAT_OFFSET | reg.FLEVEL_OFFSET | reg.DBG_PADOUT_OFFSET | reg.DBG_PADOE_OFFSET | reg.DBG_CFGINFO_OFFSET | reg.INTR_OFFSET | reg.IRQ0_INTS_OFFSET | reg.IRQ1_INTS_OFFSET -> ()
+            _ ->
+                if address >= reg.TXF0_OFFSET && address <= reg.TXF3_OFFSET
+                    self.write_tx(b, (address - reg.TXF0_OFFSET) / 4, now, data)
+                elif address >= reg.RXF0_OFFSET && address <= reg.RXF3_OFFSET
+                    ()
+                elif address >= reg.INSTR_MEM0_OFFSET && address <= reg.INSTR_MEM31_OFFSET
+                    val i = (address - reg.INSTR_MEM0_OFFSET) / 4
+                    self.blocks[b].mem[i] = written(self.blocks[b].mem[i], offset, data) & 0xffff
+                elif address >= reg.SM0_CLKDIV_OFFSET && address < reg.RXF0_PUTGET0_OFFSET
+                    self.write_sm(b, (address - reg.SM0_CLKDIV_OFFSET) / SM_STRIDE, (address - reg.SM0_CLKDIV_OFFSET) % SM_STRIDE, now, offset, data)
+                else return Err(PioFault.Access(AccessError.Unmapped))
+        // Anything a stalled state machine waits on may have changed.
+        self.wake_blocked(now)
+        Ok(())
+    end write
+
+    // A word for state machine `s`'s TX FIFO, lost where it is full (TXOVER).
+    private write_tx(*self, b: u32, s: u32, now: u64, data: u32)
+        val m = &self.blocks[b].sms[s]
+        if m.tx_full()
+            self.blocks[b].fdebug |= 1 << (reg.FDEBUG_TXOVER_SHIFT + s)
+            return
+        m.tx.push(data)
+        if self.blocks[b].enabled & (1 << s) != 0 && m.autopull() && m.osr_count >= m.pull_thresh() && m.refill_at == NEVER
+            m.refill_at = m.fire(now, 1)
+            m.wake = min(m.attempt_at, m.refill_at)
+
+    // CTRL: SM_ENABLE, the self-clearing restarts, and the same for the neighbouring blocks.
+    private write_ctrl(*self, b: u32, now: u64, offset: u32, data: u32)
+        val fired = triggered(offset, data)
+        self.enable(b, written(self.blocks[b].enabled, offset, data) & 15, now)
+        self.restarts(b, (fired & reg.CTRL_SM_RESTART_MASK) >> reg.CTRL_SM_RESTART_SHIFT, (fired & reg.CTRL_CLKDIV_RESTART_MASK) >> reg.CTRL_CLKDIV_RESTART_SHIFT, now)
+        val next = (fired & reg.CTRL_NEXT_PIO_MASK_MASK) >> reg.CTRL_NEXT_PIO_MASK_SHIFT
+        val prev = (fired & reg.CTRL_PREV_PIO_MASK_MASK) >> reg.CTRL_PREV_PIO_MASK_SHIFT
+        for (c, mask) in [((b + 1) % PIO_BLOCKS, next), ((b + PIO_BLOCKS - 1) % PIO_BLOCKS, prev)]
+            if mask == 0 || !self.connected(b, c) then continue
+            var on = self.blocks[c].enabled
+            if fired & reg.CTRL_NEXTPREV_SM_ENABLE_MASK != 0 then on |= mask
+            if fired & reg.CTRL_NEXTPREV_SM_DISABLE_MASK != 0 then on &= ~mask
+            self.enable(c, on, now)
+            if fired & reg.CTRL_NEXTPREV_CLKDIV_RESTART_MASK != 0 then self.restarts(c, 0, mask, now)
+
+    // SM_RESTART for the state machines in `sms`, CLKDIV_RESTART for those in `dividers`.
+    private restarts(*self, b: u32, sms: u32, dividers: u32, now: u64)
+        for s in 0u32..<PIO_SMS
+            if sms & (1 << s) != 0
+                self.blocks[b].sms[s].restart()
+                if self.sm_running(b, s)
+                    val m = &self.blocks[b].sms[s]
+                    m.blocked = false
+                    m.attempt_at = m.fire(now, 1)
+                    m.wake = min(m.attempt_at, m.refill_at)
+                else
+                    self.blocks[b].sms[s].attempt_at = NEVER
+                    self.blocks[b].sms[s].wake = NEVER
+            if dividers & (1 << s) != 0 then self.redivide(b, s, now, self.blocks[b].sms[s].clkdiv, true)
+
+    // One of state machine `s`'s registers, `index` bytes into its six.
+    private write_sm(*self, b: u32, s: u32, index: u32, now: u64, offset: u32, data: u32)
+        val m = &self.blocks[b].sms[s]
+        index match
+            0 -> self.redivide(b, s, now, written(m.clkdiv, offset, data) & (reg.SM0_CLKDIV_INT_MASK | reg.SM0_CLKDIV_FRAC_MASK), false)
+            4 -> m.execctrl = written(m.execctrl, offset, data) & ~reg.SM0_EXECCTRL_EXEC_STALLED_MASK
+            8 ->
+                var next = written(m.shiftctrl, offset, data) & SHIFTCTRL_BITS
+                if next & PUT_GET != 0 then next &= ~(reg.SM0_SHIFTCTRL_FJOIN_TX_MASK | reg.SM0_SHIFTCTRL_FJOIN_RX_MASK)
+                if (next ^ m.shiftctrl) & JOINS != 0
+                    m.tx.flush()
+                    m.rx.flush()
+                m.shiftctrl = next
+            12 -> ()
+            16 ->
+                val was = self.sm_running(b, s)
+                m.exec_pending = true
+                m.exec_instr = data & 0xffff
+                m.exec_system = true
+                m.exec_stalled = false
+                m.issued = false
+                m.waiting = false
+                m.halted = false
+                if !was
+                    m.attempt_at = m.fire(now, 1)
+                elif m.blocked || m.attempt_at == NEVER
+                    m.blocked = false
+                    m.attempt_at = m.fire(now, 1)
+                m.wake = min(m.attempt_at, m.refill_at)
+            _ -> m.pinctrl = written(m.pinctrl, offset, data)
+end Pio
+
+/** What an instruction did: went on to the next, jumped (or wrote the PC), or stalled, on something
+ * an event changes or on the pins.
+ */
+enum Ran
+    Next
+    Jumped
+    Stalled
+    OnPins
+
+// Which of its state machine's four RX entries an RXFn_PUTGETm address names.
+private entry_of(address: u32) -> u32 = ((address - reg.RXF0_PUTGET0_OFFSET) % PUTGET_STRIDE) / 4
+
+// Make a pin write on block `k`'s pins.
+private apply_write(k: *PioBlock, w: PinWrite)
+    if w.mask == 0 then return
+    if w.dirs then k.pad_oe = (k.pad_oe & ~w.mask) | (w.value & w.mask) else k.pad_out = (k.pad_out & ~w.mask) | (w.value & w.mask)
+
+/** The three blocks at power-on. */
+pio() -> Pio
+    var p: Pio
+    for b in 0u32..<PIO_BLOCKS do p.blocks[b] = pio_block(0)
+    p

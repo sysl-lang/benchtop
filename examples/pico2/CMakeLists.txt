@@ -82,3 +82,9 @@ pico_minimize_runtime(xip_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL 
 target_compile_definitions(xip_loop PRIVATE PICO_HEAP_SIZE=0x200)
 benchtop_program(sram_loop xip_loop.c no_flash)
 pico_minimize_runtime(sram_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
+
+# The PIO programs: pioasm (built from the SDK's tools) assembles pio/*.pio into pio/*.pio.h, which are
+# committed; pio_programs prints them with the configuration each pico-examples init builds.
+benchtop_program(pio_programs pio_programs.c no_flash)
+target_link_libraries(pio_programs hardware_pio)
+pico_generate_pio_header(pio_programs ${CMAKE_CURRENT_LIST_DIR}/pio/hello.pio ${CMAKE_CURRENT_LIST_DIR}/pio/ws2812.pio ${CMAKE_CURRENT_LIST_DIR}/pio/uart_tx.pio ${CMAKE_CURRENT_LIST_DIR}/pio/uart_rx.pio ${CMAKE_CURRENT_LIST_DIR}/pio/rp2350_only.pio OUTPUT_DIR ${CMAKE_CURRENT_LIST_DIR}/pio)
