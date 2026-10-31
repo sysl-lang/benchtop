@@ -348,6 +348,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 32 | **USB host mode** (per Q4). | L | 20 |
 | 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED). | L | 14 |
 | 34 | **POWMAN power states**: STATE, PWRUP0–3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS, the P1.x time skip (Q7) and the power-up boot as far as it needs no ROM. **Done** (below). | M | 27 |
+| 35 | **WFE latch and SEVONPEND**, on both Arm boards: a core asleep in `WFE` with nothing enabled latches every chip line that rises while it sleeps as pending in its NVIC, a pulse included, and SEVONPEND makes an interrupt's becoming pending an event. No speed loss. **Done** (below). | S | 6, 22 |
 
 ### Item 1, done: the Arm Pico 2 and its refusal census
 
@@ -766,9 +767,7 @@ BOOTSEL button). The partition, image and NS-permission functions (`load_partiti
 yet (item 30). On the RISC-V board hart 0's boot path (the ROM's Armv8-M emulator) is not run, and a
 watchdog reset of a hart still ends the run (Q13).
 
-**Fidelity limits.** The MPU is not enforced. A core asleep in `WFE` with no interrupt enabled is not
-signalled until an event wakes it, so a line that rises and falls meanwhile leaves nothing pending in
-its NVIC. `SEVONPEND` is stored and does nothing. The boot salts the board's hand-off sets are fixed
+**Fidelity limits.** The MPU is not enforced. The boot salts the board's hand-off sets are fixed
 values, not the ROM's TRNG-derived ones. A RISC-V hart runs ROM code through the interpreter.
 
 **What changed for the programs.** `WFE` now sleeps on the Pico 2, so the SDK's `sleep_ms` sleeps to
@@ -781,8 +780,7 @@ spin read `lower 9 after 25001 us`. `examples/pico2-riscv/blink.c` now follows e
 **Cost**, host instructions retired, three runs each against the branch's base: `bench --core
 cortex-m33 kernel33.bin` 37.10 G to 37.14 G; `sram_loop.elf` 5.585 G to 5.642 G and `xip_loop.elf`
 5.808 G to 5.865 G (about 1%, core 1 now started and asleep in the ROM); `dcp.elf` 1.136 G to 1.108 G
-(its waits now sleep). Signalling core 1's NVIC every quantum while it waits cost 8% on the loops,
-which is why a core asleep in `WFE` with nothing enabled is not signalled.
+(its waits now sleep). A core asleep in `WFE` latches its lines as item 35 describes.
 
 ### Item 34, done: the power states
 
@@ -1473,7 +1471,7 @@ ran Raspberry Pi's image, whose code needed them; programs reach them too):
 | what | where | model |
 |---|---|---|
 | the ROM's doorbell, its last word | `chip/rp2040.sysl` (`rom_doorbell_refusal`) | a word stored there is the ROM refusing by name: USB boot (BOOTSEL held, no valid boot2, or `reset_usb_boot`), a left-out lookup code, the tables' flags comparison, an exception through the ROM's vectors |
-| SCR | `v6m/t2system.sysl` | every profile's SCR: SLEEPONEXIT, SLEEPDEEP, SEVONPEND stored, SLEEPDEEPS with the Security Extension; an M0+ and a Main core without it used to stop at `Unmapped` |
+| SCR | `v6m/t2system.sysl` | every profile's SCR: SLEEPONEXIT and SLEEPDEEP stored, SEVONPEND making an interrupt's becoming pending an event (item 35), SLEEPDEEPS with the Security Extension; an M0+ and a Main core without it used to stop at `Unmapped` |
 | USB's DPRAM, core 1's stack in the ROM | `chip/rp2040.sysl` | 4 KB of memory, any width, ungated; the controller still refused |
 | TBMAN PLATFORM | `chip/rp2040.sysl` | reads ASIC, ungated; the rest refused |
 | SYSCFG PROC0/1_NMI_MASK | `chip/rp2040.sysl` | stored, 26 bits, ungated; the rest refused; nothing raises an NMI |
@@ -1540,3 +1538,39 @@ kernel33.bin` 36.847–36.853 G to 36.845–36.849 G; `sram_loop.elf` 5.407–5.
 `xip_loop.elf` 5.629–5.636 G to 5.633–5.634 G. Unchanged. `hello_multicore` on the Pico, 0.344–0.346 G
 (dev's build, the compiler's float on the stand-in) to 0.348–0.350 G on this ROM with the SDK's
 defaults; Raspberry Pi's image ran it in 0.349–0.355 G.
+
+### Item 35, done: the WFE latch and SEVONPEND
+
+A core asleep in `WFE` with no interrupt enabled, as core 1 waits in either boot ROM, now has its NVIC
+latch the chip's lines as silicon does: a line that rises and falls while it sleeps stays pending, and
+fires once the core wakes and enables it. Both Arm boards (`chip/arm_board.sysl`), on one mechanism:
+
+- **The chip names its lines as two words**, `ArmChip.shared_lines` (the TIMERs, UARTs, DMA, USB,
+  POWMAN, the RP2040's RTC) and `core_lines(k)` (each core's IO_IRQ_BANK0, SIO FIFO and, on the RP2350,
+  doorbell), bit n for IRQ n. The RISC-V board's `signal` drives a hart's level inputs from the same
+  two words.
+- **Every settle** raises each started core's high lines, a sleeper's included (`v6m.raise_lines`: one
+  test when all are low). A device line rises between settles only as the chip runs up to an access,
+  so the other place a rise can be lost is an access that lowers it before the next settle:
+- **Before a write to the chip, and before a read of a UART's UARTDR** (`ArmChip.read_lowers`: the RX
+  FIFO pop is the one read that lowers a shared line), the other core, when asleep, latches what is
+  high. Every other read is skipped, so a core polling UARTFR or a TIMER while the other sleeps pays
+  nothing. The accessing core is not latched: its handler lowering the line it services must not pend
+  it again.
+- **SEVONPEND** (`v6m/except.sysl` `raise`, `v6m/nvic.sysl` ISPR): an interrupt becoming pending, from a
+  device or an ISPR write, sets the event register, so it wakes a `WFE` without being taken. Already
+  pending, an out-of-range IRQ, ICPR, or SEVONPEND clear are not events.
+
+**Tests**, `chip/wfe_tests.sysl`, six, three on each chip's own board with its own blink image: a TIMER line
+forced and lowered by core 0 while core 1 sleeps is pending in core 1's NVIC only, sleeps on while
+disabled and fires once core 1 enables it, and with no pulse nothing fires; a line held across a settle
+is latched; a TIMER or UARTFR read latches nothing and a UARTDR read does; SEVONPEND wakes the core on the
+pulse without taking it, and clear the core sleeps on; becoming pending is an event once, from a device
+and from ISPR, and never without SEVONPEND. Removing the write latch, the UARTDR latch or the
+SEVONPEND event each turns its tests red.
+
+**Cost**, host instructions retired, three interleaved runs against the branch's base (dev at
+eb87237): `sram_loop.elf` 5.431–5.435 G to 5.415–5.417 G; `xip_loop.elf` 5.653–5.660 G to
+5.631–5.638 G; `bench --core cortex-m33 kernel33.bin` 118.08–118.10 G to 118.08–118.10 G. No loss: the
+line words replace the per-line calls. A latch before every chip access, reads included, cost 0.5% on
+the loops through printf's UARTFR polling while core 1 sleeps, which is why reads are filtered.
