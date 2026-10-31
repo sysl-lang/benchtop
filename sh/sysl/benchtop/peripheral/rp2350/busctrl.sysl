@@ -1,0 +1,202 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, w1c, written}
+import sh.sysl.rp2350.busctrl as busctrl_reg
+import sh.sysl.rp2350.glitch_detector as glitch_reg
+import sh.sysl.rp2350.tbman as tbman_reg
+import sysl.fmt.hex
+
+// BUSCTRL (both chips), the RP2350's TBMAN and its GLITCH_DETECTOR (datasheet 2.1 "Bus fabric", 12.15
+// "System control", 10.9 "Glitch detector").
+
+/** Why one of these blocks refuses an access: a register rule, or a behaviour benchtop does not run. */
+enum BusFault
+    Access(e: AccessError)
+    Refused(why: string)
+
+/** BUS_PRIORITY's four bits: DMA_W, DMA_R, PROC1 and PROC0, at bits 12, 8, 4 and 0. */
+private const PRIORITY_BITS: u32 = 0x1111
+
+/** The RP2350's last performance event (`arbiter_rom_perf_event_access`); the RP2040's is 19. */
+private const LAST_EVENT_RP2350: u32 = 67
+private const LAST_EVENT_RP2040: u32 = 19
+
+/** BUSCTRL: the bus priority, stored, and four performance counters.
+ *
+ * **What is modelled.** BUS_PRIORITY holds its four bits and BUS_PRIORITY_ACK reads 1, as it does once
+ * the arbiters have taken the new levels; the priorities themselves change nothing, since benchtop's
+ * bus is ideal and does not arbitrate (docs/rp-coverage.md Q8). PERFSELn is stored, and PERFCTR_EN (the
+ * RP2350's only; the RP2040's counters always count). A counter reads 0 where the hardware would count
+ * nothing (the RP2350 with PERFCTR_EN clear; an event number that names no event) or where the event
+ * cannot happen on an ideal bus (a stall, or an access contested by another master), and a write to
+ * it clears it.
+ *
+ * **What is refused.** Counting a plain ACCESS event needs the cores' and the DMA's every memory access
+ * counted by target, which is a cost on the fast path the cores never pay; so a counter that has been
+ * counting one while its event was selected is refused when it is read, by name.
+ */
+struct BusCtrl
+    rp2350: bool
+    priority: u32
+    enabled: u32
+    sel: [4]u32
+    // The counters that have counted an access event since they were last cleared.
+    unmodelled: [4]bool
+
+    /** The chip at power-on: every PERFSEL at its reset value, 0x1f. */
+    reset(*self, rp2350: bool)
+        self.rp2350 = rp2350
+        self.priority = 0
+        self.enabled = 0
+        for i in 0..<4 do self.sel[i] = 0x1f
+        for i in 0..<4 do self.unmodelled[i] = false
+
+    private sel_mask(self) -> u32 = if self.rp2350 then 0x7f else 0x1f
+
+    /** Where PERFCTR0 is; PERFSEL0 is a word after it and each counter eight bytes on. */
+    private first(self) -> u32 = if self.rp2350 then busctrl_reg.PERFCTR0_OFFSET else 8
+
+    /** Whether the counters are counting: always on the RP2040, behind PERFCTR_EN on the RP2350. */
+    private counting(self) -> bool = !self.rp2350 || self.enabled & 1 != 0
+
+    /** Whether `sel` names a plain access event, which benchtop does not count. */
+    private is_access(self, sel: u32) -> bool
+        if self.rp2350 then sel <= LAST_EVENT_RP2350 && sel & 3 == 3 else sel <= LAST_EVENT_RP2040 && sel & 1 == 1
+
+    /** Notes the counters that count an access event now. */
+    private note(*self)
+        if !self.counting() then return
+        for i in 0..<4 do if self.is_access(self.sel[i]) then self.unmodelled[i] = true
+
+    /** The counter or select register at `a`: its index, and whether it is the counter. */
+    private slot(self, a: u32) -> Option[(usize, bool)]
+        val first = self.first()
+        if a < first || a >= first + 32 then return None
+        val d = a - first
+        Some((usize(d / 8), d % 8 == 0))
+
+    read(self, offset: u32, width: u32) -> Result[u32, BusFault]
+        access(offset, width, true).map_err(e -> BusFault.Access(e))?
+        val a = offset & 0xFFC
+        var value: u32 = 0
+        if a == busctrl_reg.BUS_PRIORITY_OFFSET
+            value = self.priority
+        elif a == busctrl_reg.BUS_PRIORITY_ACK_OFFSET
+            value = 1
+        elif self.rp2350 && a == busctrl_reg.PERFCTR_EN_OFFSET
+            value = self.enabled
+        else self.slot(a) match
+            Some((i, counter)) ->
+                if !counter
+                    value = self.sel[i]
+                elif self.unmodelled[i]
+                    return Err(BusFault.Refused(s"PERFCTR$i has counted event ${self.sel[i]}, an access event, and benchtop does not count accesses: the cores and the DMA run without a count per target (pico_rand's bus counter entropy source is this; build with PICO_RAND_ENTROPY_SRC_BUS_PERF_COUNTER=0 and PICO_RAND_SEED_ENTROPY_SRC_BUS_PERF_COUNTER=0)"))
+            None -> return Err(BusFault.Access(AccessError.Unmapped))
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, BusFault]
+        access(offset, width, true).map_err(e -> BusFault.Access(e))?
+        val a = offset & 0xFFC
+        val x = replicated(value, width)
+        if a == busctrl_reg.BUS_PRIORITY_OFFSET
+            self.priority = written(self.priority, offset, x) & PRIORITY_BITS
+        elif a == busctrl_reg.BUS_PRIORITY_ACK_OFFSET
+            self.note()
+        elif self.rp2350 && a == busctrl_reg.PERFCTR_EN_OFFSET
+            self.enabled = written(self.enabled, offset, x) & 1
+            self.note()
+        else self.slot(a) match
+            Some((i, counter)) ->
+                if counter then self.unmodelled[i] = false else self.sel[i] = written(self.sel[i], offset, x) & self.sel_mask()
+                self.note()
+            None -> return Err(BusFault.Access(AccessError.Unmapped))
+        Ok(())
+end BusCtrl
+
+busctrl(rp2350: bool) -> BusCtrl
+    var state: BusCtrl
+    state.reset(rp2350)
+    state
+
+/** The RP2350's TBMAN: PLATFORM reads ASIC (the chip is silicon, not an FPGA or a simulator), and a write
+ * is dropped; it has no other register.
+ */
+tbman_read(offset: u32, width: u32) -> Result[u32, BusFault]
+    access(offset, width, true).map_err(e -> BusFault.Access(e))?
+    if offset & 0xFFC != tbman_reg.PLATFORM_OFFSET then return Err(BusFault.Access(AccessError.Unmapped))
+    Ok(read_lane(tbman_reg.PLATFORM_ASIC_MASK, offset, width))
+
+tbman_write(offset: u32, width: u32) -> Result[unit, BusFault]
+    access(offset, width, true).map_err(e -> BusFault.Access(e))?
+    if offset & 0xFFC != tbman_reg.PLATFORM_OFFSET then return Err(BusFault.Access(AccessError.Unmapped))
+    Ok(())
+
+/** The glitch detectors' ARM value that means "not forced armed"; any other value arms them. */
+private const GLITCH_ARM_NO: u32 = 0x5bad
+
+/** The bits of SENSITIVITY a write can change: DEFAULT, the four INV pairs and the four DET pairs. */
+private const GLITCH_SENSITIVITY_BITS: u32 = 0xFF00FFFF
+
+/** GLITCH_DETECTOR, stored. ARM, DISARM, SENSITIVITY and LOCK hold what is written (LOCK, once nonzero,
+ * drops the writes to ARM, DISARM, SENSITIVITY and LOCK), TRIG_STATUS is write-1-to-clear, and a
+ * TRIG_FORCE write sets its TRIG_STATUS bits while the detectors are disarmed. Nothing here senses a
+ * glitch, so nothing triggers by itself.
+ *
+ * **What is refused.** TRIG_FORCE while armed (ARM anything but 0x5bad) would reset the switched core
+ * and latch the cause in POWMAN_CHIP_RESET, which benchtop does not run for this source. The OTP
+ * never arms the detectors on its own: benchtop's OTP cannot program its critical rows, where the
+ * enable flag is.
+ */
+struct GlitchDetector
+    arm: u32
+    disarm: u32
+    sensitivity: u32
+    lock: u32
+    trig: u32
+
+    reset(*self)
+        self.arm = GLITCH_ARM_NO
+        self.disarm = 0
+        self.sensitivity = 0
+        self.lock = 0
+        self.trig = 0
+
+    /** Whether a trigger would reset the chip. */
+    armed(self) -> bool = self.arm != GLITCH_ARM_NO
+
+    read(self, offset: u32, width: u32) -> Result[u32, BusFault]
+        access(offset, width, true).map_err(e -> BusFault.Access(e))?
+        val value = offset & 0xFFC match
+            glitch_reg.ARM_OFFSET -> self.arm
+            glitch_reg.DISARM_OFFSET -> self.disarm
+            glitch_reg.SENSITIVITY_OFFSET -> self.sensitivity
+            glitch_reg.LOCK_OFFSET -> self.lock
+            glitch_reg.TRIG_STATUS_OFFSET -> self.trig
+            glitch_reg.TRIG_FORCE_OFFSET -> 0
+            _ -> return Err(BusFault.Access(AccessError.Unmapped))
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, BusFault]
+        access(offset, width, true).map_err(e -> BusFault.Access(e))?
+        val x = replicated(value, width)
+        val locked = self.lock != 0
+        offset & 0xFFC match
+            glitch_reg.ARM_OFFSET -> if !locked then self.arm = written(self.arm, offset, x) & 0xFFFF
+            glitch_reg.DISARM_OFFSET -> if !locked then self.disarm = written(self.disarm, offset, x) & 0xFFFF
+            glitch_reg.SENSITIVITY_OFFSET -> if !locked then self.sensitivity = written(self.sensitivity, offset, x) & GLITCH_SENSITIVITY_BITS
+            glitch_reg.LOCK_OFFSET -> if !locked then self.lock = written(self.lock, offset, x) & 0xFF
+            glitch_reg.TRIG_STATUS_OFFSET -> self.trig = w1c(self.trig, x) & 0xF
+            glitch_reg.TRIG_FORCE_OFFSET ->
+                val forced = written(0, offset, x) & 0xF
+                if forced != 0
+                    if self.armed()
+                        return Err(BusFault.Refused(s"TRIG_FORCE 0x${hex(forced)} with the detectors armed (ARM 0x${hex(self.arm, 4)}) would reset the switched core and latch a glitch reset in POWMAN_CHIP_RESET, which benchtop does not run"))
+                    self.trig |= forced
+            _ -> return Err(BusFault.Access(AccessError.Unmapped))
+        Ok(())
+end GlitchDetector
+
+glitch_detector() -> GlitchDetector
+    var state: GlitchDetector
+    state.reset()
+    state
