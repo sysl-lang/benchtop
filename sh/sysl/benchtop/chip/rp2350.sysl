@@ -7,6 +7,9 @@ import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, G
 import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_MAINTENANCE_BASE, XIP_WINDOWS_END, read_xip, xip_aux_read, xip_aux_write, xip_target}
 import sh.sysl.benchtop.peripheral.rp2350.{DREQ_UART0_TX, Frame, Sent, UART_UNITS_PER_CYCLE, uart_of}
 import sh.sysl.benchtop.peripheral.rp2350.{Pio, PioFault}
+import sh.sysl.benchtop.peripheral.rp2350.{DREQ_SPI0_TX, SpiHost, Spis, spi_of}
+import sh.sysl.rp2350.spi0 as spi0_reg
+import sh.sysl.rp2350.spi1 as spi1_reg
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
@@ -78,6 +81,8 @@ const SIO_IRQ_FIFO: u32 = 25
 const SIO_IRQ_BELL: u32 = 26
 const POWMAN_IRQ_POW: u32 = 44
 const POWMAN_IRQ_TIMER: u32 = 45
+const SPI0_IRQ: u32 = 31
+const SPI1_IRQ: u32 = 32
 const UART0_IRQ: u32 = 33
 const UART1_IRQ: u32 = 34
 const USBCTRL_IRQ: u32 = 14
@@ -128,6 +133,8 @@ enum Block
     OtpDataRawGuarded
     OtpBlock
     DmaBlock
+    Spi0
+    Spi1
 
 /** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
 struct Placed
@@ -137,7 +144,7 @@ struct Placed
     reset: u32
 
 /** Every block the chip runs, with the SVD's base addresses. */
-val BLOCKS: [37]Placed = [
+val BLOCKS: [39]Placed = [
     Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
     Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -151,6 +158,8 @@ val BLOCKS: [37]Placed = [
     Placed(Block.PadsBank0, pads_reg.BASE, "PADS_BANK0", resets_reg.RESET_PADS_BANK0_MASK),
     Placed(Block.Uart0, uart0_reg.BASE, "UART0", resets_reg.RESET_UART0_MASK),
     Placed(Block.Uart1, uart1_reg.BASE, "UART1", resets_reg.RESET_UART1_MASK),
+    Placed(Block.Spi0, spi0_reg.BASE, "SPI0", resets_reg.RESET_SPI0_MASK),
+    Placed(Block.Spi1, spi1_reg.BASE, "SPI1", resets_reg.RESET_SPI1_MASK),
     Placed(Block.Sio, sio_reg.BASE, "SIO", 0),
     Placed(Block.BootRam, bootram_reg.BASE, "BOOTRAM", 0),
     // Not gated by RESETS: the SDK reads SIE_CTRL before it releases USBCTRL
@@ -269,6 +278,8 @@ struct Rp2350
     // reaches it (`connect_memory`).
     dma: Dma
     memory: Option[*DmaMemory]
+    // The two SPIs, and the clock they share while one is busy (`advance_spi`).
+    spi: Spis
 
     /** Power-on, with core 1 in the boot ROM; the flash keeps its array, as the board's part, and the
      * board's memory stays connected.
@@ -347,6 +358,8 @@ struct Rp2350
         self.watchdog_reset()
         // The UARTs count only while their lines are busy, so an idle UART costs nothing here.
         if self.uarts[0].active() || self.uarts[1].active() then self.advance_lines(cycles, sys)
+        // Likewise the SPIs, whose clock counts only while a transfer or a receive timeout is pending.
+        if self.spi.live() then self.spi.pass(self, cycles, sys, self.clocks.peri_hz(self.sources()))
     end advance_devices
 
     // `cycles` of clk_sys at `sys` Hz pass on the UARTs' lines, as clk_peri's cycles, event by event: each
@@ -391,6 +404,10 @@ struct Rp2350
     // The clk_sys cycles until a UART's line next does something (`Uart.until_event`); None while both
     // are idle or clk_peri is stopped.
     private[chip] line_due(*self) -> Option[u64]
+        earliest(self.uart_due(), self.spi.due(self.sys_hz(), self.clocks.peri_hz(self.sources())))
+
+    // The clk_sys cycles until a UART's line next does something.
+    private uart_due(*self) -> Option[u64]
         if !self.uarts[0].active() && !self.uarts[1].active() then return None
         val peri = self.clocks.peri_hz(self.sources())
         val sys = self.sys_hz()
@@ -406,7 +423,7 @@ struct Rp2350
      * (clk_peri stopped).
      */
     sending_due(*self, k: usize) -> Option[u64]
-        if self.uarts[k].sending() then return self.line_due()
+        if self.uarts[k].sending() then return self.uart_due()
         if self.dma.busy != 0 && self.dma_feeds(k) && self.uarts[k].dreq_tx() then return Some(1)
         None
 
@@ -542,6 +559,9 @@ struct Rp2350
      * a request that is not a UART's.
      */
     uart_dreq(*self, dreq: u32) -> Option[bool]
+        if dreq >= DREQ_SPI0_TX && dreq < DREQ_SPI0_TX + 4
+            val k = usize((dreq - DREQ_SPI0_TX) / 2)
+            return Some(if (dreq - DREQ_SPI0_TX) % 2 == 0 then self.spi.dreq_tx(k) else self.spi.dreq_rx(k))
         if dreq < DREQ_UART0_TX || dreq >= DREQ_UART0_TX + 4 then return None
         val k = usize((dreq - DREQ_UART0_TX) / 2)
         Some(if (dreq - DREQ_UART0_TX) % 2 == 0 then self.uarts[k].dreq_tx() else self.uarts[k].dreq_rx())
@@ -601,6 +621,8 @@ struct Rp2350
             PadsBank0 -> self.pads.read(o, width)
             Uart0 -> self.uarts[0].read(o, width)
             Uart1 -> self.uarts[1].read(o, width)
+            Spi0 -> self.spi.read(self, 0, o, width)
+            Spi1 -> self.spi.read(self, 1, o, width)
             Sio -> self.sio.read(core, o, width, self.inputs())
             BootRam -> self.bootram.read(o, width)
             UsbCtrl ->
@@ -682,6 +704,8 @@ struct Rp2350
                 r
             Uart0 -> return self.uart_write(0, p, o, width, x)
             Uart1 -> return self.uart_write(1, p, o, width, x)
+            Spi0 -> return self.spi_write(0, p, o, width, x)
+            Spi1 -> return self.spi_write(1, p, o, width, x)
             Pio0 | Pio1 | Pio2 ->
                 self.pio_catch_up()
                 return self.pio.write(pio_index(p.block), self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
@@ -999,6 +1023,8 @@ struct Rp2350
                 PadsBank0 -> self.pads.reset()
                 Uart0 -> self.uarts[0].reset()
                 Uart1 -> self.uarts[1].reset()
+                Spi0 -> self.spi.reset(0)
+                Spi1 -> self.spi.reset(1)
                 Pio0 -> self.pio.reset_block(0, self.now)
                 Pio1 -> self.pio.reset_block(1, self.now)
                 Pio2 -> self.pio.reset_block(2, self.now)
@@ -1006,6 +1032,21 @@ struct Rp2350
                 PadsQspi -> self.pads_qspi.reset()
                 DmaBlock -> self.dma.reset()
                 _ -> ()
+
+    // A write to SPI `k`, refused where it asks for something benchtop does not model
+    // (`Spis.unmodelled`), or enables a port whose pins the GPIO interrupts watch: they sample levels
+    // at accesses, not at the clock's edges. A refused write leaves the SPI as it was.
+    private spi_write(*self, k: usize, p: Placed, o: u32, width: u32, x: u32) -> Result[unit, string]
+        self.spi.unmodelled(k, o, width, x) match
+            Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
+            None -> ()
+        if o & 0xFFC == 4 && x & 2 != 0
+            for g in 0..<GPIO_COUNT
+                val mine = rp.route(g, self.io.function(g)) match
+                    SpiSck | SpiTx | SpiRx -> spi_of(g) == k
+                    _ -> false
+                if mine && self.io.irq.watched(g) then return Err(s"${p.name} + 0x${hex(o)}: enabled with GPIO $g, one of its pins, watched by the GPIO interrupts, which do not sample the clock's edges")
+        self.spi.write(self, k, o, width, x).map_err(e -> refusal(p, o, e))
 
     // A write to UART `k`, refused where it asks for something benchtop does not model: a setting
     // (`Uart.unmodelled`), a character to send with no divisor to time it, or a frame its pins cannot show.
@@ -1033,7 +1074,10 @@ struct Rp2350
             Sio -> Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
             // A UART's TX drives its line: high while idle, a frame's bits, low through a break.
             UartTx -> Drive(self.uarts[uart_of(n)].line_level(), true)
-            UartRx | Null -> Drive(false, false)
+            // An SPI's SCK and TX drive the clock and MOSI levels while its port is enabled.
+            SpiSck -> Drive(self.spi.sck(spi_of(n)), self.spi.enabled(spi_of(n)))
+            SpiTx -> Drive(self.spi.tx(spi_of(n)), self.spi.enabled(spi_of(n)))
+            UartRx | SpiRx | Null -> Drive(false, false)
         self.io.after_overrides(n, d)
 
     /** What GPIO `n` is doing: whether its pad drives, and its level. Something outside drives it, or
@@ -1090,10 +1134,21 @@ struct Rp2350
         p.interrupt(POWMAN_IRQ_TIMER, self.powman.irq_timer())
         p.interrupt(UART0_IRQ, self.uarts[0].irq())
         p.interrupt(UART1_IRQ, self.uarts[1].irq())
+        p.interrupt(SPI0_IRQ, self.spi.irq(0))
+        p.interrupt(SPI1_IRQ, self.spi.irq(1))
         p.interrupt(USBCTRL_IRQ, self.usb.irq())
         for j in 0u32..<4 do p.interrupt(DMA_IRQ_0 + j, self.dma.irq(j))
         p.machine_timer(self.sio.software_irq(k), self.sio.timer_irq(k))
 end Rp2350
+
+// An SPI's MISO is the level its RX pin reads: the GPIO of its group whose function is its RX, after
+// the pad and INOVER; low where no pin is selected.
+impl SpiHost for Rp2350
+    spi_miso(*self, unit: usize) -> bool
+        for b in 0u32..<6
+            val n = 16 * (b / 2) + 4 * (b % 2) + 8 * u32(unit)
+            if rp.route(n, self.io.function(n)) == rp.Route.SpiRx then return self.io.peripheral_input(n, self.pin(n).input)
+        false
 
 /** The chip at power-on, with core 1 in the boot ROM. */
 rp2350() -> Rp2350 =
@@ -1101,7 +1156,7 @@ rp2350() -> Rp2350 =
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.pio(), rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
         rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), false,
-        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None)
+        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None, rp.spis())
 
 // The chip as `ArmBoard` drives it: its inherent methods under the trait's names.
 impl ArmChip for Rp2350

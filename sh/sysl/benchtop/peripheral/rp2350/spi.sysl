@@ -1,0 +1,179 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.ContextModel
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.benchtop.peripheral.spi as spi
+import sh.sysl.benchtop.timing.NEVER
+import sysl.math.min
+
+// The RP2040's and RP2350's two PL022 SPI controllers (datasheet, "SPI"), as masters in Motorola SPI
+// modes: the shared model `peripheral/spi/spi.sysl`, put on the chips' bus with their register rules
+// (width, aliases), a clock counted in clk_peri cycles that runs only while a transfer or a receive
+// timeout is pending, DMA requests, and the pins' levels for the function mux to drive.
+
+/** The SDK's `DREQ_SPI0_TX`; SPI0 RX, SPI1 TX and SPI1 RX follow. */
+const DREQ_SPI0_TX: u32 = 24
+
+/** Which SPI a SPI function on GPIO `n` belongs to: SPI0 on GPIOs 0–7, 16–23, 32–39 and 48 up, SPI1 on
+ * the rest. The pins of each group of four are RX, CSn, SCK and TX.
+ */
+spi_of(n: u32) -> usize = usize(n / 8 % 2)
+
+/** What the chip answers a controller's pins with: the level on the RX pin of SPI `unit`, as the GPIO
+ * that carries it reads (the chip decides which, and what drives it).
+ */
+trait SpiHost
+    spi_miso(*self, unit: usize) -> bool
+
+/** The context a controller's pins are answered from. */
+struct SpiCtx
+    host: *SpiHost
+    unit: usize
+
+private const CR0: u32 = 0x00
+private const CR1: u32 = 0x04
+private const DR: u32 = 0x08
+private const CPSR: u32 = 0x10
+private const IMSC: u32 = 0x14
+private const ICR: u32 = 0x20
+private const DMACR: u32 = 0x24
+
+/** Both SPIs and the clock they share, in clk_peri cycles that count only while one of them is busy;
+ * a controller idle or behind it is brought up to it before it is touched.
+ */
+struct Spis
+    units: [2]spi.Controller[SpiCtx]
+    time: u64
+    // The clk_sys cycles' remainder carried into the next clk_peri cycle.
+    rest: u64
+
+    /** A controller back at its power-on state; the clock stays. */
+    reset(*self, unit: usize) = self.units[unit].reset()
+
+    private bring(*self, host: *SpiHost, unit: usize)
+        var ctx = SpiCtx(host, unit)
+        self.units[unit].advance(&ctx, self.time)
+
+    // Register `address`'s value after a write of `data` at `offset`, cut to the register's width.
+    private next(*self, unit: usize, offset: u32, data: u32) -> u32
+        val c = &self.units[unit]
+        (offset & 0xFFC) match
+            CR0 -> written(c.cr0, offset, data) & 0xFFFF
+            CR1 -> written(c.cr1, offset, data) & 15
+            CPSR -> written(c.cpsr, offset, data) & 255
+            IMSC -> written(c.mask, offset, data) & 15
+            DMACR -> written(c.dma, offset, data) & 3
+            DR -> data & 0xFFFF
+            ICR -> data & 3
+            _ -> data
+
+    /** Why writing `value` at `offset` of SPI `unit` is refused: a setting benchtop does not model, or one
+     * the model takes only with the port disabled.
+     */
+    unmodelled(*self, unit: usize, offset: u32, width: u32, value: u32) -> Option[string]
+        if access(offset, width, true).is_err() then return None
+        val c = &self.units[unit]
+        val next = self.next(unit, offset, replicated(value, width))
+        val enabled = spi.enabled(c)
+        (offset & 0xFFC) match
+            CR0 ->
+                if enabled then return Some("CR0 written while SSE is set: the format is changed with the port disabled")
+            CR1 ->
+                if next & 4 != 0 then return Some("CR1.MS: slave mode is not modelled")
+                if next & 2 != 0
+                    if (c.cr0 & 15) + 1 < 4 then return Some("SSE with CR0.DSS below 3, a reserved data size")
+                    if c.cr0 & 48 != 0 then return Some("SSE with CR0.FRF selecting TI synchronous serial or Microwire frames, which are not modelled")
+                    if c.cpsr < 2 || c.cpsr > 254 || c.cpsr & 1 != 0 then return Some(s"SSE with CPSR.CPSDVSR ${c.cpsr}: the clock prescale divisor is even, 2 to 254")
+            CPSR ->
+                if enabled then return Some("CPSR written while SSE is set: the clock is divided with the port disabled")
+                if next < 2 || next > 254 || next & 1 != 0 then return Some(s"CPSR.CPSDVSR $next: the clock prescale divisor is even, 2 to 254")
+            _ -> ()
+        None
+
+    /** A read of SPI `unit`'s register at `offset`. */
+    read(*self, host: *SpiHost, unit: usize, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        if (address == DR || address == ICR) && offset & 0x3000 != 0 then return Err(AccessError.UnsupportedAlias)
+        self.bring(host, unit)
+        self.units[unit].read(address, 4, self.time) match
+            Some(v) -> Ok(read_lane(v, offset, width))
+            None -> Err(AccessError.Unmapped)
+
+    /** A write to SPI `unit`'s register at `offset`; `unmodelled` is asked first. */
+    write(*self, host: *SpiHost, unit: usize, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        if (address == DR || address == ICR) && offset & 0x3000 != 0 then return Err(AccessError.UnsupportedAlias)
+        self.bring(host, unit)
+        var ctx = SpiCtx(host, unit)
+        val next = self.next(unit, offset, replicated(value, width))
+        if !self.units[unit].write(&ctx, address, 4, next, self.time) then return Err(AccessError.Unmapped)
+        Ok(())
+
+    /** SPI `unit`'s transmit request: TXDMAE and room in the transmit FIFO (the PL022's single request). */
+    dreq_tx(*self, unit: usize) -> bool
+        val c = &self.units[unit]
+        c.dma & 2 != 0 && c.tx.len() < c.capacity
+
+    /** SPI `unit`'s receive request: RXDMAE and a word waiting. */
+    dreq_rx(*self, unit: usize) -> bool
+        val c = &self.units[unit]
+        c.dma & 1 != 0 && !c.rx.is_empty()
+
+    irq(*self, unit: usize) -> bool = self.units[unit].irq()
+
+    /** Whether SPI `unit` has its port enabled, so that its SCK and TX pads drive. */
+    enabled(*self, unit: usize) -> bool = spi.enabled(&self.units[unit])
+
+    /** The levels the pads of SPI `unit` are driven with: SCK and TX. */
+    sck(*self, unit: usize) -> bool = self.units[unit].sck
+    tx(*self, unit: usize) -> bool = self.units[unit].mosi
+
+    /** Whether either controller has a transfer under way or a receive timeout still to come, which is
+     * when the clock counts.
+     */
+    live(*self) -> bool
+        for k in 0..<2
+            val c = &self.units[k]
+            if c.shifting || (!c.rx.is_empty() && c.timeout > c.time) then return true
+        false
+
+    /** `cycles` of clk_sys at `sys` Hz pass with clk_peri at `peri` Hz; both controllers run through the
+     * clk_peri cycles that makes. A controller's edges are replayed in order, each with the pins
+     * answering it as they are then.
+     */
+    pass(*self, host: *SpiHost, cycles: u64, sys: u64, peri: u64)
+        if peri == 0 then return
+        // A device access every few cycles (a core polling SSPSR) comes here each time: 64-bit
+        // arithmetic wherever the product fits.
+        if cycles <= 0xFFFFFFFF && peri <= 0xFFFFFFFF
+            val total = self.rest + cycles * peri
+            self.time += total / sys
+            self.rest = total % sys
+        else
+            val total = u128(self.rest) + u128(cycles) * u128(peri)
+            self.time += u64(total / u128(sys))
+            self.rest = u64(total % u128(sys))
+        self.bring(host, 0)
+        self.bring(host, 1)
+
+    /** The clk_sys cycles until a controller next finishes a word or raises its masked receive timeout;
+     * None while neither will, or clk_peri is stopped.
+     */
+    due(*self, sys: u64, peri: u64) -> Option[u64]
+        if peri == 0 || sys == 0 then return None
+        val at = min(self.units[0].due(), self.units[1].due())
+        if at == NEVER then return None
+        val units = if at > self.time then at - self.time else 1
+        // The first c with (rest + c × peri) / sys reaching `units`.
+        val need = u128(units) * u128(sys) - u128(self.rest)
+        Some(u64((need + u128(peri) - 1) / u128(peri)))
+end Spis
+
+/** Both SPIs at power-on. Each answers its pins through the host: the MISO level is the level on the
+ * RX pin of its own number.
+ */
+spis() -> Spis
+    val pins: spi.Pins[SpiCtx] = (ctx, edge) -> ctx.host.spi_miso(ctx.unit)
+    Spis([spi.controller[SpiCtx](8, pins), spi.controller[SpiCtx](8, pins)], 0, 0)
