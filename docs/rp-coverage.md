@@ -107,7 +107,7 @@ day. An L is split before it is handed out (§6).
 | PADS_BANK0 (ISO, IE, OD, pulls, drive, slew) | 9.8 Pads | full | `gpio.sysl:82–131`. Drive and slew are stored. | `rp2350/tests.sysl:169` | — | — |
 | IO_QSPI, PADS_QSPI (including the BOOTSEL read via QSPI_SS) | 9 GPIO | partial (stored) | PADS_QSPI's seven registers and IO_QSPI's eight CTRLs and interrupt registers stored with their reset values and aliases, behind their RESETS bits, which the boards' boot releases (`peripheral/rp2350/qspi_pins.sysl`, item 6). The pins drive nothing (the flash is the QMI's); each STATUS, and so the BOOTSEL read, refused by name. | `peripheral/rp2350/rom_blocks_tests.sysl`, `chip/tests.sysl` | S (levels, BOOTSEL) | XIP for the shared pins |
 | UART0/1 (PL011) | 12.1 UART | full | Item 8: frames timed from clk_peri at the divisor LCR_H latched, through `next_event`; the bits on the TX pin through the mux, frames over wires between GPIOs and from off the chip; FIFOs or holding registers, the IFLS trigger levels, the RT timeout, break both ways, FE/PE/BE/OE, LBE loopback, the TX and RX DREQs (`peripheral/rp2350/uart.sysl`, `chip/rp2350.sysl` `advance_lines`). Refused by name: IrDA, hardware flow control (CTSEN/RTSEN, and the CTS and RTS functions in the mux), reserved IFLS levels, a character with IBRD 0 latched, and a frame its pins cannot show. Modem status reads 0. | `rp2350/uart_tests.sysl`, `chip/uart_tests.sysl` | — | DMA consumes the DREQs (item 11) |
-| SPI0/1 (PL022) | 12.3 SPI | missing | Not on the chip's bus. The PL022 model exists (`peripheral/spi/spi.sysl`) and runs on STM32 and virtual boards. | `peripheral/spi/tests.sysl` (6) | S (place) + S (DREQ) | mux, DMA |
+| SPI0/1 (PL022) | 12.3 SPI | partial | Master mode in Motorola modes 0 to 3, 4 to 16 bits, loopback, FIFOs, interrupts, DREQs 24 to 27, pins through the mux (item 16). CSn's frame signal, slave mode, TI and Microwire frames refused by name. | `peripheral/spi/tests.sysl` (6), `chip/spi_tests.sysl` | — | slave mode, CSn |
 | I2C0/1 (DW_apb_i2c) | 12.2 I2C | missing | `dw-i2c` has `modelled = false` (`registry.sysl:322`). The device callbacks exist (`peripheral/i2c/i2c.sysl`). | — | M (master), S (slave) | mux, DMA |
 | PWM (12 slices) | 12.5 PWM | full | Item 18: every slice's counter in each DIVMODE (free-running, B level, B rising and falling edges) through the fractional divider, phase-correct counting, the inverts, CC and TOP taking effect at the wrap, PH_ADV and PH_RET; INTR, both lines' INTE/INTF/INTS into PWM_IRQ_WRAP_0/1, the 12 wrap DREQs paced DMA answers; the pins through the mux, A and B out and B in, over wires (`peripheral/rp2040/pwm.sysl`, shared, and `chip/pwm.sysl`). Never stepped per cycle. Refused by name: DIV with INT 0, a phase control on a stopped slice, PH_ADV at full speed, PH_ADV with PH_RET, an INTR word showing an unwatched PWM pin, a UART frame into a counting B input. | `rp2040/pwm_tests.sysl`, `chip/pwm_tests.sysl` (`hello_pwm.elf`, `pwm_led_fade.elf`, `measure_duty_cycle.elf`, `pwm_features.elf`) | — | — |
 | ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
@@ -160,7 +160,7 @@ day. An L is split before it is handed out (§6).
 | USB controller (device and host) | 4.1 USB | missing | The same controller as the RP2350's. SIE_CTRL alone is stored, ungated, for the SDK's `runtime_init_usb_power_down`; every other register is refused by name (item 22). Its 4 KB of DPRAM is memory, the top of which is core 1's stack while it waits in the boot ROM (item 23). | `chip/pico_tests.sysl` | (shared) | — |
 | UART0/1 (PL011) | 4.2 UART | partial | The RP2350's `Uart`, placed (item 22): frames timed from clk_peri through `next_event`, its TX on the pins through the mux, IRQs 20 and 21. The workbench's wires and frames sent in from outside (`Rp2350.wire`, `line_in`) are not on the RP2040 yet. | `chip/pico_tests.sysl` (hello_serial) | S (wires) | — |
 | I2C0/1 | 4.3 I2C | missing | Shared. | — | (shared) | — |
-| SPI0/1 (PL022) | 4.4 SPI | missing | The model exists (`peripheral/spi/spi.sysl`). | — | S (place) | chip layer |
+| SPI0/1 (PL022) | 4.4 SPI | partial | The RP2350's placement at the RP2040's addresses and IRQs 18 and 19 (item 16); the same refusals. | `chip/spi_tests.sysl` | — | slave mode, CSn |
 | PWM (8 slices) | 4.5 PWM | full | The RP2350's model at the RP2040's layout (item 18): 8 slices, one line (PWM_IRQ_WRAP, 4), GPIO 0–29 through the mux. Its DREQs are raised and wait for the DMA (item 11 on this chip). | `rp2040/pwm_tests.sysl`, `chip/pwm_tests.sysl` | — | — |
 | TIMER | 4.6 Timer | full | `peripheral/rp2040/timer.sysl:5–120`: latch, 4 alarms, pause, debug pause. | `rp2040/tests.sysl`, `virt/rp_tests.sysl` (13) | — | — |
 | WATCHDOG | 4.7 Watchdog | full | The tick generator and the counter shared with the RP2350 (`peripheral/rp2040/watchdog.sysl`), TIME falling two a tick (erratum RP2040-E1): CTRL, LOAD, TRIGGER, REASON, SCRATCH0–7. On the `virt*` boards the reset stops the cores at `Reset`, named, since they have no PSM. On the Pico its reset takes down the PSM stages WDSEL selects and the cores boot again through the ROM (item 23); a reset into the ROM's USB boot is refused by name. | `rp2040/tests.sysl`, `rp2040/watchdog_tests.sysl`, `virt/rp_tests.sysl`, `chip/pico_tests.sysl` | — | — |
@@ -1629,3 +1629,23 @@ examples directory is not rebuilt for this item.
 **Cost**: the devices' step gains a test of `pwm.enabled`; no existing program is changed, so the train's
 bench of the main lines is the comparison. `measure_duty_cycle`, which walks every edge for 50 ms of
 guest time, runs in about 0.1 s.
+
+### Item 16, done: the SPIs
+
+The shared PL022 model (`peripheral/spi/spi.sysl`) on both chips' buses as SPI0 and SPI1
+(`peripheral/rp2350/spi.sysl`, `Spis`; the chips' `spi_write`, `SpiHost`, the mux's `SpiSck`/`SpiTx`/`SpiRx`).
+
+- **Clock**: clk_peri cycles counted only while a word is shifting or a receive timeout is pending, so an
+  idle SPI costs nothing; the chip offers the next word's end or timeout as `next_event`. A bit is CPSDVSR x
+  (SCR + 1) cycles.
+- **Pins**: SCK and TX drive their pads while SSE is set (SCK idling at CPOL's level); MISO is the level on
+  the RX pin of the port's group (a wire from TX gives a loopback off the chip, CR1.LBM one inside it).
+- **DMA**: TX request (TXDMAE and room) and RX request (RXDMAE and a word) as DREQs 24 to 27; the
+  RP2350's TREQ set gains them. Interrupts on lines 31 and 32 (RP2350), 18 and 19 (RP2040).
+- **Refused by name**: slave mode, CSn's function (the SDK's examples drive chip select from a GPIO),
+  TI and Microwire frames, a reserved data size, an odd or out-of-range CPSDVSR, CR0 or CPSR written with SSE
+  set, DR and ICR through an alias, and enabling a port whose pins the GPIO interrupts watch. The DMA test of
+  "SPI0's DREQ refused" now names the PWM's.
+- **Oracle**: pico-examples' `spi/spi_dma` (`examples/pico2/spi_dma.elf`), output asserted line by line.
+  `chip/spi_tests.sysl`: timing, modes x sizes, wires, FIFOs, interrupts, DREQs, a paced DMA loopback,
+  refusals, reset, the RP2040. Breaking `dreq_rx` turned three of them red.
