@@ -166,6 +166,7 @@ enum Block40
     Vreg
     IoQspi
     PadsQspi
+    PwmBlock
 
 /** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
 struct Placed40
@@ -199,6 +200,7 @@ val BLOCKS_RP2040: [20]Placed40 = [
     Placed40(Block40.Vreg, vreg_reg.BASE, "VREG_AND_CHIP_RESET", 0),
     Placed40(Block40.IoQspi, io_qspi_reg.BASE, "IO_QSPI", resets_reg.RESET_IO_QSPI_MASK),
     Placed40(Block40.PadsQspi, pads_qspi_reg.BASE, "PADS_QSPI", resets_reg.RESET_PADS_QSPI_MASK),
+    Placed40(Block40.PwmBlock, pwm_reg.BASE, "PWM", resets_reg.RESET_PWM_MASK),
 ]
 
 /** A block on the RP2040's bus that benchtop does not run yet: its window, its name and why. */
@@ -214,7 +216,6 @@ val ABSENT_RP2040: [11]Absent40 = [
     Absent40(spi1_reg.BASE, WINDOW_RP2040, "SPI1", "not on the chip yet (docs/rp-coverage.md item 16)"),
     Absent40(i2c0_reg.BASE, WINDOW_RP2040, "I2C0", "not on the chip yet (docs/rp-coverage.md item 17)"),
     Absent40(i2c1_reg.BASE, WINDOW_RP2040, "I2C1", "not on the chip yet (docs/rp-coverage.md item 17)"),
-    Absent40(pwm_reg.BASE, WINDOW_RP2040, "PWM", "not on the chip yet (docs/rp-coverage.md item 18)"),
     Absent40(adc_reg.BASE, WINDOW_RP2040, "ADC", "not on the chip yet (docs/rp-coverage.md item 19)"),
     Absent40(dma_reg.BASE, 0x1000, "DMA", "not on the chip yet (docs/rp-coverage.md item 11)"),
     Absent40(pio0_reg.BASE, 0x1000, "PIO0", "not on the chip yet (docs/rp-coverage.md items 13 and 14)"),
@@ -289,6 +290,10 @@ struct Rp2040
     // Why the chip did something benchtop does not model while time passed (a watchdog reset into USB
     // boot, a UART frame its pins cannot show), for the board to stop on; empty for nothing.
     fault: string
+    // The PWM block (pwm.sysl runs it), as on the RP2350.
+    pwm: r40.Pwm
+    pwm_watched: bool
+    pwm_stepping: bool
 
     /** Power-on, with core 1 in the boot ROM. */
     reset(*self)
@@ -328,6 +333,7 @@ struct Rp2040
         self.timer.advance(ticks, 0)
         self.watchdog_fired()
         if self.uarts[0].active() || self.uarts[1].active() then self.advance_lines(cycles, sys)
+        if self.pwm.enabled != 0 then self.advance_pwm(cycles)
     end advance
 
     // `cycles` of clk_sys at `sys` Hz pass for the RTC, as clk_rtc's cycles.
@@ -523,6 +529,9 @@ struct Rp2040
             if self.io.irq.watched(g) then return Some(s"UART$k sends a frame on GPIO $g, whose interrupts are enabled: the GPIO interrupts do not sample a frame's bits")
         None
 
+    /** The level PWM offers GPIO `n`'s channel, for a test. */
+    pwm_pin(*self, n: u32) -> bool = self.drive(n).out
+
     // The clk_sys cycles until the watchdog's tick generator has made `n` ticks from now, rounded up;
     // None while it is stopped.
     private ticks_to_cycles(*self, n: u64) -> Option[u64]
@@ -554,8 +563,11 @@ struct Rp2040
             PllUsb -> if pll_lacks(o) then Err(AccessError.Unmapped) else self.pll_usb.read(o, width)
             Watchdog -> self.watchdog.read(o, width)
             Timer -> self.timer.read(o, width)
-            IoBank0 -> self.io.read(o, width, self.pins(), self.drives())
+            IoBank0 ->
+                if self.pwm.enabled != 0 then self.pwm_io_read(p, o)?
+                self.io.read(o, width, self.pins(), self.drives())
             PadsBank0 -> self.pads.read(o, width)
+            PwmBlock -> self.pwm.read(o, width)
             Uart0 -> self.uarts[0].read(o, width)
             Uart1 -> self.uarts[1].read(o, width)
             Psm -> self.psm.read(o, width)
@@ -596,7 +608,7 @@ struct Rp2040
                 if asserted & resets_reg.RESET_IO_QSPI_MASK != 0 then self.cs_changed()?
                 // Every released block is ready at once.
                 self.resets.complete(~self.resets.held)
-                if (self.resets.held ^ before) & (resets_reg.RESET_IO_BANK0_MASK | resets_reg.RESET_PADS_BANK0_MASK) != 0 then self.gpio_changed()
+                if (self.resets.held ^ before) & (resets_reg.RESET_IO_BANK0_MASK | resets_reg.RESET_PADS_BANK0_MASK | resets_reg.RESET_PWM_MASK) != 0 then self.gpio_changed()
                 r
             Clocks ->
                 val before = self.clocks
@@ -633,6 +645,7 @@ struct Rp2040
                 val r = self.pads.write(o, width, x)
                 self.gpio_changed()
                 r
+            PwmBlock -> return self.pwm_write(p, o, width, x)
             Uart0 -> return self.uart_write(0, p, o, width, x)
             Uart1 -> return self.uart_write(1, p, o, width, x)
             Psm ->
@@ -760,6 +773,7 @@ struct Rp2040
                 Uart0 -> self.uarts[0].reset()
                 Uart1 -> self.uarts[1].reset()
                 Rtc -> self.rtc.reset()
+                PwmBlock -> self.pwm.reset()
                 IoQspi -> self.io_qspi.reset()
                 PadsQspi ->
                     self.pads_qspi.reset()
@@ -790,6 +804,7 @@ struct Rp2040
         val d = rp.route(n, self.io.function(n)) match
             Sio -> Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
             UartTx -> Drive(self.uarts[uart_of(n)].line_level(), true)
+            Pwm -> rp.pwm_drive(&self.pwm, n)
             UartRx | Null -> Drive(false, false)
         self.io.after_overrides(n, d)
 
@@ -836,6 +851,7 @@ struct Rp2040
     gpio_changed(*self)
         self.io.irq.sample(self.irq_inputs(), self.resets.held & resets_reg.RESET_IO_BANK0_MASK == 0)
         if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
+        if self.pwm.enabled != 0 || self.pwm_stepping then self.pwm_gpio_changed()
 end Rp2040
 
 /** The RP2040 at power-on, with core 1 in the boot ROM. */
@@ -843,7 +859,7 @@ rp2040() -> Rp2040 =
     Rp2040(r40.resets(), rp.clocks_rp2040(), rp.xosc(), rp.pll(), rp.pll(), r40.watchdog(), r40.timer(), rp.sio_rp2040(),
         [divider(), divider()], rp.io_bank0_rp2040(), rp.pads_bank0_rp2040(), [rp.uart(), rp.uart()], rp.psm_rp2040(), rp.rosc(),
         rp.sysinfo(), 0, [0; 1024], [0, 0], r40.ssi(), r40.xip_ctrl(), w25q16jv(), rp.io_qspi_rp2040(), rp.qspi_pads_rp2040(), r40.vreg(), r40.rtc(), 0, true,
-        false, false, 0, 0, 0, 0, 0, 0, 0, 0, "")
+        false, false, 0, 0, 0, 0, 0, 0, 0, 0, "", r40.pwm_rp2040(), false, false)
 
 impl ArmChip for Rp2040
     const rp2350() -> bool = false
@@ -862,7 +878,7 @@ impl ArmChip for Rp2040
         self.timer.next_alarm(0) match
             Some(n) -> due = earliest(due, self.ticks_to_cycles(n))
             None -> ()
-        earliest(earliest(due, self.line_due()), self.rtc_due())
+        earliest(earliest(earliest(due, self.line_due()), self.rtc_due()), self.pwm_due())
 
     load(*self, core: u32, a: u32, width: u32) -> Result[u32, string]
         // The board maps the ROM on the cores' fast path; an access that reaches the bus reads the same bytes.
@@ -891,6 +907,7 @@ impl ArmChip for Rp2040
         p.interrupt(UART0_IRQ_RP2040, self.uarts[0].irq())
         p.interrupt(UART1_IRQ_RP2040, self.uarts[1].irq())
         p.interrupt(RTC_IRQ_RP2040, self.rtc.irq())
+        p.interrupt(PWM_IRQ_WRAP_RP2040, self.pwm.irq(0))
 
     core1_stopped(*self) -> bool
         val held = self.core1_reset
