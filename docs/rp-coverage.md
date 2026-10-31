@@ -1305,10 +1305,11 @@ to the GPIO mux, the DMA and both cores' NVICs.
 - **DREQs**: TREQ_SEL 0 to 23, eight to a block, TX FIFO 0–3 then RX FIFO 0–3 (`Pio.dreq`): a TX FIFO
   asks while not full, an RX FIFO while not empty, run to the cycle first (`dma_ready`). While a channel
   waits on one, the DMA's step ends at the next cycle a state machine acts (`pio_paced_due`).
-- **Interrupt lines**: each block's IRQ0 and IRQ1 (IRQs 15 to 20) in `shared_interrupts`, once a block has
-  enabled one (`irq_armed`). A line the system lowers before the board next looks (a DMA channel
-  emptying the RX FIFO that raised it) is still reported once (`Pio.take_lines`), as the NVIC latches a
-  pulse; an RXFn read is in `read_lowers`, so a sleeping core latches the line before another core's
+- **Interrupt lines**: each block's IRQ0 and IRQ1 (IRQs 15 to 20) into every core, once a block has
+  enabled one (`irq_armed`). A line the system lowers before a core next looks (a DMA channel emptying
+  the RX FIFO that raised it) is still reported to each core once, as each NVIC latches a pulse: the
+  pulse is latched for both cores and each core's look (`core_interrupts`, `Pio.take_lines`) takes only
+  its own, on both Arm cores and both Hazard3 harts; an RXFn read is in `read_lowers`, so a sleeping core latches the line before another core's
   pop. While a line is enabled, a DMA channel waits on a FIFO, or a GPIO interrupt or POWMAN watches a
   pin a block drives, the blocks' next action is a board event (`pio_due`); otherwise they stay lazy.
 - **The pin record** (`capture_edges`, `pin_edges`): the levels of chosen GPIOs, each change with its
@@ -1317,9 +1318,6 @@ to the GPIO mux, the DMA and both cores' NVICs.
 - **Refused by name**: a block driving a GPIO wired to a UART's RX (the UARTs receive whole frames from
   another UART), and a block driving a GPIO POWMAN watches as its timer reference or a power-up request.
   On the RP2040, FUNCSEL 6 and 7 stay refused: its PIO is not on the chip.
-- **A fidelity limit**: a pulse is reported to the first look after it. On the Arm board that is both
-  NVICs at a settle, or the sleeping core alone before the other core's access; on the RISC-V board, the
-  first hart signalled.
 
 The oracles are pico-examples' own programs run whole on the Arm Pico 2 (`chip/pio_examples_tests.sysl`,
 `examples/pico2/pio_*.c` unchanged, commit 0d62f75): `pio_blink` (PIO2 at offset 24, GPIO 3–6 at 4, 3, 2
@@ -1332,7 +1330,8 @@ DMA paced by the RX DREQ, PIO2's IRQ 0 on RX-not-empty printing progress: `pio_r
 interrupts, `pio_rx dma_rx=43/43`, `Test passed`, as the SDK's `printf` waits for UART0 to drain in the
 first handler). `chip/pio_tests.sysl` adds the SDK's `uart_tx` relocated to offset 28 on PIO2 through the
 mux, the pin record across a FUNCSEL hand-over and back to the SIO, all 24 DREQs, and both refusals;
-`chip/wfe_tests.sysl` a sleeper latching before an RXF3 read. The first runs found the pin record missing
+`chip/wfe_tests.sysl` a sleeper latching before an RXF3 read; and `chip/pio_tests.sysl` a DMA-emptied
+pulse taken once by each core's look, and by both Arm cores' NVICs and both harts. The first runs found the pin record missing
 a level the mux handed over (it recorded only the blocks' own moves) and the interrupt lost when the DMA
 emptied the FIFO within the quantum; both are fixed and tested. Breaking the DREQ direction, the pin
 record's mux path, the pulse latch, the IRQ numbering or the RXF window in `read_lowers` each turns
@@ -1345,8 +1344,10 @@ about 0.3%; `bench --core cortex-m33 kernel33.bin`, which never touches the chip
 program uses a PIO block, so the cost is in paths they share. Variants rule out the struct's growth and
 its new `Buf`, `pio.sysl` and `uart.sysl`, the TREQ mask, the PIO terms in `shared_interrupts` and
 `gpio_changed`, the catch-ups in the bus's `read` and `write`, and `advance_lines` and `route`, each
-alone; the rest is not yet attributed. The catch-up, a PIO write and the line read are out of line, and
-the PIO routes and drives are tested last.
+alone; the rest is not yet attributed. The catch-up, a PIO write and the line read are out of line, the
+PIO routes and drives are tested last, and `gpio_changed` on a chip whose PIO nobody has touched is one
+test (`pio_on`); none of these moved the numbers (with the last, three rounds: 5.489 G to 5.503 G and
+5.698 G to 5.727 G).
 
 ### Item 22, done: the RP2040 chip layer
 
