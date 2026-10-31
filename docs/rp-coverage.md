@@ -326,7 +326,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 11 | **DMA core**: channels, DREQ inputs, pacing timers, chaining, ring, IRQs. The register model is shared by both chips' channel counts. **Done** (below). | L | 9 |
 | 12 | **DMA sniff/CRC and security attributes**. | S | 11 |
 | 13 | **PIO state machine**: the instruction set, FIFOs, shift registers, side-set, divider, IRQ flags, and the RP2350 additions, with register-level tests. **Done** (below). | L | 9 |
-| 14 | **PIO integration**: pins through the mux, DREQs, the IRQ lines. `ws2812`, `pio_blink`, `uart_tx` and `uart_rx` are its oracles. | M | 11, 13 |
+| 14 | **PIO integration**: pins through the mux, DREQs, the IRQ lines. `ws2812`, `pio_blink`, `uart_tx` and `uart_rx` are its oracles. **Done** (below). | M | 11, 13 |
 | 15 | **Doorbells and interpolators** (shared by both chips). **Done** (below). | M | 1 |
 | 16 | **SPI on the chip**: the PL022 placed, with DREQs. | S | 9, 11 |
 | 17 | **I²C (DW_apb_i2c) master and slave**. **Done** (below). | M | 9, 11 |
@@ -1287,6 +1287,66 @@ these runs; the rest of the 0.04–0.06% is the base's own spread between sessio
 as `kernel33` moving both ways shows. Two first cuts cost 0.08%: a test in `advance` on every clk_sys
 step, and a `take_line_fault` that had grown past inlining; the blocks now run only when something can
 see them, and the rare path is out of line (`next_line_fault`).
+
+### Item 14, done: PIO integration
+
+`chip/rp2350.sysl`, `chip/dma.sysl`, `peripheral/rp2350/pio.sysl` and `gpio.sysl`: the blocks of item 13 joined
+to the GPIO mux, the DMA and both cores' NVICs.
+
+- **Pins through the mux**: FUNCSEL 6, 7 and 8 route a GPIO to PIO0, PIO1 or PIO2, which drives it with the
+  level and direction its block holds for the pin GPIOBASE puts there (`pio_output`), then CTRL's
+  overrides and the pad as for any function. `Pio.advance_to` stops after any cycle that moved a pin
+  (`pins_moved`), so the chip carries the level on that cycle: the GPIO interrupts sample it, the blocks
+  read it back through their synchronisers, and the pin record notes it. Every level the blocks read is
+  the pad's after INOVER (`inputs_now`), kept current only once a state machine has run (`listening`);
+  a UART line's bit edges are events then too (`advance_lines`, `Uart.until_bit`), and a write to the
+  SIO, IO_BANK0, PADS_BANK0, RESETS, a UART or a wire first runs the blocks to the access with the old
+  levels. A block's reset lets go of its pins.
+- **DREQs**: TREQ_SEL 0 to 23, eight to a block, TX FIFO 0–3 then RX FIFO 0–3 (`Pio.dreq`): a TX FIFO
+  asks while not full, an RX FIFO while not empty, run to the cycle first (`dma_ready`). While a channel
+  waits on one, the DMA's step ends at the next cycle a state machine acts (`pio_paced_due`).
+- **Interrupt lines**: each block's IRQ0 and IRQ1 (IRQs 15 to 20) in `shared_interrupts`, once a block has
+  enabled one (`irq_armed`). A line the system lowers before the board next looks (a DMA channel
+  emptying the RX FIFO that raised it) is still reported once (`Pio.take_lines`), as the NVIC latches a
+  pulse; an RXFn read is in `read_lowers`, so a sleeping core latches the line before another core's
+  pop. While a line is enabled, a DMA channel waits on a FIFO, or a GPIO interrupt or POWMAN watches a
+  pin a block drives, the blocks' next action is a board event (`pio_due`); otherwise they stay lazy.
+- **The pin record** (`capture_edges`, `pin_edges`): the levels of chosen GPIOs, each change with its
+  clk_sys cycle, from a block's move and from any change through the mux, pads, SIO or outside; current
+  to the last catch-up (each board quantum). It is how the tests read a PIO program's waveform.
+- **Refused by name**: a block driving a GPIO wired to a UART's RX (the UARTs receive whole frames from
+  another UART), and a block driving a GPIO POWMAN watches as its timer reference or a power-up request.
+  On the RP2040, FUNCSEL 6 and 7 stay refused: its PIO is not on the chip.
+- **A fidelity limit**: a pulse is reported to the first look after it. On the Arm board that is both
+  NVICs at a settle, or the sleeping core alone before the other core's access; on the RISC-V board, the
+  first hart signalled.
+
+The oracles are pico-examples' own programs run whole on the Arm Pico 2 (`chip/pio_examples_tests.sysl`,
+`examples/pico2/pio_*.c` unchanged, commit 0d62f75): `pio_blink` (PIO2 at offset 24, GPIO 3–6 at 4, 3, 2
+and 1 Hz, each half period exact to the clk_sys cycle, all low after the clean shutdown); `ws2812` (its
+first frame's 150 pixels off GPIO 2 checked against newlib's `rand` from seed 1, every bit's timing to
+the cycle); `uart_tx` ("Hello, world! (from PIO!)" off GPIO 0 at 115200 baud, twice, a second apart);
+`uart_rx` (core 1's text sent by UART1 over a wire into PIO2's receiver); and `uart_dma` (DMA paced by
+PIO2's TX DREQ into `uart_tx` on GPIO 4, wired to GPIO 5 where `uart_rx_mini` receives at 921600 baud,
+DMA paced by the RX DREQ, PIO2's IRQ 0 on RX-not-empty printing progress: `pio_rx dma_rx=1/43`, both DMA
+interrupts, `pio_rx dma_rx=43/43`, `Test passed`, as the SDK's `printf` waits for UART0 to drain in the
+first handler). `chip/pio_tests.sysl` adds the SDK's `uart_tx` relocated to offset 28 on PIO2 through the
+mux, the pin record across a FUNCSEL hand-over and back to the SIO, all 24 DREQs, and both refusals;
+`chip/wfe_tests.sysl` a sleeper latching before an RXF3 read. The first runs found the pin record missing
+a level the mux handed over (it recorded only the blocks' own moves) and the interrupt lost when the DMA
+emptied the FIFO within the quantum; both are fixed and tested. Breaking the DREQ direction, the pin
+record's mux path, the pulse latch, the IRQ numbering or the RXF window in `read_lowers` each turns
+tests red.
+
+**Cost**, host instructions retired, interleaved runs against the branch's base (dev at 8ac1199),
+`/usr/bin/time -l`, `benchtop run --board pico2`, five or six runs each: `sram_loop.elf` 5.476–5.483 G
+(median 5.477) to 5.487–5.501 G (5.494), `xip_loop.elf` 5.692–5.702 G (5.697) to 5.710–5.719 G (5.716),
+about 0.3%; `bench --core cortex-m33 kernel33.bin`, which never touches the chip, unchanged. Neither
+program uses a PIO block, so the cost is in paths they share. Variants rule out the struct's growth and
+its new `Buf`, `pio.sysl` and `uart.sysl`, the TREQ mask, the PIO terms in `shared_interrupts` and
+`gpio_changed`, the catch-ups in the bus's `read` and `write`, and `advance_lines` and `route`, each
+alone; the rest is not yet attributed. The catch-up, a PIO write and the line read are out of line, and
+the PIO routes and drives are tested last.
 
 ### Item 22, done: the RP2040 chip layer
 
