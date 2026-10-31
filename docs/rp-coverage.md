@@ -118,8 +118,8 @@ day. An L is split before it is handed out (§6).
 | TIMER0/1 | 12.8 System timers | full | 64-bit counter, latch, 4 alarms, LOCKED, SOURCE (`peripheral/rp2350/timing.sysl:91–145`). | `rp2350/tests.sysl:44`, `chip/tests.sysl:18` | — | — |
 | WATCHDOG | 12.9 Watchdog | full | The RP2040's counter (`peripheral/rp2040/watchdog.sysl`, `WatchdogCounter`), one decrement a tick from TICKS' watchdog generator: CTRL (ENABLE, PAUSE_DBG0/DBG1/JTAG, TIME), LOAD, TRIGGER, REASON, SCRATCH0–7. Firing resets the PSM stages WDSEL selects, and RESETS.WDSEL's peripherals where RESETS' stage is not selected (`Rp2350.watchdog_reset`); the Arm board restarts core 0 through the ROM's boot path (the PC/SP request in SCRATCH4–7, or the flash image's normal boot) and core 1 into the ROM wait; a typed boot request and a blank flash's BOOTSEL are refused by name; the RISC-V board refuses the restart by name. No debugger exists to pause it, so the PAUSE inputs are only tested at the model (item 10). | `rp2040/watchdog_tests.sysl`, `rp2350/tests.sysl`, `chip/watchdog_tests.sysl` (`watchdog.elf`) | — | — |
 | HSTX | 12.11 HSTX | missing | Not decoded. | — | M | clk_hstx, DMA, mux, a display part |
-| TRNG | 12.12 TRNG | missing | Not decoded. | — | S | — |
-| SHA-256 | 12.13 SHA-256 | missing | Not decoded. | — | S | DMA (for the SDK's DMA path) |
+| TRNG | 12.12 TRNG | full | The 192-bit holding register filled from a seeded SplitMix64 (`TRNG_SEED`, or `seed`), with the sampling time and the interrupt; the CRNGT and autocorrelation failure bits never set. | `rp2350/crypto_tests.sysl`, `chip/crypto_tests.sysl` (`system/rand`) | — | — |
+| SHA-256 | 12.13 SHA-256 | full | START, WDATA in words, halfwords or bytes, BSWAP, the 57-cycle digest, SUM0–7 and the DREQ for the DMA path; the compression is `sha256_compress`. | `rp2350/crypto_tests.sysl`, `chip/crypto_tests.sysl` (`sha/hello_sha256`) | — | DMA (for the SDK's DMA path) |
 | SYSINFO (CHIP_ID, PLATFORM, GITREF) | 12.15 System control | full | CHIP_ID 0x30004927, PACKAGE_SEL 1 (RP2350A), PLATFORM ASIC, GITREF 0; read-only. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | SYSCFG (NMI masks, proc in-sync bypass, DBGFORCE, mem power-down) | 12.15 System control | full (stored) | PROC_CONFIG (halted flags read 0), PROC_IN_SYNC_BYPASS(_HI), DBGFORCE, MEMPOWERDOWN (memory is not lost), AUXCTRL stored with their writable bits. | `rp2350/sysctl_tests.sysl` | — | — |
 | TBMAN | 12.15 / 2 System bus | full | PLATFORM reads ASIC; the rest refused (item 28). | `chip/busctrl_tests.sysl` | — | — |
@@ -171,8 +171,8 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 35 | 10 | 1 | 12 | 58 |
-| RP2040 | 20 | 8 | 2 | 7 | 37 |
+| RP2350 | COUNT | COUNT | COUNT | COUNT | 58 |
+| RP2040 | COUNT | COUNT | COUNT | COUNT | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
 benchtop's policy for unsupported accesses (`docs/peripheral-models.md:54`). Several items below
@@ -1581,3 +1581,11 @@ too; SECCFG_* and the MPU on the RP2350 only). The header of that file is the sp
 
 **Cost**: only the transfer path gained a check that is skipped while SNIFF_CTRL.EN is clear; no bench of
 the five main lines was run here (the train benches them).
+
+### Item 25, done: the TRNG and SHA-256
+
+**TRNG** (`peripheral/rp2350/trng.sysl`): the entropy is SplitMix64 from `TRNG_SEED` (or `seed`), so tests assert exact words; a collection takes 192 samples of SAMPLE_CNT1 + 1 clk_sys cycles (four times with the decorrelator on), reading EHR_DATA5 starts the next, SAMPLE_CNT1 restarts, RNG_ICR clears, the interrupt (IRQ 39) is EHR_VALID unmasked. The CRNGT and autocorrelation failure bits never set.
+
+**SHA-256** (`peripheral/rp2350/sha256.sysl`): `sha256_compress` on the assembled words, BSWAP, 57 busy cycles after the 16th word, DREQ_SHA256 (54) held while WDATA_RDY is, the DMA waking for the digest by event. Refused by name: DMA_SIZE 3, mixed write sizes in a block, atomic aliases on WDATA.
+
+**Oracles:** pico-examples `system/rand` (`examples/pico2/rand.c`) and `sha/hello_sha256` (`examples/pico2/hello_sha256.c`, with and without DMA; the digest is the known SHA-256 of the lorem text) run to completion with their output asserted line by line in `chip/crypto_tests.sysl`; FIPS 180-4 "abc" in `rp2350/crypto_tests.sysl`.

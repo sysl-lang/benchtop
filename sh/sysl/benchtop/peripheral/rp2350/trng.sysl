@@ -1,0 +1,212 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, w1c, written}
+import sh.sysl.rp2350.trng as reg
+import sysl.fmt.hex
+
+// The TRNG (datasheet 12.12), as the SDK's `pico_rand` drives it: the entropy source enabled, the
+// 192-bit holding register filled, six words read, the next collection started by the last read.
+//
+// **The entropy is a seeded generator, so a test can assert it.** The ring oscillator's samples are the
+// outputs of SplitMix64 started from `TRNG_SEED` (or from `seed`), eight bytes a draw; a collection takes
+// three draws, the six EHR words low word first. A reset of the block (RESETS, SW_RESET) does not
+// restart the generator, so the words keep changing across resets; `seed` does.
+//
+// **Time is clk_sys cycles from the access that starts a collection**, counted from the `now` the chip
+// passes: the 192 samples take `SAMPLE_CNT1 + 1` cycles each, and four times that with the von Neumann
+// decorrelator on (VNC_BYPASS clear), which keeps one of every pair of unequal samples, on average one
+// pair in two. The block's own clock (rng_clk) is taken to be clk_sys; the datasheet does not give its
+// source. The two tests that can fail a collection (CRNGT, autocorrelation) and the decorrelator's
+// 32-identical-bits error never do, since the generator is not a ring: their ISR bits stay 0 and the
+// debug bypass bits are stored.
+//
+// A collection starts when RND_SOURCE_ENABLE is set and none is held or running. Reading EHR_DATA5, the
+// last word, empties the register (TRNG_VALID falls) and starts the next one, as the SDK's comment says
+// ("TRNG is now sampling again, having started after we read the last EHR word"); a write to
+// SAMPLE_CNT1 restarts a running one ("writing to this register seems to restart the sampling").
+// Clearing RND_SOURCE_ENABLE stops it.
+
+/** SplitMix64's start value at power-on. */
+const TRNG_SEED: u64 = 0x5EED_0F_7241_0000
+
+private const TRNG_SAMPLES: u64 = 192
+private const TRNG_VNC_FACTOR: u64 = 4
+private const TRNG_IRQ_BITS: u32 = 0xF
+
+enum TrngFault
+    Access(e: AccessError)
+    Refused(why: string)
+
+struct Trng
+    imr: u32
+    isr: u32
+    config: u32
+    debug: u32
+    enable: bool
+    sample_cnt: u32
+    autocorr: u32
+    debug_en: u32
+    sw_reset: u32
+    ehr: [6]u32
+    valid: bool
+    collecting: bool
+    // The clk_sys cycle the running collection ends at.
+    done_at: u64
+    gen: u64
+
+    /** The registers at power-on or after a RESETS pulse; the generator keeps its place. */
+    reset(*self)
+        self.imr = TRNG_IRQ_BITS
+        self.isr = 0
+        self.config = 0
+        self.debug = 0
+        self.enable = false
+        self.sample_cnt = 0xFFFF
+        self.autocorr = 0
+        self.debug_en = 0
+        self.sw_reset = 0
+        self.ehr = [0; 6]
+        self.valid = false
+        self.collecting = false
+        self.done_at = 0
+
+    /** The generator restarts from `s`. */
+    seed(*self, s: u64) = self.gen = s
+
+    // One SplitMix64 output.
+    private draw(*self) -> u64
+        self.gen = self.gen +% 0x9E3779B97F4A7C15
+        var z = self.gen
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB
+        z ^ (z >> 31)
+
+    // The clk_sys cycles a collection takes at the present settings.
+    private duration(self) -> u64
+        val per = u64(self.sample_cnt) + 1
+        TRNG_SAMPLES * per * (if self.debug & reg.TRNG_DEBUG_CONTROL_VNC_BYPASS_MASK != 0 then 1 else TRNG_VNC_FACTOR)
+
+    private begin(*self, now: u64)
+        self.collecting = true
+        self.done_at = now + self.duration()
+
+    /** A collection that ends by cycle `now` has filled the EHR and raised EHR_VALID. */
+    settle(*self, now: u64)
+        if !self.collecting || now < self.done_at then return
+        for i in 0..<3
+            val x = self.draw()
+            self.ehr[2 * i] = u32(x & 0xFFFFFFFF)
+            self.ehr[2 * i + 1] = u32(x >> 32)
+        self.valid = true
+        self.collecting = false
+        self.isr |= reg.RNG_ISR_EHR_VALID_MASK
+
+    /** TRNG_IRQ: an unmasked ISR bit. */
+    irq(self) -> bool = self.isr & ~self.imr & TRNG_IRQ_BITS != 0
+
+    /** The clk_sys cycles until the running collection ends, where that raises the interrupt (EHR_VALID
+     * unmasked) and so can wake a core; None otherwise.
+     */
+    due(self, now: u64) -> Option[u64]
+        if !self.collecting || self.imr & reg.RNG_IMR_EHR_VALID_INT_MASK_MASK != 0 then return None
+        Some(if self.done_at > now then self.done_at - now else 1)
+
+    /** Whether a collection is running at cycle `now`. */
+    busy(self, now: u64) -> bool = self.collecting && now < self.done_at
+
+    read(*self, now: u64, offset: u32, width: u32) -> Result[u32, TrngFault]
+        access(offset, width, true).map_err(e -> TrngFault.Access(e))?
+        self.settle(now)
+        val o = offset & 0xFFC
+        val value: u32 = o match
+            reg.RNG_IMR_OFFSET -> self.imr
+            reg.RNG_ISR_OFFSET -> self.isr
+            reg.RNG_ICR_OFFSET -> 0
+            reg.TRNG_CONFIG_OFFSET -> self.config
+            reg.TRNG_VALID_OFFSET -> if self.valid then 1 else 0
+            reg.EHR_DATA0_OFFSET | reg.EHR_DATA1_OFFSET | reg.EHR_DATA2_OFFSET | reg.EHR_DATA3_OFFSET | reg.EHR_DATA4_OFFSET ->
+                self.ehr[usize((o - reg.EHR_DATA0_OFFSET) / 4)]
+            reg.EHR_DATA5_OFFSET ->
+                val last = self.ehr[5]
+                // Only a word that was valid empties the register; the next collection starts after it.
+                if self.valid
+                    self.valid = false
+                    self.ehr = [0; 6]
+                    if self.enable then self.begin(now)
+                last
+            reg.RND_SOURCE_ENABLE_OFFSET -> if self.enable then 1 else 0
+            reg.SAMPLE_CNT1_OFFSET -> self.sample_cnt
+            reg.AUTOCORR_STATISTIC_OFFSET -> self.autocorr
+            reg.TRNG_DEBUG_CONTROL_OFFSET -> self.debug
+            reg.TRNG_SW_RESET_OFFSET -> self.sw_reset
+            reg.RNG_DEBUG_EN_INPUT_OFFSET -> self.debug_en
+            reg.TRNG_BUSY_OFFSET -> if self.busy(now) then 1 else 0
+            reg.RST_BITS_COUNTER_OFFSET -> 0
+            // The version register's fields all reset to 0 in the header; the silicon's value is not
+            // published, so it reads that.
+            reg.RNG_VERSION_OFFSET -> 0
+            reg.RNG_BIST_CNTR_0_OFFSET | reg.RNG_BIST_CNTR_1_OFFSET | reg.RNG_BIST_CNTR_2_OFFSET ->
+                return Err(TrngFault.Refused("the BIST counters count a ring oscillator's cycles, which benchtop's entropy source does not have"))
+            _ -> return Err(TrngFault.Access(AccessError.Unmapped))
+        Ok(read_lane(value, offset, width))
+
+    write(*self, now: u64, offset: u32, width: u32, value: u32) -> Result[unit, TrngFault]
+        access(offset, width, true).map_err(e -> TrngFault.Access(e))?
+        self.settle(now)
+        val data = replicated(value, width)
+        val o = offset & 0xFFC
+        o match
+            reg.RNG_IMR_OFFSET -> self.imr = written(self.imr, offset, data) & TRNG_IRQ_BITS
+            // The ISR is read-only. ICR clears an ISR bit on a 1, through every alias; the
+            // autocorrelation bit only a reset clears (it is never set here).
+            reg.RNG_ICR_OFFSET -> self.isr = w1c(self.isr, data & ~reg.RNG_ICR_AUTOCORR_ERR_MASK)
+            reg.TRNG_CONFIG_OFFSET -> self.config = written(self.config, offset, data) & reg.TRNG_CONFIG_RND_SRC_SEL_MASK
+            reg.RND_SOURCE_ENABLE_OFFSET ->
+                val on = written(if self.enable then 1 else 0, offset, data) & 1 != 0
+                if on && !self.enable && !self.valid && !self.collecting then self.begin(now)
+                if !on then self.collecting = false
+                self.enable = on
+            reg.SAMPLE_CNT1_OFFSET ->
+                self.sample_cnt = written(self.sample_cnt, offset, data)
+                if self.collecting then self.begin(now)
+            reg.AUTOCORR_STATISTIC_OFFSET -> self.autocorr = 0
+            reg.TRNG_DEBUG_CONTROL_OFFSET -> self.debug = written(self.debug, offset, data) & 0xE
+            reg.TRNG_SW_RESET_OFFSET ->
+                val next = written(self.sw_reset, offset, data) & 1
+                // A 1 resets the block's collection logic: the EHR is emptied, EHR_VALID and the
+                // collection restarted if the source is on. (Whether the bit reads back is not stated;
+                // it is stored.)
+                if next != 0 && self.sw_reset == 0
+                    self.valid = false
+                    self.ehr = [0; 6]
+                    self.isr = 0
+                    self.collecting = false
+                    if self.enable then self.begin(now)
+                self.sw_reset = next
+            reg.RNG_DEBUG_EN_INPUT_OFFSET -> self.debug_en = written(self.debug_en, offset, data) & 1
+            // Resets the collected-bits counter and EHR_VALID, but only with the source off.
+            reg.RST_BITS_COUNTER_OFFSET ->
+                if !self.enable
+                    self.valid = false
+                    self.ehr = [0; 6]
+                    self.collecting = false
+            // Read-only registers.
+            reg.RNG_ISR_OFFSET | reg.TRNG_VALID_OFFSET | reg.TRNG_BUSY_OFFSET | reg.RNG_VERSION_OFFSET |
+            reg.EHR_DATA0_OFFSET | reg.EHR_DATA1_OFFSET | reg.EHR_DATA2_OFFSET |
+            reg.EHR_DATA3_OFFSET | reg.EHR_DATA4_OFFSET | reg.EHR_DATA5_OFFSET |
+            reg.RNG_BIST_CNTR_0_OFFSET | reg.RNG_BIST_CNTR_1_OFFSET | reg.RNG_BIST_CNTR_2_OFFSET -> ()
+            _ -> return Err(TrngFault.Access(AccessError.Unmapped))
+        Ok(())
+end Trng
+
+/** The TRNG at power-on, its source off. */
+trng() -> Trng
+    var t: Trng
+    t.gen = TRNG_SEED
+    t.reset()
+    t
+
+/** Why the TRNG refused an access, as a person reads it. */
+trng_why(f: TrngFault) -> string = f match
+    Access(_) -> "TRNG: not a register or access width benchtop runs"
+    Refused(why) -> s"TRNG: $why"

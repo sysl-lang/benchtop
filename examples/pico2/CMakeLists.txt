@@ -26,6 +26,26 @@ foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp
     benchtop_program(${prog} ${prog}.c no_flash)
 endforeach()
 target_link_libraries(sniff_crc hardware_dma)
+benchtop_program(rand rand.c no_flash)
+target_link_libraries(rand pico_rand)
+# hello_sha256.c includes sample.txt as a C array, which pico-examples' CMake generates from the text.
+function(make_sample_inc input_filename target_name)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/inc.cmake"
+        "file(READ \${input_file} content)\n"
+        "file(WRITE \${output_file} \"static const char sample_txt[] = { \\\"\${content}\\\" };\")"
+        )
+    get_filename_component(input_file "${input_filename}" REALPATH)
+    set(output_file "${CMAKE_CURRENT_BINARY_DIR}/generated/${input_filename}.inc")
+    add_custom_command(OUTPUT ${output_file}
+        COMMAND ${CMAKE_COMMAND} -Dinput_file:FILEPATH=${input_file} -Doutput_file:FILEPATH=${output_file} -P "${CMAKE_CURRENT_BINARY_DIR}/generated/inc.cmake"
+        DEPENDS ${input_filename})
+    add_custom_target(${target_name} DEPENDS ${output_file})
+endfunction(make_sample_inc)
+make_sample_inc(sample.txt sample.txt.inc)
+benchtop_program(hello_sha256 hello_sha256.c no_flash)
+add_dependencies(hello_sha256 sample.txt.inc)
+target_link_libraries(hello_sha256 pico_sha256)
+target_include_directories(hello_sha256 PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(hello_dma hardware_dma)
 target_link_libraries(control_blocks hardware_dma)
 target_link_libraries(dma_uart hardware_dma)
