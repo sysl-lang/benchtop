@@ -7,7 +7,7 @@ import sysl.buf.{Buf,buf}
 import sysl.container.ring.{InlineRing,inline_ring}
 import sysl.sync.*
 import sysl.threads.Mutex
-import sysl.math.{min,max}
+import sysl.math.{min,max,pi}
 
 /** The WM8994 codec (`wm8994`) on the I2C bus and the SAI. Its model is one of the bus's parts
  * (`I2cParts.codec`), reached only under the bus's lock. Here: whether the board has one, the SAI block it plays from
@@ -60,12 +60,44 @@ private const MIC_PRIME: usize = 1024
  */
 struct CodecMix
     sums: [2]real
+    speaker: [2]real
     frame: u64
     started: bool
+    cone: [2]Biquad
+
+/** A second-order section in direct form I: its coefficients, normalised by a0, and the last two
+ * inputs and outputs.
+ */
+struct Biquad
+    b: [3]real
+    a: [2]real
+    x: [2]real
+    y: [2]real
+
+/** The identity: a speaker with no stated resonance passes everything. */
+private flat() -> Biquad = Biquad([1.0,0.0,0.0], [0.0,0.0], [0.0,0.0], [0.0,0.0])
+
+/** A speaker cone's low-frequency roll-off: below its resonance `hz`, at `rate` samples a second, a
+ * small speaker falls 12 dB an octave. A Butterworth high-pass (Q = 1/sqrt 2, the RBJ cookbook's)
+ * stands for it; the datasheets give the resonance, not the box's Q.
+ */
+private[virt] cone(hz: u32, rate: u32) -> Biquad
+    if hz == 0 then return flat()
+    val w = 2.0 * pi * real(hz) / real(rate)
+    val alpha = w.sin() / (2.0 * 0.7071067811865476)
+    val a0 = 1.0 + alpha
+    val c = w.cos()
+    Biquad([(1.0 + c) / 2.0 / a0, -(1.0 + c) / a0, (1.0 + c) / 2.0 / a0], [-2.0 * c / a0, (1.0 - alpha) / a0], [0.0,0.0], [0.0,0.0])
+
+private[virt] step(f: *Biquad, x: real) -> real
+    val y = f.b[0] * x + f.b[1] * f.x[0] + f.b[2] * f.x[1] - f.a[0] * f.y[0] - f.a[1] * f.y[1]
+    f.x = [x, f.x[0]]
+    f.y = [y, f.y[0]]
+    y
 
 /** No codec on the board. */
 codec_state() -> CodecState = CodecState(false, 0, false, false, false, false, [12,12], codec_settings(),
-    0, Mutex.new(CodecInput(inline_ring(), false)), Mutex.new(CodecMix([0.0,0.0], 0, false)))
+    0, Mutex.new(CodecInput(inline_ring(), false)), Mutex.new(CodecMix([0.0,0.0], [0.0,0.0], 0, false, [flat(), flat()])))
 
 // The name of `b`'s WM8994 codec, "" for none.
 private codec_name(b: Board) -> string
@@ -132,6 +164,8 @@ private[virt] check_codec(b: Board, bus: *I2cState, devices: *Buf[I2cDevice]) ->
         else
             if s.speaker_present then return Err("one speaker output is supported per codec")
             s.speaker_present = true
+            val roll_off = cone(u32(part_whole(p,"resonance-hz",0)), 48000)
+            s.mix.with(m -> m.cone = [roll_off, roll_off])
         s.present = true
         s.host_gain[if headphone then 1 else 0] = u32(part_whole(p,"gain",12))
     for source in b.parts
@@ -165,7 +199,11 @@ private[virt] boot_codecs(ds: *Devices)
         publish_codec(&bus.parts.codec,s.settings))
     s.mix.with(m ->
         m.sums = [0.0,0.0]
-        m.started = false)
+        m.started = false
+        // A reset leaves the cones at rest.
+        for i in 0..<2
+            m.cone[i].x = [0.0,0.0]
+            m.cone[i].y = [0.0,0.0])
     clear_codec_input(s)
 
 // Called under the SAI queue lock: integer snapshots only, no codec/I2C lock.
@@ -189,14 +227,18 @@ private[virt] take_codec_sound(ds: *Devices, channels: u32 = 1) -> Buf[f32]
         for p in packets
             if p.slot == 0
                 m.sums = [0.0,0.0]
+                m.speaker = [0.0,0.0]
                 m.frame = p.frame
                 m.started = true
             if !m.started || p.frame != m.frame then continue
             if p.bits > 0 && p.bits <= 32 && p.slot < 4
                 val signed = long(int.wrap(p.word << (32 - p.bits))) >> (32 - p.bits)
-                m.sums[usize(p.slot / 2)] += real(signed) / real(1u64 << (p.bits - 1)) * real(p.gain) / 65536.0
+                val level = real(signed) / real(1u64 << (p.bits - 1)) * real(p.gain) / 65536.0
+                // Odd slots drive the speaker, whose cone shapes what it plays; even ones the headphones.
+                if p.slot & 1 == 1 then m.speaker[usize(p.slot / 2)] += level else m.sums[usize(p.slot / 2)] += level
             if p.slot + 1 == p.slots
                 m.started = false
+                for i in 0..<2 do m.sums[i] += step(&m.cone[i], m.speaker[i])
                 if channels == 1
                     into.push(f32(max(-1.0,min(1.0,(m.sums[0] + m.sums[1]) * 0.5))))
                 else

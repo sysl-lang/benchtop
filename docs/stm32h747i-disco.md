@@ -89,7 +89,13 @@ flash and AXI SRAM addresses, RCC CM4 release, STM32 DSI at 0x50000000, I2C4 at
 0x58001c00, SDMMC1, SPI1, GPIO A to K with their reset modes, and the pins each signal
 can be routed to. The board picks I2C4's pins, PD12/PD13, under `buses`;
 `stm32h747-sd.hocon` and `stm32h747-spi-sd.hocon` are the same board with a card. An FT6206 at address 0x2a supplies touch
-reports. The display part implements common MIPI DCS behavior rather
+reports.
+
+The four user LEDs, LD1 to LD4, are on PI12 to PI15 and light while their pin is an output driven
+low. The wake-up button B2 holds PC13 high while pressed (key 1); the reset button B1 (key 2)
+resets the chip as it goes down, and the chip stays in reset until it is let go. The speaker on the
+codec's speaker output is a Same Sky CMS-151103-088SP, a 15 x 11 mm micro speaker: below its
+850 Hz resonance its cone rolls off at 12 dB an octave, so it sounds thin where headphones do not. The display part implements common MIPI DCS behavior rather
 than a complete NT35510/OTM8009A vendor-specific controller.
 
 M4 sends real DCS short/long packets through GHCR/GPDR. The host emulates their
