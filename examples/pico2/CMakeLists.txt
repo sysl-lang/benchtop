@@ -32,6 +32,11 @@ target_link_libraries(dma_uart hardware_dma)
 benchtop_program(hello_dma_flash hello_dma.c default)
 target_link_libraries(hello_dma_flash hardware_dma)
 target_link_libraries(gpio_irq pico_multicore)
+# pico-examples' HSTX programs: DVI through the command expander and an ST7789 LCD through the raw path.
+benchtop_program(dvi_out_hstx_encoder dvi_out_hstx_encoder.c no_flash)
+target_link_libraries(dvi_out_hstx_encoder pico_multicore hardware_dma pico_sync)
+benchtop_program(hstx_spi_lcd hstx_spi_lcd.c no_flash)
+target_link_libraries(hstx_spi_lcd pico_sync)
 # rom.c calls the boot ROM's functions, the flash's among them, from SRAM.
 target_link_libraries(rom hardware_flash hardware_watchdog)
 target_compile_definitions(rom PRIVATE PICO_ALWAYS_INCLUDE_FLASH_ID_FUNCTIONS=1)

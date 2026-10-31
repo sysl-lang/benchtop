@@ -1,0 +1,313 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.hstx_ctrl as reg
+import sh.sysl.rp2350.hstx_fifo as fifo_reg
+import sysl.fmt.hex
+import sysl.math.min
+
+// The RP2350's high-speed serial transmit (datasheet 12.11; `hardware/regs/hstx_ctrl.h`, `hstx_fifo.h`).
+// Eight FIFO words feed a 32-bit output shift register, directly or through the command expander.
+//
+// **The shift register** loads a word and rotates right by CSR.SHIFT at each of the N_SHIFTS clk_hstx
+// cycles that follow, then loads the next. With nothing to load it stops, and so does the generated clock:
+// both advance only on cycles where the register shifts. Clearing CSR.EN puts the shift count, the clock
+// generator and the expander back to their start and leaves the FIFO alone.
+//
+// **The outputs**: BITn takes shift register bit SEL_P in the first half of a cycle and SEL_N in the second,
+// or the generated clock where CLK is set, inverted by INV. The clock is low for its first half period,
+// CLKPHASE half cycles already gone.
+//
+// **The expander** reads a command word: bits 15:12 the opcode, bits 11:0 a count of pushes to the shift
+// register. RAW and TMDS take a new data word each N_SHIFTS pushes of EXPAND_SHIFT and rotate it by SHIFT
+// between pushes; RAW_REPEAT and TMDS_REPEAT take one and go back to it. NOP is dropped at once, and no
+// command takes shift register time. A count that ends part way through a data word drops the rest of it.
+// The clock domain crossing takes no time (Q8), so a FIFO write is visible to the expander at once.
+//
+// **The TMDS encoders' running balance** is cleared by CSR.EN low and by each raw command, as DVI 1.0
+// zeroes it in a control period. The registers give no other way to clear it, and the receiver's decode
+// does not depend on it.
+//
+// **Refused by name**: coupled mode (the PIO-to-HSTX path), EXPAND_EN changing while EN stays set, a
+// CLKPHASE of a full clock period or more, a reserved opcode, a raw or TMDS command with a count of 0, and
+// a narrow write to the FIFO.
+
+/** HSTX_FIFO holds eight words. */
+const HSTX_FIFO_DEPTH: u32 = 8
+
+/** The SDK's `DREQ_HSTX`: asserted while the FIFO has room. */
+const DREQ_HSTX: u32 = 52
+
+// CSR's fields (`hardware/regs/hstx_ctrl.h`), and what the SDK's example names the opcodes.
+private const OP_RAW: u32 = 0
+private const OP_RAW_REPEAT: u32 = 1
+private const OP_TMDS: u32 = 2
+private const OP_TMDS_REPEAT: u32 = 3
+private const OP_NOP: u32 = 0xF
+
+/** What watches the eight HSTX outputs: told each clk_hstx cycle the registers shift. Bit n of each level
+ * word is output n: `first` in the cycle's first half, `second` in its second.
+ */
+trait HstxSink
+    hstx_cycle(*self, first: u32, second: u32)
+
+// A right rotate of a 32-bit word by 0 to 31.
+private rotated(x: u32, by: u32) -> u32 = if by & 31 == 0 then x else (x >> (by & 31)) | (x << (32 - (by & 31)))
+
+// A count field where 0 means 32.
+private shifts(field: u32) -> u32 = if field == 0 then 32 else field
+
+struct Hstx
+    csr: u32
+    bits: [8]u32
+    expand_shift: u32
+    expand_tmds: u32
+    fifo: [8]u32
+    head: u32
+    level: u32
+    wof: bool
+    // The output shift register, and the shifts left before it loads again: 0 where it waits for a word.
+    sr: u32
+    left: u32
+    // The clock generator's position, in clk_hstx cycles into its period.
+    clock: u32
+    // The command running: its opcode, the pushes it has left, the data word as rotated so far and as it
+    // came, the pushes left on this word, and whether a repeat command has its word.
+    op: u32
+    pushes: u32
+    data: u32
+    held: u32
+    word_left: u32
+    loaded: bool
+    balance: [3]i32
+    // Why the expander met something benchtop does not model; the chip collects it.
+    fault: string
+
+    /** Power-on, and a reset through RESETS. */
+    reset(*self)
+        *self = hstx()
+
+    /** Whether CSR.EN is set. */
+    enabled(self) -> bool = self.csr & reg.CSR_EN_MASK != 0
+
+    /** The DMA request: the FIFO has room. */
+    dreq(self) -> bool = self.level < HSTX_FIFO_DEPTH
+
+    private full(self) -> bool = self.level == HSTX_FIFO_DEPTH
+    private expanding(self) -> bool = self.csr & reg.CSR_EXPAND_EN_MASK != 0
+    private n_shifts(self) -> u32 = shifts((self.csr & reg.CSR_N_SHIFTS_MASK) >> reg.CSR_N_SHIFTS_SHIFT)
+    private shift(self) -> u32 = (self.csr & reg.CSR_SHIFT_MASK) >> reg.CSR_SHIFT_SHIFT
+    private clock_period(self) -> u32
+        val field = (self.csr & reg.CSR_CLKDIV_MASK) >> reg.CSR_CLKDIV_SHIFT
+        if field == 0 then 16 else field
+
+    /** A read of HSTX_CTRL. */
+    read(self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val a = offset & 0xFFC
+        var value: u32 = 0
+        if a == reg.CSR_OFFSET
+            value = self.csr
+        elif a >= reg.BIT0_OFFSET && a <= reg.BIT0_OFFSET + 28
+            value = self.bits[(a - reg.BIT0_OFFSET) / 4]
+        elif a == reg.EXPAND_SHIFT_OFFSET
+            value = self.expand_shift
+        elif a == reg.EXPAND_TMDS_OFFSET
+            value = self.expand_tmds
+        else
+            return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+
+    /** Why a write of `x` to HSTX_CTRL asks for something benchtop does not model; None where it does not. */
+    unmodelled(self, offset: u32, width: u32, x: u32) -> Option[string]
+        if offset & 0xFFC != reg.CSR_OFFSET then return None
+        val next = written(self.csr, offset, replicated(x, width)) & reg.CSR_BITS
+        if next & reg.CSR_COUPLED_MODE_MASK != 0 then return Some("HSTX coupled mode, the PIO-to-HSTX path, is not modelled")
+        if self.enabled() && next & reg.CSR_EN_MASK != 0 && (next ^ self.csr) & reg.CSR_EXPAND_EN_MASK != 0
+            return Some("changing HSTX CSR.EXPAND_EN while EN stays set, which the datasheet forbids, is not modelled")
+        val field = (next & reg.CSR_CLKDIV_MASK) >> reg.CSR_CLKDIV_SHIFT
+        val phase = (next & reg.CSR_CLKPHASE_MASK) >> reg.CSR_CLKPHASE_SHIFT
+        if next & reg.CSR_EN_MASK != 0 && phase >= 2 * (if field == 0 then 16 else field)
+            return Some(s"an HSTX CLKPHASE of $phase with a CLKDIV of $field, a full clock period or more, is undefined and not modelled")
+        None
+
+    /** A write to HSTX_CTRL. */
+    write(*self, offset: u32, width: u32, x: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val a = offset & 0xFFC
+        val v = replicated(x, width)
+        if a == reg.CSR_OFFSET
+            self.csr = written(self.csr, offset, v) & reg.CSR_BITS
+            if !self.enabled() then self.halt()
+        elif a >= reg.BIT0_OFFSET && a <= reg.BIT0_OFFSET + 28
+            val i = (a - reg.BIT0_OFFSET) / 4
+            self.bits[i] = written(self.bits[i], offset, v) & reg.BIT0_BITS
+        elif a == reg.EXPAND_SHIFT_OFFSET
+            self.expand_shift = written(self.expand_shift, offset, v) & reg.EXPAND_SHIFT_BITS
+        elif a == reg.EXPAND_TMDS_OFFSET
+            self.expand_tmds = written(self.expand_tmds, offset, v) & reg.EXPAND_TMDS_BITS
+        else
+            return Err(AccessError.Unmapped)
+        Ok(())
+    end write
+
+    // EN low: the shift count, the clock and the expander at their start. The FIFO is not popped.
+    private halt(*self)
+        self.left = 0
+        self.clock = 0
+        self.pushes = 0
+        self.word_left = 0
+        self.loaded = false
+        self.balance = [0; 3]
+
+    /** A read of HSTX_FIFO. */
+    fifo_read(self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, false)?
+        val a = offset & 0xFFC
+        if a == fifo_reg.FIFO_OFFSET then return Ok(0)
+        if a != fifo_reg.STAT_OFFSET then return Err(AccessError.Unmapped)
+        val value = self.level | (if self.full() then fifo_reg.STAT_FULL_MASK else 0) | (if self.level == 0 then fifo_reg.STAT_EMPTY_MASK else 0) | (if self.wof then fifo_reg.STAT_WOF_MASK else 0)
+        Ok(read_lane(value, offset, width))
+
+    /** A write to HSTX_FIFO: FIFO takes a word, dropped with STAT.WOF set where it is full; a 1 in
+     * STAT.WOF clears it.
+     */
+    fifo_write(*self, offset: u32, width: u32, x: u32) -> Result[unit, AccessError]
+        access(offset, width, false)?
+        val a = offset & 0xFFC
+        if a == fifo_reg.STAT_OFFSET
+            if replicated(x, width) & fifo_reg.STAT_WOF_MASK != 0 then self.wof = false
+            return Ok(())
+        if a != fifo_reg.FIFO_OFFSET then return Err(AccessError.Unmapped)
+        if self.full()
+            self.wof = true
+            return Ok(())
+        self.fifo[(self.head + self.level) % HSTX_FIFO_DEPTH] = x
+        self.level += 1
+        Ok(())
+
+    private pop(*self) -> u32
+        val x = self.fifo[self.head]
+        self.head = (self.head + 1) % HSTX_FIFO_DEPTH
+        self.level -= 1
+        x
+
+    // The next word for the shift register, where there is one: false stalls it.
+    private refill(*self) -> bool
+        if !self.expanding()
+            if self.level == 0 then return false
+            self.sr = self.pop()
+            self.left = self.n_shifts()
+            return true
+        loop
+            if self.pushes == 0
+                if self.level == 0 then return false
+                if !self.command(self.pop()) then return false
+                if self.pushes == 0 then continue
+            break
+        val encoded = self.op == OP_TMDS || self.op == OP_TMDS_REPEAT
+        val repeat = self.op == OP_RAW_REPEAT || self.op == OP_TMDS_REPEAT
+        if self.word_left == 0
+            if repeat && self.loaded
+                self.data = self.held
+            else
+                if self.level == 0 then return false
+                self.data = self.pop()
+                self.held = self.data
+                self.loaded = true
+            self.word_left = shifts(if encoded then (self.expand_shift & reg.EXPAND_SHIFT_ENC_N_SHIFTS_MASK) >> reg.EXPAND_SHIFT_ENC_N_SHIFTS_SHIFT else (self.expand_shift & reg.EXPAND_SHIFT_RAW_N_SHIFTS_MASK) >> reg.EXPAND_SHIFT_RAW_N_SHIFTS_SHIFT)
+        self.sr = if encoded then self.encoded() else self.data
+        self.data = rotated(self.data, if encoded then (self.expand_shift & reg.EXPAND_SHIFT_ENC_SHIFT_MASK) >> reg.EXPAND_SHIFT_ENC_SHIFT_SHIFT else (self.expand_shift & reg.EXPAND_SHIFT_RAW_SHIFT_MASK) >> reg.EXPAND_SHIFT_RAW_SHIFT_SHIFT)
+        self.word_left -= 1
+        self.pushes -= 1
+        if self.pushes == 0 then self.word_left = 0
+        self.left = self.n_shifts()
+        true
+    end refill
+
+    // Command word `x` starts; false where it is not modelled. A NOP leaves no pushes.
+    private command(*self, x: u32) -> bool
+        val op = x >> 12
+        val count = x & 0xFFF
+        if op == OP_NOP then return true
+        if (x >> 16) != 0 || op > OP_TMDS_REPEAT
+            self.fault = s"HSTX command word 0x${hex(x, 8)}: a reserved opcode is not modelled"
+            return false
+        if count == 0
+            self.fault = s"HSTX command word 0x${hex(x, 8)}: a count of 0 is not modelled"
+            return false
+        self.op = op
+        self.pushes = count
+        self.word_left = 0
+        self.loaded = false
+        if op == OP_RAW || op == OP_RAW_REPEAT then self.balance = [0; 3]
+        true
+
+    // The three lanes' symbols of the data word as it stands: lane 0 in bits 9:0, lane 1 in 19:10, lane 2
+    // in 29:20. A lane takes bits 7:0 of the word rotated right by its ROT, its top NBITS + 1 bits kept.
+    private encoded(*self) -> u32
+        var word: u32 = 0
+        for lane in 0u32..<3
+            val field = (self.expand_tmds >> (8 * lane)) & 0xFF
+            val input = rotated(self.data, field & 0x1F) & 0xFF & (0xFF00u32 >> ((field >> 5) + 1))
+            word |= tmds_encode(&self.balance[lane], u8(input)) << (10 * lane)
+        word
+
+    /** `cycles` of clk_hstx pass: the register shifts while it has words, telling `sink` of each cycle. */
+    pass(*self, cycles: u64, sink: Option[*HstxSink])
+        if !self.enabled() || (self.left == 0 && !self.refill()) then return
+        val period = self.clock_period()
+        val amount = self.shift()
+        var n = cycles
+        while n > 0
+            val step = u32(min(n, u64(self.left)))
+            sink match
+                Some(s) ->
+                    for _ in 0u32..<step
+                        s.hstx_cycle(self.levels(0), self.levels(1))
+                        self.sr = rotated(self.sr, amount)
+                        self.clock = (self.clock + 1) % period
+                None ->
+                    self.sr = rotated(self.sr, u32((u64(step) * u64(amount)) % 32))
+                    self.clock = (self.clock + step) % period
+            self.left -= step
+            n -= u64(step)
+            if self.left == 0 && !self.refill() then return
+    end pass
+
+    /** Output `i`'s level in half `half` (0 or 1) of this cycle. */
+    output(self, i: u32, half: u32) -> bool
+        val b = self.bits[i]
+        var high = false
+        if b & reg.BIT0_CLK_MASK != 0
+            val period = self.clock_period()
+            val phase = (self.csr & reg.CSR_CLKPHASE_MASK) >> reg.CSR_CLKPHASE_SHIFT
+            high = (2 * self.clock + half + phase) % (2 * period) >= period
+        else
+            val sel = if half == 0 then b & reg.BIT0_SEL_P_MASK else (b & reg.BIT0_SEL_N_MASK) >> reg.BIT0_SEL_N_SHIFT
+            high = (self.sr >> sel) & 1 != 0
+        high != (b & reg.BIT0_INV_MASK != 0)
+
+    private levels(self, half: u32) -> u32
+        var word: u32 = 0
+        for i in 0u32..<8 do if self.output(i, half) then word |= 1u32 << i
+        word
+
+    /** The clk_hstx cycles until the FIFO next has room, while it is full and enabled; None where it will
+     * not make room by itself.
+     */
+    until_room(self) -> Option[u64]
+        if !self.enabled() || !self.full() then return None
+        val base = u64(self.left)
+        if !self.expanding() || self.pushes == 0 then return Some(if base == 0 then 1 else base)
+        val repeat = self.op == OP_RAW_REPEAT || self.op == OP_TMDS_REPEAT
+        val before = if repeat && self.loaded then self.pushes else min(self.word_left, self.pushes)
+        Some(base + u64(before) * u64(self.n_shifts()) + (if base == 0 && before == 0 then 1 else 0))
+end Hstx
+
+/** HSTX at power-on. */
+hstx() -> Hstx
+    var h: Hstx
+    h.csr = reg.CSR_N_SHIFTS_MASK & (5u32 << reg.CSR_N_SHIFTS_SHIFT) | reg.CSR_SHIFT_MASK & (6u32 << reg.CSR_SHIFT_SHIFT) | reg.CSR_CLKDIV_MASK & (1u32 << reg.CSR_CLKDIV_SHIFT)
+    h.expand_shift = (1u32 << reg.EXPAND_SHIFT_ENC_N_SHIFTS_SHIFT) | (1u32 << reg.EXPAND_SHIFT_RAW_N_SHIFTS_SHIFT)
+    h

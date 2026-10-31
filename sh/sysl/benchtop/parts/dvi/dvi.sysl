@@ -1,0 +1,165 @@
+module sh.sysl.benchtop.parts.dvi
+
+import sh.sysl.benchtop.peripheral.rp2350.HstxSink
+import sysl.buf.{Buf, buf}
+
+// A DVI monitor on HSTX's outputs. It deserialises the three data lanes, least significant bit first,
+// finding the word boundary from the first control token on lane 0, as a DVI receiver does. Control
+// tokens carry HSYNC and VSYNC on lane 0; any other symbol is decoded (DVI 1.0, figure 3-6) into a pixel.
+// A frame's active lines are stored, and its measurements kept for a test or a window to read.
+
+// The four control tokens, for (VSYNC, HSYNC) of 00, 01, 10 and 11.
+private const TOKEN_00: u32 = 0x354
+private const TOKEN_01: u32 = 0x0AB
+private const TOKEN_10: u32 = 0x154
+private const TOKEN_11: u32 = 0x2AB
+
+private is_token(s: u32) -> bool = s == TOKEN_00 || s == TOKEN_01 || s == TOKEN_10 || s == TOKEN_11
+
+/** The 8 bits TMDS symbol `s` carries (DVI 1.0, figure 3-6). */
+tmds_decode(s: u32) -> u32
+    val q = if s & 0x200 != 0 then (s & 0x3FF) ^ 0xFF else s & 0x3FF
+    var d = q & 1
+    for i in 1u32..<8
+        val next = ((q >> i) ^ (q >> (i - 1))) & 1
+        d |= (if q & 0x100 != 0 then next else next ^ 1) << i
+    d
+
+struct Dvi
+    // Output number of each pair's positive pin: lanes 0, 1 and 2, and the clock.
+    lanes: [3]u32
+    clock: u32
+    columns: i32
+    rows: i32
+    /** Pixels 0xRRGGBB, lane 2 red, lane 1 green, lane 0 blue; the last whole frame or the one arriving. */
+    pixels: Buf[u32]
+    // Deserialising.
+    shift: [3]u32
+    locked: bool
+    bit: u32
+    clock_was: bool
+    // Half cycles since the clock last rose, and the period it showed; 0 until it has risen twice.
+    since_rise: u32
+    /** The clock's period in half cycles of clk_hstx, and whether it ever changed. */
+    clock_period: u32
+    clock_steady: bool
+    // Position in the picture.
+    x: i32
+    y: i32
+    hsync: bool
+    vsync: bool
+    in_frame: bool
+    in_data: bool
+    symbols_in_line: i32
+    symbols_in_sync: i32
+    lines_in_frame: i32
+    lines_in_vsync: i32
+    /** What the last whole frame measured: symbols a line and in HSYNC's pulse, lines a frame and in VSYNC's
+     * pulse, its active width and height, and frames complete.
+     */
+    line_total: i32
+    hsync_width: i32
+    frame_total: i32
+    vsync_width: i32
+    width: i32
+    height: i32
+    frames: i32
+    /** Control symbols that disagree across lanes, and data symbols outside the picture. */
+    errors: i32
+    /** The greatest running disparity any lane reached. */
+    peak_disparity: i32
+    disparity: [3]i32
+
+    // One half cycle's level on each lane and on the clock.
+    private half(*self, levels: u32)
+        val clock = (levels >> self.clock) & 1 != 0
+        self.since_rise += 1
+        if clock && !self.clock_was
+            if self.clock_period != 0 && self.since_rise != self.clock_period then self.clock_steady = false
+            self.clock_period = self.since_rise
+            self.since_rise = 0
+        self.clock_was = clock
+        for l in 0..<3 do self.shift[l] = (self.shift[l] >> 1) | (((levels >> self.lanes[l]) & 1) << 9)
+        if !self.locked
+            if !is_token(self.shift[0]) then return
+            self.locked = true
+            self.bit = 0
+            self.symbol()
+            return
+        self.bit += 1
+        if self.bit == 10
+            self.bit = 0
+            self.symbol()
+
+    // One whole symbol on the three lanes.
+    private symbol(*self)
+        self.symbols_in_line += 1
+        if is_token(self.shift[0])
+            self.control(self.shift[0], self.shift[1], self.shift[2])
+            return
+        if !self.in_data then self.in_data = true
+        var colour: u32 = 0
+        for l in 0u32..<3
+            val s = self.shift[l]
+            colour |= tmds_decode(s) << (8 * l)
+            val q = (s & 0xFF).count_ones()
+            self.disparity[l] += i32(q) * 2 - 8
+            if self.disparity[l] > self.peak_disparity then self.peak_disparity = self.disparity[l]
+            if -self.disparity[l] > self.peak_disparity then self.peak_disparity = -self.disparity[l]
+        if self.in_frame
+            if self.x < self.columns && self.y < self.rows then self.pixels[self.y * self.columns + self.x] = colour else self.errors += 1
+        self.x += 1
+
+    private control(*self, lane0: u32, lane1: u32, lane2: u32)
+        if lane1 != TOKEN_00 || lane2 != TOKEN_00 then self.errors += 1
+        if self.in_data
+            self.in_data = false
+            self.width = self.x
+            self.x = 0
+            self.y += 1
+            self.disparity = [0; 3]
+        val h = lane0 == TOKEN_01 || lane0 == TOKEN_11
+        val v = lane0 == TOKEN_10 || lane0 == TOKEN_11
+        // The SDK's example has active-low pulses: a pulse is measured from its falling edge.
+        if self.hsync && !h
+            self.line_total = self.symbols_in_line
+            self.symbols_in_line = 0
+            self.symbols_in_sync = 0
+            self.lines_in_frame += 1
+            if !v then self.lines_in_vsync += 1
+        if !h then self.symbols_in_sync += 1
+        if !self.hsync && h then self.hsync_width = self.symbols_in_sync
+        if self.vsync && !v
+            if self.in_frame
+                self.frame_total = self.lines_in_frame
+                self.height = self.y
+                self.frames += 1
+            self.in_frame = true
+            self.y = 0
+            self.lines_in_frame = 0
+            self.lines_in_vsync = 0
+        if !self.vsync && v then self.vsync_width = self.lines_in_vsync
+        self.hsync = h
+        self.vsync = v
+    end control
+end Dvi
+
+impl HstxSink for Dvi
+    hstx_cycle(*self, first: u32, second: u32)
+        self.half(first)
+        self.half(second)
+
+/** A monitor for a `columns` by `rows` mode, wired to the HSTX outputs given. */
+dvi(lanes: [3]u32, clock: u32, columns: i32, rows: i32) -> &Dvi
+    var pixels: Buf[u32] = buf()
+    for _ in 0..<(columns * rows) do pixels.push(0)
+    var m: Dvi
+    m.lanes = lanes
+    m.clock = clock
+    m.columns = columns
+    m.rows = rows
+    m.pixels = pixels
+    m.clock_steady = true
+    m.hsync = true
+    m.vsync = true
+    &m
