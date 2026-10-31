@@ -3,7 +3,7 @@ module sh.sysl.benchtop.chip
 import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Dma, Resets, replicated, written}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
 import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, qspi_flash}
-import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, Otp, OtpFault, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
+import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, BusCtrl, BusFault, Clocks, GlitchDetector, Drive, GPIO_COUNT, IoBank0, IoQspi, Otp, OtpFault, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
 import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_MAINTENANCE_BASE, XIP_WINDOWS_END, read_xip, xip_aux_read, xip_aux_write, xip_target}
 import sh.sysl.benchtop.peripheral.rp2350.{DREQ_UART0_TX, Frame, Sent, UART_UNITS_PER_CYCLE, uart_of}
 import sh.sysl.benchtop.peripheral.rp2350.{Pio, PioFault}
@@ -34,7 +34,10 @@ import sh.sysl.rp2350.psm as psm_reg
 import sh.sysl.rp2350.resets as resets_reg
 import sh.sysl.rp2350.rosc as rosc_reg
 import sh.sysl.rp2350.sio as sio_reg
+import sh.sysl.rp2350.busctrl as busctrl_reg
+import sh.sysl.rp2350.glitch_detector as glitch_reg
 import sh.sysl.rp2350.syscfg as syscfg_reg
+import sh.sysl.rp2350.tbman as tbman_reg
 import sh.sysl.rp2350.sysinfo as sysinfo_reg
 import sh.sysl.rp2350.ticks as ticks_reg
 import sh.sysl.rp2350.timer0 as timer0_reg
@@ -120,6 +123,9 @@ enum Block
     Rosc
     SysInfo
     SysCfg
+    BusCtrlBlock
+    TbMan
+    GlitchBlock
     Powman
     AccessCtrl
     XipCtrl
@@ -142,7 +148,7 @@ struct Placed
     reset: u32
 
 /** Every block the chip runs, with the SVD's base addresses. */
-val BLOCKS: [39]Placed = [
+val BLOCKS: [42]Placed = [
     Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
     Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -168,6 +174,9 @@ val BLOCKS: [39]Placed = [
     Placed(Block.Rosc, rosc_reg.BASE, "ROSC", 0),
     Placed(Block.SysInfo, sysinfo_reg.BASE, "SYSINFO", 0),
     Placed(Block.SysCfg, syscfg_reg.BASE, "SYSCFG", 0),
+    Placed(Block.BusCtrlBlock, busctrl_reg.BASE, "BUSCTRL", 0),
+    Placed(Block.TbMan, tbman_reg.BASE, "TBMAN", 0),
+    Placed(Block.GlitchBlock, glitch_reg.BASE, "GLITCH_DETECTOR", 0),
     Placed(Block.Powman, powman_reg.BASE, "POWMAN", 0),
     Placed(Block.AccessCtrl, accessctrl_reg.BASE, "ACCESSCTRL", 0),
     // XIP_CTRL and the QMI have no RESETS bit; XIP_AUX is on the AHB, with no atomic aliases.
@@ -224,6 +233,8 @@ struct Rp2350
     rosc: Rosc
     sysinfo: SysInfo
     syscfg: SysCfg
+    busctrl: BusCtrl
+    glitch: GlitchDetector
     powman: Powman
     accessctrl: AccessCtrl
     io_qspi: IoQspi
@@ -648,6 +659,9 @@ struct Rp2350
             Rosc -> self.rosc.read(o, width)
             SysInfo -> self.sysinfo.read(o, width)
             SysCfg -> self.syscfg.read(o, width)
+            BusCtrlBlock -> return self.busctrl.read(o, width).map_err(f -> bus_refusal(p, o, f))
+            TbMan -> return rp.tbman_read(o, width).map_err(f -> bus_refusal(p, o, f))
+            GlitchBlock -> return self.glitch.read(o, width).map_err(f -> bus_refusal(p, o, f))
             Powman ->
                 if self.powman.watching() then self.powman.sample(self.pwrup_levels())
                 self.powman.read(o, width)
@@ -762,6 +776,9 @@ struct Rp2350
                 r
             SysInfo -> self.sysinfo.write(o, width, x)
             SysCfg -> self.syscfg.write(o, width, x)
+            BusCtrlBlock -> return self.busctrl.write(o, width, x).map_err(f -> bus_refusal(p, o, f))
+            TbMan -> return rp.tbman_write(o, width).map_err(f -> bus_refusal(p, o, f))
+            GlitchBlock -> return self.glitch.write(o, width, x).map_err(f -> bus_refusal(p, o, f))
             Powman ->
                 self.powman.unmodelled(o, width, x) match
                     Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
@@ -1149,7 +1166,7 @@ end Rp2350
 rp2350() -> Rp2350 =
     Rp2350(rp.rp2350_resets(), rp.clocks(), rp.xosc(), rp.pll(), rp.pll(), rp.ticks(), [rp.timer(), rp.timer()], rp.watchdog(),
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.pio(), rp.bootram(), rp.usb_ctrl(),
-        rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
+        rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.busctrl(true), rp.glitch_detector(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
         rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), false,
         rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None, rp.hstx(), 0, None)
 
@@ -1192,6 +1209,11 @@ private pio_index(b: Block) -> u32 = if b == Block.Pio0 then 0 elif b == Block.P
 
 // Why a PIO block refused an access, as a person reads it.
 private pio_refusal(p: Placed, o: u32, f: PioFault) -> string = f match
+    Access(e) -> refusal(p, o, e)
+    Refused(why) -> s"${p.name} + 0x${hex(o)}: $why"
+
+// Why BUSCTRL, TBMAN or the glitch detector refused an access, as a person reads it.
+private bus_refusal(p: Placed, o: u32, f: BusFault) -> string = f match
     Access(e) -> refusal(p, o, e)
     Refused(why) -> s"${p.name} + 0x${hex(o)}: $why"
 
