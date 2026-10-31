@@ -38,13 +38,13 @@ day. An L is split before it is handed out (§6).
   generator are also library peripherals (`rp-resets`, `rp-timer`, `rp-watchdog`) that run on the
   `virt*` boards through `virt/rp.sysl`, with clk_ref taken to be the core clock because the virtual
   boards have no CLOCKS block (`virt/rp.sysl:8–12`). `virt-sio` (`virt/sio.sysl`) is
-  an RP2040-shaped SIO with FIFOs, spinlocks and CPUID for the virtual boards. `rp-sio`, `pl011`,
-  `dw-i2c` and `rp-adc` are accepted by the checker and marked `modelled = false`
-  (`registry.sysl:301,318,322,324`).
+  an RP2040-shaped SIO with FIFOs, spinlocks and CPUID for the virtual boards. `rp-sio`, `pl011` and
+  `dw-i2c` are accepted by the checker and marked `modelled = false`
+  (`registry.sysl:301,318,322`); `rp-adc` is modelled on both chips (item 19).
 - **Reusable models that are not on either RP bus yet:**
   - the PL022 SPI controller (`peripheral/spi/spi.sysl`, run on the STM32 and virtual boards through
     `virt/spi.sysl`);
-  - a virtual ADC (`peripheral/adc/adc.sysl`);
+  - a virtual ADC (`peripheral/adc/adc.sysl`; the RP chips' own is item 19's);
   - a virtual PWM channel (`peripheral/pwm/pwm.sysl`);
   - the I²C device-callback layer (`peripheral/i2c/i2c.sysl`);
   - the STM32 DMA (`peripheral/dma/dma.sysl`). Its request/arbitration split is the shape to copy,
@@ -110,7 +110,7 @@ day. An L is split before it is handed out (§6).
 | SPI0/1 (PL022) | 12.3 SPI | missing | Not on the chip's bus. The PL022 model exists (`peripheral/spi/spi.sysl`) and runs on STM32 and virtual boards. | `peripheral/spi/tests.sysl` (6) | S (place) + S (DREQ) | mux, DMA |
 | I2C0/1 (DW_apb_i2c) | 12.2 I2C | missing | `dw-i2c` has `modelled = false` (`registry.sysl:322`). The device callbacks exist (`peripheral/i2c/i2c.sysl`). | — | M (master), S (slave) | mux, DMA |
 | PWM (12 slices) | 12.5 PWM | missing | Only `virt-pwm` (`peripheral/pwm/pwm.sysl`). | — | M | mux, DMA, IRQ |
-| ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
+| ADC and temperature sensor | 12.4 ADC | full | Item 19: one model for both chips (`peripheral/rp2040/adc.sysl`, `chip/adc.sysl`). 96 clk_adc cycles a conversion, timed through `next_event`; START_ONCE, START_MANY with DIV's sample period, round robin, the 8-deep FIFO with THRESH, SHIFT, OVER and UNDER, ADC_IRQ_FIFO (35) and DREQ 48 to the DMA. Ideal levels (Q8): `floor(uv × 4096 / 3.3 V)` from the board's `set_analog` or the pad's rail; the sensor on input 4 on its datasheet line at the board's `set_temperature`. Refused by name: an input the RP2350A lacks, a start with EN clear or clk_adc stopped, START_ONCE mid-conversion, the sensor converted with TS_EN clear. | `chip/adc_tests.sysl` | — | — |
 | DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | partial | Item 11: the 16 channels with their four alias sets and triggers, TRANS_COUNT with MODE, every CTRL field, the UART DREQs, the four X/Y pacing timers and TREQ_PERMANENT, chaining, IRQ0–3, MULTI_CHAN_TRIGGER, CHAN_ABORT; transfers through the chip's bus, one a cycle, scheduled through `next_event` (`peripheral/rp2040/dma.sysl`, `chip/dma.sysl`). Refused by name: the sniffer, a change to SECCFG_* or MPU_* (item 12), a TREQ_SEL whose source is not modelled. | `rp2350/dma_tests.sysl`, `chip/dma_tests.sysl` | S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
 | PIO0/1/2 | 11 PIO | partial | The state machines are full (item 13): every PIO version 1 instruction, delay and side-set, the FIFOs and their joins (FJOIN_RX_GET/PUT too), the shift registers' thresholds, the fractional divider cycle-exact against clk_sys, EXECCTRL, SM_RESTART/CLKDIV_RESTART and their PREV/NEXT forms, SMx_INSTR, the IRQ flags across blocks, INTR and both interrupt lines' INTE/INTF/INTS, FDEBUG, FLEVEL, DBG_PADOUT/PADOE and GPIOBASE (`peripheral/rp2350/pio.sysl`). The pins are a vector of their own: FUNCSEL PIO0–2 stays refused, and the DREQs and the lines into the NVIC are item 14's. | `rp2350/pio_tests.sysl`, `chip/pio_tests.sysl` (`pio_programs.elf`: `hello_pio`, `ws2812`, `uart_tx`, `uart_rx`, the RP2350-only pair) | M (GPIO/DMA/IRQ) | mux, DMA, IRQ |
 | USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | full | The controller in device mode, whole (`peripheral/rp2350/usb.sysl`, item 20): the registers, DPRAM with the SETUP packet, endpoint and buffer control, single and double buffering, NAK, STALL, abort, the interrupts and USBCTRL_IRQ, driven by a host through the Arm board's `usb_*` seam. Not gated by RESETS, since the SDK reads SIE_CTRL before releasing USBCTRL; RESETS asserting it resets the controller. benchtop's own host (`chip/usb_host.sysl`, item 21) enumerates a CDC ACM device on a 1 ms frame schedule and bridges its port to the console or a pty (`benchtop run --usb`). | `peripheral/rp2350/usb_tests.sysl`, `chip/usb_tests.sysl`, `chip/usb_host_tests.sysl`, `host/pty_tests.sysl` | — | clk_usb |
@@ -131,7 +131,7 @@ day. An L is split before it is handed out (§6).
 |---|---|---|---|---|---|---|
 | Chip layer: bus decode, clock tree, IRQ routing, Pico board | 2.2 Address map | full | `chip.Rp2040` (`chip/rp2040.sysl`) on `ArmBoard[Rp2040]`, the `pico` board (item 22). Every block not on the chip yet is refused by name with its item. | `chip/pico_tests.sysl` | — | — |
 | Cortex-M0+ ×2 | 2.4 Cortex-M0+ | partial | v6m on the Pico, on the instruction timing table (the SDK's divider wait needs it), with WFE and SEV between the cores (item 22). The 8-region MPU (`mcus/rp2040.hocon:9`) is not modelled. | `v6m/*_tests`, `v6m/exceptions.sysl` (WFE/SEV) | S (MPU, PMSAv7 subset) | — |
-| NVIC and SysTick (M0+) | 2.3.2 Interrupts, 2.4 | full | `v6m/except.sysl`, `v6m/nvic.sysl`. 26 IRQ lines; the chip drives TIMER 0–3, IO_IRQ_BANK0 (13), SIO_IRQ_PROC0/1 (15, 16, each into its own core), UART0/1 (20, 21) and RTC (25). | `v6m/nvic_tests`, `chip/pico_tests.sysl`, `chip/pico_xip_tests.sysl` | — | — |
+| NVIC and SysTick (M0+) | 2.3.2 Interrupts, 2.4 | full | `v6m/except.sysl`, `v6m/nvic.sysl`. 26 IRQ lines; the chip drives TIMER 0–3, IO_IRQ_BANK0 (13), SIO_IRQ_PROC0/1 (15, 16, each into its own core), UART0/1 (20, 21), ADC_IRQ_FIFO (22) and RTC (25). | `v6m/nvic_tests`, `chip/pico_tests.sysl`, `chip/pico_xip_tests.sysl` | — | — |
 | SIO: CPUID, FIFOs (8-deep), spinlocks, FIFO IRQ | 2.3.1 SIO | full | The RP2350's `Sio` with its depth a parameter (`sio_rp2040`), at the RP2040's offsets (`Rp2040.sio_read`). | `chip/pico_tests.sysl` | — | — |
 | SIO GPIO (OUT/OE/IN, SET/CLR/XOR) | 2.3.1 SIO | full | GPIO 0–29 at the RP2040's offsets, mapped onto the shared model's. Of the GPIO_HI bank (the QSPI pins as levels), GPIO_HI_IN answers SS, the flash's chip select, for the ROM's BOOTSEL read (item 23), with the other five pins reading 0; the rest of the bank is refused by name. | `chip/pico_tests.sysl` | — | — |
 | SIO hardware divider (per core) | 2.3.1.5 Integer divider | full | `peripheral/rp2040/divider.sysl:5–84`: 8-cycle completion, DIRTY, signed and unsigned. Each core's at SIO 0x060–0x078 (item 22). | `rp2040/tests.sysl`, `chip/pico_tests.sysl` (the bus, and the SDK's sequence on a core) | — | — |
@@ -165,14 +165,14 @@ day. An L is split before it is handed out (§6).
 | TIMER | 4.6 Timer | full | `peripheral/rp2040/timer.sysl:5–120`: latch, 4 alarms, pause, debug pause. | `rp2040/tests.sysl`, `virt/rp_tests.sysl` (13) | — | — |
 | WATCHDOG | 4.7 Watchdog | full | The tick generator and the counter shared with the RP2350 (`peripheral/rp2040/watchdog.sysl`), TIME falling two a tick (erratum RP2040-E1): CTRL, LOAD, TRIGGER, REASON, SCRATCH0–7. On the `virt*` boards the reset stops the cores at `Reset`, named, since they have no PSM. On the Pico its reset takes down the PSM stages WDSEL selects and the cores boot again through the ROM (item 23); a reset into the ROM's USB boot is refused by name. | `rp2040/tests.sysl`, `rp2040/watchdog_tests.sysl`, `virt/rp_tests.sysl`, `chip/pico_tests.sysl` | — | — |
 | RTC | 4.8 RTC | full | `peripheral/rp2040/rtc.sysl` (item 24): the calendar counting clk_rtc over CLKDIV_M1 + 1, with the RP2040's leap-year rule and FORCE_NOTLEAPYEAR; SETUP and LOAD; RTC_0 latching RTC_1; the alarm's masks, taken as the time changes, held until MATCH_ENA clears; INTE/INTF/INTS and IRQ 25. The next second is scheduled only while the alarm is armed. Refused by name: a LOAD of a date the calendar does not hold, CLKDIV_M1 changed while running. | `chip/pico_xip_tests.sysl` (`hello_rtc`, `rtc_alarm`) | — | — |
-| ADC and temperature sensor | 4.9 ADC | missing | `rp-adc` has `modelled = false`. | — | (shared) | — |
+| ADC and temperature sensor | 4.9 ADC | full | Item 19: the RP2350's model at 0x4004c000 with the RP2040's 3-bit AINSEL and 5-bit RROBIN, ADC_IRQ_FIFO on line 22. Its DREQ reaches no DMA until the RP2040's DMA is on the chip (item 11's row). | `chip/adc_tests.sysl` | — | — |
 
 ## 3. Counts
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 34 | 9 | 0 | 15 | 58 |
-| RP2040 | 20 | 7 | 2 | 8 | 37 |
+| RP2350 | 35 | 9 | 0 | 14 | 58 |
+| RP2040 | 21 | 7 | 2 | 7 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
 benchtop's policy for unsupported accesses (`docs/peripheral-models.md:54`). Several items below
@@ -332,7 +332,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 16 | **SPI on the chip**: the PL022 placed, with DREQs. | S | 9, 11 |
 | 17 | **I²C (DW_apb_i2c) master and slave**. | M | 9, 11 |
 | 18 | **PWM** (12 slices, IRQ, DREQ, pins through the mux). | M | 9, 11 |
-| 19 | **ADC and temperature sensor** (round robin, FIFO, DREQ). | M | 11 |
+| 19 | **ADC and temperature sensor** (round robin, FIFO, DREQ). **Done** (below). | M | 11 |
 | 20 | **USB device controller**: endpoints, buffers, IRQ. **Done** (below). | L | 6 |
 | 21 | **USB host enumerator and CDC bridge to a pty**. `hello_world/usb` is its oracle. **Done** (below). | M | 20 |
 | 22 | **RP2040 chip layer**: `chip.Rp2040` over the shared models (CLOCKS without TICKS, pads without ISO, SIO with 8-deep FIFOs and the divider wired), and the `pico` board running. **Done** (below). | M | 5, 8, 9 |
@@ -1540,3 +1540,47 @@ kernel33.bin` 36.847–36.853 G to 36.845–36.849 G; `sram_loop.elf` 5.407–5.
 `xip_loop.elf` 5.629–5.636 G to 5.633–5.634 G. Unchanged. `hello_multicore` on the Pico, 0.344–0.346 G
 (dev's build, the compiler's float on the stand-in) to 0.348–0.350 G on this ROM with the SDK's
 defaults; Raspberry Pi's image ran it in 0.349–0.355 G.
+
+### Item 19, done: the ADC and the temperature sensor
+
+**One model, both chips** (`peripheral/rp2040/adc.sysl`): the registers sit at the same offsets on
+the RP2040 and the RP2350, which only widens AINSEL (4 bits) and RROBIN (9 bits) for the RP2350B. Each
+chip passes its own masks and name, places the block (0x4004c000 on the RP2040, 0x400a0000 on the
+RP2350, each behind its RESETS bit) and wires ADC_IRQ_FIFO (22 on the RP2040, 35 on the RP2350).
+Both chips have inputs 0 to 3 on GPIO 26 to 29 and the temperature sensor on input 4.
+
+- **Time.** A conversion is 96 cycles of clk_adc, counted in 1/256 of a cycle so DIV's fraction is
+  exact. START_MANY starts the next conversion at once (DIV 0), or 1 + INT + FRAC/256 cycles after the
+  last started; while waiting the ADC is READY. The chip turns clk_sys cycles into ADC units against
+  clk_adc's frequency from CLOCKS, carrying the remainder, and steps the ADC event by event only while
+  something is under way, so an idle ADC costs one test per `advance`. `next_event` offers the next
+  sample's landing (through a DIV wait, the conversion after it) only where the interrupt or the DMA
+  request could see it; the RP2350's DMA loop stops at it too.
+- **Levels** are ideal (Q8): `floor(uv × 4096 / 3.3 V)`, saturating at 4095. A GPIO input's level is
+  the board's (`set_analog`, kept across a chip reset) unless the pad drives itself; otherwise the
+  rail its digital level is at, so a pin driven high from outside reads 4095. The sensor is the
+  datasheet's line, 0.706 V at 27 °C falling 1.721 mV a degree, at the board's `set_temperature`.
+- **FIFO**: 8 deep; LEVEL, EMPTY, FULL; a sample into a full FIFO is dropped and sets OVER; a read of an
+  empty one answers 0 and sets UNDER; both write-1-to-clear. SHIFT keeps the top 8 bits; ERR is stored
+  and never set (no conversion errors in the ideal model). INTR and DREQ hold while the FIFO has a
+  sample and LEVEL ≥ THRESH. DREQ 48 is a TREQ_SEL the RP2350's DMA accepts now.
+- **Refused by name**, leaving CS as it was: AINSEL or RROBIN naming an input the chip does not have
+  (5 to 15 on the RP2350A, 5 to 7 on the RP2040); a start with EN clear; START_ONCE during a
+  conversion; a start with clk_adc stopped. Converting the sensor with TS_EN clear stops the board by
+  name as the conversion ends. On the RP2040 the DREQ reaches nothing until its DMA is on the chip.
+
+**Tests** (`chip/adc_tests.sysl`, 12): a conversion's length to the cycle and its codes at the
+boundaries; a digitally driven input; the sensor at 27, 50 and −40 °C and the board's temperature
+across a reset; round robin wrapping from an AINSEL it does not enable; the FIFO filling, OVER,
+UNDER, SHIFT and a conversion finishing after START_MANY falls; DIV's period and `next_event`; the
+interrupt with INTE and INTF; DREQ against THRESH; each refusal; RESETS; the RP2040's block at its own
+address with its own masks. **Oracles**, pico-examples at 0d62f75 copied unchanged: `adc/hello_adc`
+and `adc/onboard_temperature` on the Pico 2 and the Pico, `adc/adc_console` on the Pico 2 driven over
+UART0 (`c2s`, `c9c4sx`, `c2S`: a channel switch, a sample, an unknown channel, the sensor, an unknown
+command, a 1000-sample FIFO capture), and `adc/dma_capture` on the Pico 2 (`dma_capture_adc.c` leaves
+its core-1 PIO DAC unlaunched, the PIO's pins not being on the mux yet, item 14): 1000 samples at
+500 kS/s moved by the DMA on DREQ 48, every line asserted. Lengthening the conversion by one cycle
+turns four tests red; letting DREQ ignore THRESH turns the DREQ test red.
+
+**Cost**: the five main lines run no ADC; what they pay is `adc.active()` in `advance` and
+`adc.wakes()` in `next_event`, measured by the train's bench.
