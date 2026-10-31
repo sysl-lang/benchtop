@@ -1,0 +1,263 @@
+module sh.sysl.benchtop.peripheral.rp2040
+
+import sh.sysl.rp2350.adc as reg
+import sysl.math.min
+
+// The ADC of the RP2040 and the RP2350A (datasheets 4.9 and 12.4; `hardware/regs/adc.h`), one model: the
+// registers sit at the same offsets on both, and the RP2350's AINSEL and RROBIN are only wider, for the
+// inputs of the QFN-80 part. Both chips have four GPIO inputs and the temperature sensor on input 4.
+//
+// **Analogue is ideal and deterministic** (docs/rp-coverage.md, cut line Q8): no noise, no INL, no ERR. A
+// level becomes `floor(uv × 4096 / 3.3 V)`, the inverse of the conversion the SDK's examples print, and
+// saturates at 4095. The temperature sensor's level is the datasheet's line, 0.706 V at 27 °C falling
+// 1.721 mV per °C, at a temperature the board sets (27 °C until it does).
+//
+// **Time.** A conversion takes 96 cycles of clk_adc, and START_MANY starts the next one at once, or (DIV
+// non-zero) 1 + INT + FRAC/256 cycles after the last started, where that is longer than a conversion. The
+// model counts in 1/256 of a clk_adc cycle and only while something is under way; the chip gives it time
+// event by event and supplies the level as a conversion ends (`pass`, `finish`), so an idle ADC costs
+// nothing. READY is set at once when EN is: the "few cycles" of staging are not visible to a program,
+// which polls READY across them.
+//
+// **The FIFO** holds 8 samples. A sample arriving at a full FIFO is dropped and sets OVER; a read of an
+// empty one sets UNDER and answers 0. DREQ and the FIFO interrupt hold while the FIFO has a sample and
+// its level has reached THRESH, so THRESH 0 at reset asserts neither on an empty FIFO (INTR resets to 0).
+//
+// **Refused by name** (`unmodelled`, and the chip for what needs its state): AINSEL or RROBIN naming an
+// input the chip does not have, a start with EN clear, a START_ONCE during a conversion, a start with
+// clk_adc stopped, and a conversion of the temperature sensor with TS_EN clear.
+
+/** The inputs on the RP2040 and the RP2350A, and the one the temperature sensor is on. */
+const ADC_INPUTS: u32 = 5
+const ADC_TEMPERATURE_INPUT: u32 = 4
+/** The GPIO input 0 is on; the others follow it. */
+const ADC_BASE_GPIO: u32 = 26
+/** The units `Adc.pass` counts in, to a clk_adc cycle. */
+const ADC_UNITS_PER_CYCLE: u64 = 256
+
+private const FIFO_DEPTH: u32 = 8
+private const CONVERSION: u64 = 96 * ADC_UNITS_PER_CYCLE
+private const VREF_UV: u64 = 3300000
+private const TEMPERATURE_27C_UV: i64 = 706000
+private const UV_PER_DEGREE: i64 = 1721
+private const FCS_STORED: u32 = reg.FCS_THRESH_MASK | reg.FCS_DREQ_EN_MASK | reg.FCS_ERR_MASK | reg.FCS_SHIFT_MASK | reg.FCS_EN_MASK
+private const DIV_MASK: u32 = reg.DIV_INT_MASK | reg.DIV_FRAC_MASK
+
+/** The code a level of `uv` microvolts converts to. */
+adc_code(uv: u32) -> u32 = u32(min(u64(uv) * 4096 / VREF_UV, 4095))
+
+/** What the board puts on the ADC's inputs from off the chip; kept across a chip reset, as the board's. */
+struct AnalogIn
+    // Each GPIO input's level in microvolts, and which of them something drives, bit n for input n.
+    uv: [4]u32
+    driven: u32
+    temperature_uv: u32
+
+/** Nothing on the GPIO inputs, and the chip at 27 °C. */
+analog_in() -> AnalogIn = AnalogIn([0; 4], 0, u32(TEMPERATURE_27C_UV))
+
+impl AnalogIn
+    /** Drive GPIO input `input` at `level` microvolts, or leave it undriven with None. */
+    set(*self, input: u32, level: Option[u32])
+        require input < 4, "an ADC GPIO input is 0 to 3"
+        level match
+            Some(uv) ->
+                self.uv[input] = uv
+                self.driven |= 1u32 << input
+            None -> self.driven &= ~(1u32 << input)
+
+    /** The chip's temperature, in thousandths of a degree Celsius, on the sensor's ideal line. */
+    set_temperature(*self, millidegrees: i32)
+        val uv = TEMPERATURE_27C_UV - UV_PER_DEGREE * (i64(millidegrees) - 27000) / 1000
+        self.temperature_uv = if uv < 0 then 0 else u32(uv)
+
+    /** The level at GPIO input `input`, whose pad is `drives` and at `level`: a pad driving itself wins,
+     * then what the board puts there; otherwise the rail its digital level is at (something driving it
+     * digitally, or its pull-up). An input nothing drives reads 0 V, ideal as analogue is.
+     */
+    level(self, input: u32, drives: bool, level: bool) -> u32
+        if !drives && self.driven & (1u32 << input) != 0 then return self.uv[input]
+        if level then u32(VREF_UV) else 0
+
+/** What the converter is doing. */
+enum AdcPhase
+    Idle
+    Converting
+    // START_MANY with a DIV longer than a conversion: waiting for the next start.
+    Waiting
+
+struct Adc
+    // The chip's name in a refusal, and its CS fields.
+    chip: string
+    ainsel_mask: u32
+    rrobin_mask: u32
+    cs: u32
+    result: u32
+    fcs: u32
+    under: bool
+    over: bool
+    fifo: [FIFO_DEPTH]u16
+    head: u32
+    count: u32
+    div: u32
+    inte: u32
+    intf: u32
+    phase: AdcPhase
+    // The units left in `phase`.
+    left: u64
+    /** The input the conversion under way samples, latched as it starts. */
+    input: u32
+
+/** An ADC at power-on on `chip`, whose CS fields AINSEL and RROBIN are `ainsel_mask` and `rrobin_mask`. */
+adc(chip: string, ainsel_mask: u32, rrobin_mask: u32) -> Adc =
+    Adc(chip, ainsel_mask, rrobin_mask, 0, 0, 0, false, false, [0; FIFO_DEPTH], 0, 0, 0, 0, 0, AdcPhase.Idle, 0, 0)
+
+impl Adc
+    reset(*self) = *self = adc(self.chip, self.ainsel_mask, self.rrobin_mask)
+
+    /** TS_EN: the temperature sensor is powered. */
+    temperature_on(self) -> bool = self.cs & reg.CS_TS_EN_MASK != 0
+
+    /** Whether a conversion or the wait for one is under way, so that time means something to it. */
+    active(self) -> bool = self.phase != AdcPhase.Idle
+
+    /** The units until a conversion ends or the next one starts (`pass`). */
+    until_event(self) -> u64 = self.left
+
+    /** Whether the next conversion's end could be seen without a read: by the interrupt or by the DMA. */
+    wakes(self) -> bool = self.active() && (self.inte != 0 || self.fcs & reg.FCS_DREQ_EN_MASK != 0)
+
+    /** `units` pass, no more than `until_event`. True where a conversion has ended: the chip answers with
+     * `finish` and the level on `input`.
+     */
+    pass(*self, units: u64) -> bool
+        self.left -= units
+        if self.left != 0 then return false
+        if self.phase == AdcPhase.Waiting
+            self.start()
+            return false
+        self.phase == AdcPhase.Converting
+
+    /** The conversion under way ends at `uv` microvolts: RESULT, the FIFO, the next round-robin input,
+     * and the next conversion under START_MANY.
+     */
+    finish(*self, uv: u32)
+        self.result = adc_code(uv)
+        if self.fcs & reg.FCS_EN_MASK != 0 then self.push(self.result)
+        self.round_robin()
+        if self.cs & reg.CS_START_MANY_MASK == 0
+            self.phase = AdcPhase.Idle
+            return
+        val period = if self.div == 0 then 0 else u64(self.div) + ADC_UNITS_PER_CYCLE
+        if period > CONVERSION
+            self.phase = AdcPhase.Waiting
+            self.left = period - CONVERSION
+        else self.start()
+
+    private start(*self)
+        self.phase = AdcPhase.Converting
+        self.left = CONVERSION
+        self.input = (self.cs & reg.CS_AINSEL_MASK) >> reg.CS_AINSEL_SHIFT
+
+    private push(*self, code: u32)
+        if self.count == FIFO_DEPTH
+            self.over = true
+            return
+        val sample = if self.fcs & reg.FCS_SHIFT_MASK != 0 then code >> 4 else code
+        self.fifo[(self.head + self.count) % FIFO_DEPTH] = u16(sample)
+        self.count += 1
+
+    // RROBIN moves AINSEL on to the next input it enables, wrapping; the first conversion is of AINSEL
+    // whether or not RROBIN enables it.
+    private round_robin(*self)
+        val enabled = (self.cs & self.rrobin_mask) >> reg.CS_RROBIN_SHIFT
+        if enabled == 0 then return
+        val at = (self.cs & reg.CS_AINSEL_MASK) >> reg.CS_AINSEL_SHIFT
+        for i in 1u32..=ADC_INPUTS
+            val next = (at + i) % ADC_INPUTS
+            if enabled & (1u32 << next) != 0
+                self.cs = (self.cs & ~reg.CS_AINSEL_MASK) | (next << reg.CS_AINSEL_SHIFT)
+                return
+
+    // Whether the FIFO has a sample and its level has reached THRESH.
+    private at_threshold(self) -> bool = self.count > 0 && self.count >= (self.fcs & reg.FCS_THRESH_MASK) >> reg.FCS_THRESH_SHIFT
+
+    /** The DMA request. */
+    dreq(self) -> bool = self.fcs & reg.FCS_DREQ_EN_MASK != 0 && self.at_threshold()
+
+    private intr(self) -> u32 = if self.at_threshold() then reg.INTR_FIFO_MASK else 0
+    private ints(self) -> u32 = (self.intr() | self.intf) & self.inte
+
+    /** The interrupt line, ADC_IRQ_FIFO. */
+    irq(self) -> bool = self.ints() != 0
+
+    private pop(*self) -> u32
+        if self.count == 0
+            self.under = true
+            return 0
+        val sample = u32(self.fifo[self.head])
+        self.head = (self.head + 1) % FIFO_DEPTH
+        self.count -= 1
+        sample
+
+    /** A read: a read of FIFO, through any alias and at any width, takes a sample. */
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val value = offset & 0xFFC match
+            reg.CS_OFFSET -> self.cs | (if self.cs & reg.CS_EN_MASK != 0 && self.phase != AdcPhase.Converting then reg.CS_READY_MASK else 0)
+            reg.RESULT_OFFSET -> self.result
+            reg.FCS_OFFSET -> self.fcs | (if self.count == 0 then reg.FCS_EMPTY_MASK else 0) | (if self.count == FIFO_DEPTH then reg.FCS_FULL_MASK else 0) |
+                (if self.under then reg.FCS_UNDER_MASK else 0) | (if self.over then reg.FCS_OVER_MASK else 0) | (self.count << reg.FCS_LEVEL_SHIFT)
+            reg.FIFO_OFFSET -> self.pop()
+            reg.DIV_OFFSET -> self.div
+            reg.INTR_OFFSET -> self.intr()
+            reg.INTE_OFFSET -> self.inte
+            reg.INTF_OFFSET -> self.intf
+            reg.INTS_OFFSET -> self.ints()
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+
+    /** Why a write of `value` at `offset` is refused, leaving the ADC as it was; None where it is not. */
+    unmodelled(self, offset: u32, width: u32, value: u32) -> Option[string]
+        if access(offset, width, true).is_err() || offset & 0xFFC != reg.CS_OFFSET then return None
+        val data = replicated(value, width)
+        val next = written(self.cs, offset, data)
+        val ainsel = (next & self.ainsel_mask) >> reg.CS_AINSEL_SHIFT
+        if ainsel >= ADC_INPUTS then return Some(s"CS.AINSEL $ainsel selects an input the ${self.chip} does not have: its inputs are 0 to 3 (GPIO 26 to 29) and 4, the temperature sensor")
+        val rrobin = (next & self.rrobin_mask) >> reg.CS_RROBIN_SHIFT
+        if rrobin >> ADC_INPUTS != 0 then return Some(s"CS.RROBIN $rrobin enables an input the ${self.chip} does not have: its inputs are 0 to 4")
+        val once = triggered(offset, data) & reg.CS_START_ONCE_MASK != 0
+        val many = next & reg.CS_START_MANY_MASK != 0
+        if (once || many) && next & reg.CS_EN_MASK == 0 then return Some("CS starts a conversion with EN clear, on an ADC powered down and unclocked, which is not modelled")
+        if once && !many && self.phase == AdcPhase.Converting then return Some("CS.START_ONCE during a conversion, which READY says has not finished, is not modelled")
+        None
+
+    /** A write `unmodelled` lets through. */
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
+        access(offset, width, true)?
+        val data = replicated(value, width)
+        offset & 0xFFC match
+            reg.CS_OFFSET -> self.write_cs(offset, data)
+            reg.FCS_OFFSET ->
+                self.fcs = written(self.fcs, offset, data) & FCS_STORED
+                if data & reg.FCS_UNDER_MASK != 0 then self.under = false
+                if data & reg.FCS_OVER_MASK != 0 then self.over = false
+            reg.DIV_OFFSET -> self.div = written(self.div, offset, data) & DIV_MASK
+            reg.INTE_OFFSET -> self.inte = written(self.inte, offset, data) & reg.INTE_FIFO_MASK
+            reg.INTF_OFFSET -> self.intf = written(self.intf, offset, data) & reg.INTF_FIFO_MASK
+            // Read-only registers ignore writes.
+            reg.RESULT_OFFSET | reg.FIFO_OFFSET | reg.INTR_OFFSET | reg.INTS_OFFSET -> ()
+            _ -> return Err(AccessError.Unmapped)
+        Ok(())
+
+    // CS: a conversion ends with EN, a wait with START_MANY; START_MANY starts one, and START_ONCE (which
+    // START_MANY overrides) does. A conversion under way finishes after START_MANY falls.
+    private write_cs(*self, offset: u32, data: u32)
+        val once = triggered(offset, data) & reg.CS_START_ONCE_MASK != 0
+        self.cs = written(self.cs, offset, data) & (self.ainsel_mask | self.rrobin_mask | reg.CS_START_MANY_MASK | reg.CS_TS_EN_MASK | reg.CS_EN_MASK)
+        val many = self.cs & reg.CS_START_MANY_MASK != 0
+        if self.cs & reg.CS_EN_MASK == 0 || (!many && self.phase == AdcPhase.Waiting)
+            self.phase = AdcPhase.Idle
+            self.left = 0
+        if self.phase == AdcPhase.Idle && (many || once) then self.start()
+end Adc

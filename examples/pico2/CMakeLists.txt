@@ -100,6 +100,17 @@ target_compile_definitions(xip_loop PRIVATE PICO_HEAP_SIZE=0x200)
 benchtop_program(sram_loop xip_loop.c no_flash)
 pico_minimize_runtime(sram_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
 
+# The ADC. dma_capture_adc.c is pico-examples' dma_capture.c with core 1's resistor DAC left unlaunched:
+# its PIO pins do not reach the mux yet (docs/rp-coverage.md item 14), and a test drives GPIO 26 instead.
+foreach(prog hello_adc onboard_temperature adc_console)
+    benchtop_program(${prog} ${prog}.c no_flash)
+    target_link_libraries(${prog} hardware_adc)
+endforeach()
+benchtop_program(dma_capture_adc dma_capture_adc.c no_flash)
+target_link_libraries(dma_capture_adc hardware_adc hardware_dma hardware_pio pico_multicore)
+pico_generate_pio_header(dma_capture_adc ${CMAKE_CURRENT_LIST_DIR}/pio/resistor_dac.pio OUTPUT_DIR ${CMAKE_CURRENT_LIST_DIR}/pio)
+target_include_directories(dma_capture_adc PRIVATE ${CMAKE_CURRENT_LIST_DIR}/pio)
+
 # The PIO programs: pioasm (built from the SDK's tools) assembles pio/*.pio into pio/*.pio.h, which are
 # committed; pio_programs prints them with the configuration each pico-examples init builds.
 benchtop_program(pio_programs pio_programs.c no_flash)

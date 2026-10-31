@@ -1,6 +1,6 @@
 module sh.sysl.benchtop.chip
 
-import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Dma, Resets, replicated, written}
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Adc, AnalogIn, Dma, Resets, adc, analog_in, replicated, written}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
 import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, qspi_flash}
 import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, Otp, OtpFault, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
@@ -10,6 +10,7 @@ import sh.sysl.benchtop.peripheral.rp2350.{Pio, PioFault}
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
+import sh.sysl.rp2350.adc as adc_reg
 import sh.sysl.rp2350.bootram as bootram_reg
 import sh.sysl.rp2350.otp as otp_reg
 import sh.sysl.rp2350.qmi as qmi_reg
@@ -82,6 +83,7 @@ const UART0_IRQ: u32 = 33
 const UART1_IRQ: u32 = 34
 const USBCTRL_IRQ: u32 = 14
 const DMA_IRQ_0: u32 = 10
+const ADC_IRQ_FIFO: u32 = 35
 
 /** A GPIO with no wire (`Rp2350.wire`). */
 const NO_WIRE: u8 = 0xFF
@@ -128,6 +130,7 @@ enum Block
     OtpDataRawGuarded
     OtpBlock
     DmaBlock
+    AdcBlock
 
 /** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
 struct Placed
@@ -137,7 +140,7 @@ struct Placed
     reset: u32
 
 /** Every block the chip runs, with the SVD's base addresses. */
-val BLOCKS: [37]Placed = [
+val BLOCKS: [38]Placed = [
     Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
     Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -180,6 +183,7 @@ val BLOCKS: [37]Placed = [
     Placed(Block.OtpBlock, otp_reg.BASE, "OTP", 0),
     // On the AHB, with its atomic aliases (the SDK sets INTE bits with `hw_set_bits`).
     Placed(Block.DmaBlock, dma_reg.BASE, "DMA", resets_reg.RESET_DMA_MASK),
+    Placed(Block.AdcBlock, adc_reg.BASE, "ADC", resets_reg.RESET_ADC_MASK),
     // The PIO blocks, on the AHB with the atomic aliases. Last, so the blocks a running program polls
     // are found without passing them (`block_at` walks the table).
     Placed(Block.Pio0, pio0_reg.BASE, "PIO0", resets_reg.RESET_PIO0_MASK),
@@ -269,6 +273,11 @@ struct Rp2350
     // reaches it (`connect_memory`).
     dma: Dma
     memory: Option[*DmaMemory]
+    // The ADC (adc.sysl gives it time), the clk_sys remainder it carries, and what the board puts on its
+    // inputs.
+    adc: Adc
+    adc_rest: u64
+    analog: AnalogIn
 
     /** Power-on, with core 1 in the boot ROM; the flash keeps its array, as the board's part, and the
      * board's memory stays connected.
@@ -279,12 +288,14 @@ struct Rp2350
         val wires = self.wires
         val array = self.otp
         val memory = self.memory
+        val analog = self.analog
         val fresh = rp2350()
         *self = fresh
         if size != 0 then self.flash.connect(bytes, size)
         self.otp.power_on(array)
         self.wires = wires
         self.memory = memory
+        self.analog = analog
 
     /** Whether the flash's contents, direct mode or the pinned XIP_SRAM lines have changed since the last
      * call, for a board that mirrors them.
@@ -347,6 +358,7 @@ struct Rp2350
         self.watchdog_reset()
         // The UARTs count only while their lines are busy, so an idle UART costs nothing here.
         if self.uarts[0].active() || self.uarts[1].active() then self.advance_lines(cycles, sys)
+        if self.adc.active() then self.advance_adc(cycles, sys)
     end advance_devices
 
     // `cycles` of clk_sys at `sys` Hz pass on the UARTs' lines, as clk_peri's cycles, event by event: each
@@ -572,6 +584,7 @@ struct Rp2350
             self.sio.mtime_due(k) match
                 Some(n) -> due = earliest(due, if self.sio.mtime_full_speed() then Some(n) else self.ticks_to_cycles(Tick.Riscv, n))
                 None -> ()
+        if self.adc.wakes() then due = earliest(due, self.adc_due())
         earliest(earliest(due, self.line_due()), self.dma_due())
 
     // The clk_sys cycles until generator `g`'s `n`th tick from now, rounded up; None while it is
@@ -627,6 +640,7 @@ struct Rp2350
             QmiBlock -> return self.qmi.read(o, width, &self.flash).map_err(f -> xip_refusal(p, o, f))
             XipAux -> return xip_aux_read(&self.xip, &self.qmi, &self.flash, o, width).map_err(f -> xip_refusal(p, o, f))
             DmaBlock -> self.dma.read(o, width)
+            AdcBlock -> self.adc.read(o, width)
         got.map_err(e -> refusal(p, o, e))
 
     /** A write of `width` bytes at `a` by core `core`, or why the chip refuses it. */
@@ -745,6 +759,7 @@ struct Rp2350
                 self.xip_changed = true
                 return r.map_err(f -> xip_refusal(p, o, f))
             DmaBlock -> return self.dma_write(p, o, width, x)
+            AdcBlock -> return self.adc_write(p, o, width, x)
         got.map_err(e -> refusal(p, o, e))
 
     // PROC1 has gone into reset or come out of it, between the stages held `before` and `after`. Going
@@ -881,11 +896,13 @@ struct Rp2350
         val wires = self.wires
         val array = self.otp
         val memory = self.memory
+        val analog = self.analog
         *self = rp2350()
         if size != 0 then self.flash.connect(bytes, size)
         self.otp.power_on(array)
         self.wires = wires
         self.memory = memory
+        self.analog = analog
         self.powman = powman
         self.now = now
         self.dma.paced_at = now
@@ -1005,6 +1022,7 @@ struct Rp2350
                 IoQspiBlock -> self.io_qspi.reset()
                 PadsQspi -> self.pads_qspi.reset()
                 DmaBlock -> self.dma.reset()
+                AdcBlock -> self.adc.reset()
                 _ -> ()
 
     // A write to UART `k`, refused where it asks for something benchtop does not model: a setting
@@ -1092,6 +1110,7 @@ struct Rp2350
         p.interrupt(UART1_IRQ, self.uarts[1].irq())
         p.interrupt(USBCTRL_IRQ, self.usb.irq())
         for j in 0u32..<4 do p.interrupt(DMA_IRQ_0 + j, self.dma.irq(j))
+        p.interrupt(ADC_IRQ_FIFO, self.adc.irq())
         p.machine_timer(self.sio.software_irq(k), self.sio.timer_irq(k))
 end Rp2350
 
@@ -1101,7 +1120,8 @@ rp2350() -> Rp2350 =
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.pio(), rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
         rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), false,
-        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None)
+        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None,
+        adc("RP2350A", adc_reg.CS_AINSEL_MASK, adc_reg.CS_RROBIN_MASK), 0, analog_in())
 
 // The chip as `ArmBoard` drives it: its inherent methods under the trait's names.
 impl ArmChip for Rp2350
