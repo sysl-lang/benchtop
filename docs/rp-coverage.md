@@ -1539,3 +1539,75 @@ kernel33.bin` 36.847–36.853 G to 36.845–36.849 G; `sram_loop.elf` 5.407–5.
 `xip_loop.elf` 5.629–5.636 G to 5.633–5.634 G. Unchanged. `hello_multicore` on the Pico, 0.344–0.346 G
 (dev's build, the compiler's float on the stand-in) to 0.348–0.350 G on this ROM with the SDK's
 defaults; Raspberry Pi's image ran it in 0.349–0.355 G.
+
+### Item 17, done: I2C0 and I2C1
+
+`peripheral/rp2350/i2c.sysl` (`I2c`, one DW_apb_i2c, and `I2cBus`, both controllers and the parts on
+their lines) against the field descriptions and configuration parameters of `hardware/regs/i2c.h`, the
+same on both chips, and the SDK's `hardware_i2c` and `pico_i2c_slave`; the chips place it, wire it and
+time it (`chip/i2c.sysl`).
+
+- **A bus a step at a time, timed.** START, the address and its acknowledge, data bytes with theirs,
+  repeated STARTs and the STOP, each a whole number of SCL bits: a bit is HCNT + LCNT + SPKLEN + 8
+  ic_clk cycles (the databook's high time HCNT + SPKLEN + 7 and low time LCNT + 1, edges ideal per Q8),
+  and ic_clk is clk_sys, so a step is counted in the chip's own cycles. START, STOP and an acknowledge on
+  its own are one bit, an address or a byte written nine, a byte read eight with its acknowledge sent
+  when the next command decides it. At the SDK's 100 kHz from 150 MHz a bit is 1564 cycles (95.9 kHz). The
+  chip runs the bus only where a master's step ends (`next_due`, offered through `next_event` and to the
+  DMA's steps), so an idle bus, or one a slave holds, costs a comparison per advance.
+- **Masters**: commands from IC_DATA_CMD's 16-deep FIFO with RESTART and STOP; the bus held, SCL low,
+  while the FIFO is empty after a command with no STOP; each byte read acknowledged but the last before a
+  STOP or repeated START; TX_EMPTY with TX_EMPTY_CTRL waiting for the byte in the shift register;
+  TX_CMD_BLOCK; IC_ENABLE cleared or ABORT set ending the transfer after the step in progress with a STOP
+  (a byte being read NACKed and dropped), ABRT_USER_ABRT; ABRT_7B_ADDR_NOACK and ABRT_TXDATA_NOACK with
+  TX_FLUSH_CNT, both FIFOs flushed and the transmit FIFO held flushed until IC_CLR_TX_ABRT.
+- **Slaves**: IC_SAR answered; bytes into the receive FIFO with FIRST_DATA_BYTE on the first; RD_REQ once
+  per byte with SCL held until the CPU writes one; the master's NACK as RX_DONE; stale data flushed with
+  ABRT_SLVFLUSH_TXFIFO; a read command in slave mode ABRT_SLVRD_INTX; SLV_DATA_NACK_ONLY;
+  STOP_DET_IFADDRESSED; RESTART_DET. A full receive FIFO holds SCL with RX_FIFO_FULL_HLD_CTRL and loses
+  the byte with RX_OVER without it, a master's as a slave's.
+- **Registers**: every one at its reset value; CON, TAR, SAR, the SCL counts and FS_SPKLEN take no write
+  while enabled; the counts' minimums (6, 8, 1) and SPEED outside 1–2 set to fast, as the descriptions
+  say; the thresholds clamped to 15; the clearing reads, ACTIVITY kept while busy; IC_STATUS,
+  IC_ENABLE_STATUS, IC_TXFLR/RXFLR; COMP_PARAM_1 0, COMP_VERSION and COMP_TYPE the header's. The
+  clearing reads and IC_DATA_CMD are refused through the atomic aliases.
+- **The lines** (`i2c_wiring`): an I2C function (F3, SDA on the even GPIO, SCL on the odd, I2C0 or I2C1 by
+  `n / 2 % 2`) drives nothing, the line idling at its pull-up. A controller's line is its one GPIO and
+  the far end of that GPIO's wire; a part on the workbench (`attach_i2c`, an `I2cPart` with the
+  `peripheral/i2c` device callbacks and whether it pulls the lines up) is on a line where its SDA and SCL
+  GPIOs are. The other controller is a target where its SDA and SCL are on the master's lines.
+- **Interrupts and DMA**: IC_INTR_STAT through IC_INTR_MASK, I2C0_IRQ and I2C1_IRQ (36 and 37 on the
+  RP2350, 23 and 24 on the RP2040), each line kept as it changes (`I2cBus.lines`) rather than worked out
+  every quantum; the TX and RX DREQs at DMATDL and DMARDL, 44 to 47 on the RP2350's DMA, which now takes
+  those TREQ_SELs.
+- **The RP2040** places the same `I2cBus` at 0x40044000 and 0x40048000 behind RESETS. Its workbench has
+  no wires, so its two controllers cannot reach each other, and its DMA is not on the chip.
+- **Refused by name**: 10-bit addressing (IC_CON), a general call or START BYTE (IC_TAR.SPECIAL), a master
+  and a slave at once (at IC_ENABLE), disabling a slave while a transfer addresses it, and, while the bus
+  runs (`take_line_fault`), a repeated START with IC_RESTART_EN clear, two masters on one bus, two
+  targets answering one address, RESETS taking a slave from a transfer, and lines benchtop cannot show:
+  no GPIO or more than one carrying a signal, a pad that does not read its input, an override in CTRL,
+  something else driving the line or driving it from off the chip, GPIO interrupts enabled on it, a line
+  with no pull-up, a part or a slave on one line and not the other. A command that would start a transfer
+  on such lines is refused at its IC_DATA_CMD write and leaves the controller as it was.
+- **Assumptions**, since the headers do not say: START, repeated START and STOP each last one SCL bit;
+  SDA_HOLD and SDA_SETUP do not change the timing; RD_REQ is raised at the end of the address or the
+  master's acknowledge, before the byte's eight bits.
+
+The oracles: `examples/pico2/bus_scan.c` and `examples/pico/bus_scan.c` are pico-examples' `i2c/bus_scan`,
+`examples/pico2/slave_mem_i2c.c` its `i2c/slave_mem_i2c`, all unchanged from `pico-scratch/pico-examples`
+at commit 0d62f75 below their header comment. `bus_scan` finds the DS3231 the test puts on GPIO 4 and 5
+at 0x68 on both boards, and nothing else; `slave_mem_i2c` runs I2C0 as a slave through pico_i2c_slave's
+interrupt handler and I2C1 as the master over two wires (4 to 6, 5 to 7), and three rounds of its message
+written and read back across a repeated START come out line by line. `chip/i2c_tests.sysl` (8) asserts
+those, and at register level the lines, the timing through `next_event`, the interrupt lines, the
+refusals with the block's name, RESETS, a DMA channel paced by DREQ 44; `rp2350/i2c_tests.sysl` (11) the
+model alone. Breaking the read's bit count, RD_REQ's once per byte, or the SCL pull-up check turns them
+red.
+
+**Cost**, host instructions retired, three interleaved runs each against the branch's base (dev at
+eb87237, `/usr/bin/time -l`, `benchtop run --board pico2`): `sram_loop.elf` 5.438–5.447 G to
+5.445–5.454 G, `xip_loop.elf` 5.660–5.662 G to 5.665–5.668 G, `bench --core cortex-m33 kernel33.bin`
+118.08–118.12 G to 118.08–118.10 G: within 0.1%. An earlier cut that worked out both I2C lines every
+quantum cost `sram_loop` 0.3%; `I2cBus.lines` is why it does not. `bus_scan.elf`, with no part on the
+lines, runs in 4.04–4.05 G.
