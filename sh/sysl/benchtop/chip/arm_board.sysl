@@ -6,6 +6,7 @@ import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.benchtop.v6m as arm
 import sh.sysl.benchtop.v6m.{CoprocessorOp, Fpu, Kind, MemoryMap, RamBank, Stop}
 import sh.sysl.elf
+import sh.sysl.rp2350.dma as dma_reg
 import sh.sysl.rp2350.powman as powman_reg
 import sh.sysl.rp2040.psm as psm40_reg
 import sh.sysl.rp2350.psm as psm_reg
@@ -830,18 +831,26 @@ impl ArmBoard[Rp2350]
     // The common case costs two tests: Secure code with nPRIV clear, where no device denies either core
     // Secure privileged access and FORCE_CORE_NS is clear (`AccessCtrl.secure_free`).
     @inline
-    private gated(*self, cpu: *arm.Cpu, a: u32) -> bool
+    private gated(*self, cpu: *arm.Cpu, a: u32, write: bool, x: u32) -> bool
         if !cpu.ns && cpu.control & 1 == 0 && self.chip.accessctrl.secure_free then return false
-        self.gated_slow(cpu, a)
+        self.gated_slow(cpu, a, write, x)
 
     @noinline
     @cold
-    private gated_slow(*self, cpu: *arm.Cpu, a: u32) -> bool
+    private gated_slow(*self, cpu: *arm.Cpu, a: u32, write: bool, x: u32) -> bool
         if cpu.ns && a >= SIO_BASE && a < SIO_END
             self.refuse(cpu, a, s"0x${hex(a, 8)} is the SIO, from Non-secure state: the SIO's Non-secure bank is not modelled")
             return true
+        val privileged = cpu.ipsr != 0 || cpu.control & 1 == 0
+        // The DMA's own registers are guarded by its SECCFG and MPU levels.
+        if a >= dma_reg.BASE && a < dma_reg.BASE + 0x1000
+            self.chip.dma.access_refusal(a - dma_reg.BASE, write, x, cpu.ns, privileged) match
+                Some(why) ->
+                    self.refuse(cpu, a, why)
+                    return true
+                None -> ()
         val ac = &self.chip.accessctrl
-        val need = ac.need(cpu.core, cpu.ns, cpu.ipsr != 0 || cpu.control & 1 == 0)
+        val need = ac.need(cpu.core, cpu.ns, privileged)
         if need & ac.denied == 0 then return false
         ac.refusal(a, need) match
             None -> false
@@ -876,7 +885,7 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
         self.chip.run_to(self.at(cpu, n))
         if self.reset_first(cpu, a) then return 0
         if const C.rp2350()
-            if self.gated(cpu, a) then return 0
+            if self.gated(cpu, a, false, 0) then return 0
             if in_xip_sram(u64(a))
                 self.sram_line(a, width) match
                     Ok(at) ->
@@ -907,7 +916,7 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
         self.chip.run_to(self.at(cpu, n))
         if self.reset_first(cpu, a) then return
         if const C.rp2350()
-            if self.gated(cpu, a) then return
+            if self.gated(cpu, a, true, x) then return
             // The boot ROM is read-only, and a write to it is ignored rather than faulted: TinyUSB's RP2350 port
             // stores endpoint 0's control word through a null pointer, to 0x00000000, on every control
             // transfer, which every Pico 2 running stdio_usb survives (`hw_endpoint_start_next_buffer`).

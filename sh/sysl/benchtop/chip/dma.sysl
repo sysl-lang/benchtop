@@ -1,6 +1,6 @@
 module sh.sysl.benchtop.chip
 
-import sh.sysl.benchtop.peripheral.rp2040.{DMA_READ_ERROR, DMA_WRITE_ERROR, DmaFault, NO_CHANNEL, TREQ_PERMANENT, TREQ_TIMER0}
+import sh.sysl.benchtop.peripheral.rp2040.{DMA_READ_ERROR, DMA_WRITE_ERROR, DmaFault, NO_CHANNEL, TREQ_PERMANENT, TREQ_TIMER0, swapped}
 import sh.sysl.benchtop.peripheral.rp2350.{DREQ_UART0_TX, XIP_BASE, XIP_WINDOWS_END, treq_name}
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
 import sysl.fmt.hex
@@ -14,9 +14,9 @@ import sysl.math.{max, min}
 // XIP_SRAM) is the board's to answer (`DmaMemory`), and a store there is one the cores see at once: code
 // decoded from it decodes again and an exclusive monitor on it is broken. Everything else is the chip's
 // `read` and `write`, so a device's side effects happen as for a core's access (a UART's FIFO pops and
-// pushes, a write to the DMA's own registers triggers a channel). The DMA master has the RP2350's
-// security attributes at their reset values (Secure, privileged: SECCFG is item 12), and ACCESSCTRL's
-// DMA bit decides each device. **A bus error is modelled**: an ACCESSCTRL denial, the SIO and the
+// pushes, a write to the DMA's own registers triggers a channel). Each channel's bus accesses have its
+// SECCFG level (Secure and privileged at reset) and the DMA's MPU can raise an address's, and ACCESSCTRL's
+// DMA bit with that level decides each device. **A bus error is modelled**: an ACCESSCTRL denial, the SIO and the
 // cores' private bus (which are not on the DMA's bus), and an XIP_SRAM line with no pin set the
 // channel's READ_ERROR or WRITE_ERROR, halt it and raise its interrupt. A write to ACCESSCTRL is dropped
 // (LOCK.DMA is hardwired). **Refused by name**, stopping the run (`take_line_fault`): an access the chip
@@ -57,8 +57,6 @@ private enum Moved
 
 // The SIO and the cores' private peripheral bus, neither on the DMA's bus.
 private const SIO_FIRST: u32 = 0xD0000000
-// What the DMA master needs of a device's ACCESSCTRL register: its master bit (DMA) and Secure privileged.
-private const DMA_NEED: u32 = 0x48
 
 impl Rp2350
     /** The board's memory, for the DMA to reach (`DmaMemory`); a chip with none answers only its devices. */
@@ -124,7 +122,7 @@ impl Rp2350
     private dma_transfer(*self, k: u32)
         val c = self.dma.ch[k]
         val size = c.size
-        val v = self.dma_load(c.read_addr, size) match
+        val v = self.dma_load(k, c.read_addr, size) match
             Data(x) -> x
             BusError ->
                 self.dma.bus_error(k, DMA_READ_ERROR)
@@ -135,7 +133,8 @@ impl Rp2350
         self.dma.ch[k].read_addr = c.next(c.read_addr, c.read_step, !c.ring_write)
         self.dma.ch[k].write_addr = c.next(c.write_addr, c.write_step, c.ring_write)
         val data = if c.bswap then swapped(v, size) else v
-        self.dma_store(c.write_addr, size, data) match
+        if c.sniff then self.dma.sniff(k, data, size)
+        self.dma_store(k, c.write_addr, size, data) match
             Data(_) -> ()
             BusError ->
                 self.dma.bus_error(k, DMA_WRITE_ERROR)
@@ -151,9 +150,20 @@ impl Rp2350
         self.dma.busy &= ~(1u32 << k)
         if self.dma.fault.is_empty() then self.dma.fault = s"DMA channel $k $why"
 
-    // A DMA read of `width` bytes at `a`.
-    private dma_load(*self, a: u32, width: u32) -> Moved
+    // Whether channel `k` may reach `a` under the DMA's MPU: a bus error where not.
+    private dma_mpu(*self, k: u32, a: u32) -> Option[Moved]
+        if !self.dma.mpu_live then return None
+        self.dma.mpu_allows(k, a) match
+            Ok(true) -> None
+            Ok(false) -> Some(Moved.BusError)
+            Err(why) -> Some(Moved.Refused(why))
+
+    // A DMA read of `width` bytes at `a`, by channel `k`.
+    private dma_load(*self, k: u32, a: u32, width: u32) -> Moved
         if a & (width - 1) != 0 then return Moved.Refused(s"a transfer not aligned to its size ($width bytes) is not modelled")
+        self.dma_mpu(k, a) match
+            Some(m) -> return m
+            None -> ()
         self.memory match
             Some(m) ->
                 m.dma_read(a, width) match
@@ -161,14 +171,17 @@ impl Rp2350
                     BusError -> return Moved.BusError
                     Chip -> ()
             None -> ()
-        if a >= SIO_FIRST || self.accessctrl.refusal(a, DMA_NEED).is_some() then return Moved.BusError
+        if a >= SIO_FIRST || self.accessctrl.refusal(a, self.dma.need(k)).is_some() then return Moved.BusError
         self.read(0, a, width) match
             Ok(x) -> Moved.Data(x)
             Err(why) -> Moved.Refused(why)
 
-    // A DMA write of `width` bytes of `x` at `a`.
-    private dma_store(*self, a: u32, width: u32, x: u32) -> Moved
+    // A DMA write of `width` bytes of `x` at `a`, by channel `k`.
+    private dma_store(*self, k: u32, a: u32, width: u32, x: u32) -> Moved
         if a & (width - 1) != 0 then return Moved.Refused(s"a transfer not aligned to its size ($width bytes) is not modelled")
+        self.dma_mpu(k, a) match
+            Some(m) -> return m
+            None -> ()
         self.memory match
             Some(m) ->
                 m.dma_write(a, width, x) match
@@ -176,7 +189,7 @@ impl Rp2350
                     BusError -> return Moved.BusError
                     Chip -> ()
             None -> ()
-        if a >= SIO_FIRST || self.accessctrl.refusal(a, DMA_NEED).is_some() then return Moved.BusError
+        if a >= SIO_FIRST || self.accessctrl.refusal(a, self.dma.need(k)).is_some() then return Moved.BusError
         if a >= accessctrl_reg.BASE && a - accessctrl_reg.BASE < 0x4000 then return Moved.Data(0)
         val xip_block = block_at(a) match
             Some((p, _)) -> p.block == Block.XipCtrl || p.block == Block.QmiBlock || p.block == Block.XipAux
@@ -225,9 +238,3 @@ impl Rp2350
             if self.dma.ch[c].en && self.dma.ch[c].treq == treq then return true
         false
 end Rp2350
-
-// BSWAP: a halfword's two bytes swapped, a word's four reversed; a byte unchanged.
-private swapped(v: u32, size: u32) -> u32 = size match
-    2 -> ((v & 0xFF) << 8) | ((v >> 8) & 0xFF)
-    4 -> ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | (v >> 24)
-    _ -> v

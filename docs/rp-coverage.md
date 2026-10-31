@@ -111,7 +111,7 @@ day. An L is split before it is handed out (§6).
 | I2C0/1 (DW_apb_i2c) | 12.2 I2C | missing | `dw-i2c` has `modelled = false` (`registry.sysl:322`). The device callbacks exist (`peripheral/i2c/i2c.sysl`). | — | M (master), S (slave) | mux, DMA |
 | PWM (12 slices) | 12.5 PWM | missing | Only `virt-pwm` (`peripheral/pwm/pwm.sysl`). | — | M | mux, DMA, IRQ |
 | ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
-| DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | partial | Item 11: the 16 channels with their four alias sets and triggers, TRANS_COUNT with MODE, every CTRL field, the UART DREQs, the four X/Y pacing timers and TREQ_PERMANENT, chaining, IRQ0–3, MULTI_CHAN_TRIGGER, CHAN_ABORT; transfers through the chip's bus, one a cycle, scheduled through `next_event` (`peripheral/rp2040/dma.sysl`, `chip/dma.sysl`). Refused by name: the sniffer, a change to SECCFG_* or MPU_* (item 12), a TREQ_SEL whose source is not modelled. | `rp2350/dma_tests.sysl`, `chip/dma_tests.sysl` | S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
+| DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | partial | Item 11: the 16 channels with their four alias sets and triggers, TRANS_COUNT with MODE, every CTRL field, the UART DREQs, the four X/Y pacing timers and TREQ_PERMANENT, chaining, IRQ0–3, MULTI_CHAN_TRIGGER, CHAN_ABORT; transfers through the chip's bus, one a cycle, scheduled through `next_event` (`peripheral/rp2040/dma.sysl`, `chip/dma.sysl`). Item 12 added the sniffer (CRC-32, CRC-32R, CRC-16, CRC-16R, XOR, sum, with BSWAP, OUT_REV, OUT_INV) and SECCFG_CH/IRQ/MISC and the MPU regions. Refused by name: a TREQ_SEL whose source is not modelled, on an enabled channel. | `rp2350/dma_tests.sysl`, `chip/dma_tests.sysl` | DREQs from every other peripheral |
 | PIO0/1/2 | 11 PIO | partial | The state machines are full (item 13): every PIO version 1 instruction, delay and side-set, the FIFOs and their joins (FJOIN_RX_GET/PUT too), the shift registers' thresholds, the fractional divider cycle-exact against clk_sys, EXECCTRL, SM_RESTART/CLKDIV_RESTART and their PREV/NEXT forms, SMx_INSTR, the IRQ flags across blocks, INTR and both interrupt lines' INTE/INTF/INTS, FDEBUG, FLEVEL, DBG_PADOUT/PADOE and GPIOBASE (`peripheral/rp2350/pio.sysl`). The pins are a vector of their own: FUNCSEL PIO0–2 stays refused, and the DREQs and the lines into the NVIC are item 14's. | `rp2350/pio_tests.sysl`, `chip/pio_tests.sysl` (`pio_programs.elf`: `hello_pio`, `ws2812`, `uart_tx`, `uart_rx`, the RP2350-only pair) | M (GPIO/DMA/IRQ) | mux, DMA, IRQ |
 | USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | full | The controller in device mode, whole (`peripheral/rp2350/usb.sysl`, item 20): the registers, DPRAM with the SETUP packet, endpoint and buffer control, single and double buffering, NAK, STALL, abort, the interrupts and USBCTRL_IRQ, driven by a host through the Arm board's `usb_*` seam. Not gated by RESETS, since the SDK reads SIE_CTRL before releasing USBCTRL; RESETS asserting it resets the controller. benchtop's own host (`chip/usb_host.sysl`, item 21) enumerates a CDC ACM device on a 1 ms frame schedule and bridges its port to the console or a pty (`benchtop run --usb`). | `peripheral/rp2350/usb_tests.sysl`, `chip/usb_tests.sysl`, `chip/usb_host_tests.sysl`, `host/pty_tests.sysl` | — | clk_usb |
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
@@ -1561,3 +1561,23 @@ core and latch POWMAN_CHIP_RESET) is refused.
 
 **Cost:** the cores, the DMA and the scheduler are untouched: the counters are register state only, so
 no bench of the main lines was needed.
+
+### Item 12, done: the DMA sniffer and security attributes
+
+Both live in `peripheral/rp2040/dma.sysl` and run on both chips' layouts (the sniffer on the RP2040
+too; SECCFG_* and the MPU on the RP2350 only). The header of that file is the specification.
+
+- **Sniffer**: CALC 0 CRC-32, 1 CRC-32R, 2 CRC-16, 3 CRC-16R, 14 even parity, 15 sum; a transfer's bytes go in
+  low byte first; OUT_REV and OUT_INV change only what SNIFF_DATA reads back. Checked against the standard
+  check values of "123456789" (0xCBF43926, 0x29B1, 0x0376E6E7, the CRC-16/KERMIT 0x2189), and by
+  `dma/sniff_crc` (copied unchanged to `examples/pico2/sniff_crc.c`, ELF committed) on the Arm Pico 2.
+- **Security attributes**: a channel's S and P decide the level of its bus accesses (ACCESSCTRL and MPU),
+  an MPU region's first match gives an address its level, a violation is READ_ERROR or WRITE_ERROR with
+  the interrupt; SECCFG_CH.LOCK, SECCFG_IRQ masking and SECCFG_MISC hiding are modelled.
+- **Refused by name**: reserved CALC values, a register access below its level, overlapping MPU regions of
+  different attributes.
+- **Fixed on the way**: a disabled channel may hold an unmodelled TREQ_SEL (the SDK's `hw_set_bits` on
+  AL1_CTRL is a read-modify-write of the reset value 0); enabling it with that selection is still refused.
+
+**Cost**: only the transfer path gained a check that is skipped while SNIFF_CTRL.EN is clear; no bench of
+the five main lines was run here (the train benches them).
