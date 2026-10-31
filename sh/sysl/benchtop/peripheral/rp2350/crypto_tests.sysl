@@ -1,0 +1,223 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.rp2350.sha256 as sha
+import sh.sysl.rp2350.trng as tr
+
+// The SHA-256 core and the TRNG, register by register. The digests are FIPS 180-4's worked example
+// ("abc") and a two-block message whose digest is the standard library's own `Sha256` hasher's (checked by
+// the chip test against the SDK's long vector).
+
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const XOR: u32 = 0x1000
+
+private val ABC_DIGEST: [8]u32 = [0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223, 0xb00361a3, 0x96177a9c, 0xb410ff61, 0xf20015ad]
+
+// "abc", the 1 bit and the 24-bit length as one padded block of 16 words written little-endian, so BSWAP
+// turns each into the standard's big-endian word.
+private abc_block(s: *Sha256, now: u64, width: u32)
+    var bytes: [64]u8 = [0; 64]
+    bytes[0] = 0x61
+    bytes[1] = 0x62
+    bytes[2] = 0x63
+    bytes[3] = 0x80
+    bytes[63] = 0x18
+    var i: u32 = 0
+    while i < 64
+        var v: u32 = 0
+        for k in 0..<width do v |= u32(bytes[usize(i + k)]) << (8 * k)
+        s.write(now, sha.WDATA_OFFSET, width, v).unwrap()
+        i += width
+
+private sums(s: *Sha256, now: u64) -> [8]u32
+    var out: [8]u32 = [0; 8]
+    for i in 0u32..<8 do out[usize(i)] = s.read(now, sha.SUM0_OFFSET + 4 * i, 4).unwrap()
+    out
+
+@test("SHA256: power-on CSR is BSWAP, 32-bit DMA_SIZE, WDATA_RDY and SUM_VLD; START loads the initial hash value")
+sha_reset_and_start()
+    var s = sha256()
+    assert(s.read(0, sha.CSR_OFFSET, 4).unwrap() == 0x1206, "datasheet reset value")
+    assert(sums(&s, 0)[0] == 0, "SUM reads 0 before START")
+    s.write(0, sha.CSR_OFFSET + SET, 4, sha.CSR_START_MASK).unwrap()
+    assert(sums(&s, 0)[0] == 0x6a09e667 && sums(&s, 0)[7] == 0x5be0cd19, "the initial hash value")
+    assert(s.read(0, sha.CSR_OFFSET, 4).unwrap() == 0x1206, "START reads back 0")
+    s.write(0, sha.CSR_OFFSET + CLR, 4, sha.CSR_START_MASK).unwrap()
+    s.write(0, sha.WDATA_OFFSET, 4, 1).unwrap()
+    s.write(0, sha.CSR_OFFSET + CLR, 4, sha.CSR_START_MASK).unwrap()
+    assert(s.read(0, sha.CSR_OFFSET, 4).unwrap() & sha.CSR_SUM_VLD_MASK == 0, "CLR does not fire START: the block is still half written")
+    s.write(0, sha.CSR_OFFSET + XOR, 4, sha.CSR_START_MASK).unwrap()
+    assert(s.read(0, sha.CSR_OFFSET, 4).unwrap() & sha.CSR_SUM_VLD_MASK != 0, "XOR fires it")
+
+@test("SHA256: FIPS 180-4's \"abc\", the same digest whether written as words, halfwords or bytes")
+sha_abc_every_width()
+    for width in [4u32, 2, 1]
+        var s = sha256()
+        s.write(0, sha.CSR_OFFSET, 4, sha.CSR_START_MASK | sha.CSR_BSWAP_MASK | (2 << sha.CSR_DMA_SIZE_SHIFT)).unwrap()
+        abc_block(&s, 100, width)
+        assert(sums(&s, 200) == ABC_DIGEST, s"width $width")
+
+@test("SHA256: the 16th word drops WDATA_RDY and SUM_VLD for 57 cycles; SUM_VLD is low from a block's first word")
+sha_timing()
+    var s = sha256()
+    s.write(0, sha.CSR_OFFSET, 4, sha.CSR_START_MASK | sha.CSR_BSWAP_MASK).unwrap()
+    s.write(10, sha.WDATA_OFFSET, 4, 0).unwrap()
+    assert(s.read(10, sha.CSR_OFFSET, 4).unwrap() & 6 == sha.CSR_WDATA_RDY_MASK, "ready, not valid, mid-block")
+    for i in 1u32..<16 do s.write(10, sha.WDATA_OFFSET, 4, 0).unwrap()
+    assert(s.read(10, sha.CSR_OFFSET, 4).unwrap() & 6 == 0, "digesting")
+    assert(!s.dreq(10) && s.due(10) == Some(57))
+    assert(s.read(66, sha.CSR_OFFSET, 4).unwrap() & 6 == 0, "56 cycles on")
+    assert(s.read(67, sha.CSR_OFFSET, 4).unwrap() & 6 == 6, "57 on")
+    assert(s.dreq(67) && s.due(67).is_none())
+
+@test("SHA256: a write while WDATA_RDY is low is dropped and latches ERR_WDATA_NOT_RDY, cleared by a 1 through any alias")
+sha_err_not_ready()
+    var s = sha256()
+    s.write(0, sha.CSR_OFFSET, 4, sha.CSR_START_MASK | sha.CSR_BSWAP_MASK).unwrap()
+    abc_block(&s, 0, 4)
+    s.write(5, sha.WDATA_OFFSET, 4, 0xDEADBEEF).unwrap()
+    assert(s.read(5, sha.CSR_OFFSET, 4).unwrap() & sha.CSR_ERR_WDATA_NOT_RDY_MASK != 0)
+    assert(sums(&s, 60) == ABC_DIGEST, "the dropped word changed nothing")
+    s.write(60, sha.CSR_OFFSET + CLR, 4, sha.CSR_ERR_WDATA_NOT_RDY_MASK).unwrap()
+    assert(s.read(60, sha.CSR_OFFSET, 4).unwrap() & sha.CSR_ERR_WDATA_NOT_RDY_MASK == 0, "the SDK's hw_clear_bits clears it")
+    assert(s.read(60, sha.CSR_OFFSET, 4).unwrap() & sha.CSR_BSWAP_MASK != 0, "and leaves BSWAP")
+
+@test("SHA256: with BSWAP clear each word is the message word as written")
+sha_no_bswap()
+    var s = sha256()
+    s.write(0, sha.CSR_OFFSET, 4, sha.CSR_START_MASK).unwrap()
+    assert(s.read(0, sha.CSR_OFFSET, 4).unwrap() & sha.CSR_BSWAP_MASK == 0)
+    s.write(0, sha.WDATA_OFFSET, 4, 0x61626380).unwrap()
+    for i in 1u32..<15 do s.write(0, sha.WDATA_OFFSET, 4, 0).unwrap()
+    s.write(0, sha.WDATA_OFFSET, 4, 0x18).unwrap()
+    assert(sums(&s, 100) == ABC_DIGEST)
+
+@test("SHA256: DMA_SIZE is stored (3 is refused), mixed write sizes in one block and an aliased WDATA write are refused by name")
+sha_refusals()
+    var s = sha256()
+    s.write(0, sha.CSR_OFFSET, 4, sha.CSR_START_MASK | (1 << sha.CSR_DMA_SIZE_SHIFT)).unwrap()
+    assert((s.read(0, sha.CSR_OFFSET, 4).unwrap() >> sha.CSR_DMA_SIZE_SHIFT) & 3 == 1)
+    assert(sha_why(s.write(0, sha.CSR_OFFSET, 4, 3 << sha.CSR_DMA_SIZE_SHIFT).unwrap_err()).contains("reserved"))
+    s.write(0, sha.WDATA_OFFSET, 2, 0x1234).unwrap()
+    assert(sha_why(s.write(0, sha.WDATA_OFFSET, 1, 1).unwrap_err()).contains("mixing sizes"))
+    assert(sha_why(s.write(0, sha.WDATA_OFFSET + SET, 4, 1).unwrap_err()).contains("no atomic aliases"))
+    assert(s.read(0, 0x40, 4).is_err() && s.read(0, sha.CSR_OFFSET + 1, 4).is_err(), "unmapped, unaligned")
+    s.reset()
+    assert(s.read(0, sha.CSR_OFFSET, 4).unwrap() == 0x1206, "RESETS puts it back")
+
+private ehr(t: *Trng, now: u64) -> [6]u32
+    var out: [6]u32 = [0; 6]
+    for i in 0u32..<6 do out[usize(i)] = t.read(now, tr.EHR_DATA0_OFFSET + 4 * i, 4).unwrap()
+    out
+
+@test("TRNG: power-on registers, then a collection takes 192 samples of SAMPLE_CNT1 + 1 cycles, four times that with the decorrelator")
+trng_timing()
+    var t = trng()
+    assert(t.read(0, tr.RNG_IMR_OFFSET, 4).unwrap() == 0xF && t.read(0, tr.SAMPLE_CNT1_OFFSET, 4).unwrap() == 0xFFFF)
+    assert(t.read(0, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 0 && t.read(0, tr.TRNG_VALID_OFFSET, 4).unwrap() == 0, "idle until enabled")
+    t.write(0, tr.SAMPLE_CNT1_OFFSET, 4, 9).unwrap()
+    t.write(100, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    assert(t.read(100, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 1)
+    assert(t.read(100 + 192 * 10 * 4 - 1, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 1, "VNC on: 4 x 192 x 10")
+    assert(t.read(100 + 192 * 10 * 4, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 0)
+    assert(t.read(100 + 192 * 40, tr.TRNG_VALID_OFFSET, 4).unwrap() == 1 && t.read(0, tr.RNG_ISR_OFFSET, 4).unwrap() == 1)
+    // The bypass bits: a run with VNC_BYPASS takes a quarter.
+    var u = trng()
+    u.write(0, tr.SAMPLE_CNT1_OFFSET, 4, 0).unwrap()
+    u.write(0, tr.TRNG_DEBUG_CONTROL_OFFSET, 4, 0xFFFFFFFF).unwrap()
+    assert(u.read(0, tr.TRNG_DEBUG_CONTROL_OFFSET, 4).unwrap() == 0xE, "only bits 3:1 exist")
+    u.write(0, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    assert(u.read(191, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 1 && u.read(192, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 0, "192 samples of 1 cycle")
+
+@test("TRNG: the words are SplitMix64 from the seed, low word first; the same seed gives the same words and another a different set")
+trng_seeded_words()
+    var t = trng()
+    t.seed(1)
+    t.write(0, tr.SAMPLE_CNT1_OFFSET, 4, 0).unwrap()
+    t.write(0, tr.TRNG_DEBUG_CONTROL_OFFSET, 4, 0xE).unwrap()
+    t.write(0, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    val first = ehr(&t, 1000)
+    // SplitMix64 from state 1: the first output (state 0x9E3779B97F4A7C16).
+    var g: u64 = 1
+    var want: [6]u32 = [0; 6]
+    for i in 0..<3
+        g = g +% 0x9E3779B97F4A7C15
+        var z = g
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB
+        z = z ^ (z >> 31)
+        want[2 * i] = u32(z & 0xFFFFFFFF)
+        want[2 * i + 1] = u32(z >> 32)
+    assert(first == want, s"$first $want")
+    assert(want[0] != 0 && want[0] != want[1])
+    var u = trng()
+    u.seed(1)
+    u.write(0, tr.SAMPLE_CNT1_OFFSET, 4, 0).unwrap()
+    u.write(0, tr.TRNG_DEBUG_CONTROL_OFFSET, 4, 0xE).unwrap()
+    u.write(0, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    assert(ehr(&u, 5000) == want, "same seed, same words")
+    var v = trng()
+    v.seed(2)
+    v.write(0, tr.SAMPLE_CNT1_OFFSET, 4, 0).unwrap()
+    v.write(0, tr.TRNG_DEBUG_CONTROL_OFFSET, 4, 0xE).unwrap()
+    v.write(0, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    assert(ehr(&v, 5000) != want, "another seed")
+
+@test("TRNG: reading EHR_DATA5 empties the register and starts the next collection, which holds different words")
+trng_next_collection()
+    var t = trng()
+    t.write(0, tr.SAMPLE_CNT1_OFFSET, 4, 0).unwrap()
+    t.write(0, tr.TRNG_DEBUG_CONTROL_OFFSET, 4, 0xE).unwrap()
+    t.write(0, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    val a = ehr(&t, 300)
+    assert(t.read(300, tr.TRNG_VALID_OFFSET, 4).unwrap() == 0 && t.read(300, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 1, "sampling again from the last word")
+    assert(t.read(300, tr.EHR_DATA0_OFFSET, 4).unwrap() == 0, "the register is empty")
+    val b = ehr(&t, 300 + 192)
+    assert(a != b, "new words")
+    // Disabling stops it; re-enabling with nothing held starts one.
+    t.write(600, tr.RND_SOURCE_ENABLE_OFFSET, 4, 0).unwrap()
+    assert(t.read(600, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 0 && t.read(10000, tr.TRNG_VALID_OFFSET, 4).unwrap() == 0)
+    t.write(10000, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    assert(t.read(10000, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 1)
+
+@test("TRNG: SAMPLE_CNT1 restarts a running collection; RNG_ICR clears EHR_VALID; the interrupt is EHR_VALID unmasked, and due() offers its time")
+trng_interrupt()
+    var t = trng()
+    t.write(0, tr.SAMPLE_CNT1_OFFSET, 4, 1).unwrap()
+    t.write(0, tr.TRNG_DEBUG_CONTROL_OFFSET, 4, 0xE).unwrap()
+    t.write(0, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    assert(t.due(0).is_none(), "masked: nothing to wake for")
+    t.write(100, tr.SAMPLE_CNT1_OFFSET, 4, 2).unwrap()
+    assert(t.busy(100 + 575) && !t.busy(100 + 576), "restarted at 100 with 3 cycles a sample")
+    t.write(100, tr.RNG_IMR_OFFSET, 4, 0xE).unwrap()
+    assert(t.due(100) == Some(576))
+    assert(!t.irq())
+    t.settle(676)
+    assert(t.irq())
+    assert(t.due(700).is_none(), "done")
+    t.write(700, tr.RNG_ICR_OFFSET + SET, 4, 1).unwrap()
+    assert(t.read(700, tr.RNG_ISR_OFFSET, 4).unwrap() == 0 && !t.irq(), "cleared")
+    assert(t.read(700, tr.TRNG_VALID_OFFSET, 4).unwrap() == 1, "the data stays")
+
+@test("TRNG: SW_RESET and RST_BITS_COUNTER empty the register (the counter only with the source off); the BIST counters and unmapped offsets are refused")
+trng_resets_and_refusals()
+    var t = trng()
+    t.write(0, tr.SAMPLE_CNT1_OFFSET, 4, 0).unwrap()
+    t.write(0, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    t.settle(10000)
+    t.write(10000, tr.RST_BITS_COUNTER_OFFSET, 4, 1).unwrap()
+    assert(t.read(10000, tr.TRNG_VALID_OFFSET, 4).unwrap() == 1, "ignored with the source on")
+    t.write(10000, tr.TRNG_SW_RESET_OFFSET, 4, 1).unwrap()
+    assert(t.read(10000, tr.TRNG_VALID_OFFSET, 4).unwrap() == 0 && t.read(10000, tr.RNG_ISR_OFFSET, 4).unwrap() == 0 && t.read(10000, tr.TRNG_BUSY_OFFSET, 4).unwrap() == 1, "emptied and sampling again")
+    t.write(10000, tr.RND_SOURCE_ENABLE_OFFSET, 4, 0).unwrap()
+    t.write(10000, tr.TRNG_SW_RESET_OFFSET, 4, 0).unwrap()
+    t.write(20000, tr.RND_SOURCE_ENABLE_OFFSET, 4, 1).unwrap()
+    t.settle(30000)
+    t.write(30000, tr.RND_SOURCE_ENABLE_OFFSET, 4, 0).unwrap()
+    t.write(30000, tr.RST_BITS_COUNTER_OFFSET, 4, 1).unwrap()
+    assert(t.read(30000, tr.TRNG_VALID_OFFSET, 4).unwrap() == 0, "with the source off it empties")
+    assert(trng_why(t.read(0, tr.RNG_BIST_CNTR_0_OFFSET, 4).unwrap_err()).contains("BIST"))
+    assert(t.read(0, 0x200, 4).is_err() && t.read(0, tr.EHR_DATA0_OFFSET + 1, 4).is_err())
+    t.reset()
+    assert(t.read(0, tr.SAMPLE_CNT1_OFFSET, 4).unwrap() == 0xFFFF && t.read(0, tr.RND_SOURCE_ENABLE_OFFSET, 4).unwrap() == 0, "RESETS puts it back")

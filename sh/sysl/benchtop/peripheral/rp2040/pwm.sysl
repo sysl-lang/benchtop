@@ -1,0 +1,347 @@
+module sh.sysl.benchtop.peripheral.rp2040
+
+import sh.sysl.rp2040.pwm as reg
+import sysl.math.min
+
+// The PWM block of both chips (`hardware/regs/pwm.h`): 8 slices and one interrupt line on the RP2040, 12
+// slices and two on the RP2350, with the same registers in the same order. Each slice has a counter, a
+// fractional divider from clk_sys, two compare values and two outputs. The counter is never stepped per
+// cycle: `pass` works out where a stretch of clk_sys leaves it, and the chip asks `until_change` where
+// something must see each edge (`Rp2350.advance_pwm`).
+//
+// Refused by name, leaving the block as it was: a DIV with INT 0, whose rate the headers do not give;
+// PH_ADV or PH_RET on a slice that is not running; PH_ADV at full speed, which the header forbids; both
+// together.
+//
+// Assumptions, since the headers do not say: a CC or TOP written to a disabled slice takes effect at once,
+// and to a running one at its next wrap, DIV at once. A phase-correct counter holds each end for a tick
+// (0..TOP, TOP..0, which is the 2 x (TOP + 1) period) and wraps on leaving 0 downward. PH_ADV and PH_RET
+// read as 0 straight after the write: an advance happens then, a retard drops the next tick. Edges of the B
+// pin go through the divider, as the SDK's PWM_DIV_B_RISING says. A wrap asserts the slice's DREQ until a
+// transfer it paces completes, so wraps the DMA has not answered count once.
+
+/** The most slices either chip has. */
+const PWM_SLICES_MAX: u32 = 12
+private const STRIDE: u32 = reg.CH1_CSR_OFFSET - reg.CH0_CSR_OFFSET
+private const CSR_STORED: u32 = reg.CH0_CSR_DIVMODE_MASK | reg.CH0_CSR_B_INV_MASK | reg.CH0_CSR_A_INV_MASK | reg.CH0_CSR_PH_CORRECT_MASK | reg.CH0_CSR_EN_MASK
+private const PH_BITS: u32 = reg.CH0_CSR_PH_ADV_MASK | reg.CH0_CSR_PH_RET_MASK
+private const FREE: u32 = 0
+private const LEVEL: u32 = 1
+private const RISE: u32 = 2
+private const NEVER_CHANGES: u64 = 0xFFFFFFFFFFFFFFFF
+
+/** Why the PWM block refused a write. */
+enum PwmFault
+    Access(e: AccessError)
+    Refused(why: string)
+
+/** One slice: its counter, what software last wrote, and what the counter is using. */
+struct PwmSlice
+    csr: u32
+    // The divider in sixteenths: DIV as written.
+    div: u32
+    ctr: u32
+    cc: u32
+    top: u32
+    cc_live: u32
+    top_live: u32
+    // A phase-correct counter on its way back to 0.
+    down: bool
+    // Sixteenths of a clock towards the next tick, below `div`.
+    rest: u32
+    // Ticks PH_RET still has to drop.
+    skip: u32
+
+    /** The level on channel B's output, or A's. */
+    level(*self, b: bool) -> bool
+        val cmp = if b then self.cc_live >> 16 else self.cc_live & 0xFFFF
+        val inverted = self.csr & (if b then reg.CH0_CSR_B_INV_MASK else reg.CH0_CSR_A_INV_MASK) != 0
+        (self.ctr < cmp) != inverted
+
+    private mode(*self) -> u32 = (self.csr & reg.CH0_CSR_DIVMODE_MASK) >> reg.CH0_CSR_DIVMODE_SHIFT
+    private phase_correct(*self) -> bool = self.csr & reg.CH0_CSR_PH_CORRECT_MASK != 0
+
+    // Ticks from the counter's position until it wraps, dropped ticks aside. A counter above TOP runs round
+    // through 0xFFFF to reach it.
+    private to_wrap(*self) -> u64
+        val up = u64((self.top_live - self.ctr) & 0xFFFF)
+        if !self.phase_correct() then return up + 1
+        if self.down then u64(self.ctr) + 1 else up + u64(self.top_live) + 2
+
+    // Ticks until compare value `cmp` next changes its output, or to the wrap if that comes first, when
+    // the values may change. May answer early, never late.
+    private to_change(*self, cmp: u32) -> u64
+        val wrap = self.to_wrap()
+        if !self.phase_correct()
+            return if self.ctr < cmp && cmp <= self.top_live then u64(cmp - self.ctr) else wrap
+        if self.down
+            return if self.ctr >= cmp && cmp >= 1 then u64(self.ctr - (cmp - 1)) else wrap
+        if self.ctr < cmp && cmp <= self.top_live then return u64(cmp - self.ctr)
+        if self.ctr >= cmp && cmp >= 1 && cmp - 1 <= self.top_live && self.ctr <= self.top_live
+            return u64(self.top_live - self.ctr) + 1 + u64(self.top_live - (cmp - 1))
+        wrap
+
+    // Fewer than `to_wrap` ticks.
+    private walk(*self, n: u64)
+        if !self.phase_correct()
+            self.ctr = u32((u64(self.ctr) + n) & 0xFFFF)
+        elif self.down
+            self.ctr -= u32(n)
+        else
+            val up = u64((self.top_live - self.ctr) & 0xFFFF)
+            if n <= up
+                self.ctr = u32((u64(self.ctr) + n) & 0xFFFF)
+            else
+                self.down = true
+                self.ctr = self.top_live - u32(n - up - 1)
+
+    /** `t` ticks of the counter: whether it wrapped. A wrap takes up the written CC and TOP. */
+    ticks(*self, t: u64) -> bool
+        var left = t
+        if self.skip != 0
+            val dropped = min(left, u64(self.skip))
+            self.skip -= u32(dropped)
+            left -= dropped
+        val first = self.to_wrap()
+        if left < first
+            self.walk(left)
+            return false
+        left -= first
+        self.ctr = 0
+        self.down = false
+        self.cc_live = self.cc
+        self.top_live = self.top
+        val period = (u64(self.top_live) + 1) * (if self.phase_correct() then 2 else 1)
+        self.walk(left % period)
+        true
+
+    // The clocks of the divider until its `t`th tick from now.
+    private clocks_for(*self, t: u64) -> u64 = ((t + u64(self.skip)) * u64(self.div) - u64(self.rest) + 15) / 16
+
+    /** `clocks` clocks into the divider: whether the counter wrapped. */
+    pass(*self, clocks: u64) -> bool
+        val total = u64(self.rest) + clocks * 16
+        self.rest = u32(total % u64(self.div))
+        self.ticks(total / u64(self.div))
+end PwmSlice
+
+/** The block: its slices, and what they raise. */
+struct Pwm
+    slices: [PWM_SLICES_MAX]PwmSlice
+    // The chip's: slices and interrupt lines. A reset keeps them.
+    count: u32
+    irqs: u32
+    /** The slices with EN set, bit k for slice k. */
+    enabled: u32
+    /** The enabled slices counting from their B pin. */
+    gated: u32
+    intr: u32
+    inte: [2]u32
+    intf: [2]u32
+    /** The DREQs asserted. */
+    dreq: u32
+    /** Each slice's B input when last sampled, for its edges. */
+    b_was: u32
+
+    /** Reset: every slice as `hardware/regs/pwm.h` gives it. */
+    reset(*self)
+        for k in 0..<PWM_SLICES_MAX do self.slices[k] = PwmSlice(0, 1u32 << reg.CH0_DIV_INT_SHIFT, 0, 0, 0xFFFF, 0, 0xFFFF, false, 0, 0)
+        self.enabled = 0
+        self.gated = 0
+        self.intr = 0
+        self.inte = [0, 0]
+        self.intf = [0, 0]
+        self.dreq = 0
+        self.b_was = 0
+
+    private all(*self) -> u32 = (1u32 << self.count) - 1
+    private en_at(*self) -> u32 = self.count * STRIDE
+
+    /** Whether interrupt line `i` is asserted. */
+    irq(*self, i: u32) -> bool = (self.intr | self.intf[i]) & self.inte[i] != 0
+
+    /** The level slice `k` offers its B pin, or its A pin. */
+    level(*self, k: u32, b: bool) -> bool = self.slices[k].level(b)
+
+    /** Whether slice `k`'s B pin is an output: it is an input in every mode but free-running. */
+    b_drives(*self, k: u32) -> bool = self.slices[k].mode() == FREE
+
+    /** A transfer paced by slice `k`'s DREQ has completed. */
+    take_dreq(*self, k: u32) = self.dreq &= ~(1u32 << k)
+
+    private wrapped(*self, k: u32)
+        self.intr |= 1u32 << k
+        self.dreq |= 1u32 << k
+
+    /** `clocks` of clk_sys, with `inputs` the B pins throughout, bit k for slice k. */
+    pass(*self, clocks: u64, inputs: u32)
+        var m = self.enabled
+        while m != 0
+            val k = m.trailing_zeros()
+            m &= m - 1
+            if self.counts(k, inputs) && self.slices[k].pass(clocks) then self.wrapped(k)
+
+    /** The B pins are now `inputs`: a slice counting edges takes those it was waiting for. */
+    edges(*self, inputs: u32)
+        var m = self.gated
+        while m != 0
+            val k = m.trailing_zeros()
+            m &= m - 1
+            val mode = self.slices[k].mode()
+            if mode == LEVEL then continue
+            val bit = 1u32 << k
+            val now = inputs & bit != 0
+            val was = self.b_was & bit != 0
+            if now != was && now == (mode == RISE) && self.slices[k].pass(1) then self.wrapped(k)
+        self.b_was = inputs
+
+    // Whether slice `k` counts clk_sys as things stand.
+    private counts(*self, k: u32, inputs: u32) -> bool
+        val mode = self.slices[k].mode()
+        mode == FREE || (mode == LEVEL && inputs & (1u32 << k) != 0)
+
+    /** The clocks until an output of an enabled slice may change or a counter wraps; at least 1, and
+     * NEVER_CHANGES where only an edge from outside would move one.
+     */
+    until_change(*self, inputs: u32) -> u64
+        var soonest = NEVER_CHANGES
+        var m = self.enabled
+        while m != 0
+            val k = m.trailing_zeros()
+            m &= m - 1
+            if !self.counts(k, inputs) then continue
+            val s = &self.slices[k]
+            val t = min(min(s.to_change(s.cc_live & 0xFFFF), s.to_change(s.cc_live >> 16)), s.to_wrap())
+            soonest = min(soonest, s.clocks_for(t))
+        soonest
+
+    /** The clocks until the next wrap of a slice in `wanted` that counts clk_sys now. */
+    wrap_due(*self, wanted: u32, inputs: u32) -> Option[u64]
+        var soonest = NEVER_CHANGES
+        var m = self.enabled & wanted
+        while m != 0
+            val k = m.trailing_zeros()
+            m &= m - 1
+            if self.counts(k, inputs) then soonest = min(soonest, self.slices[k].clocks_for(self.slices[k].to_wrap()))
+        if soonest == NEVER_CHANGES then None else Some(soonest)
+
+    /** The slices whose next wrap would raise an interrupt line. */
+    irq_wanted(*self) -> u32 = (self.inte[0] | self.inte[1]) & ~self.intr
+
+    /** A register read. */
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val a = offset & 0xFFC
+        Ok(read_lane(self.register(a)?, offset, width))
+
+    private register(*self, a: u32) -> Result[u32, AccessError]
+        val at = self.en_at()
+        if a < at
+            val s = &self.slices[a / STRIDE]
+            return Ok((a % STRIDE) match
+                reg.CH0_CSR_OFFSET -> s.csr
+                reg.CH0_DIV_OFFSET -> s.div
+                reg.CH0_CTR_OFFSET -> s.ctr
+                reg.CH0_CC_OFFSET -> s.cc
+                _ -> s.top)
+        if a == at then return Ok(self.enabled)
+        if a == at + 4 then return Ok(self.intr)
+        if a >= at + 8 + 12 * self.irqs then return Err(AccessError.Unmapped)
+        val i = (a - at - 8) / 12
+        Ok((a - at - 8) % 12 match
+            0 -> self.inte[i]
+            4 -> self.intf[i]
+            _ -> (self.intr | self.intf[i]) & self.inte[i])
+
+    /** A register write, through any alias; a refused one changes nothing. */
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, PwmFault]
+        access(offset, width, true).map_err(e -> PwmFault.Access(e))?
+        val a = offset & 0xFFC
+        val data = replicated(value, width)
+        val at = self.en_at()
+        if a < at then return self.write_slice(a / STRIDE, a % STRIDE, offset, data)
+        if a == at
+            self.set_enabled(written(self.enabled, offset, data) & self.all())
+        elif a == at + 4
+            self.intr = w1c(self.intr, data)
+        elif a >= at + 8 + 12 * self.irqs
+            return Err(PwmFault.Access(AccessError.Unmapped))
+        else
+            val i = (a - at - 8) / 12
+            (a - at - 8) % 12 match
+                0 -> self.inte[i] = written(self.inte[i], offset, data) & self.all()
+                4 -> self.intf[i] = written(self.intf[i], offset, data) & self.all()
+                _ -> ()
+        Ok(())
+
+    private write_slice(*self, k: u32, r: u32, offset: u32, data: u32) -> Result[unit, PwmFault]
+        val running = self.enabled & (1u32 << k) != 0
+        val s = &self.slices[k]
+        r match
+            reg.CH0_CSR_OFFSET -> return self.write_csr(k, offset, data)
+            reg.CH0_DIV_OFFSET ->
+                val next = written(s.div, offset, data) & (reg.CH0_DIV_INT_MASK | reg.CH0_DIV_FRAC_MASK)
+                if next & reg.CH0_DIV_INT_MASK == 0 then return Err(PwmFault.Refused(s"slice $k's DIV with INT 0: the rate it gives is not modelled"))
+                s.div = next
+                if s.rest >= next then s.rest = 0
+            reg.CH0_CTR_OFFSET -> s.ctr = written(s.ctr, offset, data) & 0xFFFF
+            reg.CH0_CC_OFFSET ->
+                s.cc = written(s.cc, offset, data)
+                if !running then s.cc_live = s.cc
+            _ ->
+                s.top = written(s.top, offset, data) & 0xFFFF
+                if !running then s.top_live = s.top
+        Ok(())
+
+    private write_csr(*self, k: u32, offset: u32, data: u32) -> Result[unit, PwmFault]
+        val s = &self.slices[k]
+        val next = written(s.csr, offset, data) & CSR_STORED
+        val phase = triggered(offset, data) & PH_BITS
+        if phase != 0
+            if phase == PH_BITS then return Err(PwmFault.Refused(s"slice $k's PH_ADV and PH_RET together are not modelled"))
+            if next & reg.CH0_CSR_EN_MASK == 0 then return Err(PwmFault.Refused(s"slice $k's PH_ADV or PH_RET needs a running counter (the header): on a stopped one the bit would never clear"))
+            if phase == reg.CH0_CSR_PH_ADV_MASK && s.div <= 16 then return Err(PwmFault.Refused(s"slice $k's PH_ADV at full speed: the header needs DIV above 1"))
+        s.csr = next
+        val bit = 1u32 << k
+        self.tally(if next & reg.CH0_CSR_EN_MASK != 0 then self.enabled | bit else self.enabled & ~bit)
+        if phase == reg.CH0_CSR_PH_ADV_MASK
+            if s.ticks(1) then self.wrapped(k)
+        elif phase != 0
+            s.skip += 1
+        Ok(())
+
+    // EN as written to the EN register: the one bit each CSR also shows.
+    private set_enabled(*self, mask: u32)
+        for k in 0..<self.count
+            val on = mask & (1u32 << k) != 0
+            self.slices[k].csr = if on then self.slices[k].csr | reg.CH0_CSR_EN_MASK else self.slices[k].csr & ~reg.CH0_CSR_EN_MASK
+        self.tally(mask)
+
+    private tally(*self, mask: u32)
+        self.enabled = mask
+        var gated: u32 = 0
+        var m = mask
+        while m != 0
+            val k = m.trailing_zeros()
+            m &= m - 1
+            if self.slices[k].mode() != FREE then gated |= 1u32 << k
+        self.gated = gated
+end Pwm
+
+private pwm_with(count: u32, irqs: u32) -> Pwm
+    var state: Pwm
+    state.count = count
+    state.irqs = irqs
+    state.reset()
+    state
+
+/** The RP2040's PWM at reset: 8 slices, one interrupt line. */
+pwm_rp2040() -> Pwm = pwm_with(8, 1)
+
+/** The RP2350's PWM at reset: 12 slices, two interrupt lines. */
+pwm_rp2350() -> Pwm = pwm_with(12, 2)
+
+/** The slice of GPIO `n`'s PWM function; its channel is B on an odd GPIO. GPIO 0 to 31 take slices 0 to 7
+ * round, GPIO 32 to 47 (the RP2350's) slices 8 to 11 round.
+ */
+pwm_slice_of(n: u32) -> u32 = if n < 32 then (n >> 1) & 7 else 8 + ((n >> 1) & 3)

@@ -1,0 +1,166 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, triggered, w1c, written}
+import sh.sysl.rp2350.sha256 as reg
+import sysl.crypto.{sha256_compress, sha256_init}
+
+// The SHA-256 block (datasheet 12.13), as the SDK's `hardware_sha256` and `pico_sha256` drive it: START,
+// then 16 words (or 32 halfwords, or 64 bytes) of WDATA a block, then the digest in SUM0 to SUM7.
+//
+// The compression is the standard library's `sha256_compress` on the message words as the bus interface
+// assembles them. The interface gathers bytes and halfwords into a word in little-endian order, so the same
+// buffer gives the same digest whatever the transfer size; BSWAP, set at reset, swaps each word as it
+// is committed, which makes a byte buffer hash as SHA-256 defines it.
+//
+// **Time.** The 16th word of a block drops WDATA_RDY and SUM_VLD for 57 clk_sys cycles; both are
+// computed from the cycle the chip passes, so nothing is counted per cycle. SUM_VLD is also low from
+// the first word of a block until its digest is done.
+//
+// **The DMA request** (DREQ_SHA256) holds while WDATA_RDY does. The block asks for a whole block at once
+// and takes `DMA_SIZE`'s number of transfers, which a DMA programmed for a different size would not
+// match: DMA_SIZE is stored and nothing more.
+//
+// **Refused by name:** mixing byte, halfword and word writes within one block (the datasheet forbids it), and
+// a write to WDATA through an atomic alias (a write-FIFO register has no read-modify-write meaning).
+// A write while WDATA_RDY is low is dropped and latches ERR_WDATA_NOT_RDY, as the datasheet says.
+
+private const SHA_BLOCK_BYTES: u32 = 64
+private const SHA_DIGEST_CYCLES: u64 = 57
+
+enum ShaFault
+    Access(e: AccessError)
+    Refused(why: string)
+
+struct Sha256
+    bswap: bool
+    dma_size: u32
+    err: bool
+    sum: [8]u32
+    block: [64]u8
+    // Bytes of the block committed so far, and of the word being assembled.
+    filled: u32
+    pending: u32
+    word: u32
+    // The size in bytes of this block's writes, 0 before the first.
+    unit: u32
+    // The clk_sys cycle the digest in progress ends at.
+    ready_at: u64
+
+    reset(*self)
+        self.bswap = true
+        self.dma_size = reg.CSR_DMA_SIZE_32BIT
+        self.err = false
+        self.sum = [0; 8]
+        self.block = [0; 64]
+        self.filled = 0
+        self.pending = 0
+        self.word = 0
+        self.unit = 0
+        self.ready_at = 0
+
+    /** WDATA_RDY at cycle `now`: no digest is in progress. */
+    ready(self, now: u64) -> bool = now >= self.ready_at
+
+    /** SUM_VLD: no block is half written and no digest in progress. */
+    sum_valid(self, now: u64) -> bool = self.filled == 0 && self.pending == 0 && now >= self.ready_at
+
+    /** DREQ_SHA256. */
+    dreq(self, now: u64) -> bool = self.ready(now)
+
+    /** The clk_sys cycles until the digest in progress ends, for a DMA waiting on the request; None when
+     * none is.
+     */
+    due(self, now: u64) -> Option[u64] = if self.ready_at > now then Some(self.ready_at - now) else None
+
+    private csr(self, now: u64) -> u32
+        var v: u32 = self.dma_size << reg.CSR_DMA_SIZE_SHIFT
+        if self.bswap then v |= reg.CSR_BSWAP_MASK
+        if self.err then v |= reg.CSR_ERR_WDATA_NOT_RDY_MASK
+        if self.sum_valid(now) then v |= reg.CSR_SUM_VLD_MASK
+        if self.ready(now) then v |= reg.CSR_WDATA_RDY_MASK
+        v
+
+    // START: the digest registers take the initial hash value and the block counters clear.
+    private start(*self)
+        self.sum = sha256_init
+        self.filled = 0
+        self.pending = 0
+        self.word = 0
+        self.unit = 0
+        self.ready_at = 0
+
+    // A 32-bit message word is committed: swapped if BSWAP, as four bytes of the block, big-endian (the
+    // order the compression reads them in).
+    private commit(*self, now: u64)
+        var w = self.word
+        if self.bswap
+            w = ((w & 0xFF) << 24) | ((w & 0xFF00) << 8) | ((w >> 8) & 0xFF00) | (w >> 24)
+        val at = usize(self.filled)
+        self.block[at] = u8(w >> 24)
+        self.block[at + 1] = u8((w >> 16) & 0xFF)
+        self.block[at + 2] = u8((w >> 8) & 0xFF)
+        self.block[at + 3] = u8(w & 0xFF)
+        self.filled += 4
+        self.word = 0
+        self.pending = 0
+        if self.filled == SHA_BLOCK_BYTES
+            sha256_compress(&self.sum, self.block[0..<64])
+            self.filled = 0
+            self.unit = 0
+            self.ready_at = now + SHA_DIGEST_CYCLES
+
+    read(*self, now: u64, offset: u32, width: u32) -> Result[u32, ShaFault]
+        access(offset, width, true).map_err(e -> ShaFault.Access(e))?
+        val o = offset & 0xFFC
+        val value: u32 = o match
+            reg.CSR_OFFSET -> self.csr(now)
+            reg.WDATA_OFFSET -> 0
+            reg.SUM0_OFFSET | reg.SUM1_OFFSET | reg.SUM2_OFFSET | reg.SUM3_OFFSET |
+            reg.SUM4_OFFSET | reg.SUM5_OFFSET | reg.SUM6_OFFSET | reg.SUM7_OFFSET -> self.sum[usize((o - reg.SUM0_OFFSET) / 4)]
+            _ -> return Err(ShaFault.Access(AccessError.Unmapped))
+        Ok(read_lane(value, offset, width))
+
+    write(*self, now: u64, offset: u32, width: u32, value: u32) -> Result[unit, ShaFault]
+        access(offset, width, true).map_err(e -> ShaFault.Access(e))?
+        val data = replicated(value, width)
+        val o = offset & 0xFFC
+        o match
+            reg.CSR_OFFSET ->
+                // BSWAP and DMA_SIZE are stored; ERR_WDATA_NOT_RDY clears on a 1 through every alias;
+                // START fires on a 1 written plainly or through SET or XOR.
+                val stored = written(self.csr(now), offset, data)
+                self.bswap = stored & reg.CSR_BSWAP_MASK != 0
+                val size = (stored & reg.CSR_DMA_SIZE_MASK) >> reg.CSR_DMA_SIZE_SHIFT
+                if size > reg.CSR_DMA_SIZE_32BIT then return Err(ShaFault.Refused("DMA_SIZE 3 is reserved"))
+                self.dma_size = size
+                self.err = w1c(if self.err then reg.CSR_ERR_WDATA_NOT_RDY_MASK else 0, data) != 0
+                if triggered(offset, data) & reg.CSR_START_MASK != 0 then self.start()
+            reg.WDATA_OFFSET ->
+                if offset >= 0x1000 then return Err(ShaFault.Refused("WDATA is a write FIFO, and has no atomic aliases"))
+                if !self.ready(now)
+                    self.err = true
+                    return Ok(())
+                if self.unit != 0 && self.unit != width
+                    return Err(ShaFault.Refused(s"a $width-byte write in a block begun with ${self.unit}-byte ones: the datasheet forbids mixing sizes within a block"))
+                self.unit = width
+                val bits = width * 8
+                val part = if width == 4 then data else data & ((1u32 << bits) - 1)
+                self.word |= part << (self.pending * 8)
+                self.pending += width
+                if self.pending == 4 then self.commit(now)
+            reg.SUM0_OFFSET | reg.SUM1_OFFSET | reg.SUM2_OFFSET | reg.SUM3_OFFSET |
+            reg.SUM4_OFFSET | reg.SUM5_OFFSET | reg.SUM6_OFFSET | reg.SUM7_OFFSET -> ()
+            _ -> return Err(ShaFault.Access(AccessError.Unmapped))
+        Ok(())
+end Sha256
+
+/** The block at power-on. */
+sha256() -> Sha256
+    var s: Sha256
+    s.reset()
+    s
+
+/** Why the block refused an access, as a person reads it. */
+sha_why(f: ShaFault) -> string = f match
+    Access(_) -> "SHA256: not a register or access width benchtop runs"
+    Refused(why) -> s"SHA256: $why"

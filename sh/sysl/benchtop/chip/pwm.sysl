@@ -1,0 +1,189 @@
+module sh.sysl.benchtop.chip
+
+import sh.sysl.benchtop.peripheral.rp2040.{PwmFault, pwm_slice_of}
+import sh.sysl.benchtop.peripheral.rp2350 as rp
+import sh.sysl.benchtop.peripheral.rp2350.{GPIO_COUNT, GPIO_COUNT_RP2040}
+import sh.sysl.rp2040.io_bank0 as io40_reg
+import sh.sysl.rp2350.io_bank0 as io_reg
+import sysl.fmt.hex
+import sysl.math.min
+
+// The PWM block on both chips: the registers and counters are the shared model's
+// (`peripheral/rp2040/pwm.sysl`); here clk_sys reaches them and their pins reach the rest of the chip.
+//
+// **Time.** A running PWM whose pins nothing watches pays one call per step of the devices, whatever its
+// rate, and its pins' levels are worked out when something reads them. Two things need its edges at their
+// own times, and then the chip walks from edge to edge (never cycle by cycle) for as long as they hold: a
+// slice counting from its B pin, and a GPIO interrupt enabled on a pin PWM drives, or at the far end of a
+// wire from one. `next_event` offers the next wrap that would raise an interrupt or answer a DMA channel,
+// or the next edge while walking.
+//
+// **Refused by name**: a read of an INTR word covering a GPIO a running slice drives whose interrupts are
+// not enabled, since its edges are latched only while an interrupt watches; and a UART frame reaching a
+// PWM B input, whose bits the slice does not see one by one. A B input moved by the SIO or from outside
+// is seen at that moment.
+
+/** The first PWM DREQ on the RP2350 (`hardware/regs/dreq.h`), one for each slice. */
+const DREQ_PWM_WRAP0: u32 = 32
+
+/** Whether TREQ_SEL `treq` is one of the 12 slices' wrap DREQs (32 to 43). */
+private[chip] is_pwm_dreq(treq: u32) -> bool = treq >= DREQ_PWM_WRAP0 && treq < DREQ_PWM_WRAP0 + 12
+/** PWM_IRQ_WRAP_0 on the RP2350 (`hardware/regs/intctrl.h`); PWM_IRQ_WRAP_1 is the next. */
+private[chip] const PWM_IRQ_WRAP_0: u32 = 8
+
+impl Rp2350
+    // `cycles` of clk_sys pass on the PWM's running slices.
+    private[chip] advance_pwm(*self, cycles: u64)
+        if !self.pwm_stepping
+            self.pwm.pass(cycles, 0)
+            return
+        var left = cycles
+        while left > 0
+            val inputs = self.pwm_inputs()
+            val step = min(left, self.pwm.until_change(inputs))
+            self.pwm.pass(step, inputs)
+            left -= step
+            if self.pwm_watched then self.gpio_changed() else self.pwm.edges(self.pwm_inputs())
+
+    // Each slice's B input, bit k for slice k: the GPIOs selecting its channel B, ORed.
+    private[chip] pwm_inputs(*self) -> u32
+        var bits: u32 = 0
+        for n in 0..<GPIO_COUNT
+            if n & 1 == 1 && self.io.function(n) == rp.PWM_FUNCTION && self.io.peripheral_input(n, self.pin(n).input) then bits |= 1u32 << pwm_slice_of(n)
+        bits
+
+    // Whether PWM drives GPIO `n` from a running slice, directly or over a wire.
+    private pwm_drives(*self, n: u32) -> bool
+        if self.pwm_running_on(n) then return true
+        val h = self.wires[n]
+        h != NO_WIRE && self.pwm_running_on(u32(h))
+
+    private pwm_running_on(*self, n: u32) -> bool =
+        self.io.function(n) == rp.PWM_FUNCTION && self.pwm.enabled & (1u32 << pwm_slice_of(n)) != 0
+
+    // Something that decides a GPIO's level has moved with PWM running, or the block's state has: whether
+    // the chip must walk its edges, and what the slices counting edges have seen.
+    private[chip] pwm_gpio_changed(*self)
+        var watched = false
+        for n in 0..<GPIO_COUNT do if self.pwm_drives(n) && self.io.irq.watched(n) then watched = true
+        self.pwm_watched = watched
+        self.pwm_stepping = watched || self.pwm.gated != 0
+        if self.pwm.gated != 0 then self.pwm.edges(self.pwm_inputs())
+
+    // A read of IO_BANK0 with PWM running: the interrupts see the pins as they are now, and an INTR word
+    // that could show an edge benchtop did not latch is refused.
+    private[chip] pwm_io_read(*self, p: Placed, o: u32) -> Result[unit, string]
+        self.gpio_changed()
+        val a = o & 0xFFC
+        if a < io_reg.INTR0_OFFSET || a > io_reg.INTR5_OFFSET then return Ok(())
+        val first = (a - io_reg.INTR0_OFFSET) * 2
+        for n in first..<first + 8
+            if self.pwm_drives(n) && !self.io.irq.watched(n)
+                return Err(s"${p.name} + 0x${hex(o)}: INTR shows GPIO $n, which a running PWM slice drives with its interrupts not enabled: its edges are latched only while an interrupt watches")
+        Ok(())
+
+    // A write to the PWM block, refused where it asks for what benchtop does not model.
+    private[chip] pwm_write(*self, p: Placed, o: u32, width: u32, x: u32) -> Result[unit, string]
+        val gated = self.pwm.gated
+        self.pwm.write(o, width, x).map_err(f -> pwm_refusal(p.name, o, f))?
+        // A slice that has just started counting edges counts from the level its pin has now.
+        val fresh = self.pwm.gated & ~gated
+        if fresh != 0 then self.pwm.b_was = (self.pwm.b_was & ~fresh) | (self.pwm_inputs() & fresh)
+        self.gpio_changed()
+        Ok(())
+
+    // The clk_sys cycles until the PWM next does something a sleeping core could wake for, or a waiting
+    // DMA channel acts on.
+    private[chip] pwm_due(*self) -> Option[u64]
+        if self.pwm.enabled == 0 then return None
+        if self.pwm_stepping
+            val n = self.pwm.until_change(self.pwm_inputs())
+            return if n == 0xFFFFFFFFFFFFFFFF then None else Some(n)
+        self.pwm.wrap_due(self.pwm.irq_wanted() | self.pwm_dma_wanted(), 0)
+
+    // The slices a busy, enabled DMA channel is waiting on.
+    private pwm_dma_wanted(*self) -> u32
+        var wanted: u32 = 0
+        var b = self.dma.busy
+        while b != 0
+            val c = b.trailing_zeros()
+            b &= b - 1
+            val treq = self.dma.ch[c].treq
+            if self.dma.ch[c].en && is_pwm_dreq(treq) then wanted |= 1u32 << (treq - DREQ_PWM_WRAP0)
+        wanted
+
+    // Why a frame from UART `k` cannot reach a PWM B input as benchtop models it.
+    private[chip] pwm_frame_refusal(*self, k: usize, g: u32) -> Option[string]
+        val h = self.wires[g]
+        if h == NO_WIRE || self.io.function(u32(h)) != rp.PWM_FUNCTION || h & 1 == 0 then return None
+        if self.pwm.gated & (1u32 << pwm_slice_of(u32(h))) == 0 then return None
+        Some(s"UART$k sends a frame on GPIO $g to GPIO $h over a wire, a PWM slice's B input: the slice does not see a frame's bits")
+end Rp2350
+
+/** PWM_IRQ_WRAP on the RP2040, its one line. */
+private[chip] const PWM_IRQ_WRAP_RP2040: u32 = 4
+
+impl Rp2040
+    // `cycles` of clk_sys pass on the PWM's running slices.
+    private[chip] advance_pwm(*self, cycles: u64)
+        if !self.pwm_stepping
+            self.pwm.pass(cycles, 0)
+            return
+        var left = cycles
+        while left > 0
+            val inputs = self.pwm_inputs()
+            val step = min(left, self.pwm.until_change(inputs))
+            self.pwm.pass(step, inputs)
+            left -= step
+            if self.pwm_watched then self.gpio_changed() else self.pwm.edges(self.pwm_inputs())
+
+    // Each slice's B input, bit k for slice k: the GPIOs selecting its channel B, ORed.
+    private[chip] pwm_inputs(*self) -> u32
+        var bits: u32 = 0
+        for n in 0..<GPIO_COUNT_RP2040
+            if n & 1 == 1 && self.io.function(n) == rp.PWM_FUNCTION && self.io.peripheral_input(n, self.pin(n).input) then bits |= 1u32 << pwm_slice_of(n)
+        bits
+
+    private pwm_drives(*self, n: u32) -> bool =
+        self.io.function(n) == rp.PWM_FUNCTION && self.pwm.enabled & (1u32 << pwm_slice_of(n)) != 0
+
+    // As on the RP2350 (`Rp2350.pwm_gpio_changed`).
+    private[chip] pwm_gpio_changed(*self)
+        var watched = false
+        for n in 0..<GPIO_COUNT_RP2040 do if self.pwm_drives(n) && self.io.irq.watched(n) then watched = true
+        self.pwm_watched = watched
+        self.pwm_stepping = watched || self.pwm.gated != 0
+        if self.pwm.gated != 0 then self.pwm.edges(self.pwm_inputs())
+
+    // As on the RP2350 (`Rp2350.pwm_io_read`), with INTR0 to INTR3.
+    private[chip] pwm_io_read(*self, p: Placed40, o: u32) -> Result[unit, string]
+        self.gpio_changed()
+        val a = o & 0xFFC
+        if a < io40_reg.INTR0_OFFSET || a > io40_reg.INTR3_OFFSET then return Ok(())
+        val first = (a - io40_reg.INTR0_OFFSET) * 2
+        for n in first..<min(first + 8, GPIO_COUNT_RP2040)
+            if self.pwm_drives(n) && !self.io.irq.watched(n)
+                return Err(s"${p.name} + 0x${hex(o)}: INTR shows GPIO $n, which a running PWM slice drives with its interrupts not enabled: its edges are latched only while an interrupt watches")
+        Ok(())
+
+    // As on the RP2350 (`Rp2350.pwm_write`).
+    private[chip] pwm_write(*self, p: Placed40, o: u32, width: u32, x: u32) -> Result[unit, string]
+        val gated = self.pwm.gated
+        self.pwm.write(o, width, x).map_err(f -> pwm_refusal(p.name, o, f))?
+        val fresh = self.pwm.gated & ~gated
+        if fresh != 0 then self.pwm.b_was = (self.pwm.b_was & ~fresh) | (self.pwm_inputs() & fresh)
+        self.gpio_changed()
+        Ok(())
+
+    // The clk_sys cycles until the PWM next does something a sleeping core could wake for.
+    private[chip] pwm_due(*self) -> Option[u64]
+        if self.pwm.enabled == 0 then return None
+        if self.pwm_stepping
+            val n = self.pwm.until_change(self.pwm_inputs())
+            return if n == 0xFFFFFFFFFFFFFFFF then None else Some(n)
+        self.pwm.wrap_due(self.pwm.irq_wanted(), 0)
+end Rp2040
+
+private pwm_refusal(name: string, o: u32, f: PwmFault) -> string = f match
+    Access(e) -> s"$name + 0x${hex(o)} ${what_refused(e)}"
+    Refused(why) -> s"$name + 0x${hex(o)}: $why"

@@ -1,0 +1,247 @@
+module sh.sysl.benchtop.peripheral.rp2040
+@tests
+
+import sh.sysl.rp2040.pwm as reg
+
+// The PWM block both chips share (`Pwm`): every register against `hardware/regs/pwm.h` at the RP2040's
+// layout (8 slices, one interrupt line) and the RP2350's (12 slices, two), the counter in each divider
+// mode, the fractional divider, phase-correct counting, the double-buffered compare values, the
+// interrupts and DREQs, the phase controls, and each refusal.
+
+private const SLICE: u32 = 0x14
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const EN_2040: u32 = 0xA0
+private const EN_2350: u32 = 0xF0
+private const MODE_LEVEL: u32 = 1 << 4
+private const MODE_RISE: u32 = 2 << 4
+private const MODE_FALL: u32 = 3 << 4
+
+private at(k: u32, r: u32) -> u32 = SLICE * k + r
+private rd(p: *Pwm, o: u32) -> u32 = p.read(o, 4).unwrap()
+private wr(p: *Pwm, o: u32, x: u32) = p.write(o, 4, x).unwrap()
+private ctr(p: *Pwm, k: u32) -> u32 = rd(p, at(k, reg.CH0_CTR_OFFSET))
+private refused(p: *Pwm, o: u32, x: u32) -> string = p.write(o, 4, x) match
+    Err(PwmFault.Refused(why)) -> why
+    Err(_) -> "an access error"
+    Ok(_) -> "taken"
+
+// Slice `k` with TOP `top`, CC `cc` and CSR `csr` (EN set by the caller's bits).
+private slice(p: *Pwm, k: u32, top: u32, cc: u32, csr: u32)
+    wr(p, at(k, reg.CH0_TOP_OFFSET), top)
+    wr(p, at(k, reg.CH0_CC_OFFSET), cc)
+    wr(p, at(k, reg.CH0_CSR_OFFSET), csr)
+
+@test("power-on: every slice's CSR 0, DIV 1.0, CTR 0, CC 0, TOP 0xFFFF; EN, INTR and each line's INTE, INTF and INTS 0; past the last line is unmapped")
+pwm_power_on()
+    for (count, irqs, en) in [(8u32, 1u32, EN_2040), (12, 2, EN_2350)]
+        var p = if count == 8 then pwm_rp2040() else pwm_rp2350()
+        for k in 0..<count
+            assert(rd(&p, at(k, reg.CH0_CSR_OFFSET)) == 0 && rd(&p, at(k, reg.CH0_DIV_OFFSET)) == 0x10)
+            assert(ctr(&p, k) == 0 && rd(&p, at(k, reg.CH0_CC_OFFSET)) == 0 && rd(&p, at(k, reg.CH0_TOP_OFFSET)) == 0xFFFF)
+        for o in 0u32..<2 + 3 * irqs do assert(rd(&p, en + 4 * o) == 0)
+        assert(p.read(en + 8 + 12 * irqs, 4).unwrap_err() == AccessError.Unmapped, s"$count slices")
+        assert(p.write(en + 8 + 12 * irqs, 4, 1).is_err())
+        assert(!p.irq(0) && p.until_change(0) == 0xFFFFFFFFFFFFFFFF, "nothing runs")
+
+@test("the fields each register keeps: CSR its five, DIV 12 bits, CTR and TOP 16, CC both halves; EN and INTE only the chip's slices")
+pwm_register_fields()
+    var p = pwm_rp2040()
+    wr(&p, at(3, reg.CH0_CSR_OFFSET), 0xFFFFFF3E)
+    assert(rd(&p, at(3, reg.CH0_CSR_OFFSET)) == 0x3E, "DIVMODE, both INVs and PH_CORRECT; EN clear")
+    wr(&p, at(3, reg.CH0_DIV_OFFSET), 0xFFFFFFFF)
+    wr(&p, at(3, reg.CH0_CTR_OFFSET), 0x12345678)
+    wr(&p, at(3, reg.CH0_TOP_OFFSET), 0xABCDEF01)
+    wr(&p, at(3, reg.CH0_CC_OFFSET), 0x89ABCDEF)
+    assert(rd(&p, at(3, reg.CH0_DIV_OFFSET)) == 0xFFF && ctr(&p, 3) == 0x5678 && rd(&p, at(3, reg.CH0_TOP_OFFSET)) == 0xEF01)
+    assert(rd(&p, at(3, reg.CH0_CC_OFFSET)) == 0x89ABCDEF)
+    wr(&p, EN_2040, 0xFFFFFFFF)
+    assert(rd(&p, EN_2040) == 0xFF && rd(&p, at(7, reg.CH0_CSR_OFFSET)) & 1 == 1, "EN is each CSR's EN bit")
+    wr(&p, at(7, reg.CH0_CSR_OFFSET) + CLR, 1)
+    assert(rd(&p, EN_2040) == 0x7F, "and a CSR's EN is EN's bit")
+    wr(&p, EN_2040 + 8, 0xFFFFFFFF)
+    assert(rd(&p, EN_2040 + 8) == 0xFF)
+    var q = pwm_rp2350()
+    wr(&q, EN_2350, 0xFFFFFFFF)
+    wr(&q, EN_2350 + 20, 0xFFFFFFFF)
+    assert(rd(&q, EN_2350) == 0xFFF && rd(&q, EN_2350 + 20) == 0xFFF, "12 slices, line 1's INTE")
+
+@test("hello_pwm's slice: TOP 3, A high below 1 and B below 3, at full speed: four clocks a period, one wrap each, INTR and the DREQ raised")
+pwm_free_running()
+    var p = pwm_rp2350()
+    slice(&p, 0, 3, (3 << 16) | 1, 1)
+    var a = ""
+    var b = ""
+    for _ in 0..<8
+        a += if p.level(0, false) then "1" else "0"
+        b += if p.level(0, true) then "1" else "0"
+        p.pass(1, 0)
+    assert(a == "10001000" && b == "11101110", s"$a $b")
+    assert(rd(&p, EN_2350 + 4) == 1 && p.dreq == 1, "wrapped")
+    wr(&p, EN_2350 + 4, 1)
+    assert(rd(&p, EN_2350 + 4) == 0)
+    p.pass(4 * 1000 + 2, 0)
+    assert(ctr(&p, 0) == 2 && rd(&p, EN_2350 + 4) == 1, "a thousand wraps, counted once")
+    p.take_dreq(0)
+    assert(p.dreq == 0)
+
+@test("the inverts flip each output; CC 0 is always low and CC above TOP always high")
+pwm_inverts_and_extremes()
+    var p = pwm_rp2040()
+    slice(&p, 1, 9, (10 << 16) | 0, 1)
+    for _ in 0..<10
+        assert(!p.level(1, false) && p.level(1, true))
+        p.pass(1, 0)
+    wr(&p, at(1, reg.CH0_CSR_OFFSET), 1 | reg.CH0_CSR_A_INV_MASK | reg.CH0_CSR_B_INV_MASK)
+    assert(p.level(1, false) && !p.level(1, true))
+
+@test("the fractional divider: DIV 2.5 ticks the counter 10 times in 25 clocks, carrying the remainder between passes; DIV 255.9375 the slowest")
+pwm_fractional_divider()
+    var p = pwm_rp2350()
+    wr(&p, at(2, reg.CH0_DIV_OFFSET), 0x28)
+    slice(&p, 2, 0xFFFF, 0, 1)
+    for _ in 0..<25 do p.pass(1, 0)
+    assert(ctr(&p, 2) == 10, s"${ctr(&p, 2)}")
+    p.pass(2, 0)
+    assert(ctr(&p, 2) == 10)
+    p.pass(1, 0)
+    assert(ctr(&p, 2) == 11, "the third clock of 2.5 completes a tick")
+    wr(&p, at(4, reg.CH0_DIV_OFFSET), 0xFFF)
+    slice(&p, 4, 0xFFFF, 0, 1)
+    p.pass(4095, 0)
+    assert(ctr(&p, 4) == 16)
+
+@test("phase-correct: the counter climbs to TOP and back, holding each end, so the period is 2 x (TOP + 1); one wrap a period, at 0")
+pwm_phase_correct()
+    var p = pwm_rp2040()
+    slice(&p, 0, 3, 2, 1 | reg.CH0_CSR_PH_CORRECT_MASK)
+    var seen = ""
+    var a = ""
+    for _ in 0..<16
+        seen += s"${ctr(&p, 0)}"
+        a += if p.level(0, false) then "1" else "0"
+        p.pass(1, 0)
+        if rd(&p, EN_2040 + 4) != 0
+            seen += "w"
+            wr(&p, EN_2040 + 4, 1)
+    assert(seen == "01233210w01233210w", seen)
+    assert(a == "1100001111000011", a)
+
+@test("CC and TOP written to a running slice wait for its wrap; to a stopped one they apply at once")
+pwm_double_buffered()
+    var p = pwm_rp2350()
+    slice(&p, 0, 9, 5, 1)
+    p.pass(3, 0)
+    wr(&p, at(0, reg.CH0_CC_OFFSET), 1)
+    wr(&p, at(0, reg.CH0_TOP_OFFSET), 4)
+    assert(p.level(0, false) && rd(&p, at(0, reg.CH0_CC_OFFSET)) == 1, "the counter still uses 5; the register reads what was written")
+    p.pass(6, 0)
+    assert(ctr(&p, 0) == 9 && !p.level(0, false))
+    p.pass(1, 0)
+    assert(ctr(&p, 0) == 0 && p.level(0, false))
+    p.pass(1, 0)
+    assert(!p.level(0, false), "CC 1 from the wrap")
+    p.pass(4, 0)
+    assert(ctr(&p, 0) == 0, "TOP 4 from the wrap")
+    wr(&p, EN_2350, 0)
+    wr(&p, at(0, reg.CH0_CC_OFFSET), 3)
+    assert(p.level(0, false), "stopped at CTR 0 with CC 3: at once")
+
+@test("the B pin's modes: LEVEL counts clocks while it is high, RISE and FALL count its edges through the divider; B drives only while free-running")
+pwm_b_modes()
+    var p = pwm_rp2350()
+    slice(&p, 1, 0xFFFF, 0, 1 | MODE_LEVEL)
+    slice(&p, 2, 0xFFFF, 0, 1 | MODE_RISE)
+    slice(&p, 3, 0xFFFF, 0, 1 | MODE_FALL)
+    wr(&p, at(3, reg.CH0_DIV_OFFSET), 0x20)
+    assert(p.b_drives(0) && !p.b_drives(1) && !p.b_drives(2) && !p.b_drives(3))
+    assert(p.gated == 0b1110)
+    p.pass(100, 0)
+    assert(ctr(&p, 1) == 0, "B low")
+    p.pass(100, 0b10)
+    assert(ctr(&p, 1) == 100 && ctr(&p, 2) == 0, "edges are not clocks")
+    for i in 0..<10 do p.edges(if i % 2 == 0 then 0b1100 else 0)
+    assert(ctr(&p, 2) == 5, "five rising edges")
+    assert(ctr(&p, 3) == 2, "five falling edges through DIV 2: two ticks and a half")
+    assert(p.until_change(0) == 0xFFFFFFFFFFFFFFFF && p.until_change(0b10) == 0xFFFF - 100 + 1, "only clocks move a slice: LEVEL's while B is high")
+
+@test("INTE, INTF and INTS on each line: INTS = (INTR | INTF) & INTE; INTR clears a 1 at a time; INTS ignores writes")
+pwm_interrupts()
+    var p = pwm_rp2350()
+    slice(&p, 5, 0, 0, 1)
+    p.pass(1, 0)
+    assert(rd(&p, EN_2350 + 4) == 1 << 5 && !p.irq(0) && !p.irq(1))
+    wr(&p, EN_2350 + 20, 1 << 5)
+    assert(p.irq(1) && !p.irq(0) && rd(&p, EN_2350 + 28) == 1 << 5, "line 1 enabled")
+    wr(&p, EN_2350 + 8, 1 << 7)
+    wr(&p, EN_2350 + 12, 1 << 7)
+    assert(p.irq(0) && rd(&p, EN_2350 + 16) == 1 << 7, "a force on line 0")
+    wr(&p, EN_2350 + 16, 0xFFF)
+    assert(rd(&p, EN_2350 + 16) == 1 << 7)
+    wr(&p, EN_2350 + 4, 1 << 4)
+    assert(rd(&p, EN_2350 + 4) == 1 << 5, "only the 1s clear")
+    wr(&p, EN_2350 + 4 + SET, 1 << 5)
+    assert(rd(&p, EN_2350 + 4) == 0 && !p.irq(1), "through the SET alias too")
+    assert(p.irq_wanted() == ((1 << 5) | (1 << 7)))
+
+@test("PH_ADV steps the counter a tick and PH_RET drops the next; both read 0 and the CLR alias fires neither")
+pwm_phase_controls()
+    var p = pwm_rp2040()
+    wr(&p, at(0, reg.CH0_DIV_OFFSET), 0x20)
+    slice(&p, 0, 0xFFFF, 0, 1)
+    wr(&p, at(0, reg.CH0_CSR_OFFSET) + SET, reg.CH0_CSR_PH_ADV_MASK)
+    assert(ctr(&p, 0) == 1 && rd(&p, at(0, reg.CH0_CSR_OFFSET)) == 1)
+    wr(&p, at(0, reg.CH0_CSR_OFFSET) + SET, reg.CH0_CSR_PH_RET_MASK)
+    p.pass(2, 0)
+    assert(ctr(&p, 0) == 1, "the tick two clocks make is dropped")
+    assert(p.until_change(0) == 2 * (0xFFFF - 1 + 1), "and the next is two clocks on")
+    p.pass(2, 0)
+    assert(ctr(&p, 0) == 2)
+    wr(&p, at(0, reg.CH0_CSR_OFFSET) + CLR, reg.CH0_CSR_PH_ADV_MASK | reg.CH0_CSR_PH_RET_MASK)
+    assert(ctr(&p, 0) == 2 && rd(&p, at(0, reg.CH0_CSR_OFFSET)) == 1)
+
+@test("refused by name, changing nothing: DIV with INT 0, a phase control on a stopped slice, PH_ADV at full speed, both together")
+pwm_refusals()
+    var p = pwm_rp2350()
+    assert(refused(&p, at(6, reg.CH0_DIV_OFFSET), 0xF) == "slice 6's DIV with INT 0: the rate it gives is not modelled")
+    assert(rd(&p, at(6, reg.CH0_DIV_OFFSET)) == 0x10)
+    assert(refused(&p, at(6, reg.CH0_CSR_OFFSET), reg.CH0_CSR_PH_RET_MASK).contains("needs a running counter"))
+    assert(refused(&p, at(6, reg.CH0_CSR_OFFSET), 1 | reg.CH0_CSR_PH_ADV_MASK) == "slice 6's PH_ADV at full speed: the header needs DIV above 1")
+    assert(rd(&p, at(6, reg.CH0_CSR_OFFSET)) == 0 && rd(&p, EN_2350) == 0, "not started either")
+    wr(&p, at(6, reg.CH0_DIV_OFFSET), 0x11)
+    assert(refused(&p, at(6, reg.CH0_CSR_OFFSET), 1 | reg.CH0_CSR_PH_ADV_MASK | reg.CH0_CSR_PH_RET_MASK).contains("together"))
+    wr(&p, at(6, reg.CH0_CSR_OFFSET), 1 | reg.CH0_CSR_PH_ADV_MASK)
+    assert(ctr(&p, 6) == 1, "DIV 1.0625 is above 1")
+
+@test("until_change answers the clocks to the first output change or wrap, never late, in each counting mode, through a divider")
+pwm_until_change()
+    var p = pwm_rp2350()
+    wr(&p, at(0, reg.CH0_DIV_OFFSET), 0x18)
+    slice(&p, 0, 99, (70 << 16) | 30, 1)
+    slice(&p, 1, 49, 20, 1 | reg.CH0_CSR_PH_CORRECT_MASK)
+    for _ in 0..<40
+        val n = p.until_change(0)
+        val before = [p.level(0, false), p.level(0, true), p.level(1, false), p.level(1, true)]
+        val wraps = rd(&p, EN_2350 + 4)
+        if n > 1
+            p.pass(n - 1, 0)
+            assert([p.level(0, false), p.level(0, true), p.level(1, false), p.level(1, true)] == before && rd(&p, EN_2350 + 4) == wraps, "late")
+            p.pass(1, 0)
+        else
+            p.pass(n, 0)
+        wr(&p, EN_2350 + 4, 0xFFF)
+    assert(ctr(&p, 0) != 0 || ctr(&p, 1) != 0)
+
+@test("each GPIO's slice: GPIO 0 to 15 slices 0 to 7, 16 to 31 the same round again, the RP2350's 32 to 47 slices 8 to 11")
+pwm_gpio_slices()
+    assert(pwm_slice_of(0) == 0 && pwm_slice_of(1) == 0 && pwm_slice_of(15) == 7 && pwm_slice_of(16) == 0 && pwm_slice_of(29) == 6)
+    assert(pwm_slice_of(32) == 8 && pwm_slice_of(39) == 11 && pwm_slice_of(40) == 8 && pwm_slice_of(47) == 11)
+
+@test("a reset puts every slice back and keeps the chip's slice and line counts")
+pwm_reset()
+    var p = pwm_rp2040()
+    slice(&p, 2, 5, 3, 1)
+    p.pass(100, 0)
+    p.reset()
+    assert(rd(&p, EN_2040) == 0 && rd(&p, EN_2040 + 4) == 0 && ctr(&p, 2) == 0 && rd(&p, at(2, reg.CH0_TOP_OFFSET)) == 0xFFFF)
+    assert(p.count == 8 && p.irqs == 1 && p.dreq == 0)

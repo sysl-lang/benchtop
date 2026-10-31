@@ -1,0 +1,286 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.parts.dvi.{Dvi, dvi}
+import sh.sysl.benchtop.parts.mipi_dcs as dcs
+import sh.sysl.benchtop.peripheral.rp2350.{DREQ_HSTX, HstxSink, RP2350_DMA}
+import sh.sysl.rp2350.clocks as clk
+import sh.sysl.rp2350.dma as d
+import sh.sysl.rp2350.hstx_ctrl as hr
+import sh.sysl.rp2350.hstx_fifo as hf
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.sio as sr
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+
+// HSTX on the chip (`chip/rp2350.sysl`, `chip/dma.sysl`): its registers behind RESETS, clk_hstx's time,
+// the DMA paced by DREQ_HSTX feeding a whole DVI frame into the `Dvi` monitor, what is refused by name;
+// then pico-examples' hstx/spi_lcd and hstx/dvi_out_hstx_encoder on the Arm Pico 2.
+
+private val SPI_LCD = embed("../../../../examples/pico2/hstx_spi_lcd.elf")
+private val DVI_OUT = embed("../../../../examples/pico2/dvi_out_hstx_encoder.elf")
+private val IMAGE = embed("../../../../examples/pico2/mountains_640x480_rgb332.h")
+private const CLR: u32 = 0x3000
+private const RAM: u32 = 0x20000000
+
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+
+// 4 KB of SRAM at 0x20000000 for a chip with no board, as `dma_tests.sysl` has it.
+private struct HstxRam
+    words: [1024]u32
+
+impl DmaMemory for HstxRam
+    dma_read(*self, a: u32, width: u32) -> Reach
+        if a < RAM || a - RAM >= 4096 || width != 4 then return Reach.Chip
+        Reach.Done(self.words[(a - RAM) / 4])
+
+    dma_write(*self, a: u32, width: u32, x: u32) -> Reach = Reach.Chip
+
+// HSTX and the DMA out of reset, clk_hstx on (from clk_sys, its AUXSRC 0), `ram` the board's memory.
+private hstx_chip(ram: *HstxRam) -> Rp2350
+    var c = rp2350()
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_DMA_MASK | rr.RESET_HSTX_MASK | rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK)
+    wr(&c, clk.BASE + clk.CLK_HSTX_CTRL_OFFSET, clk.CLK_HSTX_CTRL_ENABLE_MASK)
+    c.connect_memory(ram)
+    c
+
+@test("HSTX's registers on the chip: held by RESETS they are refused, released they read their power-on values; a RESETS cycle puts them back")
+chip_hstx_reset()
+    var c = rp2350()
+    assert(c.read(0, hr.BASE + hr.CSR_OFFSET, 4).is_err() && c.read(0, hf.BASE + hf.STAT_OFFSET, 4).is_err(), "held")
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_HSTX_MASK)
+    assert(rd(&c, hr.BASE + hr.CSR_OFFSET) == 0x10050600 && rd(&c, hf.BASE + hf.STAT_OFFSET) == hf.STAT_EMPTY_MASK)
+    wr(&c, hr.BASE + hr.BIT0_OFFSET, 0x1F)
+    wr(&c, hf.BASE + hf.FIFO_OFFSET, 1)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + 0x2000, rr.RESET_HSTX_MASK)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_HSTX_MASK)
+    assert(rd(&c, hr.BASE + hr.BIT0_OFFSET) == 0 && rd(&c, hf.BASE + hf.STAT_OFFSET) == hf.STAT_EMPTY_MASK, "back to power-on")
+
+@test("refused by name on the chip: coupled mode, a narrow FIFO write, a reserved command word met in the FIFO, TMDS_CTRL's reserved PIX_SHIFT, a GPIO interrupt on a pin HSTX drives; FUNCSEL 0 on GPIOs 12 to 19 is HSTX")
+chip_hstx_refusals()
+    var ram: HstxRam
+    var c = hstx_chip(&ram)
+    c.write(0, hr.BASE + hr.CSR_OFFSET, 4, hr.CSR_COUPLED_MODE_MASK) match
+        Ok(_) -> assert(false, "coupled mode let through")
+        Err(why) -> assert(why.contains("HSTX_CTRL + 0x0") && why.contains("coupled mode"), why)
+    c.write(0, hf.BASE + hf.FIFO_OFFSET, 2, 1) match
+        Ok(_) -> assert(false, "a narrow FIFO write let through")
+        Err(why) -> assert(why.contains("narrow write to the HSTX FIFO"), why)
+    c.write(0, sr.BASE + sr.TMDS_CTRL_OFFSET, 4, 7u32 << sr.TMDS_CTRL_PIX_SHIFT_SHIFT) match
+        Ok(_) -> assert(false, "PIX_SHIFT 7 let through")
+        Err(why) -> assert(why.contains("SIO") && why.contains("PIX_SHIFT 7"), why)
+    wr(&c, hr.BASE + hr.CSR_OFFSET, hr.CSR_EN_MASK | hr.CSR_EXPAND_EN_MASK | (1u32 << hr.CSR_N_SHIFTS_SHIFT))
+    wr(&c, hf.BASE + hf.FIFO_OFFSET, 0x5001)
+    c.advance(4)
+    c.take_line_fault() match
+        Some(why) -> assert(why.contains("HSTX command word 0x00005001") && why.contains("reserved opcode"), why)
+        None -> assert(false, "a reserved opcode let through")
+    for n in 12u32..<20
+        assert(c.write(0, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * n, 4, 0).is_ok(), s"HSTX on GPIO $n")
+    c.write(0, io.BASE + io.GPIO0_CTRL_OFFSET, 4, 0) match
+        Ok(_) -> assert(false, "F0 on GPIO 0 is JTAG")
+        Err(why) -> assert(why.contains("JTAG"), why)
+    var g = hstx_chip(&ram)
+    wr(&g, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * 13, 0)
+    wr(&g, io.BASE + io.PROC0_INTE1_OFFSET, 0xF << 20)
+    wr(&g, hr.BASE + hr.CSR_OFFSET, hr.CSR_EN_MASK | (1u32 << hr.CSR_N_SHIFTS_SHIFT))
+    for _ in 0..<8 do wr(&g, hf.BASE + hf.FIFO_OFFSET, 0)
+    g.advance(4)
+    g.take_line_fault() match
+        Some(why) -> assert(why.contains("GPIO 13, which HSTX drives"), why)
+        None -> assert(false, "a GPIO interrupt on an HSTX pin let through")
+
+// A mode small enough for 4 KB: 8 by 4 active, a line of 2 + 3 + 2 + 8 pixels, a frame of 1 + 1 + 1 + 4
+// lines, sync pulses active low as pico-examples' 640x480 has them.
+private const H_FP: u32 = 2
+private const H_SYNC: u32 = 3
+private const H_BP: u32 = 2
+private const H_ACTIVE: u32 = 8
+private const V_ACTIVE: u32 = 4
+private const SYNC_V0_H0: u32 = 0x354 | (0x354u32 << 10) | (0x354u32 << 20)
+private const SYNC_V0_H1: u32 = 0x0AB | (0x354u32 << 10) | (0x354u32 << 20)
+private const SYNC_V1_H0: u32 = 0x154 | (0x354u32 << 10) | (0x354u32 << 20)
+private const SYNC_V1_H1: u32 = 0x2AB | (0x354u32 << 10) | (0x354u32 << 20)
+
+// The RGB332 pixel at (x, y) of the test picture.
+private picture(x: u32, y: u32) -> u32 = (x * 37 + y * 91 + 5) & 0xFF
+
+// An RGB332 pixel as the Dvi monitor shows it, through pico-examples' EXPAND_TMDS: red 7:5, green 4:2,
+// blue 1:0, each at the top of its byte.
+private shown(p: u32) -> u32 = ((p & 0xE0) << 16) | (((p << 3) & 0xE0) << 8) | ((p << 6) & 0xC0)
+
+// Command words for one line into `ram` from word `at`; the next free word.
+private line(ram: *HstxRam, at: u32, y: i32, vsync: bool) -> u32
+    var i = at
+    val idle = if vsync then SYNC_V0_H1 else SYNC_V1_H1
+    val pulse = if vsync then SYNC_V0_H0 else SYNC_V1_H0
+    for (cmd, word) in [(0x1000u32 | H_FP, idle), (0x1000 | H_SYNC, pulse)]
+        ram.words[i] = cmd
+        ram.words[i + 1] = word
+        i += 2
+    if y < 0
+        ram.words[i] = 0x1000 | (H_BP + H_ACTIVE)
+        ram.words[i + 1] = idle
+        return i + 2
+    ram.words[i] = 0x1000 | H_BP
+    ram.words[i + 1] = idle
+    ram.words[i + 2] = 0x2000 | H_ACTIVE
+    i += 3
+    for w in 0u32..<(H_ACTIVE / 4)
+        var word: u32 = 0
+        for k in 0u32..<4 do word |= picture(4 * w + k, u32(y)) << (8 * k)
+        ram.words[i] = word
+        i += 1
+    i
+
+@test("a DVI frame through the chip: the DMA paced by DREQ_HSTX feeds the command expander two frames of an 8x4 mode, and the Dvi monitor on HSTX's outputs sees the mode's timing, every pixel, a steady clock of 5 cycles and no error")
+chip_hstx_dvi_frame()
+    var ram: HstxRam
+    var c = hstx_chip(&ram)
+    var at: u32 = 0
+    for _ in 0..<2
+        at = line(&ram, at, -1, false)
+        at = line(&ram, at, -1, true)
+        at = line(&ram, at, -1, false)
+        for y in 0..<i32(V_ACTIVE) do at = line(&ram, at, y, false)
+    at = line(&ram, at, -1, false)
+    at = line(&ram, at, -1, true)
+    // pico-examples' set-up: lanes on outputs 0, 6 and 4, each with its inverted twin; the clock on 2 and 3.
+    wr(&c, hr.BASE + hr.EXPAND_TMDS_OFFSET, (2u32 << 21) | (2u32 << 13) | (29u32 << 8) | (1u32 << 5) | 26)
+    wr(&c, hr.BASE + hr.EXPAND_SHIFT_OFFSET, (4u32 << 24) | (8u32 << 16) | (1u32 << 8))
+    wr(&c, hr.BASE + hr.BIT0_OFFSET + 8, hr.BIT0_CLK_MASK)
+    wr(&c, hr.BASE + hr.BIT0_OFFSET + 12, hr.BIT0_CLK_MASK | hr.BIT0_INV_MASK)
+    val outputs = [0u32, 6, 4]
+    for lane in 0u32..<3
+        val s = (10 * lane) | ((10 * lane + 1) << hr.BIT0_SEL_N_SHIFT)
+        wr(&c, hr.BASE + hr.BIT0_OFFSET + 4 * outputs[lane], s)
+        wr(&c, hr.BASE + hr.BIT0_OFFSET + 4 * outputs[lane] + 4, s | hr.BIT0_INV_MASK)
+    wr(&c, hr.BASE + hr.CSR_OFFSET, hr.CSR_EXPAND_EN_MASK | (5u32 << hr.CSR_CLKDIV_SHIFT) | (5u32 << hr.CSR_N_SHIFTS_SHIFT) | (2u32 << hr.CSR_SHIFT_SHIFT) | hr.CSR_EN_MASK)
+    val m = dvi(outputs, 2, i32(H_ACTIVE), i32(V_ACTIVE))
+    c.connect_hstx(m.sink())
+    val l = RP2350_DMA
+    wr(&c, d.BASE + d.CH0_READ_ADDR_OFFSET, RAM)
+    wr(&c, d.BASE + d.CH0_WRITE_ADDR_OFFSET, hf.BASE + hf.FIFO_OFFSET)
+    wr(&c, d.BASE + d.CH0_TRANS_COUNT_OFFSET, at)
+    wr(&c, d.BASE + d.CH0_CTRL_TRIG_OFFSET, (2u32 << l.size.trailing_zeros()) | l.incr_read | (DREQ_HSTX << l.treq.trailing_zeros()) | l.en)
+    var guard = 0
+    while c.dma.busy != 0 && guard < 100000
+        val step = c.next_event() match
+            Some(n) -> n
+            None -> 1000
+        c.advance(step)
+        guard += 1
+    assert(c.dma.busy == 0 && c.take_line_fault().is_none(), "the DMA ran the list out")
+    c.advance(1000)
+    // Three VSYNC pulses: the first starts the monitor's frame, each later one ends a whole frame.
+    assert(m.frames == 2, s"two whole frames: ${m.frames}")
+    assert(m.errors == 0, s"errors ${m.errors}")
+    assert(m.clock_period == 10 && m.clock_steady, s"the clock: ${m.clock_period} half cycles")
+    assert(m.line_total == i32(H_FP + H_SYNC + H_BP + H_ACTIVE) && m.hsync_width == i32(H_SYNC), s"line ${m.line_total}, hsync ${m.hsync_width}")
+    assert(m.frame_total == i32(3 + V_ACTIVE) && m.vsync_width == 1, s"frame ${m.frame_total}, vsync ${m.vsync_width}")
+    assert(m.width == i32(H_ACTIVE) && m.height == i32(V_ACTIVE), s"${m.width}x${m.height}")
+    for y in 0u32..<V_ACTIVE
+        for x in 0u32..<H_ACTIVE
+            assert(m.pixels[i32(y * H_ACTIVE + x)] == shown(picture(x, y)), s"pixel ($x, $y): 0x${m.pixels[i32(y * H_ACTIVE + x)]}")
+    assert(m.peak_disparity <= 10, s"DC balance kept: ${m.peak_disparity}")
+
+// An ST7789 on HSTX's outputs as pico-examples' spi_lcd wires it: DIN on output 0, SCK 1, CSn 2, DC 3. SPI
+// mode 0: a bit is taken as SCK rises with CSn low, eight to a byte, MSB first.
+private struct Lcd
+    panel: dcs.Display
+    sck: bool
+    bits: u32
+    shift: u32
+    // Bytes since the last RAMWR, and RAMWRs seen.
+    pixels_bytes: u32
+    frames: u32
+
+impl Lcd
+    private half(*self, levels: u32)
+        // The panel keeps the first whole frame: what comes after it is not given to it.
+        if self.frames == 1 && self.pixels_bytes == 240 * 240 * 2 then return
+        val sck = levels & 2 != 0
+        if levels & 4 != 0
+            self.bits = 0
+        elif sck && !self.sck
+            self.shift = (self.shift << 1) | (levels & 1)
+            self.bits += 1
+            if self.bits == 8
+                val data = levels & 8 != 0
+                val byte = u8(self.shift & 0xFF)
+                if !data && byte == 0x2C
+                    self.frames += 1
+                    self.pixels_bytes = 0
+                elif data
+                    self.pixels_bytes += 1
+                dcs.write(&self.panel, data, byte)
+                self.bits = 0
+        self.sck = sck
+
+impl HstxSink for Lcd
+    hstx_cycle(*self, first: u32, second: u32)
+        self.half(first)
+        self.half(second)
+
+impl Lcd
+    sink(*self) -> *HstxSink = self
+
+@test("pico-examples' hstx/spi_lcd on the Arm Pico 2: HSTX's raw path from clk_usb, SCK from its clock generator, drives an ST7789 through its whole init sequence and a first frame whose every pixel is the program's formula")
+arm_hstx_spi_lcd()
+    val b = arm_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(SPI_LCD).unwrap()
+    val lcd: &Lcd = Lcd(dcs.display(240, 240, dcs.Controller.St7789), false, 0, 0, 0, 0)
+    b.chip.connect_hstx(lcd.sink())
+    var spent = 0
+    while !(lcd.frames == 1 && lcd.pixels_bytes == 240 * 240 * 2) && spent < 400
+        val end = b.run(1000000)
+        assert(end == RunEnd.Budget, s"$end ${b.refused}")
+        spent += 1
+    assert(lcd.frames == 1 && lcd.pixels_bytes == 240 * 240 * 2, s"frames ${lcd.frames}, bytes ${lcd.pixels_bytes}")
+    assert(!lcd.panel.state.sleeping && lcd.panel.state.enabled && lcd.panel.state.inverse && lcd.panel.state.format == 5, "SLPOUT, COLMOD 16 bit, INVON, DISPON")
+    for y in 0..<240
+        for x in 0..<240
+            val r = u32(x) & 0x1F
+            val bl = u32(y) & 0x1F
+            val g = u32(x + y) & 0x3F
+            val want = (((r << 3) | (r >> 2)) << 16) | (((g << 2) | (g >> 4)) << 8) | ((bl << 3) | (bl >> 2))
+            assert(lcd.panel.ram.at(usize(y * 240 + x)) == want, s"pixel ($x, $y)")
+
+// The RGB332 bytes of pico-examples' mountains_640x480, read out of its header: the array's initializer,
+// after the `{` (the array's name holds a "0x" of its own).
+private mountains() -> Buf[u8]
+    var out: Buf[u8] = buf()
+    val text = IMAGE
+    var i = 0
+    while text[i] != u8('{') do i += 1
+    while i + 3 < text.len
+        if text[i] == u8('0') && text[i + 1] == u8('x')
+            out.push(hex_digit(text[i + 2]) * 16 + hex_digit(text[i + 3]))
+            i += 4
+        else
+            i += 1
+    assert(out.len() == 307200, s"${out.len()} bytes")
+    out
+
+private hex_digit(c: u8) -> u8 = if c <= u8('9') then c - u8('0') else c - u8('a') + 10
+
+@test("pico-examples' hstx/dvi_out_hstx_encoder on the Arm Pico 2: two chained DMA channels refilled from DMA_IRQ_0 in WFI feed the command expander, and a DVI monitor sees 640x480 at 800 by 525, every pixel of the picture")
+arm_hstx_dvi_out()
+    val b = arm_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(DVI_OUT).unwrap()
+    val m = dvi([0, 6, 4], 2, 640, 480)
+    b.chip.connect_hstx(m.sink())
+    var spent = 0
+    while m.frames < 1 && spent < 100
+        val end = b.run(1000000)
+        assert(end == RunEnd.Budget || end == RunEnd.Asleep, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+        spent += 1
+    assert(m.frames == 1, s"one whole frame: ${m.frames}")
+    assert(m.errors == 0 && m.clock_period == 10 && m.clock_steady, s"errors ${m.errors}, clock ${m.clock_period}")
+    assert(m.line_total == 800 && m.hsync_width == 96 && m.frame_total == 525 && m.vsync_width == 2, s"${m.line_total} ${m.hsync_width} ${m.frame_total} ${m.vsync_width}")
+    assert(m.width == 640 && m.height == 480)
+    val image = mountains()
+    for i in 0..<307200
+        assert(m.pixels[i] == shown(u32(image[i])), s"pixel (${i % 640}, ${i / 640})")

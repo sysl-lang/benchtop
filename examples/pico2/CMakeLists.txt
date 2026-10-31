@@ -22,9 +22,37 @@ function(benchtop_program target source type)
 endfunction()
 
 # RAM images: the ELF is loaded into SRAM and entered at `_entry_point`, as a debugger does.
-foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp aon_timer rom otp hello_gpio_irq gpio_irq hello_uart uart_advanced uart_loopback hello_dma control_blocks dma_uart)
+foreach(prog hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp aon_timer rom otp hello_gpio_irq gpio_irq hello_uart uart_advanced uart_loopback hello_dma control_blocks dma_uart sniff_crc hello_pwm pwm_led_fade measure_duty_cycle pwm_features spi_dma bus_scan slave_mem_i2c)
     benchtop_program(${prog} ${prog}.c no_flash)
 endforeach()
+target_link_libraries(sniff_crc hardware_dma)
+benchtop_program(rand rand.c no_flash)
+target_link_libraries(rand pico_rand)
+# hello_sha256.c includes sample.txt as a C array, which pico-examples' CMake generates from the text.
+function(make_sample_inc input_filename target_name)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/inc.cmake"
+        "file(READ \${input_file} content)\n"
+        "file(WRITE \${output_file} \"static const char sample_txt[] = { \\\"\${content}\\\" };\")"
+        )
+    get_filename_component(input_file "${input_filename}" REALPATH)
+    set(output_file "${CMAKE_CURRENT_BINARY_DIR}/generated/${input_filename}.inc")
+    add_custom_command(OUTPUT ${output_file}
+        COMMAND ${CMAKE_COMMAND} -Dinput_file:FILEPATH=${input_file} -Doutput_file:FILEPATH=${output_file} -P "${CMAKE_CURRENT_BINARY_DIR}/generated/inc.cmake"
+        DEPENDS ${input_filename})
+    add_custom_target(${target_name} DEPENDS ${output_file})
+endfunction(make_sample_inc)
+make_sample_inc(sample.txt sample.txt.inc)
+benchtop_program(hello_sha256 hello_sha256.c no_flash)
+add_dependencies(hello_sha256 sample.txt.inc)
+target_link_libraries(hello_sha256 pico_sha256)
+target_include_directories(hello_sha256 PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_link_libraries(hello_pwm hardware_pwm)
+target_link_libraries(pwm_led_fade hardware_pwm)
+target_link_libraries(measure_duty_cycle hardware_pwm)
+target_link_libraries(pwm_features hardware_pwm hardware_dma)
+target_link_libraries(spi_dma hardware_spi hardware_dma)
+target_link_libraries(bus_scan hardware_i2c)
+target_link_libraries(slave_mem_i2c pico_i2c_slave hardware_i2c)
 target_link_libraries(hello_dma hardware_dma)
 target_link_libraries(control_blocks hardware_dma)
 target_link_libraries(dma_uart hardware_dma)
@@ -32,6 +60,11 @@ target_link_libraries(dma_uart hardware_dma)
 benchtop_program(hello_dma_flash hello_dma.c default)
 target_link_libraries(hello_dma_flash hardware_dma)
 target_link_libraries(gpio_irq pico_multicore)
+# pico-examples' HSTX programs: DVI through the command expander and an ST7789 LCD through the raw path.
+benchtop_program(dvi_out_hstx_encoder dvi_out_hstx_encoder.c no_flash)
+target_link_libraries(dvi_out_hstx_encoder pico_multicore hardware_dma pico_sync)
+benchtop_program(hstx_spi_lcd hstx_spi_lcd.c no_flash)
+target_link_libraries(hstx_spi_lcd pico_sync)
 # rom.c calls the boot ROM's functions, the flash's among them, from SRAM.
 target_link_libraries(rom hardware_flash hardware_watchdog)
 target_compile_definitions(rom PRIVATE PICO_ALWAYS_INCLUDE_FLASH_ID_FUNCTIONS=1)
@@ -99,6 +132,17 @@ pico_minimize_runtime(xip_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL 
 target_compile_definitions(xip_loop PRIVATE PICO_HEAP_SIZE=0x200)
 benchtop_program(sram_loop xip_loop.c no_flash)
 pico_minimize_runtime(sram_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
+
+# The ADC. dma_capture_adc.c is pico-examples' dma_capture.c with core 1's resistor DAC left unlaunched:
+# its PIO pins do not reach the mux yet (docs/rp-coverage.md item 14), and a test drives GPIO 26 instead.
+foreach(prog hello_adc onboard_temperature adc_console)
+    benchtop_program(${prog} ${prog}.c no_flash)
+    target_link_libraries(${prog} hardware_adc)
+endforeach()
+benchtop_program(dma_capture_adc dma_capture_adc.c no_flash)
+target_link_libraries(dma_capture_adc hardware_adc hardware_dma hardware_pio pico_multicore)
+pico_generate_pio_header(dma_capture_adc ${CMAKE_CURRENT_LIST_DIR}/pio/resistor_dac.pio OUTPUT_DIR ${CMAKE_CURRENT_LIST_DIR}/pio)
+target_include_directories(dma_capture_adc PRIVATE ${CMAKE_CURRENT_LIST_DIR}/pio)
 
 # The PIO programs: pioasm (built from the SDK's tools) assembles pio/*.pio into pio/*.pio.h, which are
 # committed; pio_programs prints them with the configuration each pico-examples init builds.

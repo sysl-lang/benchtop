@@ -1,7 +1,7 @@
 module sh.sysl.benchtop.chip
 
-import sh.sysl.benchtop.peripheral.rp2040.{DMA_READ_ERROR, DMA_WRITE_ERROR, DmaFault, NO_CHANNEL, TREQ_PERMANENT, TREQ_TIMER0}
-import sh.sysl.benchtop.peripheral.rp2350.{DREQ_UART0_TX, XIP_BASE, XIP_WINDOWS_END, treq_name}
+import sh.sysl.benchtop.peripheral.rp2040.{DMA_READ_ERROR, DMA_WRITE_ERROR, DmaFault, NO_CHANNEL, TREQ_PERMANENT, TREQ_TIMER0, swapped}
+import sh.sysl.benchtop.peripheral.rp2350.{DREQ_ADC, DREQ_HSTX, DREQ_UART0_TX, XIP_BASE, XIP_WINDOWS_END, treq_name}
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
 import sysl.fmt.hex
@@ -15,9 +15,9 @@ import sysl.math.{max, min}
 // XIP_SRAM) is the board's to answer (`DmaMemory`), and a store there is one the cores see at once: code
 // decoded from it decodes again and an exclusive monitor on it is broken. Everything else is the chip's
 // `read` and `write`, so a device's side effects happen as for a core's access (a UART's FIFO pops and
-// pushes, a write to the DMA's own registers triggers a channel). The DMA master has the RP2350's
-// security attributes at their reset values (Secure, privileged: SECCFG is item 12), and ACCESSCTRL's
-// DMA bit decides each device. **A bus error is modelled**: an ACCESSCTRL denial, the SIO and the
+// pushes, a write to the DMA's own registers triggers a channel). Each channel's bus accesses have its
+// SECCFG level (Secure and privileged at reset) and the DMA's MPU can raise an address's, and ACCESSCTRL's
+// DMA bit with that level decides each device. **A bus error is modelled**: an ACCESSCTRL denial, the SIO and the
 // cores' private bus (which are not on the DMA's bus), and an XIP_SRAM line with no pin set the
 // channel's READ_ERROR or WRITE_ERROR, halt it and raise its interrupt. A write to ACCESSCTRL is dropped
 // (LOCK.DMA is hardwired). **Refused by name**, stopping the run (`take_line_fault`): an access the chip
@@ -30,8 +30,8 @@ import sysl.math.{max, min}
 // channel after the last. A channel is ready when it is busy and enabled and its request holds: always
 // for TREQ_PERMANENT, a request counted from its pacing timer, or its device's DREQ as it reads now.
 // `advance` gives the DMA its cycles from the start of each step of the devices', and bounds a step by
-// the next UART line event while a channel waits on a DREQ, so a UART paced by the DMA keeps its FIFO
-// fed at the line's own times (`advance_with_dma`). Nothing is done per cycle while the DMA waits: it
+// the next UART line event or I2C step while a channel waits on a DREQ, so a UART or an I2C controller
+// paced by the DMA keeps its FIFO fed at the line's own times (`advance_with_dma`). Nothing is done per cycle while the DMA waits: it
 // skips to the next request a pacing timer makes, and `next_event` offers the soonest completion.
 
 /** The board's memory as the DMA reaches it: an access to an address the board keeps (its SRAM, its
@@ -56,12 +56,11 @@ private enum Moved
     BusError
     Refused(why: string)
 
-// TREQ_SEL below this is a PIO FIFO's request.
+// TREQ_SEL 0 to 23: the PIO blocks' FIFOs, eight to a block (`Pio.dreq`).
 private const PIO_TREQS: u32 = 24
+private is_pio_dreq(treq: u32) -> bool = treq < PIO_TREQS
 // The SIO and the cores' private peripheral bus, neither on the DMA's bus.
 private const SIO_FIRST: u32 = 0xD0000000
-// What the DMA master needs of a device's ACCESSCTRL register: its master bit (DMA) and Secure privileged.
-private const DMA_NEED: u32 = 0x48
 
 impl Rp2350
     /** The board's memory, for the DMA to reach (`DmaMemory`); a chip with none answers only its devices. */
@@ -74,9 +73,15 @@ impl Rp2350
         var left = cycles
         while left > 0
             val used = self.dma_run(left)
+            self.dma_t = 0
             var step = left
             if used < left && self.dma.busy != 0
-                step = earliest(self.line_due(), self.pio_paced_due()) match
+                // The soonest of a UART line event, a PWM wrap, an ADC sample, an I2C bus step, room in
+                // HSTX's FIFO, the SHA-256 core finishing a digest and a state machine a channel waits on.
+                var wake = earliest(earliest(earliest(earliest(self.line_due(), self.pwm_due()), self.adc_due()), self.i2c_due()), self.hstx_due())
+                if self.sha_awaited() then wake = earliest(wake, self.sha.due(self.now))
+                if self.pio.running then wake = earliest(wake, self.pio_paced_due())
+                step = wake match
                     Some(n) -> max(max(used, 1), min(left, n))
                     None -> left
             self.advance_devices(step)
@@ -88,6 +93,7 @@ impl Rp2350
         var t: u64 = 0
         while t < budget && self.dma.busy != 0
             self.dma.pace_to(self.now + t)
+            self.dma_t = t
             val k = self.dma_pick()
             if k == NO_CHANNEL
                 // Waiting: on a pacing timer, the cycles to its next request; else on a device.
@@ -119,18 +125,21 @@ impl Rp2350
         val treq = self.dma.ch[k].treq
         if treq == TREQ_PERMANENT then return true
         if treq >= TREQ_TIMER0 then return self.dma.ch[k].credit > 0
-        if treq < PIO_TREQS
+        if treq == DREQ_SHA256 then return self.sha.dreq(self.now + self.dma_t)
+        if treq == DREQ_HSTX then return self.hstx.dreq()
+        if is_pwm_dreq(treq) then return self.pwm.dreq & (1u32 << (treq - DREQ_PWM_WRAP0)) != 0
+        if is_pio_dreq(treq)
             if self.pio.running then self.pio_catch_up()
             return self.pio.dreq(treq)
         self.uart_dreq(treq) match
             Some(level) -> level
-            None -> false
+            None -> if treq == DREQ_ADC then self.adc.dreq() else self.i2c_dreq(treq).unwrap_or(false)
 
     // One transfer on channel `k`: read, step the addresses, write, then count it.
     private dma_transfer(*self, k: u32)
         val c = self.dma.ch[k]
         val size = c.size
-        val v = self.dma_load(c.read_addr, size) match
+        val v = self.dma_load(k, c.read_addr, size) match
             Data(x) -> x
             BusError ->
                 self.dma.bus_error(k, DMA_READ_ERROR)
@@ -141,7 +150,8 @@ impl Rp2350
         self.dma.ch[k].read_addr = c.next(c.read_addr, c.read_step, !c.ring_write)
         self.dma.ch[k].write_addr = c.next(c.write_addr, c.write_step, c.ring_write)
         val data = if c.bswap then swapped(v, size) else v
-        self.dma_store(c.write_addr, size, data) match
+        if c.sniff then self.dma.sniff(k, data, size)
+        self.dma_store(k, c.write_addr, size, data) match
             Data(_) -> ()
             BusError ->
                 self.dma.bus_error(k, DMA_WRITE_ERROR)
@@ -149,6 +159,7 @@ impl Rp2350
             Refused(why) ->
                 self.dma_refused(k, s"writing 0x${hex(c.write_addr, 8)}: $why")
                 return
+        if is_pwm_dreq(c.treq) then self.pwm.take_dreq(c.treq - DREQ_PWM_WRAP0)
         // The write may have aborted the channel (CHAN_ABORT through the DMA itself).
         if self.dma.busy & (1u32 << k) != 0 then self.dma.transferred(k)
 
@@ -157,9 +168,20 @@ impl Rp2350
         self.dma.busy &= ~(1u32 << k)
         if self.dma.fault.is_empty() then self.dma.fault = s"DMA channel $k $why"
 
-    // A DMA read of `width` bytes at `a`.
-    private dma_load(*self, a: u32, width: u32) -> Moved
+    // Whether channel `k` may reach `a` under the DMA's MPU: a bus error where not.
+    private dma_mpu(*self, k: u32, a: u32) -> Option[Moved]
+        if !self.dma.mpu_live then return None
+        self.dma.mpu_allows(k, a) match
+            Ok(true) -> None
+            Ok(false) -> Some(Moved.BusError)
+            Err(why) -> Some(Moved.Refused(why))
+
+    // A DMA read of `width` bytes at `a`, by channel `k`.
+    private dma_load(*self, k: u32, a: u32, width: u32) -> Moved
         if a & (width - 1) != 0 then return Moved.Refused(s"a transfer not aligned to its size ($width bytes) is not modelled")
+        self.dma_mpu(k, a) match
+            Some(m) -> return m
+            None -> ()
         self.memory match
             Some(m) ->
                 m.dma_read(a, width) match
@@ -167,14 +189,17 @@ impl Rp2350
                     BusError -> return Moved.BusError
                     Chip -> ()
             None -> ()
-        if a >= SIO_FIRST || self.accessctrl.refusal(a, DMA_NEED).is_some() then return Moved.BusError
+        if a >= SIO_FIRST || self.accessctrl.refusal(a, self.dma.need(k)).is_some() then return Moved.BusError
         self.read(0, a, width) match
             Ok(x) -> Moved.Data(x)
             Err(why) -> Moved.Refused(why)
 
-    // A DMA write of `width` bytes of `x` at `a`.
-    private dma_store(*self, a: u32, width: u32, x: u32) -> Moved
+    // A DMA write of `width` bytes of `x` at `a`, by channel `k`.
+    private dma_store(*self, k: u32, a: u32, width: u32, x: u32) -> Moved
         if a & (width - 1) != 0 then return Moved.Refused(s"a transfer not aligned to its size ($width bytes) is not modelled")
+        self.dma_mpu(k, a) match
+            Some(m) -> return m
+            None -> ()
         self.memory match
             Some(m) ->
                 m.dma_write(a, width, x) match
@@ -182,7 +207,7 @@ impl Rp2350
                     BusError -> return Moved.BusError
                     Chip -> ()
             None -> ()
-        if a >= SIO_FIRST || self.accessctrl.refusal(a, DMA_NEED).is_some() then return Moved.BusError
+        if a >= SIO_FIRST || self.accessctrl.refusal(a, self.dma.need(k)).is_some() then return Moved.BusError
         if a >= accessctrl_reg.BASE && a - accessctrl_reg.BASE < 0x4000 then return Moved.Data(0)
         val xip_block = block_at(a) match
             Some((p, _)) -> p.block == Block.XipCtrl || p.block == Block.QmiBlock || p.block == Block.XipAux
@@ -218,6 +243,7 @@ impl Rp2350
             b &= b - 1
             val c = self.dma.ch[k]
             if c.en && c.treq < TREQ_TIMER0 && self.dma_ready(k) then return Some(1)
+        if self.sha_awaited() then return earliest(self.sha.due(self.now), self.dma.completion_due(self.now))
         self.dma.completion_due(self.now)
 
     // Whether a busy, enabled channel is paced by a PIO FIFO's request.
@@ -226,7 +252,7 @@ impl Rp2350
         while b != 0
             val c = b.trailing_zeros()
             b &= b - 1
-            if self.dma.ch[c].en && self.dma.ch[c].treq < PIO_TREQS then return true
+            if self.dma.ch[c].en && is_pio_dreq(self.dma.ch[c].treq) then return true
         false
 
     // The clk_sys cycles until a state machine next acts, where a channel waits on a PIO FIFO's request
@@ -236,6 +262,55 @@ impl Rp2350
         val w = self.pio.next_wake()
         if w == NEVER then return None
         Some(if w > self.now then w - self.now else 1)
+
+    // Whether a busy, enabled channel is paced by the SHA-256 core's request.
+    private[chip] sha_awaited(*self) -> bool
+        var b = self.dma.busy
+        while b != 0
+            val c = b.trailing_zeros()
+            b &= b - 1
+            if self.dma.ch[c].en && self.dma.ch[c].treq == DREQ_SHA256 then return true
+        false
+
+    // The clk_sys cycles until HSTX's FIFO has room, where a busy, enabled channel waits on its request.
+    private[chip] hstx_due(*self) -> Option[u64]
+        if self.dma.busy == 0 || !self.hstx.enabled() then return None
+        val waiting = self.hstx.until_room() match
+            Some(n) -> n
+            None -> return None
+        var fed = false
+        var b = self.dma.busy
+        while b != 0
+            val c = b.trailing_zeros()
+            b &= b - 1
+            if self.dma.ch[c].en && self.dma.ch[c].treq == DREQ_HSTX then fed = true
+        val hz = self.clocks.hstx_hz(self.sources())
+        val sys = self.sys_hz()
+        if !fed || hz == 0 || sys == 0 then return None
+        val need = u128(waiting) * u128(sys) - min(u128(self.hstx_rest), u128(waiting) * u128(sys))
+        Some(max(u64((need + u128(hz) - 1) / u128(hz)), 1))
+
+    /** The clk_sys cycles within which a busy channel fed by HSTX may finish with its interrupt enabled,
+     * for the board to end its quantum there: a core asleep in `WFI` then takes the interrupt about when
+     * silicon would, before the channel chained from it has run on. A channel owing no more words than
+     * the FIFO has room for finishes in that many cycles; one owing more first fills the room, then waits
+     * on a pop, and the time to the next pop is all that bounds it.
+     */
+    hstx_irq_due(*self) -> Option[u64]
+        if self.dma.busy == 0 || !self.hstx.enabled() then return None
+        var enabled: u32 = 0
+        for n in 0..<self.dma.layout.irq_lines do enabled |= self.dma.inte[n]
+        val room = self.hstx.room()
+        var due: Option[u64] = None
+        var b = self.dma.busy & enabled
+        while b != 0
+            val k = b.trailing_zeros()
+            b &= b - 1
+            val c = &self.dma.ch[k]
+            if !c.en || c.treq != DREQ_HSTX || c.endless() then continue
+            val bound = if c.count <= room then Some(max(u64(c.count), 1)) else if room > 0 then Some(u64(room)) else self.hstx_due()
+            due = earliest(due, bound)
+        due
 
     // Whether a busy, enabled channel is paced by UART `k`'s TX request: the DMA still has characters to
     // give it.
@@ -248,9 +323,3 @@ impl Rp2350
             if self.dma.ch[c].en && self.dma.ch[c].treq == treq then return true
         false
 end Rp2350
-
-// BSWAP: a halfword's two bytes swapped, a word's four reversed; a byte unchanged.
-private swapped(v: u32, size: u32) -> u32 = size match
-    2 -> ((v & 0xFF) << 8) | ((v >> 8) & 0xFF)
-    4 -> ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | (v >> 24)
-    _ -> v

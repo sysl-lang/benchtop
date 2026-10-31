@@ -11,11 +11,14 @@ end to end:
 | `hello_rtc.c` | pico-examples' `rtc/hello_rtc` (commit 0d62f75), unchanged: the RTC set to Friday 5 June 2020 15:45:00 and read every 100 ms | `Hello RTC!`, then the date and time, a second on every second of guest time |
 | `rtc_alarm.c` | pico-examples' `rtc/rtc_alarm` (commit 0d62f75), unchanged: an alarm five seconds on, through RTC_IRQ | `RTC Alarm!`, `Alarm Fired At Wednesday 13 January 11:20:05 2020` five seconds of guest time on |
 | `ssi_flash.c` | benchtop's own: the flash through the SSI with no ROM function, the SDK's `flash_do_cmd` sequence (chip select forced through IO_QSPI) for the IDs, an erase and two page programs; the SDK's boot2 into quad XIP; the four XIP aliases, code run from flash and again after reprogramming, the stream, the cache as SRAM, VREG | every line it prints (`chip/pico_xip_tests.sysl`) |
+| `hello_adc.c` | pico-examples' `adc/hello_adc` (commit 0d62f75), unchanged: GPIO 26 converted every 500 ms | `Raw value: 0x4d9, voltage: 0.999829 V` for 1 V on GPIO 26 (`chip/adc_tests.sysl`) |
+| `onboard_temperature.c` | pico-examples' `adc/onboard_temperature` (commit 0d62f75), unchanged: the temperature sensor on input 4 | `Onboard temperature = 27.14 C` at the board's 27 °C (`chip/adc_tests.sysl`) |
 | `blink.uf2` | `blink` as a RAM UF2 | GPIO 25 toggling, as the ELF does |
 | `rom_funcs.c` | benchtop's own: `rom_func_lookup` of the bit functions, memset and memcpy, `rom_data_lookup` of the soft float and double tables, each called; then the SDK's own float and double divide, which go through the ROM | every line, against the host's arithmetic |
 | `hello_world_serial.c` | pico-examples' `hello_world/serial` (commit 0d62f75), unchanged, **a flash image**: the boot ROM checks boot2's CRC, runs it, and boot2 enters the image | `Hello, world!` every second of guest time; XIP left reading the flash |
 | `flash_program.c` | pico-examples' `flash/program` (commit 0d62f75), unchanged, a flash image: a sector erased and a page programmed 256 KB in through the ROM's flash functions | every line, and the page in the flash array |
 | `hello_watchdog.c` | pico-examples' `watchdog/hello_watchdog` (commit 0d62f75), unchanged, a flash image: the watchdog's reset boots it again through the ROM | `Clean boot`, the five updates, then `Rebooted by Watchdog!` |
+| `bus_scan.c` | pico-examples' `i2c/bus_scan` (commit 0d62f75), unchanged: I2C0 on GPIO 4 and 5 at 100 kHz reads one byte from every address that is not reserved | the table, `@` at 0x68 for the DS3231 the test puts on GPIO 4 and 5 (`chip/i2c_tests.sysl`) |
 | `sdk_tests/` | the Pico SDK's own `test/pico_float_test` programs (SDK 2.3.0), unchanged but for a first line naming their origin: `pico_float_test`, `pico_double_test`, `custom_float_funcs_test`, `custom_double_funcs_test`, flash images on the SDK's default implementation, the ROM's | `PASSED` |
 | `rom_crosscheck/` | benchtop's own: the chip's ROM against benchtop's ROM routines compiled into the firmware, bit for bit; a flash image and a UF2 for a real Pico (below) | every function's line with no mismatch, and `CROSSCHECK 71248 0 8c217b56` |
 
@@ -49,7 +52,7 @@ The settings, all in `CMakeLists.txt`:
 - otherwise the SDK's defaults: float, double, the bit operations and memcpy/memset from the boot ROM,
   which on benchtop is benchtop's own (`sh/sysl/benchtop/chip/rom/README.md`), and the SIO's hardware
   divider;
-- `rom_crosscheck` links an archive `sysl build-c` makes from `rom_crosscheck/ours` (sysl 0.8.7 on
+- `rom_crosscheck` links an archive `sysl build-c` makes from `rom_crosscheck/ours` (sysl 0.8.9 on
   the PATH), benchtop's ROM routines compiled for the Cortex-M0+.
 
 ## The ROM cross-check on a real Pico

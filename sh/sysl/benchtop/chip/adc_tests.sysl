@@ -1,0 +1,327 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2350.Frame
+import sh.sysl.rp2040.adc as a40
+import sh.sysl.rp2040.clocks as clk40
+import sh.sysl.rp2040.resets as rr40
+import sh.sysl.rp2350.adc as a
+import sh.sysl.rp2350.clocks as clk
+import sh.sysl.rp2350.resets as rr
+import sysl.text.{from_utf8_lossy, replace_all}
+
+// The ADC on the two chips (`chip/adc.sysl`, `peripheral/rp2040/adc.sysl`): a conversion's 96 cycles of
+// clk_adc through `advance` and `next_event`, the ideal levels of the GPIO inputs and the temperature
+// sensor, round robin, the FIFO with its threshold, SHIFT, OVER and UNDER, DIV's sample period, the
+// interrupt and the DMA request, RESETS, and what is refused by name; then pico-examples' adc/hello_adc,
+// adc/onboard_temperature, adc/adc_console and adc/dma_capture on the Arm Pico 2, and hello_adc and
+// onboard_temperature on the Pico.
+
+private val HELLO_ADC = embed("../../../../examples/pico2/hello_adc.elf")
+private val ONBOARD_TEMPERATURE = embed("../../../../examples/pico2/onboard_temperature.elf")
+private val ADC_CONSOLE = embed("../../../../examples/pico2/adc_console.elf")
+private val DMA_CAPTURE_ADC = embed("../../../../examples/pico2/dma_capture_adc.elf")
+private val PICO_HELLO_ADC = embed("../../../../examples/pico/hello_adc.elf")
+private val PICO_ONBOARD_TEMPERATURE = embed("../../../../examples/pico/onboard_temperature.elf")
+private val ADC_SRAM = SramMap(0x20000000, 520 * 1024)
+private val ADC_PICO_SRAM = SramMap(0x20000000, 264 * 1024)
+private const ADC_SET: u32 = 0x2000
+private const ADC_CLR: u32 = 0x3000
+
+private get(c: *Rp2350, o: u32) -> u32 = c.read(0, a.BASE + o, 4).unwrap()
+private put(c: *Rp2350, o: u32, x: u32) = c.write(0, a.BASE + o, 4, x).unwrap()
+
+// An RP2350 with the ADC out of reset and clk_adc running from the ring oscillator, as clk_sys is at
+// power-on; the clk_sys cycles one conversion takes.
+private adc_chip() -> (Rp2350, u64)
+    var c = rp2350()
+    c.write(0, rr.BASE + rr.RESET_OFFSET + ADC_CLR, 4, rr.RESET_ADC_MASK | rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK).unwrap()
+    c.write(0, clk.BASE + clk.CLK_ADC_CTRL_OFFSET, 4, clk.CLK_ADC_CTRL_ENABLE_MASK | (clk.CLK_ADC_CTRL_AUXSRC_ROSC_CLKSRC_PH << clk.CLK_ADC_CTRL_AUXSRC_SHIFT)).unwrap()
+    val sys = c.sys_hz()
+    val adc = c.clocks.adc_hz(c.sources())
+    assert(sys != 0 && adc != 0, "clk_sys and clk_adc run")
+    (c, (96 * sys + adc - 1) / adc)
+
+private ainsel(n: u32) -> u32 = n << a.CS_AINSEL_SHIFT
+
+@test("one conversion: READY falls for 96 cycles of clk_adc, the level is floor(uv × 4096 / 3.3 V) saturating at 4095, an input driven digitally reads its rail, and an idle ADC asks for no event")
+chip_adc_one_conversion()
+    var (c, conv) = adc_chip()
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK)
+    assert(get(&c, a.CS_OFFSET) & a.CS_READY_MASK != 0, "READY once powered")
+    assert(c.next_event().is_none(), "nothing under way")
+    for (input, uv, want) in [(0u32, 1650000u32, 2048u32), (1, 1000000, 1241), (2, 0, 0), (3, 3300000, 4095), (3, 5000000, 4095), (0, 805, 0), (0, 806, 1)]
+        c.set_analog(input, Some(uv))
+        put(&c, a.CS_OFFSET, a.CS_EN_MASK | ainsel(input) | a.CS_START_ONCE_MASK)
+        assert(get(&c, a.CS_OFFSET) & (a.CS_READY_MASK | a.CS_START_ONCE_MASK) == 0, "converting, and START_ONCE reads 0")
+        c.advance(conv - 1)
+        assert(get(&c, a.CS_OFFSET) & a.CS_READY_MASK == 0, "one cycle short")
+        c.advance(1)
+        assert(get(&c, a.CS_OFFSET) & a.CS_READY_MASK != 0 && get(&c, a.RESULT_OFFSET) == want, s"input $input at $uv uV: ${get(&c, a.RESULT_OFFSET)}")
+    // GPIO 27 with the board's level taken away and driven high from off the chip: the rail.
+    c.set_analog(1, None)
+    c.drive_from_outside(27, Some(true))
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | ainsel(1) | a.CS_START_ONCE_MASK)
+    c.advance(conv)
+    assert(get(&c, a.RESULT_OFFSET) == 4095, s"${get(&c, a.RESULT_OFFSET)}")
+    c.drive_from_outside(27, Some(false))
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | ainsel(1) | a.CS_START_ONCE_MASK)
+    c.advance(conv)
+    assert(get(&c, a.RESULT_OFFSET) == 0, s"${get(&c, a.RESULT_OFFSET)}")
+    assert(c.next_event().is_none() && c.take_line_fault().is_none())
+
+@test("the temperature sensor on input 4: 0.706 V at 27 °C, 1.721 mV less per degree; the board's temperature is kept across a chip reset; converting it with TS_EN clear stops the board by name")
+chip_adc_temperature()
+    var (c, conv) = adc_chip()
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | a.CS_TS_EN_MASK | ainsel(4) | a.CS_START_ONCE_MASK)
+    c.advance(conv)
+    assert(get(&c, a.RESULT_OFFSET) == 876, s"27 C: ${get(&c, a.RESULT_OFFSET)}")
+    c.set_temperature(50000)
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | a.CS_TS_EN_MASK | ainsel(4) | a.CS_START_ONCE_MASK)
+    c.advance(conv)
+    assert(get(&c, a.RESULT_OFFSET) == 827, s"50 C: ${get(&c, a.RESULT_OFFSET)}")
+    c.set_temperature(-40000)
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | a.CS_TS_EN_MASK | ainsel(4) | a.CS_START_ONCE_MASK)
+    c.advance(conv)
+    assert(get(&c, a.RESULT_OFFSET) == 1019, s"-40 C: ${get(&c, a.RESULT_OFFSET)}")
+    c.reset()
+    assert(c.analog.temperature_uv == 821307, "the board's -40 C survives the chip's reset")
+    var (d, conv2) = adc_chip()
+    put(&d, a.CS_OFFSET, a.CS_EN_MASK | ainsel(4) | a.CS_START_ONCE_MASK)
+    d.advance(conv2)
+    d.take_line_fault() match
+        Some(why) -> assert(why.contains("temperature sensor") && why.contains("TS_EN"), why)
+        None -> assert(false, "an unpowered sensor was converted")
+
+@test("round robin and the FIFO: RROBIN moves AINSEL on after each conversion, wrapping; LEVEL counts, a ninth sample sets OVER and is dropped, an empty read sets UNDER and answers 0, both cleared by writing 1; SHIFT keeps 8 bits")
+chip_adc_round_robin_fifo()
+    var (c, conv) = adc_chip()
+    c.set_analog(0, Some(100000))
+    c.set_analog(1, Some(1000000))
+    c.set_analog(3, Some(3000000))
+    put(&c, a.FCS_OFFSET, a.FCS_EN_MASK)
+    // Inputs 1, 3 and 4 in turn, starting from AINSEL 0, which RROBIN does not enable.
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | a.CS_TS_EN_MASK | (0b11010 << a.CS_RROBIN_SHIFT) | a.CS_START_MANY_MASK)
+    c.advance(conv)
+    assert(get(&c, a.CS_OFFSET) & a.CS_AINSEL_MASK == ainsel(1), "AINSEL moved on to input 1")
+    c.advance(3 * conv)
+    assert(get(&c, a.CS_OFFSET) & a.CS_AINSEL_MASK == ainsel(1), "3, 4, then wrapped to 1")
+    val fcs = get(&c, a.FCS_OFFSET)
+    assert((fcs & a.FCS_LEVEL_MASK) >> a.FCS_LEVEL_SHIFT == 4 && fcs & (a.FCS_EMPTY_MASK | a.FCS_FULL_MASK) == 0, s"FCS 0x$fcs")
+    c.advance(5 * conv)
+    assert(get(&c, a.FCS_OFFSET) & (a.FCS_FULL_MASK | a.FCS_OVER_MASK) == (a.FCS_FULL_MASK | a.FCS_OVER_MASK), "full, and the ninth dropped")
+    // START_MANY cleared mid-conversion: that conversion still finishes, and its sample is dropped too.
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | a.CS_TS_EN_MASK)
+    assert(get(&c, a.CS_OFFSET) & a.CS_READY_MASK == 0, "the tenth still converting")
+    c.advance(conv)
+    assert(get(&c, a.CS_OFFSET) & a.CS_READY_MASK != 0 && c.next_event().is_none())
+    for want in [124u32, 1241, 3723, 876, 1241, 3723, 876, 1241]
+        val got = get(&c, a.FIFO_OFFSET)
+        assert(got == want, s"$got, not $want")
+    assert(get(&c, a.FIFO_OFFSET) == 0 && get(&c, a.FCS_OFFSET) & (a.FCS_UNDER_MASK | a.FCS_EMPTY_MASK) == (a.FCS_UNDER_MASK | a.FCS_EMPTY_MASK))
+    put(&c, a.FCS_OFFSET, a.FCS_EN_MASK | a.FCS_SHIFT_MASK | a.FCS_OVER_MASK | a.FCS_UNDER_MASK)
+    assert(get(&c, a.FCS_OFFSET) & (a.FCS_OVER_MASK | a.FCS_UNDER_MASK) == 0, "write 1 to clear")
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | ainsel(3) | a.CS_START_ONCE_MASK)
+    c.advance(conv)
+    assert(get(&c, a.FIFO_OFFSET) == 3723 >> 4, "SHIFT: the top 8 bits")
+
+@test("DIV: START_MANY starts each conversion 1 + INT + FRAC/256 cycles of clk_adc after the last, and DIV 0 back to back; next_event offers each end while the interrupt is enabled; START_MANY cleared ends the wait")
+chip_adc_div_pacing()
+    var (c, conv) = adc_chip()
+    val period = conv * 1000 / 96
+    c.set_analog(0, Some(2000000))
+    put(&c, a.FCS_OFFSET, a.FCS_EN_MASK | (1 << a.FCS_THRESH_SHIFT))
+    put(&c, a.INTE_OFFSET, a.INTE_FIFO_MASK)
+    put(&c, a.DIV_OFFSET, 999 << a.DIV_INT_SHIFT)
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | a.CS_START_MANY_MASK)
+    assert(c.next_event() == Some(conv), s"${c.next_event()}")
+    c.advance(conv)
+    assert(c.adc.irq() && get(&c, a.INTS_OFFSET) == 1 && get(&c, a.INTR_OFFSET) == 1, "the first sample at THRESH 1")
+    assert(get(&c, a.FIFO_OFFSET) == 2482 && !c.adc.irq())
+    // Waiting for the next start: READY, and the next event is that conversion's end.
+    assert(get(&c, a.CS_OFFSET) & a.CS_READY_MASK != 0)
+    assert(c.next_event() == Some(period), s"${c.next_event()}, not $period")
+    c.advance(period - 1)
+    assert(get(&c, a.FCS_OFFSET) & a.FCS_LEVEL_MASK == 0)
+    c.advance(1)
+    assert((get(&c, a.FCS_OFFSET) & a.FCS_LEVEL_MASK) >> a.FCS_LEVEL_SHIFT == 1, "the second, a period after the first")
+    c.advance(period - conv - 1)
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK)
+    assert(get(&c, a.CS_OFFSET) & a.CS_READY_MASK != 0 && c.next_event().is_none(), "START_MANY cleared while waiting: idle")
+    // INTF forces the interrupt; with INTE clear it is not raised.
+    put(&c, a.INTF_OFFSET, 1)
+    assert(get(&c, a.INTS_OFFSET) == 1)
+    put(&c, a.INTE_OFFSET, 0)
+    assert(!c.adc.irq())
+
+@test("the DMA request: DREQ 48 holds while DREQ_EN is set and the FIFO has reached THRESH; a channel paced by it moves each sample as it lands")
+chip_adc_dreq()
+    var (c, conv) = adc_chip()
+    c.set_analog(2, Some(3300000))
+    put(&c, a.FCS_OFFSET, a.FCS_EN_MASK | (2 << a.FCS_THRESH_SHIFT))
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | ainsel(2) | a.CS_START_MANY_MASK)
+    c.advance(conv)
+    assert(!c.adc.dreq(), "DREQ_EN clear")
+    put(&c, a.FCS_OFFSET, a.FCS_EN_MASK | a.FCS_DREQ_EN_MASK | (2 << a.FCS_THRESH_SHIFT))
+    assert(!c.adc.dreq(), "one sample, THRESH 2")
+    assert(c.next_event() == Some(conv), "the DMA could see the next sample")
+    c.advance(conv)
+    assert(c.adc.dreq() && !c.adc.irq())
+    get(&c, a.FIFO_OFFSET)
+    assert(!c.adc.dreq())
+
+@test("refused by name, leaving CS as it was: AINSEL or RROBIN naming an input the RP2350A does not have, a start with EN clear, START_ONCE during a conversion, a start with clk_adc stopped")
+chip_adc_refusals()
+    var (c, conv) = adc_chip()
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | ainsel(2))
+    val cases = [
+        (a.CS_EN_MASK | ainsel(5), "AINSEL 5"),
+        (a.CS_EN_MASK | (0x20 << a.CS_RROBIN_SHIFT), "RROBIN 32"),
+        (a.CS_START_ONCE_MASK, "EN clear"),
+        (a.CS_START_MANY_MASK, "EN clear"),
+    ]
+    for (x, want) in cases
+        c.write(0, a.BASE + a.CS_OFFSET, 4, x) match
+            Ok(_) -> assert(false, s"0x$x was let through")
+            Err(why) -> assert(why.contains("ADC + 0x0") && why.contains(want), why)
+        assert(get(&c, a.CS_OFFSET) == a.CS_EN_MASK | ainsel(2) | a.CS_READY_MASK, "CS as it was")
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | a.CS_START_ONCE_MASK)
+    c.write(0, a.BASE + a.CS_OFFSET, 4, a.CS_EN_MASK | a.CS_START_ONCE_MASK) match
+        Ok(_) -> assert(false, "START_ONCE during a conversion")
+        Err(why) -> assert(why.contains("during a conversion"), why)
+    c.advance(conv)
+    c.write(0, clk.BASE + clk.CLK_ADC_CTRL_OFFSET, 4, 0).unwrap()
+    c.write(0, a.BASE + a.CS_OFFSET, 4, a.CS_EN_MASK | a.CS_START_ONCE_MASK) match
+        Ok(_) -> assert(false, "a start with clk_adc stopped")
+        Err(why) -> assert(why.contains("clk_adc stopped"), why)
+    assert(!c.adc.active(), "nothing started")
+
+@test("RESETS holding the ADC stops a conversion and puts its registers back to power-on; its registers are refused while it is held")
+chip_adc_reset()
+    var (c, conv) = adc_chip()
+    put(&c, a.FCS_OFFSET, a.FCS_EN_MASK)
+    put(&c, a.DIV_OFFSET, 0x1234)
+    put(&c, a.CS_OFFSET, a.CS_EN_MASK | a.CS_START_MANY_MASK)
+    c.advance(conv * 2)
+    c.write(0, rr.BASE + rr.RESET_OFFSET + ADC_SET, 4, rr.RESET_ADC_MASK).unwrap()
+    assert(!c.adc.active() && c.next_event().is_none())
+    assert(c.read(0, a.BASE + a.CS_OFFSET, 4).is_err())
+    c.write(0, rr.BASE + rr.RESET_OFFSET + ADC_CLR, 4, rr.RESET_ADC_MASK).unwrap()
+    assert(get(&c, a.CS_OFFSET) == 0 && get(&c, a.DIV_OFFSET) == 0 && get(&c, a.FCS_OFFSET) == a.FCS_EMPTY_MASK)
+
+@test("the RP2040's ADC at 0x4004c000: a conversion, the temperature sensor, round robin over its five inputs, and AINSEL 5 to 7 refused by name")
+chip_adc_rp2040()
+    var c = rp2040()
+    c.store(0, rr40.BASE + rr40.RESET_OFFSET + ADC_CLR, 4, rr40.RESET_ADC_MASK).unwrap()
+    c.store(0, clk40.BASE + clk40.CLK_ADC_CTRL_OFFSET, 4, clk40.CLK_ADC_CTRL_ENABLE_MASK | (clk40.CLK_ADC_CTRL_AUXSRC_ROSC_CLKSRC_PH << clk40.CLK_ADC_CTRL_AUXSRC_SHIFT)).unwrap()
+    val sys = c.sys_hz()
+    val adc = c.clocks.adc_hz(c.sources())
+    val conv = (96 * sys + adc - 1) / adc
+    c.set_analog(3, Some(1650000))
+    c.store(0, a40.BASE + a40.FCS_OFFSET, 4, a40.FCS_EN_MASK).unwrap()
+    c.store(0, a40.BASE + a40.CS_OFFSET, 4, a40.CS_EN_MASK | a40.CS_TS_EN_MASK | (3 << a40.CS_AINSEL_SHIFT) | (0b11000 << a40.CS_RROBIN_SHIFT) | a40.CS_START_MANY_MASK).unwrap()
+    c.pass(conv - 1)
+    assert(c.load(0, a40.BASE + a40.FCS_OFFSET, 4).unwrap() & a40.FCS_EMPTY_MASK != 0, "one cycle short")
+    c.pass(1)
+    c.pass(conv)
+    c.store(0, a40.BASE + a40.CS_OFFSET, 4, a40.CS_EN_MASK | a40.CS_TS_EN_MASK).unwrap()
+    assert(c.load(0, a40.BASE + a40.FIFO_OFFSET, 4).unwrap() == 2048 && c.load(0, a40.BASE + a40.FIFO_OFFSET, 4).unwrap() == 876, "input 3, then the sensor")
+    c.store(0, a40.BASE + a40.CS_OFFSET, 4, a40.CS_EN_MASK | (5 << a40.CS_AINSEL_SHIFT)) match
+        Ok(_) -> assert(false, "AINSEL 5 on the RP2040")
+        Err(why) -> assert(why.contains("AINSEL 5") && why.contains("RP2040"), why)
+
+// The SDK's stdio sends each "\n" as "\r\n".
+private crlf(s: string) -> string = replace_all(s, "\n", "\r\n")
+
+// Run the board in steps of `step` cycles until its console holds `text` (with the SDK's line ends), at
+// most `limit` steps.
+private adc_run_until(b: &ArmBoard, text: string, step: u64, limit: int)
+    val want = crlf(text)
+    for i in 0..<limit
+        val end = b.run(step)
+        // A program whose main returns ends at the SDK's BKPT: what UART0 still holds is sent.
+        if end == RunEnd.Breakpoint then assert(b.finish_sending(), b.refused)
+        if from_utf8_lossy(b.console.view()).contains(want) then return
+        assert(end == RunEnd.Budget || end == RunEnd.Asleep, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(false, s"never printed \"$text\": ${from_utf8_lossy(b.console.view())}")
+
+private pico_run_until(b: &ArmBoard[Rp2040], text: string, step: u64, limit: int)
+    val want = crlf(text)
+    for i in 0..<limit
+        val end = b.run(step)
+        if from_utf8_lossy(b.console.view()).contains(want) then return
+        assert(end == RunEnd.Budget || end == RunEnd.Asleep, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(false, s"never printed \"$text\": ${from_utf8_lossy(b.console.view())}")
+
+// The console of `b` exactly `want`, given with "\n" line ends.
+private console_is(console: string, want: string) = assert(console == crlf(want), console)
+
+private val HELP = "\nCommands:\nc0, ...\t: Select ADC channel n\ns\t: Sample once\nS\t: Sample many\nw\t: Wiggle pins\n"
+
+@test("pico-examples' adc/hello_adc on the Arm Pico 2 and the Pico: GPIO 26 at 1 V, then at 2.5 V half a second later")
+arm_hello_adc()
+    val b = arm_board(ADC_SRAM)
+    b.boot(HELLO_ADC).unwrap()
+    b.chip.set_analog(0, Some(1000000))
+    adc_run_until(b, "V\n", 1000000, 200)
+    b.chip.set_analog(0, Some(2500000))
+    adc_run_until(b, "V\nRaw value: 0xc1f, voltage: 2.499975 V\n", 1000000, 200)
+    console_is(from_utf8_lossy(b.console.view()), "ADC Example, measuring GPIO26\nRaw value: 0x4d9, voltage: 0.999829 V\nRaw value: 0xc1f, voltage: 2.499975 V\n")
+    val p = pico_board(ADC_PICO_SRAM)
+    p.boot(PICO_HELLO_ADC).unwrap()
+    p.chip.set_analog(0, Some(1000000))
+    pico_run_until(p, "V\n", 1000000, 200)
+    console_is(from_utf8_lossy(p.console.view()), "ADC Example, measuring GPIO26\nRaw value: 0x4d9, voltage: 0.999829 V\n")
+
+@test("pico-examples' adc/onboard_temperature on the Arm Pico 2 and the Pico: the sensor's line read back as the board's temperature")
+arm_onboard_temperature()
+    val b = arm_board(ADC_SRAM)
+    b.boot(ONBOARD_TEMPERATURE).unwrap()
+    b.chip.set_temperature(40000)
+    adc_run_until(b, " C\n", 1000000, 200)
+    console_is(from_utf8_lossy(b.console.view()), "Onboard temperature = 40.25 C\n")
+    val p = pico_board(ADC_PICO_SRAM)
+    p.boot(PICO_ONBOARD_TEMPERATURE).unwrap()
+    pico_run_until(p, " C\n", 1000000, 200)
+    console_is(from_utf8_lossy(p.console.view()), "Onboard temperature = 27.14 C\n")
+
+// Send `text` into UART0's RX on GPIO 1, a frame at a time.
+private type_in(b: &ArmBoard, text: string)
+    for ch in text.bytes
+        loop
+            b.chip.line_in(1, Frame(ch, 0)) match
+                Ok(true) -> break
+                Ok(false) -> assert(b.run(1000) != RunEnd.Fault, b.refused)
+                Err(why) -> assert(false, why)
+
+@test("pico-examples' adc/adc_console on the Arm Pico 2: select inputs, a single sample, the sensor, and a 1000-sample capture through the FIFO; an unknown input and an unknown command answered")
+arm_adc_console()
+    val b = arm_board(ADC_SRAM)
+    b.boot(ADC_CONSOLE).unwrap()
+    b.chip.set_analog(2, Some(1234567))
+    adc_run_until(b, "Wiggle pins\n", 100000, 200)
+    type_in(b, "c2s")
+    adc_run_until(b, " V\n", 100000, 200)
+    type_in(b, "c9c4sx")
+    adc_run_until(b, "Unrecognised command: x\n" + HELP, 100000, 200)
+    type_in(b, "c2S")
+    var want = "\n===========================\nRP2040 ADC and Test Console\n===========================\n" + HELP +
+        "c2\nSwitched to channel 2\ns\n0x5fc -> 1.234277 V\n" +
+        "c9\nUnknown input channel\n" + HELP + "c4\nSwitched to channel 4\ns\n0x36c -> 0.705762 V\nx\nUnrecognised command: x\n" + HELP +
+        "c2\nSwitched to channel 2\nS\nStarting capture\nDone\n"
+    for i in 0..<1000 do want += "5fc\n"
+    adc_run_until(b, want, 1000000, 400)
+    console_is(from_utf8_lossy(b.console.view()), want)
+
+@test("pico-examples' adc/dma_capture on the Arm Pico 2 (its PIO DAC unlaunched): 1000 samples of GPIO 26 at 500 kS/s moved by the DMA on the ADC's DREQ, 8 bits each through SHIFT")
+arm_dma_capture()
+    val b = arm_board(ADC_SRAM)
+    b.boot(DMA_CAPTURE_ADC).unwrap()
+    b.chip.set_analog(0, Some(2000000))
+    adc_run_until(b, "Capture finished\n", 10000000, 400)
+    var want = "Arming DMA\nStarting capture\nCapture finished\n"
+    for i in 0..<1000
+        want += "155, "
+        if i % 10 == 9 then want += "\n"
+    adc_run_until(b, want, 1000000, 400)
+    console_is(from_utf8_lossy(b.console.view()), want)

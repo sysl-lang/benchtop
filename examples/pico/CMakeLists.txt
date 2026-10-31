@@ -20,9 +20,10 @@ function(benchtop_program target source)
     pico_enable_stdio_usb(${target} 0)
 endfunction()
 
-foreach(prog hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash rom_funcs)
+foreach(prog hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash rom_funcs bus_scan)
     benchtop_program(${prog} ${prog}.c)
 endforeach()
+target_link_libraries(bus_scan hardware_i2c)
 
 # pico-examples' programs as their own CMakeLists build them: flash images, with boot2 in the first
 # 256 bytes, which the boot ROM's boot path checks and runs.
@@ -41,6 +42,10 @@ target_link_libraries(hello_multicore pico_multicore)
 # blink also as a UF2, the RAM image the boot ROM's USB drive takes and enters at its first byte.
 pico_add_uf2_output(blink)
 target_link_libraries(hello_rtc hardware_rtc)
+foreach(prog hello_adc onboard_temperature)
+    benchtop_program(${prog} ${prog}.c no_flash)
+    target_link_libraries(${prog} hardware_adc)
+endforeach()
 target_link_libraries(rtc_alarm hardware_rtc)
 # rom_crosscheck: a flash image with a UF2, for a real Pico as well as benchtop, stdio on UART0 and USB.
 # benchtop's own ROM routines are compiled into it by sysl from rom_crosscheck/ours, an archive it links.

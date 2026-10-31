@@ -1,0 +1,286 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.parts.ds3231 as rtc
+import sh.sysl.benchtop.peripheral.i2c.Device
+import sh.sysl.benchtop.peripheral.rp2350.I2cPart
+import sh.sysl.rp2040.i2c0 as ir40
+import sh.sysl.rp2040.resets as rr40
+import sh.sysl.rp2350.dma as dr
+import sh.sysl.rp2350.i2c0 as ir
+import sh.sysl.rp2350.i2c1 as ir1
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.sio as sr
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// I2C0 and I2C1 on the chips: their lines through the GPIO mux, the pads and the wires (`i2c_lines`),
+// parts on the workbench, the steps timed through `next_event`, the interrupt lines and DMA requests,
+// RESETS, and the refusals as the bus reports them; then pico-examples' i2c/bus_scan on the Pico 2 and
+// the Pico, and i2c/slave_mem_i2c on the Pico 2, its two controllers wired to each other.
+
+private val BUS_SCAN = embed("../../../../examples/pico2/bus_scan.elf")
+private val SLAVE_MEM = embed("../../../../examples/pico2/slave_mem_i2c.elf")
+private val PICO_BUS_SCAN = embed("../../../../examples/pico/bus_scan.elf")
+private val SRAM_2350 = SramMap(0x20000000, 520 * 1024)
+private val SRAM_2040 = SramMap(0x20000000, 264 * 1024)
+private const SET_ALIAS: u32 = 0x2000
+private const CLR_ALIAS: u32 = 0x3000
+// One SCL bit in clk_sys cycles at the counts `i2c_master` sets: HCNT 9, LCNT 8, SPKLEN 1, plus 8.
+private const BIT: u64 = 26
+
+private get(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private put(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+
+// The pads, IO_BANK0 and both controllers out of reset.
+private i2c_chip() -> Rp2350
+    var c = rp2350()
+    put(&c, rr.BASE + rr.RESET_OFFSET + CLR_ALIAS, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK | rr.RESET_I2C0_MASK | rr.RESET_I2C1_MASK)
+    c
+
+// GPIO `n` given to I2C as the SDK's gpio_set_function and gpio_pull_up leave it.
+private i2c_pin(c: *Rp2350, n: u32)
+    put(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + CLR_ALIAS, pads.GPIO0_OD_MASK | pads.GPIO0_ISO_MASK | pads.GPIO0_PDE_MASK)
+    put(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET_ALIAS, pads.GPIO0_IE_MASK | pads.GPIO0_PUE_MASK)
+    put(c, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * n, 3)
+
+// I2C0 a master at the shortest SCL the counts allow, addressing `tar`.
+private i2c_master(c: *Rp2350, tar: u32)
+    put(c, ir.BASE + ir.IC_ENABLE_OFFSET, 0)
+    put(c, ir.BASE + ir.IC_CON_OFFSET, 0x165)
+    put(c, ir.BASE + ir.IC_FS_SCL_HCNT_OFFSET, 9)
+    put(c, ir.BASE + ir.IC_FS_SCL_LCNT_OFFSET, 8)
+    put(c, ir.BASE + ir.IC_FS_SPKLEN_OFFSET, 1)
+    put(c, ir.BASE + ir.IC_TAR_OFFSET, tar)
+    put(c, ir.BASE + ir.IC_ENABLE_OFFSET, 1)
+
+// A part at `address` on GPIOs 4 and 5 that acknowledges everything and counts what it is written.
+private struct Counter
+    starts: int
+    bytes: int
+
+    started(*self) = self.starts += 1
+
+    took(*self) -> bool
+        self.bytes += 1
+        true
+end Counter
+
+private counter_part(n: &Counter, address: u8, pull_ups: bool) -> I2cPart =
+    I2cPart(4, 5, Device(address, (b, reading, t) -> n.started(), (b, x, t) -> n.took(), (b, t) -> u8(n.bytes)), pull_ups)
+
+// The DS3231 as a part on the workbench: its model, whose functions take where it lives.
+private struct Clock
+    r: rtc.Rtc
+
+    begin(*self, reading: bool, t: u64) = rtc.start(&self.r, reading, t)
+    take(*self, x: u8, t: u64) -> bool = rtc.write(&self.r, x, t)
+    give(*self, t: u64) -> u8 = rtc.read(&self.r, t)
+
+private ds3231(hz: u64) -> I2cPart
+    val clock: &Clock = Clock(rtc.rtc(hz))
+    I2cPart(4, 5, Device(0x68, (b, reading, t) -> clock.begin(reading, t), (b, x, t) -> clock.take(x, t), (b, t) -> clock.give(t)), true)
+
+// What i2c/bus_scan prints with one target answering at `found`.
+private scan_text(found: u32) -> string
+    var s = "\r\nI2C Bus Scan\r\n   0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F\r\n"
+    for addr in 0u32..<128
+        if addr % 16 == 0 then s = s + s"${hex(addr, 2)} "
+        s = s + (if addr == found then "@" else ".")
+        s = s + (if addr % 16 == 15 then "\r\n" else "  ")
+    s + "Done.\r\n"
+
+@test("an I2C line is modelled where one GPIO carries each signal, its pad reads its input with no override, nothing else drives or watches it, and a pull-up holds it; each other case is named")
+chip_i2c_lines()
+    var c = i2c_chip()
+    assert(c.i2c_lines()[0].why == "no GPIO carries I2C0's SDA", c.i2c_lines()[0].why)
+    i2c_pin(&c, 4)
+    assert(c.i2c_lines()[0].why == "no GPIO carries I2C0's SCL")
+    i2c_pin(&c, 5)
+    val w = c.i2c_lines()
+    assert(w[0].why.is_empty() && w[0].sda == 1u64 << 4 && w[0].scl == 1u64 << 5, w[0].why)
+    assert(!c.drive(4).oe && c.pin(4).level && c.pin(5).input, "released, pulled high")
+    assert(c.i2c_lines()[1].why == "no GPIO carries I2C1's SDA", "GPIO 4 and 5 are I2C0's")
+    // A wire takes the line to the other end.
+    c.wire(4, Some(20))
+    assert(c.i2c_lines()[0].sda == (1u64 << 4) | (1u64 << 20))
+    // Something driving the far end.
+    put(&c, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * 20, 5)
+    put(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 20 + CLR_ALIAS, pads.GPIO0_ISO_MASK)
+    put(&c, sr.BASE + sr.GPIO_OE_SET_OFFSET, 1 << 20)
+    assert(c.i2c_lines()[0].why == "GPIO 20 drives a level onto I2C0's lines, which is not modelled", c.i2c_lines()[0].why)
+    put(&c, sr.BASE + sr.GPIO_OE_CLR_OFFSET, 1 << 20)
+    c.drive_from_outside(20, Some(true))
+    assert(c.i2c_lines()[0].why.contains("driven from off the chip"), c.i2c_lines()[0].why)
+    c.drive_from_outside(20, None)
+    c.wire(4, None)
+    // Interrupts enabled on the line.
+    put(&c, io.BASE + io.PROC0_INTE0_OFFSET + 4 * (5 / 8), 0xF << (4 * (5 % 8)))
+    assert(c.i2c_lines()[0].why.contains("interrupts enabled"), c.i2c_lines()[0].why)
+    put(&c, io.BASE + io.PROC0_INTE0_OFFSET + 4 * (5 / 8), 0)
+    // An input override.
+    put(&c, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * 4, 3 | (io.GPIO0_CTRL_INOVER_INVERT << io.GPIO0_CTRL_INOVER_SHIFT))
+    assert(c.i2c_lines()[0].why.contains("override"), c.i2c_lines()[0].why)
+    put(&c, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * 4, 3)
+    // A second SDA.
+    i2c_pin(&c, 8)
+    assert(c.i2c_lines()[0].why.contains("more than one GPIO"), c.i2c_lines()[0].why)
+    put(&c, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * 8, 31)
+    // The pad's input off.
+    put(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 5 + CLR_ALIAS, pads.GPIO0_IE_MASK)
+    assert(c.i2c_lines()[0].why == "GPIO 5's pad does not read its input (IE clear or isolated), so I2C0 cannot see its line")
+    put(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 5 + SET_ALIAS, pads.GPIO0_IE_MASK)
+    // No pull-up, until a part brings its own.
+    put(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 4 + CLR_ALIAS, pads.GPIO0_PUE_MASK)
+    assert(c.i2c_lines()[0].why.contains("SDA line has no pull-up"), c.i2c_lines()[0].why)
+    c.attach_i2c(counter_part(Counter(0, 0), 0x40, true))
+    assert(c.i2c_lines()[0].why.is_empty())
+
+@test("I2C on the chip: a write to a part timed through next_event, the interrupt line, the refusals worded with the block, RESETS holding a controller, and the DMA requests 44 to 47")
+chip_i2c_transfer()
+    var c = i2c_chip()
+    i2c_pin(&c, 4)
+    i2c_pin(&c, 5)
+    val n: &Counter = Counter(0, 0)
+    c.attach_i2c(counter_part(n, 0x40, false))
+    i2c_master(&c, 0x40)
+    assert(c.next_event().is_none())
+    put(&c, ir.BASE + ir.IC_DATA_CMD_OFFSET, 0x7)
+    put(&c, ir.BASE + ir.IC_DATA_CMD_OFFSET, 0x8 | ir.IC_DATA_CMD_STOP_MASK)
+    assert(c.next_event() == Some(BIT), s"${c.next_event()}")
+    c.advance(10 * BIT)
+    assert(n.starts == 1 && n.bytes == 0)
+    // Time in pieces of half a bit comes to the same.
+    for i in 0..<36 do c.advance(BIT / 2)
+    assert(n.bytes == 2 && c.next_event() == Some(BIT), s"${n.bytes} ${c.next_event()}")
+    c.advance(BIT)
+    assert(get(&c, ir.BASE + ir.IC_RAW_INTR_STAT_OFFSET) & ir.IC_RAW_INTR_STAT_STOP_DET_MASK != 0 && c.next_event().is_none())
+    // STOP_DET unmasked: I2C0's line.
+    put(&c, ir.BASE + ir.IC_INTR_MASK_OFFSET, ir.IC_INTR_MASK_M_STOP_DET_MASK)
+    assert(c.i2c.units[0].irq() && !c.i2c.units[1].irq() && c.i2c.lines == 1, "the line the chip signals")
+    put(&c, ir.BASE + ir.IC_INTR_MASK_OFFSET, 0)
+    assert(c.i2c.lines == 0)
+    put(&c, ir.BASE + ir.IC_INTR_MASK_OFFSET, ir.IC_INTR_MASK_M_STOP_DET_MASK)
+    // A refusal names the block and the register.
+    assert(c.write(0, ir.BASE + ir.IC_ENABLE_OFFSET, 4, 0).is_ok())
+    assert(c.write(0, ir.BASE + ir.IC_TAR_OFFSET, 4, ir.IC_TAR_SPECIAL_MASK).unwrap_err() == "I2C0 + 0x4: IC_TAR.SPECIAL: a general call or a START BYTE is not modelled")
+    assert(c.read(0, ir1.BASE + 0xC, 4).unwrap_err() == "I2C1 + 0xc is not a register benchtop runs")
+    // A command for lines with no pull-up is refused at the write, and leaves nothing behind.
+    put(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * 5 + CLR_ALIAS, pads.GPIO0_PUE_MASK)
+    put(&c, ir.BASE + ir.IC_ENABLE_OFFSET, 1)
+    val why = c.write(0, ir.BASE + ir.IC_DATA_CMD_OFFSET, 4, 1).unwrap_err()
+    assert(why.contains("I2C0 + 0x10") && why.contains("SCL line has no pull-up"), why)
+    assert(get(&c, ir.BASE + ir.IC_TXFLR_OFFSET) == 0)
+    // RESETS: held, refused; released, at power-on.
+    put(&c, rr.BASE + rr.RESET_OFFSET + SET_ALIAS, rr.RESET_I2C0_MASK)
+    assert(c.read(0, ir.BASE, 4).unwrap_err().contains("I2C0 is held in reset"))
+    put(&c, rr.BASE + rr.RESET_OFFSET + CLR_ALIAS, rr.RESET_I2C0_MASK)
+    assert(get(&c, ir.BASE + ir.IC_TAR_OFFSET) == 0x55 && get(&c, ir.BASE + ir.IC_ENABLE_OFFSET) == 0)
+    // The DMA requests.
+    put(&c, ir.BASE + ir.IC_DMA_CR_OFFSET, 3)
+    put(&c, ir.BASE + ir.IC_ENABLE_OFFSET, 1)
+    assert(c.i2c_dreq(44) == Some(true) && c.i2c_dreq(45) == Some(false) && c.i2c_dreq(46) == Some(false) && c.i2c_dreq(47) == Some(false))
+    assert(c.i2c_dreq(43).is_none() && c.i2c_dreq(48).is_none())
+    // An enabled channel takes TREQ_SEL 44 now; 53, CORESIGHT's, which nothing sources, still not (a
+    // disabled channel may hold any).
+    put(&c, rr.BASE + rr.RESET_OFFSET + CLR_ALIAS, rr.RESET_DMA_MASK)
+    assert(c.write(0, dr.BASE + dr.CH0_AL1_CTRL_OFFSET, 4, dr.CH0_CTRL_TRIG_EN_MASK | (44 << dr.CH0_CTRL_TRIG_TREQ_SEL_SHIFT)).is_ok())
+    assert(c.write(0, dr.BASE + dr.CH0_AL1_CTRL_OFFSET, 4, dr.CH0_CTRL_TRIG_EN_MASK | (53 << dr.CH0_CTRL_TRIG_TREQ_SEL_SHIFT)).is_err())
+
+@test("the DMA paced by I2C0's TX request: each command written as the FIFO empties, so the part takes a byte every nine SCL bits")
+chip_i2c_dma_paced()
+    var c = i2c_chip()
+    i2c_pin(&c, 4)
+    i2c_pin(&c, 5)
+    val n: &Counter = Counter(0, 0)
+    c.attach_i2c(counter_part(n, 0x40, false))
+    i2c_master(&c, 0x40)
+    put(&c, ir.BASE + ir.IC_DMA_CR_OFFSET, ir.IC_DMA_CR_TDMAE_MASK)
+    put(&c, rr.BASE + rr.RESET_OFFSET + CLR_ALIAS, rr.RESET_DMA_MASK)
+    // Three words from IC_TAR (0x40, a write of that byte) to IC_DATA_CMD, neither address moving.
+    put(&c, dr.BASE + dr.CH0_READ_ADDR_OFFSET, ir.BASE + ir.IC_TAR_OFFSET)
+    put(&c, dr.BASE + dr.CH0_WRITE_ADDR_OFFSET, ir.BASE + ir.IC_DATA_CMD_OFFSET)
+    put(&c, dr.BASE + dr.CH0_TRANS_COUNT_OFFSET, 3)
+    put(&c, dr.BASE + dr.CH0_CTRL_TRIG_OFFSET, dr.CH0_CTRL_TRIG_EN_MASK | (2 << dr.CH0_CTRL_TRIG_DATA_SIZE_SHIFT) | (44 << dr.CH0_CTRL_TRIG_TREQ_SEL_SHIFT))
+    c.advance(19 * BIT - 10)
+    assert(n.starts == 1 && n.bytes == 0 && c.dma.busy != 0, "the third word waits for room")
+    c.advance(20)
+    assert(n.bytes == 1 && c.dma.busy == 0, s"${n.bytes}")
+    c.advance(9 * BIT)
+    assert(n.bytes == 2)
+    c.advance(9 * BIT)
+    assert(n.bytes == 3 && c.next_event().is_none(), "holding the bus after the last, no STOP asked")
+    assert(get(&c, ir.BASE + ir.IC_STATUS_OFFSET) & ir.IC_STATUS_MST_ACTIVITY_MASK != 0)
+
+@test("RESETS putting a slave in reset while a master's transfer addresses it stops the run with the reason")
+chip_i2c_reset_mid_transfer()
+    var c = i2c_chip()
+    for g in [4u32, 5, 6, 7] do i2c_pin(&c, g)
+    c.wire(4, Some(6))
+    c.wire(5, Some(7))
+    // I2C1 a slave at 0x17, I2C0 a master reading from it: the slave holds SCL for its data.
+    put(&c, ir1.BASE + ir.IC_CON_OFFSET, 0x324)
+    put(&c, ir1.BASE + ir.IC_SAR_OFFSET, 0x17)
+    put(&c, ir1.BASE + ir.IC_ENABLE_OFFSET, 1)
+    i2c_master(&c, 0x17)
+    put(&c, ir.BASE + ir.IC_DATA_CMD_OFFSET, ir.IC_DATA_CMD_CMD_MASK | ir.IC_DATA_CMD_STOP_MASK)
+    c.advance(10 * BIT)
+    assert(c.i2c.units[1].addressed && get(&c, ir1.BASE + ir.IC_RAW_INTR_STAT_OFFSET) & ir.IC_RAW_INTR_STAT_RD_REQ_MASK != 0)
+    put(&c, rr.BASE + rr.RESET_OFFSET + SET_ALIAS, rr.RESET_I2C1_MASK)
+    assert(c.take_line_fault() == Some("I2C1 was reset while I2C0's transfer addressed it, which is not modelled"))
+
+@test("the RP2040's I2C0 and I2C1 at its addresses, held by its RESETS, on its interrupt lines 23 and 24")
+pico_i2c_placed()
+    var c = rp2040()
+    assert(c.load(0, ir40.BASE, 4).unwrap_err().contains("I2C0 is held in reset"))
+    c.store(0, rr40.BASE + rr40.RESET_OFFSET + CLR_ALIAS, 4, rr40.RESET_I2C0_MASK | rr40.RESET_I2C1_MASK).unwrap()
+    assert(c.load(0, ir40.BASE + ir40.IC_COMP_TYPE_OFFSET, 4).unwrap() == 0x44570140 && c.load(0, ir40.BASE + 0x4000 + ir40.IC_CON_OFFSET, 4).unwrap() == 0x65)
+    c.store(0, ir40.BASE + 0x4000 + ir40.IC_INTR_MASK_OFFSET, 4, ir40.IC_INTR_MASK_M_TX_EMPTY_MASK).unwrap()
+    c.store(0, ir40.BASE + 0x4000 + ir40.IC_ENABLE_OFFSET, 4, 1).unwrap()
+    assert(c.i2c.units[1].irq() && !c.i2c.units[0].irq() && c.i2c.lines == 2)
+    assert(c.store(0, ir40.BASE + ir40.IC_TAR_OFFSET, 4, ir40.IC_TAR_SPECIAL_MASK).unwrap_err().starts_with("I2C0 + 0x4: "))
+
+@test("pico-examples' i2c/bus_scan on the Arm Pico 2: a DS3231 on GPIO 4 and 5 answers at 0x68, every other address does not")
+arm_bus_scan()
+    val b = arm_board(SRAM_2350)
+    b.chip.attach_i2c(ds3231(150000000))
+    b.boot(BUS_SCAN).unwrap()
+    val end = b.run(300000000)
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == scan_text(0x68), text)
+
+@test("pico-examples' i2c/bus_scan on the Pico (RP2040): the same scan, the same answer")
+pico_bus_scan()
+    val b = pico_board(SRAM_2040)
+    b.chip.attach_i2c(ds3231(125000000))
+    b.boot(PICO_BUS_SCAN).unwrap()
+    val end = b.run(300000000)
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == scan_text(0x68), text)
+
+@test("pico-examples' i2c/slave_mem_i2c on the Arm Pico 2: I2C1 the master on GPIO 6 and 7, wired to I2C0 the slave on 4 and 5; each message written, read back in two parts across a repeated START, line by line")
+arm_slave_mem_i2c()
+    val b = arm_board(SRAM_2350)
+    b.chip.wire(4, Some(6))
+    b.chip.wire(5, Some(7))
+    b.boot(SLAVE_MEM).unwrap()
+    var want = "\r\nI2C slave example\r\n"
+    for (at, then_at) in [("00", "05"), ("20", "25"), ("40", "45")]
+        val msg = s"Hello, I2C slave! - 0x$at"
+        want = want + s"Write at 0x$at: '$msg'\r\n"
+        want = want + s"Read  at 0x$at: '${msg[0..<5]}'\r\n"
+        want = want + s"Read  at 0x$then_at: '${msg[5..<msg.len]}'\r\n"
+        want = want + "\r\n"
+    var text = ""
+    for i in 0..<100
+        val end = b.run(10000000)
+        text = from_utf8_lossy(b.console.view())
+        if text.len >= want.len then break
+        assert(end == RunEnd.Budget, s"$end ${b.refused}: $text")
+    assert(text == want, text)

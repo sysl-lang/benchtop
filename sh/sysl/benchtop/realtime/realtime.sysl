@@ -81,7 +81,7 @@ struct Run
     capacity_mhz(self, k: int) -> real = self.mhz(k) / max(self.busy(k), 0.000001)
 
 // Where the window starts or ends: the workers' published state and the host's counters.
-private struct Mark
+struct Mark
     wall_us: long
     time: [2]u64
     late_us: [2]u64
@@ -95,7 +95,7 @@ private struct Mark
     cpu_us: long
 
 // What this thread has done for the desktop so far.
-private struct Host
+struct Host
     sound_frames: u64
     mic_frames: u64
     display_reads: u64
@@ -144,13 +144,91 @@ run(m: *virt.Machine, which: string, file: []const u8, o: Options) -> Result[Run
     val launched = virt.workers_observe(m).launched
     virt.stop_workers(m)
     if !failed.is_empty() then return Err(s"the guest stopped: $failed")
-    val from = first.unwrap()
-    Ok(Run(hz, virt.clock_divisors(m), launched, o.paced, u64(last.wall_us - from.wall_us),
+    Ok(measured(m, o.paced, launched, first.unwrap(), last))
+
+/** The run between two marks. */
+private measured(m: *virt.Machine, paced: bool, launched: bool, from: Mark, last: Mark) -> Run =
+    Run(virt.clock_hz(m), virt.clock_divisors(m), launched, paced, u64(last.wall_us - from.wall_us),
         [core_run(from, last, 0), core_run(from, last, 1)],
         last.dsi.completed - from.dsi.completed, last.dsi.busy_us - from.dsi.busy_us,
         last.sound_frames - from.sound_frames, u64(virt.sound_channels(m)), last.mic_frames - from.mic_frames,
         last.display_reads - from.display_reads, last.display_read_us - from.display_read_us,
-        u64(last.cpu_us - from.cpu_us)))
+        u64(last.cpu_us - from.cpu_us))
+
+/** A run measured inside the desktop's own window: the window's frame loop owns the host's part
+ * (it plays the audio, paints the display), so it only reports what it did -- `sound` frames taken,
+ * `mic` frames given, a display `paint` and how long it took -- and calls `observe` once a frame.
+ * The window is measured from `warmup` guest seconds for `seconds` guest seconds, as `run` does.
+ */
+struct Meter
+    warmup: u64
+    seconds: u64
+    hz: u64
+    host: Host
+    first: Option[Mark]
+    result: Option[Run]
+
+    /** Take the board `m` is made as the one measured: it needs a clock to pace against. */
+    attach(*self, m: *virt.Machine) -> Result[unit, string]
+        if self.seconds == 0 then return Err("--seconds must be at least 1")
+        self.hz = virt.clock_hz(m)
+        if self.hz == 0 then return Err("the board has no mcu.clock-hz to pace against")
+        Ok(())
+
+    sound(*self, frames: u64)
+        self.host.sound_frames += frames
+
+    mic(*self, frames: u64)
+        self.host.mic_frames += frames
+
+    paint(*self, took_us: u64)
+        self.host.display_reads += 1
+        self.host.display_read_us += took_us
+
+    /** Look at the workers once a frame: mark the window's start and end. True once the window has closed. */
+    observe(*self, m: *virt.Machine) -> bool
+        if self.result.is_some() then return true
+        val snapshot = virt.workers_observe(m)
+        if !snapshot.running then return true
+        val now = max(snapshot.cores[0].time, snapshot.cores[1].time)
+        self.step(m, snapshot, now)
+        self.result.is_some()
+
+    private step(*self, m: *virt.Machine, snapshot: virt.WorkerObservation, now: u64)
+        if self.first.is_none() && now >= self.warmup * self.hz then self.first = Some(mark(m, snapshot, self.host))
+        if self.first.is_some() && now >= (self.warmup + self.seconds) * self.hz
+            self.result = Some(measured(m, true, snapshot.launched, self.first.unwrap(), mark(m, snapshot, self.host)))
+
+/** A meter for `o`'s window; its pacing and inputs are the window's. */
+meter(o: Options) -> &Meter = Meter(o.warmup, o.seconds, 0, Host(0, 0, 0, 0, 0), None, None)
+
+/** What `benchtop realtime` prints for `r`, whose run was of `file` on the board `which` (in `where`, "" or
+ * "a window"), and whether both cores kept real time.
+ */
+struct Report
+    text: string
+    real_time: bool
+
+report(r: Run, which: string, file: string, where: string = "") -> Report
+    val wall = real(r.wall_us) / 1000000.0
+    val share = (us: u64) -> 100.0 * real(us) / real(r.wall_us)
+    var text = f"realtime: $which $file, ${if r.paced then "paced" else "unpaced"}${if where.is_empty() then "" else ", " + where}, ${wall}%.3f s of host time"
+    var real_time = true
+    for k in 0..<2
+        if k == 1 && !r.launched
+            text += "\n  core 1: not launched"
+            continue
+        val c = r.cores[k]
+        val mhz = r.mhz(k)
+        val rated = real(r.hz / r.divisors[k]) / 1000000.0
+        text += f"\n  core $k: ${r.speed(k)}%.3f x real time (${mhz}%.1f of ${rated}%.0f MHz), ${real(c.retired) / real(r.wall_us)}%.1f MIPS, worker busy ${100.0 * r.busy(k)}%.1f % (could sustain ${r.capacity_mhz(k)}%.0f MHz), late ${c.late_us} us"
+        if r.speed(k) < 0.99 then real_time = false
+    text += f"\n  dsi worker: ${r.dsi_packets} packets, busy ${share(r.dsi_busy_us)}%.1f %"
+    text += f"\n  audio: ${real(r.sound_frames) / wall}%.0f frames/s out over ${r.channels} channel(s), ${real(r.mic_frames) / wall}%.0f frames/s into the microphone"
+    text += f"\n  display: ${r.display_reads} ${if where.is_empty() then "copies out" else "paints"}, busy ${share(r.display_read_us)}%.1f %"
+    text += f"\n  process: ${real(r.process_cpu_us) / real(r.wall_us)}%.2f host cores busy"
+    text += if real_time then "\n  REAL TIME" else "\n  BELOW REAL TIME"
+    Report(text, real_time)
 
 private core_run(from: Mark, to: Mark, k: int) -> CoreRun =
     CoreRun(to.time[k] - from.time[k], to.retired[k] - from.retired[k], to.waited_us[k] - from.waited_us[k], to.late_us[k])

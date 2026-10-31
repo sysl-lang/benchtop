@@ -1,0 +1,114 @@
+module sh.sysl.benchtop.chip
+
+import sh.sysl.benchtop.peripheral.rp2040.{ADC_BASE_GPIO, ADC_TEMPERATURE_INPUT, ADC_UNITS_PER_CYCLE}
+import sysl.fmt.hex
+import sysl.math.min
+
+// The ADC on the two chips (`peripheral/rp2040/adc.sysl`): its time in clk_adc from `advance`, event by
+// event and only while a conversion or the wait for one is under way, and the level on its input as each
+// conversion ends: the temperature sensor, or the pin's own (`AnalogIn.level`) through the GPIO's pad. On
+// the RP2350 the DMA reads its FIFO paced by its DREQ (`dma_ready`, and `advance_with_dma` stops at each
+// of its events). The RP2040's DMA is not on the chip yet, so its DREQ reaches nothing there.
+
+// Why the ADC was asked to convert something benchtop does not model.
+private const SENSOR_OFF: string = "the ADC converts input 4, the temperature sensor, with CS.TS_EN clear: what an unpowered sensor reads is not modelled"
+private const NO_CLOCK: string = "a conversion starts with clk_adc stopped, which would never finish"
+
+// The units of ADC time in `cycles` of clk_sys at `sys` Hz with clk_adc at `hz`, given the remainder
+// carried in `rest`: the units, and the remainder.
+private adc_units(cycles: u64, sys: u64, hz: u64, rest: u64) -> (u64, u64)
+    val scaled = u128(rest) + u128(cycles) * u128(hz) * u128(ADC_UNITS_PER_CYCLE)
+    (u64(scaled / u128(sys)), u64(scaled % u128(sys)))
+
+// The clk_sys cycles until `units` of ADC time have passed, rounded up; at least one.
+private adc_cycles(units: u64, sys: u64, hz: u64) -> u64
+    val rate = u128(hz) * u128(ADC_UNITS_PER_CYCLE)
+    u64((u128(units) * u128(sys) + rate - 1) / rate)
+
+impl Rp2350
+    /** Drive ADC input `input` (GPIO 26 + `input`) at `level` microvolts from off the chip, or stop with None. */
+    set_analog(*self, input: u32, level: Option[u32]) = self.analog.set(input, level)
+
+    /** The chip's temperature for its sensor, in thousandths of a degree Celsius. */
+    set_temperature(*self, millidegrees: i32) = self.analog.set_temperature(millidegrees)
+
+    // `cycles` of clk_sys at `sys` Hz pass on the ADC.
+    private[chip] advance_adc(*self, cycles: u64, sys: u64)
+        val hz = self.clocks.adc_hz(self.sources())
+        var (units, rest) = adc_units(cycles, sys, hz, self.adc_rest)
+        self.adc_rest = rest
+        while units > 0 && self.adc.active()
+            val step = min(units, self.adc.until_event())
+            units -= step
+            if self.adc.pass(step)
+                val input = self.adc.input
+                if input == ADC_TEMPERATURE_INPUT && !self.adc.temperature_on() && self.line_fault.is_empty() then self.line_fault = SENSOR_OFF
+                self.adc.finish(self.adc_level(input))
+
+    private adc_level(*self, input: u32) -> u32
+        if input == ADC_TEMPERATURE_INPUT then return self.analog.temperature_uv
+        val p = self.pin(ADC_BASE_GPIO + input)
+        self.analog.level(input, p.drives, p.level)
+
+    // The clk_sys cycles until the ADC's next sample lands, while it has one and clk_adc runs.
+    private[chip] adc_due(*self) -> Option[u64]
+        if !self.adc.active() then return None
+        val hz = self.clocks.adc_hz(self.sources())
+        if hz == 0 then None else Some(adc_cycles(self.adc.until_sample(), self.sys_hz(), hz))
+
+    // A write to the ADC, refused where it asks for something benchtop does not model, leaving it as it was.
+    private[chip] adc_write(*self, p: Placed, o: u32, width: u32, x: u32) -> Result[unit, string]
+        self.adc.unmodelled(o, width, x) match
+            Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
+            None -> ()
+        val before = self.adc
+        self.adc.write(o, width, x).map_err(e -> refusal(p, o, e))?
+        if self.adc.active() && self.clocks.adc_hz(self.sources()) == 0
+            self.adc = before
+            return Err(s"${p.name} + 0x${hex(o)}: $NO_CLOCK")
+        Ok(())
+end Rp2350
+
+impl Rp2040
+    /** Drive ADC input `input` (GPIO 26 + `input`) at `level` microvolts from off the chip, or stop with None. */
+    set_analog(*self, input: u32, level: Option[u32]) = self.analog.set(input, level)
+
+    /** The chip's temperature for its sensor, in thousandths of a degree Celsius. */
+    set_temperature(*self, millidegrees: i32) = self.analog.set_temperature(millidegrees)
+
+    // `cycles` of clk_sys at `sys` Hz pass on the ADC.
+    private[chip] advance_adc(*self, cycles: u64, sys: u64)
+        val hz = self.clocks.adc_hz(self.sources())
+        var (units, rest) = adc_units(cycles, sys, hz, self.adc_rest)
+        self.adc_rest = rest
+        while units > 0 && self.adc.active()
+            val step = min(units, self.adc.until_event())
+            units -= step
+            if self.adc.pass(step)
+                val input = self.adc.input
+                if input == ADC_TEMPERATURE_INPUT && !self.adc.temperature_on() && self.fault.is_empty() then self.fault = SENSOR_OFF
+                self.adc.finish(self.adc_level(input))
+
+    private adc_level(*self, input: u32) -> u32
+        if input == ADC_TEMPERATURE_INPUT then return self.analog.temperature_uv
+        val p = self.pin(ADC_BASE_GPIO + input)
+        self.analog.level(input, p.drives, p.level)
+
+    // The clk_sys cycles until the ADC's next sample lands, while it has one and clk_adc runs.
+    private[chip] adc_due(*self) -> Option[u64]
+        if !self.adc.active() then return None
+        val hz = self.clocks.adc_hz(self.sources())
+        if hz == 0 then None else Some(adc_cycles(self.adc.until_sample(), self.sys_hz(), hz))
+
+    // A write to the ADC, refused where it asks for something benchtop does not model, leaving it as it was.
+    private[chip] adc_write(*self, p: Placed40, o: u32, width: u32, x: u32) -> Result[unit, string]
+        self.adc.unmodelled(o, width, x) match
+            Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
+            None -> ()
+        val before = self.adc
+        self.adc.write(o, width, x).map_err(e -> refusal40(p, o, e))?
+        if self.adc.active() && self.clocks.adc_hz(self.sources()) == 0
+            self.adc = before
+            return Err(s"${p.name} + 0x${hex(o)}: $NO_CLOCK")
+        Ok(())
+end Rp2040

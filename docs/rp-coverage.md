@@ -38,15 +38,14 @@ day. An L is split before it is handed out (§6).
   generator are also library peripherals (`rp-resets`, `rp-timer`, `rp-watchdog`) that run on the
   `virt*` boards through `virt/rp.sysl`, with clk_ref taken to be the core clock because the virtual
   boards have no CLOCKS block (`virt/rp.sysl:8–12`). `virt-sio` (`virt/sio.sysl`) is
-  an RP2040-shaped SIO with FIFOs, spinlocks and CPUID for the virtual boards. `rp-sio`, `pl011`,
-  `dw-i2c` and `rp-adc` are accepted by the checker and marked `modelled = false`
-  (`registry.sysl:301,318,322,324`).
+  an RP2040-shaped SIO with FIFOs, spinlocks and CPUID for the virtual boards. `rp-sio`, `pl011` and
+  `dw-i2c` are accepted by the checker and marked `modelled = false`
+  (`registry.sysl:301,318,322`); `rp-adc` is modelled on both chips (item 19).
 - **Reusable models that are not on either RP bus yet:**
   - the PL022 SPI controller (`peripheral/spi/spi.sysl`, run on the STM32 and virtual boards through
     `virt/spi.sysl`);
-  - a virtual ADC (`peripheral/adc/adc.sysl`);
+  - a virtual ADC (`peripheral/adc/adc.sysl`; the RP chips' own is item 19's);
   - a virtual PWM channel (`peripheral/pwm/pwm.sysl`);
-  - the I²C device-callback layer (`peripheral/i2c/i2c.sysl`);
   - the STM32 DMA (`peripheral/dma/dma.sysl`). Its request/arbitration split is the shape to copy,
     and its registers are not the RP DMA's.
 - **The register shape.** The RP models share `AccessError`, the width, alignment and alias rules,
@@ -81,8 +80,8 @@ day. An L is split before it is handed out (§6).
 | SIO RISC-V platform timer (MTIME, MTIMECMP, soft IRQ) | 3.1.8 / 3.1 SIO | full | `peripheral/rp2350/sio.sysl:15–16,48–51`. | `rp2350/tests.sysl:129` | — | — |
 | SIO doorbells (8, SIO_IRQ_BELL) | 3.1 SIO | full | DOORBELL_OUT_SET/CLR (the other core's DOORBELL_IN) and DOORBELL_IN_SET/CLR (this core's), bits 7:0; SIO_IRQ_BELL (26) per core while any bit is set (`peripheral/rp2350/sio.sysl`, `chip/rp2350.sysl` `signal`; item 15). The Non-secure SIO's SIO_IRQ_BELL_NS is not (Secure-only). | `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
 | SIO interpolators INTERP0/1 (per core) | 3.1 SIO | full | `peripheral/rp2040/interp.sysl`, shared with the RP2040: each core's own pair; shift (rotate here), mask, SIGNED, CROSS_INPUT, CROSS_RESULT, ADD_RAW, FORCE_MSB, BLEND (INTERP0), CLAMP (INTERP1), OVERF flags, PEEK/POP, ACCUMx_ADD, BASE_1AND0 (item 15). | `rp2040/interp_tests.sysl`, `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
-| SIO TMDS encoder | 3.1 SIO | missing | Refused (`sio.sysl:10`). | — | S | HSTX (for a use) |
-| BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | missing | Not decoded. | — | S (counters) | DMA/cores for events |
+| SIO TMDS encoder | 3.1 SIO | full | `peripheral/rp2350/tmds.sysl` (item 29): each core's colour register and per-lane balance, PEEK/POP SINGLE and DOUBLE_Ln, PIX_SHIFT and PIX2_NOSHIFT, CLEAR_BALANCE. Refused by name: PIX_SHIFT 6 and 7. | `peripheral/rp2350/hstx_tests.sysl` | — | — |
+| BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | partial | Priority and PERFSEL stored, PERFCTR_EN; counters of events an ideal bus cannot have read 0; access-event counters refused by name (item 28). | `chip/busctrl_tests.sysl` | — | — |
 | ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. The Arm board gates every core bus access by it (master, security state, privilege), a denial refused by name; a write restricting a memory device is refused. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl`, `chip/arm_tests.sysl` | — | — |
 | ROM: core-1 launch protocol | 5.3 / 5 Bootrom | full | The real ROM's own code, on both boards: each M33's and Hazard3's core 1 starts from reset in it and waits there (salts, then the FIFO handshake, asleep in `WFE` / `h3.block`); PSM's release restarts it (item 6). | `chip/arm_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | ROM: contents and API (`rom_func_lookup`, flash ops, `reset_usb_boot`, `get_sys_info`, OTP access) | 5.4 Bootrom APIs | partial | Raspberry Pi's A4 image, whole, at 0 on both boards (`chip/rom/`); every function runs as the ROM's code. Run end to end: the lookup, `get_sys_info`'s BOOT_INFO, CHIP_INFO, CRITICAL and CPU_INFO, `connect_internal_flash`, `flash_exit_xip`, `flash_range_erase`/`_program`, `flash_flush_cache`, the unique ID, `otp_access` (reads and writes, raw and ECC, its lock and argument checks; item 26), `bootrom_state_reset` and `reboot` (PC/SP). Each other function runs until it reaches a block not modelled, which refuses it by name: USB (`reset_usb_boot`), the partition and image calls (item 30). | `chip/arm_tests.sysl` (`rom.elf`), `chip/otp_tests.sysl` (`otp.elf`) | M | USB (20), item 30 |
@@ -94,7 +93,7 @@ day. An L is split before it is handed out (§6).
 | OTP | 13 OTP | full | The array of 4096 rows, the board's for the run (a factory image of CHIPID and RANDID; a boot starts it again, a reset keeps it); the four read windows with the ECC (SECDED, one wrong bit corrected, BRBP inversion) and the guarded windows' bus faults refused by name; SW_LOCK0–63, loaded from the PAGEn_LOCK1 rows by majority and only advanced; the SBPI bridge as the ROM's `otp_access` drives it, programming a row's bits from 0 to 1; USR; CRITICAL and KEY_VALID (0); ARCHSEL and ARCHSEL_STATUS (`peripheral/rp2350/otp.sysl`, item 26). Refused by name: programming the critical flag rows, the hardware keys and key locks, any other SBPI instruction, an uncorrectable row through the unguarded window, ARCHSEL naming another architecture, DBG, BIST, CRT_KEY, DEBUGEN(_LOCK), BOOTDIS and the interrupt registers. | `peripheral/rp2350/otp_tests.sysl`, `chip/otp_tests.sysl` (`otp.elf`), `chip/tests.sysl` | S (keys, debug enables, its interrupts) | — |
 | POWMAN: the AON timer, LPOSC, VREG and BOD control | 6 Power | full | The store: VREG (locked until UNLOCK, VSEL limit), BOD, LPOSC (TRIM, MODE) and XOSC settings, SEQ_CFG, CHIP_RESET (HAD_POR), WDSEL, SCRATCH/BOOT, the interrupt registers into IRQs 44 and 45, all behind the 0x5AFE password; a 1 clears a W1C bit through any alias. The AON timer (item 27): 64-bit milliseconds loaded from SET_TIME by RUN, CLEAR, READ_TIME live (the SDK's re-read catches the carry); from the LPOSC (nominal 32.768 kHz) or the crystal at the rate LPOSC_/XOSC_FREQ_KHZ state, from GPIO 12/20/14/22 one millisecond per rising edge, or synchronised to a 1 Hz edge; the 64-bit alarm latching TIMER.ALARM into INTR.TIMER and IRQ 45, and a sleeping core skipping to it (`peripheral/rp2350/powman.sysl`). | `rp2350/aon_tests.sysl`, `rp2350/sysctl_tests.sysl`, `chip/aon_tests.sysl` (`aon_timer.elf`), `chip/startup_tests.sysl` | — | — |
 | POWMAN power states and power-up requests | 6.2 Power management | full | STATE's requests judged as the header describes (WAITING for the processors, BAD_SW_REQ, REQ_IGNORED, PWRUP_WHILE_WAITING into POWMAN_IRQ_POW), PWRUP0–3 level and edge requests with RAW_STATUS and STATUS, the alarm request, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP, BOOTDIS; P1.x entered once every core halts, the switched core back at power-on and the SRAM banks and XIP cache it switches off cleared, time skipped to the alarm (Q7), GPIO power-ups through the pads' isolation latches and from outside the chip, and core 0 booted again as the ROM's power-up path does without the ROM (item 34). Refused by name: an SRAM bank switched off under the running switched core (P0 with a bank off), a PWRUP on a QSPI pin, a BOOT0–3 power-up vector (item 6), and the RISC-V harts' power-down (Q13). | `rp2350/power_tests.sysl`, `chip/power_tests.sysl` (`powman.elf`) | — | — |
-| GLITCH_DETECTOR | 10.9 Glitch detector | missing | Not decoded. | — | S (store) | — |
+| GLITCH_DETECTOR | 10.9 Glitch detector | register-stub | Stored, LOCK, TRIG_STATUS w1c; armed TRIG_FORCE refused by name (item 28). | `chip/busctrl_tests.sysl` | — | — |
 | RESETS (29 outputs) | 7.5 Subsystem resets | full | `peripheral/rp2350/timing.sysl:15–22` over `rp2040/resets.sysl:7–11`. Release completes at once. | `rp2350/tests.sysl:15`, `chip/tests.sysl:43,81` | — | — |
 | PSM (power-on state machine; FRCE_ON/FRCE_OFF/DONE) | 7.4 Power-on state machine | full | The 25-stage sequence: FRCE_OFF holds a stage and those after it, FRCE_ON releases from a later stage, DONE is computed, WDSEL stored. PROC1 forced off stops core 1 and its release re-enters the ROM wait with a 0 for core 0 (`multicore_reset_core1`). Forcing any other stage off is refused by name. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | CLOCKS | 8.1 Clocks | partial | CTRL and DIV are stored. clk_ref and clk_sys follow their muxes and drive time. SELECTED is one-hot (`peripheral/rp2350/clocks.sysl:25–30`). The frequency counter FC0 is run (it measures the modelled tree, finishing at once); resus is stored. clk_peri, clk_usb, clk_adc and clk_hstx have frequencies from their AUXSRC and DIV, which FC0 reads, but no consumer. GPOUT is not driven on a pin. | `rp2350/tests.sysl:112`, `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | S | consumers |
@@ -102,27 +101,27 @@ day. An L is split before it is handed out (§6).
 | ROSC (including RANDOMBIT) | 8.3 Ring oscillator | full | Every register, the code-protected fields with BADWRITE, DORMANT, COUNT. Frequency stays the nominal 11 MHz (Q8) and follows ENABLE and DORMANT. RANDOMBIT is a seeded LFSR (seed 0x3F04B16D at power-on, reloaded by RANDOM, one step per read). | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | TICKS (6 generators) | 8.4 Tick generators | full | `peripheral/rp2350/timing.sysl:24–90`. | `rp2350/tests.sysl:25` | — | — |
 | PLL_SYS, PLL_USB | 8.6 PLL | full | LOCK once powered with an FBDIV. The output frequency is computed (`clocks.sysl:167–225`). Lock is instant. | `rp2350/tests.sysl:81` | — | — |
-| IO_BANK0: FUNCSEL, overrides, STATUS | 9 GPIO | full | 48 GPIOs, one routing layer (item 9): FUNCSEL picks a producer (`route`), each offers a level and an output enable, OUTOVER/OEOVER then the pad decide; INOVER feeds the functions (SIO's GPIO_IN), IRQOVER the interrupts; STATUS with IRQTOPROC (`peripheral/rp2350/gpio.sysl`, `chip/rp2350.sysl` `drive`). Producers: SIO, NULL, and each UART's TX (idling high; bytes leave at once, item 8) and RX on F2 and F11. Every other function, and a FUNCSEL that is no function of its GPIO, is refused by name when selected, naming the item that builds it (`unmodelled_function`). | `chip/gpio_tests.sysl`, `rp2350/tests.sysl:183` | — | each peripheral adds its producer |
+| IO_BANK0: FUNCSEL, overrides, STATUS | 9 GPIO | full | 48 GPIOs, one routing layer (item 9): FUNCSEL picks a producer (`route`), each offers a level and an output enable, OUTOVER/OEOVER then the pad decide; INOVER feeds the functions (SIO's GPIO_IN), IRQOVER the interrupts; STATUS with IRQTOPROC (`peripheral/rp2350/gpio.sysl`, `chip/rp2350.sysl` `drive`). Producers: SIO, NULL, each UART's TX (idling high; bytes leave at once, item 8) and RX on F2 and F11, the SPIs on F1 (item 16), I2C's SDA and SCL on F3 (released between transfers, item 17), and PWM's A and B on F4 (item 18). Every other function, and a FUNCSEL that is no function of its GPIO, is refused by name when selected, naming the item that builds it (`unmodelled_function`). | `chip/gpio_tests.sysl`, `rp2350/tests.sysl:183` | — | each peripheral adds its producer |
 | GPIO interrupts (PROC0/1 INTE/INTF/INTS, edge latch, IO_IRQ_BANK0, dormant wake) | 9 GPIO | full | INTR's levels and latched edges (write 1 to clear through any alias), INTE/INTF/INTS for processor 0, processor 1 and the dormant wake, IRQSUMMARY (Secure only, Q3); processor k's line is IO_IRQ_BANK0 (21) in core k on both boards, the dormant wake's wakes a DORMANT ROSC. Edges latch whenever a GPIO's input can move: a function, override, pad or SIO write, the GPIO coprocessor, or a level driven from outside; none while IO_BANK0 is held (`peripheral/rp2350/gpio_irq.sysl`, shared with the RP2040's layout; item 9). IO_IRQ_BANK0_NS is never raised (Q3). | `rp2350/gpio_irq_tests.sysl`, `chip/gpio_tests.sysl` (`hello_gpio_irq.elf`, `gpio_irq.elf`, `pico2-riscv/gpio_irq.elf`) | — | — |
 | PADS_BANK0 (ISO, IE, OD, pulls, drive, slew) | 9.8 Pads | full | `gpio.sysl:82–131`. Drive and slew are stored. | `rp2350/tests.sysl:169` | — | — |
 | IO_QSPI, PADS_QSPI (including the BOOTSEL read via QSPI_SS) | 9 GPIO | partial (stored) | PADS_QSPI's seven registers and IO_QSPI's eight CTRLs and interrupt registers stored with their reset values and aliases, behind their RESETS bits, which the boards' boot releases (`peripheral/rp2350/qspi_pins.sysl`, item 6). The pins drive nothing (the flash is the QMI's); each STATUS, and so the BOOTSEL read, refused by name. | `peripheral/rp2350/rom_blocks_tests.sysl`, `chip/tests.sysl` | S (levels, BOOTSEL) | XIP for the shared pins |
 | UART0/1 (PL011) | 12.1 UART | full | Item 8: frames timed from clk_peri at the divisor LCR_H latched, through `next_event`; the bits on the TX pin through the mux, frames over wires between GPIOs and from off the chip; FIFOs or holding registers, the IFLS trigger levels, the RT timeout, break both ways, FE/PE/BE/OE, LBE loopback, the TX and RX DREQs (`peripheral/rp2350/uart.sysl`, `chip/rp2350.sysl` `advance_lines`). Refused by name: IrDA, hardware flow control (CTSEN/RTSEN, and the CTS and RTS functions in the mux), reserved IFLS levels, a character with IBRD 0 latched, and a frame its pins cannot show. Modem status reads 0. | `rp2350/uart_tests.sysl`, `chip/uart_tests.sysl` | — | DMA consumes the DREQs (item 11) |
-| SPI0/1 (PL022) | 12.3 SPI | missing | Not on the chip's bus. The PL022 model exists (`peripheral/spi/spi.sysl`) and runs on STM32 and virtual boards. | `peripheral/spi/tests.sysl` (6) | S (place) + S (DREQ) | mux, DMA |
-| I2C0/1 (DW_apb_i2c) | 12.2 I2C | missing | `dw-i2c` has `modelled = false` (`registry.sysl:322`). The device callbacks exist (`peripheral/i2c/i2c.sysl`). | — | M (master), S (slave) | mux, DMA |
-| PWM (12 slices) | 12.5 PWM | missing | Only `virt-pwm` (`peripheral/pwm/pwm.sysl`). | — | M | mux, DMA, IRQ |
-| ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
-| DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | partial | Item 11: the 16 channels with their four alias sets and triggers, TRANS_COUNT with MODE, every CTRL field, the UART DREQs, the four X/Y pacing timers and TREQ_PERMANENT, chaining, IRQ0–3, MULTI_CHAN_TRIGGER, CHAN_ABORT; transfers through the chip's bus, one a cycle, scheduled through `next_event` (`peripheral/rp2040/dma.sysl`, `chip/dma.sysl`). Refused by name: the sniffer, a change to SECCFG_* or MPU_* (item 12), a TREQ_SEL whose source is not modelled. | `rp2350/dma_tests.sysl`, `chip/dma_tests.sysl` | S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
+| SPI0/1 (PL022) | 12.3 SPI | partial | Master mode in Motorola modes 0 to 3, 4 to 16 bits, loopback, FIFOs, interrupts, DREQs 24 to 27, pins through the mux (item 16). CSn's frame signal, slave mode, TI and Microwire frames refused by name. | `peripheral/spi/tests.sysl` (6), `chip/spi_tests.sysl` | — | slave mode, CSn |
+| I2C0/1 (DW_apb_i2c) | 12.2 I2C | full | Item 17: masters, slaves and parts on the workbench on one bus, a step at a time, timed in SCL bits of HCNT + LCNT + SPKLEN + 8 clk_sys cycles through `next_event`; the lines through the mux (F3), the pads' pull-ups and the wires; RD_REQ and a full receive FIFO holding SCL, repeated STARTs, every interrupt but GEN_CALL, the TX_ABRT sources, disable and ABORT, TX_CMD_BLOCK, the DREQs 44–47, IRQs 36 and 37 (`peripheral/rp2350/i2c.sysl`, `chip/i2c.sysl`). Refused by name: 10-bit addressing, general call and START BYTE, master and slave at once, disabling an addressed slave, a repeated START with RESTART_EN clear, two masters on a bus, two targets on an address, and a line it cannot show. | `rp2350/i2c_tests.sysl`, `chip/i2c_tests.sysl` (`bus_scan.elf`, `slave_mem_i2c.elf`) | — | — |
+| PWM (12 slices) | 12.5 PWM | full | Item 18: every slice's counter in each DIVMODE (free-running, B level, B rising and falling edges) through the fractional divider, phase-correct counting, the inverts, CC and TOP taking effect at the wrap, PH_ADV and PH_RET; INTR, both lines' INTE/INTF/INTS into PWM_IRQ_WRAP_0/1, the 12 wrap DREQs paced DMA answers; the pins through the mux, A and B out and B in, over wires (`peripheral/rp2040/pwm.sysl`, shared, and `chip/pwm.sysl`). Never stepped per cycle. Refused by name: DIV with INT 0, a phase control on a stopped slice, PH_ADV at full speed, PH_ADV with PH_RET, an INTR word showing an unwatched PWM pin, a UART frame into a counting B input. | `rp2040/pwm_tests.sysl`, `chip/pwm_tests.sysl` (`hello_pwm.elf`, `pwm_led_fade.elf`, `measure_duty_cycle.elf`, `pwm_features.elf`) | — | — |
+| DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | partial | Item 11: the 16 channels with their four alias sets and triggers, TRANS_COUNT with MODE, every CTRL field, the UART DREQs, the four X/Y pacing timers and TREQ_PERMANENT, chaining, IRQ0–3, MULTI_CHAN_TRIGGER, CHAN_ABORT; transfers through the chip's bus, one a cycle, scheduled through `next_event` (`peripheral/rp2040/dma.sysl`, `chip/dma.sysl`). Item 12 added the sniffer (CRC-32, CRC-32R, CRC-16, CRC-16R, XOR, sum, with BSWAP, OUT_REV, OUT_INV) and SECCFG_CH/IRQ/MISC and the MPU regions. Refused by name: a TREQ_SEL whose source is not modelled, on an enabled channel. | `rp2350/dma_tests.sysl`, `chip/dma_tests.sysl` | DREQs from every other peripheral |
+| ADC and temperature sensor | 12.4 ADC | full | Item 19: one model for both chips (`peripheral/rp2040/adc.sysl`, `chip/adc.sysl`). 96 clk_adc cycles a conversion, timed through `next_event`; START_ONCE, START_MANY with DIV's sample period, round robin, the 8-deep FIFO with THRESH, SHIFT, OVER and UNDER, ADC_IRQ_FIFO (35) and DREQ 48 to the DMA. Ideal levels (Q8): `floor(uv × 4096 / 3.3 V)` from the board's `set_analog` or the pad's rail; the sensor on input 4 on its datasheet line at the board's `set_temperature`. Refused by name: an input the RP2350A lacks, a start with EN clear or clk_adc stopped, START_ONCE mid-conversion, the sensor converted with TS_EN clear. | `chip/adc_tests.sysl` | — | — |
 | PIO0/1/2 | 11 PIO | full | The state machines (item 13): every PIO version 1 instruction, delay and side-set, the FIFOs and their joins (FJOIN_RX_GET/PUT too), the shift registers' thresholds, the fractional divider cycle-exact against clk_sys, EXECCTRL, SM_RESTART/CLKDIV_RESTART and their PREV/NEXT forms, SMx_INSTR, the IRQ flags across blocks, INTR and both interrupt lines' INTE/INTF/INTS, FDEBUG, FLEVEL, DBG_PADOUT/PADOE and GPIOBASE (`peripheral/rp2350/pio.sysl`). Integrated (item 14): FUNCSEL PIO0–2 through the mux on the cycle a pin moves, the GPIOs read back through it, the 24 FIFO DREQs pacing the DMA, the six lines into both NVICs with a pulse latched; a PIO level into a UART's RX or a POWMAN-watched GPIO refused by name. | `rp2350/pio_tests.sysl`, `chip/pio_tests.sysl` (`pio_programs.elf`: `hello_pio`, `ws2812`, `uart_tx`, `uart_rx`, the RP2350-only pair), `chip/pio_examples_tests.sysl` (`pio_blink`, `ws2812`, `uart_tx`, `uart_rx`, `uart_dma` whole) | M (GPIO/DMA/IRQ) | mux, DMA, IRQ |
 | USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | full | The controller in device mode, whole (`peripheral/rp2350/usb.sysl`, item 20): the registers, DPRAM with the SETUP packet, endpoint and buffer control, single and double buffering, NAK, STALL, abort, the interrupts and USBCTRL_IRQ, driven by a host through the Arm board's `usb_*` seam. Not gated by RESETS, since the SDK reads SIE_CTRL before releasing USBCTRL; RESETS asserting it resets the controller. benchtop's own host (`chip/usb_host.sysl`, item 21) enumerates a CDC ACM device on a 1 ms frame schedule and bridges its port to the console or a pty (`benchtop run --usb`). | `peripheral/rp2350/usb_tests.sysl`, `chip/usb_tests.sysl`, `chip/usb_host_tests.sysl`, `host/pty_tests.sysl` | — | clk_usb |
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
 | TIMER0/1 | 12.8 System timers | full | 64-bit counter, latch, 4 alarms, LOCKED, SOURCE (`peripheral/rp2350/timing.sysl:91–145`). | `rp2350/tests.sysl:44`, `chip/tests.sysl:18` | — | — |
 | WATCHDOG | 12.9 Watchdog | full | The RP2040's counter (`peripheral/rp2040/watchdog.sysl`, `WatchdogCounter`), one decrement a tick from TICKS' watchdog generator: CTRL (ENABLE, PAUSE_DBG0/DBG1/JTAG, TIME), LOAD, TRIGGER, REASON, SCRATCH0–7. Firing resets the PSM stages WDSEL selects, and RESETS.WDSEL's peripherals where RESETS' stage is not selected (`Rp2350.watchdog_reset`); the Arm board restarts core 0 through the ROM's boot path (the PC/SP request in SCRATCH4–7, or the flash image's normal boot) and core 1 into the ROM wait; a typed boot request and a blank flash's BOOTSEL are refused by name; the RISC-V board refuses the restart by name. No debugger exists to pause it, so the PAUSE inputs are only tested at the model (item 10). | `rp2040/watchdog_tests.sysl`, `rp2350/tests.sysl`, `chip/watchdog_tests.sysl` (`watchdog.elf`) | — | — |
-| HSTX | 12.11 HSTX | missing | Not decoded. | — | M | clk_hstx, DMA, mux, a display part |
-| TRNG | 12.12 TRNG | missing | Not decoded. | — | S | — |
-| SHA-256 | 12.13 SHA-256 | missing | Not decoded. | — | S | DMA (for the SDK's DMA path) |
+| HSTX | 12.11 HSTX | full | `peripheral/rp2350/hstx.sysl` (item 29): the FIFO and DREQ_HSTX, the shift register, the clock generator, BIT0–7, the command expander (RAW, RAW_REPEAT, TMDS, TMDS_REPEAT, NOP) with its TMDS encoders, on GPIO 12–19 at FUNCSEL 0; a DVI monitor part (`parts/dvi`) reads the outputs. Refused by name: coupled mode, EXPAND_EN changed while enabled, CLKPHASE of a period or more, reserved opcodes, a count of 0, a narrow FIFO write. | `chip/hstx_tests.sysl` (`hstx/spi_lcd`, `hstx/dvi_out_hstx_encoder`), `peripheral/rp2350/hstx_tests.sysl`, `parts/dvi/tests.sysl` | — | — |
+| TRNG | 12.12 TRNG | full | The 192-bit holding register filled from a seeded SplitMix64 (`TRNG_SEED`, or `seed`), with the sampling time and the interrupt; the CRNGT and autocorrelation failure bits never set. | `rp2350/crypto_tests.sysl`, `chip/crypto_tests.sysl` (`system/rand`) | — | — |
+| SHA-256 | 12.13 SHA-256 | full | START, WDATA in words, halfwords or bytes, BSWAP, the 57-cycle digest, SUM0–7 and the DREQ for the DMA path; the compression is `sha256_compress`. | `rp2350/crypto_tests.sysl`, `chip/crypto_tests.sysl` (`sha/hello_sha256`) | — | DMA (for the SDK's DMA path) |
 | SYSINFO (CHIP_ID, PLATFORM, GITREF) | 12.15 System control | full | CHIP_ID 0x30004927, PACKAGE_SEL 1 (RP2350A), PLATFORM ASIC, GITREF 0; read-only. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | SYSCFG (NMI masks, proc in-sync bypass, DBGFORCE, mem power-down) | 12.15 System control | full (stored) | PROC_CONFIG (halted flags read 0), PROC_IN_SYNC_BYPASS(_HI), DBGFORCE, MEMPOWERDOWN (memory is not lost), AUXCTRL stored with their writable bits. | `rp2350/sysctl_tests.sysl` | — | — |
-| TBMAN | 12.15 / 2 System bus | missing | Not decoded. | — | S | — |
+| TBMAN | 12.15 / 2 System bus | full | PLATFORM reads ASIC; the rest refused (item 28). | `chip/busctrl_tests.sysl` | — | — |
 | Debug: SW-DP, RESCUE, CoreSight trace | 3.5 Debug | missing | Debugger *entry* is how images boot. The probe itself is not modelled. | — | L | — |
 
 ## 2. RP2040
@@ -131,12 +130,12 @@ day. An L is split before it is handed out (§6).
 |---|---|---|---|---|---|---|
 | Chip layer: bus decode, clock tree, IRQ routing, Pico board | 2.2 Address map | full | `chip.Rp2040` (`chip/rp2040.sysl`) on `ArmBoard[Rp2040]`, the `pico` board (item 22). Every block not on the chip yet is refused by name with its item. | `chip/pico_tests.sysl` | — | — |
 | Cortex-M0+ ×2 | 2.4 Cortex-M0+ | partial | v6m on the Pico, on the instruction timing table (the SDK's divider wait needs it), with WFE and SEV between the cores (item 22). The 8-region MPU (`mcus/rp2040.hocon:9`) is not modelled. | `v6m/*_tests`, `v6m/exceptions.sysl` (WFE/SEV) | S (MPU, PMSAv7 subset) | — |
-| NVIC and SysTick (M0+) | 2.3.2 Interrupts, 2.4 | full | `v6m/except.sysl`, `v6m/nvic.sysl`. 26 IRQ lines; the chip drives TIMER 0–3, IO_IRQ_BANK0 (13), SIO_IRQ_PROC0/1 (15, 16, each into its own core), UART0/1 (20, 21) and RTC (25). | `v6m/nvic_tests`, `chip/pico_tests.sysl`, `chip/pico_xip_tests.sysl` | — | — |
+| NVIC and SysTick (M0+) | 2.3.2 Interrupts, 2.4 | full | `v6m/except.sysl`, `v6m/nvic.sysl`. 26 IRQ lines; the chip drives TIMER 0–3, IO_IRQ_BANK0 (13), SIO_IRQ_PROC0/1 (15, 16, each into its own core), UART0/1 (20, 21), ADC_IRQ_FIFO (22) and RTC (25). | `v6m/nvic_tests`, `chip/pico_tests.sysl`, `chip/pico_xip_tests.sysl` | — | — |
 | SIO: CPUID, FIFOs (8-deep), spinlocks, FIFO IRQ | 2.3.1 SIO | full | The RP2350's `Sio` with its depth a parameter (`sio_rp2040`), at the RP2040's offsets (`Rp2040.sio_read`). | `chip/pico_tests.sysl` | — | — |
 | SIO GPIO (OUT/OE/IN, SET/CLR/XOR) | 2.3.1 SIO | full | GPIO 0–29 at the RP2040's offsets, mapped onto the shared model's. Of the GPIO_HI bank (the QSPI pins as levels), GPIO_HI_IN answers SS, the flash's chip select, for the ROM's BOOTSEL read (item 23), with the other five pins reading 0; the rest of the bank is refused by name. | `chip/pico_tests.sysl` | — | — |
 | SIO hardware divider (per core) | 2.3.1.5 Integer divider | full | `peripheral/rp2040/divider.sysl:5–84`: 8-cycle completion, DIRTY, signed and unsigned. Each core's at SIO 0x060–0x078 (item 22). | `rp2040/tests.sysl`, `chip/pico_tests.sysl` (the bus, and the SDK's sequence on a core) | — | — |
 | SIO interpolators (with the RP2040's blend and clamp modes) | 2.3.1.6 Interpolator | full | `peripheral/rp2040/interp.sysl`, the RP2350's model with SHIFT a logical right shift (item 15), each core's pair on the RP2040's SIO (item 22). | `rp2040/interp_tests.sysl` (both shifts) | — | — |
-| Bus fabric, BUSCTRL, performance counters | 2.1 Bus fabric | missing | — | — | S | — |
+| Bus fabric, BUSCTRL, performance counters | 2.1 Bus fabric | partial | As the RP2350's, with no PERFCTR_EN (item 28). | `chip/busctrl_tests.sysl`, `chip/pico_tests.sysl` | — | — |
 | DMA: 12 channels, DREQs, pacing timers, chaining, ring, sniff/CRC | 2.5 DMA | missing | Not on a chip yet. The register model is shared and built for the RP2040's layout (`RP2040_DMA`: 12 channels, two IRQ lines, its CTRL fields and offsets), tested at register level beside the RP2350's. | `rp2350/dma_tests.sysl` | S (place it) | DREQs |
 | ROM: contents, float/double/mem tables, `rom_func_lookup`, core-1 launch | 2.8 Bootrom | full | benchtop's own, written in sysl to work as the RP2040's does (`chip/rom/rp2040/`, item 23), at 0; everything runs as its code: core 1's launch wait, core 0's boot path, `rom_table_lookup`, the soft float and double tables (IEEE, denormals flushed as documented), the bit and mem functions, the flash functions through the SSI, `reset_usb_boot` up to its watchdog reboot. The SDK's defaults use it. Refused by name through the ROM's doorbell: USB boot, the tables' flags comparison, the lookup codes 'DT', 'DE', 'WV', 'FS', 'FE'. | `chip/pico_tests.sysl`, `chip/rom40_float_tests.sysl` | — | — |
 | Boot sequence (boot2, CRC check, USB boot) | 2.7 Boot sequence | partial | An image that starts in flash boots through the ROM (item 23): core 0 from reset, the BOOTSEL read (SS through GPIO_HI_IN, never pressed), the QSPI pins and pads out of reset, the flash's exit from XIP, boot2 read with the serial 03h command and its CRC checked over the first 252 bytes, boot2, the image; the watchdog's reset runs it again, or a SCRATCH4–7 vector. Also the debugger entry: an ELF into SRAM, core 0 at its entry (item 22); a RAM UF2 entered at its first byte as the ROM enters one (item 24). USB boot (no valid boot2, or `reset_usb_boot`) is refused by name. | `chip/pico_tests.sysl`, `chip/pico_xip_tests.sysl` | M (USB boot) | USB |
@@ -159,22 +158,22 @@ day. An L is split before it is handed out (§6).
 | PIO0/1 | 3 PIO | missing | The same machine as the RP2350's (`peripheral/rp2350/pio.sysl`, item 13), with two blocks and no RP2350 additions: PREV and NEXT name the one other block, WAIT IRQ's bit 4 is REL, only flags 0–3 reach INTR, and MOV PINDIRS, the RX entries and JMPPIN are reserved. | — | (shared) | mux, DMA |
 | USB controller (device and host) | 4.1 USB | missing | The same controller as the RP2350's. SIE_CTRL alone is stored, ungated, for the SDK's `runtime_init_usb_power_down`; every other register is refused by name (item 22). Its 4 KB of DPRAM is memory, the top of which is core 1's stack while it waits in the boot ROM (item 23). | `chip/pico_tests.sysl` | (shared) | — |
 | UART0/1 (PL011) | 4.2 UART | partial | The RP2350's `Uart`, placed (item 22): frames timed from clk_peri through `next_event`, its TX on the pins through the mux, IRQs 20 and 21. The workbench's wires and frames sent in from outside (`Rp2350.wire`, `line_in`) are not on the RP2040 yet. | `chip/pico_tests.sysl` (hello_serial) | S (wires) | — |
-| I2C0/1 | 4.3 I2C | missing | Shared. | — | (shared) | — |
-| SPI0/1 (PL022) | 4.4 SPI | missing | The model exists (`peripheral/spi/spi.sysl`). | — | S (place) | chip layer |
-| PWM (8 slices) | 4.5 PWM | missing | Shared. | — | (shared) | — |
+| I2C0/1 | 4.3 I2C | partial | The RP2350's `I2cBus`, placed (item 17): masters and slaves, parts on the workbench, IRQs 23 and 24. The RP2040's workbench has no wires, so one controller cannot reach the other; its DMA is not on the chip, so the DREQs go nowhere. | `chip/i2c_tests.sysl` (`pico/bus_scan.elf`) | S (wires) | DMA |
+| SPI0/1 (PL022) | 4.4 SPI | partial | The RP2350's placement at the RP2040's addresses and IRQs 18 and 19 (item 16); the same refusals. | `chip/spi_tests.sysl` | — | slave mode, CSn |
+| PWM (8 slices) | 4.5 PWM | full | The RP2350's model at the RP2040's layout (item 18): 8 slices, one line (PWM_IRQ_WRAP, 4), GPIO 0–29 through the mux. Its DREQs are raised and wait for the DMA (item 11 on this chip). | `rp2040/pwm_tests.sysl`, `chip/pwm_tests.sysl` | — | — |
 | TIMER | 4.6 Timer | full | `peripheral/rp2040/timer.sysl:5–120`: latch, 4 alarms, pause, debug pause. | `rp2040/tests.sysl`, `virt/rp_tests.sysl` (13) | — | — |
 | WATCHDOG | 4.7 Watchdog | full | The tick generator and the counter shared with the RP2350 (`peripheral/rp2040/watchdog.sysl`), TIME falling two a tick (erratum RP2040-E1): CTRL, LOAD, TRIGGER, REASON, SCRATCH0–7. On the `virt*` boards the reset stops the cores at `Reset`, named, since they have no PSM. On the Pico its reset takes down the PSM stages WDSEL selects and the cores boot again through the ROM (item 23); a reset into the ROM's USB boot is refused by name. | `rp2040/tests.sysl`, `rp2040/watchdog_tests.sysl`, `virt/rp_tests.sysl`, `chip/pico_tests.sysl` | — | — |
 | RTC | 4.8 RTC | full | `peripheral/rp2040/rtc.sysl` (item 24): the calendar counting clk_rtc over CLKDIV_M1 + 1, with the RP2040's leap-year rule and FORCE_NOTLEAPYEAR; SETUP and LOAD; RTC_0 latching RTC_1; the alarm's masks, taken as the time changes, held until MATCH_ENA clears; INTE/INTF/INTS and IRQ 25. The next second is scheduled only while the alarm is armed. Refused by name: a LOAD of a date the calendar does not hold, CLKDIV_M1 changed while running. | `chip/pico_xip_tests.sysl` (`hello_rtc`, `rtc_alarm`) | — | — |
-| ADC and temperature sensor | 4.9 ADC | missing | `rp-adc` has `modelled = false`. | — | (shared) | — |
+| ADC and temperature sensor | 4.9 ADC | full | Item 19: the RP2350's model at 0x4004c000 with the RP2040's 3-bit AINSEL and 5-bit RROBIN, ADC_IRQ_FIFO on line 22. Its DREQ reaches no DMA until the RP2040's DMA is on the chip (item 11's row). | `chip/adc_tests.sysl` | — | — |
 
 ## 3. Counts
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 35 | 8 | 0 | 15 | 58 |
-| RP2040 | 20 | 7 | 2 | 8 | 37 |
+| RP2350 | 43 | 10 | 1 | 4 | 58 |
+| RP2040 | 22 | 10 | 2 | 3 | 37 |
 
-No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
+The one RP2350 register-stub is GLITCH_DETECTOR, whose detectors cannot fire in an emulator. Every block that is not modelled is refused by the bus, which is
 benchtop's policy for unsupported accesses (`docs/peripheral-models.md:54`). Several items below
 build register-stubs on purpose: a block stored as written, with a named refusal for any behaviour
 the stub does not carry out.
@@ -330,9 +329,9 @@ that must land first. Items with no shared "after" run in parallel.
 | 14 | **PIO integration**: pins through the mux, DREQs, the IRQ lines. `ws2812`, `pio_blink`, `uart_tx` and `uart_rx` are its oracles. | M | 11, 13 |
 | 15 | **Doorbells and interpolators** (shared by both chips). **Done** (below). | M | 1 |
 | 16 | **SPI on the chip**: the PL022 placed, with DREQs. | S | 9, 11 |
-| 17 | **I²C (DW_apb_i2c) master and slave**. | M | 9, 11 |
+| 17 | **I²C (DW_apb_i2c) master and slave**. **Done** (below). | M | 9, 11 |
 | 18 | **PWM** (12 slices, IRQ, DREQ, pins through the mux). | M | 9, 11 |
-| 19 | **ADC and temperature sensor** (round robin, FIFO, DREQ). | M | 11 |
+| 19 | **ADC and temperature sensor** (round robin, FIFO, DREQ). **Done** (below). | M | 11 |
 | 20 | **USB device controller**: endpoints, buffers, IRQ. **Done** (below). | L | 6 |
 | 21 | **USB host enumerator and CDC bridge to a pty**. `hello_world/usb` is its oracle. **Done** (below). | M | 20 |
 | 22 | **RP2040 chip layer**: `chip.Rp2040` over the shared models (CLOCKS without TICKS, pads without ISO, SIO with 8-deep FIFOs and the divider wired), and the `pico` board running. **Done** (below). | M | 5, 8, 9 |
@@ -348,6 +347,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 32 | **USB host mode** (per Q4). | L | 20 |
 | 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED). | L | 14 |
 | 34 | **POWMAN power states**: STATE, PWRUP0–3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS, the P1.x time skip (Q7) and the power-up boot as far as it needs no ROM. **Done** (below). | M | 27 |
+| 35 | **WFE latch and SEVONPEND**, on both Arm boards: a core asleep in `WFE` with nothing enabled latches every chip line that rises while it sleeps as pending in its NVIC, a pulse included, and SEVONPEND makes an interrupt's becoming pending an event. No speed loss. **Done** (below). | S | 6, 22 |
 
 ### Item 1, done: the Arm Pico 2 and its refusal census
 
@@ -766,9 +766,7 @@ BOOTSEL button). The partition, image and NS-permission functions (`load_partiti
 yet (item 30). On the RISC-V board hart 0's boot path (the ROM's Armv8-M emulator) is not run, and a
 watchdog reset of a hart still ends the run (Q13).
 
-**Fidelity limits.** The MPU is not enforced. A core asleep in `WFE` with no interrupt enabled is not
-signalled until an event wakes it, so a line that rises and falls meanwhile leaves nothing pending in
-its NVIC. `SEVONPEND` is stored and does nothing. The boot salts the board's hand-off sets are fixed
+**Fidelity limits.** The MPU is not enforced. The boot salts the board's hand-off sets are fixed
 values, not the ROM's TRNG-derived ones. A RISC-V hart runs ROM code through the interpreter.
 
 **What changed for the programs.** `WFE` now sleeps on the Pico 2, so the SDK's `sleep_ms` sleeps to
@@ -781,8 +779,7 @@ spin read `lower 9 after 25001 us`. `examples/pico2-riscv/blink.c` now follows e
 **Cost**, host instructions retired, three runs each against the branch's base: `bench --core
 cortex-m33 kernel33.bin` 37.10 G to 37.14 G; `sram_loop.elf` 5.585 G to 5.642 G and `xip_loop.elf`
 5.808 G to 5.865 G (about 1%, core 1 now started and asleep in the ROM); `dcp.elf` 1.136 G to 1.108 G
-(its waits now sleep). Signalling core 1's NVIC every quantum while it waits cost 8% on the loops,
-which is why a core asleep in `WFE` with nothing enabled is not signalled.
+(its waits now sleep). A core asleep in `WFE` latches its lines as item 35 describes.
 
 ### Item 34, done: the power states
 
@@ -1414,8 +1411,9 @@ copies, once.
 **The image** is benchtop's own, written in sysl to work as the RP2040's does (`chip/rom/rp2040/`,
 `chip/rom/README.md`): 16 KB at 0 on the cores' fast path, read-only, built by `image/build.sh`
 (`sysl build-c --target thumbv6m-freestanding -Oz`, then Arm's `ld` with `rom.ld`), reproducibly:
-SHA-256 `af067cb98ffc5efa71eee78e9a758b9ea95e945e1d6fdcdba87367383cedfb2d` from sysl 0.8.7, code and
-data to 0x37A7. Raspberry Pi's image is not in the repository; neither it nor its
+SHA-256 `af067cb98ffc5efa71eee78e9a758b9ea95e945e1d6fdcdba87367383cedfb2d` from sysl 0.8.9 (the same bytes 0.8.7 gave), code and
+data to 0x37A7. The WFE and SEV are `sysl.hint`'s `wfe()`/`sev()`; `examples/pico/rom_crosscheck.uf2`
+is SHA-256 `b4b7b03a4e3e34c43e4198b857c8474de1270c4128a011f9ac8b3e19d307038b` (was `c395b145`). Raspberry Pi's image is not in the repository; neither it nor its
 float code was read. **Clean-room sources:** the Pico SDK's `pico/bootrom.h`, `bootrom_constants.h`
 and `pico/bootrom/sf_table.h` (the header, the codes, the tables' layout and the size byte before
 each), `pico_float`'s and `pico_double`'s RP2040 callers (which entries, in which registers, with
@@ -1472,7 +1470,7 @@ ran Raspberry Pi's image, whose code needed them; programs reach them too):
 | what | where | model |
 |---|---|---|
 | the ROM's doorbell, its last word | `chip/rp2040.sysl` (`rom_doorbell_refusal`) | a word stored there is the ROM refusing by name: USB boot (BOOTSEL held, no valid boot2, or `reset_usb_boot`), a left-out lookup code, the tables' flags comparison, an exception through the ROM's vectors |
-| SCR | `v6m/t2system.sysl` | every profile's SCR: SLEEPONEXIT, SLEEPDEEP, SEVONPEND stored, SLEEPDEEPS with the Security Extension; an M0+ and a Main core without it used to stop at `Unmapped` |
+| SCR | `v6m/t2system.sysl` | every profile's SCR: SLEEPONEXIT and SLEEPDEEP stored, SEVONPEND making an interrupt's becoming pending an event (item 35), SLEEPDEEPS with the Security Extension; an M0+ and a Main core without it used to stop at `Unmapped` |
 | USB's DPRAM, core 1's stack in the ROM | `chip/rp2040.sysl` | 4 KB of memory, any width, ungated; the controller still refused |
 | TBMAN PLATFORM | `chip/rp2040.sysl` | reads ASIC, ungated; the rest refused |
 | SYSCFG PROC0/1_NMI_MASK | `chip/rp2040.sysl` | stored, 26 bits, ungated; the rest refused; nothing raises an NMI |
@@ -1539,3 +1537,296 @@ kernel33.bin` 36.847–36.853 G to 36.845–36.849 G; `sram_loop.elf` 5.407–5.
 `xip_loop.elf` 5.629–5.636 G to 5.633–5.634 G. Unchanged. `hello_multicore` on the Pico, 0.344–0.346 G
 (dev's build, the compiler's float on the stand-in) to 0.348–0.350 G on this ROM with the SDK's
 defaults; Raspberry Pi's image ran it in 0.349–0.355 G.
+
+### Item 28, done: BUSCTRL counters, TBMAN and GLITCH_DETECTOR stores
+
+**Modelled** (`peripheral/rp2350/busctrl.sysl`, both chips share `BusCtrl`): BUS_PRIORITY holds its four
+bits and BUS_PRIORITY_ACK reads 1 (the bus is ideal and does not arbitrate); PERFSELn stored at 7 bits
+(RP2350) or 5 bits (RP2040), reset 0x1f; PERFCTR_EN is the RP2350's only, the RP2040's counters always
+count. A counter reads 0 where the hardware would count nothing (RP2350 with PERFCTR_EN clear, an event
+number naming no event) or where the event cannot happen on an ideal bus (stalls, contested accesses); a
+write clears it. The RP2350's TBMAN reads PLATFORM as ASIC. GLITCH_DETECTOR stores ARM (reset 0x5bad),
+DISARM, SENSITIVITY and LOCK (nonzero LOCK drops further writes), TRIG_STATUS is write-1-to-clear, and
+TRIG_FORCE sets TRIG_STATUS while disarmed.
+
+**Refused by name:** a counter that has counted a plain access event (the cores' and the DMA's accesses
+per target) is refused on read, naming the counter, the event and `pico_rand`'s bus-counter entropy
+source with the SDK defines that turn it off; counting accesses would cost the cores' fast path a count
+per access, which they never pay. TRIG_FORCE while the detectors are armed (it would reset the switched
+core and latch POWMAN_CHIP_RESET) is refused.
+
+**Cost:** the cores, the DMA and the scheduler are untouched: the counters are register state only, so
+no bench of the main lines was needed.
+
+### Item 12, done: the DMA sniffer and security attributes
+
+Both live in `peripheral/rp2040/dma.sysl` and run on both chips' layouts (the sniffer on the RP2040
+too; SECCFG_* and the MPU on the RP2350 only). The header of that file is the specification.
+
+- **Sniffer**: CALC 0 CRC-32, 1 CRC-32R, 2 CRC-16, 3 CRC-16R, 14 even parity, 15 sum; a transfer's bytes go in
+  low byte first; OUT_REV and OUT_INV change only what SNIFF_DATA reads back. Checked against the standard
+  check values of "123456789" (0xCBF43926, 0x29B1, 0x0376E6E7, the CRC-16/KERMIT 0x2189), and by
+  `dma/sniff_crc` (copied unchanged to `examples/pico2/sniff_crc.c`, ELF committed) on the Arm Pico 2.
+- **Security attributes**: a channel's S and P decide the level of its bus accesses (ACCESSCTRL and MPU),
+  an MPU region's first match gives an address its level, a violation is READ_ERROR or WRITE_ERROR with
+  the interrupt; SECCFG_CH.LOCK, SECCFG_IRQ masking and SECCFG_MISC hiding are modelled.
+- **Refused by name**: reserved CALC values, a register access below its level, overlapping MPU regions of
+  different attributes.
+- **Fixed on the way**: a disabled channel may hold an unmodelled TREQ_SEL (the SDK's `hw_set_bits` on
+  AL1_CTRL is a read-modify-write of the reset value 0); enabling it with that selection is still refused.
+
+**Cost**: only the transfer path gained a check that is skipped while SNIFF_CTRL.EN is clear; no bench of
+the five main lines was run here (the train benches them).
+
+### Item 25, done: the TRNG and SHA-256
+
+**TRNG** (`peripheral/rp2350/trng.sysl`): the entropy is SplitMix64 from `TRNG_SEED` (or `seed`), so tests assert exact words; a collection takes 192 samples of SAMPLE_CNT1 + 1 clk_sys cycles (four times with the decorrelator on), reading EHR_DATA5 starts the next, SAMPLE_CNT1 restarts, RNG_ICR clears, the interrupt (IRQ 39) is EHR_VALID unmasked. The CRNGT and autocorrelation failure bits never set.
+
+**SHA-256** (`peripheral/rp2350/sha256.sysl`): `sha256_compress` on the assembled words, BSWAP, 57 busy cycles after the 16th word, DREQ_SHA256 (54) held while WDATA_RDY is, the DMA waking for the digest by event. Refused by name: DMA_SIZE 3, mixed write sizes in a block, atomic aliases on WDATA.
+
+**Oracles:** pico-examples `system/rand` (`examples/pico2/rand.c`) and `sha/hello_sha256` (`examples/pico2/hello_sha256.c`, with and without DMA; the digest is the known SHA-256 of the lorem text) run to completion with their output asserted line by line in `chip/crypto_tests.sysl`; FIPS 180-4 "abc" in `rp2350/crypto_tests.sysl`.
+
+### Item 18, done: the PWM slices
+
+`peripheral/rp2040/pwm.sysl` (the block, shared: 8 slices and one line on the RP2040, 12 and two on the
+RP2350, the same registers in the same order) against `hardware/regs/pwm.h` and the SDK's `hardware_pwm`;
+`chip/pwm.sysl` connects it to clk_sys, the mux, the GPIO interrupts, the DMA and the NVIC on both chips.
+
+- **The counter**: free-running, gated by the B input's level, or counting its rising or falling edges,
+  through the 8.4 fractional divider; phase-correct counting; A and B high while the counter is below
+  their compare value, each inverted on request; CC and TOP written to a running slice taken at its wrap;
+  PH_ADV and PH_RET. EN is each CSR's EN bit, both ways.
+- **Time**: never per cycle. `pass` works out where a stretch of clk_sys leaves a slice. A running PWM
+  that nothing watches costs one call per step of the devices; a slice counting from its B pin, or a GPIO
+  interrupt enabled on a pin PWM drives (directly or over a wire), makes the chip walk from edge to edge
+  (`until_change`). `next_event` offers the next wrap an interrupt enable or a paced DMA channel waits
+  for, or the next edge while walking.
+- **Interrupts and DREQs**: INTR (write 1 to clear through any alias), INTE/INTF/INTS for each line, into
+  PWM_IRQ_WRAP_0/1 (8, 9) on the RP2350 and PWM_IRQ_WRAP (4) on the RP2040, in both cores. A wrap asserts
+  the slice's DREQ (TREQ 32–43) until a transfer it paces completes.
+- **Pins**: FUNCSEL 4 is taken on every GPIO of both chips (GPIO 32–47 reach slices 8–11); A always drives,
+  B drives only while free-running and is otherwise the slice's input, read through the pad and INOVER.
+- **Refused by name**: DIV with INT 0 (the rate is not in the headers); PH_ADV or PH_RET on a stopped
+  slice; PH_ADV at DIV 1; both at once; a read of an INTR word showing a GPIO a running slice drives with
+  no interrupt enabled on it (its edges are latched only while one watches); a UART frame over a wire into
+  a counting B input.
+- **Assumptions**, since the headers do not say: CC and TOP written to a stopped slice apply at once; a
+  phase-correct counter holds each end for a tick (0..TOP, TOP..0, the 2 x (TOP + 1) period) and wraps
+  leaving 0; wraps the DMA has not answered count once.
+
+The oracles: pico-examples' `pwm/hello_pwm`, `pwm/led_fade` and `pwm/measure_duty_cycle`, unchanged at
+commit 0d62f75 apart from a header comment, on the Arm Pico 2 (`measure_duty_cycle` with GPIO 2 wired to
+GPIO 5: 0.0, 10.0, 49.9, 89.9 and 100.0%, the truncated levels' true duty cycles); `examples/pico2/
+pwm_features.c` covers a DMA channel paced by a wrap, an edge interrupt on a PWM pin and a slice counting
+another's edges. `chip/pwm_tests.sysl` asserts each program and the chip-level behaviour on both chips;
+`rp2040/pwm_tests.sysl` the registers at both layouts. The RP2040's PWM runs at register level only: its
+examples directory is not rebuilt for this item.
+
+**Cost**: the devices' step gains a test of `pwm.enabled`; no existing program is changed, so the train's
+bench of the main lines is the comparison. `measure_duty_cycle`, which walks every edge for 50 ms of
+guest time, runs in about 0.1 s.
+
+### Item 16, done: the SPIs
+
+The shared PL022 model (`peripheral/spi/spi.sysl`) on both chips' buses as SPI0 and SPI1
+(`peripheral/rp2350/spi.sysl`, `Spis`; the chips' `spi_write`, `SpiHost`, the mux's `SpiSck`/`SpiTx`/`SpiRx`).
+
+- **Clock**: clk_peri cycles counted only while a word is shifting or a receive timeout is pending, so an
+  idle SPI costs nothing; the chip offers the next word's end or timeout as `next_event`. A bit is CPSDVSR x
+  (SCR + 1) cycles.
+- **Pins**: SCK and TX drive their pads while SSE is set (SCK idling at CPOL's level); MISO is the level on
+  the RX pin of the port's group (a wire from TX gives a loopback off the chip, CR1.LBM one inside it).
+- **DMA**: TX request (TXDMAE and room) and RX request (RXDMAE and a word) as DREQs 24 to 27; the
+  RP2350's TREQ set gains them. Interrupts on lines 31 and 32 (RP2350), 18 and 19 (RP2040).
+- **Refused by name**: slave mode, CSn's function (the SDK's examples drive chip select from a GPIO),
+  TI and Microwire frames, a reserved data size, an odd or out-of-range CPSDVSR, CR0 or CPSR written with SSE
+  set, DR and ICR through an alias, and enabling a port whose pins the GPIO interrupts watch. The DMA test of
+  "SPI0's DREQ refused" now names the PWM's.
+- **Oracle**: pico-examples' `spi/spi_dma` (`examples/pico2/spi_dma.elf`), output asserted line by line.
+  `chip/spi_tests.sysl`: timing, modes x sizes, wires, FIFOs, interrupts, DREQs, a paced DMA loopback,
+  refusals, reset, the RP2040. Breaking `dreq_rx` turned three of them red.
+
+### Item 35, done: the WFE latch and SEVONPEND
+
+A core asleep in `WFE` with no interrupt enabled, as core 1 waits in either boot ROM, now has its NVIC
+latch the chip's lines as silicon does: a line that rises and falls while it sleeps stays pending, and
+fires once the core wakes and enables it. Both Arm boards (`chip/arm_board.sysl`), on one mechanism:
+
+- **The chip names its lines as two words**, `ArmChip.shared_lines` (the TIMERs, UARTs, SPIs, I2Cs,
+  PWM, ADC, DMA, USB, POWMAN, the RP2350's TRNG, the RP2040's RTC) and `core_lines(k)` (each core's IO_IRQ_BANK0, SIO FIFO and, on the RP2350,
+  doorbell), bit n for IRQ n. The RISC-V board's `signal` drives a hart's level inputs from the same
+  two words.
+- **Every settle** raises each started core's high lines, a sleeper's included (`v6m.raise_lines`: one
+  test when all are low). A device line rises between settles only as the chip runs up to an access,
+  so the other place a rise can be lost is an access that lowers it before the next settle:
+- **Before a write to the chip, and before a read of a UART's UARTDR, an SPI's SSPDR, the ADC's FIFO
+  or any I2C register** (`ArmChip.read_lowers`: those FIFO pops, and I2C's IC_CLR_* reads, are the
+  reads that lower a shared line), the other core, when asleep, latches what is
+  high. Every other read is skipped, so a core polling UARTFR or a TIMER while the other sleeps pays
+  nothing. The accessing core is not latched: its handler lowering the line it services must not pend
+  it again.
+- **SEVONPEND** (`v6m/except.sysl` `raise`, `v6m/nvic.sysl` ISPR): an interrupt becoming pending, from a
+  device or an ISPR write, sets the event register, so it wakes a `WFE` without being taken. Already
+  pending, an out-of-range IRQ, ICPR, or SEVONPEND clear are not events.
+
+**Tests**, `chip/wfe_tests.sysl`, six, three on each chip's own board with its own blink image: a TIMER line
+forced and lowered by core 0 while core 1 sleeps is pending in core 1's NVIC only, sleeps on while
+disabled and fires once core 1 enables it, and with no pulse nothing fires; a line held across a settle
+is latched; a TIMER or UARTFR read latches nothing and a UARTDR read does; SEVONPEND wakes the core on the
+pulse without taking it, and clear the core sleeps on; becoming pending is an event once, from a device
+and from ISPR, and never without SEVONPEND. Removing the write latch, the UARTDR latch or the
+SEVONPEND event each turns its tests red.
+
+**Cost**, host instructions retired, three interleaved runs against the branch's base (dev at
+eb87237): `sram_loop.elf` 5.431–5.435 G to 5.415–5.417 G; `xip_loop.elf` 5.653–5.660 G to
+5.631–5.638 G; `bench --core cortex-m33 kernel33.bin` 118.08–118.10 G to 118.08–118.10 G. No loss: the
+line words replace the per-line calls. A latch before every chip access, reads included, cost 0.5% on
+the loops through printf's UARTFR polling while core 1 sleeps, which is why reads are filtered.
+
+### Item 19, done: the ADC and the temperature sensor
+
+**One model, both chips** (`peripheral/rp2040/adc.sysl`): the registers sit at the same offsets on
+the RP2040 and the RP2350, which only widens AINSEL (4 bits) and RROBIN (9 bits) for the RP2350B. Each
+chip passes its own masks and name, places the block (0x4004c000 on the RP2040, 0x400a0000 on the
+RP2350, each behind its RESETS bit) and wires ADC_IRQ_FIFO (22 on the RP2040, 35 on the RP2350).
+Both chips have inputs 0 to 3 on GPIO 26 to 29 and the temperature sensor on input 4.
+
+- **Time.** A conversion is 96 cycles of clk_adc, counted in 1/256 of a cycle so DIV's fraction is
+  exact. START_MANY starts the next conversion at once (DIV 0), or 1 + INT + FRAC/256 cycles after the
+  last started; while waiting the ADC is READY. The chip turns clk_sys cycles into ADC units against
+  clk_adc's frequency from CLOCKS, carrying the remainder, and steps the ADC event by event only while
+  something is under way, so an idle ADC costs one test per `advance`. `next_event` offers the next
+  sample's landing (through a DIV wait, the conversion after it) only where the interrupt or the DMA
+  request could see it; the RP2350's DMA loop stops at it too.
+- **Levels** are ideal (Q8): `floor(uv × 4096 / 3.3 V)`, saturating at 4095. A GPIO input's level is
+  the board's (`set_analog`, kept across a chip reset) unless the pad drives itself; otherwise the
+  rail its digital level is at, so a pin driven high from outside reads 4095. The sensor is the
+  datasheet's line, 0.706 V at 27 °C falling 1.721 mV a degree, at the board's `set_temperature`.
+- **FIFO**: 8 deep; LEVEL, EMPTY, FULL; a sample into a full FIFO is dropped and sets OVER; a read of an
+  empty one answers 0 and sets UNDER; both write-1-to-clear. SHIFT keeps the top 8 bits; ERR is stored
+  and never set (no conversion errors in the ideal model). INTR and DREQ hold while the FIFO has a
+  sample and LEVEL ≥ THRESH. DREQ 48 is a TREQ_SEL the RP2350's DMA accepts now.
+- **Refused by name**, leaving CS as it was: AINSEL or RROBIN naming an input the chip does not have
+  (5 to 15 on the RP2350A, 5 to 7 on the RP2040); a start with EN clear; START_ONCE during a
+  conversion; a start with clk_adc stopped. Converting the sensor with TS_EN clear stops the board by
+  name as the conversion ends. On the RP2040 the DREQ reaches nothing until its DMA is on the chip.
+
+**Tests** (`chip/adc_tests.sysl`, 12): a conversion's length to the cycle and its codes at the
+boundaries; a digitally driven input; the sensor at 27, 50 and −40 °C and the board's temperature
+across a reset; round robin wrapping from an AINSEL it does not enable; the FIFO filling, OVER,
+UNDER, SHIFT and a conversion finishing after START_MANY falls; DIV's period and `next_event`; the
+interrupt with INTE and INTF; DREQ against THRESH; each refusal; RESETS; the RP2040's block at its own
+address with its own masks. **Oracles**, pico-examples at 0d62f75 copied unchanged: `adc/hello_adc`
+and `adc/onboard_temperature` on the Pico 2 and the Pico, `adc/adc_console` on the Pico 2 driven over
+UART0 (`c2s`, `c9c4sx`, `c2S`: a channel switch, a sample, an unknown channel, the sensor, an unknown
+command, a 1000-sample FIFO capture), and `adc/dma_capture` on the Pico 2 (`dma_capture_adc.c` leaves
+its core-1 PIO DAC unlaunched, the PIO's pins not being on the mux yet, item 14): 1000 samples at
+500 kS/s moved by the DMA on DREQ 48, every line asserted. Lengthening the conversion by one cycle
+turns four tests red; letting DREQ ignore THRESH turns the DREQ test red.
+
+**Cost**: the five main lines run no ADC; what they pay is `adc.active()` in `advance` and
+`adc.wakes()` in `next_event`, measured by the train's bench.
+
+### Item 17, done: I2C0 and I2C1
+
+`peripheral/rp2350/i2c.sysl` (`I2c`, one DW_apb_i2c, and `I2cBus`, both controllers and the parts on
+their lines) against the field descriptions and configuration parameters of `hardware/regs/i2c.h`, the
+same on both chips, and the SDK's `hardware_i2c` and `pico_i2c_slave`; the chips place it, wire it and
+time it (`chip/i2c.sysl`).
+
+- **A bus a step at a time, timed.** START, the address and its acknowledge, data bytes with theirs,
+  repeated STARTs and the STOP, each a whole number of SCL bits: a bit is HCNT + LCNT + SPKLEN + 8
+  ic_clk cycles (the databook's high time HCNT + SPKLEN + 7 and low time LCNT + 1, edges ideal per Q8),
+  and ic_clk is clk_sys, so a step is counted in the chip's own cycles. START, STOP and an acknowledge on
+  its own are one bit, an address or a byte written nine, a byte read eight with its acknowledge sent
+  when the next command decides it. At the SDK's 100 kHz from 150 MHz a bit is 1564 cycles (95.9 kHz). The
+  chip runs the bus only where a master's step ends (`next_due`, offered through `next_event` and to the
+  DMA's steps), so an idle bus, or one a slave holds, costs a comparison per advance.
+- **Masters**: commands from IC_DATA_CMD's 16-deep FIFO with RESTART and STOP; the bus held, SCL low,
+  while the FIFO is empty after a command with no STOP; each byte read acknowledged but the last before a
+  STOP or repeated START; TX_EMPTY with TX_EMPTY_CTRL waiting for the byte in the shift register;
+  TX_CMD_BLOCK; IC_ENABLE cleared or ABORT set ending the transfer after the step in progress with a STOP
+  (a byte being read NACKed and dropped), ABRT_USER_ABRT; ABRT_7B_ADDR_NOACK and ABRT_TXDATA_NOACK with
+  TX_FLUSH_CNT, both FIFOs flushed and the transmit FIFO held flushed until IC_CLR_TX_ABRT.
+- **Slaves**: IC_SAR answered; bytes into the receive FIFO with FIRST_DATA_BYTE on the first; RD_REQ once
+  per byte with SCL held until the CPU writes one; the master's NACK as RX_DONE; stale data flushed with
+  ABRT_SLVFLUSH_TXFIFO; a read command in slave mode ABRT_SLVRD_INTX; SLV_DATA_NACK_ONLY;
+  STOP_DET_IFADDRESSED; RESTART_DET. A full receive FIFO holds SCL with RX_FIFO_FULL_HLD_CTRL and loses
+  the byte with RX_OVER without it, a master's as a slave's.
+- **Registers**: every one at its reset value; CON, TAR, SAR, the SCL counts and FS_SPKLEN take no write
+  while enabled; the counts' minimums (6, 8, 1) and SPEED outside 1–2 set to fast, as the descriptions
+  say; the thresholds clamped to 15; the clearing reads, ACTIVITY kept while busy; IC_STATUS,
+  IC_ENABLE_STATUS, IC_TXFLR/RXFLR; COMP_PARAM_1 0, COMP_VERSION and COMP_TYPE the header's. The
+  clearing reads and IC_DATA_CMD are refused through the atomic aliases.
+- **The lines** (`i2c_wiring`): an I2C function (F3, SDA on the even GPIO, SCL on the odd, I2C0 or I2C1 by
+  `n / 2 % 2`) drives nothing, the line idling at its pull-up. A controller's line is its one GPIO and
+  the far end of that GPIO's wire; a part on the workbench (`attach_i2c`, an `I2cPart` with the
+  `peripheral/i2c` device callbacks and whether it pulls the lines up) is on a line where its SDA and SCL
+  GPIOs are. The other controller is a target where its SDA and SCL are on the master's lines.
+- **Interrupts and DMA**: IC_INTR_STAT through IC_INTR_MASK, I2C0_IRQ and I2C1_IRQ (36 and 37 on the
+  RP2350, 23 and 24 on the RP2040), each line kept as it changes (`I2cBus.lines`) rather than worked out
+  every quantum; the TX and RX DREQs at DMATDL and DMARDL, 44 to 47 on the RP2350's DMA, which now takes
+  those TREQ_SELs.
+- **The RP2040** places the same `I2cBus` at 0x40044000 and 0x40048000 behind RESETS. Its workbench has
+  no wires, so its two controllers cannot reach each other, and its DMA is not on the chip.
+- **Refused by name**: 10-bit addressing (IC_CON), a general call or START BYTE (IC_TAR.SPECIAL), a master
+  and a slave at once (at IC_ENABLE), disabling a slave while a transfer addresses it, and, while the bus
+  runs (`take_line_fault`), a repeated START with IC_RESTART_EN clear, two masters on one bus, two
+  targets answering one address, RESETS taking a slave from a transfer, and lines benchtop cannot show:
+  no GPIO or more than one carrying a signal, a pad that does not read its input, an override in CTRL,
+  something else driving the line or driving it from off the chip, GPIO interrupts enabled on it, a line
+  with no pull-up, a part or a slave on one line and not the other. A command that would start a transfer
+  on such lines is refused at its IC_DATA_CMD write and leaves the controller as it was.
+- **Assumptions**, since the headers do not say: START, repeated START and STOP each last one SCL bit;
+  SDA_HOLD and SDA_SETUP do not change the timing; RD_REQ is raised at the end of the address or the
+  master's acknowledge, before the byte's eight bits.
+
+The oracles: `examples/pico2/bus_scan.c` and `examples/pico/bus_scan.c` are pico-examples' `i2c/bus_scan`,
+`examples/pico2/slave_mem_i2c.c` its `i2c/slave_mem_i2c`, all unchanged from `pico-scratch/pico-examples`
+at commit 0d62f75 below their header comment. `bus_scan` finds the DS3231 the test puts on GPIO 4 and 5
+at 0x68 on both boards, and nothing else; `slave_mem_i2c` runs I2C0 as a slave through pico_i2c_slave's
+interrupt handler and I2C1 as the master over two wires (4 to 6, 5 to 7), and three rounds of its message
+written and read back across a repeated START come out line by line. `chip/i2c_tests.sysl` (8) asserts
+those, and at register level the lines, the timing through `next_event`, the interrupt lines, the
+refusals with the block's name, RESETS, a DMA channel paced by DREQ 44; `rp2350/i2c_tests.sysl` (12) the
+model alone, among them a held master retried by a read of its own receive FIFO while the slave is
+still empty raising no second RD_REQ. Breaking the read's bit count, RD_REQ's once per byte (the `fresh`
+guard in `begin`), or the SCL pull-up check turns them red.
+
+**Cost**, host instructions retired, three interleaved runs each against the branch's base (dev at
+eb87237, `/usr/bin/time -l`, `benchtop run --board pico2`): `sram_loop.elf` 5.438–5.447 G to
+5.445–5.454 G, `xip_loop.elf` 5.660–5.662 G to 5.665–5.668 G, `bench --core cortex-m33 kernel33.bin`
+118.08–118.12 G to 118.08–118.10 G: within 0.1%. An earlier cut that worked out both I2C lines every
+quantum cost `sram_loop` 0.3%; `I2cBus.lines` is why it does not. `bus_scan.elf`, with no part on the
+lines, runs in 4.04–4.05 G.
+
+### Item 29, done: HSTX and the SIO TMDS encoder
+
+**Modelled** (`peripheral/rp2350/hstx.sysl`, `tmds.sysl`): HSTX's eight-word FIFO, its DREQ (52) and
+STAT.WOF; the shift register rotating by CSR.SHIFT through N_SHIFTS cycles a word; the clock generator,
+which runs only while the register shifts; BIT0–7 with SEL_P, SEL_N, INV and CLK, on GPIO 12–19 at
+FUNCSEL 0; the command expander's RAW, RAW_REPEAT, TMDS, TMDS_REPEAT and NOP with EXPAND_SHIFT and
+EXPAND_TMDS, its encoders' balance cleared by EN low and by each raw command. clk_hstx comes from
+CLOCKS, its cycles carried between steps as a remainder of clk_sys. The SIO's TMDS encoder per core:
+the colour register, PEEK/POP SINGLE and DOUBLE_Ln, PIX_SHIFT, PIX2_NOSHIFT and CLEAR_BALANCE, both
+sharing the DVI 1.0 encoder. A DVI monitor part (`parts/dvi`) deserialises the outputs, locks on the
+first control token and measures the mode, the sync widths, the clock and every pixel.
+
+**Refused by name:** coupled mode (PIO to HSTX), EXPAND_EN changed while EN is set, CLKPHASE of a full
+period or more, a reserved opcode or a count of 0 met in the FIFO, a narrow FIFO write, a GPIO interrupt
+on a pin HSTX drives, the SIO encoder's reserved PIX_SHIFT 6 and 7.
+
+**Timing:** the DMA paced by DREQ_HSTX waits on the FIFO's next pop (`hstx_due`), never per cycle. A
+board's quantum also ends where a busy channel fed by HSTX may finish with its interrupt enabled
+(`hstx_irq_due`): `dvi_out_hstx_encoder` refills a ping-pong pair from DMA_IRQ_0 in `WFI`, and a
+1000-cycle quantum let the chained channel run on with its spent addresses (the framebuffer's next
+words met as commands) before the handler could take the interrupt. With no HSTX-fed channel the bound
+is None and quanta are unchanged.
+
+**Oracles:** pico-examples' `hstx/spi_lcd` (an ST7789 driven through HSTX's raw path, every pixel of
+its first frame) and `hstx/dvi_out_hstx_encoder` (640x480 at 800 by 525, every pixel of the mountains
+picture), both on the Arm Pico 2. BUSCTRL's BUS_PRIORITY, which the DVI example sets, comes from item 28,
+merged into this branch.
+
+**Cost:** the main lines do not enable HSTX, so `hstx_irq_due` answers None at its first test and the
+DMA's paths are unchanged for them; the train's bench of the five main lines covers it.

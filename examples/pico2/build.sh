@@ -8,7 +8,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cmake -S . -B "$work" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$work"
-for prog in hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp aon_timer rom otp hello_serial_flash blink_flash qmi_flash xip_sram xip_loop sram_loop watchdog powman usb_device usb_reconnect hello_usb dev_lowlevel hello_gpio_irq gpio_irq hello_uart uart_advanced uart_loopback nonsecure pio_programs hello_dma hello_dma_flash control_blocks dma_uart pio_ws2812 pio_uart_tx pio_uart_rx pio_blink pio_uart_dma; do
+for prog in hello_serial blink rcp gpioc stack_limit tt interp clock_report dcp aon_timer rom otp hello_serial_flash blink_flash qmi_flash xip_sram xip_loop sram_loop watchdog powman usb_device usb_reconnect hello_usb dev_lowlevel hello_gpio_irq gpio_irq hello_uart uart_advanced uart_loopback nonsecure pio_programs hello_dma hello_dma_flash control_blocks dma_uart sniff_crc rand hello_sha256 hello_pwm pwm_led_fade measure_duty_cycle pwm_features spi_dma hello_adc onboard_temperature adc_console dma_capture_adc bus_scan slave_mem_i2c dvi_out_hstx_encoder hstx_spi_lcd pio_ws2812 pio_uart_tx pio_uart_rx pio_blink pio_uart_dma; do
     cp "$work/$prog.elf" "$prog.elf"
 done
 cp "$work/hello_serial_flash.uf2" hello_serial_flash.uf2

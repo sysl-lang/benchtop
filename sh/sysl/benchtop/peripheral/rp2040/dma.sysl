@@ -24,13 +24,31 @@ import sysl.math.min
 // DREQ, a level the chip reads (`Rp2350.uart_dreq`). A TREQ_SEL whose source the chip does not drive is
 // refused by name (`modelled`).
 //
-// Refused by name: the sniffer (SNIFF_CTRL set, CTRL.SNIFF_EN, a SNIFF_DATA write: rp-coverage item 12),
-// a change to SECCFG_* or MPU_* (item 12; they read their reset values), the reserved DATA_SIZE and MODE
-// values, a pacing timer with Y 0 and X not, and a trigger that would start a channel with a count of 0.
+// **The sniffer** (both chips): while SNIFF_CTRL.EN is set and DMACH names a channel whose CTRL.SNIFF_EN
+// is set, each transfer's data (after the channel's own BSWAP, and SNIFF_CTRL.BSWAP on top) goes into
+// SNIFF_DATA: CRC-32 (poly 0x04C11DB7, MSB first; CRC32R feeds each byte bit-reversed), CRC-16-CCITT
+// (poly 0x1021, likewise), the XOR of every bit (EVEN: into bit 0) or a 32-bit sum. A transfer's bytes go
+// in low byte first. SNIFF_DATA reads back reversed (OUT_REV) and inverted (OUT_INV) as asked, without
+// changing the accumulator. CRC-16 works on SNIFF_DATA[15:0] and leaves [31:16] 0.
+//
+// **Security attributes** (RP2350 only): SECCFG_CH, SECCFG_IRQ, SECCFG_MISC and the MPU are stored with
+// their writable bits. A channel's S and P give the bus access its level (ACCESSCTRL's SP, SU, NSP or NSU
+// bit, `need`), and the MPU gives each address one (the first enabled region it falls in, else MPU_CTRL's
+// S and P); a channel whose level is below the address's gets a bus error (READ_ERROR or WRITE_ERROR).
+// SECCFG_CH.LOCK sets itself on a successful write to the channel's CTRL, READ_ADDR, WRITE_ADDR or
+// TRANS_COUNT and then freezes the register. SECCFG_IRQ masks the channels it may not see from that
+// line's status and acknowledge; SECCFG_MISC hides the sniffer's data from the channels it may not see,
+// and a pacing timer's requests from the channels it is not visible to (they never become ready).
+// `access_refusal` is what a core of a given level may reach: the board asks it before each access.
+//
+// Refused by name: the reserved SNIFF_CTRL.CALC values, an access by a core below the register's level
+// (silicon's answer, a RAZ/WI or a bus fault, is not in the headers), two enabled MPU regions of different
+// attributes covering one address, the reserved DATA_SIZE and MODE values, a pacing timer with Y 0 and X
+// not, and a trigger that would start a channel with a count of 0.
 //
 // Assumptions, where the headers do not say: CHAN_ABORT stops the channel at once, with no interrupt and
 // no chain; a trigger to a busy channel is ignored (as MULTI_CHAN_TRIGGER's description says); a write to
-// a pacing timer restarts its fraction.
+// a pacing timer restarts its fraction; the MPU's rule above.
 
 /** CTRL's error flags, at the same place on both chips; READ_ERROR and WRITE_ERROR are write-1-to-clear. */
 const DMA_AHB_ERROR: u32 = 0x80000000
@@ -73,6 +91,27 @@ private const DBG_FIRST: u32 = 0x800
 // SECCFG's reset values: each channel and IRQ Secure and privileged, every MISC bit set.
 private const SECCFG_RESET: u32 = 3
 private const SECCFG_MISC_RESET: u32 = 0x3ff
+// SECCFG_CH's bits: P, S and LOCK.
+private const SEC_P: u32 = 1
+private const SEC_S: u32 = 2
+private const SEC_LOCK: u32 = 4
+// Writable bits: SECCFG_CH, SECCFG_IRQ, SECCFG_MISC, MPU_CTRL, an MPU base, an MPU limit.
+private const SECCFG_CH_BITS: u32 = 7
+private const SECCFG_IRQ_BITS: u32 = 3
+private const MPU_CTRL_BITS: u32 = 0xe
+private const MPU_NS_HIDE: u32 = 8
+private const MPU_BAR_BITS: u32 = 0xffffffe0
+private const MPU_LAR_BITS: u32 = 0xffffffe7
+// MPU_LAR's attributes: S, P and EN.
+private const LAR_S: u32 = 4
+private const LAR_P: u32 = 2
+private const LAR_EN: u32 = 1
+// SNIFF_CTRL's fields.
+private const SNIFF_EN: u32 = 1
+private const SNIFF_BSWAP: u32 = 0x200
+private const SNIFF_OUT_REV: u32 = 0x400
+private const SNIFF_OUT_INV: u32 = 0x800
+private const SNIFF_BITS: u32 = 0xfff
 
 /** Where a chip's DMA keeps CTRL's fields (masks into CTRL), and how many channels and IRQ lines it has. */
 struct DmaLayout
@@ -137,9 +176,14 @@ struct DmaChannel
     bswap: bool
     high: bool
     en: bool
+    // CTRL.SNIFF_EN.
+    sniff: bool
 
     /** TRANS_COUNT.MODE, as the last write left it (always NORMAL on the RP2040). */
     mode(self) -> u32 = self.reload >> 28
+
+    /** TRANS_COUNT.MODE is ENDLESS: the channel never finishes. */
+    endless(self) -> bool = self.mode() == MODE_ENDLESS
 
     /** Where an address steps to from `a`: by `step`, within the ring where `ring` covers it. */
     next(self, a: u32, step: u32, ring: bool) -> u32 =
@@ -163,7 +207,12 @@ struct Dma
     paced_at: u64
     // The channel the last round of issue ended at.
     rr: u32
+    sniff_ctrl: u32
     sniff_data: u32
+    // Each IRQ line's channels it may see (SECCFG_IRQ against SECCFG_CH), kept in step with both.
+    irq_vis: [4]u32
+    // Whether the MPU can change an address's attributes: MPU_CTRL's S or P set, or a region enabled.
+    mpu_live: bool
     seccfg_ch: [DMA_CHANNELS_MAX]u32
     seccfg_irq: [4]u32
     seccfg_misc: u32
@@ -184,7 +233,7 @@ struct Dma
     mask(self) -> u32 = if self.layout.channels >= 32 then ~0u32 else (1u32 << self.layout.channels) - 1
 
     /** DMA IRQ `n`'s level: (INTR & INTEn) | INTFn. */
-    irq(self, n: u32) -> bool = n < self.layout.irq_lines && ((self.intr & self.inte[n]) | self.intf[n]) != 0
+    irq(*self, n: u32) -> bool = n < self.layout.irq_lines && ((self.intr & self.inte[n] & self.irq_vis[n]) | self.intf[n]) != 0
 
     /** Whether a busy channel is enabled, so that the DMA has work it may do. */
     running(self) -> bool
@@ -236,7 +285,7 @@ struct Dma
             val value = (a & 0xF) match
                 4 -> self.inte[line]
                 8 -> self.intf[line]
-                0xC -> (self.intr & self.inte[line]) | self.intf[line]
+                0xC -> (self.intr & self.inte[line] & self.irq_vis[line]) | self.intf[line]
                 _ -> return Err(AccessError.Unmapped)
             return Ok(read_lane(value, offset, width))
         if a >= TIMER0 && a < TIMER0 + 16 then return Ok(read_lane(self.timers[(a - TIMER0) >> 2], offset, width))
@@ -247,8 +296,9 @@ struct Dma
             if a == MPU_CTRL then return Ok(read_lane(self.mpu_ctrl, offset, width))
             if a >= MPU_BAR0 && a <= MPU_LAR7 then return Ok(read_lane(self.mpu[(a - MPU_BAR0) >> 2], offset, width))
         val value = a match
-            MULTI_CHAN_TRIGGER | CHAN_ABORT | SNIFF_CTRL | FIFO_LEVELS -> 0
-            SNIFF_DATA -> self.sniff_data
+            MULTI_CHAN_TRIGGER | CHAN_ABORT | FIFO_LEVELS -> 0
+            SNIFF_CTRL -> self.sniff_ctrl
+            SNIFF_DATA -> self.sniff_result()
             N_CHANNELS -> n
             _ -> return Err(AccessError.Unmapped)
         Ok(read_lane(value, offset, width))
@@ -281,7 +331,7 @@ struct Dma
             (a & 0xF) match
                 4 -> self.inte[line] = written(self.inte[line], offset, data) & self.mask()
                 8 -> self.intf[line] = written(self.intf[line], offset, data) & self.mask()
-                0xC -> self.intr = w1c(self.intr, data & self.mask())
+                0xC -> self.intr = w1c(self.intr, data & self.mask() & self.irq_vis[line])
                 _ -> return Err(DmaFault.Access(AccessError.Unmapped))
             return Ok(())
         if a >= TIMER0 && a < TIMER0 + 16
@@ -292,20 +342,41 @@ struct Dma
             self.phase[i] = 0
             return Ok(())
         if self.layout.rp2350
-            if a >= SECCFG_CH0 && a < SECCFG_CH0 + 4 * n then return stored_only(&self.seccfg_ch[(a - SECCFG_CH0) >> 2], offset, data, s"SECCFG_CH${(a - SECCFG_CH0) >> 2}")
-            if a >= SECCFG_IRQ0 && a < SECCFG_IRQ0 + 16 then return stored_only(&self.seccfg_irq[(a - SECCFG_IRQ0) >> 2], offset, data, s"SECCFG_IRQ${(a - SECCFG_IRQ0) >> 2}")
-            if a == SECCFG_MISC then return stored_only(&self.seccfg_misc, offset, data, "SECCFG_MISC")
-            if a == MPU_CTRL then return stored_only(&self.mpu_ctrl, offset, data, "MPU_CTRL")
+            if a >= SECCFG_CH0 && a < SECCFG_CH0 + 4 * n
+                val k = (a - SECCFG_CH0) >> 2
+                // LOCK freezes the register.
+                if self.seccfg_ch[k] & SEC_LOCK == 0
+                    self.seccfg_ch[k] = written(self.seccfg_ch[k], offset, data) & SECCFG_CH_BITS
+                    self.sync_security()
+                return Ok(())
+            if a >= SECCFG_IRQ0 && a < SECCFG_IRQ0 + 16
+                val i = (a - SECCFG_IRQ0) >> 2
+                self.seccfg_irq[i] = written(self.seccfg_irq[i], offset, data) & SECCFG_IRQ_BITS
+                self.sync_security()
+                return Ok(())
+            if a == SECCFG_MISC
+                self.seccfg_misc = written(self.seccfg_misc, offset, data) & 0x3ff
+                return Ok(())
+            if a == MPU_CTRL
+                self.mpu_ctrl = written(self.mpu_ctrl, offset, data) & MPU_CTRL_BITS
+                self.sync_security()
+                return Ok(())
             if a >= MPU_BAR0 && a <= MPU_LAR7
                 val i = (a - MPU_BAR0) >> 2
-                return stored_only(&self.mpu[i], offset, data, s"MPU_${if i % 2 == 0 then "BAR" else "LAR"}${i / 2}")
+                self.mpu[i] = written(self.mpu[i], offset, data) & (if i % 2 == 0 then MPU_BAR_BITS else MPU_LAR_BITS)
+                self.sync_security()
+                return Ok(())
         a match
             MULTI_CHAN_TRIGGER ->
                 val m = triggered(offset, data) & self.mask()
                 for k in 0..<n do if m & (1u32 << k) != 0 then self.trigger(k).map_err(why -> DmaFault.Refused(why))?
             CHAN_ABORT -> self.abort(triggered(offset, data) & self.mask())
-            SNIFF_CTRL -> if written(0, offset, data) != 0 then return Err(DmaFault.Refused("SNIFF_CTRL: the sniffer (CRC and sum) is not modelled (rp-coverage item 12)"))
-            SNIFF_DATA -> return Err(DmaFault.Refused("SNIFF_DATA: the sniffer (CRC and sum) is not modelled (rp-coverage item 12)"))
+            SNIFF_CTRL ->
+                val v = written(self.sniff_ctrl, offset, data) & SNIFF_BITS
+                val calc = (v >> 5) & 15
+                if calc > 3 && calc < 14 then return Err(DmaFault.Refused(s"SNIFF_CTRL.CALC $calc is reserved"))
+                self.sniff_ctrl = v
+            SNIFF_DATA -> self.sniff_data = written(self.sniff_data, offset, data)
             FIFO_LEVELS | N_CHANNELS -> ()
             _ -> return Err(DmaFault.Access(AccessError.Unmapped))
         Ok(())
@@ -334,6 +405,8 @@ struct Dma
                 self.ch[k].errors = w1c(self.ch[k].errors, data & (DMA_READ_ERROR | DMA_WRITE_ERROR))
                 stored = written(self.ch[k].ctrl, offset, data) & self.writable()
                 self.set_ctrl(k, stored)?
+        // A successful write to the channel's registers locks its SECCFG.
+        self.seccfg_ch[k] |= SEC_LOCK
         if !trig then return Ok(())
         if stored == 0
             // A null trigger: the end of a control-block chain.
@@ -351,9 +424,10 @@ struct Dma
         val l = self.layout
         val size_code = field(v, l.size)
         if size_code == 3 then return Err(DmaFault.Refused(s"CH${k} CTRL.DATA_SIZE 3 is reserved"))
-        if v & l.sniff != 0 then return Err(DmaFault.Refused(s"CH${k} CTRL.SNIFF_EN: the sniffer (CRC and sum) is not modelled (rp-coverage item 12)"))
         val treq = field(v, l.treq)
-        if self.modelled & (1u64 << u64(treq)) == 0 then return Err(DmaFault.Treq(k, treq))
+        // A disabled channel makes no requests, so a TREQ_SEL it only holds (the reset value 0 under an
+        // atomic set or clear of another bit) is not a selection; enabling it with one is refused.
+        if v & l.en != 0 && self.modelled & (1u64 << u64(treq)) == 0 then return Err(DmaFault.Treq(k, treq))
         val size = 1u32 << size_code
         val c = &self.ch[k]
         c.ctrl = v
@@ -369,6 +443,7 @@ struct Dma
         c.bswap = v & l.bswap != 0
         c.high = v & l.high != 0
         c.en = v & l.en != 0
+        c.sniff = v & l.sniff != 0
         Ok(())
 
     /** Start channel `k` where it is enabled and not busy: the live count from RELOAD. Refused (the
@@ -423,9 +498,126 @@ struct Dma
         self.busy &= ~(1u32 << k)
         self.intr |= 1u32 << k
 
-    /** Whether channel `k` is paced by a pacing timer, and which. */
-    timer_of(self, k: u32) -> Option[u32] =
-        if self.ch[k].treq >= TREQ_TIMER0 && self.ch[k].treq < TREQ_PERMANENT then Some(self.ch[k].treq - TREQ_TIMER0) else None
+    /** Whether channel `k` is paced by a pacing timer it can see, and which: SECCFG_MISC hides a timer's
+     * requests from a channel below its level, and that channel's requests never come.
+     */
+    timer_of(self, k: u32) -> Option[u32]
+        if self.ch[k].treq < TREQ_TIMER0 || self.ch[k].treq >= TREQ_PERMANENT then return None
+        val i = self.ch[k].treq - TREQ_TIMER0
+        val need = (self.seccfg_misc >> (2 + 2 * i)) & 3
+        val c = self.seccfg_ch[k]
+        if (need & SEC_S != 0 && c & SEC_S == 0) || (need & SEC_P != 0 && c & (SEC_P | SEC_S) == 0) then return None
+        Some(i)
+
+    /** SNIFF_DATA as software reads it: bit-reversed and inverted as SNIFF_CTRL asks. */
+    sniff_result(self) -> u32
+        var x = self.sniff_data
+        if self.sniff_ctrl & SNIFF_OUT_REV != 0 then x = x.reverse_bits()
+        if self.sniff_ctrl & SNIFF_OUT_INV != 0 then x = ~x
+        x
+
+    /** Channel `k` read `data`, `size` bytes of it: the sniffer takes it into SNIFF_DATA where it is
+     * enabled, watching `k`, set to see `k` (SECCFG_MISC) and `k` has CTRL.SNIFF_EN.
+     */
+    sniff(*self, k: u32, data: u32, size: u32)
+        val sc = self.sniff_ctrl
+        if sc & SNIFF_EN == 0 || (sc >> 1) & 15 != k || !self.ch[k].sniff then return
+        val c = self.seccfg_ch[k]
+        if (c & SEC_S != 0 && self.seccfg_misc & SEC_S == 0) || (c & SEC_P != 0 && self.seccfg_misc & SEC_P == 0) then return
+        val x = if sc & SNIFF_BSWAP != 0 then swapped(data, size) else data
+        self.sniff_data = ((sc >> 5) & 15) match
+            0 -> crc32(self.sniff_data, x, size, false)
+            1 -> crc32(self.sniff_data, x, size, true)
+            2 -> crc16(self.sniff_data, x, size, false)
+            3 -> crc16(self.sniff_data, x, size, true)
+            14 -> self.sniff_data ^ (x.count_ones() & 1)
+            _ -> self.sniff_data +% x
+
+    /** Bring what depends on SECCFG and the MPU back in step after a write to them. */
+    private sync_security(*self)
+        for line in 0..<4
+            var vis: u32 = 0
+            for k in 0..<self.layout.channels
+                val c = self.seccfg_ch[k]
+                val i = self.seccfg_irq[line]
+                if !((c & SEC_S != 0 && i & SEC_S == 0) || (c & SEC_P != 0 && i & SEC_P == 0)) then vis |= 1u32 << k
+            self.irq_vis[line] = vis
+        var live = self.mpu_ctrl & 6 != 0
+        for r in 0..<8 do if self.mpu[2 * r + 1] & LAR_EN != 0 then live = true
+        self.mpu_live = live
+
+    /** The ACCESSCTRL bits channel `k`'s bus accesses need: the DMA master's, and its level's (SP, SU, NSP
+     * or NSU).
+     */
+    need(self, k: u32) -> u32
+        val c = self.seccfg_ch[k]
+        0x40 | (if c & SEC_S != 0 then (if c & SEC_P != 0 then 8u32 else 4) else (if c & SEC_P != 0 then 2 else 1))
+
+    /** Whether channel `k` may access `a` under the MPU: the address's level (S 2, P 1) must not exceed
+     * the channel's. Refused (the reason) where two enabled regions of different attributes cover `a`.
+     */
+    mpu_allows(self, k: u32, a: u32) -> Result[bool, string]
+        var found = false
+        var rank: u32 = 0
+        for r in 0..<8
+            val lar = self.mpu[2 * r + 1]
+            if lar & LAR_EN == 0 || (a >> 5) < (self.mpu[2 * r] >> 5) || (a >> 5) > (lar >> 5) then continue
+            val x = (if lar & LAR_S != 0 then 2u32 else 0) | (if lar & LAR_P != 0 then 1 else 0)
+            if found && x != rank then return Err(s"0x${hex(a, 8)} is in two enabled MPU regions of different attributes (region $r and an earlier one): the headers do not say which wins")
+            found = true
+            rank = x
+        if !found then rank = (if self.mpu_ctrl & 4 != 0 then 2u32 else 0) | (if self.mpu_ctrl & 2 != 0 then 1 else 0)
+        Ok(rank <= self.seccfg_ch[k] & 3)
+
+    /** Why a core of this level ({Secure, Non-secure} x {privileged, not}) may not make this access to
+     * the register at `offset` (`value` is what a write stores): channel registers need the channel's
+     * level, an IRQ line's, a pacing timer's and the sniffer's registers theirs, SECCFG and the MPU's
+     * base and limit a Secure privileged one (a Non-secure privileged write may set a limit's P bit of
+     * a Non-secure region), MPU_CTRL a privileged one. None on the RP2040, which has no levels, and for
+     * Secure privileged. Silicon's answer to a denied access is not in the headers.
+     */
+    access_refusal(self, offset: u32, write: bool, value: u32, ns: bool, priv: bool) -> Option[string]
+        if !self.layout.rp2350 || (!ns && priv) then return None
+        val level = (if ns then 0u32 else 2) | (if priv then 1 else 0)
+        val a = offset & 0xFFC
+        val n = self.layout.channels
+        if a < n * 0x40 then return rank_refusal(level, self.seccfg_ch[a >> 6] & 3, s"channel ${a >> 6}")
+        if a >= DBG_FIRST && a < DBG_FIRST + n * 0x40 then return rank_refusal(level, self.seccfg_ch[(a - DBG_FIRST) >> 6] & 3, s"channel ${(a - DBG_FIRST) >> 6}")
+        if a > INTR && a < TIMER0
+            val line = (a - IRQ_FIRST) >> 4
+            return line_refusal(ns, priv, self.seccfg_irq[line], s"IRQ $line")
+        if a >= TIMER0 && a < TIMER0 + 16
+            val i = (a - TIMER0) >> 2
+            return line_refusal(ns, priv, (self.seccfg_misc >> (2 + 2 * i)) & 3, s"TIMER$i")
+        if (a == MULTI_CHAN_TRIGGER || a == CHAN_ABORT) && write
+            for k in 0..<n
+                if value & (1u32 << k) != 0
+                    rank_refusal(level, self.seccfg_ch[k] & 3, s"channel $k") match
+                        Some(why) -> return Some(why)
+                        None -> ()
+            return None
+        if a == SNIFF_CTRL || a == SNIFF_DATA
+            val m = self.seccfg_misc
+            // P alone lets a Secure context in when S is clear.
+            if (m & SEC_S != 0 && ns) || (m & SEC_P != 0 && !priv && !(!ns && m & SEC_S == 0))
+                return Some(s"the DMA's sniffer registers are for ${if m & SEC_S != 0 then "Secure" else "any"}${if m & SEC_P != 0 then " privileged" else ""} contexts (SECCFG_MISC 0x${hex(m)}) and were reached by ${level_name(level)}")
+            return None
+        if a >= SECCFG_CH0 && a < SECCFG_MISC + 4
+            if write then return Some(s"the DMA's SECCFG registers are writable from Secure privileged code only and were written by ${level_name(level)}")
+            return None
+        if a == MPU_CTRL
+            if priv then return None
+            return Some(s"MPU_CTRL is for privileged code only and was reached by ${level_name(level)}")
+        if a >= MPU_BAR0 && a <= MPU_LAR7
+            val r = (a - MPU_BAR0) >> 3
+            val lar = self.mpu[2 * r + 1]
+            val is_lar = (a - MPU_BAR0) & 4 != 0
+            if write
+                if is_lar && priv && lar & LAR_S == 0 && ((value ^ lar) & ~LAR_P & MPU_LAR_BITS) == 0 then return None
+                return Some(s"MPU region $r is writable from Secure privileged code only (a Non-secure region's P bit from any privileged code) and was written by ${level_name(level)}")
+            if priv && lar & LAR_S == 0 && self.mpu_ctrl & MPU_NS_HIDE == 0 then return None
+            return Some(s"MPU region $r is readable from Secure privileged code only (a Non-secure region from any privileged code, unless NS_HIDE_ADDR) and was read by ${level_name(level)}")
+        None
 
     /** The pacing timers run to clk_sys cycle `at`: each request they make counts in every busy channel
      * they pace.
@@ -525,7 +717,9 @@ dma(layout: DmaLayout, modelled: u64) -> Dma
         // CTRL's power-on value: every field 0, so byte transfers, DREQ 0, and CHAIN_TO channel 0.
         d.ch[k].size = 1
         d.seccfg_ch[k] = SECCFG_RESET
-    for i in 0..<4 do d.seccfg_irq[i] = SECCFG_RESET
+    for i in 0..<4
+        d.seccfg_irq[i] = SECCFG_RESET
+        d.irq_vis[i] = ~0u32
     d.seccfg_misc = SECCFG_MISC_RESET
     d
 
@@ -549,11 +743,44 @@ private field(v: u32, mask: u32) -> u32 = (v & mask) >> mask.trailing_zeros()
 private step(incr: bool, rev: bool, size: u32) -> u32 =
     if incr && rev then 0 -% size elif incr then size elif rev then 2 * size else 0
 
-// A register item 12 builds: it keeps its value, and a write that would change it is refused.
-private stored_only(r: *u32, offset: u32, data: u32, name: string) -> Result[unit, DmaFault]
-    val v = written(*r, offset, data)
-    if v != *r then return Err(DmaFault.Refused(s"$name = 0x${hex(v)}: the DMA's security attributes and MPU are not modelled (rp-coverage item 12); it keeps 0x${hex(*r)}"))
-    Ok(())
+private level_name(rank: u32) -> string = ["Non-secure unprivileged", "Non-secure privileged", "Secure unprivileged", "Secure privileged"][rank]
+
+// Why a context of `level` (S 2, P 1) may not reach what needs `need`; None where it may.
+private rank_refusal(level: u32, need: u32, what: string) -> Option[string]
+    if level >= need then return None
+    Some(s"DMA $what is ${level_name(need)} (SECCFG) and was reached by ${level_name(level)}")
+
+// Why a context may not reach a register an IRQ line, pacing timer or sniffer guards with `bits` (S 2,
+// P 1): S needs Secure, P privileged.
+private line_refusal(ns: bool, priv: bool, bits: u32, what: string) -> Option[string]
+    if (bits & SEC_S != 0 && ns) || (bits & SEC_P != 0 && !priv)
+        return Some(s"DMA $what is guarded S=${bits >> 1} P=${bits & 1} and was reached by ${level_name((if ns then 0u32 else 2) | (if priv then 1 else 0))}")
+    None
+
+// CRC-32 (poly 0x04C11DB7, MSB first) of `size` bytes of `x`, low byte first, each reversed first with
+// `reflect`.
+private crc32(acc: u32, x: u32, size: u32, reflect: bool) -> u32
+    var crc = acc
+    for i in 0u32..<size
+        val byte = (x >> (8 * i)) & 0xFF
+        crc ^= (if reflect then byte.reverse_bits() >> 24 else byte) << 24
+        for bit in 0..<8 do crc = if crc & 0x80000000 != 0 then (crc << 1) ^ 0x04C11DB7 else crc << 1
+    crc
+
+// CRC-16-CCITT (poly 0x1021, MSB first) of `size` bytes of `x`, in the low 16 bits of `acc`.
+private crc16(acc: u32, x: u32, size: u32, reflect: bool) -> u32
+    var crc = acc & 0xFFFF
+    for i in 0u32..<size
+        val byte = (x >> (8 * i)) & 0xFF
+        crc ^= (if reflect then byte.reverse_bits() >> 24 else byte) << 8
+        for bit in 0..<8 do crc = (if crc & 0x8000 != 0 then (crc << 1) ^ 0x1021 else crc << 1) & 0xFFFF
+    crc
+
+/** BSWAP: a halfword's two bytes swapped, a word's four reversed; a byte unchanged. */
+swapped(v: u32, size: u32) -> u32 = size match
+    2 -> ((v & 0xFF) << 8) | ((v >> 8) & 0xFF)
+    4 -> ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | (v >> 24)
+    _ -> v
 
 private sooner(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
     Some(x) -> b match
