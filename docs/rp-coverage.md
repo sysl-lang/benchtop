@@ -170,8 +170,8 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 34 | 9 | 0 | 15 | 58 |
-| RP2040 | 20 | 7 | 2 | 8 | 37 |
+| RP2350 | 35 | 9 | 0 | 14 | 58 |
+| RP2040 | 20 | 8 | 2 | 7 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
 benchtop's policy for unsupported accesses (`docs/peripheral-models.md:54`). Several items below
