@@ -105,3 +105,15 @@ pico_minimize_runtime(sram_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL
 benchtop_program(pio_programs pio_programs.c no_flash)
 target_link_libraries(pio_programs hardware_pio)
 pico_generate_pio_header(pio_programs ${CMAKE_CURRENT_LIST_DIR}/pio/hello.pio ${CMAKE_CURRENT_LIST_DIR}/pio/ws2812.pio ${CMAKE_CURRENT_LIST_DIR}/pio/uart_tx.pio ${CMAKE_CURRENT_LIST_DIR}/pio/uart_rx.pio ${CMAKE_CURRENT_LIST_DIR}/pio/rp2350_only.pio OUTPUT_DIR ${CMAKE_CURRENT_LIST_DIR}/pio)
+
+# pico-examples' PIO programs, run whole: their state machines through the mux. PIO_BLINK_FLASH_TIME_SECONDS
+# is the program's own setting; a second of guest time shows all four rates and the clean shutdown.
+foreach(prog pio_ws2812 pio_uart_tx pio_uart_rx pio_blink)
+    benchtop_program(${prog} ${prog}.c no_flash)
+    target_link_libraries(${prog} hardware_pio hardware_clocks)
+    target_include_directories(${prog} PRIVATE ${CMAKE_CURRENT_LIST_DIR}/pio)
+    add_dependencies(${prog} pio_programs)
+endforeach()
+target_link_libraries(pio_uart_rx pico_multicore)
+target_compile_definitions(pio_blink PRIVATE PIO_BLINK_FLASH_TIME_SECONDS=1)
+pico_generate_pio_header(pio_blink ${CMAKE_CURRENT_LIST_DIR}/pio/blink.pio OUTPUT_DIR ${CMAKE_CURRENT_LIST_DIR}/pio)

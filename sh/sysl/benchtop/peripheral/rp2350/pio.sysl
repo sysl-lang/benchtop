@@ -23,10 +23,11 @@ import sysl.math.min
 // again until that something happens: a FIFO access by the system, a register write, a level driven
 // onto the inputs, an IRQ flag changing. Then it tries again on its next cycle, as it would have.
 //
-// **The pins are a vector**, not GPIOs through the mux (item 14 connects them): each block drives a
-// 32-bit level and direction in its own numbering, which GPIOBASE (0 or 16) places on GPIO 0–31 or
-// 16–47 (`pad_out`, `pad_oe`, DBG_PADOUT and DBG_PADOE), and reads the levels `drive` gives it for
-// GPIO 0–47, through a two-cycle input synchroniser per pin that INPUT_SYNC_BYPASS removes. Within a
+// **The pins**: each block drives a 32-bit level and direction in its own numbering, which GPIOBASE (0
+// or 16) places on GPIO 0–31 or 16–47 (`pad_out`, `pad_oe`, DBG_PADOUT and DBG_PADOE), and reads the
+// levels `drive` gives it for GPIO 0–47, through a two-cycle input synchroniser per pin that
+// INPUT_SYNC_BYPASS removes. The chip connects them through the mux: `advance_to` stops after a cycle
+// that moved a pin (`pins_moved`) so the chip can carry the level to whatever reads it. Within a
 // block a higher-numbered state machine's write to a pin wins on the cycle it is made, a side-set wins
 // over its own state machine's OUT, SET or MOV, and the block holds each pin as last written.
 //
@@ -37,12 +38,11 @@ import sysl.math.min
 // either way or given over to the RX entries (FJOIN_RX_GET and FJOIN_RX_PUT), the shift registers with
 // their autopush and autopull thresholds, wrap, STATUS_SEL, OUT_STICKY, INLINE_OUT_EN, SM_RESTART,
 // CLKDIV_RESTART and their PREV/NEXT forms, SMx_INSTR, the eight IRQ flags, INTR and the two interrupt
-// lines of each block (`irq_line`; item 14 takes them to the NVIC), FDEBUG, FLEVEL and FSTAT. Blocks
+// lines of each block (`irq_line`), the DMA requests (`dreq`), FDEBUG, FLEVEL and FSTAT. Blocks
 // that ACCESSCTRL makes one Non-secure and the other not are disconnected from each other's PREV and
 // NEXT, as the datasheet says (status 0, controls ignored). Refused by name (`PioFault.Refused`, or
 // `take_fault` while running): every reserved encoding and setting, an empty TX FIFO's write path
-// read, and the RX entries reached in a mode that does not give them to the reader. The DMA requests are
-// item 14's.
+// read, and the RX entries reached in a mode that does not give them to the reader.
 //
 // **Assumptions**, where the datasheet does not say: SM_RESTART leaves the output shift register empty
 // (count 32) and the input one empty (count 0); an OUT that finds the OSR empty under autopull stalls
@@ -302,6 +302,46 @@ struct Pio
     fault: string
     // OUT EXEC or MOV EXEC ran this cycle: its own delay is not taken.
     drop_delay: bool
+    // Since the chip last looked, each block's pins that changed level or direction, in its own
+    // numbering, and the cycle at whose end the last of them did (`advance_to` stops there).
+    moved: [3]u32
+    pins_moved: bool
+    moved_at: u64
+    // A state machine has run, so the chip keeps `levels` current; until then nothing reads them.
+    listening: bool
+    // Some block has had an interrupt enabled, so its lines can be up; until then all are low.
+    irq_armed: bool
+
+    /** Whether any state machine is enabled, or has an instruction the system wrote to run. */
+    live(*self) -> bool
+        if self.running then return true
+        for b in 0u32..<PIO_BLOCKS do if self.blocks[b].enabled != 0 then return true
+        false
+
+    /** The levels on GPIO 0–47 have stood at `levels` for as long as anything can look back. */
+    settle_levels(*self, levels: u64)
+        self.levels = [levels, levels, levels]
+        self.since = [0, 0, 0]
+
+    /** The next cycle on which anything is due to run, or NEVER. */
+    next_wake(*self) -> u64
+        var w = NEVER
+        for b in 0u32..<PIO_BLOCKS
+            w = min(w, self.blocks[b].recompose_at)
+            for s in 0u32..<PIO_SMS do w = min(w, self.blocks[b].sms[s].wake)
+        w
+
+    /** Whether any block's interrupt line could rise: one with something enabled. */
+    irq_enabled(*self) -> bool
+        for b in 0u32..<PIO_BLOCKS do if self.blocks[b].inte[0] | self.blocks[b].inte[1] != 0 then return true
+        false
+
+    /** DMA request `sel` (TREQ_SEL 0–23: eight per block, TX FIFO 0–3 then RX FIFO 0–3): a TX FIFO
+     * asks while it is not full, an RX FIFO while it is not empty.
+     */
+    dreq(*self, sel: u32) -> bool
+        val m = &self.blocks[sel / 8].sms[sel % 4]
+        if sel % 8 < 4 then !m.tx_full() else !m.rx_empty()
 
     /** Power-on for block `b` at cycle `now` (its RESETS bit). */
     reset_block(*self, b: u32, now: u64)
@@ -417,18 +457,18 @@ struct Pio
             if is && !was then self.start(b, s, now)
             if was && !is then self.stop(b, s, now)
 
-    /** Run every state machine to the end of clk_sys cycle `t`. */
+    /** Run every state machine to the end of clk_sys cycle `t`, or of the first cycle that moves a pin
+     * (`pins_moved`), which the caller carries to what reads it before running on.
+     */
     advance_to(*self, t: u64)
         while self.running
-            var w = NEVER
-            for b in 0u32..<PIO_BLOCKS
-                w = min(w, self.blocks[b].recompose_at)
-                for s in 0u32..<PIO_SMS do w = min(w, self.blocks[b].sms[s].wake)
+            val w = self.next_wake()
             if w == NEVER
                 self.running = false
                 break
             if w > t then break
             self.cycle(w)
+            if self.pins_moved then break
 
     // Clk_sys cycle `w`: each state machine with something to do then does it, in block and state
     // machine order; each block then drives its pins, and the IRQ flags change.
@@ -456,6 +496,8 @@ struct Pio
     // asserted again by a state machine that made none.
     private compose(*self, b: u32, w: u64)
         val k = &self.blocks[b]
+        val out = k.pad_out
+        val oe = k.pad_oe
         var wrote = false
         var sticky = false
         for s in 0u32..<PIO_SMS
@@ -471,6 +513,11 @@ struct Pio
                 apply_write(k, m.sticky)
             if m.sticky.mask != 0 then sticky = true
         k.recompose_at = if wrote && sticky then w + 1 else NEVER
+        val changed = (k.pad_out ^ out) | (k.pad_oe ^ oe)
+        if changed != 0
+            self.moved[b] |= changed
+            self.pins_moved = true
+            self.moved_at = w
 
     // State machine `s` of block `b` on cycle `w`, one of its divider's: the instruction it is due to
     // try, then an autopull refill where the OSR is empty and the TX FIFO is not.
@@ -978,9 +1025,13 @@ struct Pio
             reg.IRQ_FORCE_OFFSET -> self.blocks[b].irq |= triggered(offset, data) & 0xff
             reg.INPUT_SYNC_BYPASS_OFFSET -> self.blocks[b].sync_bypass = written(self.blocks[b].sync_bypass, offset, data)
             reg.GPIOBASE_OFFSET -> self.blocks[b].gpiobase = written(self.blocks[b].gpiobase, offset, data) & reg.GPIOBASE_GPIOBASE_MASK
-            reg.IRQ0_INTE_OFFSET -> self.blocks[b].inte[0] = written(self.blocks[b].inte[0], offset, data) & 0xffff
+            reg.IRQ0_INTE_OFFSET ->
+                self.blocks[b].inte[0] = written(self.blocks[b].inte[0], offset, data) & 0xffff
+                if self.blocks[b].inte[0] != 0 then self.irq_armed = true
             reg.IRQ0_INTF_OFFSET -> self.blocks[b].intf[0] = written(self.blocks[b].intf[0], offset, data) & 0xffff
-            reg.IRQ1_INTE_OFFSET -> self.blocks[b].inte[1] = written(self.blocks[b].inte[1], offset, data) & 0xffff
+            reg.IRQ1_INTE_OFFSET ->
+                self.blocks[b].inte[1] = written(self.blocks[b].inte[1], offset, data) & 0xffff
+                if self.blocks[b].inte[1] != 0 then self.irq_armed = true
             reg.IRQ1_INTF_OFFSET -> self.blocks[b].intf[1] = written(self.blocks[b].intf[1], offset, data) & 0xffff
             reg.FSTAT_OFFSET | reg.FLEVEL_OFFSET | reg.DBG_PADOUT_OFFSET | reg.DBG_PADOE_OFFSET | reg.DBG_CFGINFO_OFFSET | reg.INTR_OFFSET | reg.IRQ0_INTS_OFFSET | reg.IRQ1_INTS_OFFSET -> ()
             _ ->

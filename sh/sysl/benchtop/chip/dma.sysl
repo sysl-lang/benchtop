@@ -2,6 +2,7 @@ module sh.sysl.benchtop.chip
 
 import sh.sysl.benchtop.peripheral.rp2040.{DMA_READ_ERROR, DMA_WRITE_ERROR, DmaFault, NO_CHANNEL, TREQ_PERMANENT, TREQ_TIMER0}
 import sh.sysl.benchtop.peripheral.rp2350.{DREQ_UART0_TX, XIP_BASE, XIP_WINDOWS_END, treq_name}
+import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
 import sysl.fmt.hex
 import sysl.math.{max, min}
@@ -55,6 +56,8 @@ private enum Moved
     BusError
     Refused(why: string)
 
+// TREQ_SEL below this is a PIO FIFO's request.
+private const PIO_TREQS: u32 = 24
 // The SIO and the cores' private peripheral bus, neither on the DMA's bus.
 private const SIO_FIRST: u32 = 0xD0000000
 // What the DMA master needs of a device's ACCESSCTRL register: its master bit (DMA) and Secure privileged.
@@ -73,7 +76,7 @@ impl Rp2350
             val used = self.dma_run(left)
             var step = left
             if used < left && self.dma.busy != 0
-                step = self.line_due() match
+                step = earliest(self.line_due(), self.pio_paced_due()) match
                     Some(n) -> max(max(used, 1), min(left, n))
                     None -> left
             self.advance_devices(step)
@@ -116,6 +119,9 @@ impl Rp2350
         val treq = self.dma.ch[k].treq
         if treq == TREQ_PERMANENT then return true
         if treq >= TREQ_TIMER0 then return self.dma.ch[k].credit > 0
+        if treq < PIO_TREQS
+            if self.pio.running then self.pio_catch_up()
+            return self.pio.dreq(treq)
         self.uart_dreq(treq) match
             Some(level) -> level
             None -> false
@@ -213,6 +219,23 @@ impl Rp2350
             val c = self.dma.ch[k]
             if c.en && c.treq < TREQ_TIMER0 && self.dma_ready(k) then return Some(1)
         self.dma.completion_due(self.now)
+
+    // Whether a busy, enabled channel is paced by a PIO FIFO's request.
+    private[chip] dma_on_pio(*self) -> bool
+        var b = self.dma.busy
+        while b != 0
+            val c = b.trailing_zeros()
+            b &= b - 1
+            if self.dma.ch[c].en && self.dma.ch[c].treq < PIO_TREQS then return true
+        false
+
+    // The clk_sys cycles until a state machine next acts, where a channel waits on a PIO FIFO's request
+    // and so has to look again then; None where none does, or no state machine has anything to do.
+    private pio_paced_due(*self) -> Option[u64]
+        if !self.pio.running || !self.dma_on_pio() then return None
+        val w = self.pio.next_wake()
+        if w == NEVER then return None
+        Some(if w > self.now then w - self.now else 1)
 
     // Whether a busy, enabled channel is paced by UART `k`'s TX request: the DMA still has characters to
     // give it.

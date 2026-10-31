@@ -42,6 +42,7 @@ import sh.sysl.rp2350.usb as usb_reg
 import sh.sysl.rp2350.usb_device_dpram as usb_dpram_reg
 import sh.sysl.rp2350.watchdog as watchdog_reg
 import sh.sysl.rp2350.xosc as xosc_reg
+import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
 import sysl.math.min
 
@@ -82,6 +83,22 @@ const UART0_IRQ: u32 = 33
 const UART1_IRQ: u32 = 34
 const USBCTRL_IRQ: u32 = 14
 const DMA_IRQ_0: u32 = 10
+const PIO0_IRQ_0: u32 = 15
+// FUNCSEL for PIO0; PIO1 and PIO2 follow.
+private const PIO_FUNCSEL: u32 = 6
+
+/** A level a PIO block gave a GPIO: the clk_sys cycle at whose end it took effect. */
+struct PinEdge
+    cycle: u64
+    gpio: u32
+    level: bool
+
+// The clk_sys cycle, from `start`, on which `units` quarter clk_peri cycles have passed, `rest` being the
+// remainder carried into the first (`advance_lines`).
+private line_time(start: u64, units: u64, rest: u64, peri: u64, sys: u64) -> u64
+    val need = u128(units) * u128(sys) / u128(UART_UNITS_PER_CYCLE)
+    if need <= u128(rest) then return start
+    start + u64((need - u128(rest) + u128(peri) - 1) / u128(peri))
 
 /** A GPIO with no wire (`Rp2350.wire`). */
 const NO_WIRE: u8 = 0xFF
@@ -269,6 +286,11 @@ struct Rp2350
     // reaches it (`connect_memory`).
     dma: Dma
     memory: Option[*DmaMemory]
+    // What the PIO blocks have done to the GPIOs `capture_edges` asks after: which those are, the level
+    // each last had, and each change.
+    edge_mask: u64
+    edge_levels: u64
+    pin_edges: Buf[PinEdge]
 
     /** Power-on, with core 1 in the boot ROM; the flash keeps its array, as the board's part, and the
      * board's memory stays connected.
@@ -355,6 +377,7 @@ struct Rp2350
     private advance_lines(*self, cycles: u64, sys: u64)
         val peri = self.clocks.peri_hz(self.sources())
         if peri == 0 then return
+        val rest = self.peri_rest
         // A device access every few cycles (a core polling UARTFR) comes here each time: 64-bit
         // arithmetic wherever the product fits, which is all but a sleep of hours.
         var left: u64 = 0
@@ -366,16 +389,28 @@ struct Rp2350
             val total = u128(self.peri_rest) + u128(cycles) * u128(peri)
             left = u64(total / u128(sys)) * UART_UNITS_PER_CYCLE
             self.peri_rest = u64(total % u128(sys))
-        // Most steps end before any event: the counts go down and nothing else happens.
-        if left < self.uarts[0].until_event() && left < self.uarts[1].until_event()
+        // Most steps end before any event: the counts go down and nothing else happens. A PIO block
+        // reads the lines' levels, so while one listens each bit is an event too.
+        val listening = self.pio.listening
+        if !listening && left < self.uarts[0].until_event() && left < self.uarts[1].until_event()
             self.uarts[0].pass(left)
             self.uarts[1].pass(left)
             return
+        val start = self.now - cycles
+        var used: u64 = 0
         while left > 0
-            val step = min(left, min(self.uarts[0].until_event(), self.uarts[1].until_event()))
+            var step = min(left, min(self.uarts[0].until_event(), self.uarts[1].until_event()))
+            var edge = start
+            if listening
+                step = min(step, min(self.uarts[0].until_bit(), self.uarts[1].until_bit()))
+                edge = line_time(start, used + step, rest, peri, sys)
+                // The blocks run with the old level up to the cycle before the new one.
+                if edge > start && self.pio.running then self.pio_run_to(edge - 1)
+            used += step
             // Both lines move through the step before either frame is delivered: a character arriving at
             // its end starts the receiver's timeout there, not a step earlier.
             val sent = [self.uarts[0].pass(step), self.uarts[1].pass(step)]
+            if listening then self.pio.drive(if edge > start then edge - 1 else start, self.inputs_now())
             for k in 0..<2
                 sent[k] match
                     Some(s) -> self.deliver(k, s)
@@ -471,6 +506,7 @@ struct Rp2350
      * other. A GPIO has one wire.
      */
     wire(*self, a: u32, b: Option[u32])
+        if self.pio.running then self.pio_catch_up()
         val was = self.wires[a]
         if was != NO_WIRE then self.wires[usize(was)] = NO_WIRE
         self.wires[a] = NO_WIRE
@@ -514,11 +550,12 @@ struct Rp2350
             if self.accessctrl.devices[i] & 3 != 0 then bits |= 1 << k
         bits
 
-    /** The levels on GPIO 0–47 as the PIO blocks read them, from the end of this cycle: the PIO's pins
-     * are a vector of their own until item 14 takes them through the mux.
+    /** The levels on GPIO 0–47 as the PIO blocks read them, from the end of this cycle, whatever the pads
+     * say, until a GPIO next changes: a test's way to exercise the state machines by themselves.
      */
     pio_drive(*self, levels: u64)
         self.pio_catch_up()
+        self.pio.listening = true
         self.pio.drive(self.now, levels)
 
     /** PIO block `k`'s pins in its own numbering (GPIOBASE moves them): levels, and output enables. */
@@ -527,16 +564,103 @@ struct Rp2350
         self.pio.pins(k)
 
     // The PIO blocks run to `now`. Nothing outside them sees their state but through the bus, these
-    // hooks and the faults the board collects each quantum, so they run only then, and `advance` pays
-    // nothing for them (item 14's pins, DREQs and interrupts will give them events of their own).
-    // A state machine stopped on something benchtop does not model joins the lines' faults at once.
-    private pio_catch_up(*self)
+    // hooks, the interrupt lines (`signal`) and the faults the board collects each quantum, so they run
+    // only then, and `advance` pays nothing for them; `pio_due` wakes a sleeping board where something
+    // could see them. A state machine stopped on something benchtop does not model joins the lines'
+    // faults at once.
+    private[chip] pio_catch_up(*self)
         if !self.pio.running || self.swcore_off then return
-        self.pio.advance_to(self.now)
+        self.pio_run_to(self.now)
         if self.line_fault.is_empty()
             self.pio.take_fault() match
                 Some(why) -> self.line_fault = why
                 None -> ()
+
+    // The blocks run to cycle `t`, each pin they move carried to what reads it on the cycle it moved.
+    private pio_run_to(*self, t: u64)
+        loop
+            self.pio.advance_to(t)
+            if !self.pio.pins_moved then break
+            self.pio.pins_moved = false
+            self.pio_pins_moved()
+
+    // A block has moved pins at the end of cycle `moved_at`. One the mux gives to it changes what the
+    // GPIO interrupts see and what the blocks themselves read; the rest reach nothing.
+    private pio_pins_moved(*self)
+        var reaches = false
+        for b in 0u32..<3
+            var bits = self.pio.moved[b]
+            self.pio.moved[b] = 0
+            while bits != 0
+                val g = bits.trailing_zeros() + self.pio.blocks[b].gpiobase
+                bits &= bits - 1
+                if g >= GPIO_COUNT || self.io.function(g) != PIO_FUNCSEL + b then continue
+                reaches = true
+                if self.powman_reads(g) && self.line_fault.is_empty() then self.line_fault = s"PIO$b drives GPIO $g, which POWMAN watches: POWMAN samples its GPIOs as time passes, and a level from a PIO block between catch-ups is not modelled"
+                val h = self.wires[g]
+                if h == NO_WIRE || rp.route(u32(h), self.io.function(u32(h))) != rp.Route.UartRx || !self.pads.pin(g, self.drive(g), None).drives then continue
+                if self.line_fault.is_empty() then self.line_fault = s"PIO$b drives GPIO $g, wired to GPIO $h, a UART's RX: a UART receives whole frames from another UART, and a level from a PIO block is not modelled"
+        if !reaches then return
+        self.record_edges(self.pio.moved_at)
+        self.gpio_sample()
+        self.pio.drive(self.pio.moved_at, self.inputs_now())
+
+    // Whether POWMAN reads GPIO `g`: its timer's reference, or a power-up request.
+    private powman_reads(*self, g: u32) -> bool
+        if self.powman.counting() && self.powman.reference_gpio() == Some(g) then return true
+        if !self.powman.watching() then return false
+        for k in 0..<4 do if self.powman.pwrup_gpio(k) == Some(g) then return true
+        false
+
+    // PIO block `k`'s drive on GPIO `n`, which GPIOBASE may leave outside its 32 pins.
+    private pio_output(*self, k: u32, n: u32) -> Drive
+        val b = &self.pio.blocks[k]
+        if n < b.gpiobase || n - b.gpiobase >= 32 then return Drive(false, false)
+        val bit = 1u32 << (n - b.gpiobase)
+        Drive(b.pad_out & bit != 0, b.pad_oe & bit != 0)
+
+    /** Record each level the PIO blocks give the GPIOs of `mask` (bit n for GPIO n) from now on, with the
+     * cycle at whose end it changed: a logic analyser on the pins (`pin_edges`).
+     */
+    capture_edges(*self, mask: u64)
+        self.pio_catch_up()
+        self.edge_mask = mask
+        self.edge_levels = 0
+        for n in 0..<GPIO_COUNT do if self.pin(n).level then self.edge_levels |= 1u64 << n
+
+    private record_edges(*self, w: u64)
+        var bits = self.edge_mask
+        while bits != 0
+            val n = u32(bits.trailing_zeros())
+            bits &= bits - 1
+            val bit = 1u64 << n
+            val level = self.pin(n).level
+            if level == (self.edge_levels & bit != 0) then continue
+            self.edge_levels ^= bit
+            self.pin_edges.push(PinEdge(w, n, level))
+
+    // Something outside the block may see the pins of a sleeping board: an enabled interrupt line, a DMA
+    // channel waiting on a FIFO, a GPIO interrupt or power-up request on a pin a block drives.
+    private pio_watched(*self) -> bool
+        if self.pio.irq_armed && self.pio.irq_enabled() then return true
+        if self.dma.busy != 0 && self.dma_on_pio() then return true
+        if self.powman.watching() then return true
+        for g in 0u32..<GPIO_COUNT
+            val f = self.io.function(g)
+            if f < PIO_FUNCSEL || f > PIO_FUNCSEL + 2 then continue
+            if self.io.irq.watched(g) then return true
+            val h = self.wires[g]
+            if h != NO_WIRE && self.io.irq.watched(u32(h)) then return true
+        false
+
+    // The clk_sys cycles until a state machine next acts, where something is watching: a free-running
+    // block nobody can see stays lazy, however tight its loop.
+    private pio_due(*self) -> Option[u64]
+        if !self.pio.running || !self.pio_watched() then return None
+        self.pio_catch_up()
+        val w = self.pio.next_wake()
+        if w == NEVER then return None
+        Some(if w > self.now then w - self.now else 1)
 
     /** DMA request `dreq` as the UARTs drive it (the SDK's `DREQ_UART0_TX` to `DREQ_UART1_RX`); None for
      * a request that is not a UART's.
@@ -572,7 +696,7 @@ struct Rp2350
             self.sio.mtime_due(k) match
                 Some(n) -> due = earliest(due, if self.sio.mtime_full_speed() then Some(n) else self.ticks_to_cycles(Tick.Riscv, n))
                 None -> ()
-        earliest(earliest(due, self.line_due()), self.dma_due())
+        earliest(earliest(earliest(due, self.line_due()), self.dma_due()), self.pio_due())
 
     // The clk_sys cycles until generator `g`'s `n`th tick from now, rounded up; None while it is
     // stopped.
@@ -597,7 +721,9 @@ struct Rp2350
             Timer0 -> self.timers[0].read(o, width)
             Timer1 -> self.timers[1].read(o, width)
             Watchdog -> self.watchdog.read(o, width)
-            IoBank0 -> self.io.read(o, width, self.pins(), self.drives())
+            IoBank0 ->
+                if self.pio.running then self.pio_catch_up()
+                self.io.read(o, width, self.pins(), self.drives())
             PadsBank0 -> self.pads.read(o, width)
             Uart0 -> self.uarts[0].read(o, width)
             Uart1 -> self.uarts[1].read(o, width)
@@ -635,6 +761,7 @@ struct Rp2350
         val (p, o) = self.placed(a)?
         val got = p.block match
             Resets ->
+                if self.pio.running then self.pio_catch_up()
                 val before = self.resets.held
                 val r = self.resets.write(o, width, x)
                 self.reset_blocks(self.resets.held & ~before)
@@ -673,10 +800,12 @@ struct Rp2350
                 self.io.unmodelled(o, width, x) match
                     Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
                     None -> ()
+                if self.pio.running then self.pio_catch_up()
                 val r = self.io.write(o, width, x)
                 self.gpio_changed()
                 r
             PadsBank0 ->
+                if self.pio.running then self.pio_catch_up()
                 val r = self.pads.write(o, width, x)
                 self.gpio_changed()
                 r
@@ -684,8 +813,18 @@ struct Rp2350
             Uart1 -> return self.uart_write(1, p, o, width, x)
             Pio0 | Pio1 | Pio2 ->
                 self.pio_catch_up()
-                return self.pio.write(pio_index(p.block), self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
+                val k = pio_index(p.block)
+                val base = self.pio.blocks[k].gpiobase
+                val r = self.pio.write(k, self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
+                // The first state machine to run starts the blocks reading the GPIOs, which have been
+                // at these levels all along.
+                if !self.pio.listening && self.pio.live()
+                    self.pio.listening = true
+                    self.pio.settle_levels(self.inputs_now())
+                if self.pio.blocks[k].gpiobase != base then self.gpio_changed()
+                return r
             Sio ->
+                if self.pio.running then self.pio_catch_up()
                 val r = self.sio.write(core, o, width, x)
                 if o & 0xFFC >= sio_reg.GPIO_OUT_OFFSET && o & 0xFFC <= sio_reg.GPIO_HI_OE_XOR_OFFSET then self.gpio_changed()
                 r
@@ -918,6 +1057,7 @@ struct Rp2350
      * is down.
      */
     drive_from_outside(*self, n: u32, level: Option[bool])
+        if self.pio.running then self.pio_catch_up()
         val bit = 1u64 << u64(n)
         level match
             Some(v) ->
@@ -1006,6 +1146,11 @@ struct Rp2350
                 PadsQspi -> self.pads_qspi.reset()
                 DmaBlock -> self.dma.reset()
                 _ -> ()
+        // A block's reset lets go of its pins.
+        if asserted & (resets_reg.RESET_PIO0_MASK | resets_reg.RESET_PIO1_MASK | resets_reg.RESET_PIO2_MASK) != 0
+            self.pio.pins_moved = false
+            self.pio.moved = [0, 0, 0]
+            self.gpio_changed()
 
     // A write to UART `k`, refused where it asks for something benchtop does not model: a setting
     // (`Uart.unmodelled`), a character to send with no divisor to time it, or a frame its pins cannot show.
@@ -1014,6 +1159,7 @@ struct Rp2350
         self.uarts[k].unmodelled(o, width, x) match
             Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
             None -> ()
+        if self.pio.running then self.pio_catch_up()
         val before = self.uarts[k]
         self.uarts[k].write(o, width, x).map_err(e -> refusal(p, o, e))?
         if self.uarts[k].unclocked()
@@ -1025,6 +1171,8 @@ struct Rp2350
                     self.uarts[k] = before
                     return Err(s"${p.name} + 0x${hex(o)}: $why")
                 None -> ()
+        // A frame starting, a break: the line's level, which the PIO blocks read.
+        if self.pio.listening then self.pio.drive(self.now, self.inputs_now())
         Ok(())
 
     /** What the producer FUNCSEL routes to GPIO `n` drives it with, after CTRL's overrides. */
@@ -1034,6 +1182,9 @@ struct Rp2350
             // A UART's TX drives its line: high while idle, a frame's bits, low through a break.
             UartTx -> Drive(self.uarts[uart_of(n)].line_level(), true)
             UartRx | Null -> Drive(false, false)
+            Pio0 -> self.pio_output(0, n)
+            Pio1 -> self.pio_output(1, n)
+            Pio2 -> self.pio_output(2, n)
         self.io.after_overrides(n, d)
 
     /** What GPIO `n` is doing: whether its pad drives, and its level. Something outside drives it, or
@@ -1059,6 +1210,11 @@ struct Rp2350
 
     // GPIO_IN: what the SIO reads of each GPIO, its pad's input after INOVER, bit n for GPIO n.
     private[chip] inputs(*self) -> u64
+        if self.pio.running then self.pio_catch_up()
+        self.inputs_now()
+
+    // The same, with the PIO blocks where they stand.
+    private inputs_now(*self) -> u64
         var bits: u64 = 0
         for n in 0..<GPIO_COUNT do if self.io.peripheral_input(n, self.pin(n).input) then bits |= 1u64 << n
         bits
@@ -1071,14 +1227,24 @@ struct Rp2350
 
     /** Something that decides a GPIO's level may have changed (a function, an override, a pad, the SIO,
      * or what drives it from outside): the GPIO interrupts sample their inputs again, latching each
-     * edge, except while RESETS holds IO_BANK0. A dormant-wake interrupt wakes a dormant ROSC.
+     * edge, except while RESETS holds IO_BANK0. A dormant-wake interrupt wakes a dormant ROSC. The PIO
+     * blocks read the new levels from the end of this cycle.
      */
     gpio_changed(*self)
+        if self.pio.running then self.pio_catch_up()
+        self.gpio_sample()
+        if self.pio.listening then self.pio.drive(self.now, self.inputs_now())
+
+    private gpio_sample(*self)
         self.io.irq.sample(self.irq_inputs(), self.resets.held & resets_reg.RESET_IO_BANK0_MASK == 0)
         if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
 
     /** Drive `p`'s interrupt inputs from the devices' levels. */
     signal(*self, p: *Processor)
+        if self.pio.running then self.pio_catch_up()
+        if self.pio.irq_armed
+            for b in 0u32..<3
+                for j in 0u32..<2 do p.interrupt(PIO0_IRQ_0 + 2 * b + j, self.pio.irq_line(b, j))
         val k = p.number()
         for i in 0u32..<2
             val lines = self.timers[i].irqs()
@@ -1101,7 +1267,7 @@ rp2350() -> Rp2350 =
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.pio(), rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
         rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), false,
-        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None)
+        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None, 0, 0, buf())
 
 // The chip as `ArmBoard` drives it: its inherent methods under the trait's names.
 impl ArmChip for Rp2350
