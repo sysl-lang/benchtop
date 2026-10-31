@@ -1,0 +1,562 @@
+module sh.sysl.benchtop.peripheral.rp2040
+
+import sh.sysl.rp2040.dma as reg40
+import sysl.fmt.hex
+import sysl.math.min
+
+// The DMA's registers and channels, shared by the RP2040 (12 channels, two IRQ lines) and the RP2350 (16
+// channels, four) through a `DmaLayout`: where each chip keeps CTRL's fields, how many channels and
+// lines it has, and whether it has the RP2350's additions (TRANS_COUNT.MODE, the INCR_*_REV bits, the
+// SECCFG and MPU registers). Datasheet-level truth is the field descriptions of the SDK's
+// `hardware/regs/dma.h` for each chip.
+//
+// **This file is the registers and the channels' state; the chip moves the data** (`chip/dma.sysl`):
+// it asks which channel goes next, reads and writes through its own bus, and reports back
+// (`transferred`, `bus_error`). A channel is triggered by a write to its trigger register (the last of
+// each alias set), by MULTI_CHAN_TRIGGER, by the channel chaining to it, or by itself (MODE
+// TRIGGER_SELF). A trigger starts a channel that is enabled and not busy, loading the live count from the
+// RELOAD value TRANS_COUNT last took; one that is disabled or busy ignores it. Writing 0 to a trigger
+// register is a null trigger: nothing starts, and a channel with IRQ_QUIET raises its interrupt.
+//
+// **Pacing**: TREQ_SEL 0x3f transfers whenever the DMA is free; 0x3b to 0x3e are the four X/Y pacing
+// timers, each a request every Y/X clk_sys cycles on average (one per cycle at most), counted per
+// channel in its DBG_CTDREQ while the channel is busy (at most 63); any other value is a device's
+// DREQ, a level the chip reads (`Rp2350.uart_dreq`). A TREQ_SEL whose source the chip does not drive is
+// refused by name (`modelled`).
+//
+// Refused by name: the sniffer (SNIFF_CTRL set, CTRL.SNIFF_EN, a SNIFF_DATA write: rp-coverage item 12),
+// a change to SECCFG_* or MPU_* (item 12; they read their reset values), the reserved DATA_SIZE and MODE
+// values, a pacing timer with Y 0 and X not, and a trigger that would start a channel with a count of 0.
+//
+// Assumptions, where the headers do not say: CHAN_ABORT stops the channel at once, with no interrupt and
+// no chain; a trigger to a busy channel is ignored (as MULTI_CHAN_TRIGGER's description says); a write to
+// a pacing timer restarts its fraction.
+
+/** CTRL's error flags, at the same place on both chips; READ_ERROR and WRITE_ERROR are write-1-to-clear. */
+const DMA_AHB_ERROR: u32 = 0x80000000
+const DMA_READ_ERROR: u32 = 0x40000000
+const DMA_WRITE_ERROR: u32 = 0x20000000
+/** TREQ_SEL's pacing timers and the permanent request, on both chips. */
+const TREQ_TIMER0: u32 = 0x3b
+const TREQ_PERMANENT: u32 = 0x3f
+/** No channel. */
+const NO_CHANNEL: u32 = 0xFF
+/** The most channels either chip has. */
+const DMA_CHANNELS_MAX: usize = 16
+
+// TRANS_COUNT.MODE (RP2350).
+private const MODE_MASK: u32 = 0xF0000000
+private const MODE_NORMAL: u32 = 0
+private const MODE_TRIGGER_SELF: u32 = 1
+private const MODE_ENDLESS: u32 = 15
+// DBG_CTDREQ is six bits.
+private const CREDIT_MAX: u64 = 63
+
+// The registers after the channels, at the RP2350's offsets; an RP2040 offset from TIMER0 on is 0x20
+// lower (`canonical`).
+private const INTR: u32 = 0x400
+private const IRQ_FIRST: u32 = 0x404
+private const TIMER0: u32 = 0x440
+private const MULTI_CHAN_TRIGGER: u32 = 0x450
+private const SNIFF_CTRL: u32 = 0x454
+private const SNIFF_DATA: u32 = 0x458
+private const FIFO_LEVELS: u32 = 0x460
+private const CHAN_ABORT: u32 = 0x464
+private const N_CHANNELS: u32 = 0x468
+private const SECCFG_CH0: u32 = 0x480
+private const SECCFG_IRQ0: u32 = 0x4c0
+private const SECCFG_MISC: u32 = 0x4d0
+private const MPU_CTRL: u32 = 0x500
+private const MPU_BAR0: u32 = 0x504
+private const MPU_LAR7: u32 = 0x540
+private const DBG_FIRST: u32 = 0x800
+// SECCFG's reset values: each channel and IRQ Secure and privileged, every MISC bit set.
+private const SECCFG_RESET: u32 = 3
+private const SECCFG_MISC_RESET: u32 = 0x3ff
+
+/** Where a chip's DMA keeps CTRL's fields (masks into CTRL), and how many channels and IRQ lines it has. */
+struct DmaLayout
+    name: string
+    channels: u32
+    irq_lines: u32
+    // TRANS_COUNT.MODE, the INCR_*_REV bits, SECCFG and the MPU.
+    rp2350: bool
+    busy: u32
+    sniff: u32
+    bswap: u32
+    quiet: u32
+    treq: u32
+    chain: u32
+    ring_sel: u32
+    ring_size: u32
+    write_rev: u32
+    incr_write: u32
+    read_rev: u32
+    incr_read: u32
+    size: u32
+    high: u32
+    en: u32
+    count: u32
+
+/** The RP2040's DMA: 12 channels, IRQ 0 and 1. */
+val RP2040_DMA: DmaLayout = DmaLayout("RP2040", 12, 2, false, reg40.CH0_CTRL_TRIG_BUSY_MASK, reg40.CH0_CTRL_TRIG_SNIFF_EN_MASK,
+    reg40.CH0_CTRL_TRIG_BSWAP_MASK, reg40.CH0_CTRL_TRIG_IRQ_QUIET_MASK, reg40.CH0_CTRL_TRIG_TREQ_SEL_MASK,
+    reg40.CH0_CTRL_TRIG_CHAIN_TO_MASK, reg40.CH0_CTRL_TRIG_RING_SEL_MASK, reg40.CH0_CTRL_TRIG_RING_SIZE_MASK, 0,
+    reg40.CH0_CTRL_TRIG_INCR_WRITE_MASK, 0, reg40.CH0_CTRL_TRIG_INCR_READ_MASK, reg40.CH0_CTRL_TRIG_DATA_SIZE_MASK,
+    reg40.CH0_CTRL_TRIG_HIGH_PRIORITY_MASK, reg40.CH0_CTRL_TRIG_EN_MASK, 0xFFFFFFFF)
+
+/** Why the DMA refused a register write. */
+enum DmaFault
+    Access(e: AccessError)
+    Refused(why: string)
+    // Channel `k`'s TREQ_SEL `sel` selects a request the chip does not drive.
+    Treq(k: u32, sel: u32)
+
+/** One channel: its addresses, counts and CTRL, and CTRL decoded for the transfers. */
+struct DmaChannel
+    read_addr: u32
+    write_addr: u32
+    // The transfers left, and TRANS_COUNT as last written: the count a trigger loads, with MODE.
+    count: u32
+    reload: u32
+    // CTRL's stored fields (not BUSY or the error flags), and READ_ERROR and WRITE_ERROR.
+    ctrl: u32
+    errors: u32
+    // The pacing-timer requests counted and not yet used (DBG_CTDREQ).
+    credit: u32
+    // CTRL, decoded: the transfer's size in bytes, each address's step, the ring's mask (0 for none)
+    // and whether it is on the write address, CHAIN_TO, TREQ_SEL, IRQ_QUIET, BSWAP, HIGH_PRIORITY, EN.
+    size: u32
+    read_step: u32
+    write_step: u32
+    ring: u32
+    ring_write: bool
+    chain: u32
+    treq: u32
+    quiet: bool
+    bswap: bool
+    high: bool
+    en: bool
+
+    /** TRANS_COUNT.MODE, as the last write left it (always NORMAL on the RP2040). */
+    mode(self) -> u32 = self.reload >> 28
+
+    /** Where an address steps to from `a`: by `step`, within the ring where `ring` covers it. */
+    next(self, a: u32, step: u32, ring: bool) -> u32 =
+        if ring && self.ring != 0 then (a & ~self.ring) | ((a +% step) & self.ring) else a +% step
+
+/** The DMA block: its channels, interrupts, pacing timers, and the RP2350's stored security registers. */
+struct Dma
+    layout: DmaLayout
+    // The TREQ_SEL values whose source the chip drives, bit n for value n.
+    modelled: u64
+    ch: [DMA_CHANNELS_MAX]DmaChannel
+    // BUSY, bit k for channel k.
+    busy: u32
+    intr: u32
+    inte: [4]u32
+    intf: [4]u32
+    timers: [4]u32
+    // Each pacing timer's fraction, X added per cycle and Y taken per request; and the clk_sys cycle the
+    // timers have been counted to.
+    phase: [4]u64
+    paced_at: u64
+    // The channel the last round of issue ended at.
+    rr: u32
+    sniff_data: u32
+    seccfg_ch: [DMA_CHANNELS_MAX]u32
+    seccfg_irq: [4]u32
+    seccfg_misc: u32
+    mpu_ctrl: u32
+    mpu: [16]u32
+    // Why a trigger the DMA made itself (a chain, or TRIGGER_SELF) was refused; empty for none.
+    fault: string
+
+    /** Power-on, keeping the layout, what the chip drives, and the timers' clock. */
+    reset(*self)
+        val layout = self.layout
+        val modelled = self.modelled
+        val at = self.paced_at
+        *self = dma(layout, modelled)
+        self.paced_at = at
+
+    /** Channel bits that exist. */
+    mask(self) -> u32 = if self.layout.channels >= 32 then ~0u32 else (1u32 << self.layout.channels) - 1
+
+    /** DMA IRQ `n`'s level: (INTR & INTEn) | INTFn. */
+    irq(self, n: u32) -> bool = n < self.layout.irq_lines && ((self.intr & self.inte[n]) | self.intf[n]) != 0
+
+    /** Whether a busy channel is enabled, so that the DMA has work it may do. */
+    running(self) -> bool
+        var b = self.busy
+        while b != 0
+            val k = b.trailing_zeros()
+            b &= b - 1
+            if self.ch[k].en then return true
+        false
+
+    // CTRL as read: the stored fields, BUSY, and the error flags with AHB_ERROR their OR.
+    private ctrl_read(self, k: u32) -> u32
+        val c = self.ch[k]
+        var v = c.ctrl | c.errors
+        if c.errors != 0 then v |= DMA_AHB_ERROR
+        if self.busy & (1u32 << k) != 0 then v |= self.layout.busy
+        v
+
+    // TRANS_COUNT as read: the live count, with MODE as written.
+    private count_read(self, k: u32) -> u32 = (self.ch[k].reload & (if self.layout.rp2350 then MODE_MASK else 0)) | self.ch[k].count
+
+    // An RP2040 offset after the IRQ registers moved to where the RP2350 has the same register.
+    private canonical(self, address: u32) -> u32 =
+        if !self.layout.rp2350 && address >= 0x420 && address < 0x480 then address + 0x20 else address
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val address = offset & 0xFFC
+        val n = self.layout.channels
+        if address < n * 0x40
+            val k = address >> 6
+            val value = channel_register(address) match
+                0 -> self.ch[k].read_addr
+                1 -> self.ch[k].write_addr
+                2 -> self.count_read(k)
+                _ -> self.ctrl_read(k)
+            return Ok(read_lane(value, offset, width))
+        if address >= DBG_FIRST && address < DBG_FIRST + n * 0x40
+            val k = (address - DBG_FIRST) >> 6
+            val value = (address & 0x3F) match
+                0 -> self.ch[k].credit
+                4 -> self.ch[k].reload
+                _ -> return Err(AccessError.Unmapped)
+            return Ok(read_lane(value, offset, width))
+        val a = self.canonical(address)
+        if a == INTR then return Ok(read_lane(self.intr, offset, width))
+        if a > INTR && a < INTR + 0x10 * self.layout.irq_lines
+            val line = (a - IRQ_FIRST) >> 4
+            val value = (a & 0xF) match
+                4 -> self.inte[line]
+                8 -> self.intf[line]
+                0xC -> (self.intr & self.inte[line]) | self.intf[line]
+                _ -> return Err(AccessError.Unmapped)
+            return Ok(read_lane(value, offset, width))
+        if a >= TIMER0 && a < TIMER0 + 16 then return Ok(read_lane(self.timers[(a - TIMER0) >> 2], offset, width))
+        if self.layout.rp2350
+            if a >= SECCFG_CH0 && a < SECCFG_CH0 + 4 * n then return Ok(read_lane(self.seccfg_ch[(a - SECCFG_CH0) >> 2], offset, width))
+            if a >= SECCFG_IRQ0 && a < SECCFG_IRQ0 + 16 then return Ok(read_lane(self.seccfg_irq[(a - SECCFG_IRQ0) >> 2], offset, width))
+            if a == SECCFG_MISC then return Ok(read_lane(self.seccfg_misc, offset, width))
+            if a == MPU_CTRL then return Ok(read_lane(self.mpu_ctrl, offset, width))
+            if a >= MPU_BAR0 && a <= MPU_LAR7 then return Ok(read_lane(self.mpu[(a - MPU_BAR0) >> 2], offset, width))
+        val value = a match
+            MULTI_CHAN_TRIGGER | CHAN_ABORT | SNIFF_CTRL | FIFO_LEVELS -> 0
+            SNIFF_DATA -> self.sniff_data
+            N_CHANNELS -> n
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+    end read
+
+    /** A write of `width` bytes at `offset`. A refused write leaves the DMA as it was: the caller
+     * restores it from a copy, since a refusal can come after part of the write has acted.
+     */
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, DmaFault]
+        access(offset, width, true).map_err(e -> DmaFault.Access(e))?
+        val address = offset & 0xFFC
+        val data = replicated(value, width)
+        val n = self.layout.channels
+        if address < n * 0x40 then return self.channel_write(address >> 6, channel_register(address), address & 0xC == 0xC, offset, data)
+        if address >= DBG_FIRST && address < DBG_FIRST + n * 0x40
+            val k = (address - DBG_FIRST) >> 6
+            (address & 0x3F) match
+                // Any write clears the request count.
+                0 -> self.ch[k].credit = 0
+                4 -> ()
+                _ -> return Err(DmaFault.Access(AccessError.Unmapped))
+            return Ok(())
+        val a = self.canonical(address)
+        val lines = self.layout.irq_lines
+        if a == INTR
+            self.intr = w1c(self.intr, data & self.mask())
+            return Ok(())
+        if a > INTR && a < INTR + 0x10 * lines
+            val line = (a - IRQ_FIRST) >> 4
+            (a & 0xF) match
+                4 -> self.inte[line] = written(self.inte[line], offset, data) & self.mask()
+                8 -> self.intf[line] = written(self.intf[line], offset, data) & self.mask()
+                0xC -> self.intr = w1c(self.intr, data & self.mask())
+                _ -> return Err(DmaFault.Access(AccessError.Unmapped))
+            return Ok(())
+        if a >= TIMER0 && a < TIMER0 + 16
+            val i = (a - TIMER0) >> 2
+            val t = written(self.timers[i], offset, data)
+            if t & 0xFFFF == 0 && t >> 16 != 0 then return Err(DmaFault.Refused(s"TIMER$i with X ${t >> 16} and Y 0: a rate of X/Y with Y 0 is not one the headers give"))
+            self.timers[i] = t
+            self.phase[i] = 0
+            return Ok(())
+        if self.layout.rp2350
+            if a >= SECCFG_CH0 && a < SECCFG_CH0 + 4 * n then return stored_only(&self.seccfg_ch[(a - SECCFG_CH0) >> 2], offset, data, s"SECCFG_CH${(a - SECCFG_CH0) >> 2}")
+            if a >= SECCFG_IRQ0 && a < SECCFG_IRQ0 + 16 then return stored_only(&self.seccfg_irq[(a - SECCFG_IRQ0) >> 2], offset, data, s"SECCFG_IRQ${(a - SECCFG_IRQ0) >> 2}")
+            if a == SECCFG_MISC then return stored_only(&self.seccfg_misc, offset, data, "SECCFG_MISC")
+            if a == MPU_CTRL then return stored_only(&self.mpu_ctrl, offset, data, "MPU_CTRL")
+            if a >= MPU_BAR0 && a <= MPU_LAR7
+                val i = (a - MPU_BAR0) >> 2
+                return stored_only(&self.mpu[i], offset, data, s"MPU_${if i % 2 == 0 then "BAR" else "LAR"}${i / 2}")
+        a match
+            MULTI_CHAN_TRIGGER ->
+                val m = triggered(offset, data) & self.mask()
+                for k in 0..<n do if m & (1u32 << k) != 0 then self.trigger(k).map_err(why -> DmaFault.Refused(why))?
+            CHAN_ABORT -> self.abort(triggered(offset, data) & self.mask())
+            SNIFF_CTRL -> if written(0, offset, data) != 0 then return Err(DmaFault.Refused("SNIFF_CTRL: the sniffer (CRC and sum) is not modelled (rp-coverage item 12)"))
+            SNIFF_DATA -> return Err(DmaFault.Refused("SNIFF_DATA: the sniffer (CRC and sum) is not modelled (rp-coverage item 12)"))
+            FIFO_LEVELS | N_CHANNELS -> ()
+            _ -> return Err(DmaFault.Access(AccessError.Unmapped))
+        Ok(())
+    end write
+
+    // A write to channel `k`'s register `r` (0 READ_ADDR, 1 WRITE_ADDR, 2 TRANS_COUNT, 3 CTRL), through
+    // its trigger alias where `trig`.
+    private channel_write(*self, k: u32, r: u32, trig: bool, offset: u32, data: u32) -> Result[unit, DmaFault]
+        var stored: u32 = 0
+        r match
+            0 ->
+                self.ch[k].read_addr = written(self.ch[k].read_addr, offset, data)
+                stored = self.ch[k].read_addr
+            1 ->
+                self.ch[k].write_addr = written(self.ch[k].write_addr, offset, data)
+                stored = self.ch[k].write_addr
+            2 ->
+                val v = written(self.ch[k].reload, offset, data)
+                if self.layout.rp2350
+                    val mode = v >> 28
+                    if mode != MODE_NORMAL && mode != MODE_TRIGGER_SELF && mode != MODE_ENDLESS then return Err(DmaFault.Refused(s"CH${k} TRANS_COUNT.MODE $mode is reserved"))
+                self.ch[k].reload = v
+                stored = v
+            _ ->
+                // Each 1 written to an error flag clears it, through any alias.
+                self.ch[k].errors = w1c(self.ch[k].errors, data & (DMA_READ_ERROR | DMA_WRITE_ERROR))
+                stored = written(self.ch[k].ctrl, offset, data) & self.writable()
+                self.set_ctrl(k, stored)?
+        if !trig then return Ok(())
+        if stored == 0
+            // A null trigger: the end of a control-block chain.
+            if self.ch[k].quiet then self.intr |= 1u32 << k
+            return Ok(())
+        self.trigger(k).map_err(why -> DmaFault.Refused(why))
+
+    // CTRL's bits software writes: every field but BUSY and the error flags.
+    private writable(self) -> u32
+        val l = self.layout
+        l.sniff | l.bswap | l.quiet | l.treq | l.chain | l.ring_sel | l.ring_size | l.write_rev | l.incr_write | l.read_rev | l.incr_read | l.size | l.high | l.en
+
+    // CTRL takes `v`, decoded; refused where it asks for what is not modelled.
+    private set_ctrl(*self, k: u32, v: u32) -> Result[unit, DmaFault]
+        val l = self.layout
+        val size_code = field(v, l.size)
+        if size_code == 3 then return Err(DmaFault.Refused(s"CH${k} CTRL.DATA_SIZE 3 is reserved"))
+        if v & l.sniff != 0 then return Err(DmaFault.Refused(s"CH${k} CTRL.SNIFF_EN: the sniffer (CRC and sum) is not modelled (rp-coverage item 12)"))
+        val treq = field(v, l.treq)
+        if self.modelled & (1u64 << u64(treq)) == 0 then return Err(DmaFault.Treq(k, treq))
+        val size = 1u32 << size_code
+        val c = &self.ch[k]
+        c.ctrl = v
+        c.size = size
+        c.read_step = step(v & l.incr_read != 0, l.read_rev != 0 && v & l.read_rev != 0, size)
+        c.write_step = step(v & l.incr_write != 0, l.write_rev != 0 && v & l.write_rev != 0, size)
+        val ring_size = field(v, l.ring_size)
+        c.ring = if ring_size == 0 then 0 else (1u32 << ring_size) - 1
+        c.ring_write = v & l.ring_sel != 0
+        c.chain = field(v, l.chain)
+        c.treq = treq
+        c.quiet = v & l.quiet != 0
+        c.bswap = v & l.bswap != 0
+        c.high = v & l.high != 0
+        c.en = v & l.en != 0
+        Ok(())
+
+    /** Start channel `k` where it is enabled and not busy: the live count from RELOAD. Refused (the
+     * reason) where it would start with a count of 0, which the headers give no behaviour for.
+     */
+    trigger(*self, k: u32) -> Result[unit, string]
+        val bit = 1u32 << k
+        val c = &self.ch[k]
+        if !c.en || self.busy & bit != 0 then return Ok(())
+        val count = c.reload & self.layout.count
+        val endless = self.layout.rp2350 && c.mode() == MODE_ENDLESS
+        if count == 0 && !endless then return Err(s"channel $k triggered with TRANS_COUNT 0, which the headers give no behaviour for")
+        c.count = count
+        self.busy |= bit
+        Ok(())
+
+    /** CHAN_ABORT: each channel in `m` stops at once, BUSY clear, its requests forgotten; no interrupt
+     * and no chain.
+     */
+    abort(*self, m: u32)
+        self.busy &= ~m
+        for k in 0..<self.layout.channels do if m & (1u32 << k) != 0 then self.ch[k].credit = 0
+
+    /** Channel `k` has made a transfer: its count goes down (not in ENDLESS mode), and at 0 the sequence
+     * is over: BUSY clears, the interrupt rises (not with IRQ_QUIET), and CHAIN_TO's channel (where it is
+     * another) and, with TRIGGER_SELF, the channel itself are triggered. A paced channel spends a request.
+     */
+    transferred(*self, k: u32)
+        val c = &self.ch[k]
+        if c.treq >= TREQ_TIMER0 && c.treq < TREQ_PERMANENT && c.credit > 0 then c.credit -= 1
+        if self.layout.rp2350 && c.mode() == MODE_ENDLESS then return
+        c.count -= 1
+        if c.count != 0 then return
+        self.busy &= ~(1u32 << k)
+        if !c.quiet then self.intr |= 1u32 << k
+        val chain = c.chain
+        if self.layout.rp2350 && c.mode() == MODE_TRIGGER_SELF then self.chained(k)
+        if chain != k then self.chained(chain)
+
+    // A trigger the DMA makes itself; a refusal is kept for the chip to stop on.
+    private chained(*self, k: u32)
+        if k >= self.layout.channels then return
+        self.trigger(k) match
+            Ok(_) -> ()
+            Err(why) -> if self.fault.is_empty() then self.fault = why
+
+    /** Channel `k` met a bus error: READ_ERROR or WRITE_ERROR (`flag`), the channel halts (BUSY clear)
+     * and its interrupt rises whatever IRQ_QUIET says.
+     */
+    bus_error(*self, k: u32, flag: u32)
+        self.ch[k].errors |= flag
+        self.busy &= ~(1u32 << k)
+        self.intr |= 1u32 << k
+
+    /** Whether channel `k` is paced by a pacing timer, and which. */
+    timer_of(self, k: u32) -> Option[u32] =
+        if self.ch[k].treq >= TREQ_TIMER0 && self.ch[k].treq < TREQ_PERMANENT then Some(self.ch[k].treq - TREQ_TIMER0) else None
+
+    /** The pacing timers run to clk_sys cycle `at`: each request they make counts in every busy channel
+     * they pace.
+     */
+    pace_to(*self, at: u64)
+        if at <= self.paced_at then return
+        val d = at - self.paced_at
+        self.paced_at = at
+        for i in 0u32..<4
+            val x = u64(self.timers[i] >> 16)
+            val y = u64(self.timers[i] & 0xFFFF)
+            if x == 0 || y == 0 then continue
+            var made: u64 = 0
+            if x >= y
+                made = d
+                self.phase[i] = 0
+            else
+                val total = u128(self.phase[i]) + u128(d) * u128(x)
+                made = u64(min(total / u128(y), u128(CREDIT_MAX)))
+                self.phase[i] = u64(total % u128(y))
+            if made == 0 then continue
+            var b = self.busy
+            while b != 0
+                val k = b.trailing_zeros()
+                b &= b - 1
+                if self.timer_of(k) == Some(i) then self.ch[k].credit = u32(min(u64(self.ch[k].credit) + made, CREDIT_MAX))
+    end pace_to
+
+    /** The cycles after `paced_at` until pacing timer `i` makes its `n`th request (n ≥ 1); None where it
+     * makes none.
+     */
+    pulse_in(self, i: u32, n: u64) -> Option[u64]
+        val x = u64(self.timers[i] >> 16)
+        val y = u64(self.timers[i] & 0xFFFF)
+        if x == 0 || y == 0 then return None
+        if x >= y then return Some(n)
+        val need = u128(n) * u128(y) - u128(self.phase[i])
+        Some(u64((need + u128(x) - 1) / u128(x)))
+
+    /** The cycles after `paced_at` until a request arrives for a busy, enabled channel that waits on a
+     * pacing timer with none in hand; None where none waits on one that makes requests.
+     */
+    timer_wait(self) -> Option[u64]
+        var due: Option[u64] = None
+        var b = self.busy
+        while b != 0
+            val k = b.trailing_zeros()
+            b &= b - 1
+            val c = self.ch[k]
+            if !c.en || c.credit != 0 then continue
+            self.timer_of(k) match
+                Some(i) -> due = sooner(due, self.pulse_in(i, 1))
+                None -> ()
+        due
+
+    /** A lower bound on the clk_sys cycles after `now` until a busy channel that is not paced by a
+     * device ends its sequence and raises its interrupt or chains: its count, one transfer a cycle, or
+     * for a timer-paced channel the time its timer takes to make the requests it still needs. None where
+     * none will.
+     */
+    completion_due(self, now: u64) -> Option[u64]
+        var due: Option[u64] = None
+        var b = self.busy
+        while b != 0
+            val k = b.trailing_zeros()
+            b &= b - 1
+            val c = self.ch[k]
+            if !c.en || (self.layout.rp2350 && c.mode() == MODE_ENDLESS) then continue
+            if c.treq == TREQ_PERMANENT
+                due = sooner(due, Some(u64(c.count)))
+                continue
+            self.timer_of(k) match
+                Some(i) ->
+                    val needed = if u64(c.count) > u64(c.credit) then u64(c.count) - u64(c.credit) else 0
+                    if needed == 0
+                        due = sooner(due, Some(u64(c.count)))
+                    else
+                        self.pulse_in(i, needed) match
+                            Some(t) ->
+                                // The last transfer takes the cycle its request arrives in.
+                                val at = self.paced_at + t + 1
+                                due = sooner(due, Some(if at > now then at - now else 1))
+                            None -> ()
+                None -> ()
+        due
+    end completion_due
+end Dma
+
+/** A DMA at power-on with `layout`'s channels, driving the requests in `modelled` (bit n for TREQ_SEL n). */
+dma(layout: DmaLayout, modelled: u64) -> Dma
+    var d: Dma
+    d.layout = layout
+    d.modelled = modelled
+    d.rr = layout.channels - 1
+    d.fault = ""
+    for k in 0..<DMA_CHANNELS_MAX
+        // CTRL's power-on value: every field 0, so byte transfers, DREQ 0, and CHAIN_TO channel 0.
+        d.ch[k].size = 1
+        d.seccfg_ch[k] = SECCFG_RESET
+    for i in 0..<4 do d.seccfg_irq[i] = SECCFG_RESET
+    d.seccfg_misc = SECCFG_MISC_RESET
+    d
+
+// Which of READ_ADDR (0), WRITE_ADDR (1), TRANS_COUNT (2) and CTRL (3) a channel's register at `address`
+// is: alias 0 is READ, WRITE, COUNT, CTRL_TRIG; alias 1 CTRL, READ, WRITE, COUNT_TRIG; alias 2 CTRL,
+// COUNT, READ, WRITE_TRIG; alias 3 CTRL, WRITE, COUNT, READ_TRIG.
+private channel_register(address: u32) -> u32
+    val alias = (address >> 4) & 3
+    val slot = (address >> 2) & 3
+    alias match
+        0 -> slot
+        1 -> [3u32, 0, 1, 2][slot]
+        2 -> [3u32, 2, 0, 1][slot]
+        _ -> [3u32, 1, 2, 0][slot]
+
+// The field of `v` under `mask`, shifted down.
+private field(v: u32, mask: u32) -> u32 = (v & mask) >> mask.trailing_zeros()
+
+// An address's step for INCR and its REV bit: up by the size, down by it with REV, by twice the size
+// with REV and no INCR (RP2350), or none.
+private step(incr: bool, rev: bool, size: u32) -> u32 =
+    if incr && rev then 0 -% size elif incr then size elif rev then 2 * size else 0
+
+// A register item 12 builds: it keeps its value, and a write that would change it is refused.
+private stored_only(r: *u32, offset: u32, data: u32, name: string) -> Result[unit, DmaFault]
+    val v = written(*r, offset, data)
+    if v != *r then return Err(DmaFault.Refused(s"$name = 0x${hex(v)}: the DMA's security attributes and MPU are not modelled (rp-coverage item 12); it keeps 0x${hex(*r)}"))
+    Ok(())
+
+private sooner(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
+    Some(x) -> b match
+        Some(y) -> Some(min(x, y))
+        None -> a
+    None -> b

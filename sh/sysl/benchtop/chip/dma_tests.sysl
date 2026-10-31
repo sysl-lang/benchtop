@@ -1,0 +1,402 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2350.RP2350_DMA
+import sh.sysl.rp2350.accessctrl as ac
+import sh.sysl.rp2350.clocks as clk
+import sh.sysl.rp2350.dma as d
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.uart0 as ur
+import sh.sysl.rp2350.xip_aux as xa
+import sh.sysl.rp2350.xip_ctrl as xc
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+
+// The DMA on the chip (`chip/dma.sysl`): transfers through the chip's bus at one a cycle, timed through
+// `advance` and `next_event`; ring wrap, chaining (a control channel programming another through its
+// alias registers), abort mid-transfer, the pacing timers' rate, UART0 paced by its TX request with its
+// FIFO on and off, priority, BSWAP, bus errors and what is refused by name; then pico-examples'
+// dma/hello_dma (from SRAM and from flash) and dma/control_blocks, and examples/pico2/dma_uart.c, on the
+// Arm board.
+
+private val HELLO_DMA = embed("../../../../examples/pico2/hello_dma.elf")
+private val HELLO_DMA_FLASH = embed("../../../../examples/pico2/hello_dma_flash.elf")
+private val CONTROL_BLOCKS = embed("../../../../examples/pico2/control_blocks.elf")
+private val DMA_UART = embed("../../../../examples/pico2/dma_uart.elf")
+private val DMA_RV_IMAGE = embed("../../../../examples/pico2-riscv/blink.elf")
+private val SRAM = SramMap(0x20000000, 520 * 1024)
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const RAM: u32 = 0x20000000
+
+// 4 KB of SRAM at 0x20000000 for a chip with no board, reached as a board's is.
+private struct TestRam
+    bytes: [4096]u8
+
+impl DmaMemory for TestRam
+    dma_read(*self, a: u32, width: u32) -> Reach
+        if a < RAM || a - RAM >= 4096 then return Reach.Chip
+        var v: u32 = 0
+        for k in 0..<width do v |= u32(self.bytes[a - RAM + k]) << (8 * k)
+        Reach.Done(v)
+
+    dma_write(*self, a: u32, width: u32, x: u32) -> Reach
+        if a < RAM || a - RAM >= 4096 then return Reach.Chip
+        for k in 0..<width do self.bytes[a - RAM + k] = u8.wrap(x >> (8 * k))
+        Reach.Done(0)
+
+impl TestRam
+    word(*self, a: u32) -> u32
+        var v: u32 = 0
+        for k in 0u32..<4 do v |= u32(self.bytes[a - RAM + k]) << (8 * k)
+        v
+
+    set_word(*self, a: u32, x: u32)
+        for k in 0u32..<4 do self.bytes[a - RAM + k] = u8.wrap(x >> (8 * k))
+
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+private ch(k: u32, o: u32) -> u32 = d.BASE + k * 0x40 + o
+private put(value: u32, mask: u32) -> u32 = (value << mask.trailing_zeros()) & mask
+
+// CTRL: transfers of 2^`size` bytes, the addresses incrementing as asked, chaining to `chain`, paced by
+// `treq`, enabled.
+private ctrl(size: u32, incr_read: bool, incr_write: bool, chain: u32, treq: u32) -> u32
+    val l = RP2350_DMA
+    put(size, l.size) | (if incr_read then l.incr_read else 0) | (if incr_write then l.incr_write else 0) | put(chain, l.chain) | put(treq, l.treq) | l.en
+
+// Channel `k` from `from` to `to`, `count` transfers, CTRL `c`, started.
+private start(chip: *Rp2350, k: u32, from: u32, to: u32, count: u32, c: u32)
+    wr(chip, ch(k, d.CH0_READ_ADDR_OFFSET), from)
+    wr(chip, ch(k, d.CH0_WRITE_ADDR_OFFSET), to)
+    wr(chip, ch(k, d.CH0_TRANS_COUNT_OFFSET), count)
+    wr(chip, ch(k, d.CH0_CTRL_TRIG_OFFSET), c)
+
+// The DMA out of reset, with `ram` as the board's memory.
+private released(ram: *TestRam) -> Rp2350
+    var c = rp2350()
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_DMA_MASK | rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK | rr.RESET_UART0_MASK)
+    wr(&c, clk.BASE + clk.CLK_PERI_CTRL_OFFSET, clk.CLK_PERI_CTRL_ENABLE_MASK)
+    c.connect_memory(ram)
+    c
+
+@test("an unpaced channel copies one transfer a clk_sys cycle, BUSY until the last, which raises INTR and DMA_IRQ_0; next_event offers its end")
+chip_dma_copy()
+    var ram: TestRam
+    var c = released(&ram)
+    assert(c.next_event().is_none(), "nothing busy")
+    for i in 0u32..<16 do ram.bytes[i] = u8(0x40 + i)
+    wr(&c, d.BASE + d.INTE0_OFFSET, 1 << 2)
+    start(&c, 2, RAM, RAM + 0x100, 16, ctrl(0, true, true, 2, 0x3f))
+    assert(c.next_event() == Some(16), s"${c.next_event()}")
+    c.advance(10)
+    assert(ram.bytes[0x109] == 0x49 && ram.bytes[0x10A] == 0, "ten bytes in ten cycles")
+    assert(rd(&c, ch(2, d.CH0_CTRL_TRIG_OFFSET)) & d.CH0_CTRL_TRIG_BUSY_MASK != 0 && rd(&c, ch(2, d.CH0_TRANS_COUNT_OFFSET)) == 6)
+    assert(rd(&c, ch(2, d.CH0_READ_ADDR_OFFSET)) == RAM + 10 && rd(&c, ch(2, d.CH0_WRITE_ADDR_OFFSET)) == RAM + 0x10A)
+    assert(c.next_event() == Some(6) && !c.dma.irq(0))
+    c.advance(6)
+    assert(ram.bytes[0x10F] == 0x4F && rd(&c, ch(2, d.CH0_CTRL_TRIG_OFFSET)) & d.CH0_CTRL_TRIG_BUSY_MASK == 0)
+    assert(rd(&c, d.BASE + d.INTR_OFFSET) == 4 && c.dma.irq(0) && !c.dma.irq(1), "channel 2's end on IRQ 0 only")
+    assert(c.next_event().is_none())
+    wr(&c, d.BASE + d.INTS0_OFFSET, 4)
+    assert(!c.dma.irq(0))
+
+@test("word and halfword transfers with BSWAP; INCR_READ_REV counts the read address down")
+chip_dma_sizes_and_bswap()
+    var ram: TestRam
+    var c = released(&ram)
+    ram.set_word(RAM, 0x11223344)
+    ram.set_word(RAM + 4, 0x55667788)
+    start(&c, 0, RAM, RAM + 0x40, 2, ctrl(2, true, true, 0, 0x3f) | RP2350_DMA.bswap)
+    c.advance(2)
+    assert(ram.word(RAM + 0x40) == 0x44332211 && ram.word(RAM + 0x44) == 0x88776655)
+    start(&c, 0, RAM + 6, RAM + 0x80, 4, ctrl(1, true, true, 0, 0x3f) | RP2350_DMA.bswap | RP2350_DMA.read_rev)
+    c.advance(4)
+    // Halfwords read from RAM+6 down: 0x5566, 0x7788, 0x1122, 0x3344, each swapped.
+    assert(ram.word(RAM + 0x80) == 0x88776655 && ram.word(RAM + 0x84) == 0x44332211, s"0x${ram.word(RAM + 0x80)} 0x${ram.word(RAM + 0x84)}")
+    assert(rd(&c, ch(0, d.CH0_READ_ADDR_OFFSET)) == RAM - 2)
+
+@test("ring wrap: a read ring of 8 bytes repeats its two words; a decrementing write ring of 16 bytes wraps back to its top")
+chip_dma_ring()
+    var ram: TestRam
+    var c = released(&ram)
+    ram.set_word(RAM, 0xA)
+    ram.set_word(RAM + 4, 0xB)
+    start(&c, 1, RAM, RAM + 0x200, 6, ctrl(2, true, true, 1, 0x3f) | put(3, RP2350_DMA.ring_size))
+    c.advance(6)
+    for i in 0u32..<6 do assert(ram.word(RAM + 0x200 + 4 * i) == (if i % 2 == 0 then 0xA else 0xB), s"word $i")
+    assert(rd(&c, ch(1, d.CH0_READ_ADDR_OFFSET)) == RAM && rd(&c, ch(1, d.CH0_WRITE_ADDR_OFFSET)) == RAM + 0x218, "the read address wrapped back to its start; the write address did not wrap")
+    for i in 0u32..<6 do ram.set_word(RAM + 0x300 + 4 * i, 0x100 + i)
+    start(&c, 1, RAM + 0x300, RAM + 0x404, 6, ctrl(2, true, true, 1, 0x3f) | put(4, RP2350_DMA.ring_size) | RP2350_DMA.ring_sel | RP2350_DMA.write_rev)
+    c.advance(6)
+    // Writes at 0x404, 0x400, 0x40C, 0x408, 0x404, 0x400: the last four words land over the first two.
+    assert(ram.word(RAM + 0x404) == 0x104 && ram.word(RAM + 0x400) == 0x105 && ram.word(RAM + 0x40C) == 0x102 && ram.word(RAM + 0x408) == 0x103)
+    assert(rd(&c, ch(1, d.CH0_WRITE_ADDR_OFFSET)) == RAM + 0x40C)
+
+@test("chaining: a control channel writes each block's count and READ_ADDR_TRIG into the data channel's alias 3 through a write ring, the data channel chains back, and a null block ends it with IRQ_QUIET's interrupt")
+chip_dma_control_blocks()
+    var ram: TestRam
+    var c = released(&ram)
+    // Three blocks of 2, 3 and 1 words from 0x20000400, 0x20000500, 0x20000600; then the null block.
+    val blocks = [(2u32, RAM + 0x400), (3, RAM + 0x500), (1, RAM + 0x600), (0, 0)]
+    for i in 0u32..<4
+        ram.set_word(RAM + 0x100 + 8 * i, blocks[i].0)
+        ram.set_word(RAM + 0x104 + 8 * i, blocks[i].1)
+    for i in 0u32..<3 do for j in 0u32..<3 do ram.set_word(RAM + 0x400 + 0x100 * i + 4 * j, 0x1000 * (i + 1) + j)
+    // Data channel 5: words to 0x20000800 on, chaining to the control channel 4, quiet.
+    wr(&c, ch(5, d.CH0_WRITE_ADDR_OFFSET), RAM + 0x800)
+    wr(&c, ch(5, d.CH0_AL1_CTRL_OFFSET), ctrl(2, true, true, 4, 0x3f) | RP2350_DMA.quiet)
+    // Control channel 4: two words a block into channel 5's AL3 TRANS_COUNT and READ_ADDR_TRIG, its
+    // write address wrapping on 8 bytes; it chains to nothing.
+    wr(&c, ch(4, d.CH0_READ_ADDR_OFFSET), RAM + 0x100)
+    wr(&c, ch(4, d.CH0_WRITE_ADDR_OFFSET), d.BASE + 5 * 0x40 + d.CH0_AL3_TRANS_COUNT_OFFSET)
+    wr(&c, ch(4, d.CH0_TRANS_COUNT_OFFSET), 2)
+    wr(&c, ch(4, d.CH0_AL1_CTRL_OFFSET), ctrl(2, true, true, 4, 0x3f) | put(3, RP2350_DMA.ring_size) | RP2350_DMA.ring_sel)
+    wr(&c, d.BASE + d.MULTI_CHAN_TRIGGER_OFFSET, 1 << 4)
+    c.advance(100)
+    val got = [ram.word(RAM + 0x800), ram.word(RAM + 0x804), ram.word(RAM + 0x808), ram.word(RAM + 0x80C), ram.word(RAM + 0x810), ram.word(RAM + 0x814), ram.word(RAM + 0x818)]
+    assert(got == [0x1000u32, 0x1001, 0x2000, 0x2001, 0x2002, 0x3000, 0], s"$got")
+    // The data channel is quiet, so its one interrupt is the null trigger's; the control channel raises
+    // its own at each block's end.
+    assert(c.dma.busy == 0 && rd(&c, d.BASE + d.INTR_OFFSET) == (1 << 4) | (1 << 5))
+    assert(c.take_line_fault().is_none())
+
+@test("CHAN_ABORT mid-transfer: the channel stops with its count left, BUSY clear, no interrupt and no chain; what it wrote stays")
+chip_dma_abort()
+    var ram: TestRam
+    var c = released(&ram)
+    for i in 0u32..<100 do ram.set_word(RAM + 4 * i, i + 1)
+    start(&c, 1, RAM + 0x400, RAM + 0x400, 1, ctrl(2, true, true, 1, 0x3f) & ~RP2350_DMA.en)
+    start(&c, 0, RAM, RAM + 0x800, 100, ctrl(2, true, true, 1, 0x3f))
+    c.advance(30)
+    wr(&c, d.BASE + d.CHAN_ABORT_OFFSET, 1)
+    assert(rd(&c, d.BASE + d.CHAN_ABORT_OFFSET) == 0, "nothing in flight to wait for")
+    assert(rd(&c, ch(0, d.CH0_TRANS_COUNT_OFFSET)) == 70 && rd(&c, ch(0, d.CH0_CTRL_TRIG_OFFSET)) & d.CH0_CTRL_TRIG_BUSY_MASK == 0)
+    assert(rd(&c, d.BASE + d.INTR_OFFSET) == 0 && c.dma.busy == 0 && c.next_event().is_none())
+    c.advance(100)
+    assert(ram.word(RAM + 0x800 + 4 * 29) == 30 && ram.word(RAM + 0x800 + 4 * 30) == 0)
+
+@test("a pacing timer's rate: X/Y = 1/10 makes a transfer every tenth cycle, next_event gives the end, and the board sleeps to it")
+chip_dma_pacing_timer()
+    var ram: TestRam
+    var c = released(&ram)
+    for i in 0u32..<20 do ram.set_word(RAM + 4 * i, i + 1)
+    wr(&c, d.BASE + d.TIMER0_OFFSET, (1 << 16) | 10)
+    start(&c, 3, RAM, RAM + 0x400, 20, ctrl(2, true, true, 3, 0x3b))
+    // Requests at cycles 10, 20, … 200; each transfer takes the cycle its request comes in.
+    assert(c.next_event() == Some(201), s"${c.next_event()}")
+    c.advance(10)
+    assert(rd(&c, ch(3, d.CH0_TRANS_COUNT_OFFSET)) == 20, "no request before cycle 10")
+    c.advance(1)
+    assert(rd(&c, ch(3, d.CH0_TRANS_COUNT_OFFSET)) == 19)
+    c.advance(100)
+    assert(rd(&c, ch(3, d.CH0_TRANS_COUNT_OFFSET)) == 9, "one a tenth cycle")
+    assert(c.next_event() == Some(90), s"${c.next_event()}")
+    c.advance(89)
+    assert(c.dma.busy != 0)
+    c.advance(1)
+    assert(c.dma.busy == 0 && ram.word(RAM + 0x400 + 4 * 19) == 20 && rd(&c, d.BASE + d.INTR_OFFSET) == 8)
+    // Half the rate from TIMER1 = 1/20: 5 transfers take 100 cycles.
+    wr(&c, d.BASE + d.TIMER1_OFFSET, (1 << 16) | 20)
+    start(&c, 3, RAM, RAM + 0x400, 5, ctrl(2, true, true, 3, 0x3c))
+    c.advance(100)
+    assert(rd(&c, ch(3, d.CH0_TRANS_COUNT_OFFSET)) == 1)
+    c.advance(1)
+    assert(c.dma.busy == 0)
+
+@test("HIGH_PRIORITY: a high-priority channel takes the DMA before a low one ready at the same time")
+chip_dma_priority()
+    var ram: TestRam
+    var c = released(&ram)
+    start(&c, 0, RAM, RAM + 0x400, 4, ctrl(2, true, true, 0, 0x3f) & ~RP2350_DMA.en)
+    start(&c, 1, RAM, RAM + 0x800, 4, ctrl(2, true, true, 1, 0x3f) | RP2350_DMA.high)
+    // Channel 0's EN set without a trigger: its sequence runs beside channel 1's.
+    wr(&c, ch(0, d.CH0_AL1_CTRL_OFFSET), ctrl(2, true, true, 0, 0x3f))
+    wr(&c, d.BASE + d.MULTI_CHAN_TRIGGER_OFFSET, 1)
+    c.advance(4)
+    assert(c.dma.busy == 1 && rd(&c, ch(0, d.CH0_TRANS_COUNT_OFFSET)) == 4, "channel 1 first")
+    c.advance(4)
+    assert(c.dma.busy == 0)
+
+// UART0 at IBRD 6 (a 960-cycle 8N1 frame at clk_peri = clk_sys), its FIFOs on or off, TX DMA requests on.
+private uart_dma(c: *Rp2350, fifo: bool)
+    wr(c, ur.BASE + ur.UARTIBRD_OFFSET, 6)
+    wr(c, ur.BASE + ur.UARTFBRD_OFFSET, 0)
+    wr(c, ur.BASE + ur.UARTLCR_H_OFFSET, if fifo then 0x70 else 0x60)
+    wr(c, ur.BASE + ur.UARTCR_OFFSET, 0x301)
+    wr(c, ur.BASE + ur.UARTDMACR_OFFSET, ur.UARTDMACR_TXDMAE_MASK)
+
+// Run on next_event alone until UART0 has sent `n` characters: each one, and the cycle it ended at; the
+// number of steps taken.
+private sent_by_events(c: *Rp2350, n: usize) -> (Buf[u8], Buf[u64], usize)
+    var text: Buf[u8] = buf()
+    var at: Buf[u64] = buf()
+    var steps: usize = 0
+    while text.len() < n && steps < 1000
+        val e = c.next_event() match
+            Some(e) -> e
+            None -> break
+        c.advance(e)
+        steps += 1
+        loop
+            c.uarts[0].take() match
+                Some(ch) ->
+                    text.push(ch)
+                    at.push(c.now)
+                None -> break
+    (text, at, steps)
+
+@test("UART0's TX paced by its DREQ: the DMA fills the FIFO, and with the FIFO off feeds the holding register at each frame's end, one frame apart, by next_event alone")
+chip_dma_uart_tx()
+    for fifo in [true, false]
+        var ram: TestRam
+        var c = released(&ram)
+        uart_dma(&c, fifo)
+        for i in 0u32..<5 do ram.bytes[i] = "Hello".bytes[i]
+        wr(&c, d.BASE + d.INTE0_OFFSET, 1)
+        start(&c, 0, RAM, ur.BASE + ur.UARTDR_OFFSET, 5, ctrl(0, true, false, 0, 28))
+        assert(c.next_event() == Some(1), "a channel ready now acts at once")
+        val (text, at, steps) = sent_by_events(&c, 5)
+        assert(from_utf8_lossy(text.view()) == "Hello", from_utf8_lossy(text.view()))
+        for i in 1..<5 do assert(at[i] - at[i - 1] == 960, s"fifo $fifo, character $i: ${at[i] - at[i - 1]}")
+        assert(at[0] <= 961, s"${at[0]}")
+        assert(steps <= 12, s"$steps steps for five frames")
+        assert(c.dma.busy == 0 && c.dma.irq(0))
+        assert(c.next_event().is_none())
+        // The same in one advance, as a running board's quantum passes it: each step ends at a frame's
+        // end, so the holding register is fed there and not at the next call.
+        var ram2: TestRam
+        var once = released(&ram2)
+        uart_dma(&once, fifo)
+        for i in 0u32..<5 do ram2.bytes[i] = "Hello".bytes[i]
+        start(&once, 0, RAM, ur.BASE + ur.UARTDR_OFFSET, 5, ctrl(0, true, false, 0, 28))
+        once.advance(5 * 960 + 1)
+        var all: Buf[u8] = buf()
+        loop
+            once.uarts[0].take() match
+                Some(ch) -> all.push(ch)
+                None -> break
+        assert(from_utf8_lossy(all.view()) == "Hello" && once.dma.busy == 0, s"fifo $fifo: ${from_utf8_lossy(all.view())}")
+
+@test("bus errors: the SIO and a device ACCESSCTRL denies the DMA set READ_ERROR or WRITE_ERROR, halt the channel and raise its interrupt")
+chip_dma_bus_errors()
+    var ram: TestRam
+    var c = released(&ram)
+    start(&c, 0, 0xD0000000, RAM, 4, ctrl(2, false, true, 0, 0x3f) | RP2350_DMA.quiet)
+    c.advance(4)
+    val got = rd(&c, ch(0, d.CH0_CTRL_TRIG_OFFSET))
+    assert(got & 0xC0000000 == 0xC0000000 && got & d.CH0_CTRL_TRIG_BUSY_MASK == 0 && rd(&c, d.BASE + d.INTR_OFFSET) == 1, s"0x$got")
+    assert(rd(&c, ch(0, d.CH0_TRANS_COUNT_OFFSET)) == 4, "nothing transferred")
+    // ACCESSCTRL.UART0 without the DMA's bit.
+    wr(&c, ac.BASE + ac.UART0_OFFSET, 0xACCE0000 | 0xBC)
+    start(&c, 1, RAM, ur.BASE + ur.UARTDR_OFFSET, 1, ctrl(0, false, false, 1, 0x3f))
+    c.advance(1)
+    assert(rd(&c, ch(1, d.CH0_CTRL_TRIG_OFFSET)) & 0xA0000000 == 0xA0000000 && rd(&c, d.BASE + d.INTR_OFFSET) == 3)
+    // XIP_CTRL's reset ACCESSCTRL value (0xB8) leaves the DMA out: a bus error, not a refusal.
+    start(&c, 2, RAM, xc.BASE, 1, ctrl(2, false, false, 2, 0x3f))
+    c.advance(1)
+    assert(rd(&c, ch(2, d.CH0_CTRL_TRIG_OFFSET)) & 0xA0000000 == 0xA0000000)
+    assert(c.take_line_fault().is_none(), "a bus error is modelled, not refused")
+
+@test("refused by name: an unmodelled block, a write to the XIP blocks, an unaligned transfer, a TREQ_SEL with no source, the sniffer; a refused register write leaves the DMA as it was")
+chip_dma_refusals()
+    var ram: TestRam
+    val cases = [
+        (0x40080000u32, RAM, 2u32, "reading 0x40080000"),
+        (RAM, 0x10000100, 2, "flash windows"),
+        (RAM, xa.BASE, 2, "XIP blocks"),
+        (RAM + 2, RAM + 0x100, 2, "not aligned"),
+    ]
+    for (from, to, size, want) in cases
+        var c = released(&ram)
+        start(&c, 0, from, to, 2, ctrl(size, true, true, 0, 0x3f))
+        c.advance(2)
+        c.take_line_fault() match
+            Some(why) -> assert(why.contains("DMA channel 0") && why.contains(want), why)
+            None -> assert(false, s"0x$from to 0x$to was let through")
+        assert(c.dma.busy == 0, "the channel stopped")
+    var c = released(&ram)
+    wr(&c, ch(0, d.CH0_AL1_CTRL_OFFSET), ctrl(2, true, true, 0, 0x3f))
+    c.write(0, ch(0, d.CH0_AL1_CTRL_OFFSET), 4, ctrl(0, false, false, 0, 24)) match
+        Ok(_) -> assert(false, "SPI0's DREQ was let through")
+        Err(why) -> assert(why.contains("SPI0's TX FIFO") && why.contains("does not model"), why)
+    assert(rd(&c, ch(0, d.CH0_AL1_CTRL_OFFSET)) == ctrl(2, true, true, 0, 0x3f), "CTRL as it was")
+    c.write(0, d.BASE + d.SNIFF_CTRL_OFFSET, 4, 1) match
+        Ok(_) -> assert(false, "the sniffer")
+        Err(why) -> assert(why.contains("DMA + 0x454") && why.contains("item 12"), why)
+
+@test("RESETS holding the DMA stops it and puts its registers back to power-on; the DMA's registers are refused while it is held")
+chip_dma_reset()
+    var ram: TestRam
+    var c = released(&ram)
+    start(&c, 0, RAM, RAM + 0x400, 100, ctrl(2, true, true, 0, 0x3f))
+    c.advance(5)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + SET, rr.RESET_DMA_MASK)
+    assert(c.dma.busy == 0 && c.next_event().is_none())
+    assert(c.read(0, ch(0, d.CH0_CTRL_TRIG_OFFSET), 4).is_err())
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_DMA_MASK)
+    assert(rd(&c, ch(0, d.CH0_TRANS_COUNT_OFFSET)) == 0 && rd(&c, ch(0, d.CH0_CTRL_TRIG_OFFSET)) == 0)
+
+// The DMA out of reset on a booted board's chip, channel 0 copying `count` bytes from `from` to `to`
+// unpaced, run to its end.
+private board_copy(c: *Rp2350, from: u32, to: u32, count: u32)
+    wr(c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_DMA_MASK)
+    start(c, 0, from, to, count, ctrl(0, true, true, 0, 0x3f))
+    c.advance(u64(count))
+
+@test("the boards' memory as the DMA reaches it: the boot ROM read and its writes ignored, SRAM written as the cores see it, on the Arm and RISC-V boards; an unpinned XIP_SRAM line is a bus error")
+board_dma_memory()
+    val arm = arm_board(SRAM)
+    arm.boot(HELLO_DMA).unwrap()
+    board_copy(&arm.chip, 0, 0x20070000, 16)
+    for i in 0u32..<16 do assert(arm.mem.ram[0x70000 + i] == u8(rom_read(i, 1)), s"byte $i")
+    board_copy(&arm.chip, 0x20070000, 0x100, 4)
+    assert(rom_read(0x100, 4) == u32(arm.mem.ram[arm.rom_at + 0x100]) | (u32(arm.mem.ram[arm.rom_at + 0x101]) << 8) | (u32(arm.mem.ram[arm.rom_at + 0x102]) << 16) | (u32(arm.mem.ram[arm.rom_at + 0x103]) << 24), "the ROM is unchanged")
+    assert(rd(&arm.chip, ch(0, d.CH0_CTRL_TRIG_OFFSET)) & 0xE0000000 == 0 && arm.chip.take_line_fault().is_none(), "a write to the ROM is no error")
+    board_copy(&arm.chip, 0x20070000, 0x13FFC000, 1)
+    assert(rd(&arm.chip, ch(0, d.CH0_CTRL_TRIG_OFFSET)) & 0xA0000000 == 0xA0000000, "XIP_SRAM with no line pinned")
+    val rv = riscv_board(SRAM)
+    rv.boot(DMA_RV_IMAGE).unwrap()
+    board_copy(&rv.chip, 0, 0x20070000, 16)
+    for i in 0u32..<16 do assert(rv.sram[0x70000 + usize(i)] == u8(rom_read(i, 1)), s"byte $i")
+    board_copy(&rv.chip, 0x20070000, 0x200, 4)
+    assert(rd(&rv.chip, ch(0, d.CH0_CTRL_TRIG_OFFSET)) & 0xE0000000 == 0 && rv.chip.take_line_fault().is_none())
+
+// Run the board until it stops; the console, with what UART0 still held sent.
+private run_to_end(b: &ArmBoard, cycles: u64) -> string
+    val end = b.run(cycles)
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(b.finish_sending(), b.refused)
+    from_utf8_lossy(b.console.view())
+
+@test("pico-examples' dma/hello_dma on the Arm Pico 2, from SRAM and from flash (the DMA reading its source through XIP): the copy it prints")
+arm_hello_dma()
+    for image in [HELLO_DMA, HELLO_DMA_FLASH]
+        val b = arm_board(SRAM)
+        b.boot(image).unwrap()
+        val text = run_to_end(b, 150000000)
+        assert(text == "Hello, world! (from DMA)\r\n", text)
+
+@test("pico-examples' dma/control_blocks on the Arm Pico 2: the gathered words reach UART0 paced by its DREQ, between the two lines the core prints")
+arm_control_blocks()
+    val b = arm_board(SRAM)
+    b.boot(CONTROL_BLOCKS).unwrap()
+    val text = run_to_end(b, 150000000)
+    assert(text == "DMA control block example:\r\nTransferring one word at a time.\nDMA finished.\r\n", text)
+
+@test("examples/pico2/dma_uart.c on the Arm Pico 2: UART0 by DMA with its end as DMA_IRQ_1 in WFI, a pacing timer's rate, a write ring, an abort, a chain")
+arm_dma_uart()
+    val b = arm_board(SRAM)
+    b.boot(DMA_UART).unwrap()
+    val text = run_to_end(b, 150000000)
+    val want = "dma uart\r\n" +
+        "sent by the DMA, paced by UART0's TX request\r\n" +
+        // 46 characters: 33 taken at once (the FIFO's 32 and the one shifting out), the last 13 frames of
+        // 86.8 µs later (1128.5 µs), plus the SDK's own set-up and the interrupt taken at a quantum's end.
+        "irq 1 after 1135 us\r\n" +
+        "200 words at 1/150 took 200 us, last 0x10c7\r\n" +
+        "ring 0x100e 0x100f, write address back at the start\r\n" +
+        "aborted with 80 left, busy 0\r\n" +
+        "chained 0x1000 0x1001 0x100a 0x100b\r\n" +
+        "done\r\n"
+    assert(text == want, text)
