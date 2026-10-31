@@ -8,7 +8,7 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 cmake -S . -B "$work" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$work"
-for prog in hello_adc onboard_temperature hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash hello_world_serial rom_funcs flash_program hello_watchdog rom_crosscheck \
+for prog in hello_adc onboard_temperature hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash hello_world_serial rom_funcs flash_program hello_watchdog rom_crosscheck bus_scan \
         pico_float_test pico_double_test custom_float_funcs_test custom_double_funcs_test; do
     cp "$work/$prog.elf" "$prog.elf"
 done

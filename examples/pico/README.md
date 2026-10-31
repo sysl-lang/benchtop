@@ -18,6 +18,7 @@ end to end:
 | `hello_world_serial.c` | pico-examples' `hello_world/serial` (commit 0d62f75), unchanged, **a flash image**: the boot ROM checks boot2's CRC, runs it, and boot2 enters the image | `Hello, world!` every second of guest time; XIP left reading the flash |
 | `flash_program.c` | pico-examples' `flash/program` (commit 0d62f75), unchanged, a flash image: a sector erased and a page programmed 256 KB in through the ROM's flash functions | every line, and the page in the flash array |
 | `hello_watchdog.c` | pico-examples' `watchdog/hello_watchdog` (commit 0d62f75), unchanged, a flash image: the watchdog's reset boots it again through the ROM | `Clean boot`, the five updates, then `Rebooted by Watchdog!` |
+| `bus_scan.c` | pico-examples' `i2c/bus_scan` (commit 0d62f75), unchanged: I2C0 on GPIO 4 and 5 at 100 kHz reads one byte from every address that is not reserved | the table, `@` at 0x68 for the DS3231 the test puts on GPIO 4 and 5 (`chip/i2c_tests.sysl`) |
 | `sdk_tests/` | the Pico SDK's own `test/pico_float_test` programs (SDK 2.3.0), unchanged but for a first line naming their origin: `pico_float_test`, `pico_double_test`, `custom_float_funcs_test`, `custom_double_funcs_test`, flash images on the SDK's default implementation, the ROM's | `PASSED` |
 | `rom_crosscheck/` | benchtop's own: the chip's ROM against benchtop's ROM routines compiled into the firmware, bit for bit; a flash image and a UF2 for a real Pico (below) | every function's line with no mismatch, and `CROSSCHECK 71248 0 8c217b56` |
 

@@ -1,0 +1,519 @@
+module sh.sysl.benchtop.peripheral.rp2350
+@tests
+
+import sh.sysl.benchtop.peripheral.i2c.Device
+import sh.sysl.rp2350.i2c0 as ir
+import sysl.buf.{Buf, buf}
+
+// The two DW_apb_i2c controllers and the parts on their bus by themselves (`i2c.sysl`), on lines given
+// here rather than by the chip: I2C0 on GPIOs 4 and 5 and I2C1 on 6 and 7, wired 4 to 6 and 5 to 7, the
+// way pico-examples' slave_mem_i2c wires them; each step timed in clk_sys cycles. The chip's side (the
+// mux, the pads, the wires, interrupts, DMA requests, programs) is `chip/i2c_tests.sysl`.
+
+private val W: [2]Wiring = [Wiring(0x50, 0xA0, ""), Wiring(0x50, 0xA0, "")]
+
+// One bit of SCL at the SDK's 100 kHz from 150 MHz: HCNT 600, LCNT 900, SPKLEN 56, plus 8.
+private const P: u64 = 1564
+
+// IC_CON as the SDK's i2c_init leaves it (a fast-mode master with repeated STARTs and TX_EMPTY_CTRL),
+// and as i2c_set_slave_mode makes it a slave.
+private const MASTER_CON: u32 = 0x165
+private const SLAVE_CON: u32 = 0x224
+
+private const RAW: u32 = ir.IC_RAW_INTR_STAT_OFFSET
+private const CMD: u32 = ir.IC_DATA_CMD_OFFSET
+private const READ: u32 = ir.IC_DATA_CMD_CMD_MASK
+private const STOP: u32 = ir.IC_DATA_CMD_STOP_MASK
+private const RESTART: u32 = ir.IC_DATA_CMD_RESTART_MASK
+private const TX_EMPTY: u32 = ir.IC_RAW_INTR_STAT_TX_EMPTY_MASK
+private const STOP_DET: u32 = ir.IC_RAW_INTR_STAT_STOP_DET_MASK
+private const START_DET: u32 = ir.IC_RAW_INTR_STAT_START_DET_MASK
+private const TX_ABRT: u32 = ir.IC_RAW_INTR_STAT_TX_ABRT_MASK
+private const RD_REQ: u32 = ir.IC_RAW_INTR_STAT_RD_REQ_MASK
+private const RX_FULL: u32 = ir.IC_RAW_INTR_STAT_RX_FULL_MASK
+private const RX_DONE: u32 = ir.IC_RAW_INTR_STAT_RX_DONE_MASK
+private const NOT_TIMED: u64 = 0xffffffffffffffff
+
+private fault_text(f: I2cFault) -> string = f match
+    Access(e) -> s"access error $e"
+    Refused(why) -> why
+
+private wr(b: *I2cBus, k: usize, o: u32, x: u32, t: u64) = b.write(k, o, 4, x, t, W) match
+    Ok(_) -> ()
+    Err(f) -> assert(false, fault_text(f))
+
+private rd(b: *I2cBus, k: usize, o: u32, t: u64) -> u32 = b.read(k, o, 4, t) match
+    Ok(x) -> x
+    Err(f) ->
+        assert(false, fault_text(f))
+        0
+
+private refused(b: *I2cBus, k: usize, o: u32, x: u32) -> string = b.write(k, o, 4, x, 0, W) match
+    Ok(_) -> ""
+    Err(f) -> fault_text(f)
+
+/** A memory part: the first byte written after its address sets its pointer, the rest are stored there;
+ * reads come from the pointer, which wraps. It can refuse (NACK) the byte at index `nack_at` it is written.
+ */
+private struct Mem
+    pointer: u8
+    data: [256]u8
+    starts: int
+    reading: bool
+    fresh: bool
+    written: int
+    nack_at: int
+    reads: int
+
+    start(*self, reading: bool)
+        self.starts += 1
+        self.reading = reading
+        self.fresh = !reading
+
+    put(*self, x: u8) -> bool
+        if self.written == self.nack_at then return false
+        self.written += 1
+        if self.fresh
+            self.pointer = x
+            self.fresh = false
+        else
+            self.data[self.pointer] = x
+            self.pointer = self.pointer +% 1
+        true
+
+    get(*self) -> u8
+        val x = self.data[self.pointer]
+        self.pointer = self.pointer +% 1
+        self.reads += 1
+        x
+end Mem
+
+private mem() -> &Mem = Mem(0, [0; 256], 0, false, false, 0, -1, 0)
+
+// A memory part at `address` on GPIOs 4 and 5, with pull-ups of its own.
+private part(m: &Mem, address: u8) -> I2cPart =
+    I2cPart(4, 5, Device(address, (b, reading, t) -> m.start(reading), (b, x, t) -> m.put(x), (b, t) -> m.get()), true)
+
+// Controller `k` set up as the SDK's i2c_init(100 kHz) leaves it at 150 MHz, addressing `tar`.
+private master(b: *I2cBus, k: usize, tar: u32)
+    wr(b, k, ir.IC_ENABLE_OFFSET, 0, 0)
+    wr(b, k, ir.IC_CON_OFFSET, MASTER_CON, 0)
+    wr(b, k, ir.IC_FS_SCL_HCNT_OFFSET, 600, 0)
+    wr(b, k, ir.IC_FS_SCL_LCNT_OFFSET, 900, 0)
+    wr(b, k, ir.IC_FS_SPKLEN_OFFSET, 56, 0)
+    wr(b, k, ir.IC_TAR_OFFSET, tar, 0)
+    wr(b, k, ir.IC_ENABLE_OFFSET, 1, 0)
+
+// Controller `k` as pico_i2c_slave's i2c_slave_init leaves it, at `sar`.
+private slave(b: *I2cBus, k: usize, sar: u32)
+    wr(b, k, ir.IC_ENABLE_OFFSET, 0, 0)
+    wr(b, k, ir.IC_CON_OFFSET, SLAVE_CON, 0)
+    wr(b, k, ir.IC_SAR_OFFSET, sar, 0)
+    wr(b, k, ir.IC_INTR_MASK_OFFSET, 0x664, 0)
+    wr(b, k, ir.IC_ENABLE_OFFSET, 1, 0)
+
+private bus_with(m: &Mem) -> I2cBus
+    var parts: Buf[I2cPart] = buf()
+    parts.push(part(m, 0x50))
+    i2c_bus(parts)
+
+@test("I2C power-on: the header's reset values, COMP_VERSION and COMP_TYPE, the access rules, and a write while enabled leaving the timing registers alone")
+i2c_power_on()
+    var b = i2c_bus(buf())
+    for (o, x) in [(ir.IC_CON_OFFSET, 0x65u32), (ir.IC_TAR_OFFSET, 0x55), (ir.IC_SAR_OFFSET, 0x55), (ir.IC_SS_SCL_HCNT_OFFSET, 0x28),
+            (ir.IC_SS_SCL_LCNT_OFFSET, 0x2f), (ir.IC_FS_SCL_HCNT_OFFSET, 6), (ir.IC_FS_SCL_LCNT_OFFSET, 0xd), (ir.IC_INTR_MASK_OFFSET, 0x8ff),
+            (ir.IC_STATUS_OFFSET, 6), (ir.IC_SDA_HOLD_OFFSET, 1), (ir.IC_SDA_SETUP_OFFSET, 0x64), (ir.IC_ACK_GENERAL_CALL_OFFSET, 1),
+            (ir.IC_FS_SPKLEN_OFFSET, 7), (ir.IC_COMP_PARAM_1_OFFSET, 0), (ir.IC_COMP_VERSION_OFFSET, 0x3230312a),
+            (ir.IC_COMP_TYPE_OFFSET, 0x44570140), (RAW, 0), (ir.IC_ENABLE_STATUS_OFFSET, 0), (ir.IC_TX_ABRT_SOURCE_OFFSET, 0)]
+        assert(rd(&b, 1, o, 0) == x, s"0x${o}: ${rd(&b, 1, o, 0)}")
+    assert(b.read(0, 0x0C, 4, 0).is_err() && b.read(0, 0x100, 4, 0).is_err(), "no register at 0x0C or 0x100")
+    assert(b.read(0, ir.IC_CLR_INTR_OFFSET + 0x1000, 4, 0).is_err(), "a clearing read through an alias")
+    assert(b.write(0, CMD + 0x2000, 4, 1, 0, W).is_err(), "IC_DATA_CMD through an alias")
+    // CON through the XOR alias, as the SDK's hw_write_masked writes it.
+    wr(&b, 0, ir.IC_CON_OFFSET + 0x1000, 0x65 ^ MASTER_CON, 0)
+    assert(rd(&b, 0, ir.IC_CON_OFFSET, 0) == MASTER_CON)
+    // The counts' minimums, and SPEED 3 set to fast.
+    wr(&b, 0, ir.IC_FS_SCL_HCNT_OFFSET, 2, 0)
+    wr(&b, 0, ir.IC_FS_SCL_LCNT_OFFSET, 2, 0)
+    wr(&b, 0, ir.IC_FS_SPKLEN_OFFSET, 0, 0)
+    assert(rd(&b, 0, ir.IC_FS_SCL_HCNT_OFFSET, 0) == 6 && rd(&b, 0, ir.IC_FS_SCL_LCNT_OFFSET, 0) == 8 && rd(&b, 0, ir.IC_FS_SPKLEN_OFFSET, 0) == 1)
+    wr(&b, 0, ir.IC_CON_OFFSET, 0x67, 0)
+    assert(rd(&b, 0, ir.IC_CON_OFFSET, 0) == 0x65, "SPEED high speed becomes fast")
+    // Enabled: CON, TAR, SAR and the counts take no write.
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 1, 0)
+    for o in [ir.IC_CON_OFFSET, ir.IC_TAR_OFFSET, ir.IC_SAR_OFFSET, ir.IC_FS_SCL_HCNT_OFFSET, ir.IC_FS_SCL_LCNT_OFFSET, ir.IC_SS_SCL_HCNT_OFFSET, ir.IC_FS_SPKLEN_OFFSET]
+        val before = rd(&b, 0, o, 0)
+        wr(&b, 0, o, 0x23, 0)
+        assert(rd(&b, 0, o, 0) == before, s"0x$o changed while enabled")
+    assert(rd(&b, 0, ir.IC_ENABLE_STATUS_OFFSET, 0) == 1 && rd(&b, 0, RAW, 0) == TX_EMPTY, "enabled and idle: TX_EMPTY")
+    // The thresholds stop at the FIFO's last entry.
+    wr(&b, 0, ir.IC_RX_TL_OFFSET, 200, 0)
+    assert(rd(&b, 0, ir.IC_RX_TL_OFFSET, 0) == 15)
+
+@test("I2C master write: START, address, data and STOP each timed in SCL bits of HCNT + LCNT + SPKLEN + 8 clk_sys cycles; TX_EMPTY waits for the byte; the part takes it")
+i2c_master_write_timing()
+    val m = mem()
+    var b = bus_with(m)
+    master(&b, 0, 0x50)
+    wr(&b, 0, CMD, 0x12, 0)
+    wr(&b, 0, CMD, 0x34 | STOP, 0)
+    assert(b.next_due() == P, s"${b.next_due()}")
+    assert(rd(&b, 0, RAW, 0) & TX_EMPTY == 0 && rd(&b, 0, ir.IC_STATUS_OFFSET, 0) & ir.IC_STATUS_MST_ACTIVITY_MASK != 0)
+    b.run(P, W)
+    assert(rd(&b, 0, RAW, P) & START_DET != 0 && m.starts == 0, "START, then the address")
+    b.run(10 * P - 1, W)
+    assert(m.starts == 0, "not a cycle early")
+    b.run(10 * P, W)
+    assert(m.starts == 1 && !m.reading, "the part answers its address for a write")
+    b.run(19 * P, W)
+    assert(m.pointer == 0x12, "the first byte sets the pointer")
+    assert(rd(&b, 0, RAW, 19 * P) & TX_EMPTY == 0, "the second command is shifting out")
+    b.run(28 * P, W)
+    assert(m.data[0x12] == 0x34 && rd(&b, 0, RAW, 28 * P) & (TX_EMPTY | STOP_DET) == TX_EMPTY, "the byte is in; the STOP still to come")
+    b.run(29 * P - 1, W)
+    assert(rd(&b, 0, RAW, 0) & STOP_DET == 0)
+    b.run(29 * P, W)
+    assert(rd(&b, 0, RAW, 0) & STOP_DET != 0 && b.next_due() == NOT_TIMED && rd(&b, 0, ir.IC_STATUS_OFFSET, 0) & ir.IC_STATUS_ACTIVITY_MASK == 0)
+    // Standard mode times SCL from the SS counts.
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 0, 0)
+    wr(&b, 0, ir.IC_CON_OFFSET, (MASTER_CON & ~6u32) | 2, 0)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 1, 0)
+    wr(&b, 0, CMD, 1 | STOP, 1000000)
+    assert(b.next_due() == 1000000 + 0x28 + 0x2f + 56 + 8, s"${b.next_due()}")
+
+@test("I2C master read with a repeated START: the pointer written, the bus held, each byte read acknowledged but the last before the STOP")
+i2c_master_read_restart()
+    val m = mem()
+    m.data[5] = 0xA5
+    m.data[6] = 0x5A
+    var b = bus_with(m)
+    master(&b, 0, 0x50)
+    wr(&b, 0, CMD, 5, 0)
+    b.run(19 * P, W)
+    assert(rd(&b, 0, RAW, 19 * P) & (TX_EMPTY | STOP_DET) == TX_EMPTY, "the byte is done and no STOP")
+    assert(rd(&b, 0, ir.IC_STATUS_OFFSET, 0) & ir.IC_STATUS_MST_ACTIVITY_MASK != 0 && b.next_due() == NOT_TIMED, "holding the bus, untimed")
+    // Commands come a while later: the bus waits for them.
+    val t0 = 50 * P
+    wr(&b, 0, CMD, READ | RESTART, t0)
+    wr(&b, 0, CMD, READ | STOP, t0)
+    b.run(t0 + 18 * P, W)
+    assert(m.starts == 2 && m.reading && rd(&b, 0, ir.IC_RXFLR_OFFSET, 0) == 1, "repeated START, address for a read, one byte in")
+    b.run(t0 + 26 * P, W)
+    assert(rd(&b, 0, ir.IC_RXFLR_OFFSET, 0) == 1, "the acknowledge and the second byte take nine bits")
+    b.run(t0 + 27 * P, W)
+    assert(rd(&b, 0, ir.IC_RXFLR_OFFSET, 0) == 2 && rd(&b, 0, RAW, 0) & STOP_DET == 0)
+    b.run(t0 + 29 * P, W)
+    assert(rd(&b, 0, RAW, 0) & STOP_DET != 0, "the NACK and the STOP")
+    assert(rd(&b, 0, CMD, 0) == 0xA5 && rd(&b, 0, CMD, 0) == 0x5A && m.reads == 2)
+    assert(rd(&b, 0, CMD, 0) == 0 && rd(&b, 0, RAW, 0) & ir.IC_RAW_INTR_STAT_RX_UNDER_MASK != 0, "an empty FIFO read is RX_UNDER")
+    assert(rd(&b, 0, ir.IC_CLR_RX_UNDER_OFFSET, 0) == 0 && rd(&b, 0, RAW, 0) & ir.IC_RAW_INTR_STAT_RX_UNDER_MASK == 0)
+
+@test("I2C aborts: an address nobody answers, a byte the part refuses; TX_ABRT with its source and flush count, the FIFO held flushed until IC_CLR_TX_ABRT, then the STOP")
+i2c_master_aborts()
+    val m = mem()
+    var b = bus_with(m)
+    master(&b, 0, 0x51)
+    wr(&b, 0, CMD, READ, 0)
+    wr(&b, 0, CMD, READ | STOP, 0)
+    b.run(10 * P, W)
+    assert(rd(&b, 0, RAW, 0) & (TX_ABRT | STOP_DET) == TX_ABRT, "the NACK at the address")
+    assert(rd(&b, 0, ir.IC_TX_ABRT_SOURCE_OFFSET, 0) == (ir.IC_TX_ABRT_SOURCE_ABRT_7B_ADDR_NOACK_MASK | (1 << 23)), s"0x${rd(&b, 0, ir.IC_TX_ABRT_SOURCE_OFFSET, 0)}")
+    wr(&b, 0, CMD, 7 | STOP, 10 * P)
+    assert(rd(&b, 0, ir.IC_TXFLR_OFFSET, 0) == 0, "held flushed while TX_ABRT is set")
+    b.run(11 * P, W)
+    assert(rd(&b, 0, RAW, 0) & STOP_DET != 0 && m.starts == 0)
+    assert(rd(&b, 0, ir.IC_CLR_TX_ABRT_OFFSET, 0) == 0 && rd(&b, 0, ir.IC_TX_ABRT_SOURCE_OFFSET, 0) == 0 && rd(&b, 0, RAW, 0) & TX_ABRT == 0)
+    // The part NACKs its second data byte; the two commands behind it are flushed.
+    m.nack_at = 1
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 0, 0)
+    wr(&b, 0, ir.IC_TAR_OFFSET, 0x50, 0)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 1, 0)
+    val t0 = 100 * P
+    for x in [1u32, 2, 3, 4 | STOP] do wr(&b, 0, CMD, x, t0)
+    b.run(t0 + 28 * P, W)
+    assert(rd(&b, 0, RAW, 0) & TX_ABRT != 0 && rd(&b, 0, ir.IC_TX_ABRT_SOURCE_OFFSET, 0) == (ir.IC_TX_ABRT_SOURCE_ABRT_TXDATA_NOACK_MASK | (2 << 23)), s"0x${rd(&b, 0, ir.IC_TX_ABRT_SOURCE_OFFSET, 0)}")
+    assert(m.pointer == 1 && m.data[1] == 0, "the refused byte is not stored")
+    b.run(t0 + 29 * P, W)
+    assert(rd(&b, 0, RAW, 0) & STOP_DET != 0)
+    // IC_CLR_INTR clears every latched interrupt and the sources.
+    assert(rd(&b, 0, ir.IC_CLR_INTR_OFFSET, 0) == 0 && rd(&b, 0, RAW, 0) == TX_EMPTY && rd(&b, 0, ir.IC_TX_ABRT_SOURCE_OFFSET, 0) == 0)
+
+@test("I2C slave receiver: START_DET, its address, each byte into its FIFO with FIRST_DATA_BYTE on the first, RX_FULL, STOP_DET in both; a full FIFO holds the bus or, unheld, loses the byte")
+i2c_slave_receive()
+    var b = i2c_bus(buf())
+    slave(&b, 0, 0x17)
+    master(&b, 1, 0x17)
+    wr(&b, 1, CMD, 0x20, 0)
+    wr(&b, 1, CMD, u32('H') | STOP, 0)
+    b.run(P, W)
+    assert(rd(&b, 0, RAW, 0) & START_DET != 0 && b.units[0].irq(), "the slave sees the START")
+    b.run(19 * P, W)
+    assert(b.units[0].addressed && rd(&b, 0, ir.IC_STATUS_OFFSET, 0) & ir.IC_STATUS_SLV_ACTIVITY_MASK != 0)
+    assert(rd(&b, 0, RAW, 0) & RX_FULL != 0 && rd(&b, 0, CMD, 0) == 0x20 | ir.IC_DATA_CMD_FIRST_DATA_BYTE_MASK)
+    b.run(29 * P, W)
+    assert(rd(&b, 0, CMD, 0) == u32('H'), "no FIRST_DATA_BYTE on the second")
+    assert(rd(&b, 0, RAW, 0) & STOP_DET != 0 && rd(&b, 1, RAW, 0) & STOP_DET != 0 && !b.units[0].addressed)
+    // Seventeen bytes: the slave's FIFO fills and holds SCL low until its CPU reads one.
+    var t = 100 * P
+    for i in 0u32..<17 do wr(&b, 1, ir.IC_DATA_CMD_OFFSET, i | (if i == 16 then STOP else 0), t)
+    b.run(t + (10 + 16 * 9) * P, W)
+    assert(rd(&b, 0, ir.IC_RXFLR_OFFSET, 0) == 16 && rd(&b, 0, ir.IC_STATUS_OFFSET, 0) & ir.IC_STATUS_RFF_MASK != 0)
+    assert(b.next_due() == NOT_TIMED, "the master is held")
+    t += 1000 * P
+    assert(rd(&b, 0, CMD, t) & 0xFF == 0)
+    assert(b.next_due() == t + 9 * P, "it goes on from the read")
+    b.run(t + 10 * P, W)
+    assert(rd(&b, 0, ir.IC_RXFLR_OFFSET, 0) == 16 && rd(&b, 1, RAW, 0) & STOP_DET != 0)
+    // Unheld, the seventeenth byte is lost with RX_OVER, and acknowledged.
+    for i in 0..<16 do rd(&b, 0, CMD, t)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 0, t)
+    wr(&b, 0, ir.IC_CON_OFFSET, SLAVE_CON & ~ir.IC_CON_RX_FIFO_FULL_HLD_CTRL_MASK, t)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 1, t)
+    t += 100 * P
+    for i in 0u32..<17 do wr(&b, 1, ir.IC_DATA_CMD_OFFSET, i | (if i == 16 then STOP else 0), t)
+    b.run(t + 200 * P, W)
+    assert(rd(&b, 0, ir.IC_RXFLR_OFFSET, 0) == 16 && rd(&b, 0, RAW, 0) & ir.IC_RAW_INTR_STAT_RX_OVER_MASK != 0 && rd(&b, 1, RAW, 0) & TX_ABRT == 0)
+
+@test("I2C slave transmitter: RD_REQ once per byte, SCL held until its CPU writes, the master's NACK as RX_DONE; stale data flushed with ABRT_SLVFLUSH_TXFIFO; a read command is ABRT_SLVRD_INTX")
+i2c_slave_transmit()
+    var b = i2c_bus(buf())
+    slave(&b, 0, 0x17)
+    master(&b, 1, 0x17)
+    // A stale byte waiting in the slave's FIFO.
+    wr(&b, 0, CMD, 0x99, 0)
+    wr(&b, 1, CMD, READ, 0)
+    wr(&b, 1, CMD, READ | STOP, 0)
+    b.run(10 * P, W)
+    assert(rd(&b, 0, RAW, 0) & (RD_REQ | TX_ABRT) == RD_REQ | TX_ABRT && rd(&b, 0, ir.IC_TX_ABRT_SOURCE_OFFSET, 0) == (ir.IC_TX_ABRT_SOURCE_ABRT_SLVFLUSH_TXFIFO_MASK | (1 << 23)))
+    assert(b.next_due() == NOT_TIMED, "SCL held for the slave")
+    // Its handler, as pico_i2c_slave's: clear TX_ABRT, clear RD_REQ, then write.
+    var t = 20 * P
+    rd(&b, 0, ir.IC_CLR_TX_ABRT_OFFSET, t)
+    rd(&b, 0, ir.IC_CLR_RD_REQ_OFFSET, t)
+    assert(b.next_due() == NOT_TIMED && rd(&b, 0, RAW, t) & RD_REQ == 0, "clearing RD_REQ raises it no second time")
+    wr(&b, 0, CMD, u32('o'), t)
+    assert(b.next_due() == t + 8 * P)
+    b.run(t + 9 * P, W)
+    assert(rd(&b, 0, RAW, 0) & RD_REQ != 0 && rd(&b, 1, ir.IC_RXFLR_OFFSET, 0) == 1, "acknowledged; the next byte requested")
+    t += 50 * P
+    rd(&b, 0, ir.IC_CLR_RD_REQ_OFFSET, t)
+    wr(&b, 0, CMD, u32('k'), t)
+    b.run(t + 8 * P, W)
+    assert(rd(&b, 0, RAW, 0) & RX_DONE == 0)
+    b.run(t + 9 * P, W)
+    assert(rd(&b, 0, RAW, 0) & (RX_DONE | RD_REQ) == RX_DONE, "the last byte NACKed")
+    b.run(t + 10 * P, W)
+    assert(rd(&b, 1, CMD, 0) == u32('o') && rd(&b, 1, CMD, 0) == u32('k') && rd(&b, 0, RAW, 0) & STOP_DET != 0)
+    // A read command written in slave mode.
+    rd(&b, 0, ir.IC_CLR_INTR_OFFSET, t)
+    wr(&b, 0, CMD, READ, t)
+    assert(rd(&b, 0, RAW, 0) & TX_ABRT != 0 && rd(&b, 0, ir.IC_TX_ABRT_SOURCE_OFFSET, 0) == ir.IC_TX_ABRT_SOURCE_ABRT_SLVRD_INTX_MASK && rd(&b, 0, ir.IC_TXFLR_OFFSET, 0) == 0)
+
+@test("I2C slave transmitter: RD_REQ stays clear when the held master retries, from a read of its own receive FIFO, while the slave is still empty")
+i2c_slave_rd_req_once_per_byte()
+    var b = i2c_bus(buf())
+    slave(&b, 0, 0x17)
+    master(&b, 1, 0x17)
+    wr(&b, 1, CMD, READ, 0)
+    wr(&b, 1, CMD, READ | STOP, 0)
+    b.run(10 * P, W)
+    assert(rd(&b, 0, RAW, 0) & RD_REQ != 0 && b.next_due() == NOT_TIMED)
+    var t = 20 * P
+    rd(&b, 0, ir.IC_CLR_RD_REQ_OFFSET, t)
+    wr(&b, 0, CMD, u32('a'), t)
+    b.run(t + 9 * P, W)
+    assert(rd(&b, 0, RAW, 0) & RD_REQ != 0 && rd(&b, 1, ir.IC_RXFLR_OFFSET, 0) == 1, "the second byte requested")
+    // The CPU clears the request and loads nothing; the master's own CPU reads its first byte, which
+    // lets a held master try again.
+    t += 50 * P
+    rd(&b, 0, ir.IC_CLR_RD_REQ_OFFSET, t)
+    assert(rd(&b, 1, CMD, t) == u32('a'))
+    assert(rd(&b, 0, RAW, t) & RD_REQ == 0 && b.next_due() == NOT_TIMED, "the retry raises no second request and the master stays held")
+    wr(&b, 0, CMD, u32('b'), t)
+    b.run(t + 10 * P, W)
+    assert(rd(&b, 1, CMD, 0) == u32('b') && rd(&b, 0, RAW, 0) & STOP_DET != 0, "the byte loaded, the read completes")
+
+@test("I2C slave options: SLV_DATA_NACK_ONLY refuses data, STOP_DET_IFADDRESSED keeps a stop to another target from it, a repeated START is RESTART_DET")
+i2c_slave_options()
+    val m = mem()
+    var parts: Buf[I2cPart] = buf()
+    parts.push(I2cPart(6, 7, Device(0x50, (b, reading, t) -> m.start(reading), (b, x, t) -> m.put(x), (b, t) -> m.get()), false))
+    var b = i2c_bus(parts)
+    slave(&b, 0, 0x17)
+    master(&b, 1, 0x50)
+    // A transfer to the part: the slave sees its START and STOP, not being addressed.
+    wr(&b, 1, CMD, 1 | STOP, 0)
+    b.run(30 * P, W)
+    assert(m.starts == 1 && rd(&b, 0, RAW, 0) & (START_DET | STOP_DET) == START_DET | STOP_DET)
+    rd(&b, 0, ir.IC_CLR_INTR_OFFSET, 0)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 0, 0)
+    wr(&b, 0, ir.IC_CON_OFFSET, SLAVE_CON | ir.IC_CON_STOP_DET_IFADDRESSED_MASK, 0)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 1, 0)
+    var t = 100 * P
+    wr(&b, 1, CMD, 2 | STOP, t)
+    b.run(t + 30 * P, W)
+    assert(rd(&b, 0, RAW, 0) & (START_DET | STOP_DET) == START_DET, "no STOP_DET unaddressed")
+    // Addressed, then a repeated START to the part.
+    wr(&b, 1, ir.IC_ENABLE_OFFSET, 0, t)
+    wr(&b, 1, ir.IC_TAR_OFFSET, 0x17, t)
+    wr(&b, 1, ir.IC_ENABLE_OFFSET, 1, t)
+    t += 100 * P
+    wr(&b, 1, CMD, 9, t)
+    b.run(t + 19 * P, W)
+    assert(b.units[0].addressed)
+    wr(&b, 1, CMD, READ | RESTART | STOP, t + 19 * P)
+    b.run(t + 20 * P, W)
+    assert(rd(&b, 0, RAW, 0) & ir.IC_RAW_INTR_STAT_RESTART_DET_MASK != 0 && !b.units[0].addressed, "RESTART_DET ends its part")
+    b.run(t + 40 * P, W)
+    assert(rd(&b, 0, RAW, 0) & STOP_DET == 0 && rd(&b, 1, RAW, 0) & STOP_DET != 0, "the read went to the slave again, which holds SCL: no STOP yet")
+    // SLV_DATA_NACK_ONLY.
+    val again = i2c_bus(buf())
+    var c = again
+    slave(&c, 0, 0x17)
+    master(&c, 1, 0x17)
+    wr(&c, 0, ir.IC_SLV_DATA_NACK_ONLY_OFFSET, 1, 0)
+    wr(&c, 1, CMD, 5 | STOP, 0)
+    c.run(30 * P, W)
+    assert(rd(&c, 1, ir.IC_TX_ABRT_SOURCE_OFFSET, 0) & ir.IC_TX_ABRT_SOURCE_ABRT_TXDATA_NOACK_MASK != 0 && rd(&c, 0, ir.IC_RXFLR_OFFSET, 0) == 0)
+
+@test("I2C disable and ABORT end a master's transfer with a STOP after the step in progress: a write held, a read NACKed, ABRT_USER_ABRT; TX_CMD_BLOCK holds commands")
+i2c_disable_and_abort()
+    val m = mem()
+    var b = bus_with(m)
+    master(&b, 0, 0x50)
+    wr(&b, 0, CMD, 3, 0)
+    b.run(19 * P, W)
+    var t = 30 * P
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 0, t)
+    assert(rd(&b, 0, ir.IC_ENABLE_STATUS_OFFSET, t) == 1, "still active until the STOP")
+    b.run(t + P, W)
+    assert(rd(&b, 0, RAW, 0) & STOP_DET != 0 && rd(&b, 0, ir.IC_ENABLE_STATUS_OFFSET, 0) == 0)
+    // Disabled in the middle of a read: the byte finishes, NACKed, then the STOP.
+    rd(&b, 0, ir.IC_CLR_INTR_OFFSET, 0)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 1, t)
+    t += 10 * P
+    wr(&b, 0, CMD, READ, t)
+    b.run(t + 12 * P, W)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 0, t + 12 * P)
+    b.run(t + 19 * P, W)
+    assert(m.reads == 1 && rd(&b, 0, RAW, 0) & STOP_DET == 0)
+    b.run(t + 20 * P, W)
+    assert(rd(&b, 0, RAW, 0) & STOP_DET != 0 && rd(&b, 0, ir.IC_RXFLR_OFFSET, 0) == 0, "the FIFO was flushed by the disable")
+    // ABORT while holding the bus.
+    rd(&b, 0, ir.IC_CLR_INTR_OFFSET, 0)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 1, t)
+    t += 100 * P
+    wr(&b, 0, CMD, 4, t)
+    b.run(t + 19 * P, W)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 3, t + 19 * P)
+    assert(rd(&b, 0, ir.IC_ENABLE_OFFSET, 0) == 3, "ABORT in progress")
+    b.run(t + 20 * P, W)
+    assert(rd(&b, 0, ir.IC_ENABLE_OFFSET, 0) == 1 && rd(&b, 0, RAW, 0) & (TX_ABRT | STOP_DET) == TX_ABRT | STOP_DET)
+    assert(rd(&b, 0, ir.IC_TX_ABRT_SOURCE_OFFSET, 0) == ir.IC_TX_ABRT_SOURCE_ABRT_USER_ABRT_MASK)
+    rd(&b, 0, ir.IC_CLR_TX_ABRT_OFFSET, 0)
+    // ABORT while idle, at once; while disabled it takes no write.
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 3, t)
+    assert(rd(&b, 0, ir.IC_ENABLE_OFFSET, 0) == 1 && rd(&b, 0, RAW, 0) & TX_ABRT != 0)
+    rd(&b, 0, ir.IC_CLR_TX_ABRT_OFFSET, 0)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 0, t)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 2, t)
+    assert(rd(&b, 0, ir.IC_ENABLE_OFFSET, 0) == 0)
+    // TX_CMD_BLOCK: a command waits until it is cleared.
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 5, t)
+    wr(&b, 0, CMD, 6 | STOP, t)
+    assert(b.next_due() == NOT_TIMED && rd(&b, 0, ir.IC_TXFLR_OFFSET, 0) == 1)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 1, t + 5)
+    assert(b.next_due() == t + 5 + P)
+
+@test("I2C FIFO levels: TX_OVER on a full FIFO, the thresholds for RX_FULL and TX_EMPTY, the DMA requests at DMATDL and DMARDL, IC_INTR_STAT through the mask")
+i2c_fifo_levels()
+    var b = i2c_bus(buf())
+    master(&b, 0, 0x50)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 5, 0)
+    wr(&b, 0, ir.IC_TX_TL_OFFSET, 2, 0)
+    wr(&b, 0, ir.IC_DMA_CR_OFFSET, 3, 0)
+    wr(&b, 0, ir.IC_DMA_TDLR_OFFSET, 3, 0)
+    for i in 0u32..<3 do wr(&b, 0, CMD, i, 0)
+    assert(rd(&b, 0, RAW, 0) & TX_EMPTY == 0 && b.units[0].dreq_tx(), "3 waiting: above TX_TL 2, at DMATDL 3")
+    wr(&b, 0, CMD, 3, 0)
+    assert(!b.units[0].dreq_tx())
+    for i in 4u32..<17 do wr(&b, 0, CMD, i, 0)
+    assert(rd(&b, 0, ir.IC_TXFLR_OFFSET, 0) == 16 && rd(&b, 0, RAW, 0) & ir.IC_RAW_INTR_STAT_TX_OVER_MASK != 0)
+    assert(rd(&b, 0, ir.IC_STATUS_OFFSET, 0) & (ir.IC_STATUS_TFNF_MASK | ir.IC_STATUS_TFE_MASK) == 0)
+    // Masked out, then in.
+    wr(&b, 0, ir.IC_INTR_MASK_OFFSET, 0, 0)
+    assert(!b.units[0].irq() && rd(&b, 0, ir.IC_INTR_STAT_OFFSET, 0) == 0)
+    wr(&b, 0, ir.IC_INTR_MASK_OFFSET, ir.IC_INTR_MASK_M_TX_OVER_MASK, 0)
+    assert(b.units[0].irq() && rd(&b, 0, ir.IC_INTR_STAT_OFFSET, 0) == ir.IC_INTR_STAT_R_TX_OVER_MASK)
+    // The receive side, on a slave.
+    var c = i2c_bus(buf())
+    slave(&c, 0, 0x17)
+    master(&c, 1, 0x17)
+    wr(&c, 0, ir.IC_RX_TL_OFFSET, 1, 0)
+    wr(&c, 0, ir.IC_DMA_CR_OFFSET, 1, 0)
+    wr(&c, 0, ir.IC_DMA_RDLR_OFFSET, 1, 0)
+    for i in 0u32..<3 do wr(&c, 1, CMD, i | (if i == 2 then STOP else 0), 0)
+    c.run(19 * P, W)
+    assert(rd(&c, 0, RAW, 0) & RX_FULL == 0 && !c.units[0].dreq_rx(), "one entry: at RX_TL 1 and DMARDL 1")
+    c.run(28 * P, W)
+    assert(rd(&c, 0, RAW, 0) & RX_FULL != 0 && c.units[0].dreq_rx())
+
+@test("I2C refusals: 10-bit addressing, a general call, a master and a slave at once, disabling an addressed slave, lines benchtop cannot show; a refused write leaves the controller as it was")
+i2c_refusals()
+    var b = i2c_bus(buf())
+    assert(refused(&b, 0, ir.IC_CON_OFFSET, MASTER_CON | ir.IC_CON_IC_10BITADDR_MASTER_MASK).contains("10-bit") && rd(&b, 0, ir.IC_CON_OFFSET, 0) == 0x65)
+    assert(refused(&b, 0, ir.IC_CON_OFFSET, SLAVE_CON | ir.IC_CON_IC_10BITADDR_SLAVE_MASK).contains("10-bit"))
+    assert(refused(&b, 0, ir.IC_TAR_OFFSET, ir.IC_TAR_SPECIAL_MASK).contains("general call") && rd(&b, 0, ir.IC_TAR_OFFSET, 0) == 0x55)
+    wr(&b, 0, ir.IC_CON_OFFSET, 0x25, 0)
+    assert(refused(&b, 0, ir.IC_ENABLE_OFFSET, 1).contains("a master and a slave at once") && rd(&b, 0, ir.IC_ENABLE_OFFSET, 0) == 0)
+    // A slave addressed cannot be disabled.
+    slave(&b, 0, 0x17)
+    master(&b, 1, 0x17)
+    wr(&b, 1, CMD, 1, 0)
+    b.run(10 * P, W)
+    assert(refused(&b, 0, ir.IC_ENABLE_OFFSET, 0).contains("SLV_DISABLED_WHILE_BUSY") && rd(&b, 0, ir.IC_ENABLE_OFFSET, 0) == 1)
+    // A command on lines with a reason not to model them.
+    var c = i2c_bus(buf())
+    master(&c, 0, 0x17)
+    val bad = [Wiring(0, 0, "no GPIO carries I2C0's SDA"), Wiring(0, 0, "")]
+    c.write(0, CMD, 4, 1, 0, bad) match
+        Err(Refused(why)) -> assert(why.contains("no GPIO carries I2C0's SDA"), why)
+        _ -> assert(false, "a transfer on no lines")
+    assert(rd(&c, 0, ir.IC_TXFLR_OFFSET, 0) == 0, "the command was not taken")
+
+@test("I2C faults while the bus runs: a repeated START with IC_RESTART_EN clear, two targets on one address, two masters, and a slave on the bus whose lines are not modelled")
+i2c_bus_faults()
+    // RESTART_EN clear.
+    val m = mem()
+    var b = bus_with(m)
+    master(&b, 0, 0x50)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 0, 0)
+    wr(&b, 0, ir.IC_CON_OFFSET, MASTER_CON & ~ir.IC_CON_IC_RESTART_EN_MASK, 0)
+    wr(&b, 0, ir.IC_ENABLE_OFFSET, 1, 0)
+    wr(&b, 0, CMD, 1, 0)
+    b.run(19 * P, W)
+    wr(&b, 0, CMD, READ | STOP, 19 * P)
+    assert(b.fault.contains("IC_RESTART_EN"), b.fault)
+    assert(b.units[0].step == Step.Idle && b.next_due() == NOT_TIMED, "the master let go of the bus")
+    // The slave at the part's address.
+    var c = bus_with(mem())
+    slave(&c, 1, 0x50)
+    master(&c, 0, 0x50)
+    wr(&c, 0, CMD, 1 | STOP, 0)
+    c.run(10 * P, W)
+    assert(c.fault.contains("2 targets answer"), c.fault)
+    // Two masters at once.
+    var d = i2c_bus(buf())
+    master(&d, 0, 0x50)
+    master(&d, 1, 0x50)
+    wr(&d, 0, CMD, 1 | STOP, 0)
+    wr(&d, 1, CMD, 1 | STOP, 0)
+    assert(d.fault.contains("arbitration"), d.fault)
+    // A slave on the bus whose own pad does not read its input.
+    var e = i2c_bus(buf())
+    slave(&e, 1, 0x17)
+    master(&e, 0, 0x17)
+    val w = [Wiring(0x50, 0xA0, ""), Wiring(0x50, 0xA0, "GPIO 6's pad does not read its input")]
+    e.write(0, CMD, 4, 1 | STOP, 0, w).is_ok()
+    e.run(10 * P, w)
+    assert(e.fault.contains("GPIO 6's pad"), e.fault)

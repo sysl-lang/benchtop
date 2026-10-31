@@ -20,9 +20,10 @@ function(benchtop_program target source)
     pico_enable_stdio_usb(${target} 0)
 endfunction()
 
-foreach(prog hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash rom_funcs)
+foreach(prog hello_serial blink hello_multicore hello_rtc rtc_alarm ssi_flash rom_funcs bus_scan)
     benchtop_program(${prog} ${prog}.c)
 endforeach()
+target_link_libraries(bus_scan hardware_i2c)
 
 # pico-examples' programs as their own CMakeLists build them: flash images, with boot2 in the first
 # 256 bytes, which the boot ROM's boot path checks and runs.

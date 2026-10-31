@@ -7,6 +7,7 @@ import sh.sysl.benchtop.peripheral.rp2350 as rp
 import sh.sysl.benchtop.peripheral.rp2350.{BusCtrl, BusFault, ClocksRp2040, Drive, GPIO_COUNT, GPIO_COUNT_RP2040, IoBank0, IoQspi, Pads, Pin, Pll, Psm, QspiPads, Rosc, Sio, Sources, SysInfo, Uart, Xosc}
 import sh.sysl.benchtop.peripheral.rp2350.{UART_UNITS_PER_CYCLE, psm_stage_name_rp2040, uart_of}
 import sh.sysl.benchtop.peripheral.rp2350.{SpiHost, Spis, spi_of}
+import sh.sysl.benchtop.peripheral.rp2350.{I2cBus, i2c_bus}
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2040.adc as adc_reg
@@ -44,6 +45,7 @@ import sh.sysl.rp2040.vreg_and_chip_reset as vreg_reg
 import sh.sysl.rp2040.watchdog as watchdog_reg
 import sh.sysl.rp2040.xip_ctrl as xip_ctrl_reg
 import sh.sysl.rp2040.xosc as xosc_reg
+import sysl.buf.buf
 import sysl.fmt.hex
 import sysl.math.min
 import sysl.text.char_from_u32
@@ -115,6 +117,7 @@ private const SPI1_IRQ_RP2040: u32 = 19
 private const UART0_IRQ_RP2040: u32 = 20
 private const UART1_IRQ_RP2040: u32 = 21
 private const ADC_IRQ_FIFO_RP2040: u32 = 22
+private const I2C0_IRQ_RP2040: u32 = 23
 private const RTC_IRQ_RP2040: u32 = 25
 
 /** The boot ROM: benchtop's own (`rom/rp2040/`, built by its `image/build.sh`), all 16 KB of it mapped
@@ -163,6 +166,8 @@ enum Block40
     Uart1
     Spi0
     Spi1
+    I2c0
+    I2c1
     Psm
     Rosc
     SysInfo
@@ -183,7 +188,7 @@ struct Placed40
     name: string
     reset: u32
 
-val BLOCKS_RP2040: [25]Placed40 = [
+val BLOCKS_RP2040: [27]Placed40 = [
     Placed40(Block40.Resets, resets_reg.BASE, "RESETS", 0),
     Placed40(Block40.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed40(Block40.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -213,6 +218,8 @@ val BLOCKS_RP2040: [25]Placed40 = [
     Placed40(Block40.IoQspi, io_qspi_reg.BASE, "IO_QSPI", resets_reg.RESET_IO_QSPI_MASK),
     Placed40(Block40.PadsQspi, pads_qspi_reg.BASE, "PADS_QSPI", resets_reg.RESET_PADS_QSPI_MASK),
     Placed40(Block40.PwmBlock, pwm_reg.BASE, "PWM", resets_reg.RESET_PWM_MASK),
+    Placed40(Block40.I2c0, i2c0_reg.BASE, "I2C0", resets_reg.RESET_I2C0_MASK),
+    Placed40(Block40.I2c1, i2c1_reg.BASE, "I2C1", resets_reg.RESET_I2C1_MASK),
 ]
 
 /** A block on the RP2040's bus that benchtop does not run yet: its window, its name and why. */
@@ -222,9 +229,7 @@ struct Absent40
     name: string
     why: string
 
-val ABSENT_RP2040: [6]Absent40 = [
-    Absent40(i2c0_reg.BASE, WINDOW_RP2040, "I2C0", "not on the chip yet (docs/rp-coverage.md item 17)"),
-    Absent40(i2c1_reg.BASE, WINDOW_RP2040, "I2C1", "not on the chip yet (docs/rp-coverage.md item 17)"),
+val ABSENT_RP2040: [4]Absent40 = [
     Absent40(dma_reg.BASE, 0x1000, "DMA", "not on the chip yet (docs/rp-coverage.md item 11)"),
     Absent40(pio0_reg.BASE, 0x1000, "PIO0", "not on the chip yet (docs/rp-coverage.md items 13 and 14)"),
     Absent40(pio1_reg.BASE, 0x1000, "PIO1", "not on the chip yet (docs/rp-coverage.md items 13 and 14)"),
@@ -310,12 +315,16 @@ struct Rp2040
     adc: r40.Adc
     adc_rest: u64
     analog: r40.AnalogIn
+    // I2C0 and I2C1, with the I2C parts on the workbench (chip/i2c.sysl).
+    i2c: I2cBus
 
-    /** Power-on, with core 1 in the boot ROM. */
+    /** Power-on, with core 1 in the boot ROM; the I2C parts stay on the workbench. */
     reset(*self)
         val analog = self.analog
+        val parts = self.i2c.parts
         *self = rp2040()
         self.analog = analog
+        self.i2c.parts = parts
 
     /** What each clock source runs at now; the PLLs take the crystal as their reference. */
     sources(*self) -> Sources
@@ -354,6 +363,7 @@ struct Rp2040
         if self.pwm.enabled != 0 then self.advance_pwm(cycles)
         if self.spi.live() then self.spi.pass(self, cycles, sys, self.clocks.peri_hz(self.sources()))
         if self.adc.active() then self.advance_adc(cycles, sys)
+        if self.i2c.next_due() <= self.now then self.i2c_steps()
     end advance
 
     // `cycles` of clk_sys at `sys` Hz pass for the RTC, as clk_rtc's cycles.
@@ -592,6 +602,7 @@ struct Rp2040
             Uart1 -> self.uarts[1].read(o, width)
             Spi0 -> self.spi.read(self, 0, o, width)
             Spi1 -> self.spi.read(self, 1, o, width)
+            I2c0 | I2c1 -> return self.i2c_read40(p, o, width)
             Psm -> self.psm.read(o, width)
             Rosc -> self.rosc.read(rosc_offset(o), width)
             SysInfo -> sysinfo_read(o, width)
@@ -674,6 +685,7 @@ struct Rp2040
             Uart1 -> return self.uart_write(1, p, o, width, x)
             Spi0 -> return self.spi_write(0, p, o, width, x)
             Spi1 -> return self.spi_write(1, p, o, width, x)
+            I2c0 | I2c1 -> return self.i2c_write40(p, o, width, x)
             Psm ->
                 val before = self.psm
                 val r = self.psm.write(o, width, x)
@@ -802,6 +814,8 @@ struct Rp2040
                 Uart1 -> self.uarts[1].reset()
                 Spi0 -> self.spi.reset(0)
                 Spi1 -> self.spi.reset(1)
+                I2c0 -> self.i2c.reset_unit(0)
+                I2c1 -> self.i2c.reset_unit(1)
                 Rtc -> self.rtc.reset()
                 PwmBlock -> self.pwm.reset()
                 AdcBlock -> self.adc.reset()
@@ -851,7 +865,7 @@ struct Rp2040
             Pwm -> rp.pwm_drive(&self.pwm, n)
             SpiSck -> Drive(self.spi.sck(spi_of(n)), self.spi.enabled(spi_of(n)))
             SpiTx -> Drive(self.spi.tx(spi_of(n)), self.spi.enabled(spi_of(n)))
-            UartRx | SpiRx | Null -> Drive(false, false)
+            UartRx | SpiRx | Null | I2cSda | I2cScl -> Drive(false, false)
         self.io.after_overrides(n, d)
 
     /** What GPIO `n` is doing: whether its pad drives, and its level. */
@@ -906,7 +920,7 @@ rp2040() -> Rp2040 =
         [divider(), divider()], rp.io_bank0_rp2040(), rp.pads_bank0_rp2040(), [rp.uart(), rp.uart()], rp.psm_rp2040(), rp.rosc(),
         rp.sysinfo(), rp.busctrl(false), 0, [0; 1024], [0, 0], r40.ssi(), r40.xip_ctrl(), w25q16jv(), rp.io_qspi_rp2040(), rp.qspi_pads_rp2040(), r40.vreg(), r40.rtc(), 0, true,
         false, false, 0, 0, 0, 0, 0, 0, 0, 0, "", r40.pwm_rp2040(), false, false, rp.spis(),
-        r40.adc("RP2040", adc_reg.CS_AINSEL_MASK, adc_reg.CS_RROBIN_MASK), 0, r40.analog_in())
+        r40.adc("RP2040", adc_reg.CS_AINSEL_MASK, adc_reg.CS_RROBIN_MASK), 0, r40.analog_in(), i2c_bus(buf()))
 
 // An SPI's MISO is the level its RX pin reads (`Rp2350`'s SpiHost).
 impl SpiHost for Rp2040
@@ -936,7 +950,7 @@ impl ArmChip for Rp2040
             Some(n) -> due = earliest(due, self.ticks_to_cycles(n))
             None -> ()
         if self.adc.wakes() then due = earliest(due, self.adc_due())
-        earliest(earliest(earliest(due, self.line_due()), self.rtc_due()), self.pwm_due())
+        earliest(earliest(earliest(earliest(due, self.line_due()), self.rtc_due()), self.pwm_due()), self.i2c_due())
 
     load(*self, core: u32, a: u32, width: u32) -> Result[u32, string]
         // The board maps the ROM on the cores' fast path; an access that reaches the bus reads the same bytes.
@@ -964,7 +978,7 @@ impl ArmChip for Rp2040
         if self.rtc.irq() then lines |= 1u64 << RTC_IRQ_RP2040
         if self.pwm.irq(0) then lines |= 1u64 << PWM_IRQ_WRAP_RP2040
         if self.adc.irq() then lines |= 1u64 << ADC_IRQ_FIFO_RP2040
-        lines
+        lines | u64(self.i2c.lines & 3) << I2C0_IRQ_RP2040
 
     /** The lines only core `k` has, high at the moment: its IO_IRQ_BANK0 and its SIO FIFO line. */
     core_lines(*self, k: u32) -> u64
@@ -974,14 +988,15 @@ impl ArmChip for Rp2040
         lines
 
     /** Whether a read of `a` can lower a shared line: a UART's UARTDR, an SPI's SSPDR or the ADC's FIFO,
-     * each popping a FIFO.
+     * each popping a FIFO, or any read of an I2C controller, whose IC_CLR_* reads clear its interrupts
+     * and whose IC_DATA_CMD pops its receive FIFO.
      */
     @inline
     read_lowers(*self, a: u32) -> bool
         val w = a & ~3u32
         w == uart0_reg.BASE + uart0_reg.UARTDR_OFFSET || w == uart1_reg.BASE + uart1_reg.UARTDR_OFFSET ||
             w == spi0_reg.BASE + spi0_reg.SSPDR_OFFSET || w == spi1_reg.BASE + spi1_reg.SSPDR_OFFSET ||
-            w == adc_reg.BASE + adc_reg.FIFO_OFFSET
+            w == adc_reg.BASE + adc_reg.FIFO_OFFSET || w - i2c0_reg.BASE < WINDOW_RP2040 || w - i2c1_reg.BASE < WINDOW_RP2040
 
     core1_stopped(*self) -> bool
         val held = self.core1_reset
@@ -1003,6 +1018,10 @@ impl ArmChip for Rp2040
         Some(r)
 
     take_fault(*self) -> Option[string]
+        if !self.i2c.fault.is_empty()
+            val why = self.i2c.fault
+            self.i2c.fault = ""
+            return Some(why)
         if self.fault.is_empty() then return None
         val why = self.fault
         self.fault = ""
