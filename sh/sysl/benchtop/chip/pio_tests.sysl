@@ -3,6 +3,7 @@ module sh.sysl.benchtop.chip
 
 import sh.sysl.rp2350.accessctrl as ac
 import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
 import sh.sysl.rp2350.pio0 as pr
 import sh.sysl.rp2350.pio1 as pr1
 import sh.sysl.rp2350.pio2 as pr2
@@ -69,7 +70,7 @@ private program(name: string) -> Program
 // The chip with PIO0, PIO1 and PIO2 out of reset.
 private released() -> Rp2350
     var c = rp2350()
-    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_PIO0_MASK | rr.RESET_PIO1_MASK | rr.RESET_PIO2_MASK | rr.RESET_IO_BANK0_MASK)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_PIO0_MASK | rr.RESET_PIO1_MASK | rr.RESET_PIO2_MASK | rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK)
     c
 
 // One SDK register write, and the clk_sys cycle the core takes over it.
@@ -86,11 +87,17 @@ private sdk_set(c: *Rp2350, k: u32, s: u32, pin: u32, pindirs: bool, value: u32)
     sdk_wr(c, sm_reg(k, s, 20), pinctrl)
 
 // pio_add_program at offset 0, then pio_sm_init(pio, sm, 0, &c) as hardware/pio.c does it.
-private sdk_init(c: *Rp2350, k: u32, s: u32, p: Program)
-    for i in 0..<p.words.len() do sdk_wr(c, pio_base(k) + pr.INSTR_MEM0_OFFSET + 4 * u32(i), p.words[i])
+private sdk_init(c: *Rp2350, k: u32, s: u32, p: Program) = sdk_init_at(c, k, s, p, 0)
+
+// The same at `offset`, as pio_add_program relocates: each JMP's target and the wrap moved by it.
+private sdk_init_at(c: *Rp2350, k: u32, s: u32, p: Program, offset: u32)
+    for i in 0..<p.words.len()
+        val w = p.words[i]
+        val placed = if w >> 13 == 0 then (w & ~0x1fu32) | ((w + offset) & 0x1f) else w
+        sdk_wr(c, pio_base(k) + pr.INSTR_MEM0_OFFSET + 4 * (u32(i) + offset), placed)
     sdk_wr(c, pio_base(k) + pr.CTRL_OFFSET + CLR, 1 << s)
     sdk_wr(c, sm_reg(k, s, 0), p.clkdiv)
-    sdk_wr(c, sm_reg(k, s, 4), p.execctrl)
+    sdk_wr(c, sm_reg(k, s, 4), p.execctrl + (offset << 12) + (offset << 7))
     sdk_wr(c, sm_reg(k, s, 8), p.shiftctrl)
     sdk_wr(c, sm_reg(k, s, 20), p.pinctrl)
     sdk_wr(c, sm_reg(k, s, 8) + 0x1000, pr.SM0_SHIFTCTRL_FJOIN_RX_MASK)
@@ -98,7 +105,7 @@ private sdk_init(c: *Rp2350, k: u32, s: u32, p: Program)
     sdk_wr(c, pio_base(k) + pr.FDEBUG_OFFSET, 0x01010101 << s)
     sdk_wr(c, pio_base(k) + pr.CTRL_OFFSET + SET, 1 << (4 + s))
     sdk_wr(c, pio_base(k) + pr.CTRL_OFFSET + SET, 1 << (8 + s))
-    sdk_wr(c, sm_reg(k, s, 16), 0)
+    sdk_wr(c, sm_reg(k, s, 16), offset)
 
 private pin(c: *Rp2350, k: u32, n: u32) -> bool = (c.pio_pins(k).0 >> n) & 1 != 0
 
@@ -224,26 +231,61 @@ private uart_decode(line: Buf[bool], bit256: u64) -> string
 
 @test("pico-examples' pio/uart_tx: \"Hello, world! (from PIO!)\" put a character at a time as uart_tx_program_puts does, read back off pin 0 by a UART receiver at 115200 baud from the SDK's divisor 162.76: 8N1, idle high")
 pio_uart_tx()
+    // At offset 0, and at 28 where pio_add_program puts it, its JMP relocated and its wrap at the top.
+    for offset in [0u32, 28]
+        var c = released()
+        val p = program("uart_tx")
+        sdk_set(&c, 0, 0, 0, false, 1)
+        sdk_set(&c, 0, 0, 0, true, 1)
+        sdk_init_at(&c, 0, 0, p, offset)
+        sdk_enable(&c, 0, 0)
+        val text = "Hello, world! (from PIO!)\r\n"
+        var line: Buf[bool] = buf()
+        var next: usize = 0
+        var idle = 0
+        while idle < 3000
+            if next < text.len && rd(&c, pr.BASE + pr.FSTAT_OFFSET) & (1 << 16) == 0
+                wr(&c, pr.BASE + pr.TXF0_OFFSET, u32(text.bytes[next]))
+                next += 1
+            c.advance(1)
+            line.push(pin(&c, 0, 0))
+            idle = if next == text.len && pin(&c, 0, 0) && rd(&c, pr.BASE + pr.FLEVEL_OFFSET) == 0 then idle + 1 else 0
+        // 8 state machine cycles a bit at 162 + 195/256.
+        val got = uart_decode(line, 8 * u64(p.clkdiv >> 8))
+        assert(got == text, s"at $offset: $got")
+    // GPIO 0 given to PIO0 through the mux and run 1000 cycles at a time, the line read off the edges.
     var c = released()
     val p = program("uart_tx")
-    sdk_set(&c, 0, 0, 0, false, 1)
-    sdk_set(&c, 0, 0, 0, true, 1)
-    sdk_init(&c, 0, 0, p)
-    sdk_enable(&c, 0, 0)
+    // pio_gpio_init: the pad's input on, its output and isolation off, FUNCSEL PIO2, where the SDK's
+    // pio_claim_free_sm_and_add_program_for_gpio_range puts it.
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + SET, pads.GPIO0_IE_MASK)
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + CLR, pads.GPIO0_OD_MASK)
+    wr(&c, io.BASE + io.GPIO0_CTRL_OFFSET, 8)
+    wr(&c, pads.BASE + pads.GPIO0_OFFSET + CLR, pads.GPIO0_ISO_MASK)
+    c.capture_edges(1)
+    sdk_set(&c, 2, 0, 0, false, 1)
+    sdk_set(&c, 2, 0, 0, true, 1)
+    sdk_init_at(&c, 2, 0, p, 28)
+    sdk_enable(&c, 2, 0)
     val text = "Hello, world! (from PIO!)\r\n"
-    var line: Buf[bool] = buf()
+    val from = c.now
     var next: usize = 0
-    var idle = 0
-    while idle < 3000
-        if next < text.len && rd(&c, pr.BASE + pr.FSTAT_OFFSET) & (1 << 16) == 0
-            wr(&c, pr.BASE + pr.TXF0_OFFSET, u32(text.bytes[next]))
+    while next < text.len || rd(&c, pr2.BASE + pr.FLEVEL_OFFSET) != 0
+        while next < text.len && rd(&c, pr2.BASE + pr.FSTAT_OFFSET) & (1 << 16) == 0
+            wr(&c, pr2.BASE + pr.TXF0_OFFSET, u32(text.bytes[next]))
             next += 1
-        c.advance(1)
-        line.push(pin(&c, 0, 0))
-        idle = if next == text.len && pin(&c, 0, 0) && rd(&c, pr.BASE + pr.FLEVEL_OFFSET) == 0 then idle + 1 else 0
-    // 8 state machine cycles a bit at 162 + 195/256.
+        c.advance(1000)
+    c.advance(40000)
+    var line: Buf[bool] = buf()
+    var level = true
+    var k: usize = 0
+    for t in from..<c.now
+        while k < c.pin_edges.len() && c.pin_edges[k].cycle < t
+            level = c.pin_edges[k].level
+            k += 1
+        line.push(level)
     val got = uart_decode(line, 8 * u64(p.clkdiv >> 8))
-    assert(got == text, got)
+    assert(got == text, s"through the mux: $got")
 
 // Drive GPIO 3 as a UART line at 115200 baud from 150 MHz for `bits` (LSB first after a start bit, then
 // a stop bit at `stop`), from bit edge `at` of a free-running bit clock; answers the next edge.
@@ -328,7 +370,7 @@ pio_rp2350_only()
             low.advance(20)
             assert(rd(&low, sm_reg(0, 0, 12)) == 5)
 
-@test("on the chip: PIO0–2 behind their RESETS bits, back at power-on when reset; a reserved instruction stops the run through take_line_fault; refusals named with the block and offset; FUNCSEL PIO still refused; ACCESSCTRL disconnects a Non-secure block from its neighbours")
+@test("on the chip: PIO0–2 behind their RESETS bits, back at power-on when reset; a reserved instruction stops the run through take_line_fault; refusals named with the block and offset; FUNCSEL PIO accepted; ACCESSCTRL disconnects a Non-secure block from its neighbours")
 pio_on_chip()
     var c = rp2350()
     assert(c.read(0, pr1.BASE + pr.CTRL_OFFSET, 4) == Err("PIO1 is held in reset (RESETS bit 12): release it before touching 0x50300000"))
@@ -347,7 +389,7 @@ pio_on_chip()
     assert(c.write(0, sm_reg(0, 0, 20), 4, 6 << 29) == Err("PIO0 + 0xdc: SM0_PINCTRL.SIDESET_COUNT 6 is more than 5"))
     assert(c.write(0, pr1.BASE + pr.TXF0_OFFSET + SET, 4, 1) == Err("PIO1 + 0x2010 cannot be written through an atomic alias"))
     assert(c.read(0, pr2.BASE + pr.TXF1_OFFSET, 4) == Err("PIO2 + 0x14: TXF1 is write-only: what a read returns is not modelled"))
-    assert(c.write(0, io.BASE + io.GPIO25_CTRL_OFFSET, 4, 6) == Err("IO_BANK0 + 0xcc: GPIO 25 FUNCSEL 6 selects PIO0, whose pins do not reach the mux yet (docs/rp-coverage.md item 14)"))
+    assert(c.write(0, io.BASE + io.GPIO25_CTRL_OFFSET, 4, 6) == Ok(()), "FUNCSEL PIO0 reaches the mux")
     // PIO1 reachable from Non-secure code: PIO0's NEXT operations stop at it.
     wr(&c, ac.BASE + ac.PIO1_OFFSET, 0xacce00ff)
     assert(c.pio.ns == 2)

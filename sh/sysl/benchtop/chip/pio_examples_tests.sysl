@@ -1,0 +1,163 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// pico-examples' PIO programs run whole on the Arm Pico 2, their state machines' pins through the GPIO
+// mux: pio/pio_blink, pio/ws2812, pio/uart_tx and pio/uart_rx (examples/pico2/pio_*.c, unchanged). What
+// they print is compared line by line, and what they put on their pins is read off `pin_edges`, the
+// chip's record of each level a PIO block gives a GPIO, with the cycle it changed on.
+
+private val PIO_BLINK = embed("../../../../examples/pico2/pio_blink.elf")
+private val PIO_WS2812 = embed("../../../../examples/pico2/pio_ws2812.elf")
+private val PIO_UART_TX = embed("../../../../examples/pico2/pio_uart_tx.elf")
+private val PIO_UART_RX = embed("../../../../examples/pico2/pio_uart_rx.elf")
+private val SRAM = SramMap(0x20000000, 520 * 1024)
+
+// The edges recorded on GPIO `n`.
+private edges_on(b: &ArmBoard, n: u32) -> Buf[PinEdge]
+    var out: Buf[PinEdge] = buf()
+    for e in b.chip.pin_edges.view() do if e.gpio == n then out.push(e)
+    out
+
+// A UART line read back off GPIO `n`'s edges, idle high: the bytes, each sampled mid-bit at `bit256` /
+// 256 cycles a bit from its start bit's falling edge.
+private uart_edges(b: &ArmBoard, n: u32, bit256: u64) -> string
+    val e = edges_on(b, n)
+    // The level after the end of cycle `t`.
+    val level = (t: u64) ->
+        var v = true
+        for x in e.view()
+            if x.cycle > t then break
+            v = x.level
+        v
+    var out = ""
+    var i: usize = 0
+    while i < e.len()
+        if e[i].level
+            i += 1
+            continue
+        val start = e[i].cycle
+        val at = (k: u64) -> level(start + (k * bit256 + bit256 / 2) / 256)
+        assert(!at(0), s"a start bit at $start")
+        var byte: u32 = 0
+        for j in 0u64..<8 do if at(1 + j) then byte |= 1 << u32(j)
+        assert(at(9), s"the stop bit of 0x${hex(byte, 2)} at $start")
+        out = out + from_utf8_lossy([u8(byte)])
+        val stop = start + (9 * bit256 + bit256 / 2) / 256
+        while i < e.len() && e[i].cycle <= stop do i += 1
+    out
+
+@test("pico-examples' pio/pio_blink on the Arm Pico 2, flashing for one second: its lines, GPIO 3–6 on PIO2 through the mux at 4, 3, 2 and 1 Hz to the clk_sys cycle, all four low after the clean shutdown")
+arm_pio_blink()
+    val b = arm_board(SRAM)
+    b.chip.capture_edges(0x78)
+    b.boot(PIO_BLINK).unwrap()
+    val end = b.run(400000000)
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    // The SDK claims from the last block down, so PIO2 (FUNCSEL 8), the program's 8 words at the top.
+    val want = "Loaded program at 24 on pio 2\r\n" +
+        "Blinking pin 3 at 4 Hz\r\n" +
+        "Blinking pin 4 at 3 Hz\r\n" +
+        "Blinking pin 5 at 2 Hz\r\n" +
+        "Blinking pin 6 at 1 Hz\r\n" +
+        "All LEDs should be flashing\r\n" +
+        "Stopping the LEDs\r\n" +
+        "All LEDs should be off\r\n"
+    assert(text == want, text)
+    for k in 0u32..<4
+        val e = edges_on(b, 3 + k)
+        // set pins, 1 to set pins, 0: the count's x + 1 cycles, MOV and SET, which the program's
+        // clock_get_hz(clk_sys) / (2 * freq) - 3 makes exactly half a period.
+        val half = 150000000u64 / (2 * u64(4 - k))
+        assert(e.len() >= 2 && e[0].level, s"GPIO ${3 + k}: ${e.len()} edges")
+        for i in 1..<e.len() - 1
+            assert(e[i].level == (i % 2 == 0), s"GPIO ${3 + k} edge $i")
+            assert(e[i].cycle - e[i - 1].cycle == half, s"GPIO ${3 + k} edge $i: ${e[i].cycle - e[i - 1].cycle} cycles, not $half")
+        // A second's flashing: 2 × 4 half periods at 4 Hz and so on, give or take the one in progress.
+        val n = e.len()
+        assert(n + 1 >= 2 * usize(4 - k) && n <= 2 * usize(4 - k) + 2, s"GPIO ${3 + k}: $n edges")
+        assert(!e[n - 1].level && !b.chip.pin(3 + k).level, s"GPIO ${3 + k} low at the end")
+
+@test("pico-examples' pio/uart_tx on the Arm Pico 2: \"Hello, world! (from PIO!)\" off GPIO 0 through the mux at 115200 baud, 8N1, once a second")
+arm_pio_uart_tx()
+    val b = arm_board(SRAM)
+    b.chip.capture_edges(1)
+    b.boot(PIO_UART_TX).unwrap()
+    val end = b.run(170000000)
+    assert(end == RunEnd.Budget, s"$end ${b.refused}")
+    var dump = ""
+    for x in edges_on(b, 0).view()[..<20] do dump = dump + s" ${x.cycle}:${x.level}"
+    val base: u32 = 0x50400000
+    for o in [0u32, 0xc8, 0xcc, 0xd0, 0xd4, 0xd8, 0xdc, 0x168]
+        dump = dump + s" [${hex(o)}]=${hex(b.chip.read(0, base + o, 4).unwrap())}"
+    for o in 0u32..<32 do dump = dump + s" ${hex(b.chip.read(0, base + 0x48 + 4 * o, 4).unwrap_or(0xdead))}"
+    assert(false, dump)
+    // 8 state machine cycles a bit at the SDK's divisor 162 + 195/256.
+    val got = uart_edges(b, 0, 8 * (162 * 256 + 195))
+    assert(got == "Hello, world! (from PIO!)\r\nHello, world! (from PIO!)\r\n", got)
+    val e = edges_on(b, 0)
+    val second = e[e.len() / 2].cycle
+    assert(second - e[0].cycle > 150000000, s"the second line ${second - e[0].cycle} cycles after the first")
+
+@test("pico-examples' pio/ws2812 on the Arm Pico 2: its banner and first pattern, then the first frame's 150 pixels off GPIO 2 through the mux at the SDK's divisor 18.75: a 1 high 112.5 clk_sys cycles, a 0 56.25, 187.5 to a bit")
+arm_pio_ws2812()
+    val b = arm_board(SRAM)
+    b.chip.capture_edges(4)
+    b.boot(PIO_WS2812).unwrap()
+    val end = b.run(3000000)
+    assert(end == RunEnd.Budget, s"$end ${b.refused}")
+    // newlib's rand from its seed of 1: the pattern (1, "Random data"), the direction (bit 30 set,
+    // forward), then pattern_random's 150 pixels, each put_pixel(rand()) shifted out from bit 23.
+    var seed: u64 = 1
+    val rand = () ->
+        seed = seed *% 6364136223846793005 +% 1
+        u32((seed >> 32) & 0x7fffffff)
+    assert(rand() % 4 == 1 && (rand() >> 30) & 1 == 1, "newlib's sequence")
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == "WS2812 Smoke Test, using pin 2\r\nRandom data\r\n(forward)\r\n", text)
+    val e = edges_on(b, 2)
+    var pixels: Buf[u32] = buf()
+    var bits: u32 = 0
+    var word: u32 = 0
+    // The run of bits since the last gap: its first rise, and how many.
+    var run_at: u64 = 0
+    var run: u64 = 0
+    var i: usize = 0
+    while i + 1 < e.len()
+        assert(e[i].level && !e[i + 1].level, s"edge $i")
+        val n = pixels.len() * 24 + usize(bits)
+        if run == 0 then run_at = e[i].cycle
+        // Each rise within a cycle of the state machine's 10 cycles a bit at 18.75: 187.5 clk_sys cycles.
+        val drift = i64(2 * (e[i].cycle - run_at)) - i64(375 * run)
+        assert(drift >= -2 && drift <= 2, s"bit $n rises ${e[i].cycle - run_at} cycles into its run of $run")
+        run = if i + 2 < e.len() && e[i + 2].cycle - e[i].cycle < 1000 then run + 1 else 0
+        // A 1 high for 6 state machine cycles (112.5 clk_sys cycles), a 0 for 3 (56.25).
+        val high = e[i + 1].cycle - e[i].cycle
+        assert(high == 112 || high == 113 || high == 56 || high == 57, s"bit $n high for $high cycles")
+        word = (word << 1) | (if high > 84 then 1 else 0)
+        bits += 1
+        if bits == 24
+            pixels.push(word)
+            bits = 0
+            word = 0
+        i += 2
+    assert(bits == 0 && pixels.len() >= 150, s"${pixels.len()} pixels and $bits bits")
+    for k in 0..<150
+        val want = rand() & 0xFFFFFF
+        assert(pixels[k] == want, s"pixel $k: 0x${hex(pixels[k], 6)}, not 0x${hex(want, 6)}")
+
+@test("pico-examples' pio/uart_rx on the Arm Pico 2, GPIO 4 wired to GPIO 3: core 1's text sent by UART1 is read by PIO2 off GPIO 3 through the mux and echoed to the console")
+arm_pio_uart_rx()
+    val b = arm_board(SRAM)
+    b.chip.wire(4, Some(3))
+    b.boot(PIO_UART_RX).unwrap()
+    val end = b.run(30000000)
+    assert(end == RunEnd.Budget, s"$end ${b.refused}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == "Starting PIO UART RX example\r\nHello, world from PIO! (Plus 2 UARTs and 2 cores, for complex reasons)\r\n", text)
