@@ -3,7 +3,7 @@ module sh.sysl.benchtop.chip
 import sh.sysl.benchtop.peripheral.rp2040.{AccessError, Dma, Resets, replicated, written}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
 import sh.sysl.benchtop.parts.qspi_flash.{QspiFlash, qspi_flash}
-import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, Otp, OtpFault, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name}
+import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, GPIO_COUNT, IoBank0, IoQspi, Otp, OtpFault, Pads, Pin, Pll, Powman, Psm, Qmi, QspiPads, Rosc, Sha256, ShaFault, Sio, Sources, SysCfg, SysInfo, Tick, Ticks, Timer, Trng, TrngFault, Uart, UsbCtrl, Watchdog, Xip, XipFault, Xosc, psm_stage_name, sha_why, trng_why}
 import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_MAINTENANCE_BASE, XIP_WINDOWS_END, read_xip, xip_aux_read, xip_aux_write, xip_target}
 import sh.sysl.benchtop.peripheral.rp2350.{DREQ_UART0_TX, Frame, Sent, UART_UNITS_PER_CYCLE, uart_of}
 import sh.sysl.benchtop.peripheral.rp2350.{Pio, PioFault}
@@ -30,7 +30,9 @@ import sh.sysl.rp2350.powman as powman_reg
 import sh.sysl.rp2350.psm as psm_reg
 import sh.sysl.rp2350.resets as resets_reg
 import sh.sysl.rp2350.rosc as rosc_reg
+import sh.sysl.rp2350.sha256 as sha256_reg
 import sh.sysl.rp2350.sio as sio_reg
+import sh.sysl.rp2350.trng as trng_reg
 import sh.sysl.rp2350.syscfg as syscfg_reg
 import sh.sysl.rp2350.sysinfo as sysinfo_reg
 import sh.sysl.rp2350.ticks as ticks_reg
@@ -82,6 +84,9 @@ const UART0_IRQ: u32 = 33
 const UART1_IRQ: u32 = 34
 const USBCTRL_IRQ: u32 = 14
 const DMA_IRQ_0: u32 = 10
+const TRNG_IRQ: u32 = 39
+/** The SHA-256 core's DMA request (`DREQ_SHA256`). */
+const DREQ_SHA256: u32 = 54
 
 /** A GPIO with no wire (`Rp2350.wire`). */
 const NO_WIRE: u8 = 0xFF
@@ -128,6 +133,8 @@ enum Block
     OtpDataRawGuarded
     OtpBlock
     DmaBlock
+    TrngBlock
+    ShaBlock
 
 /** A block, its base address, its name in a refusal, and the RESETS bit holding it (0 for none). */
 struct Placed
@@ -137,7 +144,7 @@ struct Placed
     reset: u32
 
 /** Every block the chip runs, with the SVD's base addresses. */
-val BLOCKS: [37]Placed = [
+val BLOCKS: [39]Placed = [
     Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
     Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -180,6 +187,9 @@ val BLOCKS: [37]Placed = [
     Placed(Block.OtpBlock, otp_reg.BASE, "OTP", 0),
     // On the AHB, with its atomic aliases (the SDK sets INTE bits with `hw_set_bits`).
     Placed(Block.DmaBlock, dma_reg.BASE, "DMA", resets_reg.RESET_DMA_MASK),
+    // The TRNG and the SHA-256 core, on the APB with the atomic aliases.
+    Placed(Block.TrngBlock, trng_reg.BASE, "TRNG", resets_reg.RESET_TRNG_MASK),
+    Placed(Block.ShaBlock, sha256_reg.BASE, "SHA256", resets_reg.RESET_SHA256_MASK),
     // The PIO blocks, on the AHB with the atomic aliases. Last, so the blocks a running program polls
     // are found without passing them (`block_at` walks the table).
     Placed(Block.Pio0, pio0_reg.BASE, "PIO0", resets_reg.RESET_PIO0_MASK),
@@ -227,6 +237,11 @@ struct Rp2350
     flash: QspiFlash
     // The OTP: the board's array, as the part's flash is, and the OTP block's registers.
     otp: Otp
+    // The TRNG and the SHA-256 core, and the clk_sys cycles into the DMA's present run that the transfer
+    // being made falls at (`dma_run`), which a device with its own busy time stamps its writes with.
+    trng: Trng
+    sha: Sha256
+    dma_t: u64
     // Something a board mirrors in its memory map has changed: the flash's contents, direct mode, or
     // which XIP_SRAM lines are pinned (`take_xip_changed`).
     xip_changed: bool
@@ -572,6 +587,7 @@ struct Rp2350
             self.sio.mtime_due(k) match
                 Some(n) -> due = earliest(due, if self.sio.mtime_full_speed() then Some(n) else self.ticks_to_cycles(Tick.Riscv, n))
                 None -> ()
+        due = earliest(due, self.trng.due(self.now))
         earliest(earliest(due, self.line_due()), self.dma_due())
 
     // The clk_sys cycles until generator `g`'s `n`th tick from now, rounded up; None while it is
@@ -611,6 +627,8 @@ struct Rp2350
             UsbDpram -> self.usb.dpram_read(o, width)
             Psm -> self.psm.read(o, width)
             Rosc -> self.rosc.read(o, width)
+            TrngBlock -> return self.trng.read(self.now, o, width).map_err(f -> trng_why(f))
+            ShaBlock -> return self.sha.read(self.now + self.dma_t, o, width).map_err(f -> sha_why(f))
             SysInfo -> self.sysinfo.read(o, width)
             SysCfg -> self.syscfg.read(o, width)
             Powman ->
@@ -712,6 +730,8 @@ struct Rp2350
                 // DORMANT with a dormant-wake interrupt already asserted wakes again at once.
                 if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
                 r
+            TrngBlock -> return self.trng.write(self.now, o, width, x).map_err(f -> trng_why(f))
+            ShaBlock -> return self.sha.write(self.now + self.dma_t, o, width, x).map_err(f -> sha_why(f))
             SysInfo -> self.sysinfo.write(o, width, x)
             SysCfg -> self.syscfg.write(o, width, x)
             Powman ->
@@ -1005,6 +1025,8 @@ struct Rp2350
                 IoQspiBlock -> self.io_qspi.reset()
                 PadsQspi -> self.pads_qspi.reset()
                 DmaBlock -> self.dma.reset()
+                TrngBlock -> self.trng.reset()
+                ShaBlock -> self.sha.reset()
                 _ -> ()
 
     // A write to UART `k`, refused where it asks for something benchtop does not model: a setting
@@ -1091,6 +1113,8 @@ struct Rp2350
         p.interrupt(UART0_IRQ, self.uarts[0].irq())
         p.interrupt(UART1_IRQ, self.uarts[1].irq())
         p.interrupt(USBCTRL_IRQ, self.usb.irq())
+        self.trng.settle(self.now)
+        p.interrupt(TRNG_IRQ, self.trng.irq())
         for j in 0u32..<4 do p.interrupt(DMA_IRQ_0 + j, self.dma.irq(j))
         p.machine_timer(self.sio.software_irq(k), self.sio.timer_irq(k))
 end Rp2350
@@ -1100,7 +1124,7 @@ rp2350() -> Rp2350 =
     Rp2350(rp.rp2350_resets(), rp.clocks(), rp.xosc(), rp.pll(), rp.pll(), rp.ticks(), [rp.timer(), rp.timer()], rp.watchdog(),
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.pio(), rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
-        rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), false,
+        rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), rp.trng(), rp.sha256(), 0, false,
         rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None)
 
 // The chip as `ArmBoard` drives it: its inherent methods under the trait's names.
