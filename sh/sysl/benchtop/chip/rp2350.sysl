@@ -696,10 +696,12 @@ struct Rp2350
         self.pio.pins(k)
 
     // The PIO blocks run to `now`. Nothing outside them sees their state but through the bus, these
-    // hooks, the interrupt lines (`signal`) and the faults the board collects each quantum, so they run
-    // only then, and `advance` pays nothing for them; `pio_due` wakes a sleeping board where something
-    // could see them. A state machine stopped on something benchtop does not model joins the lines'
-    // faults at once.
+    // hooks, the interrupt lines (`shared_interrupts`) and the faults the board collects each quantum, so
+    // they run only then, and `advance` pays nothing for them; `pio_due` wakes a sleeping board where
+    // something could see them. A state machine stopped on something benchtop does not model joins the
+    // lines' faults at once. Out of line: every caller tests `pio.running` first, and the bus's `read`
+    // and `write`, which the board inlines into its loads and stores, stay small.
+    @noinline
     private[chip] pio_catch_up(*self)
         if !self.pio.running || self.swcore_off then return
         self.pio_run_to(self.now)
@@ -707,6 +709,21 @@ struct Rp2350
             self.pio.take_fault() match
                 Some(why) -> self.line_fault = why
                 None -> ()
+
+    // A write to PIO block `p`, out of line from `write`.
+    @noinline
+    private pio_write(*self, p: Placed, o: u32, width: u32, x: u32) -> Result[unit, string]
+        self.pio_catch_up()
+        val k = pio_index(p.block)
+        val base = self.pio.blocks[k].gpiobase
+        val r = self.pio.write(k, self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
+        // The first state machine to run starts the blocks reading the GPIOs, which have been at these
+        // levels all along.
+        if !self.pio.listening && self.pio.live()
+            self.pio.listening = true
+            self.pio.settle_levels(self.inputs_now())
+        if self.pio.blocks[k].gpiobase != base then self.gpio_changed()
+        r
 
     // The blocks run to cycle `t`, each pin they move carried to what reads it on the cycle it moved. Out
     // of line, so that `take_line_fault`, which the board calls each quantum, stays small enough to inline.
@@ -979,18 +996,7 @@ struct Rp2350
             Spi0 -> return self.spi_write(0, p, o, width, x)
             Spi1 -> return self.spi_write(1, p, o, width, x)
             I2c0 | I2c1 -> return self.i2c_write(p, o, width, x)
-            Pio0 | Pio1 | Pio2 ->
-                self.pio_catch_up()
-                val k = pio_index(p.block)
-                val base = self.pio.blocks[k].gpiobase
-                val r = self.pio.write(k, self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
-                // The first state machine to run starts the blocks reading the GPIOs, which have been
-                // at these levels all along.
-                if !self.pio.listening && self.pio.live()
-                    self.pio.listening = true
-                    self.pio.settle_levels(self.inputs_now())
-                if self.pio.blocks[k].gpiobase != base then self.gpio_changed()
-                return r
+            Pio0 | Pio1 | Pio2 -> return self.pio_write(p, o, width, x)
             Sio ->
                 tmds_unmodelled(o, x) match
                     Some(why) -> return Err(s"${p.name} + 0x${hex(o)}: $why")
@@ -1387,9 +1393,6 @@ struct Rp2350
             Sio -> Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
             // A UART's TX drives its line: high while idle, a frame's bits, low through a break.
             UartTx -> Drive(self.uarts[uart_of(n)].line_level(), true)
-            Pio0 -> self.pio_output(0, n)
-            Pio1 -> self.pio_output(1, n)
-            Pio2 -> self.pio_output(2, n)
             Pwm -> rp.pwm_drive(&self.pwm, n)
             // An SPI's SCK and TX drive the clock and MOSI levels while its port is enabled.
             SpiSck -> Drive(self.spi.sck(spi_of(n)), self.spi.enabled(spi_of(n)))
@@ -1397,6 +1400,10 @@ struct Rp2350
             // I2C's lines are open drain; between transfers they idle released.
             UartRx | SpiRx | Null | I2cSda | I2cScl -> Drive(false, false)
             Hstx -> Drive(self.hstx.output(n - 12, 0), true)
+            // Last: every GPIO is routed on each scan of the pins, most of them NULL.
+            Pio0 -> self.pio_output(0, n)
+            Pio1 -> self.pio_output(1, n)
+            Pio2 -> self.pio_output(2, n)
         self.io.after_overrides(n, d)
 
     /** What GPIO `n` is doing: whether its pad drives, and its level. Something outside drives it, or
