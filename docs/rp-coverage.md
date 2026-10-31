@@ -1415,8 +1415,9 @@ copies, once.
 **The image** is benchtop's own, written in sysl to work as the RP2040's does (`chip/rom/rp2040/`,
 `chip/rom/README.md`): 16 KB at 0 on the cores' fast path, read-only, built by `image/build.sh`
 (`sysl build-c --target thumbv6m-freestanding -Oz`, then Arm's `ld` with `rom.ld`), reproducibly:
-SHA-256 `af067cb98ffc5efa71eee78e9a758b9ea95e945e1d6fdcdba87367383cedfb2d` from sysl 0.8.7, code and
-data to 0x37A7. Raspberry Pi's image is not in the repository; neither it nor its
+SHA-256 `af067cb98ffc5efa71eee78e9a758b9ea95e945e1d6fdcdba87367383cedfb2d` from sysl 0.8.9 (the same bytes 0.8.7 gave), code and
+data to 0x37A7. The WFE and SEV are `sysl.hint`'s `wfe()`/`sev()`; `examples/pico/rom_crosscheck.uf2`
+is SHA-256 `b4b7b03a4e3e34c43e4198b857c8474de1270c4128a011f9ac8b3e19d307038b` (was `c395b145`). Raspberry Pi's image is not in the repository; neither it nor its
 float code was read. **Clean-room sources:** the Pico SDK's `pico/bootrom.h`, `bootrom_constants.h`
 and `pico/bootrom/sf_table.h` (the header, the codes, the tables' layout and the size byte before
 each), `pico_float`'s and `pico_double`'s RP2040 callers (which entries, in which registers, with

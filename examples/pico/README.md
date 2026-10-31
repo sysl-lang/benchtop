@@ -49,7 +49,7 @@ The settings, all in `CMakeLists.txt`:
 - otherwise the SDK's defaults: float, double, the bit operations and memcpy/memset from the boot ROM,
   which on benchtop is benchtop's own (`sh/sysl/benchtop/chip/rom/README.md`), and the SIO's hardware
   divider;
-- `rom_crosscheck` links an archive `sysl build-c` makes from `rom_crosscheck/ours` (sysl 0.8.7 on
+- `rom_crosscheck` links an archive `sysl build-c` makes from `rom_crosscheck/ours` (sysl 0.8.9 on
   the PATH), benchtop's ROM routines compiled for the Cortex-M0+.
 
 ## The ROM cross-check on a real Pico
