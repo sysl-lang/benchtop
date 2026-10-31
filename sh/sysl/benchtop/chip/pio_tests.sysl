@@ -7,7 +7,9 @@ import sh.sysl.rp2350.pads_bank0 as pads
 import sh.sysl.rp2350.pio0 as pr
 import sh.sysl.rp2350.pio1 as pr1
 import sh.sysl.rp2350.pio2 as pr2
+import sh.sysl.rp2350.powman as pm
 import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.sio as sio_reg
 import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
 import sysl.text.{fields, from_utf8_lossy, parse_ulong_base, split}
@@ -17,8 +19,8 @@ import sysl.text.{fields, from_utf8_lossy, parse_ulong_base, split}
 // read back by a UART decoder) and pio/uart_rx (fed a line waveform), and the RP2350-only pair in
 // examples/pico2/pio/rp2350_only.pio. The instructions are pioasm's (examples/pico2/pio/*.pio.h) and the
 // registers the configuration the SDK's own `sm_config_*` calls build, both as examples/pico2/pio_programs.c
-// prints them on the Arm board. The pins are the PIO's vector (`pio_drive`, `pio_pins`), not GPIOs
-// through the mux, which is item 14's.
+// prints them on the Arm board. Most read the PIO's own pins (`pio_drive`, `pio_pins`); uart_tx and the
+// pin record also take GPIO 0 through the mux (pio_examples_tests.sysl runs whole programs that way).
 
 private val PIO_PROGRAMS = embed("../../../../examples/pico2/pio_programs.elf")
 private val HELLO_H = embed("../../../../examples/pico2/pio/hello.pio.h")
@@ -276,6 +278,8 @@ pio_uart_tx()
             next += 1
         c.advance(1000)
     c.advance(40000)
+    // The record is current to the blocks' last catch-up: the board's look for faults each quantum.
+    assert(c.take_line_fault() == None)
     var line: Buf[bool] = buf()
     var level = true
     var k: usize = 0
@@ -398,3 +402,70 @@ pio_on_chip()
     wr(&c, ac.BASE + ac.PIO1_OFFSET, 0xacce00fc)
     wr(&c, pr.BASE + pr.CTRL_OFFSET, (1 << 20) | pr.CTRL_NEXTPREV_SM_ENABLE_MASK)
     assert(c.pio.ns == 0 && rd(&c, pr1.BASE + pr.CTRL_OFFSET) == 1)
+
+// GPIO 0's pad an input with no isolation, as pio_gpio_init leaves it.
+private pad_open(c: *Rp2350)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + SET, pads.GPIO0_IE_MASK)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + CLR, pads.GPIO0_OD_MASK | pads.GPIO0_ISO_MASK)
+
+@test("the pin record (`capture_edges`): nothing while GPIO 0's FUNCSEL is NULL; the high PIO0 gave it beforehand recorded on the cycle FUNCSEL hands it over; PIO0's low after; the SIO's high on the cycle FUNCSEL moves to SIO")
+pio_pin_record()
+    var c = released()
+    pad_open(&c)
+    c.capture_edges(1)
+    sdk_set(&c, 0, 0, 0, true, 1)
+    sdk_set(&c, 0, 0, 0, false, 1)
+    c.advance(10)
+    assert(c.take_line_fault() == None)
+    assert(c.pin_edges.len() == 0 && !c.pin(0).level, "FUNCSEL NULL: the pin is not PIO0's")
+    val handed = c.now
+    wr(&c, io.BASE + io.GPIO0_CTRL_OFFSET, 6)
+    assert(c.pin_edges.len() == 1 && c.pin_edges[0].cycle == handed && c.pin_edges[0].level && c.pin_edges[0].gpio == 0)
+    sdk_set(&c, 0, 0, 0, false, 0)
+    c.advance(10)
+    assert(c.take_line_fault() == None)
+    assert(c.pin_edges.len() == 2 && !c.pin_edges[1].level && c.pin_edges[1].cycle > handed)
+    // The SIO's drive counts for nothing while PIO0 has the pin.
+    wr(&c, sio_reg.BASE + sio_reg.GPIO_OE_SET_OFFSET, 1)
+    wr(&c, sio_reg.BASE + sio_reg.GPIO_OUT_SET_OFFSET, 1)
+    assert(c.pin_edges.len() == 2)
+    val sio_at = c.now
+    wr(&c, io.BASE + io.GPIO0_CTRL_OFFSET, 5)
+    assert(c.pin_edges.len() == 3 && c.pin_edges[2].cycle == sio_at && c.pin_edges[2].level)
+
+@test("PIO DREQs: TREQ_SEL 0–23 eight to a block, TX FIFO 0–3 asking while not full, RX FIFO 0–3 while not empty, each its own state machine's")
+pio_dreqs()
+    var c = released()
+    for sel in 0u32..<24
+        assert(c.pio.dreq(sel) == (sel % 8 < 4), s"DREQ $sel at power-on")
+    // PIO1's SM2 TX FIFO filled (4 deep), and PIO2's SM1 given a word to push: SET X then PUSH via SMx_INSTR.
+    for i in 0..<4 do wr(&c, pr1.BASE + pr.TXF2_OFFSET, i)
+    for instr in [0xe021u32, 0xa0c1, 0x8020]
+        wr(&c, sm_reg(2, 1, 16), instr)
+        c.advance(4)
+    assert(c.take_line_fault() == None)
+    assert(rd(&c, pr2.BASE + pr.FLEVEL_OFFSET) == 1 << 12, "one word in PIO2 SM1's RX FIFO")
+    for sel in 0u32..<24
+        val want = if sel == 10 then false elif sel == 21 then true else sel % 8 < 4
+        assert(c.pio.dreq(sel) == want, s"DREQ $sel")
+
+@test("refused by name: a PIO block driving a GPIO wired to a UART's RX, and one driving a GPIO POWMAN watches")
+pio_pin_refusals()
+    var c = released()
+    pad_open(&c)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_UART0_MASK)
+    // GPIO 1 is UART0's RX on F2; GPIO 0 PIO0's, wired to it.
+    wr(&c, io.BASE + io.GPIO1_CTRL_OFFSET, 2)
+    c.wire(0, Some(1))
+    wr(&c, io.BASE + io.GPIO0_CTRL_OFFSET, 6)
+    sdk_set(&c, 0, 0, 0, true, 1)
+    c.advance(10)
+    assert(c.take_line_fault() == Some("PIO0 drives GPIO 0, wired to GPIO 1, a UART's RX: a UART receives whole frames from another UART, and a level from a PIO block is not modelled"))
+    // A power-up request on GPIO 0, a high level.
+    var w = released()
+    pad_open(&w)
+    wr(&w, pm.BASE + pm.PWRUP0_OFFSET, 0x5AFE0000 | pm.PWRUP0_ENABLE_MASK | pm.PWRUP0_DIRECTION_MASK)
+    wr(&w, io.BASE + io.GPIO0_CTRL_OFFSET, 6)
+    sdk_set(&w, 0, 0, 0, true, 1)
+    w.advance(10)
+    assert(w.take_line_fault() == Some("PIO0 drives GPIO 0, which POWMAN watches: POWMAN samples its GPIOs as time passes, and a level from a PIO block between catch-ups is not modelled"))

@@ -3,17 +3,19 @@ module sh.sysl.benchtop.chip
 
 import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
+import sysl.math.max
 import sysl.text.from_utf8_lossy
 
 // pico-examples' PIO programs run whole on the Arm Pico 2, their state machines' pins through the GPIO
-// mux: pio/pio_blink, pio/ws2812, pio/uart_tx and pio/uart_rx (examples/pico2/pio_*.c, unchanged). What
-// they print is compared line by line, and what they put on their pins is read off `pin_edges`, the
+// mux: pio/pio_blink, pio/ws2812, pio/uart_tx, pio/uart_rx and pio/uart_dma (its DMA requests and
+// interrupt line too; examples/pico2/pio_*.c, unchanged). What they print is compared line by line, and what they put on their pins is read off `pin_edges`, the
 // chip's record of each level a PIO block gives a GPIO, with the cycle it changed on.
 
 private val PIO_BLINK = embed("../../../../examples/pico2/pio_blink.elf")
 private val PIO_WS2812 = embed("../../../../examples/pico2/pio_ws2812.elf")
 private val PIO_UART_TX = embed("../../../../examples/pico2/pio_uart_tx.elf")
 private val PIO_UART_RX = embed("../../../../examples/pico2/pio_uart_rx.elf")
+private val PIO_UART_DMA = embed("../../../../examples/pico2/pio_uart_dma.elf")
 private val SRAM = SramMap(0x20000000, 520 * 1024)
 
 // The edges recorded on GPIO `n`.
@@ -90,19 +92,15 @@ arm_pio_uart_tx()
     b.boot(PIO_UART_TX).unwrap()
     val end = b.run(170000000)
     assert(end == RunEnd.Budget, s"$end ${b.refused}")
-    var dump = ""
-    for x in edges_on(b, 0).view()[..<20] do dump = dump + s" ${x.cycle}:${x.level}"
-    val base: u32 = 0x50400000
-    for o in [0u32, 0xc8, 0xcc, 0xd0, 0xd4, 0xd8, 0xdc, 0x168]
-        dump = dump + s" [${hex(o)}]=${hex(b.chip.read(0, base + o, 4).unwrap())}"
-    for o in 0u32..<32 do dump = dump + s" ${hex(b.chip.read(0, base + 0x48 + 4 * o, 4).unwrap_or(0xdead))}"
-    assert(false, dump)
     // 8 state machine cycles a bit at the SDK's divisor 162 + 195/256.
     val got = uart_edges(b, 0, 8 * (162 * 256 + 195))
     assert(got == "Hello, world! (from PIO!)\r\nHello, world! (from PIO!)\r\n", got)
+    // sleep_ms(1000) between the lines: the one long quiet on the pin, a second less the first line's
+    // 27 characters (27 × 10 × 1302 cycles).
     val e = edges_on(b, 0)
-    val second = e[e.len() / 2].cycle
-    assert(second - e[0].cycle > 150000000, s"the second line ${second - e[0].cycle} cycles after the first")
+    var gap: u64 = 0
+    for i in 1..<e.len() do gap = max(gap, e[i].cycle - e[i - 1].cycle)
+    assert(gap > 150000000 - 27 * 10 * 1310 && gap < 150000000, s"the quiet between the lines: $gap cycles")
 
 @test("pico-examples' pio/ws2812 on the Arm Pico 2: its banner and first pattern, then the first frame's 150 pixels off GPIO 2 through the mux at the SDK's divisor 18.75: a 1 high 112.5 clk_sys cycles, a 0 56.25, 187.5 to a bit")
 arm_pio_ws2812()
@@ -150,6 +148,31 @@ arm_pio_ws2812()
     for k in 0..<150
         val want = rand() & 0xFFFFFF
         assert(pixels[k] == want, s"pixel $k: 0x${hex(pixels[k], 6)}, not 0x${hex(want, 6)}")
+
+@test("pico-examples' pio/uart_dma on the Arm Pico 2, GPIO 4 wired to GPIO 5: DMA paced by PIO2's TX DREQ feeds uart_tx on GPIO 4 at 921600 baud, uart_rx_mini reads GPIO 5 through the mux, DMA paced by the RX DREQ empties its FIFO, PIO2's IRQ 0 on RX-not-empty prints progress; both DMA interrupts, then \"Test passed\"")
+arm_pio_uart_dma()
+    val b = arm_board(SRAM)
+    b.chip.wire(4, Some(5))
+    b.chip.capture_edges(1 << 4)
+    b.boot(PIO_UART_DMA).unwrap()
+    val end = b.run(100000000)
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    // The PIO interrupt is RX-not-empty, a pulse the RX channel takes down within cycles of each byte,
+    // which the NVIC latches. The first byte's handler finds one byte moved, and its printf waits for
+    // UART0 to go idle (stdio_flush), 20 characters at 115200 baud: long past the transfer's end. Both
+    // DMA channels' completions are then pending, and DMA_IRQ_0 (10) goes before PIO2_IRQ_0 (19); the
+    // PIO interrupt pending from the last byte comes after.
+    val want = "pio_rx dma_rx=1/43\r\n" +
+        "dma_tx done\r\n" +
+        "dma_rx done\r\n" +
+        "pio_rx dma_rx=43/43\r\n" +
+        "Test passed\r\n"
+    assert(text == want, text)
+    // 8 state machine cycles a bit at the SDK's divisor 20 + 88/256: 150 MHz / (8 × 921600).
+    val got = uart_edges(b, 4, 8 * (20 * 256 + 88))
+    assert(got == "the quick brown fox jumps over the lazy dog", got)
 
 @test("pico-examples' pio/uart_rx on the Arm Pico 2, GPIO 4 wired to GPIO 3: core 1's text sent by UART1 is read by PIO2 off GPIO 3 through the mux and echoed to the console")
 arm_pio_uart_rx()
