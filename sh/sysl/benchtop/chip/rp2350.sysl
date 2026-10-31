@@ -96,6 +96,10 @@ const DMA_IRQ_0: u32 = 10
 const TRNG_IRQ: u32 = 39
 /** The SHA-256 core's DMA request (`DREQ_SHA256`). */
 const DREQ_SHA256: u32 = 54
+// Every line a device here drives: `signal` drives each one, high or low, into a hart's level inputs.
+private const WIRED_LINES: u64 = 0xFFu64 << TIMER0_IRQ_0 | 0xFu64 << DMA_IRQ_0 | 1u64 << USBCTRL_IRQ | 1u64 << rp.IO_IRQ_BANK0 |
+    1u64 << SIO_IRQ_FIFO | 1u64 << SIO_IRQ_BELL | 1u64 << UART0_IRQ | 1u64 << UART1_IRQ | 1u64 << POWMAN_IRQ_POW | 1u64 << POWMAN_IRQ_TIMER |
+    1u64 << SPI0_IRQ | 1u64 << SPI1_IRQ | 1u64 << TRNG_IRQ | 3u64 << PWM_IRQ_WRAP_0
 
 /** A GPIO with no wire (`Rp2350.wire`). */
 const NO_WIRE: u8 = 0xFF
@@ -1179,26 +1183,39 @@ struct Rp2350
         if self.io.irq.line(rp.DORMANT_WAKE) then self.rosc.wake()
         if self.pwm.enabled != 0 || self.pwm_stepping then self.pwm_gpio_changed()
 
+    /** The interrupt lines both cores share, high at the moment, bit n for IRQ n. */
+    shared_interrupts(*self) -> u64
+        var lines = u64(self.timers[0].irqs() & 0xF) << TIMER0_IRQ_0 | u64(self.timers[1].irqs() & 0xF) << (TIMER0_IRQ_0 + 4)
+        if self.powman.irq_pow() then lines |= 1u64 << POWMAN_IRQ_POW
+        if self.powman.irq_timer() then lines |= 1u64 << POWMAN_IRQ_TIMER
+        if self.uarts[0].irq() then lines |= 1u64 << UART0_IRQ
+        if self.uarts[1].irq() then lines |= 1u64 << UART1_IRQ
+        if self.usb.irq() then lines |= 1u64 << USBCTRL_IRQ
+        for j in 0u32..<4 do if self.dma.irq(j) then lines |= 1u64 << (DMA_IRQ_0 + j)
+        if self.spi.irq(0) then lines |= 1u64 << SPI0_IRQ
+        if self.spi.irq(1) then lines |= 1u64 << SPI1_IRQ
+        self.trng.settle(self.now)
+        if self.trng.irq() then lines |= 1u64 << TRNG_IRQ
+        for j in 0u32..<2 do if self.pwm.irq(j) then lines |= 1u64 << (PWM_IRQ_WRAP_0 + j)
+        lines
+
+    /** The lines only core `k` has, high at the moment: its GPIO, FIFO and doorbell interrupts. */
+    core_interrupts(*self, k: u32) -> u64
+        var lines: u64 = 0
+        if self.io.irq.line(k) then lines |= 1u64 << rp.IO_IRQ_BANK0
+        if self.sio.fifo_irq(k) then lines |= 1u64 << SIO_IRQ_FIFO
+        if self.sio.bell_irq(k) then lines |= 1u64 << SIO_IRQ_BELL
+        lines
+
     /** Drive `p`'s interrupt inputs from the devices' levels. */
     signal(*self, p: *Processor)
         val k = p.number()
-        for i in 0u32..<2
-            val lines = self.timers[i].irqs()
-            for j in 0u32..<4 do p.interrupt(TIMER0_IRQ_0 + 4 * i + j, lines & (1 << j) != 0)
-        p.interrupt(rp.IO_IRQ_BANK0, self.io.irq.line(k))
-        p.interrupt(SIO_IRQ_FIFO, self.sio.fifo_irq(k))
-        p.interrupt(SIO_IRQ_BELL, self.sio.bell_irq(k))
-        p.interrupt(POWMAN_IRQ_POW, self.powman.irq_pow())
-        p.interrupt(POWMAN_IRQ_TIMER, self.powman.irq_timer())
-        p.interrupt(UART0_IRQ, self.uarts[0].irq())
-        p.interrupt(UART1_IRQ, self.uarts[1].irq())
-        p.interrupt(SPI0_IRQ, self.spi.irq(0))
-        p.interrupt(SPI1_IRQ, self.spi.irq(1))
-        p.interrupt(USBCTRL_IRQ, self.usb.irq())
-        self.trng.settle(self.now)
-        p.interrupt(TRNG_IRQ, self.trng.irq())
-        for j in 0u32..<4 do p.interrupt(DMA_IRQ_0 + j, self.dma.irq(j))
-        for j in 0u32..<2 do p.interrupt(PWM_IRQ_WRAP_0 + j, self.pwm.irq(j))
+        val lines = self.shared_interrupts() | self.core_interrupts(k)
+        var left = WIRED_LINES
+        while left != 0
+            val irq = u32(left.trailing_zeros())
+            p.interrupt(irq, (lines >> irq) & 1 != 0)
+            left &= left - 1
         p.machine_timer(self.sio.software_irq(k), self.sio.timer_irq(k))
 end Rp2350
 
@@ -1232,7 +1249,13 @@ impl ArmChip for Rp2350
     load(*self, core: u32, a: u32, width: u32) -> Result[u32, string] = self.read(core, a, width)
     @inline
     store(*self, core: u32, a: u32, width: u32, x: u32) -> Result[unit, string] = self.write(core, a, width, x)
-    raise(*self, p: *Processor) = self.signal(p)
+    shared_lines(*self) -> u64 = self.shared_interrupts()
+    core_lines(*self, k: u32) -> u64 = self.core_interrupts(k)
+    @inline
+    read_lowers(*self, a: u32) -> bool
+        val w = a & ~3u32
+        w == uart0_reg.BASE + uart0_reg.UARTDR_OFFSET || w == uart1_reg.BASE + uart1_reg.UARTDR_OFFSET ||
+            w == spi0_reg.BASE + spi0_reg.SSPDR_OFFSET || w == spi1_reg.BASE + spi1_reg.SSPDR_OFFSET
     core1_stopped(*self) -> bool = self.take_core1_reset()
     core1_started(*self) -> bool = self.take_core1_release()
     @inline

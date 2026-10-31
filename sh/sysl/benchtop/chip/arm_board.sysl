@@ -157,8 +157,15 @@ trait ArmChip
     load(*self, core: u32, a: u32, width: u32) -> Result[u32, string]
     /** A write of `width` bytes at `a` by core `core`, or why the chip refuses it. */
     store(*self, core: u32, a: u32, width: u32, x: u32) -> Result[unit, string]
-    /** Drive `p`'s interrupt inputs from the devices' levels. */
-    raise(*self, p: *Processor)
+    /** The interrupt lines both cores share, high at the moment, bit n for IRQ n. */
+    shared_lines(*self) -> u64
+    /** The lines only core `k` has, high at the moment. */
+    core_lines(*self, k: u32) -> u64
+    /** Whether a read of `a` can lower a line the other core shares: a UART's data register, whose read
+     * pops the RX FIFO. Every other line falls only on a write or at a settle, so a core polling a flag
+     * register (UARTFR while it waits to send) costs nothing here.
+     */
+    read_lowers(*self, a: u32) -> bool
     /** Whether PSM has put core 1 in reset, or taken it out, since the last call. */
     core1_stopped(*self) -> bool
     core1_started(*self) -> bool
@@ -456,14 +463,19 @@ impl[C: ArmChip] ArmBoard[C]
         // PSM holding core 1 stops it; releasing it starts it from reset, in the boot ROM.
         if self.chip.core1_stopped() then self.started[1] = false
         if self.chip.core1_started() then self.rom_reset(1)
-        for k in 0..<2 do if self.started[k] && !self.waits_for_event(k) then self.chip.raise(&self.cores[k])
+        val shared = self.chip.shared_lines()
+        for k in 0..<2 do if self.started[k] then arm.raise_lines(&self.cores[k], shared | self.chip.core_lines(u32(k)))
 
-    // Whether core `k` sleeps in `WFE` with no interrupt enabled, as core 1 waits in the boot ROM: no
-    // line can wake it, so it is signalled once an event has (a fidelity limit: a line that rises and
-    // falls while it waits leaves nothing pending in its NVIC, where silicon latches it).
-    private waits_for_event(*self, k: usize) -> bool
-        val c = &self.cores[k]
-        c.sleeping && c.on_event && !arm.irqs_enabled(c)
+    // Before core `cpu`'s write to the chip, or a read that can lower a line (`ArmChip.read_lowers`):
+    // either may lower a line a device raised since the last `settle`, as the chip ran up to the access.
+    // The other core, asleep, has its NVIC latch what is high now, so a line that rises and falls while
+    // it sleeps stays pending there, as on silicon. Every other read is skipped, so a core polling a
+    // register while the other sleeps in the boot ROM pays nothing. The accessing core is not latched:
+    // its handler lowering the line it is servicing must not pend that line again.
+    @noinline
+    private latch_for_sleeper(*self, cpu: *arm.Cpu)
+        val k = 1 - usize(cpu.core)
+        if self.started[k] && self.cores[k].sleeping then arm.raise_lines(&self.cores[k], self.chip.shared_lines() | self.chip.core_lines(u32(k)))
 
     // The chip's clock at core `cpu`'s `n`th retired instruction.
     private at(*self, cpu: *arm.Cpu, n: u64) -> u64 = self.quantum_at + (arm.clock(cpu, n) - self.clock_at[usize(cpu.core)])
@@ -902,6 +914,7 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
                     for k in 0..<width do v |= u32(self.mem.ram[at + k]) << (8 * k)
                     return v
                 None -> ()
+        if self.chip.read_lowers(a) then self.latch_for_sleeper(cpu)
         val got = self.chip.load(cpu.core, a, width)
         // On the Pico a read of the SSI can end a transfer, which changes the flash.
         if const !C.rp2350()
@@ -935,6 +948,7 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
                     arm.bus_stored(cpu, self.map.base + (at & ~3u32), 4)
                     return
                 None -> ()
+        self.latch_for_sleeper(cpu)
         val r = self.chip.store(cpu.core, a, width, x)
         if const C.rp2350()
             if self.chip.take_xip_changed() then self.sync_xip()
