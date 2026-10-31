@@ -1,0 +1,278 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.peripheral.rp2350.{Handshake, UsbCtrl, usb_ctrl}
+import sh.sysl.rp2350.usb as reg
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+
+// benchtop's USB host (`usb_host.sysl`): on the board, end to end against unmodified programs, and at
+// the controller alone, where the test plays the device's firmware to make it misbehave.
+
+private val STDIO_USB = embed("../../../../examples/pico2/usb_device.elf")
+private val HELLO_USB = embed("../../../../examples/pico2/hello_usb.elf")
+private val RECONNECT = embed("../../../../examples/pico2/usb_reconnect.elf")
+private val LOWLEVEL = embed("../../../../examples/pico2/dev_lowlevel.elf")
+private val HOST_SRAM = SramMap(0x20000000, 520 * 1024)
+// A millisecond of clk_sys at the SDK's 150 MHz.
+private const MS: u64 = 150000
+
+// stdio_usb's device descriptor, as `chip/usb_tests.sysl` reads it from the ELF.
+private val STDIO_DEVICE: [18]u8 = [0x12, 0x01, 0x10, 0x02, 0xEF, 0x02, 0x01, 0x40, 0x8A, 0x2E, 0x09, 0x00, 0x00, 0x01, 0x01, 0x02, 0x03, 0x01]
+
+// stdio_usb's configuration: CDC's two interfaces behind an IAD (notification 0x81, data 0x02 and
+// 0x82), then the SDK's reset interface (class 0xFF).
+private val STDIO_CONFIG: [84]u8 = [
+    0x09, 0x02, 0x54, 0x00, 0x03, 0x01, 0x00, 0x80, 0x7D,
+    0x08, 0x0B, 0x00, 0x02, 0x02, 0x02, 0x00, 0x00,
+    0x09, 0x04, 0x00, 0x00, 0x01, 0x02, 0x02, 0x00, 0x04,
+    0x05, 0x24, 0x00, 0x20, 0x01,
+    0x05, 0x24, 0x01, 0x00, 0x01,
+    0x04, 0x24, 0x02, 0x06,
+    0x05, 0x24, 0x06, 0x00, 0x01,
+    0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x10,
+    0x09, 0x04, 0x01, 0x00, 0x02, 0x0A, 0x00, 0x00, 0x00,
+    0x07, 0x05, 0x02, 0x02, 0x40, 0x00, 0x00,
+    0x07, 0x05, 0x82, 0x02, 0x40, 0x00, 0x00,
+    0x09, 0x04, 0x02, 0x00, 0x00, 0xFF, 0x00, 0x01, 0x05,
+]
+
+private text(b: Buf[u8]) -> string = from_utf8_lossy(b.view())
+
+// A board running `image` with benchtop's host plugged in.
+private hosted(image: []const u8) -> &ArmBoard
+    val b = arm_board(HOST_SRAM)
+    b.boot(image).unwrap()
+    b.attach_usb_host(true)
+    b
+
+// Run a millisecond at a time until `done` or `ms` milliseconds have passed; Err where the run ended.
+private run_until(b: &ArmBoard, ms: u32, done: &Fn(&ArmBoard) -> bool) -> Result[unit, string]
+    var t: u32 = 0
+    while t < ms
+        if done(b) then return Ok(())
+        val end = b.run(MS)
+        if end != RunEnd.Budget then return Err(s"the run ended ($end) at ${t} ms: ${b.refused}")
+        t += 1
+    if done(b) then Ok(()) else Err(s"not done after $ms ms; UART0: ${text(b.console)}; USB: ${text(b.usb_host.received)}")
+
+// Run a millisecond at a time, up to `ms`, until a core stops at a breakpoint: whether one did.
+private to_breakpoint(b: &ArmBoard, ms: u32) -> bool
+    var t: u32 = 0
+    while t < ms
+        val end = b.run(MS)
+        if end == RunEnd.Breakpoint then return true
+        if end != RunEnd.Budget then return false
+        t += 1
+    false
+
+// Run `ms` milliseconds, which must all pass.
+private run_ms(b: &ArmBoard, ms: u64)
+    val end = b.run(ms * MS)
+    assert(end == RunEnd.Budget, s"the run ended ($end): ${b.refused}")
+
+@test("stdio_usb under benchtop's host: enumerated at address 1 with the ELF's own device descriptor, its CDC port found (configuration 1, interface 0, bulk 0x82 and 0x02), DTR raised, the program's line on bulk IN, and a byte the host sends reaching getchar")
+host_opens_stdio_usb()
+    val b = hosted(STDIO_USB)
+    run_until(b, 1000, x -> x.usb_host.running()).unwrap()
+    assert(b.usb_host.enumerations == 1 && b.usb_host.device_address == 1 && b.chip.usb.addr[0] == 1)
+    assert(b.usb_host.device.len() == 18)
+    for i in 0..<18 do assert(b.usb_host.device[i] == STDIO_DEVICE[i], s"device descriptor byte $i")
+    val port = b.usb_host.port
+    assert(port.config == 1 && port.comm == 0 && port.ep_in == 2 && port.ep_out == 2)
+    run_until(b, 1000, x -> text(x.usb_host.received).contains("\n")).unwrap()
+    // What the program printed before DTR went nowhere, as stdio_usb drops output with no port open.
+    assert(text(b.usb_host.received) == "hello over usb\r\n", text(b.usb_host.received))
+    b.usb_host.sending.push(0x78)
+    // The program names what getchar returned and stops at a breakpoint.
+    assert(to_breakpoint(b, 3000), s"${b.refused}; ${text(b.console)}")
+    assert(b.usb_host.sending.len() == 0)
+    assert(text(b.console).ends_with("configured\r\nhello over usb\r\ngot 120\r\n"), text(b.console))
+
+@test("the host waits the 100 ms debounce after the device connects, resets the bus, and enumerates within the next 100 ms; the device stays on the bus and the host keeps polling")
+host_enumeration_timing()
+    val b = hosted(STDIO_USB)
+    run_until(b, 1000, x -> x.chip.usb.connected).unwrap()
+    val connected = b.chip.now
+    run_until(b, 1000, x -> x.usb_host.stage == HostStage.Recovery).unwrap()
+    val reset = b.chip.now - connected
+    assert(reset >= 97 * MS && reset <= 102 * MS, s"bus reset ${reset / 1000} k cycles after the connection")
+    run_until(b, 1000, x -> x.usb_host.running()).unwrap()
+    val open = b.chip.now - connected
+    assert(open > 110 * MS && open < 200 * MS, s"open ${open / 1000} k cycles after the connection")
+
+@test("pico-examples' hello_world/usb under benchtop's host: each second's \"Hello, world!\" arrives on the bridge once the port is open, the one before it dropped")
+host_hello_usb()
+    val b = hosted(HELLO_USB)
+    run_ms(b, 3500)
+    val got = text(b.usb_host.received)
+    assert(got == "Hello, world!\r\nHello, world!\r\nHello, world!\r\n", got)
+    assert(b.usb_host.enumerations == 1 && b.console.len() == 0)
+
+@test("the host resets the bus on request: the device is enumerated afresh, at address 1 again, and its lines keep arriving")
+host_bus_reset()
+    val b = hosted(HELLO_USB)
+    run_ms(b, 1500)
+    assert(text(b.usb_host.received) == "Hello, world!\r\n")
+    b.usb_host.request_reset()
+    run_ms(b, 5)
+    assert(b.usb_host.stage == HostStage.Recovery || b.usb_host.stage == HostStage.Enumerating, "the reset took")
+    run_ms(b, 2000)
+    assert(b.usb_host.enumerations == 2 && b.usb_host.running() && b.chip.usb.addr[0] == 1)
+    val got = text(b.usb_host.received)
+    assert(got == "Hello, world!\r\nHello, world!\r\nHello, world!\r\n", got)
+
+@test("the firmware takes the device off the bus with tud_disconnect and puts it back: the host forgets it, debounces the new connection and enumerates it again")
+host_reconnect()
+    val b = hosted(RECONNECT)
+    assert(to_breakpoint(b, 3000), s"${b.refused}; ${text(b.console)}")
+    assert(text(b.console) == "up\r\nfirst\r\noff the bus\r\nsecond\r\n", text(b.console))
+    assert(b.usb_host.enumerations == 2)
+    val got = text(b.usb_host.received)
+    assert(got == "first\r\nsecond\r\n", got)
+
+@test("pico-examples' usb/device/dev_lowlevel, a vendor-class device: the host enumerates it, finds no CDC ACM interface and stops by name, making no more frames; the program runs on")
+host_refuses_a_vendor_device()
+    val b = hosted(LOWLEVEL)
+    run_until(b, 1000, x -> x.usb_host.stage == HostStage.Stopped).unwrap()
+    val note = b.usb_host.take_note().unwrap()
+    assert(note == "the USB host has given up on the device: the device has no CDC ACM interface (its interfaces' classes: 0xff): benchtop's host bridges a CDC ACM serial port only", note)
+    assert(b.usb_host.take_note().is_none(), "a note is handed over once")
+    assert(!b.usb_host.framed())
+    run_ms(b, 10)
+    assert(text(b.console).starts_with("USB Device Low-Level hardware example\r\n"), text(b.console))
+
+@test("with the host off the bus, a stdio_usb program never connects, and the host makes no frame")
+host_off()
+    val b = arm_board(HOST_SRAM)
+    b.boot(STDIO_USB).unwrap()
+    run_ms(b, 300)
+    assert(!b.chip.usb.connected && !b.usb_host.on() && !b.usb_host.framed() && b.usb_host.enumerations == 0)
+
+// ---- At the controller, with the test as the device's firmware ----
+
+// A controller on the bus at address 0 with its pull-up on, as TinyUSB's `dcd_init` leaves it, and a
+// host attached to it.
+private device_and_host() -> (UsbCtrl, UsbHost)
+    var u = usb_ctrl()
+    u.attach(true)
+    u.write(reg.MAIN_CTRL_OFFSET, 4, reg.MAIN_CTRL_CONTROLLER_EN_MASK).unwrap()
+    u.write(reg.SIE_CTRL_OFFSET, 4, reg.SIE_CTRL_EP0_INT_1BUF_MASK | reg.SIE_CTRL_PULLUP_EN_MASK).unwrap()
+    var h = usb_host()
+    h.attach(true)
+    (u, h)
+
+// One frame, as the board makes it: the connection seen, then the frame where the host has one.
+private tick(h: *UsbHost, u: *UsbCtrl)
+    h.watch(u.connected)
+    if h.framed() then h.frame(u).unwrap()
+
+private status(u: *UsbCtrl) -> u32 = u.read(reg.SIE_STATUS_OFFSET, 4).unwrap()
+
+// Frames until the host has sent its first SETUP, which the firmware takes (SETUP_REC cleared).
+private to_first_setup(h: *UsbHost, u: *UsbCtrl) -> u32
+    var n: u32 = 0
+    while status(u) & reg.SIE_STATUS_SETUP_REC_MASK == 0 && n < 1000
+        tick(h, u)
+        n += 1
+    u.write(reg.SIE_STATUS_OFFSET, 4, reg.SIE_STATUS_SETUP_REC_MASK | reg.SIE_STATUS_BUS_RESET_MASK).unwrap()
+    n
+
+@test("at the controller: the bus reset comes on the 100th frame after the connection, the first SETUP (GET_DESCRIPTOR of the device, 64 bytes, at address 0) after 10 more")
+host_reset_and_first_setup()
+    var (u, h) = device_and_host()
+    var n: u32 = 0
+    while status(&u) & reg.SIE_STATUS_BUS_RESET_MASK == 0 && n < 1000
+        tick(&h, &u)
+        n += 1
+    assert(n == 100, s"bus reset on frame $n")
+    assert(h.stage == HostStage.Recovery)
+    val more = to_first_setup(&h, &u)
+    assert(more == 11, s"first SETUP $more frames after the reset")
+    assert(u.dpram_read(0, 4).unwrap() == 0x01000680 && u.dpram_read(4, 4).unwrap() == 0x00400000)
+    assert(u.read(reg.SOF_RD_OFFSET, 4).unwrap() == 10, "a SOF every frame from the reset on, numbered from 0")
+
+@test("at the controller: a device that stalls GET_DESCRIPTOR during enumeration stops the host by name; it makes no more frames until asked to reset the bus, and then enumerates again")
+host_stall_during_enumeration()
+    var (u, h) = device_and_host()
+    to_first_setup(&h, &u)
+    u.write(reg.EP_STALL_ARM_OFFSET, 4, 1).unwrap()
+    u.dpram_write(0x80, 4, 0x800).unwrap()
+    tick(&h, &u)
+    assert(h.stage == HostStage.Stopped && !h.framed())
+    val note = h.take_note().unwrap()
+    assert(note == "the USB host has given up on the device: it stalled GET_DESCRIPTOR (device) at address 0", note)
+    h.request_reset()
+    assert(h.framed())
+    tick(&h, &u)
+    assert(h.stage == HostStage.Recovery && status(&u) & reg.SIE_STATUS_BUS_RESET_MASK != 0)
+
+@test("at the controller: a device that NAKs a control stage is retried every frame and given up on after 5 s, by name")
+host_control_timeout()
+    var (u, h) = device_and_host()
+    to_first_setup(&h, &u)
+    var n: u32 = 0
+    while h.stage == HostStage.Enumerating && n < 6000
+        tick(&h, &u)
+        n += 1
+    // The first NAK came in the SETUP's own frame.
+    assert(n == USB_CONTROL_TIMEOUT_FRAMES - 1, s"gave up after $n more frames")
+    assert(h.take_note().unwrap() == "the USB host has given up on the device: it NAKed GET_DESCRIPTOR (device) at address 0 for 5 s")
+
+@test("at the controller: a device sending its data stage's first packet as DATA0, where DATA1 is due, is given up on by name")
+host_bad_data_pid()
+    var (u, h) = device_and_host()
+    to_first_setup(&h, &u)
+    // FULL and AVAILABLE, 18 bytes, PID 0.
+    u.dpram_write(0x80, 4, 0x8400 | 18).unwrap()
+    tick(&h, &u)
+    val note = h.take_note().unwrap()
+    assert(note == "the USB host has given up on the device: a data stage packet of GET_DESCRIPTOR (device) at address 0 came with DATA0 where DATA1 was due", note)
+
+@test("at the controller: the device leaving the bus mid-enumeration is forgotten without a note, and its return is debounced afresh")
+host_device_leaves()
+    var (u, h) = device_and_host()
+    to_first_setup(&h, &u)
+    u.write(reg.SIE_CTRL_OFFSET, 4, reg.SIE_CTRL_EP0_INT_1BUF_MASK).unwrap()
+    tick(&h, &u)
+    assert(h.stage == HostStage.Waiting && !h.framed() && h.take_note().is_none())
+    u.write(reg.SIE_CTRL_OFFSET, 4, reg.SIE_CTRL_EP0_INT_1BUF_MASK | reg.SIE_CTRL_PULLUP_EN_MASK).unwrap()
+    tick(&h, &u)
+    assert(h.stage == HostStage.Debounce && h.wait == USB_DEBOUNCE_FRAMES - 1)
+
+@test("the host's room: the bridge takes what it has written, and sending is held to its room")
+host_buffers()
+    var h = usb_host()
+    for i in 0..<10 do h.received.push(u8(i))
+    h.consume(4)
+    assert(h.received.len() == 6 && h.received[0] == 4 && h.received[5] == 9)
+    h.consume(6)
+    assert(h.received.len() == 0)
+    assert(h.room_to_send() == USB_SEND_ROOM)
+    for i in 0..<USB_SEND_ROOM do h.sending.push(0)
+    assert(h.room_to_send() == 0)
+
+// ---- The configuration's CDC ACM function ----
+
+@test("cdc_port finds stdio_usb's CDC ACM function: configuration 1, communication interface 0, bulk IN 2 and OUT 2")
+cdc_port_of_stdio_usb()
+    val p = cdc_port(STDIO_CONFIG[0..<84]).unwrap()
+    assert(p.config == 1 && p.comm == 0 && p.ep_in == 2 && p.ep_out == 2)
+
+@test("cdc_port names what is missing: no CDC ACM interface (with the classes there are), no data interface, no bulk pair, a malformed descriptor, not a configuration")
+cdc_port_refusals()
+    // A HID keyboard's configuration: one interface of class 3 and an interrupt IN endpoint.
+    val hid: [25]u8 = [0x09, 0x02, 25, 0x00, 0x01, 0x01, 0x00, 0x80, 0x32, 0x09, 0x04, 0x00, 0x00, 0x01, 0x03, 0x01, 0x01, 0x00, 0x07, 0x05, 0x81, 0x03, 0x08, 0x00, 0x0A]
+    assert(cdc_port(hid[0..<25]).unwrap_err() == "the device has no CDC ACM interface (its interfaces' classes: 0x03): benchtop's host bridges a CDC ACM serial port only", cdc_port(hid[0..<25]).unwrap_err())
+    // stdio_usb's with the data interface's class changed, then its bulk OUT made interrupt.
+    var no_data = STDIO_CONFIG
+    no_data[57] = 0xFF
+    assert(cdc_port(no_data[0..<84]).unwrap_err() == "the device's CDC ACM function has no data interface (class 0x0A)")
+    var no_pair = STDIO_CONFIG
+    no_pair[64] = 0x03
+    assert(cdc_port(no_pair[0..<84]).unwrap_err() == "the device's CDC data interface has no bulk IN and bulk OUT endpoint pair")
+    var bad = STDIO_CONFIG
+    bad[9] = 0
+    assert(cdc_port(bad[0..<84]).unwrap_err() == "the configuration descriptor is malformed at byte 9 (bLength 0)")
+    assert(cdc_port(STDIO_CONFIG[0..<42]).unwrap_err() == "the configuration descriptor is malformed at byte 40 (bLength 5)")
+    assert(cdc_port(STDIO_DEVICE[0..<18]).unwrap_err() == "the configuration descriptor is not one (bDescriptorType 1)")

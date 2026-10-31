@@ -1,0 +1,282 @@
+module sh.sysl.benchtop.peripheral.rp2040
+
+import sh.sysl.rp2040.rtc as reg
+import sh.sysl.rp2040.vreg_and_chip_reset as vreg_reg
+import sysl.fmt.hex
+
+// The RP2040's real-time clock (RP2040 datasheet 4.8, "RTC"; `hardware/regs/rtc.h`): a calendar that
+// counts seconds of clk_rtc divided by CLKDIV_M1 + 1, loaded from SETUP_0/1, with an alarm that
+// matches any of its fields.
+//
+// **Time is clk_rtc cycles**, which the chip hands over as clk_sys passes (`advance`), carrying the
+// remainder; the calendar steps a second at a time, with the RP2040's rule for a leap year (every
+// fourth, unless CTRL.FORCE_NOTLEAPYEAR), and the day of the week wrapping at 7. While the alarm can
+// raise the interrupt the chip schedules the next second (`cycles_to_second`), so nothing is polled.
+//
+// **What a program reads.** RTC_ACTIVE follows RTC_ENABLE while clk_rtc runs, and LOAD and MATCH_ACTIVE
+// take effect at once: the clock-domain crossing takes no time here, where silicon takes up to three
+// clk_rtc cycles, which the SDK waits out. Reading RTC_0 latches RTC_1, so the two are one instant
+// (the register description's "Read this before RTC 1!", the SDK's order); RTC_1 read alone gives the
+// date of the last RTC_0 read.
+//
+// **The alarm** is taken as the time changes: on a second whose new time matches every enabled field,
+// with MATCH_ENA set, the raw interrupt rises, and it stays until MATCH_ENA is cleared, which is how
+// the SDK's handler clears it. Enabling the alarm within a matching second does not raise it then; the
+// SDK's repeating alarm, which re-enables from its handler within that second, relies on that.
+//
+// **Refused by name:** a LOAD of a date or time the calendar does not hold (a month past 12, a day
+// past its month's end, an hour past 23, ...), whose counting is not specified; and a change of
+// CLKDIV_M1 while the RTC runs, which the register description says is safe only while it does not.
+
+private const SETUP_0_BITS: u32 = 0x00FFFF1F
+private const SETUP_1_BITS: u32 = 0x071F3F3F
+private const IRQ_SETUP_0_BITS: u32 = 0x17FFFF1F
+private const IRQ_SETUP_1_BITS: u32 = 0xF71F3F3F
+private const CTRL_BITS: u32 = 0x101
+
+struct Rtc
+    clkdiv_m1: u32
+    setup_0: u32
+    setup_1: u32
+    // CTRL's FORCE_NOTLEAPYEAR and RTC_ENABLE.
+    ctrl: u32
+    irq_setup_0: u32
+    irq_setup_1: u32
+    // The calendar, in RTC_1's and RTC_0's layouts, and RTC_1 as the last RTC_0 read latched it.
+    date: u32
+    time: u32
+    latched_date: u32
+    // clk_rtc cycles counted into the present second.
+    count: u32
+    // The alarm has matched since MATCH_ENA was last set.
+    matched: bool
+    inte: u32
+    intf: u32
+
+    reset(*self)
+        self.clkdiv_m1 = 0
+        self.setup_0 = 0
+        self.setup_1 = 0
+        self.ctrl = 0
+        self.irq_setup_0 = 0
+        self.irq_setup_1 = 0
+        self.date = 0
+        self.time = 0
+        self.latched_date = 0
+        self.count = 0
+        self.matched = false
+        self.inte = 0
+        self.intf = 0
+
+    /** Whether the calendar counts: RTC_ENABLE set (the chip also needs clk_rtc running). */
+    enabled(self) -> bool = self.ctrl & reg.CTRL_RTC_ENABLE_MASK != 0
+
+    private match_enabled(self) -> bool = self.irq_setup_0 & reg.IRQ_SETUP_0_MATCH_ENA_MASK != 0
+    private intr(self) -> u32 = if self.matched && self.match_enabled() then reg.INTR_RTC_MASK else 0
+
+    /** The RTC's interrupt line, IRQ 25. */
+    irq(self) -> bool = (self.intr() | self.intf) & self.inte != 0
+
+    /** Whether the next second could change the interrupt line, so the chip must schedule it. */
+    alarm_armed(self) -> bool = self.enabled() && self.match_enabled() && self.inte != 0 && !self.matched
+
+    /** The clk_rtc cycles until the calendar's next second. */
+    cycles_to_second(self) -> u64 = u64(self.clkdiv_m1) + 1 - u64(self.count)
+
+    /** `cycles` of clk_rtc pass. */
+    advance(*self, cycles: u64)
+        if !self.enabled() || cycles == 0 then return
+        val period = u64(self.clkdiv_m1) + 1
+        val total = u64(self.count) + cycles
+        self.count = u32(total % period)
+        for s in 0u64..<(total / period) do self.second()
+
+    // One second on: the calendar with its carries, then the alarm.
+    private second(*self)
+        var sec = field(self.time, reg.RTC_0_SEC_MASK, reg.RTC_0_SEC_SHIFT) + 1
+        var min = field(self.time, reg.RTC_0_MIN_MASK, reg.RTC_0_MIN_SHIFT)
+        var hour = field(self.time, reg.RTC_0_HOUR_MASK, reg.RTC_0_HOUR_SHIFT)
+        var dotw = field(self.time, reg.RTC_0_DOTW_MASK, reg.RTC_0_DOTW_SHIFT)
+        var day = field(self.date, reg.RTC_1_DAY_MASK, reg.RTC_1_DAY_SHIFT)
+        var month = field(self.date, reg.RTC_1_MONTH_MASK, reg.RTC_1_MONTH_SHIFT)
+        var year = field(self.date, reg.RTC_1_YEAR_MASK, reg.RTC_1_YEAR_SHIFT)
+        if sec == 60
+            sec = 0
+            min += 1
+        if min == 60
+            min = 0
+            hour += 1
+        if hour == 24
+            hour = 0
+            dotw = (dotw + 1) % 7
+            day += 1
+        if day > self.month_days(month, year)
+            day = 1
+            month += 1
+        if month == 13
+            month = 1
+            year = (year + 1) & 0xFFF
+        self.time = (dotw << reg.RTC_0_DOTW_SHIFT) | (hour << reg.RTC_0_HOUR_SHIFT) | (min << reg.RTC_0_MIN_SHIFT) | (sec << reg.RTC_0_SEC_SHIFT)
+        self.date = (year << reg.RTC_1_YEAR_SHIFT) | (month << reg.RTC_1_MONTH_SHIFT) | (day << reg.RTC_1_DAY_SHIFT)
+        if self.match_enabled() && self.matches() then self.matched = true
+    end second
+
+    private month_days(self, month: u32, year: u32) -> u32 = month match
+        2 -> if year % 4 == 0 && self.ctrl & reg.CTRL_FORCE_NOTLEAPYEAR_MASK == 0 then 29 else 28
+        4 | 6 | 9 | 11 -> 30
+        _ -> 31
+
+    // Whether the calendar equals the alarm in every field the alarm enables.
+    private matches(self) -> bool
+        val s0 = self.irq_setup_0
+        val s1 = self.irq_setup_1
+        val date_fields = [(reg.IRQ_SETUP_0_YEAR_ENA_MASK, reg.IRQ_SETUP_0_YEAR_MASK, reg.RTC_1_YEAR_MASK, reg.IRQ_SETUP_0_YEAR_SHIFT, reg.RTC_1_YEAR_SHIFT),
+            (reg.IRQ_SETUP_0_MONTH_ENA_MASK, reg.IRQ_SETUP_0_MONTH_MASK, reg.RTC_1_MONTH_MASK, reg.IRQ_SETUP_0_MONTH_SHIFT, reg.RTC_1_MONTH_SHIFT),
+            (reg.IRQ_SETUP_0_DAY_ENA_MASK, reg.IRQ_SETUP_0_DAY_MASK, reg.RTC_1_DAY_MASK, reg.IRQ_SETUP_0_DAY_SHIFT, reg.RTC_1_DAY_SHIFT)]
+        for (ena, want, have, want_at, have_at) in date_fields
+            if s0 & ena != 0 && (s0 & want) >> want_at != (self.date & have) >> have_at then return false
+        val time_fields = [(reg.IRQ_SETUP_1_DOTW_ENA_MASK, reg.IRQ_SETUP_1_DOTW_MASK, reg.RTC_0_DOTW_MASK, reg.IRQ_SETUP_1_DOTW_SHIFT, reg.RTC_0_DOTW_SHIFT),
+            (reg.IRQ_SETUP_1_HOUR_ENA_MASK, reg.IRQ_SETUP_1_HOUR_MASK, reg.RTC_0_HOUR_MASK, reg.IRQ_SETUP_1_HOUR_SHIFT, reg.RTC_0_HOUR_SHIFT),
+            (reg.IRQ_SETUP_1_MIN_ENA_MASK, reg.IRQ_SETUP_1_MIN_MASK, reg.RTC_0_MIN_MASK, reg.IRQ_SETUP_1_MIN_SHIFT, reg.RTC_0_MIN_SHIFT),
+            (reg.IRQ_SETUP_1_SEC_ENA_MASK, reg.IRQ_SETUP_1_SEC_MASK, reg.RTC_0_SEC_MASK, reg.IRQ_SETUP_1_SEC_SHIFT, reg.RTC_0_SEC_SHIFT)]
+        for (ena, want, have, want_at, have_at) in time_fields
+            if s1 & ena != 0 && (s1 & want) >> want_at != (self.time & have) >> have_at then return false
+        true
+
+    /** A register read; `clocked` is whether clk_rtc runs. */
+    read(*self, offset: u32, width: u32, clocked: bool) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val value = offset & 0xFFC match
+            reg.CLKDIV_M1_OFFSET -> self.clkdiv_m1
+            reg.SETUP_0_OFFSET -> self.setup_0
+            reg.SETUP_1_OFFSET -> self.setup_1
+            reg.CTRL_OFFSET -> self.ctrl | (if self.enabled() && clocked then reg.CTRL_RTC_ACTIVE_MASK else 0)
+            reg.IRQ_SETUP_0_OFFSET -> self.irq_setup_0 | (if self.match_enabled() then reg.IRQ_SETUP_0_MATCH_ACTIVE_MASK else 0)
+            reg.IRQ_SETUP_1_OFFSET -> self.irq_setup_1
+            reg.RTC_1_OFFSET -> self.latched_date
+            reg.RTC_0_OFFSET ->
+                self.latched_date = self.date
+                self.time
+            reg.INTR_OFFSET -> self.intr()
+            reg.INTE_OFFSET -> self.inte
+            reg.INTF_OFFSET -> self.intf
+            reg.INTS_OFFSET -> (self.intr() | self.intf) & self.inte
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+
+    /** A register write, or why it is refused; a refused write leaves the RTC as it was. */
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, string]
+        access(offset, width, true).map_err(e -> rtc_refusal(offset, e))?
+        val data = replicated(value, width)
+        offset & 0xFFC match
+            reg.CLKDIV_M1_OFFSET ->
+                val div = written(self.clkdiv_m1, offset, data) & reg.CLKDIV_M1_CLKDIV_M1_MASK
+                if div != self.clkdiv_m1 && self.enabled() then return Err(s"RTC CLKDIV_M1 = $div while the RTC runs: the divider is safe to change only while it is disabled, and what a change does then is not modelled")
+                self.clkdiv_m1 = div
+            reg.SETUP_0_OFFSET -> self.setup_0 = written(self.setup_0, offset, data) & SETUP_0_BITS
+            reg.SETUP_1_OFFSET -> self.setup_1 = written(self.setup_1, offset, data) & SETUP_1_BITS
+            reg.CTRL_OFFSET ->
+                if triggered(offset, data) & reg.CTRL_LOAD_MASK != 0
+                    val why = self.unloadable()
+                    if !why.is_empty() then return Err(s"RTC CTRL.LOAD with SETUP_0 0x${hex(self.setup_0)}, SETUP_1 0x${hex(self.setup_1)}: $why, from which the RTC's counting is not specified")
+                    self.date = self.setup_0
+                    self.time = self.setup_1
+                    self.count = 0
+                self.ctrl = written(self.ctrl, offset, data) & CTRL_BITS
+            reg.IRQ_SETUP_0_OFFSET ->
+                self.irq_setup_0 = written(self.irq_setup_0, offset, data) & IRQ_SETUP_0_BITS
+                if !self.match_enabled() then self.matched = false
+            reg.IRQ_SETUP_1_OFFSET -> self.irq_setup_1 = written(self.irq_setup_1, offset, data) & IRQ_SETUP_1_BITS
+            reg.INTE_OFFSET -> self.inte = written(self.inte, offset, data) & reg.INTE_RTC_MASK
+            reg.INTF_OFFSET -> self.intf = written(self.intf, offset, data) & reg.INTF_RTC_MASK
+            // RTC_1, RTC_0, INTR and INTS are read-only.
+            reg.RTC_1_OFFSET | reg.RTC_0_OFFSET | reg.INTR_OFFSET | reg.INTS_OFFSET -> ()
+            _ -> return Err(rtc_refusal(offset, AccessError.Unmapped))
+        Ok(())
+
+    // Why SETUP_0/1 are not a date and time the calendar holds; empty where they are.
+    private unloadable(self) -> string
+        val year = field(self.setup_0, reg.SETUP_0_YEAR_MASK, reg.SETUP_0_YEAR_SHIFT)
+        val month = field(self.setup_0, reg.SETUP_0_MONTH_MASK, reg.SETUP_0_MONTH_SHIFT)
+        val day = field(self.setup_0, reg.SETUP_0_DAY_MASK, reg.SETUP_0_DAY_SHIFT)
+        if month < 1 || month > 12 then return s"month $month is not 1 to 12"
+        if day < 1 || day > self.month_days(month, year) then return s"day $day is not in month $month of $year"
+        if field(self.setup_1, reg.SETUP_1_DOTW_MASK, reg.SETUP_1_DOTW_SHIFT) > 6 then return "the day of the week is not 0 to 6"
+        if field(self.setup_1, reg.SETUP_1_HOUR_MASK, reg.SETUP_1_HOUR_SHIFT) > 23 then return "the hour is past 23"
+        if field(self.setup_1, reg.SETUP_1_MIN_MASK, reg.SETUP_1_MIN_SHIFT) > 59 then return "the minute is past 59"
+        if field(self.setup_1, reg.SETUP_1_SEC_MASK, reg.SETUP_1_SEC_SHIFT) > 59 then return "the second is past 59"
+        ""
+end Rtc
+
+rtc() -> Rtc
+    var r: Rtc
+    r.reset()
+    r
+
+private field(word: u32, mask: u32, shift: u32) -> u32 = (word & mask) >> shift
+
+private rtc_refusal(offset: u32, e: AccessError) -> string = e match
+    Unmapped -> s"RTC + 0x${hex(offset)} is not a register of the RTC"
+    InvalidWidth -> s"RTC + 0x${hex(offset)} is not an access width the RTC takes"
+    Unaligned -> s"RTC + 0x${hex(offset)} is not aligned to its width"
+    UnsupportedAlias -> s"RTC + 0x${hex(offset)} is not one of the RTC's aliases"
+
+// VREG's writable bits (VSEL, HIZ, EN) and its reset value, BOD's (VSEL, EN), and CHIP_RESET's
+// power-on value: the power-on reset is the one benchtop makes.
+private const VREG_BITS: u32 = 0xF3
+private const VREG_RESET: u32 = 0xB1
+private const BOD_BITS: u32 = 0xF1
+private const BOD_RESET: u32 = 0x91
+
+/** VREG_AND_CHIP_RESET (RP2040 datasheet 2.10, "Core Supply Regulator", and 2.12, "Chip-Level Reset"):
+ * the regulator's voltage and enable and the brown-out detector stored; CHIP_RESET's reasons as the
+ * reset that started the run left them, which is power-on: HAD_POR. The voltage does not limit clk_sys
+ * and the brown-out detector never trips, so neither does anything else. Turning the regulator off,
+ * or into high impedance, takes the cores' supply away: refused by name.
+ */
+struct Vreg
+    vreg: u32
+    bod: u32
+    chip_reset: u32
+
+    reset(*self)
+        self.vreg = VREG_RESET
+        self.bod = BOD_RESET
+        self.chip_reset = vreg_reg.CHIP_RESET_HAD_POR_MASK
+
+    read(*self, offset: u32, width: u32) -> Result[u32, AccessError]
+        access(offset, width, true)?
+        val value = offset & 0xFFC match
+            // Enabled and out of high impedance (anything else is refused), so in regulation.
+            vreg_reg.VREG_OFFSET -> self.vreg | vreg_reg.VREG_ROK_MASK
+            vreg_reg.BOD_OFFSET -> self.bod
+            vreg_reg.CHIP_RESET_OFFSET -> self.chip_reset
+            _ -> return Err(AccessError.Unmapped)
+        Ok(read_lane(value, offset, width))
+
+    write(*self, offset: u32, width: u32, value: u32) -> Result[unit, string]
+        access(offset, width, true).map_err(e -> s"VREG_AND_CHIP_RESET + 0x${hex(offset)} ${vreg_refusal(e)}")?
+        val data = replicated(value, width)
+        offset & 0xFFC match
+            vreg_reg.VREG_OFFSET ->
+                val v = written(self.vreg, offset, data) & VREG_BITS
+                if v & vreg_reg.VREG_EN_MASK == 0 || v & vreg_reg.VREG_HIZ_MASK != 0
+                    return Err(s"VREG_AND_CHIP_RESET VREG = 0x${hex(v)} turns the core regulator off or into high impedance, which takes the Pico's core supply (DVDD) away: not modelled")
+                self.vreg = v
+            vreg_reg.BOD_OFFSET -> self.bod = written(self.bod, offset, data) & BOD_BITS
+            // PSM_RESTART_FLAG is write-one-to-clear; the HAD_ bits are read-only.
+            vreg_reg.CHIP_RESET_OFFSET -> self.chip_reset = w1c(self.chip_reset, data & vreg_reg.CHIP_RESET_PSM_RESTART_FLAG_MASK)
+            _ -> return Err(s"VREG_AND_CHIP_RESET + 0x${hex(offset)} ${vreg_refusal(AccessError.Unmapped)}")
+        Ok(())
+end Vreg
+
+vreg() -> Vreg
+    var v: Vreg
+    v.reset()
+    v
+
+private vreg_refusal(e: AccessError) -> string = e match
+    Unmapped -> "is not a register benchtop runs"
+    InvalidWidth -> "is not an access width the block takes"
+    Unaligned -> "is not aligned to its width"
+    UnsupportedAlias -> "is not one of the block's aliases"

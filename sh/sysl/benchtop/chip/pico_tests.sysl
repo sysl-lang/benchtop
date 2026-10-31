@@ -1,0 +1,871 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.{library, load}
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.parsing.source_of
+import sh.sysl.rp2040.clocks as clk_reg
+import sh.sysl.rp2040.io_bank0 as io40
+import sh.sysl.rp2040.pads_bank0 as pads40
+import sh.sysl.rp2040.psm as psm40
+import sh.sysl.rp2040.sio as sio40
+import sh.sysl.rp2040.watchdog as wd40
+import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
+import sysl.text.{char_from_u32, from_utf8_lossy}
+import sh.sysl.rp2040rom as rom
+import sh.sysl.rp2040rom.oracle.{Rng, edge32, edge64, partner32, partner64}
+
+// The Pico (`ArmBoard[Rp2040]`): the SDK's programs built for `pico` / `rp2040` end to end
+// (examples/pico, built by its build.sh), and each RP2040 difference of the chip layer at its
+// registers: the FIFOs' depth, the divider, the GPIO and pad layouts, CLOCKS, PSM, the interrupt lines,
+// benchtop's own boot ROM (core 1's launch wait, core 0's boot path and the functions the SDK looks
+// up) and everything refused by name.
+
+private val PICO_HELLO_SERIAL = embed("../../../../examples/pico/hello_serial.elf")
+private val PICO_BLINK = embed("../../../../examples/pico/blink.elf")
+private val PICO_MULTICORE = embed("../../../../examples/pico/hello_multicore.elf")
+private val PICO_HELLO_WORLD = embed("../../../../examples/pico/hello_world_serial.elf")
+private val PICO_ROM_FUNCS = embed("../../../../examples/pico/rom_funcs.elf")
+private val PICO_HELLO_WATCHDOG = embed("../../../../examples/pico/hello_watchdog.elf")
+private val PICO_FLASH_PROGRAM = embed("../../../../examples/pico/flash_program.elf")
+private val PICO_ROM_CROSSCHECK = embed("../../../../examples/pico/rom_crosscheck.elf")
+// The cross-check's last line on benchtop: its cases, no mismatch, and the CRC-32 of benchtop's own
+// answers, which `examples/pico/README.md` asks a real Pico to print the same.
+private const PICO_CROSSCHECK_LINE = "CROSSCHECK 71248 0 8c217b56\r\n"
+// The SDK's own float and double tests (examples/pico/sdk_tests), on its default implementation.
+private val PICO_SDK_FLOAT_TESTS: [4](string, []const u8) = [
+    ("pico_float_test", embed("../../../../examples/pico/pico_float_test.elf")),
+    ("pico_double_test", embed("../../../../examples/pico/pico_double_test.elf")),
+    ("custom_float_funcs_test", embed("../../../../examples/pico/custom_float_funcs_test.elf")),
+    ("custom_double_funcs_test", embed("../../../../examples/pico/custom_double_funcs_test.elf"))]
+
+private val PICO_SRAM = SramMap(0x20000000, 264 * 1024)
+
+// 0.1 ms and 1 ms of clk_sys at the SDK's 125 MHz.
+private const PICO_TENTH_MS: u64 = 12500
+private const PICO_MS: u64 = 125000
+// One frame at 115200 baud from a 125 MHz clk_peri: IBRD 67, FBRD 52, ten bits of 16 x 67.8125 cycles.
+private const PICO_FRAME: u64 = 10850
+
+private const SIO40: u32 = 0xD0000000
+
+// A Pico with `image` booted and run for `ms` of guest time, each run asserted to have used its budget.
+private pico_ran(image: []const u8, ms: u64) -> &ArmBoard[Rp2040]
+    val b = pico_board(PICO_SRAM)
+    b.boot(image).unwrap()
+    while b.chip.now < ms * PICO_MS
+        val end = b.run(PICO_TENTH_MS)
+        assert(end == RunEnd.Budget, s"${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+    b
+
+@test("a Pico on its Cortex-M0+s runs the SDK's hello_serial: UART0 prints a numbered line every 100 ms of guest time at 125 MHz")
+pico_hello_serial()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_HELLO_SERIAL).unwrap()
+    var lines: Buf[u64] = buf()
+    var seen: usize = 0
+    while b.chip.now < 360 * PICO_MS
+        val end = b.run(PICO_TENTH_MS)
+        assert(end == RunEnd.Budget, s"${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+        for i in seen..<b.console.len() do if b.console[i] == u8('\n') then lines.push(b.chip.now)
+        seen = b.console.len()
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == "hello, serial 0\r\nhello, serial 1\r\nhello, serial 2\r\nhello, serial 3\r\n", text)
+    // The watchdog's TICK divides the 12 MHz clk_ref by 12 for the timer's 1 µs tick, and runs.
+    val tick = b.chip.load(0, wd40.BASE + wd40.TICK_OFFSET, 4).unwrap()
+    assert(tick & wd40.TICK_CYCLES_MASK == 12 && tick & wd40.TICK_RUNNING_MASK != 0, s"TICK 0x${hex(tick)}")
+    // runtime_init powered USB's transceiver down through SIE_CTRL's SET alias, USBCTRL still in reset.
+    assert(b.chip.usb_sie_ctrl == 0x40000, s"SIE_CTRL 0x${hex(b.chip.usb_sie_ctrl)}")
+    assert(b.chip.sys_hz() == 125000000 && b.chip.ref_hz() == 12000000, s"runtime_init clocked the chip from PLL_SYS and the crystal: ${b.chip.sys_hz()} ${b.chip.ref_hz()}")
+    assert(b.chip.clocks.peri_hz(b.chip.sources()) == 125000000, "clk_peri from clk_sys, undivided")
+    assert(lines[0] >= 17 * PICO_FRAME && lines[0] < 17 * PICO_FRAME + 2 * PICO_MS, s"the first line at ${lines[0]}")
+    for k in 1..<lines.len()
+        val gap = lines[k] - lines[k - 1]
+        assert(gap + PICO_TENTH_MS >= 100 * PICO_MS + 17 * PICO_FRAME && gap <= 100 * PICO_MS + 17 * PICO_FRAME + 5 * PICO_TENTH_MS, s"line $k came ${gap} cycles after the one before")
+    assert(pico_waits_in_rom(b, 1), s"core 1 is still in the ROM's wait, asleep: pc 0x${hex(b.cores[1].pc, 8)}")
+
+@test("a Pico on its Cortex-M0+s runs the SDK's blink: GPIO 25 drives the LED and toggles every 250 ms of guest time")
+pico_blink()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    var toggles: Buf[u64] = buf()
+    var level = false
+    while b.chip.now < 1100 * PICO_MS
+        val end = b.run(PICO_TENTH_MS)
+        assert(end == RunEnd.Budget, s"${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+        val led = b.chip.pin(25)
+        assert(toggles.is_empty() || led.drives, "once set up, GPIO 25 always drives")
+        if led.drives && led.level != level
+            toggles.push(b.chip.now)
+            level = led.level
+    assert(toggles.len() == 5, s"${toggles.len()} toggles")
+    assert(toggles[0] < 2 * PICO_MS, s"the first toggle at ${toggles[0]}")
+    for k in 1..<toggles.len()
+        val gap = toggles[k] - toggles[k - 1]
+        // Each edge is seen at the end of a 0.1 ms run, so a gap can read one run short.
+        assert(gap + PICO_TENTH_MS >= 250 * PICO_MS && gap <= 250 * PICO_MS + 5 * PICO_TENTH_MS, s"toggle $k came ${gap} cycles after the one before")
+    assert(b.chip.sio.out & (1u64 << 25) != 0 && b.chip.sio.oe & (1u64 << 25) != 0, "through the SIO")
+    // FUNCSEL 5 (SIO) on GPIO 25, read back in the RP2040's layout.
+    assert(b.chip.load(0, io40.BASE + io40.GPIO25_CTRL_OFFSET, 4).unwrap() == 5)
+
+@test("pico-examples' hello_multicore on the Pico: core 1 launched through the ROM's FIFO wait, each core's word answered")
+pico_hello_multicore()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_MULTICORE).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 100 * PICO_MS do end = b.run(PICO_TENTH_MS)
+    assert(end == RunEnd.Breakpoint, s"main returns, and the SDK's exit ends at a BKPT: ${end} ${b.refused}")
+    assert(b.cores[0].stop == Stop.Breakpoint, "core 0's")
+    // Core 0 stays at its BKPT, as a board with no debugger leaves it, and core 1 runs on.
+    b.started[0] = false
+    for i in 0..<20 do assert(b.run(PICO_MS) == RunEnd.Budget, b.refused)
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == "Hello, multicore!\r\nIt's all gone well on core 0!Its all gone well on core 1!", text)
+    // Core 1 runs the program's own code, out of the ROM.
+    assert(b.started[1] && b.cores[1].pc >= 0x20000000, s"core 1 at 0x${hex(b.cores[1].pc, 8)}")
+
+// Whether core `k` waits in the ROM: started, asleep, in the ROM, on the stack the ROM gives core 1's
+// launch wait (the top of USB's DPRAM, `rom/rp2040/image/boot.sysl`'s CORE1_STACK).
+private pico_waits_in_rom(b: &ArmBoard[Rp2040], k: usize) -> bool = b.started[k] && b.cores[k].sleeping && b.cores[k].pc < ROM_BYTES_RP2040 && b.cores[k].r[13] > 0x50100F00 && b.cores[k].r[13] <= 0x50101000
+
+// Core 0's side of one word of the launch, made from the test, as `push_and_echo` does on the Pico 2.
+private pico_echo(b: &ArmBoard[Rp2040], x: u32) -> u32
+    val st = SIO40 + sio40.FIFO_ST_OFFSET
+    val rd = SIO40 + sio40.FIFO_RD_OFFSET
+    if x == 0 then while b.chip.load(0, st, 4).unwrap() & sio40.FIFO_ST_VLD_MASK != 0 do b.chip.load(0, rd, 4).unwrap()
+    b.chip.store(0, SIO40 + sio40.FIFO_WR_OFFSET, 4, x).unwrap()
+    b.cores[1].event = true
+    for i in 0..<100
+        if b.chip.load(0, st, 4).unwrap() & sio40.FIFO_ST_VLD_MASK != 0 then return b.chip.load(0, rd, 4).unwrap()
+        b.run(1000)
+    assert(false, s"core 1's ROM never answered 0x${hex(x)}: core 1 at 0x${hex(b.cores[1].pc, 8)}")
+    0
+
+// Thumb halfwords into SRAM at `at`, and core 0 there next.
+private pico_place(b: &ArmBoard[Rp2040], at: u32, code: []const u16)
+    for i in 0..<code.len
+        b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
+        b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
+    b.cores[0].pc = at
+    b.cores[0].sleeping = false
+
+// Core 0 parked in `wfi; b .` at 0x20040100, out of the way of what the test does from outside it.
+private pico_park(b: &ArmBoard[Rp2040]) = pico_place(b, 0x20040100, [0xBF30, 0xE7FD])
+
+@test("the ROM's core 1: at reset it drains its FIFO and sends core 0 a 0; it echoes 0, 0, 1, VTOR, SP, ENTRY and starts core 1 there; a word out of place is answered 0 and starts the sequence again")
+pico_rom_launch()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    pico_park(b)
+    b.run(PICO_MS)
+    assert(pico_waits_in_rom(b, 1), s"core 1 asleep in the ROM: 0x${hex(b.cores[1].pc, 8)}")
+    // Asleep in WFE, not polling: a few dozen instructions in 1 ms, not tens of thousands.
+    assert(b.cores[1].on_event && b.cores[1].retired < 100, s"core 1 retired ${b.cores[1].retired}")
+    // The 0 it sent at reset.
+    assert(b.chip.load(0, SIO40 + sio40.FIFO_ST_OFFSET, 4).unwrap() & sio40.FIFO_ST_VLD_MASK != 0)
+    assert(b.chip.load(0, SIO40 + sio40.FIFO_RD_OFFSET, 4).unwrap() == 0)
+    // A word out of place is answered 0, as `core_0_handshake_loop` sends, and starts it again.
+    for x in [0u32, 0] do assert(pico_echo(b, x) == x)
+    assert(pico_echo(b, 7) == 0, "the 7 in the 1's place")
+    assert(pico_waits_in_rom(b, 1))
+    // `b .` at 0x20040200 for core 1 to start at.
+    b.mem.ram[0x40200] = 0xFE
+    b.mem.ram[0x40201] = 0xE7
+    for x in [0u32, 0, 1, 0x20040000, 0x20041800, 0x20040201] do assert(pico_echo(b, x) == x, s"echo of 0x${hex(x)}")
+    b.run(PICO_MS)
+    val c = &b.cores[1]
+    assert(c.pc == 0x20040200 && c.vtor == 0x20040000, s"core 1 at 0x${hex(c.pc, 8)}, VTOR 0x${hex(c.vtor, 8)}")
+    assert(c.r[13] == 0x20041800, s"SP 0x${hex(c.r[13], 8)}")
+
+@test("the RP2040's SIO: FIFOs eight deep (the ninth word sets WOF), each core's FIFO interrupt on a line of its own, and the QSPI bank and what lies past the spinlocks refused by name")
+pico_sio()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    pico_park(b)
+    b.run(PICO_MS)
+    // Core 1 waits in the ROM with its FIFO empty; core 0's holds the ROM's 0. Fill core 1's.
+    for i in 0u32..<8 do b.chip.store(0, SIO40 + sio40.FIFO_WR_OFFSET, 4, 100 + i).unwrap()
+    val st = b.chip.load(0, SIO40 + sio40.FIFO_ST_OFFSET, 4).unwrap()
+    assert(st & sio40.FIFO_ST_RDY_MASK == 0 && st & sio40.FIFO_ST_WOF_MASK == 0, s"eight words fill it: 0x${hex(st)}")
+    b.chip.store(0, SIO40 + sio40.FIFO_WR_OFFSET, 4, 999).unwrap()
+    assert(b.chip.load(0, SIO40 + sio40.FIFO_ST_OFFSET, 4).unwrap() & sio40.FIFO_ST_WOF_MASK != 0, "the ninth overflows")
+    for i in 0u32..<8 do assert(b.chip.load(1, SIO40 + sio40.FIFO_RD_OFFSET, 4).unwrap() == 100 + i, "core 1 reads them in order")
+    // benchtop's ROM looks at VLD before it reads core 1's FIFO, so ROE stays clear. (Raspberry Pi's
+    // reads once first and sets it; that detail of its code is not kept.) A read on empty sets it, and
+    // writing FIFO_ST clears it.
+    assert(b.chip.load(1, SIO40 + sio40.FIFO_ST_OFFSET, 4).unwrap() & sio40.FIFO_ST_ROE_MASK == 0, "no read on empty in the ROM's wait")
+    b.chip.load(1, SIO40 + sio40.FIFO_RD_OFFSET, 4).unwrap()
+    assert(b.chip.load(1, SIO40 + sio40.FIFO_ST_OFFSET, 4).unwrap() & sio40.FIFO_ST_ROE_MASK != 0, "a read on empty")
+    b.chip.store(1, SIO40 + sio40.FIFO_ST_OFFSET, 4, 0xFF).unwrap()
+    // IRQ 15 is core 0's FIFO line, IRQ 16 core 1's: core 0's FIFO holds a word, core 1's is empty.
+    assert(b.chip.sio.fifo_irq(0) && !b.chip.sio.fifo_irq(1))
+    val bad = b.chip.load(0, SIO40 + sio40.GPIO_HI_OUT_OFFSET, 4)
+    assert(bad.is_err() && bad.unwrap_err().contains("QSPI"), "the QSPI pins' bank")
+    val past = b.chip.load(0, SIO40 + 0x180, 4)
+    assert(past.is_err() && past.unwrap_err().contains("not a register of the RP2040's SIO"))
+    // GPIO_OUT at the RP2040's offsets: SET, CLR and XOR are each a word on, and only 30 bits are kept.
+    b.chip.store(0, SIO40 + sio40.GPIO_OUT_SET_OFFSET, 4, 0xFFFFFFFF).unwrap()
+    b.chip.store(0, SIO40 + sio40.GPIO_OUT_CLR_OFFSET, 4, 1).unwrap()
+    b.chip.store(0, SIO40 + sio40.GPIO_OUT_XOR_OFFSET, 4, 6).unwrap()
+    assert(b.chip.load(0, SIO40 + sio40.GPIO_OUT_OFFSET, 4).unwrap() == 0x3FFFFFF8)
+    b.chip.store(0, SIO40 + sio40.GPIO_OE_SET_OFFSET, 4, 0x10).unwrap()
+    assert(b.chip.load(0, SIO40 + sio40.GPIO_OE_OFFSET, 4).unwrap() == 0x10)
+
+@test("each core's hardware divider through the bus: eight clk_sys cycles to a result, signed and unsigned, divide by zero, and DIRTY")
+pico_divider()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    pico_park(b)
+    b.run(PICO_MS)
+    val base = SIO40
+    b.chip.store(0, base + sio40.DIV_UDIVIDEND_OFFSET, 4, 100).unwrap()
+    b.chip.store(0, base + sio40.DIV_UDIVISOR_OFFSET, 4, 7).unwrap()
+    assert(b.chip.load(0, base + sio40.DIV_CSR_OFFSET, 4).unwrap() & sio40.DIV_CSR_READY_MASK == 0, "not ready at once")
+    b.chip.pass(7)
+    assert(b.chip.load(0, base + sio40.DIV_CSR_OFFSET, 4).unwrap() & sio40.DIV_CSR_READY_MASK == 0, "not after seven cycles")
+    b.chip.pass(1)
+    val csr = b.chip.load(0, base + sio40.DIV_CSR_OFFSET, 4).unwrap()
+    assert(csr & sio40.DIV_CSR_READY_MASK != 0 && csr & sio40.DIV_CSR_DIRTY_MASK != 0, s"ready and dirty after eight: 0x${hex(csr)}")
+    assert(b.chip.load(0, base + sio40.DIV_REMAINDER_OFFSET, 4).unwrap() == 2)
+    assert(b.chip.load(0, base + sio40.DIV_QUOTIENT_OFFSET, 4).unwrap() == 14)
+    assert(b.chip.load(0, base + sio40.DIV_CSR_OFFSET, 4).unwrap() & sio40.DIV_CSR_DIRTY_MASK == 0, "reading QUOTIENT clears DIRTY")
+    // Core 1's divider is its own: signed, -7 / 2.
+    b.chip.store(1, base + sio40.DIV_SDIVIDEND_OFFSET, 4, u32.wrap(-7)).unwrap()
+    b.chip.store(1, base + sio40.DIV_SDIVISOR_OFFSET, 4, 2).unwrap()
+    b.chip.pass(8)
+    assert(b.chip.load(1, base + sio40.DIV_QUOTIENT_OFFSET, 4).unwrap() == u32.wrap(-3))
+    assert(b.chip.load(1, base + sio40.DIV_REMAINDER_OFFSET, 4).unwrap() == u32.wrap(-1))
+    assert(b.chip.load(0, base + sio40.DIV_REMAINDER_OFFSET, 4).unwrap() == 2, "core 0's untouched")
+    // Unsigned divide by zero: quotient all ones, remainder the dividend.
+    b.chip.store(0, base + sio40.DIV_UDIVIDEND_OFFSET, 4, 5).unwrap()
+    b.chip.store(0, base + sio40.DIV_UDIVISOR_OFFSET, 4, 0).unwrap()
+    b.chip.pass(8)
+    assert(b.chip.load(0, base + sio40.DIV_QUOTIENT_OFFSET, 4).unwrap() == 0xFFFFFFFF)
+    assert(b.chip.load(0, base + sio40.DIV_REMAINDER_OFFSET, 4).unwrap() == 5)
+
+@test("the SDK's hardware divide on an M0+ (divmod_u32u32_core): the quotient and remainder it reads after its eight-cycle wait are the division's, with the cores' instruction timing")
+pico_divider_from_core()
+    val b = pico_ran(PICO_BLINK, 1)
+    // str r0, [r2, #0x60]; str r1, [r2, #0x64]; cmp r1, #0; beq (not taken); b; b; b;
+    // ldr r1, [r2, #0x74]; ldr r0, [r2, #0x70]; wfi; b .
+    pico_place(b, 0x20040100, [0x6610, 0x6651, 0x2900, 0xD005, 0xE7FF, 0xE7FF, 0xE7FF, 0x6F51, 0x6F10, 0xBF30, 0xE7FD])
+    val c = &b.cores[0]
+    c.r[0] = 1000
+    c.r[1] = 7
+    c.r[2] = SIO40
+    b.run(PICO_MS)
+    assert(c.r[0] == 142 && c.r[1] == 6, s"quotient ${c.r[0]}, remainder ${c.r[1]}")
+
+@test("the hardware divide wherever a quantum ends inside its eight-cycle wait: a core that ran past one quantum's end starts the next where it reached, so the read still comes eight cycles after the write")
+pico_divider_across_quanta()
+    for q in 1u64..<24
+        val b = pico_ran(PICO_BLINK, 1)
+        b.quantum = q
+        pico_place(b, 0x20040100, [0x6610, 0x6651, 0x2900, 0xD005, 0xE7FF, 0xE7FF, 0xE7FF, 0x6F51, 0x6F10, 0xBF30, 0xE7FD])
+        val c = &b.cores[0]
+        c.r[0] = 1000 + u32(q)
+        c.r[1] = 7
+        c.r[2] = SIO40
+        var runs = 0
+        while !(c.sleeping && c.pc >= 0x20040112) && runs < 20000
+            b.run(q)
+            runs += 1
+        assert(c.sleeping && c.r[0] == (1000 + u32(q)) / 7 && c.r[1] == (1000 + u32(q)) % 7, s"a quantum of $q: quotient ${c.r[0]}, remainder ${c.r[1]}")
+
+@test("the RP2040's IO_BANK0 and pads: 30 GPIOs, CTRL's OUTOVER at bits 9:8 and OEOVER at 13:12, INTR0 at 0xF0, pads with no ISO and their inputs enabled at power-on")
+pico_gpio_layout()
+    // blink's start-up takes IO_BANK0 and PADS_BANK0 out of reset.
+    val b = pico_ran(PICO_BLINK, 5)
+    pico_park(b)
+    b.run(PICO_MS)
+    // GPIO 3 as SIO, driven high by OUTOVER and enabled by OEOVER, in the RP2040's places.
+    val ctrl = io40.BASE + io40.GPIO3_CTRL_OFFSET
+    val word = 5u32 | (3 << io40.GPIO0_CTRL_OUTOVER_SHIFT) | (3 << io40.GPIO0_CTRL_OEOVER_SHIFT)
+    b.chip.store(0, ctrl, 4, word).unwrap()
+    assert(b.chip.load(0, ctrl, 4).unwrap() == word, "CTRL reads back as written")
+    val p = b.chip.pin(3)
+    assert(p.drives && p.level, "OEOVER enable and OUTOVER high drive the pin high")
+    // The XOR alias works on the RP2040's layout: clearing OUTOVER's bits through it.
+    b.chip.store(0, ctrl + 0x1000, 4, 3 << io40.GPIO0_CTRL_OUTOVER_SHIFT).unwrap()
+    assert(!b.chip.pin(3).level, "OUTOVER back to the function's output, which is low")
+    val status = b.chip.load(0, io40.BASE + io40.GPIO3_STATUS_OFFSET, 4).unwrap()
+    assert(status & io40.GPIO0_STATUS_OETOPAD_MASK != 0 && status & io40.GPIO0_STATUS_OUTTOPAD_MASK == 0, s"STATUS 0x${hex(status)}")
+    // There is no GPIO 30; INTR0 follows GPIO29_CTRL.
+    assert(b.chip.load(0, io40.BASE + io40.INTR0_OFFSET, 4).is_ok())
+    b.chip.store(0, io40.BASE + io40.PROC0_INTE0_OFFSET, 4, 0x8).unwrap()
+    assert(b.chip.load(0, io40.BASE + io40.PROC0_INTE0_OFFSET, 4).unwrap() == 0x8)
+    // A function the chip does not run is refused at the write, by name.
+    val spi = b.chip.store(0, io40.BASE + io40.GPIO4_CTRL_OFFSET, 4, 1)
+    assert(spi.is_err() && spi.unwrap_err().contains("SPI0"), "F1 on GPIO 4")
+    val clock = b.chip.store(0, io40.BASE + io40.GPIO21_CTRL_OFFSET, 4, 8)
+    assert(clock.is_err() && clock.unwrap_err().contains("CLOCKS_GPOUT"), "F8 on GPIO 21")
+    // The pads: power-on 0x56 (IE, 4 mA, pull-down, Schmitt); bit 8 is not there to set.
+    assert(b.chip.load(0, pads40.BASE + pads40.GPIO10_OFFSET, 4).unwrap() == 0x56)
+    b.chip.store(0, pads40.BASE + pads40.GPIO10_OFFSET, 4, 0x1FF).unwrap()
+    assert(b.chip.load(0, pads40.BASE + pads40.GPIO10_OFFSET, 4).unwrap() == 0xFF)
+    assert(b.chip.load(0, pads40.BASE + pads40.SWD_OFFSET, 4).is_ok() && b.chip.load(0, pads40.BASE + pads40.SWD_OFFSET + 4, 4).is_err())
+
+@test("the RP2040's dormant wake: ROSC's DORMANT (at the RP2040's 0x0C) stops the ring until GPIO 2's dormant-wake interrupt, enabled at 0x160, wakes it")
+pico_dormant_wake()
+    val b = pico_ran(PICO_BLINK, 5)
+    pico_park(b)
+    b.chip.store(0, 0x40060000 + 0x0C, 4, 0x636F6D61).unwrap()
+    assert(b.chip.rosc.dormant && b.chip.sources().rosc == 0, "dormant")
+    // GPIO 2 an input (its pad's IE is set at power-on), LEVEL_HIGH enabled for the dormant wake.
+    b.chip.store(0, io40.BASE + io40.GPIO2_CTRL_OFFSET, 4, 5).unwrap()
+    b.chip.store(0, io40.BASE + io40.DORMANT_WAKE_INTE0_OFFSET, 4, 0x200).unwrap()
+    assert(b.chip.rosc.dormant, "still: GPIO 2 is low")
+    b.chip.drive_from_outside(2, Some(true))
+    assert(!b.chip.rosc.dormant && b.chip.sources().rosc == 6500000, "woken")
+
+@test("the RP2040's CLOCKS: clk_ref and clk_sys as the SDK leaves them, clk_peri with no divider, FC0 from the RP2040's source table, and an unclocked source refused")
+pico_clocks()
+    val b = pico_ran(PICO_BLINK, 5)
+    pico_park(b)
+    // FC0 measuring clk_sys against the 12 MHz clk_ref.
+    b.chip.store(0, clk_reg.BASE + clk_reg.FC0_REF_KHZ_OFFSET, 4, 12000).unwrap()
+    b.chip.store(0, clk_reg.BASE + clk_reg.FC0_SRC_OFFSET, 4, clk_reg.FC0_SRC_FC0_SRC_CLK_SYS).unwrap()
+    assert(b.chip.load(0, clk_reg.BASE + clk_reg.FC0_RESULT_OFFSET, 4).unwrap() >> 5 == 125000, "125000 kHz")
+    // clk_rtc: the SDK runs it from PLL_USB's 48 MHz at 46875 Hz, its 24.8 divider 1024.
+    b.chip.store(0, clk_reg.BASE + clk_reg.FC0_SRC_OFFSET, 4, clk_reg.FC0_SRC_FC0_SRC_CLK_RTC).unwrap()
+    assert(b.chip.load(0, clk_reg.BASE + clk_reg.FC0_RESULT_OFFSET, 4).unwrap() == 46 * 32 + 28, "46.875 kHz, 28/32 of a kHz over 46")
+    assert(b.chip.load(0, clk_reg.BASE + clk_reg.FC0_STATUS_OFFSET, 4).unwrap() & 0x11 == 0x11, "DONE and PASS")
+    val gpin = b.chip.store(0, clk_reg.BASE + clk_reg.FC0_SRC_OFFSET, 4, clk_reg.FC0_SRC_FC0_SRC_CLKSRC_GPIN0)
+    assert(gpin.is_err() && gpin.unwrap_err().contains("gpin0"))
+    // clk_peri has no DIV: the SDK's clock_configure wrote one, which holds nothing and reads 0, and
+    // clk_peri stays clk_sys undivided.
+    assert(b.chip.load(0, clk_reg.BASE + clk_reg.CLK_PERI_CTRL_OFFSET + 4, 4).unwrap() == 0)
+    b.chip.store(0, clk_reg.BASE + clk_reg.CLK_PERI_CTRL_OFFSET + 4, 4, 4 << 8).unwrap()
+    assert(b.chip.clocks.peri_hz(b.chip.sources()) == 125000000)
+    assert(b.chip.load(0, clk_reg.BASE + clk_reg.CLK_PERI_SELECTED_OFFSET, 4).unwrap() == 1)
+    // XOSC's COUNT is at 0x1C on the RP2040, and nothing is between STARTUP and it.
+    b.chip.store(0, 0x40024000 + 0x1C, 4, 0x1234).unwrap()
+    assert(b.chip.load(0, 0x40024000 + 0x1C, 4).unwrap() == 0x1234 && b.chip.xosc.count == 0x1234)
+    assert(b.chip.load(0, 0x40024000 + 0x10, 4).is_err())
+    // ROSC's registers from DORMANT on are a word lower than the RP2350's: STATUS at 0x18.
+    assert(b.chip.load(0, 0x40060000 + 0x18, 4).unwrap() == b.chip.rosc.read(0x1C, 4).unwrap())
+    // clk_sys's DIV is 24.8: INT 2 halves it.
+    b.chip.store(0, clk_reg.BASE + clk_reg.CLK_SYS_DIV_OFFSET, 4, 2 << 8).unwrap()
+    assert(b.chip.sys_hz() == 62500000, s"${b.chip.sys_hz()}")
+
+@test("the RP2040's PSM: FRCE_OFF of PROC1 stops core 1 and its release starts it from reset in the ROM, which answers with a 0; any other stage is refused by name")
+pico_psm()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    pico_park(b)
+    b.run(PICO_MS)
+    // Drain the power-on 0.
+    b.chip.load(0, SIO40 + sio40.FIFO_RD_OFFSET, 4).unwrap()
+    b.chip.store(0, psm40.BASE + 0x2000 + psm40.FRCE_OFF_OFFSET, 4, psm40.FRCE_OFF_PROC1_MASK).unwrap()
+    b.run(PICO_MS)
+    assert(!b.started[1], "held in reset")
+    assert(b.chip.load(0, psm40.BASE + psm40.DONE_OFFSET, 4).unwrap() == 0xFFFF, "every stage but PROC1 done")
+    b.chip.store(0, psm40.BASE + 0x3000 + psm40.FRCE_OFF_OFFSET, 4, psm40.FRCE_OFF_PROC1_MASK).unwrap()
+    b.run(PICO_MS)
+    assert(pico_waits_in_rom(b, 1))
+    assert(b.chip.load(0, SIO40 + sio40.FIFO_RD_OFFSET, 4).unwrap() == 0 && b.chip.sio.errors[0] == 0, "the ROM's 0 on release")
+    val sio = b.chip.store(0, psm40.BASE + 0x2000 + psm40.FRCE_OFF_OFFSET, 4, psm40.FRCE_OFF_SIO_MASK)
+    assert(sio.is_err() && sio.unwrap_err() == "PSM FRCE_OFF of SIO is not modelled: only PROC1 can be forced off", sio.unwrap_err())
+
+// The 16-bit pointer the ROM's table at `table` holds for the code `c1`, `c2`, read from the image as
+// `rom_table_lookup` reads it; 0 if it holds none.
+private rom_find(table: u32, c1: u8, c2: u8) -> u32
+    var at = table
+    loop
+        val code = rom_read_rp2040(at, 2)
+        if code == 0 then return 0
+        if code == u32(c1) | (u32(c2) << 8) then return rom_read_rp2040(at + 2, 2)
+        at += 4
+
+@test("the ROM is benchtop's own: the vector table, the magic and version 3, the header's three 16-bit pointers, both tables with every entry a Thumb function or a datum in the ROM, read through the fast path and the bus alike, and a store to it refused")
+pico_rom_image()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    assert(ROM_RP2040.len == 16384, s"${ROM_RP2040.len} bytes")
+    // The magic 'M', 'u', 1 and version 3 (the B2 stepping's, which the SDK's float setup reads).
+    assert(b.mem.ram[b.rom_at + 0x10] == u8('M') && b.mem.ram[b.rom_at + 0x11] == u8('u') && b.mem.ram[b.rom_at + 0x12] == 1 && b.mem.ram[b.rom_at + 0x13] == 3)
+    // The tables where `rom.ld` lays them out, right after the header, and the lookup a Thumb function.
+    val funcs = rom_read_rp2040(0x14, 2)
+    val data = rom_read_rp2040(0x16, 2)
+    val lookup = rom_read_rp2040(0x18, 2)
+    assert(funcs == 0x1C && data == 0x5C && lookup & 1 == 1 && lookup < 0x4000, s"0x${hex(funcs)} 0x${hex(data)} 0x${hex(lookup)}")
+    // Core 0's stack below boot2's 256 bytes at the top of SRAM5; reset, NMI and HardFault in the ROM, Thumb.
+    assert(rom_word_rp2040(0) == 0x20041F00)
+    for v in [4u32, 8, 12] do assert(rom_word_rp2040(v) & 1 == 1 && rom_word_rp2040(v) < 0x4000, s"vector at 0x${hex(v)}")
+    // Every function the SDK looks up is there, a Thumb address in the ROM.
+    for name in ["P3", "R3", "L3", "T3", "MS", "S4", "MC", "C4", "UB", "IF", "EX", "RE", "RP", "FC", "CX"]
+        val f = rom_find(funcs, name.bytes[0], name.bytes[1])
+        assert(f & 1 == 1 && f > 0x20 && f < 0x4000, s"$name at 0x${hex(f)}")
+    // And every datum: the copyright text, the revision, and both soft float tables with their size in
+    // words in the byte two before them.
+    val cr = rom_find(data, u8('C'), u8('R'))
+    var text = ""
+    for k in 0u32..<64
+        val c = rom_read_rp2040(cr + k, 1)
+        if c == 0 then break
+        text = s"$text${char_from_u32(c).unwrap()}"
+    assert(text == "benchtop's own RP2040 boot ROM, ISC licence; not Raspberry Pi's", text)
+    assert(rom_word_rp2040(rom_find(data, u8('G'), u8('R'))) == 1)
+    for t in ["SF", "SD"]
+        val at = rom_find(data, t.bytes[0], t.bytes[1])
+        assert(at & 3 == 0 && rom_read_rp2040(at - 2, 1) == 32, s"$t at 0x${hex(at)}")
+        for i in 0u32..<32 do assert(rom_word_rp2040(at + 4 * i) & 1 == 1 && rom_word_rp2040(at + 4 * i) < 0x4000, s"$t entry $i")
+    for a in [0x14u32, data, 0x3FF8] do assert(b.chip.load(0, a, 4).unwrap() == rom_word_rp2040(a), s"0x${hex(a)} through the bus")
+    assert(b.chip.load(0, 0x13, 1).unwrap() == 3 && b.chip.load(0, 0x10, 2).unwrap() == 0x754D)
+    val odd = b.chip.load(0, 0x11, 2)
+    assert(odd.is_err() && odd.unwrap_err().contains("not aligned"), "an unaligned halfword")
+    val w = b.chip.store(0, 0x100, 4, 1)
+    assert(w.is_err() && w.unwrap_err().contains("read-only"))
+
+@test("the ROM's doorbell: each word it is rung with refuses by name what benchtop does not model, and anything else names nothing")
+pico_rom_doorbell()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    val cases = [(1u32, "BOOTSEL is held"), (2, "no valid boot2"), (3, "reset_usb_boot"),
+        (0x15444, "'DT'"), (0x20014, "soft float table entry at 0x14"), (0x20114, "soft double"),
+        (0x30003, "exception 3"), (7, "names nothing")]
+    for (bell, says) in cases
+        val e = b.chip.store(0, ROM_DOORBELL_RP2040, 4, bell)
+        assert(e.is_err() && e.unwrap_err().contains(says), s"0x${hex(bell)}: ${e.unwrap_err()}")
+    // A byte store there is an ordinary store to the ROM.
+    val byte = b.chip.store(0, ROM_DOORBELL_RP2040, 1, 1)
+    assert(byte.is_err() && byte.unwrap_err().contains("read-only"))
+
+// Core 0 calls the ROM's function at `fn` (Thumb bit set) with r0 to r3 from a parked program
+// (`blx r4; wfi; b .`), and answers r0 to r3 as it returned them: a double in r0:r1, and the double
+// sine-and-cosine's cosine in r2:r3.
+private pico_call4(b: &ArmBoard[Rp2040], fn: u32, args: (u32, u32, u32, u32)) -> (u32, u32, u32, u32)
+    pico_place(b, 0x20040100, [0x47A0, 0xBF30, 0xE7FD])
+    val c = &b.cores[0]
+    c.r[0] = args.0
+    c.r[1] = args.1
+    c.r[2] = args.2
+    c.r[3] = args.3
+    c.r[4] = fn
+    c.r[13] = 0x20042000
+    val end = b.run(PICO_MS)
+    // Both cores asleep (core 1 in the ROM's wait) ends the run early, as Asleep.
+    assert((end == RunEnd.Budget || end == RunEnd.Asleep) && c.sleeping && c.pc >= 0x20040102 && c.pc <= 0x20040104, s"${end} '${b.refused}': core 0 at 0x${hex(c.pc, 8)}")
+    (c.r[0], c.r[1], c.r[2], c.r[3])
+
+// The same with two arguments, answering r0 and r1.
+private pico_call(b: &ArmBoard[Rp2040], fn: u32, r0: u32, r1: u32) -> (u32, u32)
+    val got = pico_call4(b, fn, (r0, r1, 0, 0))
+    (got.0, got.1)
+
+// The ROM's `rom_table_lookup` of `code` in the table at `table`, called as the SDK calls it.
+private pico_lookup(b: &ArmBoard[Rp2040], table: u32, c1: u8, c2: u8) -> u32 =
+    pico_call(b, rom_word_rp2040(0x18) & 0xFFFF, table, u32(c1) | (u32(c2) << 8)).0
+
+@test("the ROM's own code answers rom_table_lookup and its bit functions, checked against the host's arithmetic")
+pico_rom_bit_functions()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    b.run(PICO_MS)
+    val funcs = rom_word_rp2040(0x14) & 0xFFFF
+    val popcount = pico_lookup(b, funcs, u8('P'), u8('3'))
+    val clz = pico_lookup(b, funcs, u8('L'), u8('3'))
+    val ctz = pico_lookup(b, funcs, u8('T'), u8('3'))
+    val reverse = pico_lookup(b, funcs, u8('R'), u8('3'))
+    assert(popcount == rom_find(funcs, u8('P'), u8('3')) && clz == rom_find(funcs, u8('L'), u8('3')) && ctz == rom_find(funcs, u8('T'), u8('3')) && reverse == rom_find(funcs, u8('R'), u8('3')))
+    // A code the table does not hold answers 0, as the lookup's loop ends at the table's 0.
+    assert(pico_lookup(b, funcs, u8('Z'), u8('Z')) == 0)
+    for x in [0u32, 1, 0x80000000, 0xFFFFFFFF, 0xF0F01234, 0x00012340, 0x12345678, 0x00008000]
+        assert(pico_call(b, popcount, x, 0).0 == x.count_ones(), s"popcount32(0x${hex(x)})")
+        assert(pico_call(b, clz, x, 0).0 == x.leading_zeros(), s"clz32(0x${hex(x)})")
+        assert(pico_call(b, ctz, x, 0).0 == x.trailing_zeros(), s"ctz32(0x${hex(x)})")
+        assert(pico_call(b, reverse, x, 0).0 == x.reverse_bits(), s"reverse32(0x${hex(x)})")
+
+@test("a lookup of a code the RP2040's ROM has and benchtop's leaves out (debug_trampoline, 'D', 'T') is refused by name")
+pico_rom_left_out()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    b.run(PICO_MS)
+    pico_place(b, 0x20040100, [0x47A0, 0xBF30, 0xE7FD])
+    val c = &b.cores[0]
+    c.r[0] = rom_word_rp2040(0x14) & 0xFFFF
+    c.r[1] = u32('D') | (u32('T') << 8)
+    c.r[4] = rom_word_rp2040(0x18) & 0xFFFF
+    c.r[13] = 0x20042000
+    val end = b.run(PICO_MS)
+    assert(end == RunEnd.Fault && b.refused.contains("'DT'") && b.refused.contains("not provided by benchtop's ROM"), s"${end} '${b.refused}'")
+
+private lo(x: u64) -> u32 = u32.wrap(x)
+private hi(x: u64) -> u32 = u32(x >> 32)
+private wide(x: u64) -> (u32, u32) = (lo(x), hi(x))
+
+// The registers the soft float table's entry `i` (offset 4 × i, `sf_table.h`) is called with for the
+// floats `a`, `b`, the 64-bit `l` and the scale `n`, and the r0, r1 the host build of the same routine
+// answers; `both` says whether r1 is part of the answer.
+private float_entry(i: u32, a: u32, b: u32, l: u64, n: i32) -> ((u32, u32, u32, u32), u32, u32, bool)
+    val nn = u32.wrap(n)
+    val one = (a, 0u32, 0u32, 0u32)
+    val two = (a, b, 0u32, 0u32)
+    val scaled = (a, nn, 0u32, 0u32)
+    val long = (lo(l), hi(l), 0u32, 0u32)
+    val long_scaled = (lo(l), hi(l), nn, 0u32)
+    i match
+        0 -> (two, rom.fadd(a, b), 0, false)
+        1 -> (two, rom.fsub(a, b), 0, false)
+        2 -> (two, rom.fmul(a, b), 0, false)
+        3 -> (two, rom.fdiv(a, b), 0, false)
+        4 | 21 -> (two, u32.wrap(rom.fcmp(a, b)), 0, false)
+        6 -> (one, rom.fsqrt(a), 0, false)
+        7 -> (one, u32.wrap(rom.float2int(a)), 0, false)
+        8 -> (scaled, u32.wrap(rom.float2fix(a, n)), 0, false)
+        9 -> (one, rom.float2uint(a), 0, false)
+        10 -> (scaled, rom.float2ufix(a, n), 0, false)
+        11 -> (one, rom.int2float(i32.wrap(a)), 0, false)
+        12 -> (scaled, rom.fix2float(i32.wrap(a), n), 0, false)
+        13 -> (one, rom.uint2float(a), 0, false)
+        14 -> (scaled, rom.ufix2float(a, n), 0, false)
+        15 -> (one, rom.fcos(a), 0, false)
+        16 | 18 ->
+            val s, c = rom.fsincos(a)
+            (one, s, c, true)
+        17 -> (one, rom.ftan(a), 0, false)
+        19 -> (one, rom.fexp(a), 0, false)
+        20 -> (one, rom.fln(a), 0, false)
+        22 -> (two, rom.fatan2(a, b), 0, false)
+        23 -> (long, rom.int642float(i64.wrap(l)), 0, false)
+        24 -> (long_scaled, rom.fix642float(i64.wrap(l), n), 0, false)
+        25 -> (long, rom.uint642float(l), 0, false)
+        26 -> (long_scaled, rom.ufix642float(l, n), 0, false)
+        27 -> (one, lo(u64.wrap(rom.float2int64(a))), hi(u64.wrap(rom.float2int64(a))), true)
+        28 -> (scaled, lo(u64.wrap(rom.float2fix64(a, n))), hi(u64.wrap(rom.float2fix64(a, n))), true)
+        29 -> (one, lo(rom.float2uint64(a)), hi(rom.float2uint64(a)), true)
+        30 -> (scaled, lo(rom.float2ufix64(a, n)), hi(rom.float2ufix64(a, n)), true)
+        _ -> (one, lo(rom.float2double(a)), hi(rom.float2double(a)), true)
+end float_entry
+
+// The soft double table's entry `i` for the doubles `a`, `b`, the 64-bit `l` and the scale `n`: the
+// registers, and the host build's r0 to r3, `count` of them meaningful.
+private double_entry(i: u32, a: u64, b: u64, l: u64, n: i32) -> ((u32, u32, u32, u32), (u32, u32, u32, u32), u32)
+    val nn = u32.wrap(n)
+    val one = (lo(a), hi(a), 0u32, 0u32)
+    val two = (lo(a), hi(a), lo(b), hi(b))
+    val scaled = (lo(a), hi(a), nn, 0u32)
+    val word = (lo(l), 0u32, 0u32, 0u32)
+    val word_scaled = (lo(l), nn, 0u32, 0u32)
+    val long = (lo(l), hi(l), 0u32, 0u32)
+    val long_scaled = (lo(l), hi(l), nn, 0u32)
+    val d: u64 = i match
+        0 -> rom.dadd(a, b)
+        1 -> rom.dsub(a, b)
+        2 -> rom.dmul(a, b)
+        3 -> rom.ddiv(a, b)
+        4 | 21 -> u64(u32.wrap(rom.dcmp(a, b)))
+        6 -> rom.dsqrt(a)
+        7 -> u64(u32.wrap(rom.double2int(a)))
+        8 -> u64(u32.wrap(rom.double2fix(a, n)))
+        9 -> u64(rom.double2uint(a))
+        10 -> u64(rom.double2ufix(a, n))
+        11 -> rom.int2double(i32.wrap(lo(l)))
+        12 -> rom.fix2double(i32.wrap(lo(l)), n)
+        13 -> rom.uint2double(lo(l))
+        14 -> rom.ufix2double(lo(l), n)
+        15 -> rom.dcos(a)
+        16 -> rom.dsin(a)
+        17 -> rom.dtan(a)
+        18 -> rom.dsincos(a).0
+        19 -> rom.dexp(a)
+        20 -> rom.dln(a)
+        22 -> rom.datan2(a, b)
+        23 -> rom.int642double(i64.wrap(l))
+        24 -> rom.fix642double(i64.wrap(l), n)
+        25 -> rom.uint642double(l)
+        26 -> rom.ufix642double(l, n)
+        27 -> u64.wrap(rom.double2int64(a))
+        28 -> u64.wrap(rom.double2fix64(a, n))
+        29 -> rom.double2uint64(a)
+        30 -> rom.double2ufix64(a, n)
+        _ -> u64(rom.double2float(a))
+    val args = i match
+        0 | 1 | 2 | 3 | 4 | 21 | 22 -> two
+        8 | 10 | 28 | 30 -> scaled
+        11 | 13 -> word
+        12 | 14 -> word_scaled
+        23 | 25 -> long
+        24 | 26 -> long_scaled
+        _ -> one
+    // 32-bit answers: the comparisons, the conversions to a 32-bit integer and double2float.
+    val count: u32 = if i == 4 || i == 21 || (i >= 7 && i <= 10) || i == 31 then 1 elif i == 18 then 4 else 2
+    val c = rom.dsincos(a).1
+    (args, (lo(d), hi(d), lo(c), hi(c)), count)
+end double_entry
+
+@test("every entry of the ROM's soft float and double tables, called on the Pico as the SDK calls it, answers bit for bit what the host build of the same sysl routine answers")
+pico_rom_float_tables()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    b.run(PICO_MS)
+    val data = rom_word_rp2040(0x14) >> 16
+    val sf = pico_lookup(b, data, u8('S'), u8('F'))
+    val sd = pico_lookup(b, data, u8('S'), u8('D'))
+    assert(sf == rom_find(data, u8('S'), u8('F')) && sd == rom_find(data, u8('S'), u8('D')))
+    var r = Rng(0x0123456789ABCDEF)
+    var calls = 0
+    for i in 0u32..<32
+        // Entry 5, the comparison that answers in the flags, is refused (`pico_rom_flags_entry`).
+        if i == 5 then continue
+        for k in 0..<24
+            val a = edge32(&r)
+            val l = r.next() >> u32(r.next() % 64)
+            val n = i32(r.next() % 65) - 32
+            val args, w0, w1, both = float_entry(i, a, partner32(&r, a), l, n)
+            val got = pico_call4(b, rom_word_rp2040(sf + 4 * i), args)
+            assert(got.0 == w0 && (!both || got.1 == w1), s"SF entry 0x${hex(4 * i)} (0x${hex(args.0)}, 0x${hex(args.1)}, 0x${hex(args.2)}): 0x${hex(got.0)} 0x${hex(got.1)}, the host build 0x${hex(w0)} 0x${hex(w1)}")
+            val x = edge64(&r)
+            val dargs, want, count = double_entry(i, x, partner64(&r, x), l, n)
+            val dgot = pico_call4(b, rom_word_rp2040(sd + 4 * i), dargs)
+            val same = dgot.0 == want.0 && (count < 2 || dgot.1 == want.1) && (count < 4 || (dgot.2 == want.2 && dgot.3 == want.3))
+            assert(same, s"SD entry 0x${hex(4 * i)} (0x${hex(dargs.0)}, 0x${hex(dargs.1)}, 0x${hex(dargs.2)}, 0x${hex(dargs.3)}): 0x${hex(dgot.0)} 0x${hex(dgot.1)} 0x${hex(dgot.2)} 0x${hex(dgot.3)}, the host build 0x${hex(want.0)} 0x${hex(want.1)} 0x${hex(want.2)} 0x${hex(want.3)}")
+            calls += 2
+    assert(calls == 31 * 48)
+
+@test("the soft float and double tables' comparison that answers in the flags, which no function's result can, is refused by name when called")
+pico_rom_flags_entry()
+    for (table, says) in [("SF", "soft float table entry at 0x14"), ("SD", "soft double table entry at 0x14")]
+        val b = pico_board(PICO_SRAM)
+        b.boot(PICO_BLINK).unwrap()
+        b.run(PICO_MS)
+        val at = rom_find(rom_word_rp2040(0x14) >> 16, table.bytes[0], table.bytes[1])
+        pico_place(b, 0x20040100, [0x47A0, 0xBF30, 0xE7FD])
+        b.cores[0].r[4] = rom_word_rp2040(at + 0x14)
+        b.cores[0].r[13] = 0x20042000
+        val end = b.run(PICO_MS)
+        assert(end == RunEnd.Fault && b.refused.contains(says), s"$table: ${end} '${b.refused}'")
+
+@test("a program that looks ROM functions up by code, and the SDK's own float and double through them, prints what the host computes")
+pico_rom_funcs()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_ROM_FUNCS).unwrap()
+    while b.chip.now < 400 * PICO_MS && !from_utf8_lossy(b.console.view()).contains("done\r\n")
+        val end = b.run(PICO_MS)
+        assert(end == RunEnd.Budget, s"${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+    var want = s"rom version 3\r\npopcount32 at ${hex(rom_find(rom_word_rp2040(0x14) & 0xFFFF, u8('P'), u8('3')), 8)}\r\n"
+    for x in [0xF0F01234u32, 0x00012340, 0x12345678, 0, 0xFFFFFFFF]
+        want = s"$want${hex(x, 8)}: popcount ${x.count_ones()} clz ${x.leading_zeros()} ctz ${x.trailing_zeros()} reverse ${hex(x.reverse_bits(), 8)}\r\n"
+    want = s"${want}fdiv(1, 3) = ${hex((1.0f32 / 3.0f32).bits(), 8)}\r\nfsqrt(2) = ${hex(2.0f32.sqrt().bits(), 8)}\r\n"
+    want = s"${want}fadd(0.1, 0.2) = ${hex((0.1f32 + 0.2f32).bits(), 8)}\r\nfmul(0.1, 3) = ${hex((0.1f32 * 3.0f32).bits(), 8)}\r\n"
+    want = s"${want}ddiv(1, 3) = ${hex((1.0 / 3.0).bits(), 16)}\r\ndsqrt(2) = ${hex(2.0.sqrt().bits(), 16)}\r\ndmul(0.1, 3) = ${hex((0.1 * 3.0).bits(), 16)}\r\n"
+    want = s"${want}mem a5 a5 a5 11 22 33 44 55 66 77 88 99 a5 a5 a5 a5\r\n"
+    want = s"${want}sdk ${hex((1.0f32 / 3.0f32).bits(), 8)}\r\nsdk = ${hex((2.0 / 3.0).bits(), 16)}\r\ndone\r\n"
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == want, s"got:\n$text\nwant:\n$want")
+
+@test("the ROM's connect_internal_flash, flash_exit_xip and flash_flush_cache run as its own code through IO_QSPI, PADS_QSPI, the SSI and XIP_CTRL, and leave the flash deselected")
+pico_rom_flash_functions()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    b.run(PICO_MS)
+    val funcs = rom_word_rp2040(0x14) & 0xFFFF
+    val connect = pico_lookup(b, funcs, u8('I'), u8('F'))
+    val exit = pico_lookup(b, funcs, u8('E'), u8('X'))
+    val flush = pico_lookup(b, funcs, u8('F'), u8('C'))
+    assert(connect == rom_find(funcs, u8('I'), u8('F')) && exit == rom_find(funcs, u8('E'), u8('X')) && flush == rom_find(funcs, u8('F'), u8('C')), s"0x${hex(connect)} 0x${hex(exit)} 0x${hex(flush)}")
+    for f in [connect, exit, flush] do pico_call(b, f, 0, 0)
+    assert(!b.chip.flash.selected && !b.chip.xip_ready(), "the SSI left in direct mode, chip select high")
+
+@test("reset_usb_boot runs as the ROM's code up to its watchdog reboot, and the reset into the ROM's USB boot is refused by name")
+pico_reset_usb_boot()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    b.run(PICO_MS)
+    val usb = pico_lookup(b, rom_word_rp2040(0x14) & 0xFFFF, u8('U'), u8('B'))
+    assert(usb == rom_find(rom_word_rp2040(0x14) & 0xFFFF, u8('U'), u8('B')), s"0x${hex(usb)}")
+    pico_place(b, 0x20040100, [0x47A0, 0xBF30, 0xE7FD])
+    val c = &b.cores[0]
+    c.r[0] = 0
+    c.r[1] = 0
+    c.r[4] = usb
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 100 * PICO_MS do end = b.run(PICO_MS)
+    assert(end == RunEnd.Fault && b.refused.contains("USB boot") && b.refused.contains("reset_usb_boot"), s"${end} '${b.refused}'")
+    // The ROM's reboot left its boot vector as the SDK's watchdog_reboot does: the magic, PC XOR
+    // −magic, the stack (core 0's, 0x20041F00) and the USB boot's PC.
+    val s4 = b.chip.load(0, wd40.BASE + wd40.SCRATCH4_OFFSET, 4).unwrap()
+    val s5 = b.chip.load(0, wd40.BASE + wd40.SCRATCH5_OFFSET, 4).unwrap()
+    val s6 = b.chip.load(0, wd40.BASE + wd40.SCRATCH6_OFFSET, 4).unwrap()
+    val s7 = b.chip.load(0, wd40.BASE + wd40.SCRATCH7_OFFSET, 4).unwrap()
+    assert(s4 == 0xB007C0D3 && s5 == s7 ^ (0 -% 0xB007C0D3u32) && s6 == 0x20041F00 && s7 == ROM_USB_BOOT_RP2040, s"0x${hex(s4)} 0x${hex(s6)} 0x${hex(s7)}")
+
+@test("the Pico's bus refuses by name what is not on the chip yet: SYSCFG, PIO, DMA, USB, and an empty address")
+pico_absent_blocks()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    for (a, what) in [(0x40004008u32, "SYSCFG"), (0x50200000, "PIO0"), (0x50000000, "DMA"),
+            (0x50110000, "USBCTRL"), (0x40070000, "not on the RP2040's bus")]
+        val r = b.chip.load(0, a, 4)
+        assert(r.is_err() && r.unwrap_err().contains(what), s"0x${hex(a)}: ${r}")
+    val w = b.chip.store(0, 0x40004008, 4, 0)
+    assert(w.is_err() && w.unwrap_err().contains("SYSCFG"))
+    // SYSCFG's two NMI masks are stored, for a program that sets them; nothing raises an NMI.
+    b.chip.store(0, 0x40004000, 4, 0x3FFFFFF).unwrap()
+    b.chip.store(0, 0x40004004, 4, 0xFFFFFFFF).unwrap()
+    assert(b.chip.load(0, 0x40004000, 4).unwrap() == 0x3FFFFFF && b.chip.load(0, 0x40004004, 4).unwrap() == 0x3FFFFFF)
+    // USB's DPRAM is memory, where the boot ROM's core 1 waits on its stack (its top 256 bytes): words,
+    // halfwords and bytes.
+    b.chip.store(0, 0x50100EB0, 4, 0x11223344).unwrap()
+    b.chip.store(0, 0x50100EB4, 1, 0x1FF).unwrap()
+    b.chip.store(0, 0x50100EB2, 2, 0xBEEF).unwrap()
+    assert(b.chip.load(0, 0x50100EB0, 4).unwrap() == 0xBEEF3344 && b.chip.load(0, 0x50100EB4, 4).unwrap() == 0xFF)
+    assert(b.chip.load(0, 0x50100EB3, 1).unwrap() == 0xBE && b.chip.load(0, 0x50100E00, 4).unwrap() == 0)
+    val odd = b.chip.load(0, 0x50100EB1, 2)
+    assert(odd.is_err() && odd.unwrap_err().contains("USBCTRL_DPRAM"))
+    // TBMAN's PLATFORM reads ASIC and drops a write; it has no other register.
+    b.chip.store(0, 0x4006C000, 4, 2).unwrap()
+    assert(b.chip.load(0, 0x4006C000, 4).unwrap() == 1)
+    val tb = b.chip.load(0, 0x4006C004, 4)
+    assert(tb.is_err() && tb.unwrap_err().contains("TBMAN"))
+
+@test("the RP2040's watchdog: TRIGGER ends the run with the reset named, since its reset runs the boot ROM's boot path")
+pico_watchdog_trigger()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    b.run(PICO_MS)
+    // PSM.WDSEL is 0, as blink leaves it: the watchdog's reset takes no stage down, and blink runs on.
+    b.chip.store(0, wd40.BASE + wd40.CTRL_OFFSET + 0x2000, 4, wd40.CTRL_TRIGGER_MASK).unwrap()
+    val before = b.chip.pin(25).level
+    for i in 0..<300 do assert(b.run(PICO_MS) == RunEnd.Budget, b.refused)
+    assert(b.chip.load(0, wd40.BASE + wd40.REASON_OFFSET, 4).unwrap() == wd40.REASON_FORCE_MASK, "REASON")
+    assert(b.cores[0].pc >= 0x20000000 && b.chip.pin(25).level != before, "blink toggled on")
+
+@test("the RP2040's watchdog reset takes down the stages PSM.WDSEL selects, 1 ms on with its counter counting each tick twice (RP2040-E1); both cores start again in the boot ROM, whose boot path finds no boot2 in an empty flash and enters USB boot, refused by name")
+pico_watchdog_counter()
+    val b = pico_ran(PICO_BLINK, 1)
+    // Every stage but ROSC and XOSC, as the SDK's watchdog_enable selects; LOAD 2000 at 1 µs a tick,
+    // decremented twice a tick: it fires 1 ms on.
+    b.chip.store(0, 0x40010000 + 8, 4, 0x1FFFC).unwrap()
+    b.chip.store(0, wd40.BASE + wd40.LOAD_OFFSET, 4, 2000).unwrap()
+    b.chip.store(0, wd40.BASE + 0x2000 + wd40.CTRL_OFFSET, 4, wd40.CTRL_ENABLE_MASK).unwrap()
+    b.chip.store(0, wd40.BASE + wd40.SCRATCH0_OFFSET, 4, 0x5CA7).unwrap()
+    val from = b.chip.now
+    var end = RunEnd.Budget
+    var restarted: u64 = 0
+    while end == RunEnd.Budget && b.chip.now < from + 200 * PICO_MS
+        end = b.run(PICO_TENTH_MS)
+        if restarted == 0 && b.cores[0].pc < ROM_BYTES_RP2040 then restarted = b.chip.now
+    val took = restarted - from
+    assert(restarted != 0 && took >= PICO_MS - PICO_TENTH_MS && took <= PICO_MS + 2 * PICO_TENTH_MS, s"core 0 back in the ROM ${took} cycles on")
+    assert(end == RunEnd.Fault && b.refused.contains("USB"), s"${end}: ${b.refused}")
+    // The watchdog's own registers survive: REASON says its counter, SCRATCH0 is as written.
+    assert(b.chip.load(0, wd40.BASE + wd40.REASON_OFFSET, 4).unwrap() == wd40.REASON_TIMER_MASK)
+    assert(b.chip.load(0, wd40.BASE + wd40.SCRATCH0_OFFSET, 4).unwrap() == 0x5CA7)
+
+@test("pico-examples' hello_watchdog from flash: a clean boot, the watchdog's reset through the boot ROM's boot path (boot2's CRC, boot2, the image), and the second boot reports it")
+pico_hello_watchdog()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_HELLO_WATCHDOG).unwrap()
+    assert(b.cores[0].pc < ROM_BYTES_RP2040, s"core 0 starts in the ROM: 0x${hex(b.cores[0].pc, 8)}")
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 400 * PICO_MS do end = b.run(PICO_MS)
+    assert(end == RunEnd.Breakpoint, s"main returns on the second boot, at the SDK's exit BKPT: ${end} ${b.refused}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    var want = "Clean boot\r\n"
+    for i in 0..<5 do want = s"${want}Updating watchdog $i\r\n"
+    want = s"${want}Waiting to be rebooted by watchdog\r\nRebooted by Watchdog!\r\n"
+    assert(text == want, text)
+    assert(b.chip.load(0, wd40.BASE + wd40.REASON_OFFSET, 4).unwrap() == wd40.REASON_TIMER_MASK)
+
+@test("pico-examples' hello_world/serial built for the Pico as a flash image: the boot ROM checks boot2's CRC, runs it, and boot2 enters the image through XIP")
+pico_hello_world_flash()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_HELLO_WORLD).unwrap()
+    assert(b.cores[0].pc < ROM_BYTES_RP2040 && b.cores[1].pc < ROM_BYTES_RP2040, "both cores start in the ROM")
+    while b.chip.now < 2100 * PICO_MS
+        val end = b.run(PICO_MS)
+        assert(end == RunEnd.Budget, s"${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}")
+    val text = from_utf8_lossy(b.console.view())
+    assert(text == "Hello, world!\r\nHello, world!\r\nHello, world!\r\n", text)
+    assert(b.chip.xip_ready(), "boot2 left XIP reading the flash")
+    assert(pico_waits_in_rom(b, 1), s"core 1 at 0x${hex(b.cores[1].pc, 8)}")
+    // A flash image with boot2's CRC broken is not run: the ROM enters USB boot, refused by name.
+    val bad = pico_board(PICO_SRAM)
+    bad.boot(PICO_HELLO_WORLD).unwrap()
+    bad.mem.flash[0x10] ^= 0xFF
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && bad.chip.now < 200 * PICO_MS do end = bad.run(PICO_MS)
+    assert(end == RunEnd.Fault && bad.refused.contains("no valid boot2") && bad.console.len() == 0, s"${end}: ${bad.refused}")
+
+@test("pico-examples' flash/program from flash: the boot ROM's flash_range_erase and flash_range_program through the SSI, and the page read back through XIP")
+pico_flash_program()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_FLASH_PROGRAM).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 1000 * PICO_MS do end = b.run(PICO_MS)
+    assert(end == RunEnd.Breakpoint, s"main returns at the SDK's exit BKPT: ${end} ${b.refused}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    // The page as the flash holds it, 256 KB in, printed as the program prints it: 16 lines of 16 bytes.
+    // The program printed the same page before it was written, and read it back after.
+    val at = 256 * 1024
+    var written = ""
+    var erased = ""
+    for row in 0..<16
+        var line = ""
+        for i in 0..<16 do line = s"$line${if i == 0 then "" else " "}${hex(b.mem.flash[at + 16 * row + i], 2)}"
+        written = s"$written$line\r\n"
+        erased = s"${erased}ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff\r\n"
+    assert(written != erased, "the page is the program's data, not erased flash")
+    val want = s"Generated random data:\r\n$written\r\nErasing target region...\r\nDone. Read back target region:\r\n$erased\r\nProgramming target region...\r\nDone. Read back target region:\r\n${written}Programming successful!\r\n"
+    assert(text == want, s"got:\n$text\nwant:\n$want")
+    assert(b.mem.flash[at + 256] == 0xFF && b.mem.flash[at + 4095] == 0xFF, "the rest of the sector erased")
+
+@test("pico is an RP2040 board on its Cortex-M0+s with the chip's 264 KB of SRAM; the RP2350 boards are not")
+pico_plans()
+    val m = pico_named("pico").unwrap().unwrap()
+    assert(m.base == 0x20000000 && m.size == 264 * 1024)
+    assert(pico_named("pico2").is_none() && pico_named("pico2-riscv").is_none() && arm_named("pico").is_none() && riscv_named("pico").is_none())
+    val text = "board { name = b, mcu = rp2040 }"
+    val got = load(source_of("b.hocon", text), library())
+    assert(!got.report.has_errors(), got.report.render(source_of("b.hocon", text)))
+    assert(pico_plan(got.description.board).is_ok())
+
+@test("the Pico's SRAM: the non-striped alias of bank b at 0x2100_0000 reads and writes word 4w + b of the striped view, off the fast path")
+pico_sram_alias()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_BLINK).unwrap()
+    pico_park(b)
+    b.run(PICO_MS)
+    // Word 5 of bank 2 is striped word 22, at 0x20000058.
+    b.mem.ram[0x58] = 0x78
+    b.mem.ram[0x59] = 0x56
+    b.mem.ram[0x5A] = 0x34
+    b.mem.ram[0x5B] = 0x12
+    // From core 0, through the board's bus: ldr r1, [r0]; str r2, [r0, #4]; wfi; b .
+    pico_place(b, 0x20040200, [0x6801, 0x6042, 0xBF30, 0xE7FD])
+    val c = &b.cores[0]
+    c.r[0] = 0x21020014
+    c.r[2] = 0xCAFEF00D
+    b.run(PICO_MS)
+    assert(c.r[1] == 0x12345678, s"r1 0x${hex(c.r[1], 8)}")
+    // Word 6 of bank 2 is striped word 26, at 0x20000068.
+    assert(b.mem.ram[0x68] == 0x0D && b.mem.ram[0x6B] == 0xCA, "the store landed at the striped address")
+
+@test("the ROM cross-check firmware from flash: every soft float and double entry and the bit and memory functions of the ROM against the same routines compiled into the firmware, with no mismatch, and the CRC of the firmware's own answers a real Pico must print too")
+pico_rom_crosscheck()
+    val b = pico_board(PICO_SRAM)
+    b.boot(PICO_ROM_CROSSCHECK).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 60000 * PICO_MS do end = b.run(10 * PICO_MS)
+    assert(end == RunEnd.Breakpoint, s"main returns at the SDK's exit BKPT: ${end} ${b.refused}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    assert(text.contains(PICO_CROSSCHECK_LINE), s"got:\n$text")
+    assert(!text.contains("  "), s"a mismatch:\n$text")
+
+@test("the Pico SDK's own float and double tests (pico_float_test, pico_double_test, custom_float_funcs_test, custom_double_funcs_test), flash images on the SDK's default implementation, which is the boot ROM's, print PASSED")
+pico_sdk_float_tests()
+    for (name, image) in PICO_SDK_FLOAT_TESTS
+        val b = pico_board(PICO_SRAM)
+        b.boot(image).unwrap()
+        var end = RunEnd.Budget
+        while end == RunEnd.Budget && b.chip.now < 60000 * PICO_MS && !from_utf8_lossy(b.console.view()).contains("PASSED") && !from_utf8_lossy(b.console.view()).contains("FAILED")
+            end = b.run(10 * PICO_MS)
+        b.finish_sending()
+        val text = from_utf8_lossy(b.console.view())
+        assert(text.contains("PASSED\r\n") && !text.contains("FAILED"), s"$name: ${end} ${b.refused}\n$text")

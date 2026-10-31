@@ -1,0 +1,162 @@
+module sh.sysl.rp2040rom.oracle
+
+import sh.sysl.rp2040rom as rom
+
+// What the ROM's float and double routines must answer, from the host's IEEE arithmetic and libm,
+// and the inputs to ask them: the oracle that benchtop's tests (`chip/rom40_float_tests.sysl`) and
+// the sweep (`examples/sweep`) check the ROM's own routines against. Nothing here runs on the
+// Cortex-M0+; it is host code.
+//
+// **The ROM's documented difference from IEEE** is the denormal flush (`round.sysl`): a denormal input
+// reads as a zero of its sign, and a denormal result is delivered as one. So each oracle flushes the
+// host's inputs and its result. The other choices the ROM documents, which IEEE leaves to the
+// implementation or does not cover:
+// - a conversion to an integer rounds toward −∞ and saturates; ∞ saturates by its sign, and so does a
+//   NaN (to the largest value with the sign bit clear, the smallest with it set), and a negative value
+//   converted to an unsigned integer is 0;
+// - the scientific functions take |x| < 2048 for sine, cosine and tangent, answering NaN beyond;
+// - a NaN result's payload is not compared: the ROM quiets a NaN operand and answers the default NaN
+//   for an invalid operation, and the host may pick another NaN.
+
+/** A xorshift64 generator: the same sequence for the same seed. */
+struct Rng
+    s: u64
+
+    next(*self) -> u64
+        var x = self.s
+        x ^= x << 13
+        x ^= x >> 7
+        x ^= x << 17
+        self.s = x
+        x
+end Rng
+
+// Binary32 values on the edges.
+private val EDGE32: [16]u32 = [0, 1, 0x7FFFFF, 0x800000, 0x7F7FFFFF, 0x7F800000, 0x7FC00000, 0x7F800001,
+    0x3F800000, 0x3F7FFFFF, 0x3F800001, 0x4B000000, 0x4F000000, 0x5F000000, 0x4EFFFFFF, 0x00800001]
+
+/** A binary32 biased toward the edges: zeros, denormals, the extreme normals, infinities, NaNs,
+ * significands of all ones or of one bit, exponents near 1.0, and plain random words.
+ */
+edge32(r: *Rng) -> u32
+    val v = r.next()
+    val sign = u32(v >> 63) << 31
+    val mant = u32.wrap(v >> 8) & 0x7FFFFF
+    val e = u32.wrap(v >> 40) & 0xFF
+    (v & 15) match
+        0 -> sign | EDGE32[usize((v >> 4) & 15)]
+        1 -> sign | (((e & 3) + 1) << 23) | mant
+        2 -> sign | ((251 + (e & 3)) << 23) | mant
+        3 -> sign | mant
+        4 -> sign | (e << 23) | (if v & 0x100000 != 0 then 0x7FFFFF else 0)
+        5 -> sign | (e << 23) | (1u32 << u32((v >> 24) % 23))
+        6 -> sign | ((120 + (e & 15)) << 23) | mant
+        _ -> u32.wrap(v)
+
+/** A second operand for `a`: independent, a few units in the last place away, its negation nearby so
+ * that the two cancel, or 24 or 25 binades below with a significand that puts a sum on a tie.
+ */
+partner32(r: *Rng, a: u32) -> u32
+    val v = r.next()
+    (v & 7) match
+        0 -> a +% u32((v >> 8) & 3)
+        1 -> (a ^ 0x80000000) +% u32((v >> 8) & 3)
+        2 -> (a ^ (u32.wrap(v >> 32) & 0x80000000)) -% u32((v >> 8) & 3)
+        3 ->
+            val e = (a >> 23) & 0xFF
+            if e < 26 then edge32(r) else (a & 0x80000000) | ((e - 24 - u32((v >> 8) & 1)) << 23) | (if v & 0x200 != 0 then 0x400000 else 0)
+        _ -> edge32(r)
+
+// Binary64 values on the edges.
+private val EDGE64: [16]u64 = [0, 1, 0xFFFFFFFFFFFFF, 0x10000000000000, 0x7FEFFFFFFFFFFFFF, 0x7FF0000000000000,
+    0x7FF8000000000000, 0x7FF0000000000001, 0x3FF0000000000000, 0x3FEFFFFFFFFFFFFF, 0x3FF0000000000001,
+    0x41E0000000000000, 0x43E0000000000000, 0x4330000000000000, 0x41EFFFFFFFE00000, 0x10000000000001]
+
+/** A binary64 biased toward the edges, as `edge32`. */
+edge64(r: *Rng) -> u64
+    val v = r.next()
+    val w = r.next()
+    val sign = (v >> 63) << 63
+    val mant = w & 0xFFFFFFFFFFFFF
+    val e = (v >> 40) & 0x7FF
+    (v & 15) match
+        0 -> sign | EDGE64[usize((v >> 4) & 15)]
+        1 -> sign | (((e & 3) + 1) << 52) | mant
+        2 -> sign | ((2043 + (e & 3)) << 52) | mant
+        3 -> sign | mant
+        4 -> sign | (e << 52) | (if v & 0x100000 != 0 then 0xFFFFFFFFFFFFF else 0)
+        5 -> sign | (e << 52) | (1u64 << ((v >> 24) % 52))
+        6 -> sign | ((1016 + (e & 15)) << 52) | mant
+        _ -> w
+
+/** A second binary64 operand for `a`, as `partner32`. */
+partner64(r: *Rng, a: u64) -> u64
+    val v = r.next()
+    (v & 7) match
+        0 -> a +% ((v >> 8) & 3)
+        1 -> (a ^ 0x8000000000000000) +% ((v >> 8) & 3)
+        2 -> (a ^ (v & 0x8000000000000000)) -% ((v >> 8) & 3)
+        3 ->
+            val e = (a >> 52) & 0x7FF
+            if e < 56 then edge64(r) else (a & 0x8000000000000000) | ((e - 53 - ((v >> 8) & 1)) << 52) | (if v & 0x200 != 0 then 0x8000000000000 else 0)
+        _ -> edge64(r)
+
+/** The host's binary32 for a ROM input: a denormal read as zero. */
+in32(x: u32) -> f32 = f32.from_bits(rom.flush32(x))
+/** The ROM's answer for a host result: a denormal delivered as zero. */
+out32(x: f32) -> u32 = rom.flush32(x.bits())
+/** The binary64 equivalents. */
+in64(x: u64) -> f64 = f64.from_bits(rom.flush64(x))
+out64(x: f64) -> u64 = rom.flush64(x.bits())
+
+/** Whether `got` is `want`: equal bits, or both NaN. */
+same32(got: u32, want: u32) -> bool = if rom.is_nan32(want) then rom.is_nan32(got) else got == want
+/** The binary64 equivalent. */
+same64(got: u64, want: u64) -> bool = if rom.is_nan64(want) then rom.is_nan64(got) else got == want
+
+// A float's bits on a line that counts units in the last place: adjacent floats are adjacent integers.
+private ordered32(x: u32) -> i64 = if x >> 31 != 0 then -i64(x & 0x7FFFFFFF) else i64(x)
+private ordered64(x: u64) -> i128 = if x >> 63 != 0 then -i128(x & 0x7FFFFFFFFFFFFFFF) else i128(x)
+
+/** How many units in the last place `got` lies from `want`; 0 for two NaNs, and huge for one. */
+ulps32(got: u32, want: u32) -> u64
+    if rom.is_nan32(want) || rom.is_nan32(got) then return if rom.is_nan32(want) && rom.is_nan32(got) then 0 else 0xFFFFFFFF
+    val d = ordered32(got) - ordered32(want)
+    u64(if d < 0 then -d else d)
+
+/** The binary64 equivalent. */
+ulps64(got: u64, want: u64) -> u64
+    if rom.is_nan64(want) || rom.is_nan64(got) then return if rom.is_nan64(want) && rom.is_nan64(got) then 0 else 0xFFFFFFFFFFFFFFFF
+    val d = ordered64(got) - ordered64(want)
+    val m = if d < 0 then -d else d
+    if m > 0xFFFFFFFFFFFF then 0xFFFFFFFFFFFF else u64(m)
+
+/** 2^n as a binary64, for −1022 ≤ n ≤ 1023. */
+pow2(n: i32) -> f64 = f64.from_bits(u64(n + 1023) << 52)
+
+/** What the ROM's conversion of the host value `v` to an integer answers: toward −∞, saturated to the
+ * signed or unsigned range of `bits` bits; a NaN saturates by `neg`, its sign bit.
+ */
+want_fixed(v: f64, neg: bool, signed: bool, bits: u32) -> u64
+    val all: u64 = if bits == 64 then 0xFFFFFFFFFFFFFFFF else (1u64 << bits) - 1
+    val max_pos: u64 = if signed then all >> 1 else all
+    val min_bits: u64 = if signed then 1u64 << (bits - 1) else 0
+    if v != v then return if neg then min_bits else max_pos
+    val t = v.floor()
+    if signed
+        val top = pow2(i32(bits) - 1)
+        if t >= top then return max_pos
+        if t < -top then return min_bits
+        return u64.wrap(i64(t)) & all
+    if t < 0.0 then return 0
+    if t >= pow2(i32(bits)) then return max_pos
+    u64(t)
+end want_fixed
+
+/** The ROM's `float2fix` family's answer for `x × 2^n`, |n| ≤ 64 (the product is exact on the host). */
+want_float2fixed(x: u32, n: i32, signed: bool, bits: u32) -> u64 = want_fixed(f64(in32(x)) * pow2(n), x >> 31 != 0, signed, bits)
+
+/** The ROM's `double2fix` family's answer for `x × 2^n`, |n| ≤ 50: the product of the smallest
+ * normal and 2^−50 is still a nonzero denormal on the host, so its floor is right.
+ */
+want_double2fixed(x: u64, n: i32, signed: bool, bits: u32) -> u64 = want_fixed(in64(x) * pow2(n), x >> 63 != 0, signed, bits)

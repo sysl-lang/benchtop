@@ -47,6 +47,21 @@ bank's levels the board holds its pins at; the I²C controller's devices. A call
 the core whose thread runs the device (the SDMMC's RAM) reads it from the device, which records it
 under the device's lock before the model runs.
 
+### Who owns a model
+
+**Every model is a value, held in exactly one place, and reached through a `*T`.** No model has a
+`Drop`, so none is a reference type: the board keeps each one inside the state its lock guards (a
+`Mutex[dsi.Host]`, the DMA controllers in `AudioLive`, the I²C parts in `I2cParts`, the panels in
+`DisplayState`), and its functions take `*T`. A device whose callbacks must reach a model does not
+capture it: it is a `ContextModel[C]` whose callbacks take a `*C` the board lends for the call, the
+way the I²C controller lends `I2cParts` to the device a transfer addresses. So a model is never
+reached under two locks.
+
+**The one exception is state held in an `Option`**, which is an `Option[&T]`: sysl copies a pattern
+binding, so a payload can be changed in place only through a reference (`reference/patterns.md`,
+"Changing state held in an Option"). The SD card on the SDMMC host is that case
+(`sdmmc.Wiring.card: Option[&sd_card.Native]`).
+
 The RP2040 and RP2350 models (`peripheral/rp2040`, `peripheral/rp2350`) keep a shape of their own,
 which `chip.Rp2350` and `virt.rp` drive: an `AccessError` that says why an access failed, and clocks
 advanced in cycles of their own domain.

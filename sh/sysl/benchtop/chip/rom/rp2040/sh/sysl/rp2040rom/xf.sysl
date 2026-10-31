@@ -1,0 +1,104 @@
+module sh.sysl.rp2040rom
+
+import sysl.math.clamp
+
+// An extended float for the scientific functions: a sign, an unbounded exponent and a 64-bit
+// significand, `m × 2^(e − 63)` with bit 63 of `m` set (or `m` 0 for zero). Each operation truncates
+// to 64 bits, an error below 2^−63 of its result, so a function computed in a few dozen of them is
+// good to well under a unit in the last place of a double before its one final rounding
+// (`Xf.to64`, `Xf.to32`).
+
+/** An extended float. */
+struct Xf
+    neg: bool
+    e: i32
+    m: u64
+
+    /** The value negated. */
+    negated(self) -> Xf = Xf(!self.neg, self.e, self.m)
+
+    /** The value times 2^k. */
+    scaled(self, k: i32) -> Xf = Xf(self.neg, self.e + k, self.m)
+
+    /** Whether this is zero. */
+    is_zero(self) -> bool = self.m == 0
+
+    /** The binary64 nearest to the value, which is taken to be inexact unless it is zero: a scientific
+     * function's result is irrational wherever this is used, so it never lies on a rounding tie.
+     */
+    to64(self) -> u64
+        if self.m == 0 then return if self.neg then 0x8000000000000000 else 0
+        pack64(self.neg, clamp(self.e + 1023, -4096, 4096), self.m | 1)
+
+    /** The binary32 nearest to the value, taken to be inexact. */
+    to32(self) -> u32
+        if self.m == 0 then return if self.neg then 0x80000000 else 0
+        pack32(self.neg, clamp(self.e + 127, -4096, 4096), u32(self.m >> 32) | 1)
+end Xf
+
+/** Zero. */
+val XF_ZERO = Xf(false, 0, 0)
+/** One. */
+val XF_ONE = Xf(false, 0, 0x8000000000000000)
+
+/** A finite, normal binary64 as an extended float, exactly. */
+xf_of64(x: u64) -> Xf
+    val e = i32((x >> 52) & 0x7FF)
+    if e == 0 then return Xf(x >> 63 != 0, 0, 0)
+    Xf(x >> 63 != 0, e - 1023, (((x & 0xFFFFFFFFFFFFF) | 0x10000000000000) << 11))
+
+/** A 128-bit magnitude scaled by 2^−scale, rounded toward zero to an extended float. */
+xf_of128(neg: bool, v: u128, scale: i32) -> Xf
+    if v == 0 then return Xf(neg, 0, 0)
+    val n = v.leading_zeros()
+    Xf(neg, 127 - i32(n) - scale, u64((v << n) >> 64))
+
+/** An integer as an extended float. */
+xf_of_int(v: i64) -> Xf
+    val mag = if v < 0 then 0 -% u64.wrap(v) else u64(v)
+    xf_of128(v < 0, u128(mag), 0)
+
+/** `a × b`. */
+xmul(a: Xf, b: Xf) -> Xf
+    if a.m == 0 || b.m == 0 then return Xf(a.neg != b.neg, 0, 0)
+    val p = mul128(a.m, b.m)
+    if p >> 127 != 0 then return Xf(a.neg != b.neg, a.e + b.e + 1, u64(p >> 64))
+    Xf(a.neg != b.neg, a.e + b.e, u64(p >> 63))
+
+/** `a + b`, aligned and cancelled in 128 bits so that a difference of near neighbours keeps its
+ * significant bits.
+ */
+xadd(a: Xf, b: Xf) -> Xf
+    if b.m == 0 then return a
+    if a.m == 0 then return b
+    val swap = b.e > a.e || (b.e == a.e && b.m > a.m)
+    val x = if swap then b else a
+    val y = if swap then a else b
+    val d = x.e - y.e
+    if d >= 127 then return x
+    val wx = u128(x.m) << 63
+    val wy = (u128(y.m) << 63) >> u32(d)
+    if x.neg == y.neg
+        val s = wx + wy
+        return xf_of128(x.neg, s, 126 - x.e)
+    xf_of128(x.neg, wx - wy, 126 - x.e)
+
+/** `a − b`. */
+xsub(a: Xf, b: Xf) -> Xf = xadd(a, b.negated())
+
+/** `a / b`, by restoring division to 64 quotient bits. */
+xdiv(a: Xf, b: Xf) -> Xf
+    if a.m == 0 then return Xf(a.neg != b.neg, 0, 0)
+    // A significand below the divisor's is doubled, into a 65th bit.
+    val below = a.m < b.m
+    val q, rest = divide(if below then a.m << 1 else a.m, below, b.m, 64)
+    Xf(a.neg != b.neg, a.e - b.e - (if below then 1 else 0), q)
+
+/** `Σ c[i] × z^i`, by Horner's rule from the last coefficient. */
+xpoly(z: Xf, c: []const Xf) -> Xf
+    var acc = c[c.len - 1]
+    var i = c.len - 1
+    while i > 0
+        i -= 1
+        acc = xadd(xmul(acc, z), c[i])
+    acc

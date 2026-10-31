@@ -2,7 +2,8 @@ module sh.sysl.benchtop.virt
 
 import sh.sysl.benchtop.{mcu_clock_hz, Board, part_model, part_whole, part_text}
 import sh.sysl.benchtop.parts.ds3231 as rtc
-import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.parts.wm8994 as wm
+import sh.sysl.benchtop.peripheral.ContextModel
 import sh.sysl.benchtop.peripheral.i2c as i2c
 import sh.sysl.benchtop.v6m.{Cpu, Stop, halt}
 import sysl.buf.{Buf, buf}
@@ -11,7 +12,7 @@ import sysl.math.max
 
 struct RtcBinding
     name: string
-    model: &rtc.Rtc
+    model: rtc.Rtc
 
 /** The I2C bus: whether its controller is the STM32's (`stm32-i2c`) rather than `virt-i2c`, and
  * whether a real-time clock is on it, which the board fixes; and the bus itself, which the cores and
@@ -22,20 +23,32 @@ struct I2c
     has_rtcs: bool
     live: Mutex[I2cState]
 
-/** The I2C controller and the parts on its bus: real-time clocks and touch controllers. The codec on
- * the bus is a device of its own (codec.sysl). `v2_regs`, `v2_status` and `v2_left` are the STM32
- * controller's registers (i2c_v2.sysl).
+/** The parts on the I2C bus, each model held here and nowhere else: real-time clocks, touch
+ * controllers and the WM8994 codec (codec.sysl), which is here whether or not the board fits one. The
+ * controller lends them to the device a transfer addresses, so every part is reached under the bus's
+ * one lock.
  */
-struct I2cState
-    controller: i2c.Controller
+struct I2cParts
     rtcs: Buf[RtcBinding]
     touches: Buf[TouchBinding]
     focals: Buf[FocalBinding]
+    codec: wm.Codec
+
+/** A device on the bus, answering from the parts. */
+type I2cDevice = i2c.Device[I2cParts]
+
+/** The I2C controller and the parts on its bus. `v2_regs`, `v2_status` and `v2_left` are the STM32
+ * controller's registers (i2c_v2.sysl).
+ */
+struct I2cState
+    controller: i2c.Controller[I2cParts]
+    parts: I2cParts
     v2_regs: [8]u32
     v2_status: u32
     v2_left: u32
 
-private i2c_live() -> I2cState = I2cState(i2c.controller(buf()), buf(), buf(), buf(), [0;8], 1, 0)
+private i2c_live() -> I2cState =
+    I2cState(i2c.controller(buf()), I2cParts(buf(), buf(), buf(), wm.codec()), [0;8], 1, 0)
 
 /** No part on the I2C bus. */
 i2c_state() -> I2c = I2c(false, false, Mutex.new(i2c_live()))
@@ -45,7 +58,7 @@ private[virt] check_i2c(b: Board) -> Result[(I2c, CodecState), string]
     var s = i2c_live()
     var stm32 = false
     for p in b.chip.peripherals do if p.kind == "stm32-i2c" then stm32 = true
-    var devices: Buf[i2c.Device] = buf()
+    var devices: Buf[I2cDevice] = buf()
     var hz: u64 = mcu_clock_hz(b.chip)
     for p in b.chip.peripherals
         if p.kind != "virt-i2c" then continue
@@ -55,29 +68,36 @@ private[virt] check_i2c(b: Board) -> Result[(I2c, CodecState), string]
     for p in b.parts
         if part_model(p) != "ds3231" then continue
         if !devices.is_empty() then return Err("two DS3231 parts share the fixed I2C address 0x68")
-        val model = rtc.rtc(hz, int(part_whole(p, "initial-year", 2026)), int(part_whole(p, "initial-month", 1)), int(part_whole(p, "initial-day", 1)), int(part_whole(p, "temperature-quarter-c", 100)))
-        if part_text(p,"initial-time","host") == "host" then seed_rtc_from_host(model)?
-        s.rtcs.push(RtcBinding(p.name, model))
-        devices.push(i2c.Device(0x68, (reading, time) -> rtc.start(model, reading, max(model.time, time)),
-            (byte, time) -> rtc.write(model, byte, max(model.time, time)), time -> rtc.read(model, max(model.time, time))))
+        var model = rtc.rtc(hz, int(part_whole(p, "initial-year", 2026)), int(part_whole(p, "initial-month", 1)), int(part_whole(p, "initial-day", 1)), int(part_whole(p, "temperature-quarter-c", 100)))
+        if part_text(p,"initial-time","host") == "host" then seed_rtc_from_host(&model)?
+        val i = s.parts.rtcs.len()
+        s.parts.rtcs.push(RtcBinding(p.name, model))
+        devices.push(i2c.Device(0x68, (parts, reading, time) -> rtc.start(rtc_at(parts, i), reading, max(rtc_at(parts, i).time, time)),
+            (parts, byte, time) -> rtc.write(rtc_at(parts, i), byte, max(rtc_at(parts, i).time, time)),
+            (parts, time) -> rtc.read(rtc_at(parts, i), max(rtc_at(parts, i).time, time))))
     check_touches(b, &s, &devices)?
-    val codec = check_codec(b, &devices)?
+    val codec = check_codec(b, &s, &devices)?
     s.controller = i2c.controller(devices)
-    Ok((I2c(stm32, !s.rtcs.is_empty(), Mutex.new(s)), codec))
+    Ok((I2c(stm32, !s.parts.rtcs.is_empty(), Mutex.new(s)), codec))
+
+// The `i`th real-time clock on the bus.
+private rtc_at(parts: *I2cParts, i: usize) -> *rtc.Rtc = &parts.rtcs[i].model
 
 // The bus and every part on it, the codec among them, as at power-on.
 private[virt] boot_i2c(ds: *Devices)
     ds.i2c.live.with(s ->
         s.controller.reset()
         boot_i2c_v2(s)
-        boot_touches(s)
-        for b in s.rtcs do rtc.rebase(b.model, 0))
-    boot_codecs(&ds.codec)
+        boot_touches(&s.parts)
+        for i in 0..<s.parts.rtcs.len() do rtc.rebase(rtc_at(&s.parts, i), 0))
+    boot_codecs(ds)
 
 private[virt] signal_rtcs(d: *I2c, cpu: *Cpu)
     if !d.has_rtcs then return
     d.live.with(s ->
-        for b in s.rtcs do rtc.advance(b.model, max(b.model.time, board_time(cpu, cpu.retired))))
+        for i in 0..<s.parts.rtcs.len()
+            val r = rtc_at(&s.parts, i)
+            rtc.advance(r, max(r.time, board_time(cpu, cpu.retired))))
 
 private[virt] i2c_read(d: *I2c, cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
     if d.stm32 then return d.live.with(s -> read_i2c_v2(s,cpu,address,offset,width,board_time(cpu,n)))
@@ -98,12 +118,12 @@ private[virt] i2c_write(d: *I2c, cpu: *Cpu, address: u32, offset: u32, width: u3
         halt(cpu, Stop.Fault, address)
         return
     d.live.with(s ->
-        if !s.controller.write(offset, width, value, board_time(cpu, n)) then halt(cpu, Stop.Unmapped, address))
+        if !s.controller.write(&s.parts, offset, width, value, board_time(cpu, n)) then halt(cpu, Stop.Unmapped, address))
 
 rtc_snapshot(m: *Machine, name: string) -> Option[[7]u8]
     m.devices.i2c.live.with(s ->
         var found: Option[[7]u8] = None
-        for b in s.rtcs
+        for b in s.parts.rtcs
             if b.name != name then continue
             var result: [7]u8 = [0; 7]
             for i in 0..<7 do result[i] = b.model.registers[i]

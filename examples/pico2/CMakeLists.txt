@@ -76,6 +76,17 @@ target_link_libraries(powman hardware_powman)
 # USB device mode: stdio over the SDK's TinyUSB CDC device as well as UART0.
 benchtop_program(usb_device usb_device.c no_flash)
 pico_enable_stdio_usb(usb_device 1)
+benchtop_program(usb_reconnect usb_reconnect.c no_flash)
+pico_enable_stdio_usb(usb_reconnect 1)
+
+# pico-examples' hello_world/usb as it builds there: a flash image, stdio over USB and not UART.
+benchtop_program(hello_usb hello_usb.c default)
+pico_enable_stdio_usb(hello_usb 1)
+pico_enable_stdio_uart(hello_usb 0)
+
+# pico-examples' usb/device/dev_lowlevel: the USB registers driven directly, stdio on UART0.
+benchtop_program(dev_lowlevel dev_lowlevel.c default)
+target_link_libraries(dev_lowlevel hardware_resets hardware_irq)
 
 # The whole program in the XIP cache's 16 KB, as the SDK's own `pico_xip_sram_test` is built.
 benchtop_program(xip_sram xip_sram.c xip_ram)
@@ -88,3 +99,9 @@ pico_minimize_runtime(xip_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL 
 target_compile_definitions(xip_loop PRIVATE PICO_HEAP_SIZE=0x200)
 benchtop_program(sram_loop xip_loop.c no_flash)
 pico_minimize_runtime(sram_loop INCLUDE PRINTF PRINTF_MINIMAL DEFAULT_ALARM_POOL PANIC FLOAT)
+
+# The PIO programs: pioasm (built from the SDK's tools) assembles pio/*.pio into pio/*.pio.h, which are
+# committed; pio_programs prints them with the configuration each pico-examples init builds.
+benchtop_program(pio_programs pio_programs.c no_flash)
+target_link_libraries(pio_programs hardware_pio)
+pico_generate_pio_header(pio_programs ${CMAKE_CURRENT_LIST_DIR}/pio/hello.pio ${CMAKE_CURRENT_LIST_DIR}/pio/ws2812.pio ${CMAKE_CURRENT_LIST_DIR}/pio/uart_tx.pio ${CMAKE_CURRENT_LIST_DIR}/pio/uart_rx.pio ${CMAKE_CURRENT_LIST_DIR}/pio/rp2350_only.pio OUTPUT_DIR ${CMAKE_CURRENT_LIST_DIR}/pio)

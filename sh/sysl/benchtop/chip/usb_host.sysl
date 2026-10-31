@@ -1,0 +1,500 @@
+module sh.sysl.benchtop.chip
+
+import sh.sysl.benchtop.peripheral.rp2350.{Handshake, InReply, Packet, UsbCtrl}
+import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
+import sysl.math.min
+
+// benchtop's USB host: the computer a Pico 2 running `stdio_usb` (TinyUSB's CDC ACM device) is plugged
+// into. It drives the device controller (`peripheral/rp2350/usb.sysl`) one frame at a time, a frame
+// every millisecond of the board's time, which the board schedules through its event path
+// (`ArmBoard.serve_usb`): never per instruction, and only while there is something on the bus.
+//
+// **What it does, as a host does** (USB 2.0 chapter 9, and what Linux and macOS send a CDC device):
+// once the device's pull-up appears it waits the 100 ms debounce interval, resets the bus and waits the
+// 10 ms reset recovery time, then enumerates: the device descriptor at address 0 (asked for 64 bytes,
+// as a host that does not yet know bMaxPacketSize0 asks), SET_ADDRESS and the 2 ms a device has to
+// take its address, the device descriptor again at its address, the configuration descriptor's 9-byte
+// header and then all of it. It finds the CDC ACM communication interface and the data interface's
+// bulk IN and OUT endpoints, sends SET_CONFIGURATION and raises DTR with SET_CONTROL_LINE_STATE, as a
+// terminal opening the port does. From then on every frame polls bulk IN until the device NAKs, into
+// `received`, and sends what `sending` holds to bulk OUT, 64 bytes a packet, with the data toggles
+// each direction keeps from DATA0.
+//
+// **Every frame** carries a SOF from the bus reset on. A control transfer's stage the device NAKs is
+// retried in the next frame, as the device's firmware runs in between; a bulk endpoint is retried
+// until the device NAKs, at most 19 packets a frame (a full-speed frame's 1500 bytes).
+//
+// **When the device leaves the bus** (its firmware's `tud_disconnect`, or the chip's reset), the host
+// forgets it and starts again from the debounce when it comes back. `request_reset` resets the bus
+// itself, and the device is enumerated afresh.
+//
+// **What it cannot do ends with a named message** (`note`, which `take_note` hands the user) and the
+// host disables the port, as a host does with a device it gives up on, until the device disconnects:
+// a device with no CDC ACM interface, a request the device stalls, a control stage NAKed for 5 s, a
+// device that stops answering, a data PID out of turn. It does not clear a halted endpoint, send
+// SET_LINE_CODING, poll the notification endpoint, suspend the bus, or reach a hub.
+
+/** Where the host stands with the device. */
+enum HostStage
+    // Not on the bus.
+    Off
+    // On the bus; no device has connected (its pull-up is off).
+    Waiting
+    // A device has connected: the debounce interval, then the bus reset.
+    Debounce
+    // The bus has been reset: the reset recovery time, then enumeration.
+    Recovery
+    // A control transfer of the enumeration is under way (`step`).
+    Enumerating
+    // Configured and DTR raised: bulk IN polled and bulk OUT sent each frame.
+    Running
+    // Given up on the device (`note` says why) until it disconnects.
+    Stopped
+
+// Where a control transfer is.
+private enum Phase
+    Setup
+    DataIn
+    StatusOut
+    StatusIn
+
+// What a transaction left the transfer or the frame to do.
+private enum Progress
+    // It moved on: the next transaction may follow in this frame.
+    Moved
+    // The device NAKed: the next frame retries.
+    Wait
+    // The control transfer has finished.
+    Done
+    // The device has gone or the host has stopped: nothing more this frame.
+    Over
+
+/** The frames the host waits after a device connects before resetting the bus (USB 2.0 7.1.7.3, TATTDB). */
+const USB_DEBOUNCE_FRAMES: u32 = 100
+/** The frames after a bus reset before the first request (TRSTRCY). */
+const USB_RECOVERY_FRAMES: u32 = 10
+/** The frames after SET_ADDRESS before the device is addressed again (TDSETADDR, 2 ms). */
+const USB_SET_ADDRESS_FRAMES: u32 = 2
+/** The frames a control transfer's stage may be NAKed before the host gives up: 5 s, as Linux's
+ * USB_CTRL_GET_TIMEOUT.
+ */
+const USB_CONTROL_TIMEOUT_FRAMES: u32 = 5000
+/** The address the host gives the device. */
+const USB_HOST_ADDRESS: u32 = 1
+/** The bytes from bulk IN the host holds for the bridge before it stops polling, as a host's buffer fills. */
+const USB_RECEIVE_ROOM: usize = 4096
+/** The bytes waiting for bulk OUT the host holds before the bridge must wait. */
+const USB_SEND_ROOM: usize = 4096
+
+// The bulk packets a full-speed frame has room for.
+private const BULK_PER_FRAME: u32 = 19
+// Enumeration's transactions in one frame at most (each stage the device answers moves on at once).
+private const CONTROL_PER_FRAME: u32 = 8
+
+// Enumeration's requests, in order.
+private enum Request
+    GetDeviceAt0
+    SetAddress
+    GetDevice
+    GetConfigHeader
+    GetConfig
+    SetConfiguration
+    SetControlLineState
+
+private val NO_BYTES: [1]u8 = [0]
+
+/** A standard or class request's SETUP packet. */
+usb_request(kind: u8, code: u8, value: u32, index: u32, length: u32) -> [8]u8 =
+    [kind, code, u8.wrap(value), u8.wrap(value >> 8), u8.wrap(index), u8.wrap(index >> 8), u8.wrap(length), u8.wrap(length >> 8)]
+
+/** The CDC ACM function a configuration descriptor holds, as the host drives it. */
+struct CdcPort
+    // bConfigurationValue.
+    config: u8
+    // The communication interface's number, which SET_CONTROL_LINE_STATE names.
+    comm: u32
+    // The data interface's bulk endpoints' numbers.
+    ep_in: u32
+    ep_out: u32
+
+/** The CDC ACM function in configuration descriptor `d`: the first communication interface of class 2,
+ * subclass 2 (ACM), and the first data interface (class 0x0A) with a bulk IN and a bulk OUT endpoint,
+ * alternate setting 0 each; or why there is none.
+ */
+cdc_port(d: []const u8) -> Result[CdcPort, string]
+    if d.len < 9 || d[1] != 2 then return Err(s"the configuration descriptor is not one (bDescriptorType ${if d.len > 1 then d[1] else 0})")
+    var comm: Option[u32] = None
+    var data_if: Option[u32] = None
+    var ep_in: u32 = 0
+    var ep_out: u32 = 0
+    var classes = ""
+    // The interface the descriptors being walked belong to: whether it is a CDC data interface at
+    // alternate setting 0 still without its pair of endpoints.
+    var in_data = false
+    var cur_in: u32 = 0
+    var cur_out: u32 = 0
+    var at: usize = 0
+    while at < d.len
+        val n = usize(d[at])
+        if n < 2 || at + n > d.len then return Err(s"the configuration descriptor is malformed at byte $at (bLength $n)")
+        val kind = d[at + 1]
+        if kind == 4 && n >= 9
+            val number = u32(d[at + 2])
+            val alt = d[at + 3]
+            val class = d[at + 5]
+            val sub = d[at + 6]
+            if alt == 0 then classes = classes + (if classes.is_empty() then "" else ", ") + s"0x${hex(class, 2)}"
+            in_data = false
+            if alt == 0 && class == 2 && sub == 2 && comm.is_none() then comm = Some(number)
+            if alt == 0 && class == 0x0A && data_if.is_none()
+                in_data = true
+                cur_in = 0
+                cur_out = 0
+                data_if = Some(number)
+        elif kind == 5 && n >= 7 && in_data
+            val address = u32(d[at + 2])
+            if d[at + 3] & 3 == 2
+                if address & 0x80 != 0 && cur_in == 0 then cur_in = address & 0xF
+                elif address & 0x80 == 0 && cur_out == 0 then cur_out = address & 0xF
+            if cur_in != 0 && cur_out != 0
+                ep_in = cur_in
+                ep_out = cur_out
+                in_data = false
+        at += n
+    val c = comm match
+        Some(x) -> x
+        None -> return Err(s"the device has no CDC ACM interface (its interfaces' classes: ${if classes.is_empty() then "none" else classes}): benchtop's host bridges a CDC ACM serial port only")
+    if data_if.is_none() then return Err("the device's CDC ACM function has no data interface (class 0x0A)")
+    if ep_in == 0 || ep_out == 0 then return Err("the device's CDC data interface has no bulk IN and bulk OUT endpoint pair")
+    Ok(CdcPort(d[5], c, ep_in, ep_out))
+end cdc_port
+
+/** benchtop's USB host and what it holds for the bridge (the console or a pty). */
+struct UsbHost
+    stage: HostStage
+    // Frames to let pass before the stage's next step.
+    wait: u32
+    // The number the next SOF carries.
+    frame_number: u32
+    // The chip's clock at the next frame, while `timed`.
+    due: u64
+    timed: bool
+    // A bus reset the host has been asked for (`request_reset`).
+    reset_asked: bool
+    // The enumeration's request under way, and its control transfer.
+    private step: Request
+    private phase: Phase
+    setup: [8]u8
+    address: u32
+    pid: u32
+    data: Buf[u8]
+    // Frames the stage under way has been NAKed.
+    naks: u32
+    // The device's address once SET_ADDRESS has taken, its endpoint 0's packet size, its descriptor.
+    device_address: u32
+    maxp0: u32
+    device: Buf[u8]
+    port: CdcPort
+    // The data toggle each bulk direction expects next.
+    in_pid: u32
+    out_pid: u32
+    /** What the device has sent on bulk IN, for the bridge to take (`consume`). */
+    received: Buf[u8]
+    /** What the bridge has given the host to send on bulk OUT. */
+    sending: Buf[u8]
+    // How many enumerations have reached Running.
+    enumerations: u32
+    // Why the host stopped, for the user, until `take_note`.
+    note: string
+
+    /** Whether the host is on the bus. */
+    on(*self) -> bool = self.stage != HostStage.Off
+
+    /** Whether the host has frames to make: from a device's connection until it is running or given up
+     * on, and every frame while it runs.
+     */
+    framed(*self) -> bool = self.stage == HostStage.Debounce || self.stage == HostStage.Recovery || self.stage == HostStage.Enumerating || self.stage == HostStage.Running || (self.reset_asked && self.stage == HostStage.Stopped)
+
+    /** Whether the device is enumerated and its port open. */
+    running(*self) -> bool = self.stage == HostStage.Running
+
+    /** The host goes onto the bus, or off it. */
+    attach(*self, on: bool)
+        self.forget()
+        self.stage = if on then HostStage.Waiting else HostStage.Off
+
+    /** The host resets the bus at its next frame, and enumerates the device again. */
+    request_reset(*self)
+        self.reset_asked = true
+
+    /** Why the host gave up on the device, once. */
+    take_note(*self) -> Option[string]
+        if self.note.is_empty() then return None
+        val n = self.note
+        self.note = ""
+        Some(n)
+
+    /** The first `n` bytes of `received` have gone to the bridge. */
+    consume(*self, n: usize)
+        if n == 0 then return
+        val r = &self.received
+        val left = r.len() - n
+        for i in 0..<left do r[i] = r[i + n]
+        r.truncate(left)
+
+    /** How many more bytes the bridge may queue for bulk OUT. */
+    room_to_send(*self) -> usize = if self.sending.len() >= USB_SEND_ROOM then 0 else USB_SEND_ROOM - self.sending.len()
+
+    // The device and every transfer forgotten: it has left the bus, or the host has.
+    private forget(*self)
+        self.wait = 0
+        self.timed = false
+        self.reset_asked = false
+        self.step = Request.GetDeviceAt0
+        self.device_address = 0
+        self.maxp0 = 64
+        self.data.clear()
+        self.device.clear()
+
+    /** Whether the device is on the bus, as the host sees it between frames: a device that has left is
+     * forgotten, and one that has arrived is debounced.
+     */
+    watch(*self, connected: bool)
+        if self.stage == HostStage.Off then return
+        if !connected
+            if self.stage != HostStage.Waiting
+                self.forget()
+                self.stage = HostStage.Waiting
+        elif self.stage == HostStage.Waiting
+            self.stage = HostStage.Debounce
+            self.wait = USB_DEBOUNCE_FRAMES
+
+    /** One frame on the bus: the SOF, and what the stage has to do. Err where the controller refuses
+     * what the host asked of it.
+     */
+    frame(*self, usb: *UsbCtrl) -> Result[unit, string]
+        if self.reset_asked && self.stage != HostStage.Off && self.stage != HostStage.Waiting
+            self.reset_asked = false
+            self.reset_bus(usb)
+            return Ok(())
+        self.reset_asked = false
+        if self.stage == HostStage.Debounce
+            if self.wait > 1
+                self.wait -= 1
+                return Ok(())
+            self.reset_bus(usb)
+            return Ok(())
+        if !self.framed() then return Ok(())
+        usb.sof(self.frame_number)
+        self.frame_number = (self.frame_number + 1) & 0x7FF
+        if self.wait > 0
+            self.wait -= 1
+            return Ok(())
+        if self.stage == HostStage.Recovery
+            self.begin(Request.GetDeviceAt0)
+        if self.stage == HostStage.Enumerating then return self.enumerate(usb)
+        if self.stage == HostStage.Running then return self.poll(usb)
+        Ok(())
+
+    // The bus reset, and the recovery time after it; the device is enumerated afresh.
+    private reset_bus(*self, usb: *UsbCtrl)
+        usb.bus_reset()
+        self.forget()
+        self.stage = HostStage.Recovery
+        self.wait = USB_RECOVERY_FRAMES
+
+    // Give up on the device until it disconnects, saying why.
+    private give_up(*self, why: string)
+        self.note = s"the USB host has given up on the device: $why"
+        self.stage = HostStage.Stopped
+
+    // `give_up`, ending what the frame was doing.
+    private stop(*self, why: string) -> Progress
+        self.give_up(why)
+        Progress.Over
+
+    // Enumeration's request `step`, its control transfer started.
+    private begin(*self, step: Request)
+        self.stage = HostStage.Enumerating
+        self.step = step
+        self.setup = step match
+            GetDeviceAt0 -> usb_request(0x80, 6, 0x100, 0, 64)
+            SetAddress -> usb_request(0x00, 5, USB_HOST_ADDRESS, 0, 0)
+            GetDevice -> usb_request(0x80, 6, 0x100, 0, 18)
+            GetConfigHeader -> usb_request(0x80, 6, 0x200, 0, 9)
+            GetConfig -> usb_request(0x80, 6, 0x200, 0, self.config_length())
+            SetConfiguration -> usb_request(0x00, 9, u32(self.port.config), 0, 0)
+            SetControlLineState -> usb_request(0x21, 0x22, 1, self.port.comm, 0)
+        self.address = self.device_address
+        self.phase = Phase.Setup
+        self.data.clear()
+        self.naks = 0
+
+    // The configuration's wTotalLength, from its header.
+    private config_length(*self) -> u32 = u32(self.data[2]) | (u32(self.data[3]) << 8)
+
+    // The request under way, as a message names it.
+    private request_name(*self) -> string = self.step match
+        GetDeviceAt0 -> "GET_DESCRIPTOR (device) at address 0"
+        SetAddress -> "SET_ADDRESS"
+        GetDevice -> "GET_DESCRIPTOR (device)"
+        GetConfigHeader | GetConfig -> "GET_DESCRIPTOR (configuration)"
+        SetConfiguration -> "SET_CONFIGURATION"
+        SetControlLineState -> "SET_CONTROL_LINE_STATE"
+
+    // The enumeration's transactions for this frame.
+    private enumerate(*self, usb: *UsbCtrl) -> Result[unit, string]
+        var n: u32 = 0
+        while n < CONTROL_PER_FRAME && self.stage == HostStage.Enumerating && self.wait == 0
+            self.control(usb)? match
+                Moved -> self.naks = 0
+                Wait -> return Ok(())
+                Done -> self.finished()
+                Over -> return Ok(())
+            n += 1
+        Ok(())
+
+    // The next transaction of the control transfer under way.
+    private control(*self, usb: *UsbCtrl) -> Result[Progress, string]
+        val name = self.request_name()
+        val want = u32(self.setup[6]) | (u32(self.setup[7]) << 8)
+        self.phase match
+            Setup ->
+                val h = usb.setup(self.address, self.setup)
+                if h == Handshake.Silent then return Ok(self.silent(usb, name))
+                if h != Handshake.Ack then return Ok(self.stop(s"it answered the SETUP of $name with $h"))
+                self.phase = if want > 0 then Phase.DataIn else Phase.StatusIn
+                self.pid = 1
+                Ok(Progress.Moved)
+            DataIn ->
+                usb.in_token(self.address, 0)? match
+                    Data(p) ->
+                        if p.pid != self.pid then return Ok(self.stop(s"a data stage packet of $name came with DATA${p.pid} where DATA${self.pid} was due"))
+                        if u32(self.data.len()) + p.len > want then return Ok(self.stop(s"it sent more than the $want bytes $name asked for"))
+                        for k in 0..<p.len do self.data.push(p.bytes[k])
+                        self.pid ^= 1
+                        if p.len < self.maxp0 || u32(self.data.len()) == want then self.phase = Phase.StatusOut
+                        Ok(Progress.Moved)
+                    Nak -> Ok(self.nakked(name))
+                    Stall -> Ok(self.stop(s"it stalled $name"))
+                    Silent -> Ok(self.silent(usb, name))
+            StatusOut ->
+                val h = usb.out_data(self.address, 0, 1, NO_BYTES[0..<0])?
+                h match
+                    Ack -> Ok(Progress.Done)
+                    Nak -> Ok(self.nakked(name))
+                    Stall -> Ok(self.stop(s"it stalled the status stage of $name"))
+                    Silent -> Ok(self.silent(usb, name))
+            StatusIn ->
+                usb.in_token(self.address, 0)? match
+                    Data(p) ->
+                        if p.len != 0 || p.pid != 1 then return Ok(self.stop(s"the status stage of $name was ${p.len} bytes with DATA${p.pid}, where a zero-length DATA1 is due"))
+                        Ok(Progress.Done)
+                    Nak -> Ok(self.nakked(name))
+                    Stall -> Ok(self.stop(s"it stalled $name"))
+                    Silent -> Ok(self.silent(usb, name))
+    end control
+
+    // The device NAKed a stage of `name`: retried next frame, for up to 5 s.
+    private nakked(*self, name: string) -> Progress
+        self.naks += 1
+        if self.naks >= USB_CONTROL_TIMEOUT_FRAMES then return self.stop(s"it NAKed $name for 5 s")
+        Progress.Wait
+
+    // No answer to `name`: the device has left the bus, or it does not answer where it should.
+    private silent(*self, usb: *UsbCtrl, name: string) -> Progress
+        self.lost(usb, name, self.address)
+        Progress.Over
+
+    private lost(*self, usb: *UsbCtrl, name: string, address: u32)
+        if usb.connected then self.give_up(s"no answer to $name at address $address")
+        else self.watch(false)
+
+    // The control transfer of request `step` has finished: check what it read and start the next.
+    private finished(*self)
+        val d = &self.data
+        self.step match
+            GetDeviceAt0 ->
+                if d.len() < 8 || d[1] != 1 then return self.give_up(s"GET_DESCRIPTOR (device) at address 0 read ${d.len()} bytes, not a device descriptor")
+                val m = u32(d[7])
+                if m != 8 && m != 16 && m != 32 && m != 64 then return self.give_up(s"bMaxPacketSize0 is $m, which a full-speed device cannot have")
+                self.maxp0 = m
+                self.begin(Request.SetAddress)
+            SetAddress ->
+                self.device_address = USB_HOST_ADDRESS
+                self.begin(Request.GetDevice)
+                self.wait = USB_SET_ADDRESS_FRAMES
+            GetDevice ->
+                if d.len() != 18 || d[0] != 18 || d[1] != 1 then return self.give_up(s"GET_DESCRIPTOR (device) read ${d.len()} bytes, not an 18-byte device descriptor")
+                self.device.clear()
+                self.device.extend(d.view())
+                self.begin(Request.GetConfigHeader)
+            GetConfigHeader ->
+                if d.len() != 9 || d[1] != 2 || self.config_length() < 9 then return self.give_up(s"the configuration descriptor's header read ${d.len()} bytes, not a configuration's 9")
+                self.begin(Request.GetConfig)
+            GetConfig ->
+                val total = u32(self.setup[6]) | (u32(self.setup[7]) << 8)
+                if u32(d.len()) != total then return self.give_up(s"the configuration descriptor read ${d.len()} bytes where its wTotalLength says $total")
+                cdc_port(d.view()) match
+                    Ok(p) ->
+                        self.port = p
+                        self.begin(Request.SetConfiguration)
+                    Err(why) -> self.give_up(why)
+            SetConfiguration -> self.begin(Request.SetControlLineState)
+            SetControlLineState ->
+                self.stage = HostStage.Running
+                self.in_pid = 0
+                self.out_pid = 0
+                self.enumerations += 1
+    end finished
+
+    // A running frame: bulk IN until the device NAKs (while the bridge has room), then bulk OUT for what
+    // is waiting.
+    private poll(*self, usb: *UsbCtrl) -> Result[unit, string]
+        val a = self.device_address
+        val ep_in = self.port.ep_in
+        var n: u32 = 0
+        while n < BULK_PER_FRAME && self.received.len() < USB_RECEIVE_ROOM
+            usb.in_token(a, ep_in)? match
+                Data(p) ->
+                    if p.pid != self.in_pid
+                        self.give_up(s"bulk IN 0x${hex(0x80 | ep_in, 2)} sent DATA${p.pid} where DATA${self.in_pid} was due")
+                        return Ok(())
+                    for k in 0..<p.len do self.received.push(p.bytes[k])
+                    self.in_pid ^= 1
+                Nak -> break
+                Stall ->
+                    self.give_up(s"bulk IN 0x${hex(0x80 | ep_in, 2)} stalled, and benchtop's host does not clear a halt")
+                    return Ok(())
+                Silent ->
+                    self.lost(usb, s"bulk IN 0x${hex(0x80 | ep_in, 2)}", a)
+                    return Ok(())
+            n += 1
+        val ep_out = self.port.ep_out
+        var sent: usize = 0
+        n = 0
+        while sent < self.sending.len() && n < BULK_PER_FRAME
+            val k = min(self.sending.len() - sent, 64)
+            val h = usb.out_data(a, ep_out, self.out_pid, self.sending.view()[sent..<sent + k])?
+            if h == Handshake.Nak then break
+            if h == Handshake.Stall
+                self.give_up(s"bulk OUT 0x${hex(ep_out, 2)} stalled, and benchtop's host does not clear a halt")
+                break
+            if h == Handshake.Silent
+                self.lost(usb, s"bulk OUT 0x${hex(ep_out, 2)}", a)
+                break
+            sent += k
+            self.out_pid ^= 1
+            n += 1
+        if sent > 0
+            val s = &self.sending
+            val left = s.len() - sent
+            for i in 0..<left do s[i] = s[i + sent]
+            s.truncate(left)
+        Ok(())
+    end poll
+
+/** A host off the bus, holding nothing. */
+usb_host() -> UsbHost
+    UsbHost(HostStage.Off, 0, 0, 0, false, false, Request.GetDeviceAt0, Phase.Setup, [0; 8], 0, 0, buf(), 0, 0, 64, buf(), CdcPort(0, 0, 0, 0), 0, 0, buf(), buf(), 0, "")

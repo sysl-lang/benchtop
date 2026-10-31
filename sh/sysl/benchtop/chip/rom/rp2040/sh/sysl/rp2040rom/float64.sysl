@@ -1,0 +1,188 @@
+module sh.sysl.rp2040rom
+
+// The soft double table's binary64 routines: a double is its bits in a `u64`, which the Cortex-M0+
+// passes in a pair of core registers.
+
+private[rp2040rom] exp64(x: u64) -> i32 = i32((x >> 52) & 0x7FF)
+private[rp2040rom] sig64(x: u64) -> u64 = (x & 0xFFFFFFFFFFFFF) | 0x10000000000000
+
+/** `a + b`. */
+dadd(a0: u64, b0: u64) -> u64
+    val a = flush64(a0)
+    val b = flush64(b0)
+    if is_nan64(a) then return a | 0x8000000000000
+    if is_nan64(b) then return b | 0x8000000000000
+    val ea = exp64(a)
+    val eb = exp64(b)
+    if ea == 0x7FF
+        return if eb == 0x7FF && a ^ b == 0x8000000000000000 then F64_QNAN else a
+    if eb == 0x7FF then return b
+    if ea == 0 then return if eb == 0 then a & b else b
+    if eb == 0 then return a
+    val swap = b & 0x7FFFFFFFFFFFFFFF > a & 0x7FFFFFFFFFFFFFFF
+    val x = if swap then b else a
+    val y = if swap then a else b
+    val ex = exp64(x)
+    val sx = sig64(x) << 10
+    val sy = shr_sticky64(sig64(y) << 10, u32(ex - exp64(y)))
+    val sum = if (x ^ y) >> 63 == 0 then sx + sy else sx - sy
+    if sum == 0 then return 0
+    val n = sum.leading_zeros()
+    pack64(x >> 63 != 0, ex + 1 - i32(n), sum << n)
+end dadd
+
+/** `a − b`. */
+dsub(a: u64, b: u64) -> u64 = if is_nan64(b) && !is_nan64(a) then b | 0x8000000000000 else dadd(a, b ^ 0x8000000000000000)
+
+/** The 128-bit product of two 64-bit integers. */
+// Four 32 × 32-bit products, kept out of line and shared by every caller: a full 128-bit multiply
+// written inline at each would be several times the size, and the ROM is 16 KB.
+@noinline
+mul128(a: u64, b: u64) -> u128
+    val al = a & 0xFFFFFFFF
+    val ah = a >> 32
+    val bl = b & 0xFFFFFFFF
+    val bh = b >> 32
+    val ll = al * bl
+    val lh = al * bh
+    val hl = ah * bl
+    val mid = (ll >> 32) + (lh & 0xFFFFFFFF) + (hl & 0xFFFFFFFF)
+    val hi = ah * bh + (lh >> 32) + (hl >> 32) + (mid >> 32)
+    (u128(hi) << 64) | u128((ll & 0xFFFFFFFF) | (mid << 32))
+
+/** `a × b`. */
+dmul(a0: u64, b0: u64) -> u64
+    val a = flush64(a0)
+    val b = flush64(b0)
+    if is_nan64(a) then return a | 0x8000000000000
+    if is_nan64(b) then return b | 0x8000000000000
+    val sign = (a ^ b) & 0x8000000000000000
+    val ea = exp64(a)
+    val eb = exp64(b)
+    if ea == 0x7FF || eb == 0x7FF
+        return if ea == 0 || eb == 0 then F64_QNAN else sign | 0x7FF0000000000000
+    if ea == 0 || eb == 0 then return sign
+    val p = mul128(sig64(a), sig64(b))
+    val n = p.leading_zeros()
+    val s = p << n
+    val sig = u64.wrap(s >> 64) | (if u64.wrap(s) != 0 then 1 else 0)
+    pack64(sign != 0, ea + eb - 1000 - i32(n), sig)
+end dmul
+
+/** `a / b`, by restoring division, one quotient bit a step. */
+ddiv(a0: u64, b0: u64) -> u64
+    val a = flush64(a0)
+    val b = flush64(b0)
+    if is_nan64(a) then return a | 0x8000000000000
+    if is_nan64(b) then return b | 0x8000000000000
+    val sign = (a ^ b) & 0x8000000000000000
+    val ea = exp64(a)
+    val eb = exp64(b)
+    if ea == 0x7FF then return if eb == 0x7FF then F64_QNAN else sign | 0x7FF0000000000000
+    if eb == 0x7FF then return sign
+    if eb == 0 then return if ea == 0 then F64_QNAN else sign | 0x7FF0000000000000
+    if ea == 0 then return sign
+    val den = sig64(b)
+    val r = sig64(a)
+    val below = r < den
+    val q, rest = divide(if below then r << 1 else r, false, den, 64)
+    pack64(sign != 0, ea - eb + 1023 - (if below then 1 else 0), q | (if rest then 1 else 0))
+end ddiv
+
+/** The integer square root of a 128-bit `v`, and whether it is exact: the float and double roots'. */
+isqrt128(v: u128) -> (u64, bool)
+    var x = v
+    var res: u128 = 0
+    var bit: u128 = 1 << 126
+    while bit > x do bit >>= 2
+    while bit != 0
+        if x >= res + bit
+            x -= res + bit
+            res = (res >> 1) + bit
+        else
+            res >>= 1
+        bit >>= 2
+    (u64(res), x == 0)
+
+/** `√a`: −0 answers −0, and any other negative number the default NaN. */
+dsqrt(a0: u64) -> u64
+    val a = flush64(a0)
+    if is_nan64(a) then return a | 0x8000000000000
+    if a & 0x7FFFFFFFFFFFFFFF == 0 then return a
+    if a >> 63 != 0 then return F64_QNAN
+    val ea = exp64(a)
+    if ea == 0x7FF then return a
+    var e = ea - 1023
+    var m = sig64(a)
+    if e & 1 != 0
+        m <<= 1
+        e -= 1
+    val r, exact = isqrt128(u128(m) << 74)
+    pack64(false, 1023 + (e >> 1), r | (if exact then 0 else 1))
+
+/** The integer below `x × 2^n`, toward −∞, saturated (`to_fixed`). */
+double2fixed(x0: u64, n: i32, signed: bool, bits: u32) -> u64
+    val x = flush64(x0)
+    val e = exp64(x)
+    if e == 0 then return 0
+    to_fixed(x >> 63 != 0, sig64(x), e - 1075 + n, e == 0x7FF, signed, bits)
+
+/** `double2int`: toward −∞, saturated. */
+double2int(x: u64) -> i32 = i32.wrap(u32.wrap(double2fixed(x, 0, true, 32)))
+/** `double2fix`. */
+double2fix(x: u64, n: i32) -> i32 = i32.wrap(u32.wrap(double2fixed(x, n, true, 32)))
+/** `double2uint`. */
+double2uint(x: u64) -> u32 = u32.wrap(double2fixed(x, 0, false, 32))
+/** `double2ufix`. */
+double2ufix(x: u64, n: i32) -> u32 = u32.wrap(double2fixed(x, n, false, 32))
+/** `double2int64`. */
+double2int64(x: u64) -> i64 = i64.wrap(double2fixed(x, 0, true, 64))
+/** `double2fix64`. */
+double2fix64(x: u64, n: i32) -> i64 = i64.wrap(double2fixed(x, n, true, 64))
+/** `double2uint64`. */
+double2uint64(x: u64) -> u64 = double2fixed(x, 0, false, 64)
+/** `double2ufix64`. */
+double2ufix64(x: u64, n: i32) -> u64 = double2fixed(x, n, false, 64)
+
+private magnitude64(v: i64) -> u64 = if v < 0 then 0 -% u64.wrap(v) else u64(v)
+
+/** `int2double`: exact. */
+int2double(v: i32) -> u64 = from_fixed64(v < 0, magnitude64(i64(v)), 0)
+/** `fix2double`: `v × 2^−n`. */
+fix2double(v: i32, n: i32) -> u64 = from_fixed64(v < 0, magnitude64(i64(v)), n)
+/** `uint2double`. */
+uint2double(v: u32) -> u64 = from_fixed64(false, u64(v), 0)
+/** `ufix2double`. */
+ufix2double(v: u32, n: i32) -> u64 = from_fixed64(false, u64(v), n)
+/** `int642double`, rounded. */
+int642double(v: i64) -> u64 = from_fixed64(v < 0, magnitude64(v), 0)
+/** `fix642double`. */
+fix642double(v: i64, n: i32) -> u64 = from_fixed64(v < 0, magnitude64(v), n)
+/** `uint642double`. */
+uint642double(v: u64) -> u64 = from_fixed64(false, v, 0)
+/** `ufix642double`. */
+ufix642double(v: u64, n: i32) -> u64 = from_fixed64(false, v, n)
+
+/** `double2float`: rounded, a denormal result flushed, a NaN quieted with the top of its payload kept. */
+double2float(x0: u64) -> u32
+    val x = flush64(x0)
+    val neg = x >> 63 != 0
+    val sign: u32 = if neg then 0x80000000 else 0
+    val e = exp64(x)
+    if e == 0 then return sign
+    if e == 0x7FF
+        val frac = u32((x >> 29) & 0x7FFFFF)
+        return if x & 0xFFFFFFFFFFFFF == 0 then sign | 0x7F800000 else sign | 0x7FC00000 | frac
+    val s = sig64(x) << 11
+    val sig = u32(s >> 32) | (if s & 0xFFFFFFFF != 0 then 1 else 0)
+    pack32(neg, e - 1023 + 127, sig)
+
+/** `dcmp`: −1, 0 or 1 as `a` is below, equal to or above `b`; a NaN on either side answers 1. */
+dcmp(a0: u64, b0: u64) -> i32
+    val a = flush64(a0)
+    val b = flush64(b0)
+    if is_nan64(a) || is_nan64(b) then return 1
+    if (a | b) & 0x7FFFFFFFFFFFFFFF == 0 || a == b then return 0
+    val ka = if a >> 63 != 0 then ~a else a | 0x8000000000000000
+    val kb = if b >> 63 != 0 then ~b else b | 0x8000000000000000
+    if ka < kb then -1 else 1

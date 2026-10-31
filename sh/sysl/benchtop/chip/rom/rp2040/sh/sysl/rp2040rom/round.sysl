@@ -1,0 +1,139 @@
+module sh.sysl.rp2040rom
+
+import sysl.math.clamp
+import sysl.math.max
+
+// Rounding and packing, shared by every float and double routine.
+//
+// **What the ROM's floating point does**, as the RP2040 datasheet's boot ROM floating-point section
+// describes it: IEEE 754 binary32 and binary64 with round to nearest, ties to even, except that
+// **denormals are flushed to zero**. A denormal input is read as a zero of its sign, and a result that
+// IEEE arithmetic would deliver as a denormal is delivered as a zero of its sign instead. A result that
+// IEEE arithmetic rounds up to the smallest normal is that normal: the flush applies to the IEEE
+// result, after rounding at the denormal precision, so every routine here answers what the host's
+// arithmetic answers with its denormal results then flushed.
+//
+// An invalid operation (∞ − ∞, 0 × ∞, 0 / 0, ∞ / ∞, the square root of a negative number) answers the
+// default quiet NaN; a NaN operand answers itself, quieted, the first operand's where both are NaN.
+
+/** binary32's default quiet NaN. */
+const F32_QNAN: u32 = 0x7FC00000
+/** binary64's default quiet NaN. */
+const F64_QNAN: u64 = 0x7FF8000000000000
+
+/** `x >> n`, with a 1 in bit 0 if any bit shifted out was set: the sticky bit rounding needs. */
+shr_sticky32(x: u32, n: u32) -> u32
+    if n >= 32 then return if x != 0 then 1 else 0
+    val lost = x & ((1u32 << n) -% 1)
+    (x >> n) | (if lost != 0 then 1 else 0)
+
+/** `x >> n` with the sticky bit, at 64 bits. */
+shr_sticky64(x: u64, n: u32) -> u64
+    if n >= 64 then return if x != 0 then 1 else 0
+    val lost = x & ((1u64 << n) -% 1)
+    (x >> n) | (if lost != 0 then 1 else 0)
+
+// The top 24 bits of `t`, rounded to nearest, ties to even, on the 8 below.
+private round24(t: u32) -> u32
+    val q = t >> 8
+    val r = t & 0xFF
+    if r > 0x80 || (r == 0x80 && q & 1 != 0) then q + 1 else q
+
+// The top 53 bits of `t`, rounded to nearest, ties to even, on the 11 below.
+private round53(t: u64) -> u64
+    val q = t >> 11
+    val r = t & 0x7FF
+    if r > 0x400 || (r == 0x400 && q & 1 != 0) then q + 1 else q
+
+/** A binary32 from a sign, the biased exponent `exp` it has if rounding does not carry, and `sig`, the
+ * significand with its leading 1 at bit 31 and the bits below the kept 24 as round and sticky bits:
+ * the value is `sig / 2^31 × 2^(exp − 127)`. Overflow answers ∞; a denormal result is flushed to zero.
+ */
+pack32(neg: bool, exp: i32, sig: u32) -> u32
+    val sign: u32 = if neg then 0x80000000 else 0
+    if exp >= 0xFF then return sign | 0x7F800000
+    if exp <= 0
+        // Below the normal range: IEEE rounds at the denormal precision, and only a carry into the
+        // smallest normal leaves a result that is not flushed.
+        val q = round24(shr_sticky32(sig, u32(1 - max(exp, -64))))
+        return if q >= 0x800000 then sign | 0x00800000 else sign
+    var q = round24(sig)
+    var e = exp
+    if q == 0x1000000
+        q = 0x800000
+        e += 1
+        if e >= 0xFF then return sign | 0x7F800000
+    sign | (u32(e) << 23) | (q & 0x7FFFFF)
+end pack32
+
+/** A binary64 from a sign, its biased exponent and a significand with its leading 1 at bit 63: the
+ * value is `sig / 2^63 × 2^(exp − 1023)`. Overflow answers ∞; a denormal result is flushed to zero.
+ */
+pack64(neg: bool, exp: i32, sig: u64) -> u64
+    val sign: u64 = if neg then 0x8000000000000000 else 0
+    if exp >= 0x7FF then return sign | 0x7FF0000000000000
+    if exp <= 0
+        val q = round53(shr_sticky64(sig, u32(1 - max(exp, -128))))
+        return if q >= 0x10000000000000 then sign | 0x0010000000000000 else sign
+    var q = round53(sig)
+    var e = exp
+    if q == 0x20000000000000
+        q = 0x10000000000000
+        e += 1
+        if e >= 0x7FF then return sign | 0x7FF0000000000000
+    sign | (u64(e) << 52) | (q & 0xFFFFFFFFFFFFF)
+end pack64
+
+/** A binary32 whose exponent field is 0 read as the zero of its sign: the ROM's denormal flush. */
+flush32(x: u32) -> u32 = if x & 0x7F800000 == 0 then x & 0x80000000 else x
+
+/** A binary64 denormal read as the zero of its sign. */
+flush64(x: u64) -> u64 = if x & 0x7FF0000000000000 == 0 then x & 0x8000000000000000 else x
+
+/** Whether a binary32 is a NaN. */
+is_nan32(x: u32) -> bool = x & 0x7FFFFFFF > 0x7F800000
+
+/** Whether a binary64 is a NaN. */
+is_nan64(x: u64) -> bool = x & 0x7FFFFFFFFFFFFFFF > 0x7FF0000000000000
+
+/** A binary32 from an integer magnitude `mag` scaled by 2^−n, rounded: `int2float` and `fix2float`. */
+from_fixed32(neg: bool, mag: u64, n: i32) -> u32
+    if mag == 0 then return 0
+    val lz = mag.leading_zeros()
+    val s = mag << lz
+    val sig = u32(s >> 32) | (if s & 0xFFFFFFFF != 0 then 1 else 0)
+    pack32(neg, 190 - i32(lz) - clamp(n, -4096, 4096), sig)
+
+/** A binary64 from an integer magnitude scaled by 2^−n, rounded. */
+from_fixed64(neg: bool, mag: u64, n: i32) -> u64
+    if mag == 0 then return 0
+    val lz = mag.leading_zeros()
+    pack64(neg, 1086 - i32(lz) - clamp(n, -4096, 4096), mag << lz)
+
+/** The integer an IEEE magnitude `m × 2^s` rounds to toward −∞ (the sign is `neg`), saturated to the
+ * signed or unsigned range of a `bits`-bit integer: what the ROM's `float2int`, `float2fix` and their
+ * unsigned and 64-bit siblings answer. `huge` says the input was ∞ or NaN, which saturates by its sign
+ * (a NaN with the sign bit clear to the largest value, one with it set to the smallest). A negative
+ * value converted to an unsigned integer answers 0.
+ */
+to_fixed(neg: bool, m: u64, s: i32, huge: bool, signed: bool, bits: u32) -> u64
+    val all: u64 = if bits == 64 then 0xFFFFFFFFFFFFFFFF else (1u64 << bits) - 1
+    val max_pos: u64 = if signed then all >> 1 else all
+    var over = huge
+    var f: u64 = 0
+    var frac = false
+    if !over
+        if s >= 0
+            if s >= 64 || (s > 0 && m >> u32(64 - s) != 0) then over = true else f = m << u32(s)
+        else
+            val t = u32(-max(s, -64))
+            f = m >> t
+            frac = if t >= 64 then m != 0 else m & ((1u64 << t) - 1) != 0
+    if !neg then return if over || f > max_pos then max_pos else f
+    if !signed then return 0
+    // Toward −∞: the magnitude rounds up.
+    val c = f + (if frac then 1 else 0)
+    val min_mag = 1u64 << (bits - 1)
+    if over || c > min_mag then return min_mag
+    (0 -% c) & all
+end to_fixed

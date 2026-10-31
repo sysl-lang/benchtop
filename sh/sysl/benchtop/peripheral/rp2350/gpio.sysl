@@ -80,7 +80,7 @@ unmodelled_function(n: u32, f: u32) -> Option[string]
             s"UART${uart}_$signal: UART flow control is not modelled (docs/rp-coverage.md item 8)"
         3 -> s"I2C${n / 2 % 2}, which is not on the chip yet (docs/rp-coverage.md item 17)"
         4 -> s"PWM, which is not on the chip yet (docs/rp-coverage.md item 18)"
-        6 | 7 | 8 -> s"PIO${f - 6}, which is not on the chip yet (docs/rp-coverage.md items 13 and 14)"
+        6 | 7 | 8 -> s"PIO${f - 6}, whose pins do not reach the mux yet (docs/rp-coverage.md item 14)"
         9 ->
             if n == 0 || n == 8 || n == 19 || n == 47 then "XIP_SS_N_1, the QMI's second chip select, which drives no part (the Pico 2 has one flash)"
             elif n >= 1 && n < 6 then "CORESIGHT_TRACE, which is not modelled (docs/rp-coverage.md Q5)"
@@ -103,13 +103,36 @@ private overridden(ctrl: u32, mask: u32, shift: u32, input: bool) -> bool = (ctr
     3 -> true
     _ -> input
 
+// The RP2040's GPIOn_CTRL puts OUTOVER at bits 9:8 and OEOVER at 13:12, where the RP2350's has them
+// at 13:12 and 15:14; FUNCSEL, INOVER and IRQOVER are where the RP2350's are. `ctrl` holds the
+// RP2350's layout on both chips, and these convert a word as the RP2040 reads and writes it.
+private const RP2040_OUTOVER: u32 = 0x300
+private const RP2040_OEOVER: u32 = 0x3000
+private const SAME_PLACE: u32 = io.GPIO0_CTRL_FUNCSEL_MASK | io.GPIO0_CTRL_INOVER_MASK | io.GPIO0_CTRL_IRQOVER_MASK
+
+private from_rp2040(x: u32) -> u32 = (x & SAME_PLACE) | ((x & RP2040_OUTOVER) << 4) | ((x & RP2040_OEOVER) << 2)
+private to_rp2040(x: u32) -> u32 = (x & SAME_PLACE) | ((x & io.GPIO0_CTRL_OUTOVER_MASK) >> 4) | ((x & io.GPIO0_CTRL_OEOVER_MASK) >> 2)
+
 struct IoBank0
     ctrl: [GPIO_COUNT]u32
     irq: GpioIrq
+    // The chip's: its GPIOs, where IRQSUMMARY starts (INTR0 on the RP2040, which has none), and whether
+    // CTRL is read and written in the RP2040's layout. A reset keeps them.
+    count: u32
+    summary_at: u32
+    rp2040: bool
 
     reset(*self)
         for i in 0..<GPIO_COUNT do self.ctrl[i] = io.GPIO0_CTRL_FUNCSEL_NULL
         self.irq.reset()
+
+    // GPIO `n`'s CTRL as the chip's programs see it.
+    private native(self, n: u32) -> u32 = if self.rp2040 then to_rp2040(self.ctrl[n]) else self.ctrl[n]
+
+    // GPIO `n`'s CTRL after `data` is written at `offset` through its alias, in the stored layout.
+    private next_ctrl(self, n: u32, offset: u32, data: u32) -> u32
+        val next = written(self.native(n), offset, data)
+        if self.rp2040 then from_rp2040(next) else next
 
     /** The function selected on GPIO `n` (`FUNCSEL`; SIO is 5, NULL 31). */
     function(self, n: u32) -> u32 = self.ctrl[n] & io.GPIO0_CTRL_FUNCSEL_MASK
@@ -126,9 +149,9 @@ struct IoBank0
     unmodelled(self, offset: u32, width: u32, value: u32) -> Option[string]
         val address = offset & 0xFFC
         val n = address / IO_STRIDE
-        if n >= GPIO_COUNT || address % IO_STRIDE != io.GPIO0_CTRL_OFFSET || access(offset, width, true).is_err() then return None
-        val next = written(self.ctrl[n], offset, replicated(value, width)) & io.GPIO0_CTRL_FUNCSEL_MASK
-        if next == self.function(n) then None else unmodelled_function(n, next)
+        if address >= self.summary_at || n >= self.count || address % IO_STRIDE != io.GPIO0_CTRL_OFFSET || access(offset, width, true).is_err() then return None
+        val next = self.next_ctrl(n, offset, replicated(value, width)) & io.GPIO0_CTRL_FUNCSEL_MASK
+        if next == self.function(n) then None elif self.rp2040 then unmodelled_function_rp2040(n, next) else unmodelled_function(n, next)
 
     /** GPIO `n`'s output and enable after CTRL's overrides of what its function drives. */
     after_overrides(self, n: u32, d: Drive) -> Drive
@@ -149,11 +172,11 @@ struct IoBank0
     read(*self, offset: u32, width: u32, pins: [GPIO_COUNT]Pin, drives: [GPIO_COUNT]Drive) -> Result[u32, AccessError]
         access(offset, width, true)?
         val address = offset & 0xFFC
-        if address >= io.INTR0_OFFSET then return self.irq.read(address, offset, width)
-        if address >= io.IRQSUMMARY_PROC0_SECURE0_OFFSET then return Ok(read_lane(self.summary(address), offset, width))
+        if address >= self.irq.intr_at then return self.irq.read(address, offset, width)
+        if address >= self.summary_at then return Ok(read_lane(self.summary(address), offset, width))
         val n = address / IO_STRIDE
-        if n >= GPIO_COUNT then return Err(AccessError.Unmapped)
-        if address % IO_STRIDE == io.GPIO0_CTRL_OFFSET then return Ok(read_lane(self.ctrl[n], offset, width))
+        if n >= self.count then return Err(AccessError.Unmapped)
+        if address % IO_STRIDE == io.GPIO0_CTRL_OFFSET then return Ok(read_lane(self.native(n), offset, width))
         val d = drives[n]
         val out = if d.out then io.GPIO0_STATUS_OUTTOPAD_MASK else 0
         val oe = if d.oe then io.GPIO0_STATUS_OETOPAD_MASK else 0
@@ -174,33 +197,84 @@ struct IoBank0
         access(offset, width, true)?
         val address = offset & 0xFFC
         val data = replicated(value, width)
-        if address >= io.INTR0_OFFSET then return self.irq.write(address, offset, data)
+        if address >= self.irq.intr_at then return self.irq.write(address, offset, data)
         // IRQSUMMARY is read-only.
-        if address >= io.IRQSUMMARY_PROC0_SECURE0_OFFSET then return Ok(())
+        if address >= self.summary_at then return Ok(())
         val n = address / IO_STRIDE
-        if n >= GPIO_COUNT then return Err(AccessError.Unmapped)
+        if n >= self.count then return Err(AccessError.Unmapped)
         // GPIOn_STATUS is read-only.
-        if address % IO_STRIDE == io.GPIO0_CTRL_OFFSET then self.ctrl[n] = written(self.ctrl[n], offset, data)
+        if address % IO_STRIDE == io.GPIO0_CTRL_OFFSET then self.ctrl[n] = self.next_ctrl(n, offset, data)
         Ok(())
 end IoBank0
 
 io_bank0() -> IoBank0
     var state: IoBank0
     state.irq = gpio_irq(GPIO_COUNT, io.INTR0_OFFSET)
+    state.count = GPIO_COUNT
+    state.summary_at = io.IRQSUMMARY_PROC0_SECURE0_OFFSET
+    state.rp2040 = false
     state.reset()
     state
+
+/** The RP2040's GPIOs in bank 0. */
+const GPIO_COUNT_RP2040: u32 = 30
+/** INTR0 on the RP2040 (`io_bank0.h`), straight after GPIO29_CTRL. */
+const INTR0_RP2040: u32 = 0xF0
+
+/** The RP2040's IO_BANK0: 30 GPIOs, INTR0 at 0xF0 with no IRQSUMMARY, and CTRL's overrides where the
+ * RP2040 has them.
+ */
+io_bank0_rp2040() -> IoBank0
+    var state: IoBank0
+    state.irq = gpio_irq(GPIO_COUNT_RP2040, INTR0_RP2040)
+    state.count = GPIO_COUNT_RP2040
+    state.summary_at = INTR0_RP2040
+    state.rp2040 = true
+    state.reset()
+    state
+
+/** Why selecting FUNCSEL `f` on the RP2040's GPIO `n` is refused (its function table, RP2040 datasheet
+ * 2.19.2: F1 SPI, F2 UART, F3 I2C, F4 PWM, F5 SIO, F6 and F7 PIO, F8 clocks, F9 USB); None for SIO, a
+ * UART's TX and RX, and NULL.
+ */
+unmodelled_function_rp2040(n: u32, f: u32) -> Option[string]
+    val uart = (n + 4) / 8 % 2
+    val what = f match
+        5 | 31 -> return None
+        1 -> s"SPI${n / 8 % 2}, which is not on the chip yet (docs/rp-coverage.md item 16)"
+        2 ->
+            if n % 4 < 2 then return None
+            val signal = if n % 4 == 2 then "CTS" else "RTS"
+            s"UART${uart}_$signal: UART flow control is not modelled (docs/rp-coverage.md item 8)"
+        3 -> s"I2C${n / 2 % 2}, which is not on the chip yet (docs/rp-coverage.md item 17)"
+        4 -> s"PWM, which is not on the chip yet (docs/rp-coverage.md item 18)"
+        6 | 7 -> s"PIO${f - 6}, which is not on the chip yet (docs/rp-coverage.md items 13 and 14)"
+        8 ->
+            if n == 20 || n == 22 then "CLOCKS_GPIN, a clock input, which is not modelled"
+            elif n == 21 || (n >= 23 && n <= 25) then "CLOCKS_GPOUT, a clock output, which is not modelled"
+            else ""
+        9 -> "USB_MUXING (VBUS and overcurrent), which is not modelled (docs/rp-coverage.md item 20)"
+        _ -> ""
+    if what.is_empty() then return Some(s"GPIO $n has no function $f")
+    Some(s"GPIO $n FUNCSEL $f selects $what")
 
 /** A GPIO pad at power-on: isolated, input disabled, 4 mA, pull-down, Schmitt trigger. */
 const PAD_RESET: u32 = pads.GPIO0_ISO_MASK | (pads.GPIO0_DRIVE_4MA << pads.GPIO0_DRIVE_SHIFT) | pads.GPIO0_PDE_MASK | pads.GPIO0_SCHMITT_MASK
 
+/** An RP2040 GPIO pad at power-on: input enabled, 4 mA, pull-down, Schmitt trigger. It has no ISO. */
+const PAD_RESET_RP2040: u32 = pads.GPIO0_IE_MASK | (pads.GPIO0_DRIVE_4MA << pads.GPIO0_DRIVE_SHIFT) | pads.GPIO0_PDE_MASK | pads.GPIO0_SCHMITT_MASK
+
 struct Pads
     voltage: u32
-    // GPIO 0–47, then SWCLK and SWD.
+    // GPIO 0 to count - 1, then SWCLK and SWD; the RP2040's 30 use the first 32.
     pads: [GPIO_COUNT + 2]u32
+    // The chip's: its GPIOs, and whether its pads have ISO (the RP2350's). A reset keeps them.
+    count: u32
+    iso: bool
 
     reset(*self)
         self.voltage = 0
-        for i in 0..<(GPIO_COUNT + 2) do self.pads[i] = PAD_RESET
+        for i in 0..<(GPIO_COUNT + 2) do self.pads[i] = if self.iso then PAD_RESET else PAD_RESET_RP2040
 
     /** What GPIO `n`'s pad does with `d`, given `outside`: the level something off the chip drives
      * onto it, if anything. A pad drives while its output is enabled and it is neither isolated nor
@@ -220,7 +294,7 @@ struct Pads
         val address = offset & 0xFFC
         if address == pads.VOLTAGE_SELECT_OFFSET then return Ok(read_lane(self.voltage, offset, width))
         val i = (address - pads.GPIO0_OFFSET) / PAD_STRIDE
-        if i >= GPIO_COUNT + 2 then return Err(AccessError.Unmapped)
+        if i >= self.count + 2 then return Err(AccessError.Unmapped)
         Ok(read_lane(self.pads[i], offset, width))
 
     write(*self, offset: u32, width: u32, value: u32) -> Result[unit, AccessError]
@@ -231,12 +305,23 @@ struct Pads
             self.voltage = written(self.voltage, offset, data) & pads.VOLTAGE_SELECT_VOLTAGE_SELECT_MASK
             return Ok(())
         val i = (address - pads.GPIO0_OFFSET) / PAD_STRIDE
-        if i >= GPIO_COUNT + 2 then return Err(AccessError.Unmapped)
-        self.pads[i] = written(self.pads[i], offset, data) & ((pads.GPIO0_ISO_MASK << 1) - 1)
+        if i >= self.count + 2 then return Err(AccessError.Unmapped)
+        // Bits 7:0 on both chips, and ISO, bit 8, on the RP2350's.
+        self.pads[i] = written(self.pads[i], offset, data) & (if self.iso then (pads.GPIO0_ISO_MASK << 1) - 1 else pads.GPIO0_ISO_MASK - 1)
         Ok(())
 end Pads
 
 pads_bank0() -> Pads
     var state: Pads
+    state.count = GPIO_COUNT
+    state.iso = true
+    state.reset()
+    state
+
+/** The RP2040's PADS_BANK0: 30 GPIOs, then SWCLK and SWD at 0x7C and 0x80, with no ISO. */
+pads_bank0_rp2040() -> Pads
+    var state: Pads
+    state.count = GPIO_COUNT_RP2040
+    state.iso = false
     state.reset()
     state
