@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+// pico-examples' pwm/measure_duty_cycle (commit 0d62f75), unchanged: GPIO 2's slice drives five duty
+// cycles and GPIO 5's slice measures each through its B input, over a wire from GPIO 2 to GPIO 5.
+
 #include <stdio.h>
 
 #include "pico/stdlib.h"

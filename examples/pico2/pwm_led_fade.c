@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+// pico-examples' pwm/led_fade (commit 0d62f75), unchanged: the LED's slice raises PWM_IRQ_WRAP_0 on each
+// wrap and the handler sets the next level; it spins for ever.
+
 // Fade an LED between low and high brightness. An interrupt handler updates
 // the PWM slice's output level each time the counter wraps.
 

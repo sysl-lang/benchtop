@@ -1,0 +1,297 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.v6m as arm
+import sh.sysl.rp2350.clocks as clk
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
+import sh.sysl.rp2350.pwm as pw
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.uart0 as ur
+import sh.sysl.rp2040.io_bank0 as io40
+import sh.sysl.rp2040.pwm as pw40
+import sh.sysl.rp2040.resets as rr40
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// The PWM block on the chips (`chip/pwm.sysl`): its pins through the function mux, time reaching its
+// slices through `advance` and `next_event`, a B input read from its pin, a GPIO interrupt watching a pin
+// it drives, its interrupt lines into the cores, its refusals; then pico-examples' hello_pwm, led_fade and
+// measure_duty_cycle, and examples/pico2/pwm_features.c (a DMA channel paced by a wrap, an edge interrupt
+// on a PWM pin, a slice counting another's edges) on the Arm Pico 2, and the RP2040's 8 slices.
+
+private val HELLO_PWM = embed("../../../../examples/pico2/hello_pwm.elf")
+private val PWM_LED_FADE = embed("../../../../examples/pico2/pwm_led_fade.elf")
+private val MEASURE_DUTY_CYCLE = embed("../../../../examples/pico2/measure_duty_cycle.elf")
+private val PWM_FEATURES = embed("../../../../examples/pico2/pwm_features.elf")
+private val PICO_BLINK40 = embed("../../../../examples/pico/blink.elf")
+private val PWM_SRAM =SramMap(0x20000000, 520 * 1024)
+private val PWM_SRAM40 = SramMap(0x20000000, 264 * 1024)
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const MS: u64 = 150000
+private const SLICE: u32 = 0x14
+private const MODE_LEVEL: u32 = 1 << 4
+private const MODE_RISE: u32 = 2 << 4
+
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+private slice_at(k: u32, r: u32) -> u32 = pw.BASE + SLICE * k + r
+
+// IO_BANK0, PADS_BANK0 and PWM out of reset, as the SDK's runtime and pwm_init leave them.
+private released() -> Rp2350
+    var c = rp2350()
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK | rr.RESET_PWM_MASK)
+    c
+
+// GPIO `n` given to function `f` as the SDK's gpio_set_function leaves it: input on, out of isolation.
+private function(c: *Rp2350, n: u32, f: u32)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + CLR, pads.GPIO0_OD_MASK | pads.GPIO0_ISO_MASK)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET, pads.GPIO0_IE_MASK)
+    wr(c, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * n, f)
+
+// Slice `k` with TOP `top`, CC `cc` and CSR `csr`.
+private slice(c: *Rp2350, k: u32, top: u32, cc: u32, csr: u32)
+    wr(c, slice_at(k, pw.CH0_TOP_OFFSET), top)
+    wr(c, slice_at(k, pw.CH0_CC_OFFSET), cc)
+    wr(c, slice_at(k, pw.CH0_CSR_OFFSET), csr)
+
+// INTR's nibble for GPIO `n`.
+private intr(c: *Rp2350, n: u32) -> u32 = (rd(c, io.BASE + io.INTR0_OFFSET + 4 * (n / 8)) >> (4 * (n % 8))) & 0xF
+
+@test("FUNCSEL 4 routes each GPIO to its slice's channel, A on an even GPIO and B on an odd one, GPIO 32 to 47 to slices 8 to 11; B drives only while free-running; the pad shows the level clock by clock")
+chip_pwm_pins()
+    var c = released()
+    slice(&c, 0, 3, (3 << 16) | 1, 1)
+    function(&c, 0, 4)
+    function(&c, 1, 4)
+    function(&c, 16, 4)
+    var a = ""
+    var b = ""
+    for _ in 0..<8
+        a += if c.pin(0).level then "1" else "0"
+        b += if c.pin(1).level then "1" else "0"
+        assert(c.pin(16).level == c.pin(0).level, "GPIO 16 is slice 0's A too")
+        c.advance(1)
+    assert(a == "10001000" && b == "11101110", s"$a $b")
+    wr(&c, slice_at(9, pw.CH0_CC_OFFSET), 5 << 16)
+    function(&c, 35, 4)
+    assert(c.drive(35).oe && c.drive(35).out, "slice 9's B, stopped, holds the level its counter gives")
+    wr(&c, slice_at(9, pw.CH0_CSR_OFFSET), MODE_LEVEL)
+    assert(!c.drive(35).oe, "an input once DIVMODE is not free-running")
+    val st = rd(&c, io.BASE + io.GPIO0_STATUS_OFFSET + 8 * 1)
+    assert(st & io.GPIO0_STATUS_OETOPAD_MASK != 0, s"0x${hex(st)}")
+
+@test("time reaches a running slice through advance; next_event offers a wrap only an interrupt enable or a paced DMA channel waits for; RESETS holding PWM puts it back")
+chip_pwm_time()
+    var c = released()
+    wr(&c, slice_at(4, pw.CH0_DIV_OFFSET), 0x30)
+    slice(&c, 4, 999, 0, 1)
+    c.advance(3000)
+    assert(rd(&c, slice_at(4, pw.CH0_CTR_OFFSET)) == 0 && rd(&c, pw.BASE + pw.INTR_OFFSET) == 1 << 4, "DIV 3: a wrap in 3000 clocks")
+    assert(c.next_event().is_none(), "nothing waits for a wrap")
+    wr(&c, pw.BASE + pw.INTR_OFFSET, 1 << 4)
+    wr(&c, pw.BASE + pw.IRQ1_INTE_OFFSET, 1 << 4)
+    assert(c.next_event() == Some(3000), s"${c.next_event()}")
+    c.advance(1500)
+    assert(c.next_event() == Some(1500))
+    c.advance(1500)
+    assert(c.pwm.irq(1) && !c.pwm.irq(0) && c.next_event().is_none(), "raised: until it is cleared, no wrap is wanted")
+    wr(&c, rr.BASE + rr.RESET_OFFSET + SET, rr.RESET_PWM_MASK)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_PWM_MASK)
+    assert(c.pwm.enabled == 0 && !c.pwm.irq(1) && rd(&c, slice_at(4, pw.CH0_DIV_OFFSET)) == 0x10)
+
+@test("PWM_IRQ_WRAP_0 and _1 (8 and 9) into both cores, each from its own INTE")
+chip_pwm_irq_into_cores()
+    val b = arm_board(PWM_SRAM)
+    // Booted, so that the cores' NVICs have the RP2350's lines; nothing runs.
+    b.boot(HELLO_PWM).unwrap()
+    val c = &b.chip
+    wr(c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_PWM_MASK)
+    wr(c, pw.BASE + pw.IRQ0_INTF_OFFSET, 1 << 11)
+    wr(c, pw.BASE + pw.IRQ0_INTE_OFFSET, 1 << 11)
+    for k in 0..<2
+        val p = &b.cores[k]
+        c.signal(p)
+        assert(p.pending[arm.nvic_word(arm.IRQ0 + 8)] & arm.nvic_bit(arm.IRQ0 + 8) != 0, s"core $k")
+        assert(p.pending[arm.nvic_word(arm.IRQ0 + 9)] & arm.nvic_bit(arm.IRQ0 + 9) == 0, s"core $k")
+    wr(c, pw.BASE + pw.IRQ1_INTF_OFFSET, 1)
+    wr(c, pw.BASE + pw.IRQ1_INTE_OFFSET, 1)
+    c.signal(&b.cores[1])
+    assert(b.cores[1].pending[arm.nvic_word(arm.IRQ0 + 9)] & arm.nvic_bit(arm.IRQ0 + 9) != 0)
+
+@test("a GPIO interrupt watching a pin PWM drives sees every edge, the chip walking edge to edge; with none watching, an INTR word showing that pin is refused by name")
+chip_pwm_gpio_interrupt()
+    var c = released()
+    slice(&c, 2, 99, 40, 1)
+    function(&c, 4, 4)
+    val why = c.read(0, io.BASE + io.INTR0_OFFSET, 4).unwrap_err()
+    assert(why == "IO_BANK0 + 0x230: INTR shows GPIO 4, which a running PWM slice drives with its interrupts not enabled: its edges are latched only while an interrupt watches", why)
+    assert(c.read(0, io.BASE + io.INTR0_OFFSET + 4, 4).is_ok(), "INTR1 shows no PWM pin")
+    wr(&c, io.BASE + io.PROC0_INTE0_OFFSET, 0xC << 16)
+    assert(c.pwm_stepping && c.pwm_watched)
+    // Selecting the function made GPIO 4 rise.
+    wr(&c, io.BASE + io.INTR0_OFFSET, 0xF << 16)
+    c.advance(39)
+    assert(intr(&c, 4) == 0x2, "high, no edge yet")
+    c.advance(1)
+    assert(intr(&c, 4) == 0x5 && c.io.irq.line(0), "the fall at 40")
+    wr(&c, io.BASE + io.INTR0_OFFSET, 0xF << 16)
+    assert(c.next_event() == Some(60), s"${c.next_event()}: the rise at the wrap")
+    c.advance(60)
+    assert(intr(&c, 4) == 0xA)
+    // The interrupt over a wire: GPIO 4 to GPIO 20, watched there.
+    wr(&c, io.BASE + io.PROC0_INTE0_OFFSET, 0)
+    c.wire(4, Some(20))
+    function(&c, 20, 5)
+    wr(&c, io.BASE + io.PROC0_INTE0_OFFSET + 8, 0x4 << 16)
+    assert(c.pwm_watched, "GPIO 20 hears GPIO 4")
+    c.advance(100)
+    assert(intr(&c, 20) & 0x4 != 0)
+
+@test("a B input follows its pin, moved from outside, by the SIO over a wire, or by another slice: LEVEL counts while it is high, RISE its rising edges, from the level the pin has when the mode starts")
+chip_pwm_b_input()
+    var c = released()
+    function(&c, 3, 4)
+    c.drive_from_outside(3, Some(true))
+    slice(&c, 1, 0xFFFF, 0, 1 | MODE_RISE)
+    assert(rd(&c, slice_at(1, pw.CH0_CTR_OFFSET)) == 0, "already high: no edge")
+    c.drive_from_outside(3, Some(false))
+    c.drive_from_outside(3, Some(true))
+    c.drive_from_outside(3, Some(false))
+    c.drive_from_outside(3, Some(true))
+    assert(rd(&c, slice_at(1, pw.CH0_CTR_OFFSET)) == 2)
+    c.advance(1000)
+    assert(rd(&c, slice_at(1, pw.CH0_CTR_OFFSET)) == 2, "clocks are not edges")
+    wr(&c, slice_at(1, pw.CH0_CSR_OFFSET), 1 | MODE_LEVEL)
+    c.advance(500)
+    c.drive_from_outside(3, Some(false))
+    c.advance(500)
+    assert(rd(&c, slice_at(1, pw.CH0_CTR_OFFSET)) == 502, "500 clocks high")
+    // Slice 0's A on GPIO 0, wired to GPIO 3: half of each 10-clock period high.
+    c.drive_from_outside(3, None)
+    slice(&c, 0, 9, 5, 1)
+    function(&c, 0, 4)
+    c.wire(0, Some(3))
+    wr(&c, slice_at(1, pw.CH0_CTR_OFFSET), 0)
+    c.advance(10000)
+    assert(rd(&c, slice_at(1, pw.CH0_CTR_OFFSET)) == 5000, s"${rd(&c, slice_at(1, pw.CH0_CTR_OFFSET))}")
+    wr(&c, slice_at(1, pw.CH0_CTR_OFFSET), 0)
+    wr(&c, slice_at(1, pw.CH0_CSR_OFFSET), 1 | MODE_RISE)
+    c.advance(10000)
+    assert(rd(&c, slice_at(1, pw.CH0_CTR_OFFSET)) == 1000, "a rise a period")
+
+@test("refused by name through the chip: a DIV with INT 0, a phase control on a stopped slice, and a UART frame over a wire into a counting B input")
+chip_pwm_refusals()
+    var c = released()
+    assert(c.write(0, slice_at(0, pw.CH0_DIV_OFFSET), 4, 0x8).unwrap_err() == "PWM + 0x4: slice 0's DIV with INT 0: the rate it gives is not modelled")
+    assert(c.write(0, slice_at(1, pw.CH0_CSR_OFFSET) + SET, 4, pw.CH0_CSR_PH_ADV_MASK).unwrap_err().starts_with("PWM + 0x2014: slice 1's PH_ADV or PH_RET needs a running counter"))
+    assert(c.read(0, pw.BASE + 0x110, 4).unwrap_err().starts_with("PWM + 0x110"))
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_UART0_MASK)
+    wr(&c, clk.BASE + clk.CLK_PERI_CTRL_OFFSET, clk.CLK_PERI_CTRL_ENABLE_MASK)
+    wr(&c, ur.BASE + ur.UARTIBRD_OFFSET, 6)
+    wr(&c, ur.BASE + ur.UARTLCR_H_OFFSET, 0x70)
+    wr(&c, ur.BASE + ur.UARTCR_OFFSET, 0x301)
+    function(&c, 12, 2)
+    function(&c, 5, 4)
+    c.wire(12, Some(5))
+    slice(&c, 2, 0xFFFF, 0, 1 | MODE_RISE)
+    val why = c.write(0, ur.BASE + ur.UARTDR_OFFSET, 4, 0x55).unwrap_err()
+    assert(why.contains("UART0 sends a frame on GPIO 12 to GPIO 5 over a wire, a PWM slice's B input"), why)
+    wr(&c, slice_at(2, pw.CH0_CSR_OFFSET), 0)
+    wr(&c, ur.BASE + ur.UARTDR_OFFSET, 0x55)
+
+@test("pico-examples' hello_pwm on the Arm Pico 2: slice 0 runs on GPIO 0 and 1 with a period of 4, A high one clock of each and B three")
+arm_hello_pwm()
+    val b = arm_board(PWM_SRAM)
+    b.boot(HELLO_PWM).unwrap()
+    val end = b.run(10 * MS)
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}")
+    val c = &b.chip
+    for _ in 0..<12
+        val n = c.pwm.slices[0].ctr
+        assert(n < 4 && c.pin(0).level == (n < 1) && c.pin(1).level == (n < 3), s"CTR $n")
+        c.advance(1)
+        assert(c.pwm.slices[0].ctr == (n + 1) % 4)
+
+@test("pico-examples' led_fade on the Arm Pico 2: each wrap of the LED's slice (DIV 4, TOP 0xFFFF) raises PWM_IRQ_WRAP_0, whose handler squares the next level into CC")
+arm_pwm_led_fade()
+    val b = arm_board(PWM_SRAM)
+    b.boot(PWM_LED_FADE).unwrap()
+    val end = b.run(100 * MS)
+    assert(end == RunEnd.Budget, s"$end ${b.refused}")
+    val c = &b.chip
+    val wraps = c.clock() / (4 * 65536)
+    val cc = c.pwm.slices[4].cc >> 16
+    var fade: u64 = 0
+    while fade * fade < u64(cc) do fade += 1
+    assert(fade * fade == u64(cc) && fade + 3 >= wraps && fade <= wraps, s"CC B $cc after $wraps wraps")
+    assert(c.pwm.inte[0] == 1 << 4 && c.drive(25).oe, "slice 4's B on the LED")
+
+@test("pico-examples' measure_duty_cycle on the Arm Pico 2, GPIO 2 wired to GPIO 5: slice 1 drives each duty cycle and slice 2 measures it, counting clk_sys / 100 while its B input is high")
+arm_measure_duty_cycle()
+    val b = arm_board(PWM_SRAM)
+    b.boot(MEASURE_DUTY_CYCLE).unwrap()
+    b.chip.wire(2, Some(5))
+    val end = b.run(300 * MS)
+    val text = from_utf8_lossy(b.console.view())
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}\n$text")
+    // The levels are truncated: 0.5 x 1001 gives CC 500, high for 500 of 1001 clocks (49.95%), and
+    // 0.9 x 1001 CC 900 (89.91%); the measurement counts those, as silicon would.
+    val want = "\r\nPWM duty cycle measurement example\r\n" +
+        "Output duty cycle = 0.0%, measured input duty cycle = 0.0%\r\n" +
+        "Output duty cycle = 10.0%, measured input duty cycle = 10.0%\r\n" +
+        "Output duty cycle = 50.0%, measured input duty cycle = 49.9%\r\n" +
+        "Output duty cycle = 90.0%, measured input duty cycle = 89.9%\r\n" +
+        "Output duty cycle = 100.0%, measured input duty cycle = 100.0%\r\n"
+    assert(text == want, text)
+
+@test("examples/pico2/pwm_features.c on the Arm Pico 2, GPIO 4 wired to GPIO 11: a DMA channel paced by slice 3's wrap writes four levels into CC, and slice 5 counts the rising edges slice 2 makes as the edge interrupt does")
+arm_pwm_features()
+    val b = arm_board(PWM_SRAM)
+    b.boot(PWM_FEATURES).unwrap()
+    b.chip.wire(4, Some(11))
+    val end = b.run(300 * MS)
+    val text = from_utf8_lossy(b.console.view())
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}\n$text")
+    assert(text == "dma: cc 40\r\nedges: interrupt 10 counter 10\r\n", text)
+
+private rd40(c: *Rp2040, a: u32) -> u32 = c.load(0, a, 4).unwrap()
+private wr40(c: *Rp2040, a: u32, x: u32) = c.store(0, a, 4, x).unwrap()
+
+@test("the RP2040's PWM: 8 slices from 0x40050000, EN and INTE 8 bits wide, one line (PWM_IRQ_WRAP, 4) into both cores, GPIO 14 and 15 on slice 7 through the mux, a wrap through due(), and RESETS")
+pico_pwm()
+    val b = pico_board(PWM_SRAM40)
+    // Booted, so that the cores' NVICs have the RP2040's lines; nothing runs.
+    b.boot(PICO_BLINK40).unwrap()
+    val c = &b.chip
+    wr40(c, rr40.BASE + rr40.RESET_OFFSET + CLR, rr40.RESET_IO_BANK0_MASK | rr40.RESET_PADS_BANK0_MASK | rr40.RESET_PWM_MASK)
+    wr40(c, pw40.BASE + pw40.EN_OFFSET, 0xFFFFFFFF)
+    assert(rd40(c, pw40.BASE + pw40.EN_OFFSET) == 0xFF)
+    wr40(c, pw40.BASE + pw40.EN_OFFSET, 0)
+    assert(c.load(0, pw40.BASE + 0xB4, 4).is_err(), "no second line")
+    wr40(c, pw40.BASE + SLICE * 7 + pw40.CH0_TOP_OFFSET, 9)
+    wr40(c, pw40.BASE + SLICE * 7 + pw40.CH0_CC_OFFSET, (7 << 16) | 2)
+    wr40(c, pw40.BASE + SLICE * 7 + pw40.CH0_CSR_OFFSET, 1)
+    wr40(c, io40.BASE + io40.GPIO0_CTRL_OFFSET + 8 * 14, 4)
+    wr40(c, io40.BASE + io40.GPIO0_CTRL_OFFSET + 8 * 15, 4)
+    var a = ""
+    var bb = ""
+    for _ in 0..<10
+        a += if c.pin(14).level then "1" else "0"
+        bb += if c.pin(15).level then "1" else "0"
+        c.pass(1)
+    assert(a == "1100000000" && bb == "1111111000", s"$a $bb")
+    assert(c.due().is_none())
+    wr40(c, pw40.BASE + pw40.INTR_OFFSET, 0xFF)
+    wr40(c, pw40.BASE + pw40.INTE_OFFSET, 1 << 7)
+    assert(c.due() == Some(10), s"${c.due()}")
+    c.pass(10)
+    assert(rd40(c, pw40.BASE + pw40.INTS_OFFSET) == 1 << 7)
+    for k in 0..<2
+        val p = &b.cores[k]
+        c.raise(p)
+        assert(p.pending[arm.nvic_word(arm.IRQ0 + 4)] & arm.nvic_bit(arm.IRQ0 + 4) != 0, s"core $k")
+    wr40(c, rr40.BASE + rr40.RESET_OFFSET + SET, rr40.RESET_PWM_MASK)
+    wr40(c, rr40.BASE + rr40.RESET_OFFSET + CLR, rr40.RESET_PWM_MASK)
+    assert(c.pwm.enabled == 0 && rd40(c, pw40.BASE + pw40.INTS_OFFSET) == 0 && c.pwm.count == 8)

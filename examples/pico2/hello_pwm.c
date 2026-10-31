@@ -4,6 +4,9 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
+// pico-examples' pwm/hello_pwm (commit 0d62f75), unchanged: it sets slice 0 running on GPIO 0 and 1 with a
+// period of 4 and returns.
+
 // Output PWM signals on pins 0 and 1
 
 #include "pico/stdlib.h"
