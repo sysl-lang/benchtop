@@ -1601,9 +1601,10 @@ at 0x68 on both boards, and nothing else; `slave_mem_i2c` runs I2C0 as a slave t
 interrupt handler and I2C1 as the master over two wires (4 to 6, 5 to 7), and three rounds of its message
 written and read back across a repeated START come out line by line. `chip/i2c_tests.sysl` (8) asserts
 those, and at register level the lines, the timing through `next_event`, the interrupt lines, the
-refusals with the block's name, RESETS, a DMA channel paced by DREQ 44; `rp2350/i2c_tests.sysl` (11) the
-model alone. Breaking the read's bit count, RD_REQ's once per byte, or the SCL pull-up check turns them
-red.
+refusals with the block's name, RESETS, a DMA channel paced by DREQ 44; `rp2350/i2c_tests.sysl` (12) the
+model alone, among them a held master retried by a read of its own receive FIFO while the slave is
+still empty raising no second RD_REQ. Breaking the read's bit count, RD_REQ's once per byte (the `fresh`
+guard in `begin`), or the SCL pull-up check turns them red.
 
 **Cost**, host instructions retired, three interleaved runs each against the branch's base (dev at
 eb87237, `/usr/bin/time -l`, `benchtop run --board pico2`): `sram_loop.elf` 5.438–5.447 G to
