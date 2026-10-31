@@ -112,7 +112,7 @@ day. An L is split before it is handed out (§6).
 | PWM (12 slices) | 12.5 PWM | missing | Only `virt-pwm` (`peripheral/pwm/pwm.sysl`). | — | M | mux, DMA, IRQ |
 | ADC and temperature sensor | 12.4 ADC | missing | `rp-adc` has `modelled = false` (`registry.sysl:324`). The analogue input path exists in `peripheral/adc/adc.sysl`. | — | M | clk_adc, DMA |
 | DMA: 16 channels, DREQs, pacing timers, chaining, ring, IRQ0–3, sniff/CRC, MPU/secure attributes | 12.6 DMA | partial | Item 11: the 16 channels with their four alias sets and triggers, TRANS_COUNT with MODE, every CTRL field, the UART DREQs, the four X/Y pacing timers and TREQ_PERMANENT, chaining, IRQ0–3, MULTI_CHAN_TRIGGER, CHAN_ABORT; transfers through the chip's bus, one a cycle, scheduled through `next_event` (`peripheral/rp2040/dma.sysl`, `chip/dma.sysl`). Refused by name: the sniffer, a change to SECCFG_* or MPU_* (item 12), a TREQ_SEL whose source is not modelled. | `rp2350/dma_tests.sysl`, `chip/dma_tests.sysl` | S (sniff/CRC) + S (security attrs) | DREQs from every peripheral |
-| PIO0/1/2 | 11 PIO | partial | The state machines are full (item 13): every PIO version 1 instruction, delay and side-set, the FIFOs and their joins (FJOIN_RX_GET/PUT too), the shift registers' thresholds, the fractional divider cycle-exact against clk_sys, EXECCTRL, SM_RESTART/CLKDIV_RESTART and their PREV/NEXT forms, SMx_INSTR, the IRQ flags across blocks, INTR and both interrupt lines' INTE/INTF/INTS, FDEBUG, FLEVEL, DBG_PADOUT/PADOE and GPIOBASE (`peripheral/rp2350/pio.sysl`). The pins are a vector of their own: FUNCSEL PIO0–2 stays refused, and the DREQs and the lines into the NVIC are item 14's. | `rp2350/pio_tests.sysl`, `chip/pio_tests.sysl` (`pio_programs.elf`: `hello_pio`, `ws2812`, `uart_tx`, `uart_rx`, the RP2350-only pair) | M (GPIO/DMA/IRQ) | mux, DMA, IRQ |
+| PIO0/1/2 | 11 PIO | full | The state machines (item 13): every PIO version 1 instruction, delay and side-set, the FIFOs and their joins (FJOIN_RX_GET/PUT too), the shift registers' thresholds, the fractional divider cycle-exact against clk_sys, EXECCTRL, SM_RESTART/CLKDIV_RESTART and their PREV/NEXT forms, SMx_INSTR, the IRQ flags across blocks, INTR and both interrupt lines' INTE/INTF/INTS, FDEBUG, FLEVEL, DBG_PADOUT/PADOE and GPIOBASE (`peripheral/rp2350/pio.sysl`). Integrated (item 14): FUNCSEL PIO0–2 through the mux on the cycle a pin moves, the GPIOs read back through it, the 24 FIFO DREQs pacing the DMA, the six lines into both NVICs with a pulse latched; a PIO level into a UART's RX or a POWMAN-watched GPIO refused by name. | `rp2350/pio_tests.sysl`, `chip/pio_tests.sysl` (`pio_programs.elf`: `hello_pio`, `ws2812`, `uart_tx`, `uart_rx`, the RP2350-only pair), `chip/pio_examples_tests.sysl` (`pio_blink`, `ws2812`, `uart_tx`, `uart_rx`, `uart_dma` whole) | M (GPIO/DMA/IRQ) | mux, DMA, IRQ |
 | USB controller, device mode (and the CDC bridge to the host) | 12.7 USB | full | The controller in device mode, whole (`peripheral/rp2350/usb.sysl`, item 20): the registers, DPRAM with the SETUP packet, endpoint and buffer control, single and double buffering, NAK, STALL, abort, the interrupts and USBCTRL_IRQ, driven by a host through the Arm board's `usb_*` seam. Not gated by RESETS, since the SDK reads SIE_CTRL before releasing USBCTRL; RESETS asserting it resets the controller. benchtop's own host (`chip/usb_host.sysl`, item 21) enumerates a CDC ACM device on a 1 ms frame schedule and bridges its port to the console or a pty (`benchtop run --usb`). | `peripheral/rp2350/usb_tests.sysl`, `chip/usb_tests.sysl`, `chip/usb_host_tests.sysl`, `host/pty_tests.sysl` | — | clk_usb |
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
 | TIMER0/1 | 12.8 System timers | full | 64-bit counter, latch, 4 alarms, LOCKED, SOURCE (`peripheral/rp2350/timing.sysl:91–145`). | `rp2350/tests.sysl:44`, `chip/tests.sysl:18` | — | — |
@@ -171,7 +171,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 34 | 9 | 0 | 15 | 58 |
+| RP2350 | 35 | 8 | 0 | 15 | 58 |
 | RP2040 | 20 | 7 | 2 | 8 | 37 |
 
 No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
@@ -1222,7 +1222,7 @@ runs them on clk_sys (`chip/rp2350.sysl` `advance`, `pio_drive`, `pio_pins`).
   so nothing is counted while no state machine runs. The blocks run to the chip's `now` only when
   something can see them: a PIO, RESETS or ACCESSCTRL access, `pio_drive` and `pio_pins`, and the
   faults the board collects each quantum (`take_line_fault`), so the chip's `advance` pays nothing for
-  them. Item 14's pins, DREQs and interrupts will give them events of their own.
+  them. Item 14's pins, DREQs and interrupts give them events of their own where something watches.
 - **Only what changes is run**: a state machine is visited on the cycle its delay ends, its next attempt,
   or an autopull refill. One stalled on an empty TX FIFO, a full RX FIFO, a pin or an IRQ flag is not
   visited until a FIFO access, a register write, a level driven onto the inputs or an IRQ flag changes;
@@ -1242,8 +1242,7 @@ runs them on clk_sys (`chip/rp2350.sysl` `advance`, `pio_drive`, `pio_pins`).
   INPUT_SYNC_BYPASS removes. Side-set is made as the instruction issues, even when it stalls, and wins
   over its own state machine's OUT, SET or MOV; the higher-numbered state machine wins a pin on a cycle;
   OUT_STICKY asserts the last write again every cycle; INLINE_OUT_EN gates OUT and MOV to the pins by a
-  data bit and lets a sticky write go. Tests drive the vector: FUNCSEL PIO0–2 is still refused, naming
-  item 14.
+  data bit and lets a sticky write go. Item 14 takes them through the mux.
 - **FIFOs and flags**: 4 and 4, or 8 joined either way with the other reading full and empty; FJOIN_RX_PUT
   and _GET give the RX storage to MOV and RXFn_PUTGETm (the processor's only while exactly one is set);
   FSTAT, FLEVEL, FDEBUG's four sticky flags, INTR (RXNEMPTY, TXNFULL, all eight flags), IRQ0/1
