@@ -1,0 +1,208 @@
+module sh.sysl.benchtop.chip
+
+// A core asleep in `WFE` with nothing enabled, on both chips: its NVIC latches a line that rises and
+// falls meanwhile, and SEVONPEND makes the line's becoming pending an event that wakes it. The line is
+// TIMER's IRQ 0 on each chip, forced through INTF.
+
+import sh.sysl.benchtop.v6m as arm
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.rp2040.timer as timer40
+import sh.sysl.rp2350.timer0 as timer50
+
+private val WFE_BLINK50 = embed("../../../../examples/pico2/blink.elf")
+private val WFE_BLINK40 = embed("../../../../examples/pico/blink.elf")
+private val WFE_SRAM50 = SramMap(0x20000000, 520 * 1024)
+private val WFE_SRAM40 = SramMap(0x20000000, 264 * 1024)
+
+private const INTF50: u32 = timer50.BASE + timer50.INTF_OFFSET
+private const INTF40: u32 = timer40.BASE + timer40.INTF_OFFSET
+
+private const CODE: u32 = 0x20030000
+private const HANDLER: u32 = 0x20030100
+private const TABLE: u32 = 0x20030200
+private const STACK: u32 = 0x20031000
+private const PARK: u32 = 0x20031100
+
+// wfe; str r1, [r0] (NVIC_ISER gets bit 0); a taken branch, where an interrupt is taken; bkpt
+private val ENABLES = [0xBF20u16, 0x6001, 0xE7FF, 0xBE00]
+// wfe; bkpt
+private val ONLY_WAKES = [0xBF20u16, 0xBE00]
+
+private put[C: ArmChip](b: &ArmBoard[C], at: u32, code: []const u16)
+    for i in 0..<code.len
+        b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
+        b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
+
+// Core 0 parked in `wfi; b .`; core 1 at `code`, IRQ 0's handler `movs r3, #7; bx lr`, run until it sleeps
+// in the WFE with nothing enabled and IRQ 0 not pending.
+private asleep_in_wfe[C: ArmChip](b: &ArmBoard[C], code: []const u16, sevonpend: bool)
+    b.run(5 * 150000)
+    put(b, PARK, [0xBF30, 0xE7FD])
+    b.cores[0].pc = PARK
+    b.cores[0].sleeping = false
+    put(b, CODE, code)
+    put(b, HANDLER, [0x2307, 0x4770])
+    val vector = TABLE + 4 * arm.IRQ0 - b.map.base
+    b.mem.ram[vector] = u8(HANDLER & 0xFF) + 1
+    b.mem.ram[vector + 1] = u8((HANDLER >> 8) & 0xFF)
+    b.mem.ram[vector + 2] = u8((HANDLER >> 16) & 0xFF)
+    b.mem.ram[vector + 3] = u8(HANDLER >> 24)
+    val c = &b.cores[1]
+    c.vtor = TABLE
+    c.r[0] = arm.NVIC_ISER
+    c.r[1] = 1
+    c.r[3] = 0
+    c.r[13] = STACK
+    c.pc = CODE
+    c.sleeping = false
+    c.on_event = false
+    c.event = false
+    c.scr = if sevonpend then arm.SCR_SEVONPEND else 0
+    b.run(5000)
+    arm.nvic_write(c, arm.NVIC_ICPR, 1)
+    arm.nvic_write(&b.cores[0], arm.NVIC_ICPR, 1)
+    c.event = false
+    assert(c.sleeping && c.on_event && c.pc == CODE + 2, s"core 1 asleep in the WFE: ${c.pc}")
+    assert(!irq0_pending(c))
+
+private irq0_pending(c: *arm.Cpu) -> bool = arm.exception_pending(c, arm.IRQ0)
+
+// IRQ 0 rises where no settle sees it, as a device's event does during a quantum, and core 0's store
+// lowers it.
+private pulse[C: ArmChip](b: &ArmBoard[C], intf: u32)
+    b.chip.store(0, intf, 4, 1).unwrap()
+    b.write(&b.cores[0], intf, 4, 0, b.cores[0].retired)
+    assert(b.chip.shared_lines() & 1 == 0, "the line is low again")
+
+// Pulsed asleep: pending and not enabled, core 1 sleeps on; an event wakes it, it enables IRQ 0, and the
+// handler runs.
+private pulse_then_enable[C: ArmChip](b: &ArmBoard[C], intf: u32)
+    asleep_in_wfe(b, ENABLES, false)
+    pulse(b, intf)
+    val c = &b.cores[1]
+    assert(irq0_pending(c), "core 1's NVIC latched the pulse")
+    assert(!irq0_pending(&b.cores[0]), "the core lowering a line is not pended by it")
+    b.run(5000)
+    assert(c.sleeping && c.on_event && irq0_pending(c), "pending and disabled wakes nothing")
+    c.event = true
+    assert(b.run(20000) == RunEnd.Breakpoint, s"core 1 at ${c.pc}")
+    assert(c.stop == Stop.Breakpoint && c.r[3] == 7, s"the handler ran: r3 ${c.r[3]}")
+
+// The same with no pulse: enabling finds nothing to take, so the test above can fail.
+private no_pulse_no_handler[C: ArmChip](b: &ArmBoard[C])
+    asleep_in_wfe(b, ENABLES, false)
+    val c = &b.cores[1]
+    c.event = true
+    assert(b.run(20000) == RunEnd.Breakpoint, s"core 1 at ${c.pc}")
+    assert(c.r[3] == 0, "nothing was pending")
+
+// A line held across a settle, then lowered from outside the board: latched by the settle.
+private held_across_settle[C: ArmChip](b: &ArmBoard[C], intf: u32)
+    asleep_in_wfe(b, ENABLES, false)
+    b.chip.store(0, intf, 4, 1).unwrap()
+    b.run(5000)
+    b.chip.store(0, intf, 4, 0).unwrap()
+    assert(irq0_pending(&b.cores[1]))
+
+// A core's read of the chip latches what is high before it, for the sleeper only.
+private latched_before_a_read[C: ArmChip](b: &ArmBoard[C], intf: u32)
+    asleep_in_wfe(b, ENABLES, false)
+    b.chip.store(0, intf, 4, 1).unwrap()
+    b.read(&b.cores[0], intf, 4, b.cores[0].retired)
+    assert(irq0_pending(&b.cores[1]) && !irq0_pending(&b.cores[0]))
+
+// SEVONPEND: the pulse wakes the core with IRQ 0 still disabled, so it is not taken.
+private sevonpend_wakes[C: ArmChip](b: &ArmBoard[C], intf: u32)
+    asleep_in_wfe(b, ONLY_WAKES, true)
+    pulse(b, intf)
+    val c = &b.cores[1]
+    assert(b.run(20000) == RunEnd.Breakpoint, s"core 1 at ${c.pc}")
+    assert(c.stop == Stop.Breakpoint && c.pc == CODE + 2 && c.r[3] == 0 && irq0_pending(c), s"woken, not taken: ${c.pc}")
+
+// SEVONPEND clear: the same pulse leaves it asleep, the line pending.
+private sevonpend_clear_sleeps[C: ArmChip](b: &ArmBoard[C], intf: u32)
+    asleep_in_wfe(b, ONLY_WAKES, false)
+    pulse(b, intf)
+    b.run(20000)
+    val c = &b.cores[1]
+    assert(c.sleeping && c.on_event && c.pc == CODE + 2 && irq0_pending(c), s"still asleep: ${c.pc}")
+
+// Only becoming pending is an event: from a device or ISPR, once, and only with SEVONPEND.
+private becoming_pending[C: ArmChip](b: &ArmBoard[C])
+    val c = &b.cores[1]
+    arm.nvic_write(c, arm.NVIC_ICPR, 0xFFFFFFFF)
+    c.event = false
+    c.scr = arm.SCR_SEVONPEND
+    arm.raise(c, 1)
+    assert(c.event, "a device's line")
+    c.event = false
+    arm.raise(c, 1)
+    assert(!c.event, "already pending")
+    arm.raise(c, c.nvic_irqs)
+    assert(!c.event, "no such interrupt")
+    arm.nvic_write(c, arm.NVIC_ISPR, 4)
+    assert(c.event, "ISPR")
+    c.event = false
+    arm.nvic_write(c, arm.NVIC_ISPR, 4)
+    arm.nvic_write(c, arm.NVIC_ICPR, 4)
+    assert(!c.event, "ISPR of a pending one, and ICPR")
+    c.scr = 0
+    arm.raise(c, 3)
+    arm.nvic_write(c, arm.NVIC_ISPR, 16)
+    assert(!c.event, "without SEVONPEND")
+
+@test("RP2350: a line pulsed while core 1 sleeps in WFE with nothing enabled stays pending, and fires once enabled; with no pulse nothing fires")
+wfe_pulse_rp2350()
+    val b = arm_board(WFE_SRAM50)
+    b.boot(WFE_BLINK50).unwrap()
+    pulse_then_enable(b, INTF50)
+    val quiet = arm_board(WFE_SRAM50)
+    quiet.boot(WFE_BLINK50).unwrap()
+    no_pulse_no_handler(quiet)
+
+@test("RP2040: a line pulsed while core 1 sleeps in WFE with nothing enabled stays pending, and fires once enabled; with no pulse nothing fires")
+wfe_pulse_rp2040()
+    val b = pico_board(WFE_SRAM40)
+    b.boot(WFE_BLINK40).unwrap()
+    pulse_then_enable(b, INTF40)
+    val quiet = pico_board(WFE_SRAM40)
+    quiet.boot(WFE_BLINK40).unwrap()
+    no_pulse_no_handler(quiet)
+
+@test("RP2350: a sleeper latches a line at a settle and before another core's read")
+wfe_latch_paths_rp2350()
+    val b = arm_board(WFE_SRAM50)
+    b.boot(WFE_BLINK50).unwrap()
+    held_across_settle(b, INTF50)
+    val r = arm_board(WFE_SRAM50)
+    r.boot(WFE_BLINK50).unwrap()
+    latched_before_a_read(r, INTF50)
+
+@test("RP2040: a sleeper latches a line at a settle and before another core's read")
+wfe_latch_paths_rp2040()
+    val b = pico_board(WFE_SRAM40)
+    b.boot(WFE_BLINK40).unwrap()
+    held_across_settle(b, INTF40)
+    val r = pico_board(WFE_SRAM40)
+    r.boot(WFE_BLINK40).unwrap()
+    latched_before_a_read(r, INTF40)
+
+@test("RP2350: SEVONPEND wakes WFE on a disabled interrupt's pulse without taking it; clear, the core sleeps on")
+wfe_sevonpend_rp2350()
+    val b = arm_board(WFE_SRAM50)
+    b.boot(WFE_BLINK50).unwrap()
+    sevonpend_wakes(b, INTF50)
+    val c = arm_board(WFE_SRAM50)
+    c.boot(WFE_BLINK50).unwrap()
+    sevonpend_clear_sleeps(c, INTF50)
+    becoming_pending(c)
+
+@test("RP2040: SEVONPEND wakes WFE on a disabled interrupt's pulse without taking it; clear, the core sleeps on")
+wfe_sevonpend_rp2040()
+    val b = pico_board(WFE_SRAM40)
+    b.boot(WFE_BLINK40).unwrap()
+    sevonpend_wakes(b, INTF40)
+    val c = pico_board(WFE_SRAM40)
+    c.boot(WFE_BLINK40).unwrap()
+    sevonpend_clear_sleeps(c, INTF40)
+    becoming_pending(c)
