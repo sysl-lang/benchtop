@@ -171,10 +171,10 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | COUNT | COUNT | COUNT | COUNT | 58 |
-| RP2040 | COUNT | COUNT | COUNT | COUNT | 37 |
+| RP2350 | 38 | 11 | 1 | 8 | 58 |
+| RP2040 | 21 | 9 | 2 | 5 | 37 |
 
-No RP2350 block is a register-stub today. Every block that is not modelled is refused by the bus, which is
+The one RP2350 register-stub is GLITCH_DETECTOR, whose detectors cannot fire in an emulator. Every block that is not modelled is refused by the bus, which is
 benchtop's policy for unsupported accesses (`docs/peripheral-models.md:54`). Several items below
 build register-stubs on purpose: a block stored as written, with a named refusal for any behaviour
 the stub does not carry out.
