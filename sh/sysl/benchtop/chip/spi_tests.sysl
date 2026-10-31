@@ -1,0 +1,341 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.rp2040.clocks as clk40
+import sh.sysl.rp2040.io_bank0 as io40
+import sh.sysl.rp2040.pads_bank0 as pads40
+import sh.sysl.rp2040.resets as rr40
+import sh.sysl.rp2040.spi0 as sp40
+import sh.sysl.benchtop.peripheral.rp2350.RP2350_DMA
+import sh.sysl.rp2350.clocks as clk
+import sh.sysl.rp2350.dma as d
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.spi0 as sp
+import sh.sysl.rp2350.spi1 as sp1
+import sysl.text.from_utf8_lossy
+
+// The two PL022 SPI controllers on the chips (`peripheral/rp2350/spi.sysl`): the clock counted in clk_peri
+// cycles through `advance` and `next_event`, words timed edge by edge in the four Motorola modes and four
+// data sizes, MISO from a wire between GPIOs, the FIFOs' flags, requests and interrupts, the pins the
+// function mux drives, and what is refused by name; the same on the RP2040; then pico-examples' spi/spi_dma
+// on the Arm Pico 2.
+
+private val SPI_DMA = embed("../../../../examples/pico2/spi_dma.elf")
+private val SRAM = SramMap(0x20000000, 520 * 1024)
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+// The SDK's GPIOs for SPI0 on a Pico: RX, CSn, SCK, TX.
+private const RX_PIN: u32 = 16
+private const SCK_PIN: u32 = 18
+private const TX_PIN: u32 = 19
+
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+private ctrl_at(n: u32) -> u32 = io.BASE + io.GPIO0_CTRL_OFFSET + 8 * n
+private refused(c: *Rp2350, a: u32, x: u32) -> string = c.write(0, a, 4, x).unwrap_err()
+
+// The pads, both SPIs and clk_peri (from clk_sys, the ring oscillator at power-on) out of reset.
+private released() -> Rp2350
+    var c = rp2350()
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK | rr.RESET_SPI0_MASK | rr.RESET_SPI1_MASK)
+    wr(&c, clk.BASE + clk.CLK_PERI_CTRL_OFFSET, clk.CLK_PERI_CTRL_ENABLE_MASK)
+    c
+
+// GPIO `n` given to function `f` as the SDK's gpio_set_function leaves it: input on, out of isolation.
+private function(c: *Rp2350, n: u32, f: u32)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + CLR, pads.GPIO0_OD_MASK | pads.GPIO0_ISO_MASK)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET, pads.GPIO0_IE_MASK)
+    wr(c, ctrl_at(n), f)
+
+// SPI0's three pins on SPI0's function.
+private pins(c: *Rp2350)
+    for n in [RX_PIN, SCK_PIN, TX_PIN] do function(c, n, io.GPIO0_CTRL_FUNCSEL_SPI0_RX)
+
+// SPI0 as spi_init and spi_set_format leave it, then enabled: `bits` a word, `mode` 0 to 3 as the SDK's
+// (CPOL, CPHA), CPSDVSR 2 and SCR 0 so that a bit is two clk_peri cycles, and `cr1` the CR1 bits besides SSE.
+private setup(c: *Rp2350, bits: u32, mode: u32, cr1: u32)
+    wr(c, sp.BASE + sp.SSPCR0_OFFSET, (bits - 1) | (mode << 6))
+    wr(c, sp.BASE + sp.SSPCPSR_OFFSET, 2)
+    wr(c, sp.BASE + sp.SSPCR1_OFFSET, cr1 | 2)
+
+private sr(c: *Rp2350) -> u32 = rd(c, sp.BASE + sp.SSPSR_OFFSET)
+private put(c: *Rp2350, x: u32) = wr(c, sp.BASE + sp.SSPDR_OFFSET, x)
+private get(c: *Rp2350) -> u32 = rd(c, sp.BASE + sp.SSPDR_OFFSET)
+
+@test("a word in loopback takes 8 bits of CPSDVSR x (SCR + 1) clk_peri cycles: BSY until its last edge, then RNE and the word; next_event counts the cycles to it")
+spi_loopback_timing()
+    var c = released()
+    setup(&c, 8, 0, 1)
+    assert(sr(&c) == 3, s"TFE and TNF only: ${sr(&c)}")
+    assert(c.next_event().is_none(), "an idle SPI offers nothing")
+    put(&c, 0xA5)
+    assert(c.next_event() == Some(16), s"${c.next_event()}")
+    c.advance(10)
+    assert(c.next_event() == Some(6), s"${c.next_event()}")
+    c.advance(5)
+    assert(sr(&c) & 4 == 0 && sr(&c) & 16 != 0, s"after 15 cycles: ${sr(&c)}")
+    c.advance(1)
+    assert(sr(&c) & 4 != 0 && sr(&c) & 16 == 0, s"after 16 cycles: ${sr(&c)}")
+    assert(get(&c) == 0xA5, "the word")
+    assert(sr(&c) & 4 == 0, "RNE cleared by the read")
+    assert(c.next_event().is_none(), "idle again")
+    // A slower clock: SCR 3 makes a bit eight cycles, the word 64.
+    wr(&c, sp.BASE + sp.SSPCR1_OFFSET, 0)
+    wr(&c, sp.BASE + sp.SSPCR0_OFFSET, 7 | (3 << 8))
+    wr(&c, sp.BASE + sp.SSPCR1_OFFSET, 3)
+    put(&c, 0x5A)
+    c.advance(63)
+    assert(sr(&c) & 4 == 0, "63 cycles")
+    c.advance(1)
+    assert(get(&c) == 0x5A, "64 cycles")
+
+@test("loopback returns every word in all four modes and data sizes 4 to 16 bits, back to back through the FIFO")
+spi_modes_and_sizes()
+    for mode in 0u32..<4
+        for bits in [4u32, 8, 12, 16]
+            var c = released()
+            setup(&c, bits, mode, 1)
+            val mask = (1u32 << bits) - 1
+            val words = [0x1234u32 & mask, 0xFEDC & mask, 0x0001 & mask, 0x8421 & mask]
+            for w in words do put(&c, w)
+            c.advance(u64(4 * bits * 2 + 1))
+            for w in words do assert(get(&c) == w, s"mode $mode, $bits bits: word $w")
+            assert(sr(&c) & 4 == 0, "all four read")
+
+@test("MISO is the RX pin: a wire from TX to RX returns the word, no wire reads low; SCK and TX drive only while SSE is set, SCK idling at CPOL's level")
+spi_pins_and_wire()
+    var c = released()
+    pins(&c)
+    assert(!c.pin(SCK_PIN).drives && !c.pin(TX_PIN).drives, "disabled, nothing drives")
+    c.wire(TX_PIN, Some(RX_PIN))
+    setup(&c, 8, 0, 0)
+    assert(c.pin(SCK_PIN).drives && c.pin(TX_PIN).drives && !c.pin(SCK_PIN).level, "enabled, SCK idle low")
+    assert(!c.pin(RX_PIN).drives, "RX is an input")
+    put(&c, 0x3C)
+    c.advance(16)
+    assert(get(&c) == 0x3C, "the wire returned the word")
+    wr(&c, sp.BASE + sp.SSPCR1_OFFSET, 0)
+    assert(!c.pin(SCK_PIN).drives, "SSE cleared")
+    wr(&c, sp.BASE + sp.SSPCR0_OFFSET, 7 | (1 << 6))
+    wr(&c, sp.BASE + sp.SSPCR1_OFFSET, 2)
+    assert(c.pin(SCK_PIN).level, "CPOL 1 idles SCK high")
+    c.wire(TX_PIN, None)
+    put(&c, 0xFF)
+    c.advance(16)
+    assert(get(&c) == 0, "no wire: MISO low")
+    // Held high from outside, the RX pin reads all ones.
+    c.drive_from_outside(RX_PIN, Some(true))
+    put(&c, 0x00)
+    c.advance(16)
+    assert(get(&c) == 0xFF, "driven high from outside")
+
+@test("the pins of SPI1: GPIOs 8 to 11 carry SPI1, and SPI0's pins do not move it")
+spi_second_port()
+    var c = released()
+    for n in [8u32, 10, 11] do function(&c, n, io.GPIO0_CTRL_FUNCSEL_SPI0_RX)
+    c.wire(11, Some(8))
+    wr(&c, sp1.BASE + sp1.SSPCR0_OFFSET, 7)
+    wr(&c, sp1.BASE + sp1.SSPCPSR_OFFSET, 2)
+    wr(&c, sp1.BASE + sp1.SSPCR1_OFFSET, 2)
+    assert(c.pin(10).drives && c.pin(11).drives, "SPI1 enabled")
+    assert(!c.pin(SCK_PIN).drives, "SPI0 untouched")
+    wr(&c, sp1.BASE + sp1.SSPDR_OFFSET, 0x96)
+    c.advance(16)
+    assert(rd(&c, sp1.BASE + sp1.SSPDR_OFFSET) == 0x96, "SPI1 through its own wire")
+    assert(sr(&c) & 4 == 0, "SPI0's FIFO empty")
+
+@test("the transmit FIFO holds 8 and drops a ninth write; TNF, RFF and the receive overrun with RORIC; the receive FIFO's eight words stay in order")
+spi_fifos()
+    var c = released()
+    setup(&c, 8, 0, 1)
+    // One word moves to the shifter at once, so nine writes fill the FIFO.
+    for i in 0u32..<9 do put(&c, 0x10 + i)
+    assert(sr(&c) & 2 == 0 && sr(&c) & 1 == 0, s"full: ${sr(&c)}")
+    put(&c, 0xEE)
+    c.advance(16)
+    assert(sr(&c) & 2 != 0, "a slot free after a word")
+    c.advance(16 * 8)
+    assert(sr(&c) & 8 != 0, "RFF")
+    assert(rd(&c, sp.BASE + sp.SSPRIS_OFFSET) & 1 != 0, "the ninth word overran the receive FIFO")
+    for i in 0u32..<8 do assert(get(&c) == 0x10 + i, s"word $i")
+    wr(&c, sp.BASE + sp.SSPICR_OFFSET, 1)
+    assert(rd(&c, sp.BASE + sp.SSPRIS_OFFSET) & 1 == 0, "RORIC")
+
+@test("SSPIMSC's TX, RX and receive-timeout interrupts raise the chip's SPI0 line; the timeout comes 64 half-clocks after the last word is read or received")
+spi_interrupts()
+    var c = released()
+    setup(&c, 8, 0, 1)
+    assert(!c.spi.irq(0), "nothing enabled")
+    wr(&c, sp.BASE + sp.SSPIMSC_OFFSET, 8)
+    assert(c.spi.irq(0) && rd(&c, sp.BASE + sp.SSPMIS_OFFSET) == 8, "TXIM: the FIFO is at most half full")
+    wr(&c, sp.BASE + sp.SSPIMSC_OFFSET, 2)
+    put(&c, 0x42)
+    c.advance(16)
+    assert(!c.spi.irq(0), "RTIM waits")
+    assert(c.next_event() == Some(64), s"${c.next_event()}")
+    c.advance(63)
+    assert(!c.spi.irq(0), "63 cycles")
+    c.advance(1)
+    assert(c.spi.irq(0) && rd(&c, sp.BASE + sp.SSPMIS_OFFSET) == 2, "RTIM")
+    wr(&c, sp.BASE + sp.SSPICR_OFFSET, 2)
+    assert(!c.spi.irq(0), "RTIC")
+    wr(&c, sp.BASE + sp.SSPIMSC_OFFSET, 4)
+    for i in 0u32..<4 do put(&c, i)
+    c.advance(16 * 4)
+    assert(c.spi.irq(0), "RXIM at four words")
+    assert(get(&c) == 0x42, "the word before")
+    get(&c)
+    assert(!c.spi.irq(0), "below four")
+
+@test("the DMA requests: TX while TXDMAE is set and the FIFO has room, RX while RXDMAE is set and a word waits, as DREQ 24 to 27")
+spi_dreqs()
+    var c = released()
+    setup(&c, 8, 0, 1)
+    assert(c.uart_dreq(24) == Some(false) && c.uart_dreq(25) == Some(false), "DMACR clear")
+    wr(&c, sp.BASE + sp.SSPDMACR_OFFSET, 3)
+    assert(c.uart_dreq(24) == Some(true) && c.uart_dreq(25) == Some(false), "room, nothing received")
+    wr(&c, sp1.BASE + sp1.SSPDMACR_OFFSET, 3)
+    assert(c.uart_dreq(26) == Some(true) && c.uart_dreq(27) == Some(false), "SPI1 is its own")
+    for i in 0u32..<9 do put(&c, i)
+    assert(c.uart_dreq(24) == Some(false), "TX FIFO full")
+    c.advance(16)
+    assert(c.uart_dreq(24) == Some(true) && c.uart_dreq(25) == Some(true), "room again, a word waiting")
+    wr(&c, sp.BASE + sp.SSPDMACR_OFFSET, 2)
+    assert(c.uart_dreq(25) == Some(false), "RXDMAE off")
+    assert(c.uart_dreq(23).is_none() && c.uart_dreq(32).is_none(), "neighbours are not the SPIs'")
+
+@test("a channel paced by SPI0's TX request feeds the FIFO, and by its RX request drains it, 64 bytes through loopback")
+spi_dma_loopback()
+    var c = released()
+    var ram: SpiRam
+    c.connect_memory(&ram)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_DMA_MASK)
+    setup(&c, 8, 0, 1)
+    wr(&c, sp.BASE + sp.SSPDMACR_OFFSET, 3)
+    for i in 0u32..<64 do ram.bytes[i] = u8.wrap(i * 7 + 1)
+    // Channel 0 out (reading incrementing, paced by DREQ 24), channel 1 in (writing incrementing, DREQ 25),
+    // 8-bit transfers, both started together.
+    val l = RP2350_DMA
+    val out = (0u32 << l.size.trailing_zeros()) | l.incr_read | ((24u32 << l.treq.trailing_zeros()) & l.treq) | (0u32 << l.chain.trailing_zeros()) | l.en
+    val back = l.incr_write | ((25u32 << l.treq.trailing_zeros()) & l.treq) | (1u32 << l.chain.trailing_zeros()) | l.en
+    wr(&c, d.BASE + d.CH0_READ_ADDR_OFFSET, 0x20000000)
+    wr(&c, d.BASE + d.CH0_WRITE_ADDR_OFFSET, sp.BASE + sp.SSPDR_OFFSET)
+    wr(&c, d.BASE + d.CH0_TRANS_COUNT_OFFSET, 64)
+    wr(&c, d.BASE + 0x40 + d.CH0_READ_ADDR_OFFSET, sp.BASE + sp.SSPDR_OFFSET)
+    wr(&c, d.BASE + 0x40 + d.CH0_WRITE_ADDR_OFFSET, 0x20000100)
+    wr(&c, d.BASE + 0x40 + d.CH0_TRANS_COUNT_OFFSET, 64)
+    wr(&c, d.BASE + d.CH0_AL1_CTRL_OFFSET, out)
+    wr(&c, d.BASE + 0x40 + d.CH0_AL1_CTRL_OFFSET, back)
+    wr(&c, d.BASE + d.MULTI_CHAN_TRIGGER_OFFSET, 3)
+    assert(c.dma.busy == 3, s"both channels busy: ${c.dma.busy}")
+    var steps = 0
+    loop
+        c.next_event() match
+            Some(n) -> c.advance(n)
+            None -> break
+        steps += 1
+        if steps > 100000 then break
+    assert(c.dma.busy == 0, s"channels still busy: ${c.dma.busy}")
+    for i in 0u32..<64 do assert(ram.bytes[0x100 + i] == u8.wrap(i * 7 + 1), s"byte $i")
+    // 64 words at 16 clk_peri cycles: the whole run is within a few cycles of 1024.
+    assert(c.now >= 1024 && c.now < 1100, s"${c.now}")
+
+// 4 KB of SRAM at 0x20000000 for a chip with no board.
+private struct SpiRam
+    bytes: [4096]u8
+
+impl DmaMemory for SpiRam
+    dma_read(*self, a: u32, width: u32) -> Reach
+        if a < 0x20000000 || a - 0x20000000 >= 4096 then return Reach.Chip
+        var v: u32 = 0
+        for k in 0..<width do v |= u32(self.bytes[a - 0x20000000 + k]) << (8 * k)
+        Reach.Done(v)
+
+    dma_write(*self, a: u32, width: u32, x: u32) -> Reach
+        if a < 0x20000000 || a - 0x20000000 >= 4096 then return Reach.Chip
+        for k in 0..<width do self.bytes[a - 0x20000000 + k] = u8.wrap(x >> (8 * k))
+        Reach.Done(0)
+
+@test("what is refused by name: slave mode, CSn's frame signal, TI and Microwire frames, a reserved data size, a bad prescale, a format changed while enabled, DR and ICR through an alias, and a port whose pins the GPIO interrupts watch")
+spi_refusals()
+    var c = released()
+    pins(&c)
+    wr(&c, sp.BASE + sp.SSPCPSR_OFFSET, 2)
+    assert(refused(&c, sp.BASE + sp.SSPCR1_OFFSET, 4).contains("SPI0 + 0x4") && refused(&c, sp.BASE + sp.SSPCR1_OFFSET, 4).contains("slave mode"), refused(&c, sp.BASE + sp.SSPCR1_OFFSET, 4))
+    assert(rd(&c, sp.BASE + sp.SSPCR1_OFFSET) == 0, "CR1 as it was")
+    assert(refused(&c, sp.BASE + sp.SSPCR1_OFFSET, 2).contains("reserved data size"), "DSS 0")
+    wr(&c, sp.BASE + sp.SSPCR0_OFFSET, 7 | (1 << 4))
+    assert(refused(&c, sp.BASE + sp.SSPCR1_OFFSET, 2).contains("TI synchronous serial or Microwire"), "FRF")
+    wr(&c, sp.BASE + sp.SSPCR0_OFFSET, 7)
+    assert(refused(&c, sp.BASE + sp.SSPCPSR_OFFSET, 3).contains("even"), "odd CPSDVSR")
+    assert(refused(&c, sp.BASE + sp.SSPCPSR_OFFSET, 0).contains("even"), "CPSDVSR 0")
+    assert(refused(&c, sp.BASE + sp.SSPCPSR_OFFSET, 256).contains("even"), "CPSDVSR 256")
+    assert(rd(&c, sp.BASE + sp.SSPCPSR_OFFSET) == 2, "CPSDVSR as it was")
+    assert(refused(&c, sp.BASE + sp.SSPDR_OFFSET + SET, 1).contains("SPI0"), "DR through the set alias")
+    assert(refused(&c, sp.BASE + sp.SSPICR_OFFSET + CLR, 1).contains("SPI0"), "ICR through the clear alias")
+    // Enabled, the format and the divisor stay put.
+    wr(&c, sp.BASE + sp.SSPCR1_OFFSET, 2)
+    assert(refused(&c, sp.BASE + sp.SSPCR0_OFFSET, 0x47).contains("SSE is set"), "CR0 while enabled")
+    assert(refused(&c, sp.BASE + sp.SSPCPSR_OFFSET, 4).contains("SSE is set"), "CPSR while enabled")
+    // A watched pin: the interrupt would have to see SCK's edges.
+    wr(&c, sp.BASE + sp.SSPCR1_OFFSET, 0)
+    wr(&c, io.BASE + io.PROC0_INTE2_OFFSET, 1 << 8)
+    val why = refused(&c, sp.BASE + sp.SSPCR1_OFFSET, 2)
+    assert(why.contains("GPIO 18") && why.contains("GPIO interrupts"), why)
+    assert(rd(&c, sp.BASE + sp.SSPCR1_OFFSET) == 0, "still disabled")
+    // CSn's function stays refused, by name, and an unmodelled register is not silently stored.
+    val csn = c.write(0, ctrl_at(17), 4, io.GPIO0_CTRL_FUNCSEL_SPI0_RX)
+    assert(csn.is_err() && csn.unwrap_err().contains("SPI0_CSN"), "CSn")
+
+@test("the PL022's ID registers read as the datasheet's, and a RESETS pulse returns a configured port to its power-on state")
+spi_ids_and_reset()
+    var c = released()
+    assert(rd(&c, sp.BASE + sp.SSPPERIPHID0_OFFSET) == 0x22 && rd(&c, sp.BASE + sp.SSPPERIPHID1_OFFSET) == 0x10, "PeriphID")
+    assert(rd(&c, sp.BASE + sp.SSPPERIPHID2_OFFSET) == 0x04 && rd(&c, sp.BASE + sp.SSPPCELLID3_OFFSET) == 0xB1, "PCellID")
+    setup(&c, 16, 3, 1)
+    wr(&c, sp.BASE + sp.SSPIMSC_OFFSET, 15)
+    put(&c, 1)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + SET, rr.RESET_SPI0_MASK)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_SPI0_MASK)
+    for r in [sp.SSPCR0_OFFSET, sp.SSPCR1_OFFSET, sp.SSPCPSR_OFFSET, sp.SSPIMSC_OFFSET, sp.SSPDMACR_OFFSET] do assert(rd(&c, sp.BASE + r) == 0, s"register $r")
+    assert(sr(&c) == 3 && c.next_event().is_none(), "empty, idle")
+
+private rd40(c: *Rp2040, a: u32) -> u32 = c.load(0, a, 4).unwrap()
+private wr40(c: *Rp2040, a: u32, x: u32) = c.store(0, a, 4, x).unwrap()
+
+@test("the RP2040's SPI0: a loopback word, its pins through the mux, the slave mode and CSn refusals")
+rp2040_spi()
+    var c = rp2040()
+    wr40(&c, rr40.BASE + rr40.RESET_OFFSET + CLR, rr40.RESET_IO_BANK0_MASK | rr40.RESET_PADS_BANK0_MASK | rr40.RESET_SPI0_MASK | rr40.RESET_SPI1_MASK)
+    wr40(&c, clk40.BASE + clk40.CLK_PERI_CTRL_OFFSET, clk40.CLK_PERI_CTRL_ENABLE_MASK)
+    for n in [16u32, 18, 19] do wr40(&c, io40.BASE + io40.GPIO0_CTRL_OFFSET + 8 * n, 1)
+    assert(!c.pin(18).drives, "disabled")
+    wr40(&c, sp40.BASE + sp40.SSPCR0_OFFSET, 7)
+    wr40(&c, sp40.BASE + sp40.SSPCPSR_OFFSET, 2)
+    wr40(&c, sp40.BASE + sp40.SSPCR1_OFFSET, 3)
+    assert(c.pin(18).drives && c.pin(19).drives, "enabled")
+    wr40(&c, sp40.BASE + sp40.SSPDR_OFFSET, 0xC3)
+    assert(c.due().is_some(), "a transfer is due")
+    c.pass(16)
+    assert(rd40(&c, sp40.BASE + sp40.SSPDR_OFFSET) == 0xC3, "loopback")
+    assert(c.store(0, sp40.BASE + sp40.SSPCR1_OFFSET, 4, 4).unwrap_err().contains("slave mode"), "slave mode")
+    val csn = c.store(0, io40.BASE + io40.GPIO0_CTRL_OFFSET + 8 * 17, 4, 1)
+    assert(csn.is_err() && csn.unwrap_err().contains("SPI0_CSN"), "CSn")
+
+@test("pico-examples' spi/spi_dma on the Arm Pico 2: 1024 bytes out by DMA paced by SPI0's TX request and back by DMA paced by its RX request in loopback, compared by the program")
+arm_spi_dma()
+    val b = arm_board(SRAM)
+    b.boot(SPI_DMA).unwrap()
+    val end = b.run(150000000)
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(b.finish_sending(), b.refused)
+    val text = from_utf8_lossy(b.console.view())
+    val want = "SPI DMA example\r\n" +
+        "Configure TX DMA\r\n" +
+        "Configure RX DMA\r\n" +
+        "Starting DMAs...\r\n" +
+        "Wait for RX complete...\r\n" +
+        "Done. Checking...All good\r\n"
+    assert(text == want, text)
