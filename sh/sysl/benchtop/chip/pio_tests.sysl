@@ -1,7 +1,10 @@
 module sh.sysl.benchtop.chip
 @tests
 
+import sh.sysl.benchtop.peripheral.rp2350.RP2350_DMA
+import sh.sysl.benchtop.v6m as arm
 import sh.sysl.rp2350.accessctrl as ac
+import sh.sysl.rp2350.dma as dr
 import sh.sysl.rp2350.io_bank0 as io
 import sh.sysl.rp2350.pads_bank0 as pads
 import sh.sysl.rp2350.pio0 as pr
@@ -23,6 +26,7 @@ import sysl.text.{fields, from_utf8_lossy, parse_ulong_base, split}
 // pin record also take GPIO 0 through the mux (pio_examples_tests.sysl runs whole programs that way).
 
 private val PIO_PROGRAMS = embed("../../../../examples/pico2/pio_programs.elf")
+private val RISCV_PIO_IMAGE = embed("../../../../examples/pico2-riscv/blink.elf")
 private val HELLO_H = embed("../../../../examples/pico2/pio/hello.pio.h")
 private val WS2812_H = embed("../../../../examples/pico2/pio/ws2812.pio.h")
 private val UART_TX_H = embed("../../../../examples/pico2/pio/uart_tx.pio.h")
@@ -469,3 +473,45 @@ pio_pin_refusals()
     sdk_set(&w, 0, 0, 0, true, 1)
     w.advance(10)
     assert(w.take_line_fault() == Some("PIO0 drives GPIO 0, which POWMAN watches: POWMAN samples its GPIOs as time passes, and a level from a PIO block between catch-ups is not modelled"))
+
+// PIO2 SM0 pushes a word with IRQ 0 enabled on its RXNEMPTY, and DMA channel 0, paced by that FIFO's
+// DREQ (20), moves it at once into SM1's TX FIFO: the line is up for the cycles between.
+private pio_rx_pulse(c: *Rp2350)
+    wr(c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_PIO2_MASK | rr.RESET_DMA_MASK)
+    wr(c, pr2.BASE + pr.IRQ0_INTE_OFFSET, pr.IRQ0_INTE_SM0_RXNEMPTY_MASK)
+    val l = RP2350_DMA
+    wr(c, dr.BASE + dr.CH0_READ_ADDR_OFFSET, pr2.BASE + pr.RXF0_OFFSET)
+    wr(c, dr.BASE + dr.CH0_WRITE_ADDR_OFFSET, pr2.BASE + pr.TXF1_OFFSET)
+    wr(c, dr.BASE + dr.CH0_TRANS_COUNT_OFFSET, 1)
+    wr(c, dr.BASE + dr.CH0_CTRL_TRIG_OFFSET, (2 << l.size.trailing_zeros()) | (20 << l.treq.trailing_zeros()) | l.en)
+    // SET X, 1; MOV ISR, X; PUSH.
+    for instr in [0xe021u32, 0xa0c1, 0x8020]
+        wr(c, sm_reg(2, 0, 16), instr)
+        c.advance(4)
+    c.advance(20)
+    assert(rd(c, pr2.BASE + pr.FLEVEL_OFFSET) == 1 << 8, "the word moved from SM0's RX FIFO to SM1's TX FIFO")
+
+@test("a PIO interrupt pulse reaches every core: PIO2's IRQ 0, up only while the DMA empties the RX FIFO, is taken by each core's look once, one core's look leaving the other's; both Arm cores' NVICs and both Hazard3 harts take it")
+pio_irq_pulse_each_core()
+    val bit = 1u64 << 19
+    var c = released()
+    pio_rx_pulse(&c)
+    assert(c.shared_interrupts() & bit == 0, "no longer a level")
+    assert(c.core_interrupts(1) & bit != 0, "core 1")
+    assert(c.core_interrupts(1) & bit == 0, "core 1, once")
+    assert(c.core_interrupts(0) & bit != 0, "core 0, after core 1 took its own")
+    assert(c.core_interrupts(0) & bit == 0, "core 0, once")
+    // Booted, so that the NVICs and the harts have the RP2350's lines; nothing runs.
+    val b = arm_board(SRAM)
+    b.boot(PIO_PROGRAMS).unwrap()
+    pio_rx_pulse(&b.chip)
+    for k in 0..<2
+        val p = &b.cores[k]
+        arm.raise_lines(p, b.chip.shared_lines() | b.chip.core_lines(u32(k)))
+        assert(p.pending[arm.nvic_word(arm.IRQ0 + 19)] & arm.nvic_bit(arm.IRQ0 + 19) != 0, s"Arm core $k")
+    val r = riscv_board(SRAM)
+    r.boot(RISCV_PIO_IMAGE).unwrap()
+    pio_rx_pulse(&r.chip)
+    for k in 0..<2
+        r.chip.signal(&r.harts[k])
+        assert(r.harts[k].cs.pending & bit != 0, s"hart $k")
