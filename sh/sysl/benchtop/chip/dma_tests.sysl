@@ -298,7 +298,7 @@ chip_dma_bus_errors()
     assert(rd(&c, ch(2, d.CH0_CTRL_TRIG_OFFSET)) & 0xA0000000 == 0xA0000000)
     assert(c.take_line_fault().is_none(), "a bus error is modelled, not refused")
 
-@test("refused by name: an unmodelled block, a write to the XIP blocks, an unaligned transfer, a TREQ_SEL with no source, the sniffer; a refused register write leaves the DMA as it was")
+@test("refused by name: an unmodelled block, a write to the XIP blocks, an unaligned transfer, a TREQ_SEL with no source, a reserved sniffer CALC; a refused register write leaves the DMA as it was")
 chip_dma_refusals()
     var ram: TestRam
     val cases = [
@@ -321,9 +321,9 @@ chip_dma_refusals()
         Ok(_) -> assert(false, "SPI0's DREQ was let through")
         Err(why) -> assert(why.contains("SPI0's TX FIFO") && why.contains("does not model"), why)
     assert(rd(&c, ch(0, d.CH0_AL1_CTRL_OFFSET)) == ctrl(2, true, true, 0, 0x3f), "CTRL as it was")
-    c.write(0, d.BASE + d.SNIFF_CTRL_OFFSET, 4, 1) match
-        Ok(_) -> assert(false, "the sniffer")
-        Err(why) -> assert(why.contains("DMA + 0x454") && why.contains("item 12"), why)
+    c.write(0, d.BASE + d.SNIFF_CTRL_OFFSET, 4, 4 << 5) match
+        Ok(_) -> assert(false, "a reserved sniffer CALC")
+        Err(why) -> assert(why.contains("DMA + 0x454") && why.contains("CALC 4 is reserved"), why)
 
 @test("RESETS holding the DMA stops it and puts its registers back to power-on; the DMA's registers are refused while it is held")
 chip_dma_reset()
@@ -400,3 +400,71 @@ arm_dma_uart()
         "chained 0x1000 0x1001 0x100a 0x100b\r\n" +
         "done\r\n"
     assert(text == want, text)
+
+private val SNIFF_CRC = embed("../../../../examples/pico2/sniff_crc.elf")
+
+@test("a copy sniffed on the chip: the CRC-32 of the bytes the channel read accumulates in SNIFF_DATA as it goes, BSWAP of the channel included, and the copy is unharmed")
+chip_dma_sniffs_a_copy()
+    var ram: TestRam
+    var c = released(&ram)
+    for i in 0u32..<9 do ram.bytes[i] = u8(0x31 + i)
+    wr(&c, d.BASE + d.SNIFF_DATA_OFFSET, 0xFFFFFFFF)
+    // CALC 1 (CRC-32 of bit-reversed data), OUT_REV and OUT_INV, EN on channel 3.
+    wr(&c, d.BASE + d.SNIFF_CTRL_OFFSET, 1 | (3 << 1) | (1 << 5) | 0x400 | 0x800)
+    start(&c, 3, RAM, RAM + 0x100, 9, ctrl(0, true, true, 3, 0x3f) | RP2350_DMA.sniff)
+    c.advance(4)
+    assert(rd(&c, d.BASE + d.SNIFF_DATA_OFFSET) != 0xCBF43926, "part way")
+    c.advance(5)
+    assert(rd(&c, d.BASE + d.SNIFF_DATA_OFFSET) == 0xCBF43926, "the standard CRC-32 of 123456789")
+    for i in 0u32..<9 do assert(ram.bytes[0x100 + i] == u8(0x31 + i))
+    // Channel 0 is not the one watched, and has no SNIFF_EN.
+    start(&c, 0, RAM, RAM + 0x200, 9, ctrl(0, true, true, 0, 0x3f))
+    c.advance(9)
+    assert(rd(&c, d.BASE + d.SNIFF_DATA_OFFSET) == 0xCBF43926)
+    // A word copy with BSWAP on the channel is sniffed after the swap.
+    wr(&c, d.BASE + d.SNIFF_DATA_OFFSET, 0)
+    wr(&c, d.BASE + d.SNIFF_CTRL_OFFSET, 1 | (3 << 1) | (15 << 5))
+    ram.set_word(RAM + 0x300, 0x11223344)
+    start(&c, 3, RAM + 0x300, RAM + 0x310, 1, ctrl(2, true, true, 3, 0x3f) | RP2350_DMA.sniff | RP2350_DMA.bswap)
+    c.advance(1)
+    assert(rd(&c, d.BASE + d.SNIFF_DATA_OFFSET) == 0x44332211 && ram.word(RAM + 0x310) == 0x44332211)
+
+@test("the DMA's MPU on the chip: a Non-secure channel reading an address the MPU makes Secure gets READ_ERROR and its interrupt, a Secure one copies it; a channel's level is what ACCESSCTRL sees")
+chip_dma_mpu_bus_error()
+    var ram: TestRam
+    var c = released(&ram)
+    ram.set_word(RAM, 0xABCD)
+    // Region 0: the first 128 bytes of SRAM are Secure and privileged.
+    wr(&c, d.BASE + d.MPU_BAR0_OFFSET, RAM)
+    wr(&c, d.BASE + d.MPU_LAR0_OFFSET, (RAM + 0x60) | 7)
+    wr(&c, d.BASE + d.SECCFG_CH1_OFFSET, 0)
+    start(&c, 1, RAM, RAM + 0x100, 1, ctrl(2, false, false, 1, 0x3f))
+    c.advance(1)
+    assert(rd(&c, ch(1, d.CH0_CTRL_TRIG_OFFSET)) & 0xC0000000 == 0xC0000000 && rd(&c, d.BASE + d.INTR_OFFSET) == 2, "READ_ERROR")
+    assert(ram.word(RAM + 0x100) == 0, "nothing written")
+    start(&c, 0, RAM, RAM + 0x100, 1, ctrl(2, false, false, 0, 0x3f))
+    c.advance(1)
+    assert(ram.word(RAM + 0x100) == 0xABCD, "channel 0 is Secure privileged")
+    // A write into the Secure region by the Non-secure channel is a WRITE_ERROR.
+    wr(&c, d.BASE + d.SECCFG_CH2_OFFSET, 0)
+    start(&c, 2, RAM + 0x100, RAM + 0x10, 1, ctrl(2, false, false, 2, 0x3f))
+    c.advance(1)
+    assert(rd(&c, ch(2, d.CH0_CTRL_TRIG_OFFSET)) & 0xA0000000 == 0xA0000000 && ram.word(RAM + 0x10) == 0, "WRITE_ERROR")
+    // An address no region covers takes MPU_CTRL's attributes (Non-secure unprivileged): channel 1 may use it.
+    start(&c, 1, RAM + 0x100, RAM + 0x180, 1, ctrl(2, false, false, 1, 0x3f))
+    c.advance(1)
+    assert(rd(&c, ch(1, d.CH0_CTRL_TRIG_OFFSET)) & 0xC0000000 == 0, "outside the region")
+    // ACCESSCTRL sees the channel's level: UART0 reachable only by Secure privileged denies Non-secure channel 1.
+    wr(&c, ac.BASE + ac.UART0_OFFSET, 0xACCE0000 | 0x48)
+    wr(&c, d.BASE + d.SECCFG_CH3_OFFSET, 2)
+    start(&c, 3, RAM + 0x100, ur.BASE + ur.UARTDR_OFFSET, 1, ctrl(0, false, false, 3, 0x3f))
+    c.advance(1)
+    assert(rd(&c, ch(3, d.CH0_CTRL_TRIG_OFFSET)) & 0xA0000000 == 0xA0000000, "S+U is below the S+P the device wants")
+
+@test("examples/pico2/sniff_crc.c (pico-examples' dma/sniff_crc) on the Arm Pico 2: the sniffer's CRC-32 over the data and its appended checksum is 0")
+arm_sniff_crc()
+    val b = arm_board(SRAM)
+    b.boot(SNIFF_CRC).unwrap()
+    val text = run_to_end(b, 150000000)
+    assert(text == "Buffer to DMA: 0x31 0x32 0x33 0x34 0x35 0x36 0x37 0x38 0x39 0xd9 0xc6 0x0b 0x34 \r\n" +
+        "Completed DMA sniff of 13 byte buffer, DMA sniff accumulator value: 0x0\r\nCRC32 check is good\r\n", text)
