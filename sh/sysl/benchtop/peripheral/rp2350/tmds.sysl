@@ -1,0 +1,122 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.rp2350.sio as sio_reg
+
+// TMDS: the DVI 1.0 encoder (figure 3-5), which HSTX's expander and the SIO's per-core encoder share, and
+// the SIO's encoder (datasheet 3.1; `hardware/regs/sio.h`, TMDS_*).
+//
+// **The SIO's encoder**: a 32-bit colour register and a lane's running balance per lane. A lane takes the
+// colour's 16 low bits rotated right by its ROT, then bits 7:0, its top NBITS + 1 bits kept. PEEK_SINGLE and
+// POP_SINGLE encode one pixel on all three lanes, and PEEK_DOUBLE_Ln and POP_DOUBLE_Ln two pixels on lane n,
+// the second seeing the colour shifted by PIX_SHIFT unless PIX2_NOSHIFT is set. Every read advances the
+// balance; a POP also shifts the colour, by PIX_SHIFT, or by double that for a double without PIX2_NOSHIFT
+// (a shift of 32 is no shift). A write to a PEEK or POP does nothing. **Refused by name**: the reserved
+// PIX_SHIFT values 6 and 7.
+
+/** One symbol from 8 bits of data, `balance` the lane's running disparity (DVI 1.0, figure 3-5). */
+tmds_encode(balance: *i32, d: u8) -> u32
+    val data = u32(d)
+    val ones = data.count_ones()
+    val xnor = ones > 4 || (ones == 4 && data & 1 == 0)
+    var qm = data & 1
+    for i in 1u32..<8
+        val next = ((qm >> (i - 1)) ^ (data >> i)) & 1
+        qm |= (if xnor then next ^ 1 else next) << i
+    val q8 = if xnor then 0u32 else 1
+    val high = i32(qm.count_ones())
+    val low = 8 - high
+    val inverted = qm ^ 0xFF
+    if *balance == 0 || high == low
+        *balance += if q8 == 0 then low - high else high - low
+        return ((1 - q8) << 9) | (q8 << 8) | (if q8 == 1 then qm else inverted)
+    if (*balance > 0 && high > low) || (*balance < 0 && low > high)
+        *balance += 2 * i32(q8) + low - high
+        return 0x200 | (q8 << 8) | inverted
+    *balance += high - low - 2 * i32(1 - q8)
+    (q8 << 8) | qm
+
+// TMDS_CTRL's bits that are stored; CLEAR_BALANCE falls back to 0 at once.
+private const TMDS_STORED: u32 = 0x0F9FFFFF
+private const NO_SHIFT: u32 = 32
+
+/** One core's SIO TMDS encoder. */
+struct Tmds
+    ctrl: u32
+    colour: u32
+    balance: [3]i32
+
+    // PIX_SHIFT's bits (0, 1, 2, 4, 8, 16 for its six values).
+    private pix_shift(self) -> u32
+        val field = (self.ctrl & sio_reg.TMDS_CTRL_PIX_SHIFT_MASK) >> sio_reg.TMDS_CTRL_PIX_SHIFT_SHIFT
+        if field == 0 then 0 else 1u32 << (field - 1)
+
+    private noshift(self) -> bool = self.ctrl & sio_reg.TMDS_CTRL_PIX2_NOSHIFT_MASK != 0
+
+    // Lane `lane`'s encoder input from colour `c`.
+    private input(self, lane: u32, c: u32) -> u8
+        val rot = (self.ctrl >> (4 * lane)) & 0xF
+        val nbits = (self.ctrl >> (12 + 3 * lane)) & 7
+        val low = c & 0xFFFF
+        val turned = if rot == 0 then low else (low >> rot) | (low << (16 - rot))
+        u8(turned & 0xFF & (0xFF00u32 >> (nbits + 1)))
+
+    // The colour register moved on by `by` bits; 32 leaves it.
+    private shift_by(*self, by: u32)
+        if by != NO_SHIFT then self.colour >>= by
+
+    private single(*self) -> u32
+        val sym = [tmds_encode(&self.balance[0], self.input(0, self.colour)), tmds_encode(&self.balance[1], self.input(1, self.colour)), tmds_encode(&self.balance[2], self.input(2, self.colour))]
+        if self.ctrl & sio_reg.TMDS_CTRL_INTERLEAVE_MASK == 0 then return sym[0] | (sym[1] << 10) | (sym[2] << 20)
+        var word: u32 = 0
+        for chunk in 0u32..<5
+            for lane in 0u32..<3 do word |= ((sym[lane] >> (2 * chunk)) & 3) << (6 * chunk + 2 * lane)
+        word
+
+    private double(*self, lane: u32) -> u32
+        val shift = self.pix_shift()
+        val second = if self.noshift() || shift == 0 then self.colour elif shift == 32 then self.colour else self.colour >> shift
+        val a = tmds_encode(&self.balance[lane], self.input(lane, self.colour))
+        val b = tmds_encode(&self.balance[lane], self.input(lane, second))
+        a | (b << 10)
+
+    /** A read of TMDS register `address`; None where it is not one. */
+    read(*self, address: u32) -> Option[u32]
+        address match
+            sio_reg.TMDS_CTRL_OFFSET -> Some(self.ctrl)
+            sio_reg.TMDS_WDATA_OFFSET -> Some(0)
+            sio_reg.TMDS_PEEK_SINGLE_OFFSET -> Some(self.single())
+            sio_reg.TMDS_POP_SINGLE_OFFSET ->
+                val v = self.single()
+                self.shift_by(self.pix_shift())
+                Some(v)
+            sio_reg.TMDS_PEEK_DOUBLE_L0_OFFSET -> Some(self.double(0))
+            sio_reg.TMDS_PEEK_DOUBLE_L1_OFFSET -> Some(self.double(1))
+            sio_reg.TMDS_PEEK_DOUBLE_L2_OFFSET -> Some(self.double(2))
+            sio_reg.TMDS_POP_DOUBLE_L0_OFFSET -> Some(self.pop_double(0))
+            sio_reg.TMDS_POP_DOUBLE_L1_OFFSET -> Some(self.pop_double(1))
+            sio_reg.TMDS_POP_DOUBLE_L2_OFFSET -> Some(self.pop_double(2))
+            _ -> None
+
+    private pop_double(*self, lane: u32) -> u32
+        val v = self.double(lane)
+        val shift = self.pix_shift()
+        self.shift_by(if self.noshift() then shift else 2 * shift)
+        v
+
+    /** A write to TMDS register `address`; false where it is not one. */
+    write(*self, address: u32, x: u32) -> bool
+        if address == sio_reg.TMDS_CTRL_OFFSET
+            self.ctrl = x & TMDS_STORED
+            if x & sio_reg.TMDS_CTRL_CLEAR_BALANCE_MASK != 0 then self.balance = [0; 3]
+            return true
+        if address == sio_reg.TMDS_WDATA_OFFSET
+            self.colour = x
+            return true
+        address >= sio_reg.TMDS_PEEK_SINGLE_OFFSET && address <= sio_reg.TMDS_POP_DOUBLE_L2_OFFSET
+end Tmds
+
+/** Why a write of `x` at SIO offset `offset` asks for an encoder setting benchtop does not model. */
+tmds_unmodelled(offset: u32, x: u32) -> Option[string]
+    if offset != sio_reg.TMDS_CTRL_OFFSET then return None
+    val field = (x & sio_reg.TMDS_CTRL_PIX_SHIFT_MASK) >> sio_reg.TMDS_CTRL_PIX_SHIFT_SHIFT
+    if field > 5 then Some(s"TMDS_CTRL.PIX_SHIFT $field is reserved and not modelled") else None

@@ -80,7 +80,7 @@ day. An L is split before it is handed out (§6).
 | SIO RISC-V platform timer (MTIME, MTIMECMP, soft IRQ) | 3.1.8 / 3.1 SIO | full | `peripheral/rp2350/sio.sysl:15–16,48–51`. | `rp2350/tests.sysl:129` | — | — |
 | SIO doorbells (8, SIO_IRQ_BELL) | 3.1 SIO | full | DOORBELL_OUT_SET/CLR (the other core's DOORBELL_IN) and DOORBELL_IN_SET/CLR (this core's), bits 7:0; SIO_IRQ_BELL (26) per core while any bit is set (`peripheral/rp2350/sio.sysl`, `chip/rp2350.sysl` `signal`; item 15). The Non-secure SIO's SIO_IRQ_BELL_NS is not (Secure-only). | `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
 | SIO interpolators INTERP0/1 (per core) | 3.1 SIO | full | `peripheral/rp2040/interp.sysl`, shared with the RP2040: each core's own pair; shift (rotate here), mask, SIGNED, CROSS_INPUT, CROSS_RESULT, ADD_RAW, FORCE_MSB, BLEND (INTERP0), CLAMP (INTERP1), OVERF flags, PEEK/POP, ACCUMx_ADD, BASE_1AND0 (item 15). | `rp2040/interp_tests.sysl`, `rp2350/sio_tests.sysl`, `chip/interp_tests.sysl` (`interp.elf`) | — | — |
-| SIO TMDS encoder | 3.1 SIO | missing | Refused (`sio.sysl:10`). | — | S | HSTX (for a use) |
+| SIO TMDS encoder | 3.1 SIO | full | `peripheral/rp2350/tmds.sysl` (item 29): each core's colour register and per-lane balance, PEEK/POP SINGLE and DOUBLE_Ln, PIX_SHIFT and PIX2_NOSHIFT, CLEAR_BALANCE. Refused by name: PIX_SHIFT 6 and 7. | `peripheral/rp2350/hstx_tests.sysl` | — | — |
 | BUSCTRL: bus priority, performance counters | 2.1 Bus fabric | partial | Priority and PERFSEL stored, PERFCTR_EN; counters of events an ideal bus cannot have read 0; access-event counters refused by name (item 28). | `chip/busctrl_tests.sysl` | — | — |
 | ACCESSCTRL | 10.6 Access control | full (stored) | Every register stored with the datasheet's reset values; the 0xACCE password (not GPIO_NSMASK0/1), sticky LOCK bits that drop a locked core's writes, FORCE_CORE_NS, CFGRESET. The Arm board gates every core bus access by it (master, security state, privilege), a denial refused by name; a write restricting a memory device is refused. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl`, `chip/arm_tests.sysl` | — | — |
 | ROM: core-1 launch protocol | 5.3 / 5 Bootrom | full | The real ROM's own code, on both boards: each M33's and Hazard3's core 1 starts from reset in it and waits there (salts, then the FIFO handshake, asleep in `WFE` / `h3.block`); PSM's release restarts it (item 6). | `chip/arm_tests.sysl`, `chip/startup_tests.sysl` | — | — |
@@ -116,7 +116,7 @@ day. An L is split before it is handed out (§6).
 | USB controller, host mode | 12.7 USB | missing | — | — | L | device mode |
 | TIMER0/1 | 12.8 System timers | full | 64-bit counter, latch, 4 alarms, LOCKED, SOURCE (`peripheral/rp2350/timing.sysl:91–145`). | `rp2350/tests.sysl:44`, `chip/tests.sysl:18` | — | — |
 | WATCHDOG | 12.9 Watchdog | full | The RP2040's counter (`peripheral/rp2040/watchdog.sysl`, `WatchdogCounter`), one decrement a tick from TICKS' watchdog generator: CTRL (ENABLE, PAUSE_DBG0/DBG1/JTAG, TIME), LOAD, TRIGGER, REASON, SCRATCH0–7. Firing resets the PSM stages WDSEL selects, and RESETS.WDSEL's peripherals where RESETS' stage is not selected (`Rp2350.watchdog_reset`); the Arm board restarts core 0 through the ROM's boot path (the PC/SP request in SCRATCH4–7, or the flash image's normal boot) and core 1 into the ROM wait; a typed boot request and a blank flash's BOOTSEL are refused by name; the RISC-V board refuses the restart by name. No debugger exists to pause it, so the PAUSE inputs are only tested at the model (item 10). | `rp2040/watchdog_tests.sysl`, `rp2350/tests.sysl`, `chip/watchdog_tests.sysl` (`watchdog.elf`) | — | — |
-| HSTX | 12.11 HSTX | missing | Not decoded. | — | M | clk_hstx, DMA, mux, a display part |
+| HSTX | 12.11 HSTX | full | `peripheral/rp2350/hstx.sysl` (item 29): the FIFO and DREQ_HSTX, the shift register, the clock generator, BIT0–7, the command expander (RAW, RAW_REPEAT, TMDS, TMDS_REPEAT, NOP) with its TMDS encoders, on GPIO 12–19 at FUNCSEL 0; a DVI monitor part (`parts/dvi`) reads the outputs. Refused by name: coupled mode, EXPAND_EN changed while enabled, CLKPHASE of a period or more, reserved opcodes, a count of 0, a narrow FIFO write. | `chip/hstx_tests.sysl` (`hstx/spi_lcd`, `hstx/dvi_out_hstx_encoder`), `peripheral/rp2350/hstx_tests.sysl`, `parts/dvi/tests.sysl` | — | — |
 | TRNG | 12.12 TRNG | full | The 192-bit holding register filled from a seeded SplitMix64 (`TRNG_SEED`, or `seed`), with the sampling time and the interrupt; the CRNGT and autocorrelation failure bits never set. | `rp2350/crypto_tests.sysl`, `chip/crypto_tests.sysl` (`system/rand`) | — | — |
 | SHA-256 | 12.13 SHA-256 | full | START, WDATA in words, halfwords or bytes, BSWAP, the 57-cycle digest, SUM0–7 and the DREQ for the DMA path; the compression is `sha256_compress`. | `rp2350/crypto_tests.sysl`, `chip/crypto_tests.sysl` (`sha/hello_sha256`) | — | DMA (for the SDK's DMA path) |
 | SYSINFO (CHIP_ID, PLATFORM, GITREF) | 12.15 System control | full | CHIP_ID 0x30004927, PACKAGE_SEL 1 (RP2350A), PLATFORM ASIC, GITREF 0; read-only. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
@@ -170,7 +170,7 @@ day. An L is split before it is handed out (§6).
 
 | chip | full | partial | register-stub | missing | rows |
 |---|---|---|---|---|---|
-| RP2350 | 40 | 11 | 1 | 6 | 58 |
+| RP2350 | 42 | 11 | 1 | 4 | 58 |
 | RP2040 | 22 | 10 | 2 | 3 | 37 |
 
 The one RP2350 register-stub is GLITCH_DETECTOR, whose detectors cannot fire in an emulator. Every block that is not modelled is refused by the bus, which is
@@ -1800,3 +1800,34 @@ eb87237, `/usr/bin/time -l`, `benchtop run --board pico2`): `sram_loop.elf` 5.43
 118.08–118.12 G to 118.08–118.10 G: within 0.1%. An earlier cut that worked out both I2C lines every
 quantum cost `sram_loop` 0.3%; `I2cBus.lines` is why it does not. `bus_scan.elf`, with no part on the
 lines, runs in 4.04–4.05 G.
+
+### Item 29, done: HSTX and the SIO TMDS encoder
+
+**Modelled** (`peripheral/rp2350/hstx.sysl`, `tmds.sysl`): HSTX's eight-word FIFO, its DREQ (52) and
+STAT.WOF; the shift register rotating by CSR.SHIFT through N_SHIFTS cycles a word; the clock generator,
+which runs only while the register shifts; BIT0–7 with SEL_P, SEL_N, INV and CLK, on GPIO 12–19 at
+FUNCSEL 0; the command expander's RAW, RAW_REPEAT, TMDS, TMDS_REPEAT and NOP with EXPAND_SHIFT and
+EXPAND_TMDS, its encoders' balance cleared by EN low and by each raw command. clk_hstx comes from
+CLOCKS, its cycles carried between steps as a remainder of clk_sys. The SIO's TMDS encoder per core:
+the colour register, PEEK/POP SINGLE and DOUBLE_Ln, PIX_SHIFT, PIX2_NOSHIFT and CLEAR_BALANCE, both
+sharing the DVI 1.0 encoder. A DVI monitor part (`parts/dvi`) deserialises the outputs, locks on the
+first control token and measures the mode, the sync widths, the clock and every pixel.
+
+**Refused by name:** coupled mode (PIO to HSTX), EXPAND_EN changed while EN is set, CLKPHASE of a full
+period or more, a reserved opcode or a count of 0 met in the FIFO, a narrow FIFO write, a GPIO interrupt
+on a pin HSTX drives, the SIO encoder's reserved PIX_SHIFT 6 and 7.
+
+**Timing:** the DMA paced by DREQ_HSTX waits on the FIFO's next pop (`hstx_due`), never per cycle. A
+board's quantum also ends where a busy channel fed by HSTX may finish with its interrupt enabled
+(`hstx_irq_due`): `dvi_out_hstx_encoder` refills a ping-pong pair from DMA_IRQ_0 in `WFI`, and a
+1000-cycle quantum let the chained channel run on with its spent addresses (the framebuffer's next
+words met as commands) before the handler could take the interrupt. With no HSTX-fed channel the bound
+is None and quanta are unchanged.
+
+**Oracles:** pico-examples' `hstx/spi_lcd` (an ST7789 driven through HSTX's raw path, every pixel of
+its first frame) and `hstx/dvi_out_hstx_encoder` (640x480 at 800 by 525, every pixel of the mountains
+picture), both on the Arm Pico 2. BUSCTRL's BUS_PRIORITY, which the DVI example sets, comes from item 28,
+merged into this branch.
+
+**Cost:** the main lines do not enable HSTX, so `hstx_irq_due` answers None at its first test and the
+DMA's paths are unchanged for them; the train's bench of the five main lines covers it.
