@@ -41,6 +41,10 @@ target_link_libraries(hello_multicore pico_multicore)
 # blink also as a UF2, the RAM image the boot ROM's USB drive takes and enters at its first byte.
 pico_add_uf2_output(blink)
 target_link_libraries(hello_rtc hardware_rtc)
+foreach(prog hello_adc onboard_temperature)
+    benchtop_program(${prog} ${prog}.c no_flash)
+    target_link_libraries(${prog} hardware_adc)
+endforeach()
 target_link_libraries(rtc_alarm hardware_rtc)
 # rom_crosscheck: a flash image with a UF2, for a real Pico as well as benchtop, stdio on UART0 and USB.
 # benchtop's own ROM routines are compiled into it by sysl from rom_crosscheck/ours, an archive it links.
