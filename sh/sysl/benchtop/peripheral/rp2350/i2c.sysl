@@ -1,0 +1,761 @@
+module sh.sysl.benchtop.peripheral.rp2350
+
+import sh.sysl.benchtop.peripheral.i2c.Device
+import sh.sysl.benchtop.peripheral.rp2040.{AccessError, access, read_lane, replicated, written}
+import sh.sysl.rp2350.i2c0 as reg
+import sh.sysl.rp2350.pads_bank0 as pad_reg
+import sysl.buf.Buf
+import sysl.fmt.hex
+import sysl.math.{max, min}
+
+// I2C0 and I2C1: Synopsys DW_apb_i2c controllers (datasheet, "I2C"; the field descriptions and the
+// configuration parameters at the head of the SDK's `hardware/regs/i2c.h`, the same on both chips), on
+// the bus they share with each other and with the parts on the workbench (`I2cBus`).
+//
+// **The bus is modelled a step at a time, and timed.** A master's transaction is a START, the address
+// byte and its acknowledge, data bytes each with its acknowledge, any number of repeated STARTs, and a
+// STOP. Each step takes whole periods of SCL: one bit is HCNT + LCNT + SPKLEN + 8 ic_clk cycles (the
+// DW_apb_i2c databook's "IC_CLK frequency configuration": SCL high HCNT + SPKLEN + 7, low LCNT + 1, rise
+// and fall ideal), and ic_clk is clk_sys, so a step's length is counted in the chip's own cycles. A START,
+// a repeated START, a STOP and an acknowledge on its own are one bit each; an address or a data byte
+// written is nine; a byte read is eight, its acknowledge sent as the next command decides it. The chip
+// runs the steps through `next_due` and `run`, so an idle bus costs nothing.
+//
+// **Masters and slaves.** A master takes its commands from IC_DATA_CMD's FIFO: a byte to write or a read,
+// with RESTART and STOP. It holds the bus with SCL low while the FIFO is empty and the last command had no
+// STOP (IC_EMPTYFIFO_HOLD_MASTER_EN = 1), and acknowledges each byte read but the last before a STOP or a
+// repeated START. A slave answers its IC_SAR on the bus: a byte written to it goes into its receive FIFO,
+// with FIRST_DATA_BYTE on the first after the address; a read from it raises RD_REQ, and SCL stays low
+// until its CPU puts a byte in its transmit FIFO. A slave whose receive FIFO is full holds SCL low too
+// while RX_FIFO_FULL_HLD_CTRL is set, and loses the byte with RX_OVER while it is clear; a master's own
+// receive FIFO behaves the same. A part on the workbench (`I2cPart`) answers through the device callbacks
+// (`peripheral/i2c/i2c.sysl`): it acknowledges its address, and each byte it is written as it says.
+// Every interrupt but GEN_CALL is raised as the databook describes, and TX_ABRT with its sources:
+// ABRT_7B_ADDR_NOACK, ABRT_TXDATA_NOACK, ABRT_SLVFLUSH_TXFIFO, ABRT_SLVRD_INTX and ABRT_USER_ABRT. Clearing
+// IC_ENABLE or setting ABORT ends a master's transfer after the step in progress, with a STOP.
+//
+// **Refused by name**: 10-bit addressing, a general call or START BYTE (IC_TAR.SPECIAL), a master and a
+// slave at once, disabling a slave in the middle of a transfer to it, a repeated START with
+// IC_RESTART_EN clear, two masters on one bus, two targets answering one address, and a line benchtop
+// cannot show (`Wiring.why`). Writes to IC_CON, IC_TAR, IC_SAR, the SCL counts and IC_FS_SPKLEN while the
+// controller is enabled have no effect, as the descriptions say. SDA_HOLD and SDA_SETUP are stored and do
+// not change the timing.
+
+/** The DW_apb_i2c's FIFOs are 16 entries deep (IC_TX_BUFFER_DEPTH, IC_RX_BUFFER_DEPTH). */
+const I2C_FIFO: usize = 16
+
+// No step is timed.
+private const NOT_DUE: u64 = 0xffffffffffffffff
+
+// The interrupts that latch; RX_FULL and TX_EMPTY follow the FIFOs.
+private const LATCHED: u32 = reg.IC_RAW_INTR_STAT_RESTART_DET_MASK | reg.IC_RAW_INTR_STAT_GEN_CALL_MASK | reg.IC_RAW_INTR_STAT_START_DET_MASK |
+    reg.IC_RAW_INTR_STAT_STOP_DET_MASK | reg.IC_RAW_INTR_STAT_ACTIVITY_MASK | reg.IC_RAW_INTR_STAT_RX_DONE_MASK |
+    reg.IC_RAW_INTR_STAT_TX_ABRT_MASK | reg.IC_RAW_INTR_STAT_RD_REQ_MASK | reg.IC_RAW_INTR_STAT_TX_OVER_MASK |
+    reg.IC_RAW_INTR_STAT_RX_OVER_MASK | reg.IC_RAW_INTR_STAT_RX_UNDER_MASK
+
+// What a master's command holds: RESTART, STOP, CMD (a read) and the byte.
+private const COMMAND: u32 = reg.IC_DATA_CMD_RESTART_MASK | reg.IC_DATA_CMD_STOP_MASK | reg.IC_DATA_CMD_CMD_MASK | reg.IC_DATA_CMD_DAT_MASK
+
+// IC_TX_ABRT_SOURCE's TX_FLUSH_CNT.
+private const FLUSH_SHIFT: u32 = 23
+
+/** The context a part's device callbacks get from the bus. A part on an RP chip keeps its own model, as a
+ * `&T` its callbacks capture, so the workbench lends them nothing.
+ */
+struct Workbench
+end Workbench
+
+/** A part on the workbench on an RP chip's I2C lines: the GPIOs its SDA and SCL are on, its device
+ * callbacks, and whether it pulls both lines up itself (a breakout board's resistors).
+ */
+struct I2cPart
+    sda: u32
+    scl: u32
+    device: Device[Workbench]
+    pull_ups: bool
+
+/** What a controller's lines reach, as the chip finds them through the mux, the pads and the wires: the
+ * GPIOs on its SDA line and on its SCL line, bit n for GPIO n, and why the lines are not modelled, empty
+ * where they are.
+ */
+struct Wiring
+    sda: u64
+    scl: u64
+    why: string
+
+/** Why a controller refused an access. */
+enum I2cFault
+    Access(e: AccessError)
+    Refused(why: string)
+end I2cFault
+
+/** Where a master is on the bus. */
+enum Step
+    // Not holding the bus.
+    Idle
+    // Holding it, SCL low, for the next command.
+    Hold
+    // A START or repeated START.
+    Start
+    // The address byte and its acknowledge.
+    Address
+    // A data byte out and the target's acknowledge.
+    Write
+    // The master's acknowledge, or not, of the byte it last read.
+    Ack
+    // A data byte in.
+    Read
+    Stop
+end Step
+
+/** Who a master's transaction addresses: nobody yet, the other controller, or a part. */
+enum Target
+    Nobody
+    Unit(j: usize)
+    Part(i: usize)
+end Target
+
+/** One of a controller's FIFOs. */
+struct I2cFifo
+    entries: [I2C_FIFO]u32
+    first: usize
+    count: usize
+
+    push(*self, e: u32)
+        self.entries[(self.first + self.count) % I2C_FIFO] = e
+        self.count += 1
+
+    pop(*self) -> u32
+        val e = self.entries[self.first]
+        self.first = (self.first + 1) % I2C_FIFO
+        self.count -= 1
+        e
+
+    full(self) -> bool = self.count == I2C_FIFO
+end I2cFifo
+
+/** One DW_apb_i2c controller's registers and its state on the bus. */
+struct I2c
+    con: u32
+    tar: u32
+    sar: u32
+    ss_hcnt: u32
+    ss_lcnt: u32
+    fs_hcnt: u32
+    fs_lcnt: u32
+    intr_mask: u32
+    rx_tl: u32
+    tx_tl: u32
+    enable: u32
+    sda_hold: u32
+    nack_only: u32
+    dma_cr: u32
+    dma_tdlr: u32
+    dma_rdlr: u32
+    sda_setup: u32
+    ack_gc: u32
+    spklen: u32
+    // The latched interrupts, IC_TX_ABRT_SOURCE's causes, and the commands its last abort flushed.
+    raw: u32
+    abort: u32
+    flushed: u32
+    tx: I2cFifo
+    rx: I2cFifo
+    // As a master: where it is on the bus, when that step ends (NOT_DUE untimed, or `stalled` while a
+    // slave holds SCL low), the command being carried out and whether its data is still to go, the
+    // transaction's direction and target, a byte read whose acknowledge is not yet sent, whether that
+    // acknowledge is a NACK and the step after it, the byte a slave gave, and a STOP owed to a disable or
+    // an ABORT.
+    step: Step
+    due: u64
+    stalled: bool
+    cmd: u32
+    has_cmd: bool
+    reading: bool
+    target: Target
+    unread: bool
+    nack: bool
+    after: Step
+    byte: u8
+    stopping: bool
+    user_abort: bool
+    // As a slave: addressed by the transaction on the bus, and whether the next byte it takes is the
+    // first after the address.
+    addressed: bool
+    first: bool
+
+    enabled(self) -> bool = self.enable & reg.IC_ENABLE_ENABLE_MASK != 0
+    is_master(self) -> bool = self.con & reg.IC_CON_MASTER_MODE_MASK != 0
+    is_slave(self) -> bool = self.con & reg.IC_CON_IC_SLAVE_DISABLE_MASK == 0
+
+    /** Whether it is doing anything on the bus: a master's transfer, or a slave addressed. */
+    busy(self) -> bool = self.step != Step.Idle || self.addressed
+
+    /** Holding SCL's high or low half: one bit of SCL in ic_clk cycles, at IC_CON.SPEED's counts. */
+    bit_cycles(self) -> u64
+        val standard = (self.con & reg.IC_CON_SPEED_MASK) >> reg.IC_CON_SPEED_SHIFT == reg.IC_CON_SPEED_STANDARD
+        val h = if standard then self.ss_hcnt else self.fs_hcnt
+        val l = if standard then self.ss_lcnt else self.fs_lcnt
+        u64(h + l + self.spklen + 8)
+
+    /** IC_RAW_INTR_STAT: the latched interrupts, with RX_FULL and TX_EMPTY as the FIFOs stand. */
+    raw_intr(self) -> u32
+        var r = self.raw
+        if u32(self.rx.count) > self.rx_tl then r |= reg.IC_RAW_INTR_STAT_RX_FULL_MASK
+        if self.tx_empty() then r |= reg.IC_RAW_INTR_STAT_TX_EMPTY_MASK
+        r
+
+    // TX_EMPTY: the transmit FIFO at or below IC_TX_TL and, with TX_EMPTY_CTRL, the last command popped
+    // finished; never while disabled and idle.
+    private tx_empty(self) -> bool
+        if !self.enabled() && !self.busy() then return false
+        u32(self.tx.count) <= self.tx_tl && (self.con & reg.IC_CON_TX_EMPTY_CTRL_MASK == 0 || !self.has_cmd)
+
+    /** The controller's interrupt line. */
+    irq(self) -> bool = self.raw_intr() & self.intr_mask != 0
+
+    /** The transmit DMA request: TDMAE, and the FIFO at or below DMATDL. */
+    dreq_tx(self) -> bool = self.dma_cr & reg.IC_DMA_CR_TDMAE_MASK != 0 && self.enabled() && u32(self.tx.count) <= self.dma_tdlr
+
+    /** The receive DMA request: RDMAE, and more than DMARDL entries waiting. */
+    dreq_rx(self) -> bool = self.dma_cr & reg.IC_DMA_CR_RDMAE_MASK != 0 && u32(self.rx.count) > self.dma_rdlr
+
+    // Every command waiting goes, as an abort flushes them; the count for TX_FLUSH_CNT.
+    private flush_tx(*self)
+        self.flushed = u32(self.tx.count)
+        self.tx.count = 0
+end I2c
+
+/** A controller at power-on (`hardware/regs/i2c.h`'s reset values): disabled, a fast-mode master. */
+i2c() -> I2c
+    val empty = I2cFifo([0; I2C_FIFO], 0, 0)
+    I2c(0x65, 0x55, 0x55, 0x28, 0x2f, 6, 0xd, 0x8ff, 0, 0, 0, 1, 0, 0, 0, 0, 0x64, 1, 7, 0, 0, 0, empty, empty,
+        Step.Idle, NOT_DUE, false, 0, false, false, Target.Nobody, false, false, Step.Idle, 0, false, false, false, false)
+
+/** The two controllers and the parts on the workbench, on whatever lines the chip's wiring gives them. */
+struct I2cBus
+    units: [2]I2c
+    parts: Buf[I2cPart]
+    bench: Workbench
+    // Why the bus did something benchtop does not model, for the chip to stop on; empty for nothing.
+    fault: string
+
+    /** Controller `k` to power-on, as RESETS asserts it. A master addressing it loses its target, which is
+     * not modelled; a slave it addressed is released.
+     */
+    reset_unit(*self, k: usize)
+        val j = 1 - k
+        self.units[j].target match
+            Unit(t) -> if t == k && self.units[j].step != Step.Idle then self.refuse(j, s"I2C$k was reset while I2C$j's transfer addressed it, which is not modelled")
+            _ -> ()
+        self.units[k].target match
+            Unit(t) -> self.units[t].addressed = false
+            _ -> ()
+        self.units[k] = i2c()
+
+    /** The clk_sys cycle at which a master's step next ends, or NOT_DUE (all ones). */
+    next_due(self) -> u64 = min(self.units[0].due, self.units[1].due)
+
+    /** Every step that ends by clk_sys cycle `now`, each at its own time. */
+    run(*self, now: u64, w: [2]Wiring)
+        loop
+            val k: usize = if self.units[0].due <= self.units[1].due then 0 else 1
+            val t = self.units[k].due
+            if t > now then break
+            self.finish(k, t, w)
+
+    /** A read of controller `k`'s register at `offset`, with its side effects, at clk_sys cycle `now`. */
+    read(*self, k: usize, offset: u32, width: u32, now: u64) -> Result[u32, I2cFault]
+        access(offset, width, true).map_err(e -> I2cFault.Access(e))?
+        val address = offset & 0xFFC
+        if offset & 0x3000 != 0 && side_effects(address) then return Err(I2cFault.Access(AccessError.UnsupportedAlias))
+        val m = &self.units[k]
+        val value = address match
+            reg.IC_CON_OFFSET -> m.con
+            reg.IC_TAR_OFFSET -> m.tar
+            reg.IC_SAR_OFFSET -> m.sar
+            reg.IC_DATA_CMD_OFFSET ->
+                if m.rx.count == 0
+                    m.raw |= reg.IC_RAW_INTR_STAT_RX_UNDER_MASK
+                    return Ok(0)
+                val e = m.rx.pop()
+                // Room in a receive FIFO lets a master or a slave held on it go on.
+                self.retry(now)
+                e
+            reg.IC_SS_SCL_HCNT_OFFSET -> m.ss_hcnt
+            reg.IC_SS_SCL_LCNT_OFFSET -> m.ss_lcnt
+            reg.IC_FS_SCL_HCNT_OFFSET -> m.fs_hcnt
+            reg.IC_FS_SCL_LCNT_OFFSET -> m.fs_lcnt
+            reg.IC_INTR_STAT_OFFSET -> m.raw_intr() & m.intr_mask
+            reg.IC_INTR_MASK_OFFSET -> m.intr_mask
+            reg.IC_RAW_INTR_STAT_OFFSET -> m.raw_intr()
+            reg.IC_RX_TL_OFFSET -> m.rx_tl
+            reg.IC_TX_TL_OFFSET -> m.tx_tl
+            reg.IC_CLR_INTR_OFFSET ->
+                m.raw &= ~(LATCHED & ~reg.IC_RAW_INTR_STAT_ACTIVITY_MASK)
+                if !m.busy() then m.raw &= ~reg.IC_RAW_INTR_STAT_ACTIVITY_MASK
+                m.abort = 0
+                m.flushed = 0
+                0
+            reg.IC_CLR_RX_UNDER_OFFSET -> clear(m, reg.IC_RAW_INTR_STAT_RX_UNDER_MASK)
+            reg.IC_CLR_RX_OVER_OFFSET -> clear(m, reg.IC_RAW_INTR_STAT_RX_OVER_MASK)
+            reg.IC_CLR_TX_OVER_OFFSET -> clear(m, reg.IC_RAW_INTR_STAT_TX_OVER_MASK)
+            reg.IC_CLR_RD_REQ_OFFSET -> clear(m, reg.IC_RAW_INTR_STAT_RD_REQ_MASK)
+            reg.IC_CLR_TX_ABRT_OFFSET ->
+                // Clearing TX_ABRT clears its sources and lets the transmit FIFO take commands again.
+                m.abort = 0
+                m.flushed = 0
+                clear(m, reg.IC_RAW_INTR_STAT_TX_ABRT_MASK)
+            reg.IC_CLR_RX_DONE_OFFSET -> clear(m, reg.IC_RAW_INTR_STAT_RX_DONE_MASK)
+            reg.IC_CLR_ACTIVITY_OFFSET -> if m.busy() then 0 else clear(m, reg.IC_RAW_INTR_STAT_ACTIVITY_MASK)
+            reg.IC_CLR_STOP_DET_OFFSET -> clear(m, reg.IC_RAW_INTR_STAT_STOP_DET_MASK)
+            reg.IC_CLR_START_DET_OFFSET -> clear(m, reg.IC_RAW_INTR_STAT_START_DET_MASK)
+            reg.IC_CLR_GEN_CALL_OFFSET -> clear(m, reg.IC_RAW_INTR_STAT_GEN_CALL_MASK)
+            reg.IC_CLR_RESTART_DET_OFFSET -> clear(m, reg.IC_RAW_INTR_STAT_RESTART_DET_MASK)
+            reg.IC_ENABLE_OFFSET -> m.enable
+            reg.IC_STATUS_OFFSET ->
+                var s: u32 = 0
+                if m.busy() then s |= reg.IC_STATUS_ACTIVITY_MASK
+                if !m.tx.full() then s |= reg.IC_STATUS_TFNF_MASK
+                if m.tx.count == 0 then s |= reg.IC_STATUS_TFE_MASK
+                if m.rx.count > 0 then s |= reg.IC_STATUS_RFNE_MASK
+                if m.rx.full() then s |= reg.IC_STATUS_RFF_MASK
+                if m.step != Step.Idle then s |= reg.IC_STATUS_MST_ACTIVITY_MASK
+                if m.addressed then s |= reg.IC_STATUS_SLV_ACTIVITY_MASK
+                s
+            reg.IC_TXFLR_OFFSET -> u32(m.tx.count)
+            reg.IC_RXFLR_OFFSET -> u32(m.rx.count)
+            reg.IC_SDA_HOLD_OFFSET -> m.sda_hold
+            reg.IC_TX_ABRT_SOURCE_OFFSET -> m.abort | (m.flushed << FLUSH_SHIFT)
+            reg.IC_SLV_DATA_NACK_ONLY_OFFSET -> m.nack_only
+            reg.IC_DMA_CR_OFFSET -> m.dma_cr
+            reg.IC_DMA_TDLR_OFFSET -> m.dma_tdlr
+            reg.IC_DMA_RDLR_OFFSET -> m.dma_rdlr
+            reg.IC_SDA_SETUP_OFFSET -> m.sda_setup
+            reg.IC_ACK_GENERAL_CALL_OFFSET -> m.ack_gc
+            reg.IC_ENABLE_STATUS_OFFSET -> if m.enabled() || m.busy() then reg.IC_ENABLE_STATUS_IC_EN_MASK else 0
+            reg.IC_FS_SPKLEN_OFFSET -> m.spklen
+            // IC_COMP_PARAM_1 reads 0 (its fields' reset values in the header); the version and type are
+            // the header's.
+            reg.IC_COMP_PARAM_1_OFFSET -> 0
+            reg.IC_COMP_VERSION_OFFSET -> 0x3230312a
+            reg.IC_COMP_TYPE_OFFSET -> 0x44570140
+            _ -> return Err(I2cFault.Access(AccessError.Unmapped))
+        Ok(read_lane(value, offset, width))
+    end read
+
+    /** A write to controller `k`'s register at `offset` at clk_sys cycle `now`, the lines as `w` finds them;
+     * a refused write leaves the controller as it was.
+     */
+    write(*self, k: usize, offset: u32, width: u32, value: u32, now: u64, w: [2]Wiring) -> Result[unit, I2cFault]
+        access(offset, width, true).map_err(e -> I2cFault.Access(e))?
+        val address = offset & 0xFFC
+        val data = replicated(value, width)
+        if offset & 0x3000 != 0 && (address == reg.IC_DATA_CMD_OFFSET || side_effects(address)) then return Err(I2cFault.Access(AccessError.UnsupportedAlias))
+        val m = &self.units[k]
+        // These take a write only while the controller is disabled; at other times it has no effect.
+        val frozen = m.enabled()
+        address match
+            reg.IC_CON_OFFSET ->
+                if frozen then return Ok(())
+                var v = written(m.con, offset, data) & (reg.IC_CON_STOP_DET_IF_MASTER_ACTIVE_MASK - 1)
+                if v & (reg.IC_CON_IC_10BITADDR_MASTER_MASK | reg.IC_CON_IC_10BITADDR_SLAVE_MASK) != 0 then return Err(I2cFault.Refused("IC_CON: 10-bit addressing is not modelled"))
+                // SPEED outside 1 to IC_MAX_SPEED_MODE (fast) is set to fast.
+                val speed = (v & reg.IC_CON_SPEED_MASK) >> reg.IC_CON_SPEED_SHIFT
+                if speed != reg.IC_CON_SPEED_STANDARD then v = (v & ~reg.IC_CON_SPEED_MASK) | (reg.IC_CON_SPEED_FAST << reg.IC_CON_SPEED_SHIFT)
+                m.con = v
+            reg.IC_TAR_OFFSET ->
+                if frozen then return Ok(())
+                val v = written(m.tar, offset, data) & 0xFFF
+                if v & reg.IC_TAR_SPECIAL_MASK != 0 then return Err(I2cFault.Refused("IC_TAR.SPECIAL: a general call or a START BYTE is not modelled"))
+                m.tar = v
+            reg.IC_SAR_OFFSET -> if !frozen then m.sar = written(m.sar, offset, data) & reg.IC_SAR_IC_SAR_MASK
+            reg.IC_DATA_CMD_OFFSET ->
+                // A command that would start a transfer on lines benchtop cannot show is refused here.
+                val starts = m.enabled() && m.is_master() && m.step == Step.Idle && m.enable & reg.IC_ENABLE_TX_CMD_BLOCK_MASK == 0 && m.raw & reg.IC_RAW_INTR_STAT_TX_ABRT_MASK == 0
+                if starts && !w[k].why.is_empty() then return Err(I2cFault.Refused(s"a command would start a transfer, and ${w[k].why}"))
+                self.data_cmd(k, data, now, w)
+            reg.IC_SS_SCL_HCNT_OFFSET -> if !frozen then m.ss_hcnt = max(written(m.ss_hcnt, offset, data) & 0xFFFF, 6)
+            reg.IC_SS_SCL_LCNT_OFFSET -> if !frozen then m.ss_lcnt = max(written(m.ss_lcnt, offset, data) & 0xFFFF, 8)
+            reg.IC_FS_SCL_HCNT_OFFSET -> if !frozen then m.fs_hcnt = max(written(m.fs_hcnt, offset, data) & 0xFFFF, 6)
+            reg.IC_FS_SCL_LCNT_OFFSET -> if !frozen then m.fs_lcnt = max(written(m.fs_lcnt, offset, data) & 0xFFFF, 8)
+            reg.IC_FS_SPKLEN_OFFSET -> if !frozen then m.spklen = max(written(m.spklen, offset, data) & 0xFF, 1)
+            reg.IC_INTR_MASK_OFFSET -> m.intr_mask = written(m.intr_mask, offset, data) & (reg.IC_INTR_MASK_M_RESTART_DET_MASK * 2 - 1)
+            // A threshold past the FIFO's depth is set to its last entry.
+            reg.IC_RX_TL_OFFSET -> m.rx_tl = min(written(m.rx_tl, offset, data) & 0xFF, u32(I2C_FIFO) - 1)
+            reg.IC_TX_TL_OFFSET -> m.tx_tl = min(written(m.tx_tl, offset, data) & 0xFF, u32(I2C_FIFO) - 1)
+            reg.IC_ENABLE_OFFSET -> return self.set_enable(k, written(m.enable, offset, data) & 7, now, w)
+            reg.IC_SDA_HOLD_OFFSET -> m.sda_hold = written(m.sda_hold, offset, data) & 0xFFFFFF
+            reg.IC_SLV_DATA_NACK_ONLY_OFFSET -> m.nack_only = written(m.nack_only, offset, data) & 1
+            reg.IC_DMA_CR_OFFSET -> m.dma_cr = written(m.dma_cr, offset, data) & 3
+            reg.IC_DMA_TDLR_OFFSET -> m.dma_tdlr = written(m.dma_tdlr, offset, data) & 0xF
+            reg.IC_DMA_RDLR_OFFSET -> m.dma_rdlr = written(m.dma_rdlr, offset, data) & 0xF
+            reg.IC_SDA_SETUP_OFFSET -> m.sda_setup = written(m.sda_setup, offset, data) & 0xFF
+            reg.IC_ACK_GENERAL_CALL_OFFSET -> m.ack_gc = written(m.ack_gc, offset, data) & 1
+            // The read-only registers and the clearing reads take a write with no effect.
+            reg.IC_INTR_STAT_OFFSET | reg.IC_RAW_INTR_STAT_OFFSET | reg.IC_STATUS_OFFSET | reg.IC_TXFLR_OFFSET | reg.IC_RXFLR_OFFSET |
+                reg.IC_TX_ABRT_SOURCE_OFFSET | reg.IC_ENABLE_STATUS_OFFSET | reg.IC_COMP_PARAM_1_OFFSET | reg.IC_COMP_VERSION_OFFSET |
+                reg.IC_COMP_TYPE_OFFSET -> ()
+            _ -> if !side_effects(address) then return Err(I2cFault.Access(AccessError.Unmapped))
+        Ok(())
+    end write
+
+    // A write to IC_DATA_CMD: a command for a master's FIFO, a byte for a slave's. Dropped while the
+    // controller is disabled (its FIFOs held erased) or an abort holds the FIFO flushed, until
+    // IC_CLR_TX_ABRT is read; one written to a full FIFO is lost with TX_OVER.
+    private data_cmd(*self, k: usize, data: u32, now: u64, w: [2]Wiring)
+        val m = &self.units[k]
+        if !m.enabled() || m.raw & reg.IC_RAW_INTR_STAT_TX_ABRT_MASK != 0 then return
+        if !m.is_master() && data & reg.IC_DATA_CMD_CMD_MASK != 0
+            // A read command in slave mode.
+            m.raw |= reg.IC_RAW_INTR_STAT_TX_ABRT_MASK
+            m.abort |= reg.IC_TX_ABRT_SOURCE_ABRT_SLVRD_INTX_MASK
+            return
+        if m.tx.full()
+            m.raw |= reg.IC_RAW_INTR_STAT_TX_OVER_MASK
+            return
+        m.tx.push(data & (if m.is_master() then COMMAND else reg.IC_DATA_CMD_DAT_MASK))
+        if m.is_master() then self.serve(k, now, w) else self.retry(now)
+
+    // IC_ENABLE takes `v`: ENABLE, ABORT and TX_CMD_BLOCK.
+    private set_enable(*self, k: usize, v: u32, now: u64, w: [2]Wiring) -> Result[unit, I2cFault]
+        val m = &self.units[k]
+        val was = m.enabled()
+        val on = v & reg.IC_ENABLE_ENABLE_MASK != 0
+        if on && !was && m.is_master() && m.is_slave() then return Err(I2cFault.Refused("IC_ENABLE: IC_CON has MASTER_MODE set and IC_SLAVE_DISABLE clear, a master and a slave at once, which is not modelled"))
+        if !on && was && m.addressed then return Err(I2cFault.Refused(s"IC_ENABLE: disabling I2C$k while a master's transfer addresses it (SLV_DISABLED_WHILE_BUSY) is not modelled"))
+        // ABORT takes a write only while the controller is enabled.
+        val abort = v & reg.IC_ENABLE_ABORT_MASK != 0 && was && on && m.enable & reg.IC_ENABLE_ABORT_MASK == 0
+        m.enable = if was && on then v else v & ~reg.IC_ENABLE_ABORT_MASK
+        if !on
+            // Disabled: both FIFOs flushed, and a master's transfer ends with a STOP after the step in
+            // progress.
+            m.tx.count = 0
+            m.rx.count = 0
+            if m.step == Step.Hold then self.end_transfer(k, now) elif m.step != Step.Idle then m.stopping = true
+            return Ok(())
+        if abort
+            m.flush_tx()
+            if m.step == Step.Idle
+                self.aborted(k)
+            else
+                m.user_abort = true
+                if m.step == Step.Hold then self.end_transfer(k, now) else m.stopping = true
+            return Ok(())
+        self.serve(k, now, w)
+        Ok(())
+
+    // ABORT done: TX_ABRT with ABRT_USER_ABRT, the bit cleared.
+    private aborted(*self, k: usize)
+        val m = &self.units[k]
+        m.raw |= reg.IC_RAW_INTR_STAT_TX_ABRT_MASK
+        m.abort |= reg.IC_TX_ABRT_SOURCE_ABRT_USER_ABRT_MASK
+        m.enable &= ~reg.IC_ENABLE_ABORT_MASK
+        m.user_abort = false
+
+    // Master `k` takes its next command, where it may: not in the middle of a step, enabled, with a command
+    // waiting and TX_CMD_BLOCK clear.
+    private serve(*self, k: usize, t: u64, w: [2]Wiring)
+        val m = &self.units[k]
+        if (m.step != Step.Idle && m.step != Step.Hold) || !m.enabled() || !m.is_master() || m.tx.count == 0 then return
+        if m.enable & reg.IC_ENABLE_TX_CMD_BLOCK_MASK != 0 || m.stopping then return
+        val cmd = m.tx.pop()
+        val read = cmd & reg.IC_DATA_CMD_CMD_MASK != 0
+        m.cmd = cmd
+        m.has_cmd = true
+        if m.step == Step.Idle
+            if !w[k].why.is_empty() then return self.refuse(k, s"I2C$k starts a transfer: ${w[k].why}")
+            val j = 1 - k
+            if self.units[j].step != Step.Idle && w[j].sda & w[k].sda != 0 then return self.refuse(k, s"I2C$k starts a transfer while I2C$j is a master on the same bus: arbitration between two masters is not modelled")
+            m.reading = read
+            self.begin(k, Step.Start, t, true)
+            return
+        val restart = cmd & reg.IC_DATA_CMD_RESTART_MASK != 0 || read != m.reading
+        if restart && m.con & reg.IC_CON_IC_RESTART_EN_MASK == 0 then return self.refuse(k, s"I2C$k needs a repeated START with IC_CON.IC_RESTART_EN clear: a STOP and a START in its place are not modelled")
+        m.reading = read
+        if m.unread
+            // The byte last read is acknowledged where another read follows it in the same transfer.
+            m.nack = restart || !read
+            m.after = if restart then Step.Start else Step.Read
+            self.begin(k, Step.Ack, t, true)
+        elif restart then self.begin(k, Step.Start, t, true)
+        else self.begin(k, if read then Step.Read else Step.Write, t, true)
+
+    // Master `k` begins step `s` at clk_sys cycle `t`, or waits on it where SCL is held low: a read whose
+    // slave has nothing to send (RD_REQ, raised once per byte: `fresh`), or a byte for a full receive FIFO
+    // that holds the bus.
+    private begin(*self, k: usize, s: Step, t: u64, fresh: bool)
+        val m = &self.units[k]
+        m.step = s
+        m.stalled = false
+        if s == Step.Read
+            if m.rx.full() && m.con & reg.IC_CON_RX_FIFO_FULL_HLD_CTRL_MASK != 0 then return self.stall(k)
+            m.target match
+                Unit(j) ->
+                    val slave = &self.units[j]
+                    if slave.tx.count == 0
+                        if fresh then slave.raw |= reg.IC_RAW_INTR_STAT_RD_REQ_MASK
+                        return self.stall(k)
+                    m.byte = u8(slave.tx.pop())
+                _ -> ()
+        if s == Step.Write
+            m.target match
+                Unit(j) -> if self.units[j].rx.full() && self.units[j].con & reg.IC_CON_RX_FIFO_FULL_HLD_CTRL_MASK != 0 then return self.stall(k)
+                _ -> ()
+        m.due = t + m.bit_cycles() * bits(s)
+
+    private stall(*self, k: usize)
+        self.units[k].stalled = true
+        self.units[k].due = NOT_DUE
+
+    // Each master held by a slave or a full FIFO tries its step again at `t`.
+    private retry(*self, t: u64)
+        for k in 0usize..<2 do if self.units[k].stalled then self.begin(k, self.units[k].step, t, false)
+
+    // Master `k`'s step ends at `t`.
+    private finish(*self, k: usize, t: u64, w: [2]Wiring)
+        val m = &self.units[k]
+        m.due = NOT_DUE
+        m.step match
+            Start ->
+                // A repeated START ends the transfer to the slave addressed before it.
+                m.target match
+                    Unit(j) ->
+                        if self.units[j].addressed then self.units[j].raw |= reg.IC_RAW_INTR_STAT_RESTART_DET_MASK
+                        self.units[j].addressed = false
+                    _ -> ()
+                m.target = Target.Nobody
+                self.detect(k, w, reg.IC_RAW_INTR_STAT_START_DET_MASK | reg.IC_RAW_INTR_STAT_ACTIVITY_MASK)
+                self.begin(k, Step.Address, t, true)
+            Address -> self.address(k, t, w)
+            Write -> self.wrote(k, t, w)
+            Read ->
+                val byte = m.target match
+                    Part(i) -> (self.parts.at(i).device.read)(&self.bench, t)
+                    _ -> m.byte
+                // A disabled controller's FIFOs are held erased: a byte finished after the disable is dropped.
+                if !m.enabled() then ()
+                elif m.rx.full() then m.raw |= reg.IC_RAW_INTR_STAT_RX_OVER_MASK
+                else m.rx.push(u32(byte))
+                m.unread = true
+                m.has_cmd = false
+                self.complete(k, t, w)
+            Ack ->
+                m.unread = false
+                if m.nack
+                    m.target match
+                        Unit(j) -> self.units[j].raw |= reg.IC_RAW_INTR_STAT_RX_DONE_MASK
+                        _ -> ()
+                self.begin(k, if m.stopping then Step.Stop else m.after, t, true)
+            Stop -> self.stopped(k, t, w)
+            Idle | Hold -> ()
+
+    // The address byte has gone: the target that answers it acknowledges, or nobody does and the master
+    // aborts.
+    private address(*self, k: usize, t: u64, w: [2]Wiring)
+        val m = &self.units[k]
+        val address = m.tar & 0x7F
+        var found = Target.Nobody
+        var answers = 0
+        val j = 1 - k
+        val peer = &self.units[j]
+        if peer.enabled() && peer.is_slave() && !peer.is_master() && w[j].sda & w[k].sda != 0
+            if w[j].scl & w[k].scl == 0 then return self.refuse(k, s"I2C$j's SDA is on I2C$k's SDA line and its SCL is not on I2C$k's SCL line, which is not modelled")
+            if !w[j].why.is_empty() then return self.refuse(k, s"I2C$k addresses 0x${hex(address, 2)} on a bus I2C$j is on: ${w[j].why}")
+            if peer.sar & 0x7F == address
+                found = Target.Unit(j)
+                answers += 1
+        for i in 0usize..<self.parts.len()
+            val p = self.parts.at(i)
+            val on_sda = w[k].sda & (1u64 << u64(p.sda)) != 0
+            val on_scl = w[k].scl & (1u64 << u64(p.scl)) != 0
+            if on_sda != on_scl then return self.refuse(k, s"a part has its SDA on GPIO ${p.sda} and its SCL on GPIO ${p.scl}, one on I2C$k's lines and one not, which is not modelled")
+            if on_sda && u32(p.device.address) == address
+                found = Target.Part(i)
+                answers += 1
+        if answers > 1 then return self.refuse(k, s"I2C$k addresses 0x${hex(address, 2)} and $answers targets answer it, which is not modelled")
+        val reading = m.cmd & reg.IC_DATA_CMD_CMD_MASK != 0
+        found match
+            Nobody -> return self.abort_master(k, reg.IC_TX_ABRT_SOURCE_ABRT_7B_ADDR_NOACK_MASK, t)
+            Unit(n) ->
+                val slave = &self.units[n]
+                slave.addressed = true
+                slave.first = true
+                // A read finds stale data in the slave's transmit FIFO: it is flushed, with TX_ABRT.
+                if reading && slave.tx.count > 0
+                    slave.flush_tx()
+                    slave.raw |= reg.IC_RAW_INTR_STAT_TX_ABRT_MASK
+                    slave.abort |= reg.IC_TX_ABRT_SOURCE_ABRT_SLVFLUSH_TXFIFO_MASK
+            Part(i) -> (self.parts.at(i).device.start)(&self.bench, reading, t)
+        m.target = found
+        if m.stopping
+            m.has_cmd = false
+            return self.end_transfer(k, t)
+        self.begin(k, if reading then Step.Read else Step.Write, t, true)
+    end address
+
+    // A data byte has gone to the target, which acknowledges it or not.
+    private wrote(*self, k: usize, t: u64, w: [2]Wiring)
+        val m = &self.units[k]
+        val byte = u8(m.cmd & reg.IC_DATA_CMD_DAT_MASK)
+        val ack = m.target match
+            Unit(j) ->
+                val slave = &self.units[j]
+                if slave.nack_only & 1 != 0 then false
+                else
+                    if slave.rx.full() then slave.raw |= reg.IC_RAW_INTR_STAT_RX_OVER_MASK
+                    else slave.rx.push(u32(byte) | (if slave.first then reg.IC_DATA_CMD_FIRST_DATA_BYTE_MASK else 0))
+                    slave.first = false
+                    true
+            Part(i) -> (self.parts.at(i).device.write)(&self.bench, byte, t)
+            Nobody -> false
+        if !ack then return self.abort_master(k, reg.IC_TX_ABRT_SOURCE_ABRT_TXDATA_NOACK_MASK, t)
+        m.has_cmd = false
+        self.complete(k, t, w)
+
+    // A command's data is done: a STOP where it asked for one (or a disable or ABORT did), else the bus
+    // held for the next.
+    private complete(*self, k: usize, t: u64, w: [2]Wiring)
+        val m = &self.units[k]
+        if m.stopping || m.cmd & reg.IC_DATA_CMD_STOP_MASK != 0 then return self.end_transfer(k, t)
+        m.step = Step.Hold
+        self.serve(k, t, w)
+
+    // The transfer ends: a NACK for a byte read and not yet acknowledged, then the STOP.
+    private end_transfer(*self, k: usize, t: u64)
+        val m = &self.units[k]
+        if m.unread
+            m.nack = true
+            m.after = Step.Stop
+            self.begin(k, Step.Ack, t, true)
+        else self.begin(k, Step.Stop, t, true)
+
+    // Master `k` aborts with `cause`: TX_ABRT, both FIFOs flushed (IC_AVOID_RX_FIFO_FLUSH_ON_TX_ABRT = 0),
+    // and a STOP.
+    private abort_master(*self, k: usize, cause: u32, t: u64)
+        val m = &self.units[k]
+        m.abort |= cause
+        m.raw |= reg.IC_RAW_INTR_STAT_TX_ABRT_MASK
+        m.flush_tx()
+        m.rx.count = 0
+        m.has_cmd = false
+        m.unread = false
+        self.begin(k, Step.Stop, t, true)
+
+    // The STOP is on the bus: STOP_DET in the master and in each controller on its lines (a slave with
+    // STOP_DET_IFADDRESSED only where it was addressed), whose transfer ends; then the master's next
+    // command.
+    private stopped(*self, k: usize, t: u64, w: [2]Wiring)
+        val m = &self.units[k]
+        m.raw |= reg.IC_RAW_INTR_STAT_STOP_DET_MASK
+        val j = 1 - k
+        val other = &self.units[j]
+        if other.enabled() && w[j].sda & w[k].sda != 0
+            if other.con & reg.IC_CON_STOP_DET_IFADDRESSED_MASK == 0 || other.addressed then other.raw |= reg.IC_RAW_INTR_STAT_STOP_DET_MASK
+        m.target match
+            Unit(n) -> self.units[n].addressed = false
+            _ -> ()
+        m.step = Step.Idle
+        m.target = Target.Nobody
+        m.stopping = false
+        if m.user_abort then self.aborted(k)
+        self.serve(k, t, w)
+
+    // START_DET and ACTIVITY in the master and in each enabled controller on its lines.
+    private detect(*self, k: usize, w: [2]Wiring, bits: u32)
+        self.units[k].raw |= bits
+        val j = 1 - k
+        if self.units[j].enabled() && w[j].sda & w[k].sda != 0 then self.units[j].raw |= bits
+
+    // The bus does something benchtop does not model: the run stops with `why`, and master `k` lets go
+    // of the bus.
+    private refuse(*self, k: usize, why: string)
+        if self.fault.is_empty() then self.fault = why
+        val m = &self.units[k]
+        m.target match
+            Unit(n) -> self.units[n].addressed = false
+            _ -> ()
+        m.step = Step.Idle
+        m.due = NOT_DUE
+        m.stalled = false
+        m.has_cmd = false
+        m.unread = false
+        m.target = Target.Nobody
+end I2cBus
+
+/** Both controllers at power-on, with no parts on the workbench. */
+i2c_bus(parts: Buf[I2cPart]) -> I2cBus = I2cBus([i2c(), i2c()], parts, Workbench(), "")
+
+// SCL bits a step takes.
+private bits(s: Step) -> u64 = s match
+    Address | Write -> 9
+    Read -> 8
+    Idle | Hold -> 0
+    _ -> 1
+
+// The registers a read changes: IC_DATA_CMD and the clearing reads.
+private side_effects(address: u32) -> bool =
+    address == reg.IC_DATA_CMD_OFFSET || (address >= reg.IC_CLR_INTR_OFFSET && address <= reg.IC_CLR_GEN_CALL_OFFSET) || address == reg.IC_CLR_RESTART_DET_OFFSET
+
+// A latched interrupt cleared by its clearing read, which reads 0.
+private clear(m: *I2c, bit: u32) -> u32
+    m.raw &= ~bit
+    0
+
+/** Which controller an I2C function on GPIO `n` belongs to (F3 on both chips): I2C0 on GPIOs 0, 1, 4, 5,
+ * 8, 9 and so on, I2C1 on 2, 3, 6, 7 and so on; SDA on the even GPIO, SCL on the odd.
+ */
+i2c_of(n: u32) -> usize = usize(n / 2 % 2)
+
+/** Each controller's lines as the mux, the pads, the wires (`wires[n]` the GPIO at the other end of GPIO
+ * `n`'s, 0xFF for none) and the parts leave them: an I2C function on exactly one GPIO for each of SDA and
+ * SCL, the pads reading their inputs with no override, nothing else driving a line or watching it with
+ * an interrupt, nothing outside driving it (`outside`, bit n for GPIO n), and a pull-up on each line,
+ * a pad's or a part's. `driving` is the GPIOs whose pads drive.
+ */
+i2c_wiring(io: *IoBank0, pads: *Pads, wires: [GPIO_COUNT]u8, outside: u64, driving: u64, parts: Buf[I2cPart]) -> [2]Wiring
+    var sda: [2]u64 = [0, 0]
+    var scl: [2]u64 = [0, 0]
+    for n in 0u32..<io.count
+        val r = route(n, io.function(n))
+        if r == Route.I2cSda then sda[i2c_of(n)] |= 1u64 << u64(n)
+        elif r == Route.I2cScl then scl[i2c_of(n)] |= 1u64 << u64(n)
+    [wiring_of(0, sda[0], scl[0], io, pads, wires, outside, driving, parts), wiring_of(1, sda[1], scl[1], io, pads, wires, outside, driving, parts)]
+
+// Controller `k`'s lines, its SDA function on the GPIOs `sda_pins` and its SCL on `scl_pins`.
+private wiring_of(k: usize, sda_pins: u64, scl_pins: u64, io: *IoBank0, pads: *Pads, wires: [GPIO_COUNT]u8, outside: u64, driving: u64, parts: Buf[I2cPart]) -> Wiring
+    if sda_pins == 0 || scl_pins == 0 then return Wiring(0, 0, s"no GPIO carries I2C$k's ${if sda_pins == 0 then "SDA" else "SCL"}")
+    if sda_pins.count_ones() > 1 || scl_pins.count_ones() > 1 then return Wiring(0, 0, s"I2C$k's ${if sda_pins.count_ones() > 1 then "SDA" else "SCL"} is selected on more than one GPIO, whose levels it would read together, which is not modelled")
+    val sda = line(sda_pins, wires)
+    val scl = line(scl_pins, wires)
+    for pin in [u32(sda_pins.trailing_zeros()), u32(scl_pins.trailing_zeros())]
+        val p = pads.pads[pin]
+        if p & pad_reg.GPIO0_IE_MASK == 0 || p & pad_reg.GPIO0_ISO_MASK != 0 then return Wiring(0, 0, s"GPIO $pin's pad does not read its input (IE clear or isolated), so I2C$k cannot see its line")
+        val d = io.after_overrides(pin, Drive(false, false))
+        if d.out || d.oe || !io.peripheral_input(pin, true) || io.peripheral_input(pin, false) then return Wiring(0, 0, s"GPIO $pin, I2C$k's, has an override in its CTRL, which is not modelled on an I2C line")
+    for n in 0u32..<io.count
+        val bit = 1u64 << u64(n)
+        if (sda | scl) & bit == 0 then continue
+        if outside & bit != 0 then return Wiring(0, 0, s"GPIO $n, on I2C$k's lines, is driven from off the chip, which is not modelled on an I2C line")
+        if driving & bit != 0 then return Wiring(0, 0, s"GPIO $n drives a level onto I2C$k's lines, which is not modelled")
+        if io.irq.watched(n) then return Wiring(0, 0, s"GPIO $n, on I2C$k's lines, has its interrupts enabled: the GPIO interrupts do not sample an I2C line's bits")
+    if !pulled_up(sda, pads, parts, true) then return Wiring(0, 0, s"I2C$k's SDA line has no pull-up, a pad's or a part's, so it would read low, which is not modelled")
+    if !pulled_up(scl, pads, parts, false) then return Wiring(0, 0, s"I2C$k's SCL line has no pull-up, a pad's or a part's, so it would read low, which is not modelled")
+    Wiring(sda, scl, "")
+end wiring_of
+
+// The GPIOs on a line: the one GPIO `pins` names and the far end of its wire.
+private line(pins: u64, wires: [GPIO_COUNT]u8) -> u64
+    val far = wires[pins.trailing_zeros()]
+    if far == 0xFF then pins else pins | (1u64 << u64(far))
+
+// Whether something pulls a line up: a pad on it with its pull-up on and out of isolation, or a part
+// on it with pull-ups of its own (on its SDA, or on its SCL).
+private pulled_up(lines: u64, pads: *Pads, parts: Buf[I2cPart], data: bool) -> bool
+    for n in 0u32..<pads.count
+        if lines & (1u64 << u64(n)) == 0 then continue
+        if pads.pads[n] & pad_reg.GPIO0_PUE_MASK != 0 && pads.pads[n] & pad_reg.GPIO0_ISO_MASK == 0 then return true
+    for i in 0usize..<parts.len()
+        val p = parts.at(i)
+        if p.pull_ups && lines & (1u64 << u64(if data then p.sda else p.scl)) != 0 then return true
+    false

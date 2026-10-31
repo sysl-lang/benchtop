@@ -7,6 +7,7 @@ import sh.sysl.benchtop.peripheral.rp2350.{AccessCtrl, BootRam, Clocks, Drive, G
 import sh.sysl.benchtop.peripheral.rp2350.{XIP_BASE, XIP_MAINTENANCE_BASE, XIP_WINDOWS_END, read_xip, xip_aux_read, xip_aux_write, xip_target}
 import sh.sysl.benchtop.peripheral.rp2350.{DREQ_UART0_TX, Frame, Sent, UART_UNITS_PER_CYCLE, uart_of}
 import sh.sysl.benchtop.peripheral.rp2350.{Pio, PioFault}
+import sh.sysl.benchtop.peripheral.rp2350.{I2cBus, i2c_bus}
 import sh.sysl.benchtop.processor.Processor
 import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.rp2350.accessctrl as accessctrl_reg
@@ -17,6 +18,8 @@ import sh.sysl.rp2350.xip_aux as xip_aux_reg
 import sh.sysl.rp2350.xip_ctrl as xip_ctrl_reg
 import sh.sysl.rp2350.clocks as clocks_reg
 import sh.sysl.rp2350.dma as dma_reg
+import sh.sysl.rp2350.i2c0 as i2c0_reg
+import sh.sysl.rp2350.i2c1 as i2c1_reg
 import sh.sysl.rp2350.io_bank0 as io_reg
 import sh.sysl.rp2350.io_qspi as io_qspi_reg
 import sh.sysl.rp2350.pads_qspi as pads_qspi_reg
@@ -42,6 +45,7 @@ import sh.sysl.rp2350.usb as usb_reg
 import sh.sysl.rp2350.usb_device_dpram as usb_dpram_reg
 import sh.sysl.rp2350.watchdog as watchdog_reg
 import sh.sysl.rp2350.xosc as xosc_reg
+import sysl.buf.buf
 import sysl.fmt.hex
 import sysl.math.min
 
@@ -82,6 +86,7 @@ const UART0_IRQ: u32 = 33
 const UART1_IRQ: u32 = 34
 const USBCTRL_IRQ: u32 = 14
 const DMA_IRQ_0: u32 = 10
+const I2C0_IRQ: u32 = 36
 
 /** A GPIO with no wire (`Rp2350.wire`). */
 const NO_WIRE: u8 = 0xFF
@@ -104,6 +109,8 @@ enum Block
     PadsBank0
     Uart0
     Uart1
+    I2c0
+    I2c1
     Pio0
     Pio1
     Pio2
@@ -137,7 +144,7 @@ struct Placed
     reset: u32
 
 /** Every block the chip runs, with the SVD's base addresses. */
-val BLOCKS: [37]Placed = [
+val BLOCKS: [39]Placed = [
     Placed(Block.Resets, resets_reg.BASE, "RESETS", 0),
     Placed(Block.Clocks, clocks_reg.BASE, "CLOCKS", 0),
     Placed(Block.Xosc, xosc_reg.BASE, "XOSC", 0),
@@ -151,6 +158,8 @@ val BLOCKS: [37]Placed = [
     Placed(Block.PadsBank0, pads_reg.BASE, "PADS_BANK0", resets_reg.RESET_PADS_BANK0_MASK),
     Placed(Block.Uart0, uart0_reg.BASE, "UART0", resets_reg.RESET_UART0_MASK),
     Placed(Block.Uart1, uart1_reg.BASE, "UART1", resets_reg.RESET_UART1_MASK),
+    Placed(Block.I2c0, i2c0_reg.BASE, "I2C0", resets_reg.RESET_I2C0_MASK),
+    Placed(Block.I2c1, i2c1_reg.BASE, "I2C1", resets_reg.RESET_I2C1_MASK),
     Placed(Block.Sio, sio_reg.BASE, "SIO", 0),
     Placed(Block.BootRam, bootram_reg.BASE, "BOOTRAM", 0),
     // Not gated by RESETS: the SDK reads SIE_CTRL before it releases USBCTRL
@@ -269,9 +278,11 @@ struct Rp2350
     // reaches it (`connect_memory`).
     dma: Dma
     memory: Option[*DmaMemory]
+    // I2C0 and I2C1, with the I2C parts on the workbench (chip/i2c.sysl).
+    i2c: I2cBus
 
-    /** Power-on, with core 1 in the boot ROM; the flash keeps its array, as the board's part, and the
-     * board's memory stays connected.
+    /** Power-on, with core 1 in the boot ROM; the flash keeps its array, as the board's part, the
+     * board's memory stays connected, and the wires and I2C parts stay on the workbench.
      */
     reset(*self)
         val bytes = self.flash.bytes
@@ -279,12 +290,14 @@ struct Rp2350
         val wires = self.wires
         val array = self.otp
         val memory = self.memory
+        val parts = self.i2c.parts
         val fresh = rp2350()
         *self = fresh
         if size != 0 then self.flash.connect(bytes, size)
         self.otp.power_on(array)
         self.wires = wires
         self.memory = memory
+        self.i2c.parts = parts
 
     /** Whether the flash's contents, direct mode or the pinned XIP_SRAM lines have changed since the last
      * call, for a board that mirrors them.
@@ -347,6 +360,8 @@ struct Rp2350
         self.watchdog_reset()
         // The UARTs count only while their lines are busy, so an idle UART costs nothing here.
         if self.uarts[0].active() || self.uarts[1].active() then self.advance_lines(cycles, sys)
+        // The I2C buses only where a step ends: a master's bus otherwise costs a comparison.
+        if self.i2c.next_due() <= self.now then self.i2c_steps()
     end advance_devices
 
     // `cycles` of clk_sys at `sys` Hz pass on the UARTs' lines, as clk_peri's cycles, event by event: each
@@ -483,13 +498,17 @@ struct Rp2350
             None -> ()
         if !self.swcore_off then self.gpio_changed()
 
-    /** Why the UARTs' lines, a PIO state machine, or the DMA's transfers stopped being modelled since
-     * the last call, if they did.
+    /** Why the UARTs' lines, the I2C buses, a PIO state machine, or the DMA's transfers stopped being
+     * modelled since the last call, if they did.
      */
     take_line_fault(*self) -> Option[string]
         if !self.dma.fault.is_empty()
             val why = self.dma.fault
             self.dma.fault = ""
+            return Some(why)
+        if !self.i2c.fault.is_empty()
+            val why = self.i2c.fault
+            self.i2c.fault = ""
             return Some(why)
         if self.pio.running then self.pio_catch_up()
         if self.line_fault.is_empty() then return None
@@ -572,7 +591,7 @@ struct Rp2350
             self.sio.mtime_due(k) match
                 Some(n) -> due = earliest(due, if self.sio.mtime_full_speed() then Some(n) else self.ticks_to_cycles(Tick.Riscv, n))
                 None -> ()
-        earliest(earliest(due, self.line_due()), self.dma_due())
+        earliest(earliest(earliest(due, self.line_due()), self.dma_due()), self.i2c_due())
 
     // The clk_sys cycles until generator `g`'s `n`th tick from now, rounded up; None while it is
     // stopped.
@@ -601,6 +620,7 @@ struct Rp2350
             PadsBank0 -> self.pads.read(o, width)
             Uart0 -> self.uarts[0].read(o, width)
             Uart1 -> self.uarts[1].read(o, width)
+            I2c0 | I2c1 -> return self.i2c_read(p, o, width)
             Sio -> self.sio.read(core, o, width, self.inputs())
             BootRam -> self.bootram.read(o, width)
             UsbCtrl ->
@@ -682,6 +702,7 @@ struct Rp2350
                 r
             Uart0 -> return self.uart_write(0, p, o, width, x)
             Uart1 -> return self.uart_write(1, p, o, width, x)
+            I2c0 | I2c1 -> return self.i2c_write(p, o, width, x)
             Pio0 | Pio1 | Pio2 ->
                 self.pio_catch_up()
                 return self.pio.write(pio_index(p.block), self.now, o, width, x).map_err(f -> pio_refusal(p, o, f))
@@ -999,6 +1020,8 @@ struct Rp2350
                 PadsBank0 -> self.pads.reset()
                 Uart0 -> self.uarts[0].reset()
                 Uart1 -> self.uarts[1].reset()
+                I2c0 -> self.i2c.reset_unit(0)
+                I2c1 -> self.i2c.reset_unit(1)
                 Pio0 -> self.pio.reset_block(0, self.now)
                 Pio1 -> self.pio.reset_block(1, self.now)
                 Pio2 -> self.pio.reset_block(2, self.now)
@@ -1033,7 +1056,8 @@ struct Rp2350
             Sio -> Drive(self.sio.out & (1u64 << n) != 0, self.sio.oe & (1u64 << n) != 0)
             // A UART's TX drives its line: high while idle, a frame's bits, low through a break.
             UartTx -> Drive(self.uarts[uart_of(n)].line_level(), true)
-            UartRx | Null -> Drive(false, false)
+            // I2C's lines are open drain; between transfers they idle released.
+            UartRx | Null | I2cSda | I2cScl -> Drive(false, false)
         self.io.after_overrides(n, d)
 
     /** What GPIO `n` is doing: whether its pad drives, and its level. Something outside drives it, or
@@ -1090,6 +1114,8 @@ struct Rp2350
         p.interrupt(POWMAN_IRQ_TIMER, self.powman.irq_timer())
         p.interrupt(UART0_IRQ, self.uarts[0].irq())
         p.interrupt(UART1_IRQ, self.uarts[1].irq())
+        p.interrupt(I2C0_IRQ, self.i2c.units[0].irq())
+        p.interrupt(I2C0_IRQ + 1, self.i2c.units[1].irq())
         p.interrupt(USBCTRL_IRQ, self.usb.irq())
         for j in 0u32..<4 do p.interrupt(DMA_IRQ_0 + j, self.dma.irq(j))
         p.machine_timer(self.sio.software_irq(k), self.sio.timer_irq(k))
@@ -1101,7 +1127,8 @@ rp2350() -> Rp2350 =
         rp.sio(), rp.io_bank0(), rp.pads_bank0(), [rp.uart(), rp.uart()], rp.pio(), rp.bootram(), rp.usb_ctrl(),
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
         rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), false,
-        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None)
+        rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None,
+        i2c_bus(buf()))
 
 // The chip as `ArmBoard` drives it: its inherent methods under the trait's names.
 impl ArmChip for Rp2350
