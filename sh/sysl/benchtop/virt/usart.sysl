@@ -23,6 +23,11 @@ import sysl.threads.Mutex
 // The alternate function that puts USART1's TX and RX on the pins the chip lists for them (DS12930).
 const USART_AF: u32 = 7
 
+/** A pin of the chip's GPIO: its bank, an index among the storage path's banks, and its number there. */
+struct UsartPin
+    bank: usize
+    pin: u32
+
 /** The USART: whether the bus has it, the IRQ it raises (-1 for none), whether the host's terminal is
  * on its line and the pins its TX and RX are routed to, which the board fixes; `next` and `level`, its
  * next event's clock and its interrupt line, published for the cores to read without its lock; and
@@ -32,14 +37,15 @@ struct UsartState
     present: bool
     irq: int
     terminal: bool
-    tx: string
-    rx: string
+    tx: UsartPin
+    rx: UsartPin
     next: u64
     level: u32
     live: Mutex[uart.Usart]
 
 /** No USART on the bus. */
-usart_state() -> UsartState = UsartState(false, -1, false, "", "", NEVER, 0, Mutex.new(uart.usart(1, 1)))
+usart_state() -> UsartState =
+    UsartState(false, -1, false, UsartPin(0, 0), UsartPin(0, 0), NEVER, 0, Mutex.new(uart.usart(1, 1)))
 
 /** Whether part `p` is the host's terminal on one of `b`'s USARTs. */
 private[virt] usart_terminal(b: Board, p: Part) -> bool
@@ -52,7 +58,7 @@ private[virt] usart_terminal(b: Board, p: Part) -> bool
     false
 
 // The pin the board routes the USART `name`'s `signal` to, or the only one its chip lists.
-private usart_pin(b: Board, name: string, signal: string) -> string
+private usart_pin_name(b: Board, name: string, signal: string) -> string
     for bus in b.buses
         if bus.name != name then continue
         for route in bus.signals do if route.name == signal then return route.pin
@@ -61,8 +67,20 @@ private usart_pin(b: Board, name: string, signal: string) -> string
         for route in p.signals do if route.name == signal && route.pins.len() == 1 then return route.pins.at(0).name
     ""
 
-/** The USART `b` makes on a chip whose clock is `clock_hz`, or why benchtop cannot run it. */
-private[virt] check_usart(b: Board, clock_hz: u64) -> Result[UsartState, string]
+// The GPIO pin of the storage path's banks that the USART `name`'s `signal` is on, or None.
+private usart_pin(b: Board, storage: *StorageState, name: string, signal: string) -> Option[UsartPin]
+    val pin_name = usart_pin_name(b, name, signal)
+    for bank in ["PA","PB","PC","PD","PE","PF","PG","PH","PI","PJ","PK"]
+        val pin = local_pin(pin_name, bank) match
+            Some(n) -> n
+            None -> continue
+        return storage.live.with(l -> gpio_named(l, bank)).map(i -> UsartPin(i, pin))
+    None
+
+/** The USART `b` makes on a chip whose clock is `clock_hz`, with its pins among `storage`'s GPIO banks,
+ * or why benchtop cannot run it.
+ */
+private[virt] check_usart(b: Board, clock_hz: u64, storage: *StorageState) -> Result[UsartState, string]
     var s = usart_state()
     for p in b.chip.peripherals
         if p.kind != "stm32-usart" then continue
@@ -75,10 +93,12 @@ private[virt] check_usart(b: Board, clock_hz: u64) -> Result[UsartState, string]
             _ -> ()
         if clock_hz == 0 || kernel == 0 then return Err(s"`${p.name}` needs the chip's `clock-hz` and its own `kernel-clock-hz`")
         for part in b.parts do if usart_terminal(b, part) then s.terminal = true
-        s.tx = usart_pin(b, p.name, "tx")
-        s.rx = usart_pin(b, p.name, "rx")
-        if s.terminal && (s.tx.is_empty() || s.rx.is_empty())
-            return Err(s"the terminal on `${p.name}` needs its tx and rx on pins, under `buses`")
+        if s.terminal
+            (usart_pin(b, storage, p.name, "tx"), usart_pin(b, storage, p.name, "rx")) match
+                (Some(tx), Some(rx)) ->
+                    s.tx = tx
+                    s.rx = rx
+                _ -> return Err(s"the terminal on `${p.name}` needs its tx and rx on pins of the chip's GPIO, under `buses`")
         s.live = Mutex.new(uart.usart(kernel, clock_hz))
     Ok(s)
 
@@ -96,7 +116,8 @@ private usart_routes(m: *Machine) -> (bool, bool)
     val s = &m.devices.usart
     if !s.terminal then return (false, false)
     val storage = &m.devices.storage
-    (stm32_alternate(storage, s.tx, USART_AF), stm32_alternate(storage, s.rx, USART_AF))
+    (storage_gpio_alternate(storage, s.tx.bank, s.tx.pin, USART_AF),
+     storage_gpio_alternate(storage, s.rx.bank, s.rx.pin, USART_AF))
 
 // Bring the USART up to `time`: what it has sent goes to the console, and a character typed starts
 // arriving where the receiver would take one. `routes` is `usart_routes`, asked before the lock.
