@@ -1,0 +1,170 @@
+// A Forth on the STM32H747I-DISCO's ST-LINK virtual COM port: USART1 on PA9 (TX) and PA10 (RX) in
+// alternate function 7, 115200 8N1. The Forth is sysl-lang's `forth`, which talks to the world only
+// through a `Console`; here that is the USART. Typed characters arrive in the USART's interrupt and
+// wait in a ring, and the main loop sleeps in WFI until one is there.
+
+import sysl.raw.ptr_cast
+import sh.sysl.forth.{Console, Vm, boot, interpret_line, E_BYE}
+import firmware.*
+
+const USART1_IRQ: usize = 37
+
+@export("vectors")
+@section(".rodata.vectors")
+val vectors = vector_table[96](&__stack_top, &start, [(USART1_IRQ, &usart1_interrupt)])
+
+struct Word
+    value: volatile u32
+
+reg(at: u32) -> *Word = ptr_cast(usize(at))
+
+const RCC_AHB4ENR: u32 = 0x580244e0
+const RCC_APB2ENR: u32 = 0x580244f0
+const AHB4_GPIOA: u32 = 1 << 0
+const AHB4_GPIOC: u32 = 1 << 2
+const AHB4_GPIOI: u32 = 1 << 8
+const APB2_USART1: u32 = 1 << 4
+
+const GPIOA: u32 = 0x58020000
+const GPIOC: u32 = 0x58020800
+const GPIOI: u32 = 0x58022000
+const MODER: u32 = 0x00
+const BSRR: u32 = 0x18
+const AFRH: u32 = 0x24
+
+const USART1: u32 = 0x40011000
+const CR1: u32 = 0x00
+const BRR: u32 = 0x0c
+const ISR: u32 = 0x1c
+const ICR: u32 = 0x20
+const RDR: u32 = 0x24
+const TDR: u32 = 0x28
+const CR1_UE: u32 = 1 << 0
+const CR1_RE: u32 = 1 << 2
+const CR1_TE: u32 = 1 << 3
+const CR1_RXNEIE: u32 = 1 << 5
+const ISR_ORE: u32 = 1 << 3
+const ISR_RXNE: u32 = 1 << 5
+const ISR_TXE: u32 = 1 << 7
+
+const NVIC_ISER1: u32 = 0xe000e104
+
+// Characters received but not yet read. The interrupt owns `head`, the main loop owns `tail`.
+struct Ring
+    bytes: [64]volatile u8
+    head: volatile u32
+    tail: volatile u32
+
+var ring: Ring
+
+wait_for_interrupt()
+    asm
+        [thumb] "wfi"
+        [aarch64, x86_64, riscv64, riscv32, wasm32, craft] unavailable "Cortex-M firmware"
+
+interrupts_off()
+    asm
+        [thumb] "cpsid i"
+        [aarch64, x86_64, riscv64, riscv32, wasm32, craft] unavailable "Cortex-M firmware"
+
+interrupts_on()
+    asm
+        [thumb] "cpsie i"
+        [aarch64, x86_64, riscv64, riscv32, wasm32, craft] unavailable "Cortex-M firmware"
+
+usart1_interrupt()
+    val status = reg(USART1 + ISR).value
+    if status & ISR_ORE != 0 then reg(USART1 + ICR).value = ISR_ORE
+    if status & ISR_RXNE != 0
+        val c = u8(reg(USART1 + RDR).value) // Reading RDR clears RXNE.
+        val next = (ring.head + 1) % 64
+        if next != ring.tail
+            ring.bytes[ring.head] = c
+            ring.head = next
+
+// The next received character. Interrupts are off between looking at the ring and sleeping, so a
+// character that arrives in between is not missed: a pending interrupt still ends the WFI.
+read_char() -> u8
+    loop
+        interrupts_off()
+        if ring.head != ring.tail
+            val c = ring.bytes[ring.tail]
+            ring.tail = (ring.tail + 1) % 64
+            interrupts_on()
+            return c
+        wait_for_interrupt()
+        interrupts_on()
+
+write_char(c: u8)
+    while reg(USART1 + ISR).value & ISR_TXE == 0 do ()
+    reg(USART1 + TDR).value = u32(c)
+
+// Forth's console is the USART: the keyboard is what is typed, the screen what is sent. There is no
+// source file, so `refill` has nothing to give.
+struct Serial
+    baud: u32
+
+impl Console for Serial
+    emit(*self, c: u8) = write_char(c)
+
+    send(*self, s: []const u8)
+        for c in s do write_char(c)
+
+    key(*self) -> isize = isize(read_char())
+
+    // A line, echoed as it is typed and edited with backspace.
+    accept(*self, into: []u8) -> isize
+        var len: usize = 0
+        loop
+            val c = read_char()
+            if c == u8('\r') || c == u8('\n')
+                write_char(u8('\n'))
+                return isize(len)
+            elif (c == 8 || c == 127) && len > 0
+                len -= 1
+                self.send("\b \b".bytes)
+            elif c >= 32 && c < 127 && len < into.len
+                into[len] = c
+                len += 1
+                write_char(c)
+
+    refill(*self, into: []u8) -> isize = -1
+
+// The machine, its dictionary, its console and the line being read: all module storage.
+var region: [8192]usize
+var machine: Vm
+var serial: Serial
+var line: [128]u8
+
+// Words that reach the board through `@` and `!`, which take real addresses: the LEDs LD1 to LD4
+// (PI12 to PI15, lit by driving the pin low, through GPIOI's BSRR) and the wake-up button B2 (PC13,
+// high while pressed, in GPIOC's IDR).
+val startup: [3]string = [
+    ": LED-ON ( n -- ) 27 + 1 SWAP LSHIFT $58022018 ! ;",
+    ": LED-OFF ( n -- ) 11 + 1 SWAP LSHIFT $58022018 ! ;",
+    ": BUTTON? ( -- flag ) $58020810 @ $2000 AND 0<> ;",
+]
+
+@export("start")
+start() -> never
+    initialize_memory()
+    reg(RCC_AHB4ENR).value = AHB4_GPIOA | AHB4_GPIOC | AHB4_GPIOI
+    reg(RCC_APB2ENR).value = APB2_USART1
+    // PA9 and PA10 to alternate function 7; PC13 an input; PI12 to PI15 outputs with the LEDs off.
+    reg(GPIOA + AFRH).value = (7 << 4) | (7 << 8)
+    reg(GPIOA + MODER).value = (reg(GPIOA + MODER).value & ~((3u32 << 18) | (3u32 << 20))) | (2 << 18) | (2 << 20)
+    reg(GPIOC + MODER).value = reg(GPIOC + MODER).value & ~(3u32 << 26)
+    reg(GPIOI + BSRR).value = 0xf << 12
+    reg(GPIOI + MODER).value = (reg(GPIOI + MODER).value & ~(0xffu32 << 24)) | (0x55 << 24)
+    // 115200 baud from the 120 MHz kernel clock.
+    serial = Serial(115200)
+    reg(USART1 + BRR).value = 120000000 / serial.baud
+    reg(USART1 + CR1).value = CR1_UE | CR1_TE | CR1_RE | CR1_RXNEIE
+    reg(NVIC_ISER1).value = 1 << (USART1_IRQ - 32)
+    boot(&machine, usize(&region[0]), sizeof(region), &serial)
+    for text in startup do interpret_line(&machine, text.bytes)
+    serial.send("forth on the STM32H747I-DISCO\n".bytes)
+    loop
+        val n = serial.accept(line[..])
+        val code = interpret_line(&machine, line[0..<usize(n)])
+        if code == 0 && machine.state == 0 then serial.send(" ok\n".bytes)
