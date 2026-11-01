@@ -116,6 +116,25 @@ but complete physical-board startup is not ready: RCC clock/gating/pin-mux setup
 and the panel-specific vendor initialization sequence remain to be implemented
 before this example can boot unchanged on a physical Discovery board.
 
+## ST-LINK virtual COM port (USART1)
+
+The ST-LINK's virtual COM port is USART1 at 0x40011000, IRQ 37, its TX on PA9 and RX on PA10 in
+alternate function 7 (`buses { usart1 { tx = PA9, rx = PA10 } }`); the board's `vcp` part is the
+host's terminal on its line. Its kernel clock is 120 MHz, rcc_pclk2 with APB2 at 120 MHz, the
+reset choice of USART16SEL. What the guest transmits joins the console's output, at the baud rate
+BRR and PRESC set; what is typed into the console reaches the receiver, one character a frame. A
+character crosses only while its pin is in AF7, as on the board: a guest that leaves PA9 analogue
+sends to no one, and typed input waits in the console while the receiver is off or PA10 is not
+routed. A core in WFI with RXNEIE set is woken by typing; with the input ended, or with nothing
+enabled that typing would raise, it is reported asleep.
+
+The register model is the STM32H7 USART in asynchronous mode: 7, 8 or 9 data bits with even or odd
+parity, 0.5 to 2 stop bits, 16 or 8 times oversampling and the prescaler, the 16-deep FIFOs and their
+thresholds, and the flags and interrupts a polling or interrupt-driven driver uses. What it refuses
+is listed in [peripheral models](peripheral-models.md). Benchtop runs one STM32 USART on a board;
+a second is refused, as is a `stm32-usart` without `kernel-clock-hz` and a terminal on a USART
+whose TX and RX are not routed to pins of the chip's GPIO.
+
 ## Remaining board bring-up
 
 Real memory banks and external SDRAM; remaining STM32 RCC/PWR behavior;
