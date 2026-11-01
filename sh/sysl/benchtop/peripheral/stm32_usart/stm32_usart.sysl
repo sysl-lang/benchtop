@@ -1,0 +1,321 @@
+module sh.sysl.benchtop.peripheral.stm32_usart
+
+import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.stm32h747.usart1 as reg
+import sysl.container.ring.InlineRing
+import sysl.math.{min, max}
+
+// The STM32H7 USART in asynchronous mode (RM0399 §51): 7, 8 or 9 data bits with even or odd parity,
+// 0.5 to 2 stop bits, 16 or 8 times oversampling and the kernel-clock prescaler, the 16-deep transmit
+// and receive FIFOs and their thresholds, and the status flags and interrupts a polling or
+// interrupt-driven driver uses (TXE/TXFNF, TC, RXNE/RXFNE, IDLE, ORE, TXFE, RXFF, TXFT, RXFT).
+//
+// Time is the board clock; `kernel_hz` and `board_hz` turn the baud rate the guest sets into it, so a
+// character takes as long to go as it would on the wire. What the line carries is the model's
+// connection to the board: a character the transmitter finishes joins `sent`, which the board takes
+// from, and a character the board offers through `receive` arrives a frame later.
+//
+// Divergences from the silicon (policy: docs/peripheral-models.md, "Unsupported writes"):
+// - A write that selects a mode the model does not carry out is refused (`write` answers false, a bus
+//   fault): synchronous, LIN, smartcard and IrDA modes, half duplex, hardware flow control and driver
+//   enable, DMA requests, auto baud rate, receiver timeout, character match and mute mode, swapped or
+//   inverted lines and MSB first; the reserved word length M1:M0 = 11; changing the frame, baud rate
+//   or prescaler while UE is set; and enabling with a BRR below 16.
+// - The line never corrupts a character, so PE, FE and NF stay clear; and no break is sent.
+// - Enabling the transmitter sends no idle preamble.
+
+// The FIFOs' depth.
+const DEPTH: usize = 16
+
+const CR1_WRITABLE: u32 = reg.CR1_UE_MASK | reg.CR1_UESM_MASK | reg.CR1_RE_MASK | reg.CR1_TE_MASK | reg.CR1_IDLEIE_MASK |
+    reg.CR1_RXNEIE_MASK | reg.CR1_TCIE_MASK | reg.CR1_TXEIE_MASK | reg.CR1_PEIE_MASK | reg.CR1_PS_MASK |
+    reg.CR1_PCE_MASK | reg.CR1_WAKE_MASK | reg.CR1_M0_MASK | reg.CR1_OVER8_MASK | reg.CR1_M1_MASK |
+    reg.CR1_FIFOEN_MASK | reg.CR1_TXFEIE_MASK | reg.CR1_RXFFIE_MASK | reg.CR1_RTOIE_MASK | reg.CR1_EOBIE_MASK |
+    DE_TIMES
+const DE_TIMES: u32 = reg.CR1_DEAT4_MASK | reg.CR1_DEAT3_MASK | reg.CR1_DEAT2_MASK | reg.CR1_DEAT1_MASK | reg.CR1_DEAT0_MASK |
+    reg.CR1_DEDT4_MASK | reg.CR1_DEDT3_MASK | reg.CR1_DEDT2_MASK | reg.CR1_DEDT1_MASK | reg.CR1_DEDT0_MASK
+// CR1's bits that shape the frame, which only a disabled USART may change.
+const CR1_FRAME: u32 = reg.CR1_PS_MASK | reg.CR1_PCE_MASK | reg.CR1_M0_MASK | reg.CR1_OVER8_MASK | reg.CR1_M1_MASK |
+    reg.CR1_FIFOEN_MASK
+// CR2's bits that matter only in a mode the model refuses (the clock pin's phase, an address), so
+// they are kept; and STOP.
+const CR2_WRITABLE: u32 = reg.CR2_ADD4_7_MASK | reg.CR2_ADD0_3_MASK | reg.CR2_STOP_MASK | reg.CR2_CPOL_MASK |
+    reg.CR2_CPHA_MASK | reg.CR2_LBCL_MASK | reg.CR2_ADDM7_MASK
+const CR3_WRITABLE: u32 = reg.CR3_EIE_MASK | reg.CR3_OVRDIS_MASK | reg.CR3_ONEBIT_MASK | reg.CR3_DDRE_MASK |
+    reg.CR3_WUS_MASK | reg.CR3_TXFTIE_MASK | reg.CR3_RXFTIE_MASK | reg.CR3_TXFTCFG_MASK | reg.CR3_RXFTCFG_MASK
+const RQR_WRITABLE: u32 = reg.RQR_RXFRQ_MASK | reg.RQR_TXFRQ_MASK
+
+// The slots of a FIFO a threshold setting stands for, 1/8 of its depth to all of it.
+private val THRESHOLDS: [6]usize = [2, 4, 8, 12, 14, 16]
+// What the prescaler divides the kernel clock by, PRESCALER 0 to 11 (any larger value is 256).
+private val DIVIDERS: [12]u64 = [1, 2, 4, 6, 8, 10, 12, 16, 32, 64, 128, 256]
+
+/** A USART whose kernel clock runs at `kernel_hz` on a board clock of `board_hz`. */
+struct Usart
+    kernel_hz: u64
+    board_hz: u64
+    cr1: u32
+    cr2: u32
+    cr3: u32
+    brr: u32
+    presc: u32
+    rtor: u32
+    // What waits to be sent, TDR or the transmit FIFO, and the character on the wire, if any, which
+    // the transmitter finishes at `tx_done`.
+    tx: InlineRing[u16, DEPTH]
+    shifting: bool
+    shift: u16
+    tx_done: u64
+    // What has been received and not read, RDR or the receive FIFO; the last character read, which
+    // RDR keeps; and the character on the wire, which arrives at `rx_done`.
+    rx: InlineRing[u16, DEPTH]
+    rdr: u16
+    arriving: bool
+    incoming: u16
+    rx_done: u64
+    // When the line has been idle for a frame after a character, NEVER where it is not counting.
+    idle_at: u64
+    tc: bool
+    idle: bool
+    ore: bool
+    /** The characters the transmitter has finished, oldest first, which the board takes after every
+     * call. Without the guest writing TDR the transmitter finishes at most a FIFO and a character.
+     */
+    sent: InlineRing[u16, SENT]
+
+// Room for what the transmitter can finish between two of the board's calls, with some to spare.
+const SENT: usize = 2 * DEPTH
+
+/** A USART at reset, its kernel clock at `kernel_hz` on a board clock of `board_hz`. */
+usart(kernel_hz: u64, board_hz: u64) -> Usart
+    require kernel_hz > 0 && board_hz > 0, "a USART needs its kernel clock and the board's"
+    var tx: InlineRing[u16, DEPTH]
+    var rx: InlineRing[u16, DEPTH]
+    var sent: InlineRing[u16, SENT]
+    Usart(kernel_hz, board_hz, 0, 0, 0, 0, 0, 0, tx, false, 0, NEVER, rx, 0, false, 0, NEVER, NEVER, true, false, false, sent)
+
+impl Usart
+    /** Whether the USART is enabled. */
+    enabled(*self) -> bool = self.cr1 & reg.CR1_UE_MASK != 0
+
+    /** Whether the receiver would take a character the board offers now: it is enabled and the line
+     * is free.
+     */
+    receiving(*self) -> bool = self.enabled() && self.cr1 & reg.CR1_RE_MASK != 0 && !self.arriving
+
+    /** The character `value` starts arriving on the line at `time`, and is in RDR a frame later.
+     * False, and nothing happens, where the receiver would not take it.
+     */
+    receive(*self, value: u16, time: u64) -> bool
+        if !self.receiving() then return false
+        self.arriving = true
+        self.incoming = value
+        self.rx_done = time + self.frame_ticks()
+        self.idle_at = NEVER
+        true
+
+    /** How many board-clock ticks one character takes on the line, start bit to the last stop bit. */
+    frame_ticks(*self) -> u64
+        // Half bits: the start bit, the data bits (parity among them), and the stop bits.
+        val stop_halves: u64 = (self.cr2 & reg.CR2_STOP_MASK) >> reg.CR2_STOP_SHIFT match
+            1 -> 1
+            2 -> 4
+            3 -> 3
+            _ -> 2
+        val halves = 2 * (1 + u64(self.data_bits())) + stop_halves
+        val presc = u64(min(self.presc & reg.PRESC_PRESCALER_MASK, 11))
+        // With 8 times oversampling BRR[2:0] holds USARTDIV[3:1], and a bit is USARTDIV / 2 kernel clocks.
+        var kernel_per_bit_x2 = 2 * u64(self.brr)
+        if self.cr1 & reg.CR1_OVER8_MASK != 0 then kernel_per_bit_x2 = u64((self.brr & 0xfff0) | ((self.brr & 7) << 1))
+        val kernel_x4 = halves * kernel_per_bit_x2 * DIVIDERS[presc]
+        max(1, (kernel_x4 * self.board_hz + 4 * self.kernel_hz - 1) / (4 * self.kernel_hz))
+
+    /** The data bits a character has, its parity bit among them: 7, 8 or 9. */
+    data_bits(*self) -> u32
+        if self.cr1 & reg.CR1_M1_MASK != 0 then 7 elif self.cr1 & reg.CR1_M0_MASK != 0 then 9 else 8
+
+    /** How many characters TDR or the transmit FIFO, and RDR or the receive FIFO, hold. */
+    depth(*self) -> usize = if self.cr1 & reg.CR1_FIFOEN_MASK != 0 then DEPTH else 1
+
+    /** ISR as the guest reads it. */
+    status(*self) -> u32
+        val fifo = self.cr1 & reg.CR1_FIFOEN_MASK != 0
+        val tx_free = self.depth() - self.tx.len()
+        val txft = THRESHOLDS[min((self.cr3 & reg.CR3_TXFTCFG_MASK) >> reg.CR3_TXFTCFG_SHIFT, 5)]
+        val rxft = THRESHOLDS[min((self.cr3 & reg.CR3_RXFTCFG_MASK) >> reg.CR3_RXFTCFG_SHIFT, 5)]
+        var isr: u32 = 0
+        if tx_free > 0 then isr |= reg.ISR_TXE_MASK
+        if self.tx.is_empty() then isr |= reg.ISR_TXFE_MASK
+        if self.tc then isr |= reg.ISR_TC_MASK
+        if !self.rx.is_empty() then isr |= reg.ISR_RXNE_MASK
+        if fifo && self.rx.len() == DEPTH then isr |= reg.ISR_RXFF_MASK
+        if fifo && tx_free >= txft then isr |= reg.ISR_TXFT_MASK
+        if fifo && self.rx.len() >= rxft then isr |= reg.ISR_RXFT_MASK
+        if self.idle then isr |= reg.ISR_IDLE_MASK
+        if self.ore then isr |= reg.ISR_ORE_MASK
+        if self.arriving then isr |= reg.ISR_BUSY_MASK
+        if self.enabled() && self.cr1 & reg.CR1_TE_MASK != 0 then isr |= reg.ISR_TEACK_MASK
+        if self.enabled() && self.cr1 & reg.CR1_RE_MASK != 0 then isr |= reg.ISR_REACK_MASK
+        isr
+
+    // Start the next character waiting, at `time`, where the transmitter is enabled and idle.
+    private kick(*self, time: u64)
+        if self.shifting || self.tx.is_empty() || !self.enabled() || self.cr1 & reg.CR1_TE_MASK == 0 then return
+        self.shift = self.tx.pop_front().unwrap()
+        self.shifting = true
+        self.tx_done = time + self.frame_ticks()
+
+    // A character's data bits as the line carries them, parity in the top one where it is enabled.
+    private framed(*self, value: u16) -> u16
+        val bits = self.data_bits()
+        val data = u32(value) & ((1u32 << bits) - 1)
+        if self.cr1 & reg.CR1_PCE_MASK == 0 then return u16(data)
+        val payload = data & ((1u32 << (bits - 1)) - 1)
+        var ones: u32 = 0
+        for i in 0u32..<(bits - 1) do ones += (payload >> i) & 1
+        val odd = self.cr1 & reg.CR1_PS_MASK != 0
+        val parity = if odd then (ones + 1) & 1 else ones & 1
+        u16(payload | (parity << (bits - 1)))
+
+    // The payload of a character the transmitter sends: the parity bit dropped.
+    private payload(*self, value: u16) -> u16
+        val bits = self.data_bits() - (if self.cr1 & reg.CR1_PCE_MASK != 0 then 1 else 0)
+        u16(u32(value) & ((1u32 << bits) - 1))
+
+    // Put the USART's activity as UE's clearing leaves it: what was waiting or on the line is gone,
+    // and every flag is as at reset.
+    private stop(*self)
+        self.tx.clear()
+        self.rx.clear()
+        self.shifting = false
+        self.arriving = false
+        self.tx_done = NEVER
+        self.rx_done = NEVER
+        self.idle_at = NEVER
+        self.tc = true
+        self.idle = false
+        self.ore = false
+
+impl Model for Usart
+    read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = read_register(self, offset, width)
+    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool = write_register(self, offset, width, value, time)
+    override advance(*self, time: u64) = advance_line(self, time)
+    override due(*self) -> u64 = min(min(self.tx_done, self.rx_done), self.idle_at)
+    override irq(*self) -> bool = raised(self)
+    reset(*self) = *self = usart(self.kernel_hz, self.board_hz)
+
+// Every event on the line up to `time`, in the order they happen.
+private advance_line(u: *Usart, time: u64)
+    loop
+        val next = min(min(u.tx_done, u.rx_done), u.idle_at)
+        if next == NEVER || next > time then return
+        if u.tx_done == next
+            u.sent.push_back(u.payload(u.shift))
+            u.shifting = false
+            u.tx_done = NEVER
+            u.kick(next)
+            if !u.shifting then u.tc = true
+        elif u.rx_done == next
+            u.arriving = false
+            u.rx_done = NEVER
+            u.idle_at = next + u.frame_ticks()
+            if u.rx.len() < u.depth() then u.rx.push_back(u.framed(u.incoming))
+            elif u.cr3 & reg.CR3_OVRDIS_MASK == 0 then u.ore = true
+            elif u.depth() == 1
+                // With overrun detection off, a new character replaces the one RDR held.
+                u.rx.clear()
+                u.rx.push_back(u.framed(u.incoming))
+        else
+            u.idle_at = NEVER
+            u.idle = true
+
+// The interrupt line: each flag whose interrupt is enabled.
+private raised(u: *Usart) -> bool
+    val isr = u.status()
+    val cr1 = u.cr1
+    val cr3 = u.cr3
+    val on = (bit: u32, enable: bool) -> isr & bit != 0 && enable
+    on(reg.ISR_TXE_MASK, cr1 & reg.CR1_TXEIE_MASK != 0) || on(reg.ISR_TC_MASK, cr1 & reg.CR1_TCIE_MASK != 0) ||
+        on(reg.ISR_RXNE_MASK | reg.ISR_ORE_MASK, cr1 & reg.CR1_RXNEIE_MASK != 0) ||
+        on(reg.ISR_IDLE_MASK, cr1 & reg.CR1_IDLEIE_MASK != 0) || on(reg.ISR_ORE_MASK, cr3 & reg.CR3_EIE_MASK != 0) ||
+        on(reg.ISR_TXFE_MASK, cr1 & reg.CR1_TXFEIE_MASK != 0) || on(reg.ISR_RXFF_MASK, cr1 & reg.CR1_RXFFIE_MASK != 0) ||
+        on(reg.ISR_TXFT_MASK, cr3 & reg.CR3_TXFTIE_MASK != 0) || on(reg.ISR_RXFT_MASK, cr3 & reg.CR3_RXFTIE_MASK != 0)
+
+// RDR and TDR answer accesses of any width; every other register only a word.
+private read_register(u: *Usart, offset: u32, width: u32) -> Option[u32]
+    if offset == reg.RDR_OFFSET
+        u.rx.pop_front() match
+            Some(c) -> u.rdr = c
+            None -> ()
+        return Some(u32(u.rdr))
+    if width != 4 then return None
+    offset match
+        reg.CR1_OFFSET -> Some(u.cr1)
+        reg.CR2_OFFSET -> Some(u.cr2)
+        reg.CR3_OFFSET -> Some(u.cr3)
+        reg.BRR_OFFSET -> Some(u.brr)
+        reg.GTPR_OFFSET -> Some(0)
+        reg.RTOR_OFFSET -> Some(u.rtor)
+        reg.RQR_OFFSET -> Some(0)
+        reg.ISR_OFFSET -> Some(u.status())
+        reg.ICR_OFFSET -> Some(0)
+        reg.TDR_OFFSET -> Some(0)
+        reg.PRESC_OFFSET -> Some(u.presc)
+        _ -> None
+
+private write_register(u: *Usart, offset: u32, width: u32, value: u32, time: u64) -> bool
+    if offset == reg.TDR_OFFSET
+        val c = u16(value & reg.TDR_TDR_MASK)
+        if u.tx.len() < u.depth() then u.tx.push_back(c)
+        elif u.depth() == 1
+            // TDR full: the new character replaces the one waiting, as on the silicon.
+            u.tx.clear()
+            u.tx.push_back(c)
+        u.tc = false
+        u.kick(time)
+        return true
+    if width != 4 then return false
+    val disabled = !u.enabled()
+    offset match
+        reg.CR1_OFFSET ->
+            if value & ~CR1_WRITABLE != 0 then return false
+            if value & reg.CR1_M0_MASK != 0 && value & reg.CR1_M1_MASK != 0 then return false
+            if !disabled && (value ^ u.cr1) & CR1_FRAME != 0 then return false
+            val enabling = value & reg.CR1_UE_MASK != 0
+            if enabling && disabled && u.brr < 16 then return false
+            if !enabling && !disabled then u.stop()
+            val receiver_off = value & reg.CR1_RE_MASK == 0
+            u.cr1 = value
+            if receiver_off
+                u.arriving = false
+                u.rx_done = NEVER
+            u.kick(time)
+        reg.CR2_OFFSET ->
+            if value & ~CR2_WRITABLE != 0 then return false
+            if !disabled && (value ^ u.cr2) & reg.CR2_STOP_MASK != 0 then return false
+            u.cr2 = value
+        reg.CR3_OFFSET ->
+            if value & ~CR3_WRITABLE != 0 then return false
+            if (value & reg.CR3_TXFTCFG_MASK) >> reg.CR3_TXFTCFG_SHIFT > 5 then return false
+            if (value & reg.CR3_RXFTCFG_MASK) >> reg.CR3_RXFTCFG_SHIFT > 5 then return false
+            u.cr3 = value
+        reg.BRR_OFFSET ->
+            if value > 0xffff || !disabled then return false
+            u.brr = value
+        reg.PRESC_OFFSET ->
+            if value & ~reg.PRESC_PRESCALER_MASK != 0 || !disabled then return false
+            u.presc = value
+        reg.GTPR_OFFSET -> if value != 0 then return false
+        reg.RTOR_OFFSET -> u.rtor = value
+        reg.RQR_OFFSET ->
+            if value & ~RQR_WRITABLE != 0 then return false
+            if value & reg.RQR_RXFRQ_MASK != 0 then u.rx.clear()
+            if value & reg.RQR_TXFRQ_MASK != 0 then u.tx.clear()
+        reg.ICR_OFFSET ->
+            if value & reg.ICR_ORECF_MASK != 0 then u.ore = false
+            if value & reg.ICR_IDLECF_MASK != 0 then u.idle = false
+            if value & reg.ICR_TCCF_MASK != 0 then u.tc = false
+        reg.ISR_OFFSET | reg.RDR_OFFSET -> ()
+        _ -> return false
+    true

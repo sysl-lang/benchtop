@@ -1,0 +1,323 @@
+module sh.sysl.benchtop.peripheral.stm32_usart
+@tests
+import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.timing.NEVER
+
+// Register offsets and bits, spelled out so a test does not lean on the model's own names.
+private const CR1 = 0x00u32
+private const CR2 = 0x04u32
+private const CR3 = 0x08u32
+private const BRR = 0x0cu32
+private const GTPR = 0x10u32
+private const RQR = 0x18u32
+private const ISR = 0x1cu32
+private const ICR = 0x20u32
+private const RDR = 0x24u32
+private const TDR = 0x28u32
+private const PRESC = 0x2cu32
+
+private const UE = 1u32
+private const RE = 1u32 << 2
+private const TE = 1u32 << 3
+private const IDLEIE = 1u32 << 4
+private const RXNEIE = 1u32 << 5
+private const TCIE = 1u32 << 6
+private const TXEIE = 1u32 << 7
+private const PS = 1u32 << 9
+private const PCE = 1u32 << 10
+private const M0 = 1u32 << 12
+private const OVER8 = 1u32 << 15
+private const M1 = 1u32 << 28
+private const FIFOEN = 1u32 << 29
+
+private const ORE = 1u32 << 3
+private const IDLE = 1u32 << 4
+private const RXNE = 1u32 << 5
+private const TC = 1u32 << 6
+private const TXE = 1u32 << 7
+private const BUSY = 1u32 << 16
+private const TEACK = 1u32 << 21
+private const REACK = 1u32 << 22
+private const TXFE = 1u32 << 23
+private const RXFF = 1u32 << 24
+private const RXFT = 1u32 << 26
+private const TXFT = 1u32 << 27
+
+// 115200 baud from a 100 MHz kernel clock (RM0399's formula, USARTDIV = fck / baud, rounded), on a
+// 480 MHz board: a bit is 868 kernel clocks, 4166.4 board ticks.
+private const KERNEL: u64 = 100000000
+private const BOARD: u64 = 480000000
+private const DIV_115200 = 868u32
+// Ten bits, 8680 kernel clocks.
+private const FRAME_8N1: u64 = 41664
+
+private isr(u: *Usart) -> u32 = u.read(ISR, 4, 0).unwrap()
+
+// A USART at 115200 baud, 8N1, enabled with `cr1`'s other bits.
+private ready(cr1: u32) -> Usart
+    var u = usart(KERNEL, BOARD)
+    assert(u.write(BRR, 4, DIV_115200, 0))
+    assert(u.write(CR1, 4, cr1 | UE | TE | RE, 0))
+    u
+
+// The transmitter has finished exactly the characters of `expect`, which are taken.
+private sends(u: *Usart, expect: string)
+    val want = expect.view()
+    for i in 0..<want.len do assert_eq(u.sent.pop_front().unwrap_or(0xffff), u16(want[i]))
+    assert(u.sent.is_empty())
+
+@test("STM32 USART: reset values")
+reset_values()
+    var u = usart(KERNEL, BOARD)
+    assert_eq(isr(&u), 0x008000c0, "RM0399's ISR reset value: TXFE, TXE and TC")
+    for o in [CR1, CR2, CR3, BRR, GTPR, PRESC] do assert_eq(u.read(o, 4, 0).unwrap(), 0)
+    assert_eq(u.due(), NEVER)
+    assert(!u.irq())
+
+@test("STM32 USART: a character takes its frame on the line, and TC follows it")
+transmit_timing()
+    var u = ready(0)
+    assert_eq(isr(&u) & (TEACK | REACK), TEACK | REACK)
+    assert(u.write(TDR, 4, u32('A'), 100))
+    assert_eq(isr(&u) & (TXE | TC), TXE, "TDR moved into the shift register; TC cleared by the write")
+    assert_eq(u.due(), 100 + FRAME_8N1)
+    u.advance(99 + FRAME_8N1)
+    sends(&u, "")
+    u.advance(100 + FRAME_8N1)
+    sends(&u, "A")
+    assert(isr(&u) & TC != 0)
+    assert_eq(u.due(), NEVER)
+
+@test("STM32 USART: TDR holds one character behind the one on the line, and a third replaces it")
+transmit_without_fifo()
+    var u = ready(0)
+    assert(u.write(TDR, 1, u32('a'), 0))
+    assert(u.write(TDR, 1, u32('b'), 0))
+    assert_eq(isr(&u) & TXE, 0, "TDR full")
+    assert(u.write(TDR, 1, u32('c'), 0))
+    u.advance(2 * FRAME_8N1)
+    sends(&u, "ac")
+    assert(isr(&u) & (TXE | TC | TXFE) == TXE | TC | TXFE)
+
+@test("STM32 USART: the transmit FIFO holds sixteen behind the line, with its threshold flag")
+transmit_fifo()
+    var u = ready(FIFOEN)
+    // Threshold at half the FIFO: TXFT while eight or more slots are free.
+    assert(u.write(CR3, 4, 2u32 << 29, 0))
+    assert(u.write(TDR, 4, u32('0'), 0))
+    for i in 0..<16
+        assert(isr(&u) & TXE != 0, "TXFNF while the FIFO has room")
+        assert_eq(isr(&u) & TXFT != 0, i <= 8)
+        assert(u.write(TDR, 4, u32('a') + u32(i), 0))
+    assert_eq(isr(&u) & (TXE | TXFE | TXFT), 0)
+    assert(u.write(TDR, 4, u32('!'), 0), "a write to a full FIFO is lost")
+    u.advance(17 * FRAME_8N1)
+    sends(&u, "0abcdefghijklmnop")
+    assert(isr(&u) & (TC | TXFE | TXE | TXFT) == TC | TXFE | TXE | TXFT)
+
+@test("STM32 USART: a received character lands a frame later, then IDLE a frame after that")
+receive_timing()
+    var u = ready(RXNEIE | IDLEIE)
+    assert(u.receive(u16('x'), 1000))
+    assert(isr(&u) & BUSY != 0)
+    assert(!u.receive(u16('y'), 1000), "the line is busy")
+    u.advance(999 + FRAME_8N1)
+    assert_eq(isr(&u) & RXNE, 0)
+    assert(!u.irq())
+    u.advance(1000 + FRAME_8N1)
+    assert_eq(isr(&u) & (RXNE | BUSY), RXNE)
+    assert(u.irq())
+    assert_eq(u.read(RDR, 4, 0).unwrap(), u32('x'))
+    assert_eq(isr(&u) & RXNE, 0)
+    assert(!u.irq())
+    assert_eq(u.read(RDR, 4, 0).unwrap(), u32('x'), "RDR keeps the last character")
+    u.advance(1000 + 2 * FRAME_8N1)
+    assert(isr(&u) & IDLE != 0)
+    assert(u.irq(), "IDLEIE")
+    assert(u.write(ICR, 4, IDLE, 0))
+    assert_eq(isr(&u) & IDLE, 0)
+    assert(!u.irq())
+
+@test("STM32 USART: a character that finds RDR full sets ORE and is lost; overrun detection off replaces it")
+receive_overrun()
+    var u = ready(RXNEIE)
+    assert(u.receive(u16('1'), 0))
+    u.advance(FRAME_8N1)
+    assert(u.receive(u16('2'), FRAME_8N1))
+    u.advance(2 * FRAME_8N1)
+    assert(isr(&u) & ORE != 0)
+    assert_eq(u.read(RDR, 4, 0).unwrap(), u32('1'))
+    assert(u.irq(), "RXNEIE raises ORE too")
+    assert(u.write(ICR, 4, ORE, 0))
+    assert(!u.irq())
+
+    var v = usart(KERNEL, BOARD)
+    assert(v.write(BRR, 4, DIV_115200, 0))
+    assert(v.write(CR3, 4, 1u32 << 12, 0))
+    assert(v.write(CR1, 4, UE | RE, 0))
+    assert(v.receive(u16('1'), 0))
+    v.advance(FRAME_8N1)
+    assert(v.receive(u16('2'), FRAME_8N1))
+    v.advance(2 * FRAME_8N1)
+    assert_eq(isr(&v) & ORE, 0)
+    assert_eq(v.read(RDR, 4, 0).unwrap(), u32('2'))
+
+@test("STM32 USART: the receive FIFO holds sixteen, with RXFF and the threshold flag")
+receive_fifo()
+    var u = ready(FIFOEN)
+    // Threshold at a quarter of the FIFO: RXFT once four have arrived.
+    assert(u.write(CR3, 4, 1u32 << 25, 0))
+    var t: u64 = 0
+    for i in 0..<17
+        assert(u.receive(u16('a') + u16(i), t))
+        t += FRAME_8N1
+        u.advance(t)
+        assert_eq(isr(&u) & RXFT != 0, i >= 3)
+    assert(isr(&u) & (RXFF | ORE) == RXFF | ORE)
+    assert(u.write(RQR, 4, 1u32 << 3, 0), "RXFRQ")
+    assert_eq(isr(&u) & (RXNE | RXFF), 0)
+
+@test("STM32 USART: parity is the top data bit, even or odd")
+parity()
+    var u = ready(PCE)
+    assert(u.write(TDR, 4, 0xff, 0))
+    u.advance(FRAME_8N1)
+    assert_eq(u.sent.pop_front().unwrap(), 0x7f, "the transmitter puts parity in the eighth bit")
+    // 'A' has two ones and 'C' three: even parity sets the eighth bit for 'C' alone.
+    assert(u.receive(u16('A'), FRAME_8N1))
+    u.advance(2 * FRAME_8N1)
+    assert_eq(u.read(RDR, 4, 0).unwrap(), 0x41)
+    assert(u.receive(u16('C'), 2 * FRAME_8N1))
+    u.advance(3 * FRAME_8N1)
+    assert_eq(u.read(RDR, 4, 0).unwrap(), 0xc3)
+
+    var odd = ready(PCE | PS)
+    assert(odd.receive(u16('A'), 0))
+    odd.advance(FRAME_8N1)
+    assert_eq(odd.read(RDR, 4, 0).unwrap(), 0xc1)
+
+    // Seven data bits: nine bits on the line, 37497.6 board ticks, rounded up.
+    var seven = ready(M1)
+    assert(seven.write(TDR, 4, 0xff, 0))
+    assert_eq(seven.due(), 37498)
+    seven.advance(FRAME_8N1)
+    assert_eq(seven.sent.pop_front().unwrap(), 0x7f)
+
+    // Nine data bits: eleven bits, 45830.4 ticks.
+    var nine = ready(M0)
+    assert(nine.write(TDR, 4, 0x1ff, 0))
+    assert_eq(nine.due(), 45831)
+    nine.advance(FRAME_8N1 * 2)
+    assert_eq(nine.sent.pop_front().unwrap(), 0x1ff)
+
+@test("STM32 USART: stop bits, 8x oversampling and the prescaler set the frame")
+frame_shapes()
+    // Two stop bits: eleven bits.
+    var two = usart(KERNEL, BOARD)
+    assert(two.write(BRR, 4, DIV_115200, 0))
+    assert(two.write(CR2, 4, 2u32 << 12, 0))
+    assert(two.write(CR1, 4, UE | TE, 0))
+    assert_eq(two.frame_ticks(), 45831)
+    // Half a stop bit: 9.5 bits, 39580.8 ticks; a stop bit and a half: 10.5 bits, 43747.2.
+    var half = usart(KERNEL, BOARD)
+    assert(half.write(BRR, 4, DIV_115200, 0))
+    assert(half.write(CR2, 4, 1u32 << 12, 0))
+    assert_eq(half.frame_ticks(), 39581)
+    assert(half.write(CR2, 4, 3u32 << 12, 0))
+    assert_eq(half.frame_ticks(), 43748)
+    // 8x oversampling: USARTDIV = 2 * fck / baud = 1736, BRR = 0x6c0 | (8 >> 1); the same baud rate.
+    var over8 = usart(KERNEL, BOARD)
+    assert(over8.write(BRR, 4, 1732, 0))
+    assert(over8.write(CR1, 4, OVER8, 0))
+    assert_eq(over8.frame_ticks(), FRAME_8N1)
+    // PRESCALER 1 halves the kernel clock; 3 divides by six; past 11 by 256.
+    var slow = usart(KERNEL, BOARD)
+    assert(slow.write(BRR, 4, DIV_115200, 0))
+    assert(slow.write(PRESC, 4, 1, 0))
+    assert_eq(slow.frame_ticks(), 2 * FRAME_8N1)
+    assert(slow.write(PRESC, 4, 3, 0))
+    assert_eq(slow.frame_ticks(), 6 * FRAME_8N1)
+    assert(slow.write(PRESC, 4, 15, 0))
+    assert_eq(slow.frame_ticks(), 256 * FRAME_8N1)
+
+@test("STM32 USART: TXE, TC and RXNE raise the line only where enabled")
+interrupts()
+    var u = ready(0)
+    assert(!u.irq(), "TXE and TC set, neither enabled")
+    assert(u.write(CR1, 4, UE | TE | RE | TXEIE, 0))
+    assert(u.irq())
+    assert(u.write(TDR, 4, 1, 0))
+    assert(u.write(TDR, 4, 2, 0))
+    assert(!u.irq(), "TDR full")
+    assert(u.write(CR1, 4, UE | TE | RE | TCIE, 0))
+    assert(!u.irq())
+    u.advance(2 * FRAME_8N1)
+    assert(u.irq(), "TC")
+    assert(u.write(ICR, 4, TC, 0))
+    assert(!u.irq())
+
+@test("STM32 USART: the receiver takes nothing while it or the USART is off")
+receiver_off()
+    var u = usart(KERNEL, BOARD)
+    assert(!u.receive(1, 0))
+    assert(u.write(BRR, 4, DIV_115200, 0))
+    assert(u.write(CR1, 4, UE | TE, 0))
+    assert(!u.receive(1, 0))
+    assert(u.write(CR1, 4, UE | TE | RE, 0))
+    assert(u.receive(1, 0))
+    assert(u.write(CR1, 4, UE | TE, 0))
+    assert_eq(isr(&u) & BUSY, 0, "turning the receiver off drops the character on the line")
+    assert_eq(u.due(), NEVER)
+
+@test("STM32 USART: clearing UE discards what is waiting and on the line, and puts the flags back")
+disable()
+    var u = ready(FIFOEN)
+    assert(u.write(TDR, 4, 1, 0))
+    assert(u.write(TDR, 4, 2, 0))
+    assert(u.receive(3, 0))
+    assert(u.write(CR1, 4, FIFOEN, 0))
+    assert_eq(isr(&u) & (TXE | TC | TXFE | RXNE | BUSY | TEACK | REACK), TXE | TC | TXFE)
+    assert_eq(u.due(), NEVER)
+    u.advance(10 * FRAME_8N1)
+    assert(u.sent.is_empty())
+
+@test("STM32 USART: a mode the model does not carry out is refused")
+refusals()
+    var u = usart(KERNEL, BOARD)
+    assert(!u.write(CR1, 4, UE | TE, 0), "enabling with BRR below 16")
+    assert(!u.write(BRR, 4, 0x10000, 0))
+    assert(u.write(BRR, 4, DIV_115200, 0))
+    assert(!u.write(CR1, 4, M0 | M1, 0), "the reserved word length")
+    assert(!u.write(CR1, 4, 1u32 << 13, 0), "mute mode")
+    assert(!u.write(CR1, 4, 1u32 << 14, 0), "character match")
+    assert(!u.write(CR2, 4, 1u32 << 14, 0), "LIN")
+    assert(!u.write(CR2, 4, 1u32 << 11, 0), "synchronous mode")
+    assert(!u.write(CR2, 4, 1u32 << 15, 0), "swapped pins")
+    assert(!u.write(CR2, 4, 1u32 << 23, 0), "receiver timeout")
+    assert(!u.write(CR3, 4, 1u32 << 7, 0), "transmit DMA")
+    assert(!u.write(CR3, 4, 1u32 << 6, 0), "receive DMA")
+    assert(!u.write(CR3, 4, 1u32 << 9, 0), "CTS flow control")
+    assert(!u.write(CR3, 4, 1u32 << 3, 0), "half duplex")
+    assert(!u.write(CR3, 4, 6u32 << 29, 0), "a reserved TX FIFO threshold")
+    assert(!u.write(GTPR, 4, 1, 0), "smartcard and IrDA prescaler")
+    assert(!u.write(RQR, 4, 2, 0), "send break")
+    assert(!u.write(0x30, 4, 0, 0))
+    assert(u.read(0x30, 4, 0).is_none())
+    assert(!u.write(CR1, 2, UE, 0), "only a word reaches CR1")
+    assert(u.read(CR1, 2, 0).is_none())
+    assert(u.write(CR1, 4, UE | TE, 0))
+    assert(!u.write(CR1, 4, UE | TE | PCE, 0), "the frame while enabled")
+    assert(!u.write(BRR, 4, 100, 0), "BRR while enabled")
+    assert(!u.write(PRESC, 4, 1, 0), "PRESC while enabled")
+    assert(!u.write(CR2, 4, 2u32 << 12, 0), "STOP while enabled")
+    assert(u.write(CR1, 4, UE | TE | RE | RXNEIE, 0), "enable bits change while enabled")
+
+@test("STM32 USART: a reset keeps the clocks")
+reset_keeps_clocks()
+    var u = ready(FIFOEN)
+    assert(u.write(TDR, 4, 1, 0))
+    u.reset()
+    assert_eq(isr(&u), 0x008000c0)
+    assert(u.kernel_hz == KERNEL && u.board_hz == BOARD)
+    assert(u.write(BRR, 4, DIV_115200, 0))
+    assert_eq(u.frame_ticks(), FRAME_8N1)
