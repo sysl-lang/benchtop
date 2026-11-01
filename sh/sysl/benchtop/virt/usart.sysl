@@ -1,0 +1,173 @@
+module sh.sysl.benchtop.virt
+
+// The STM32's USART (`stm32-usart`) on the board: the register model (peripheral/stm32_usart) and the
+// line it drives. A board puts the host's terminal on the line with a `terminal` part wired to the
+// USART's bus, as the STM32H747I-DISCO's ST-LINK virtual COM port is on USART1: what the guest sends
+// joins the machine's console output, and what is typed into the console reaches the guest's receiver.
+//
+// A character crosses only where the pin carrying it is in the USART's alternate function, as on the
+// board. Typed input waits in the console until the receiver is enabled and its line is free, where a
+// person typing at a real port while the receiver is off would lose it; once taken, a character
+// arrives a frame later at the baud rate the guest set, so a paste reaches the guest at line rate and
+// overruns a guest that reads too slowly, as on the wire.
+
+import sh.sysl.benchtop.{Board, Part, part_model}
+import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.peripheral.stm32_usart as uart
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.benchtop.v6m.{Cpu, Stop, IRQ0, could_wake, exception_active, halt, lower_limit, raise}
+import sh.sysl.stm32h747.usart1 as reg
+import sysl.sync.*
+import sysl.threads.Mutex
+
+// The alternate function that puts USART1's TX and RX on the pins the chip lists for them (DS12930).
+const USART_AF: u32 = 7
+
+/** The USART: whether the bus has it, the IRQ it raises (-1 for none), whether the host's terminal is
+ * on its line and the pins its TX and RX are routed to, which the board fixes; `next` and `level`, its
+ * next event's clock and its interrupt line, published for the cores to read without its lock; and
+ * under `live` the register model.
+ */
+struct UsartState
+    present: bool
+    irq: int
+    terminal: bool
+    tx: string
+    rx: string
+    next: u64
+    level: u32
+    live: Mutex[uart.Usart]
+
+/** No USART on the bus. */
+usart_state() -> UsartState = UsartState(false, -1, false, "", "", NEVER, 0, Mutex.new(uart.usart(1, 1)))
+
+/** Whether part `p` is the host's terminal on one of `b`'s USARTs. */
+private[virt] usart_terminal(b: Board, p: Part) -> bool
+    if part_model(p) != "terminal" then return false
+    for wire in p.wires
+        if wire.port != "uart" then continue
+        wire.to match
+            Bus(name) -> for q in b.chip.peripherals do if q.name == name && q.kind == "stm32-usart" then return true
+            _ -> ()
+    false
+
+// The pin the board routes the USART `name`'s `signal` to, or the only one its chip lists.
+private usart_pin(b: Board, name: string, signal: string) -> string
+    for bus in b.buses
+        if bus.name != name then continue
+        for route in bus.signals do if route.name == signal then return route.pin
+    for p in b.chip.peripherals
+        if p.name != name then continue
+        for route in p.signals do if route.name == signal && route.pins.len() == 1 then return route.pins.at(0).name
+    ""
+
+/** The USART `b` makes on a chip whose clock is `clock_hz`, or why benchtop cannot run it. */
+private[virt] check_usart(b: Board, clock_hz: u64) -> Result[UsartState, string]
+    var s = usart_state()
+    for p in b.chip.peripherals
+        if p.kind != "stm32-usart" then continue
+        if s.present then return Err("benchtop runs one STM32 USART")
+        s.present = true
+        if !p.irqs.is_empty() then s.irq = int(p.irqs.at(0).n)
+        var kernel: u64 = 0
+        for q in p.params do if q.name == "kernel-clock-hz" then q.value match
+            Whole(hz) -> kernel = u64(hz)
+            _ -> ()
+        if clock_hz == 0 || kernel == 0 then return Err(s"`${p.name}` needs the chip's `clock-hz` and its own `kernel-clock-hz`")
+        for part in b.parts do if usart_terminal(b, part) then s.terminal = true
+        s.tx = usart_pin(b, p.name, "tx")
+        s.rx = usart_pin(b, p.name, "rx")
+        if s.terminal && (s.tx.is_empty() || s.rx.is_empty())
+            return Err(s"the terminal on `${p.name}` needs its tx and rx on pins, under `buses`")
+        s.live = Mutex.new(uart.usart(kernel, clock_hz))
+    Ok(s)
+
+private[virt] boot_usart(s: *UsartState)
+    s.live.with(u -> u.reset())
+    atomic_store(&s.next, NEVER, Release)
+    atomic_store(&s.level, 0, Release)
+
+private publish_usart(s: *UsartState, u: *uart.Usart)
+    atomic_store(&s.next, u.due(), Release)
+    atomic_store(&s.level, if u.irq() then 1 else 0, Release)
+
+// Which way the line reaches the host's terminal now: each pin in the USART's alternate function.
+private usart_routes(m: *Machine) -> (bool, bool)
+    val s = &m.devices.usart
+    if !s.terminal then return (false, false)
+    val storage = &m.devices.storage
+    (stm32_alternate(storage, s.tx, USART_AF), stm32_alternate(storage, s.rx, USART_AF))
+
+// Bring the USART up to `time`: what it has sent goes to the console, and a character typed starts
+// arriving where the receiver would take one. `routes` is `usart_routes`, asked before the lock.
+private bring_usart(m: *Machine, u: *uart.Usart, routes: (bool, bool), time: u64)
+    u.advance(time)
+    val (tx, rx) = routes
+    loop
+        u.sent.pop_front() match
+            Some(c) -> if tx then console_put(&m.console, u8.wrap(c))
+            None -> break
+    if rx && u.receiving()
+        console_take(&m.console) match
+            Some(b) -> u.receive(u16(b), time)
+            None -> ()
+    publish_usart(&m.devices.usart, u)
+
+private[virt] usart_due(s: *UsartState) -> u64 = atomic_load(&s.next, Acquire)
+
+private[virt] usart_wake(s: *UsartState, cpu: *Cpu) -> u64
+    if !s.present || s.irq < 0 || !could_wake(cpu, IRQ0 + u32(s.irq)) then return NEVER
+    if atomic_load(&s.level, Acquire) != 0 then board_time(cpu, cpu.retired) else usart_due(s)
+
+/** Whether typed input would wake `cpu` through the USART: the host's terminal is on its line and the
+ * guest is waiting on its receiver's interrupt, and the input has not ended.
+ */
+private[virt] usart_listens(m: *Machine, cpu: *Cpu) -> bool
+    val s = &m.devices.usart
+    if !s.present || !s.terminal || s.irq < 0 || !could_wake(cpu, IRQ0 + u32(s.irq)) then return false
+    if console_status(&m.console) == ENDED then return false
+    val (_, rx) = usart_routes(m)
+    val listening = reg.CR1_UE_MASK | reg.CR1_RE_MASK | reg.CR1_RXNEIE_MASK
+    rx && s.live.with(u -> u.cr1 & listening == listening)
+
+private[virt] signal_usart(m: *Machine, cpu: *Cpu)
+    val s = &m.devices.usart
+    if !s.present then return
+    val routes = usart_routes(m)
+    s.live.with(u -> bring_usart(m, u, routes, board_time(cpu, cpu.retired)))
+    if atomic_load(&s.level, Acquire) != 0 && s.irq >= 0 && !exception_active(cpu, IRQ0 + u32(s.irq)) then raise(cpu, u32(s.irq))
+
+// RDR and TDR take a byte, a halfword or a word; every other register only a word, which the model
+// checks. Any access off its own alignment faults.
+private usart_access(cpu: *Cpu, address: u32, offset: u32, width: u32) -> bool
+    if (width == 1 || width == 2 || width == 4) && offset & (width - 1) == 0 then return true
+    halt(cpu, Stop.Fault, address)
+    false
+
+private[virt] usart_read(m: *Machine, cpu: *Cpu, address: u32, offset: u32, width: u32, n: u64) -> u32
+    if !usart_access(cpu, address, offset, width) then return 0
+    val time = board_time(cpu, n)
+    val routes = usart_routes(m)
+    m.devices.usart.live.with(u ->
+        bring_usart(m, u, routes, time)
+        val value = u.read(offset, width, time)
+        publish_usart(&m.devices.usart, u)
+        value) match
+        Some(value) -> value
+        None ->
+            halt(cpu, Stop.Unmapped, address)
+            0
+
+private[virt] usart_write(m: *Machine, cpu: *Cpu, address: u32, offset: u32, width: u32, value: u32, n: u64)
+    if !usart_access(cpu, address, offset, width) then return
+    val s = &m.devices.usart
+    val time = board_time(cpu, n)
+    val routes = usart_routes(m)
+    val ok = s.live.with(u ->
+        bring_usart(m, u, routes, time)
+        val ok = u.write(offset, width, value, time)
+        publish_usart(s, u)
+        ok)
+    if !ok then halt(cpu, Stop.Fault, address)
+    val next = usart_due(s)
+    if next != NEVER then lower_limit(cpu, retirement_limit(cpu, next))
