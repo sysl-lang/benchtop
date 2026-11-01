@@ -5,9 +5,28 @@ import sh.sysl.benchtop.v6m.{Cpu,Stop,halt,load32,set_limit}
 import sysl.threads.Mutex
 import sh.sysl.stm32h747.rcc.GCR_OFFSET
 
-// The RCC's boot control, and nothing else of the RCC. Unknown registers fault explicitly; this
-// does not substitute ready bits for unimplemented oscillator/PLL behavior.
-// CM4's reset address is a board option-byte setting, not a fictitious MMIO.
+// The RCC's boot control and its peripheral clock enables, and nothing else of the RCC. Unknown
+// registers fault explicitly; this does not substitute ready bits for unimplemented
+// oscillator/PLL behavior. CM4's reset address is a board option-byte setting, not a fictitious
+// MMIO.
+//
+// The enables are stored and read back, but gate nothing: a peripheral whose clock is off still
+// runs. The reset registers (AHB3RSTR..APB4RSTR) stay refused, since a held reset would have to
+// reach the peripheral models.
+
+// The nine enable registers of one core's view, in RM0399's order: AHB3, AHB1, AHB2, AHB4, APB3,
+// APB1L, APB1H, APB2, APB4. RCC_C1_xxxENR (CPU1, the CM7) starts at 0x134 and RCC_C2_xxxENR (CPU2,
+// the CM4) at 0x194; RCC_xxxENR at 0xD4 is the accessing core's own copy.
+private const ENR_COUNT: u32 = 9
+private const ENR_OWN: u32 = 0xd4
+private const ENR_C1: u32 = 0x134
+private const ENR_C2: u32 = 0x194
+// The bits each register implements, from ST's CMSIS stm32h747xx.h; a write to any other bit is
+// refused.
+private val ENR_WRITABLE: [9]u32 = [0xf0015131, 0x1e03c023, 0xe0000241, 0x132807ff, 0x00000058,
+    0xe8ffcbff, 0x00000136, 0x31d73033, 0x0021deaa]
+// Reset values: everything off but APB4ENR.RTCAPBEN.
+private val ENR_RESET: [9]u32 = [0, 0, 0, 0, 0, 0, 0, 0, 0x00010000]
 
 // RCC_GCR's boot requests (ST CMSIS stm32h747xx.h; the SVD lists only WW1RSC): BOOT_C1 lets the
 // CM7 run, and is set from reset; BOOT_C2 starts the CM4.
@@ -17,15 +36,34 @@ private const GCR_BOOT: u32 = GCR_BOOT_C1 | GCR_BOOT_C2
 // The CM4 boot address's alignment: the option bytes hold its top 16 bits.
 private const CM4_BOOT_GRANULE_MASK: u32 = 0xffff
 
+/** Both cores' copies of the peripheral clock enables: CPU1's nine, then CPU2's. */
+struct RccEnables
+    regs: [18]u32
+
+private enables_at_reset() -> RccEnables
+    var e = RccEnables([0; 18])
+    for i in 0..<18 do e.regs[i] = ENR_RESET[i % 9]
+    e
+
 /** The RCC's boot control: the CM4's boot address, from the board's option bytes, and GCR, which
- * either core may reach.
+ * either core may reach; and the peripheral clock enables of both cores.
  */
 struct RccState
     cm4_boot: u32
     gcr: Mutex[u32]
+    enables: Mutex[RccEnables]
 
 /** The RCC as a board without one leaves it. */
-rcc_state() -> RccState = RccState(0x08100000, Mutex.new(GCR_BOOT_C1))
+rcc_state() -> RccState = RccState(0x08100000, Mutex.new(GCR_BOOT_C1), Mutex.new(enables_at_reset()))
+
+// The slot in `RccEnables.regs` an offset names for core `core`, if it is an enable register.
+private enable_slot(core: u32, offset: u32) -> Option[u32]
+    val own = if core == 0 then ENR_C1 else ENR_C2
+    for base in [ENR_OWN, ENR_C1, ENR_C2]
+        if offset >= base && offset < base + ENR_COUNT * 4
+            val copy = if base == ENR_OWN then own else base
+            return Some((if copy == ENR_C1 then 0 else ENR_COUNT) + (offset - base) / 4)
+    None
 
 private[virt] check_rcc(b: Board) -> Result[RccState,string]
     var s = rcc_state()
@@ -41,15 +79,27 @@ private[virt] check_rcc(b: Board) -> Result[RccState,string]
         if s.cm4_boot & CM4_BOOT_GRANULE_MASK != 0 then return Err("CM4 boot address must align to the option bytes' 64 KB granularity")
     Ok(s)
 
-private[virt] boot_h7(r: *RccState) = r.gcr.with(gcr -> *gcr = GCR_BOOT_C1)
+private[virt] boot_h7(r: *RccState)
+    r.gcr.with(gcr -> *gcr = GCR_BOOT_C1)
+    r.enables.with(e -> *e = enables_at_reset())
 
 private[virt] h7_rcc_read(r: *RccState, c: *Cpu, address: u32, offset: u32, width: u32) -> u32
     if width != 4 || offset & 3 != 0
         halt(c,Stop.Fault,address)
         return 0
     if offset == GCR_OFFSET then return r.gcr.with(gcr -> *gcr)
+    enable_slot(c.core,offset) match
+        Some(slot) -> return r.enables.with(e -> e.regs[slot])
+        None -> ()
     halt(c,Stop.Unmapped,address)
     0
+
+// A write of an enable register stores it, or faults if it sets a bit the register does not have.
+private h7_enable_write(r: *RccState, c: *Cpu, address: u32, slot: u32, value: u32)
+    if value & ~ENR_WRITABLE[slot % ENR_COUNT] != 0
+        halt(c,Stop.Fault,address)
+        return
+    r.enables.with(e -> e.regs[slot] = value)
 
 // A write of GCR by core 0 that asks for the CM4's boot launches `m`'s core 1, as the option bytes'
 // boot address says.
@@ -58,7 +108,9 @@ private[virt] h7_rcc_write(m: *Machine, c: *Cpu, address: u32, offset: u32, widt
         halt(c,Stop.Fault,address)
         return
     if offset != GCR_OFFSET
-        halt(c,Stop.Unmapped,address)
+        enable_slot(c.core,offset) match
+            Some(slot) -> h7_enable_write(&m.devices.rcc,c,address,slot,value)
+            None -> halt(c,Stop.Unmapped,address)
         return
     val boot = m.devices.rcc.cm4_boot
     val s = &m.scheduler
