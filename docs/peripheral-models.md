@@ -84,6 +84,7 @@ Each model's header lists its own divergences. The current ones:
 | `peripheral/sdmmc` | refuses reserved bits and reconfiguration during a transfer; starts the data path only after an error-free R1, where the real DPSM does not look at the response |
 | `peripheral/dma` | refuses FIFO/burst/unequal-width/memory-to-memory streams; ignores writes to the read-only LISR/HISR, as the silicon does |
 | `peripheral/stm32_spi` | refuses CRC, DMA, hardware NSS, finite TSIZE and non-8-bit frames |
+| `peripheral/stm32_usart` | refuses synchronous, LIN, smartcard and IrDA modes, half duplex, hardware flow control and driver enable, DMA requests, auto baud rate, receiver timeout, character match and mute mode, swapped or inverted lines, MSB first, the reserved word length M1:M0 = 11, changing the frame, baud rate or prescaler while UE is set, and enabling with a BRR below 16; the line never corrupts a character (PE, FE and NF stay clear), sends no break and no idle preamble |
 | `peripheral/dsi` | refuses video mode, more than two lanes and out-of-range PLL settings |
 | `virt/h7` (`stm32h7-rcc`) | stores the peripheral clock enables and refuses their unimplemented bits, but gates nothing: enable bits are stored; peripherals run regardless. Refuses every other RCC register but GCR |
 | `parts/wm8994` | NACKs an unmodelled register address and configurations outside the 48 kHz slave subset |

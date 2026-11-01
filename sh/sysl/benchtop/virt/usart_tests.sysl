@@ -1,0 +1,194 @@
+module sh.sysl.benchtop.virt
+@tests
+
+// The STM32 USART on a board whose terminal is on its line, as the STM32H747I-DISCO's ST-LINK virtual
+// COM port is on USART1: what the guest sends joins the console's output, what is typed reaches its
+// receiver, each only through a pin in the USART's alternate function, and a core waiting on the
+// receiver's interrupt is woken by typing.
+
+import sh.sysl.benchtop.v6m.{Cpu, Stop, NVIC_ISER, RAM_BYTES}
+import sh.sysl.stm32h747.usart1 as reg
+import sysl.raw.str_cast
+
+const USART: u32 = 0x40011000
+const GPIOA: u32 = 0x58020000
+// GPIOA's MODER as the DISCO's chip leaves reset, and AFRH.
+const GPIOA_RESET: u32 = 0xabffffff
+const AFRH: u32 = 0x24
+
+// Pin `pin` of GPIOA in alternate function `af`, every other pin as at reset; a pin of 16 or more
+// puts none in an alternate function.
+private route(m: *Machine, c: *Cpu, pins: []const u32, af: u32, n: u64)
+    var mode = GPIOA_RESET
+    var afrh: u32 = 0
+    for pin in pins
+        mode = (mode & ~(3u32 << (pin * 2))) | (2u32 << (pin * 2))
+        afrh |= af << ((pin - 8) * 4)
+    board_write(m, c, GPIOA, 4, mode, n)
+    board_write(m, c, GPIOA + AFRH, 4, afrh, n)
+
+// The DISCO, booted with no program, its output captured and `keys` typed.
+private disco(keys: string) -> &Machine
+    val board = machine()
+    val m = &*board
+    assert(board_named(m, "stm32h747-disco").is_ok())
+    open_console(m)
+    capture(m)
+    if !keys.is_empty() then type_in(m, keys.bytes)
+    boot(m, image_of(m, []).unwrap().view())
+    board
+
+private uw(m: *Machine, offset: u32, value: u32, n: u64) = board_write(m, core0(m), USART + offset, 4, value, n)
+private ur(m: *Machine, offset: u32, n: u64) -> u32 = board_read(m, core0(m), USART + offset, 4, n)
+
+// USART1 enabled at the fastest baud rate it takes, with CR1's `bits` besides UE.
+private enable(m: *Machine, bits: u32, n: u64)
+    uw(m, reg.BRR_OFFSET, 16, n)
+    uw(m, reg.CR1_OFFSET, reg.CR1_UE_MASK | bits, n)
+
+@test("USART1: what the guest writes to TDR reaches the console, only while PA9 is in AF7")
+usart_transmits_to_console()
+    val board = disco("")
+    val m = &*board
+    enable(m, reg.CR1_TE_MASK | reg.CR1_RE_MASK, 0)
+    // Out of reset PA9 is analogue: the character goes, and reaches no one.
+    board_write(m, core0(m), USART + reg.TDR_OFFSET, 1, u32('h'), 0)
+    assert(ur(m, reg.ISR_OFFSET, 10000) & reg.ISR_TC_MASK != 0, "the transmitter finished")
+    // In the wrong alternate function it reaches no one either.
+    route(m, core0(m), [9, 10], 8, 10000)
+    uw(m, reg.TDR_OFFSET, u32('x'), 10000)
+    assert(ur(m, reg.ISR_OFFSET, 20000) & reg.ISR_TC_MASK != 0)
+    assert(output(m).view().len == 0, str_cast(output(m).view()))
+    route(m, core0(m), [9], 7, 20000)
+    val text = "ok\n".bytes
+    for i in 0..<text.len do uw(m, reg.TDR_OFFSET, u32(text[i]), 20000 + 10000 * u64(i))
+    ur(m, reg.ISR_OFFSET, 60000)
+    assert(output(m).view() == "ok\n".bytes, str_cast(output(m).view()))
+
+@test("USART1: typed input reaches RDR only while the receiver is on and PA10 is in AF7")
+usart_receives_typed_input()
+    val board = disco("ab")
+    val m = &*board
+    route(m, core0(m), [9, 10], 7, 0)
+    enable(m, reg.CR1_TE_MASK, 0)
+    // The receiver off: what was typed waits in the console.
+    assert(ur(m, reg.ISR_OFFSET, 10000) & reg.ISR_RXNE_MASK == 0)
+    assert(console_status(&m.console) == WAITING)
+    // The receiver on, its pin analogue: it still waits.
+    route(m, core0(m), [9], 7, 10000)
+    uw(m, reg.CR1_OFFSET, reg.CR1_UE_MASK | reg.CR1_TE_MASK | reg.CR1_RE_MASK, 10000)
+    assert(ur(m, reg.ISR_OFFSET, 20000) & reg.ISR_RXNE_MASK == 0)
+    assert(console_status(&m.console) == WAITING)
+    // Routed: a character starts arriving, and is in RDR a frame later.
+    route(m, core0(m), [9, 10], 7, 20000)
+    ur(m, reg.ISR_OFFSET, 20000)
+    assert(ur(m, reg.ISR_OFFSET, 30000) & reg.ISR_RXNE_MASK != 0)
+    assert(ur(m, reg.RDR_OFFSET, 30000) == u32('a'))
+    assert(ur(m, reg.ISR_OFFSET, 40000) & reg.ISR_RXNE_MASK != 0)
+    assert(ur(m, reg.RDR_OFFSET, 40000) == u32('b'))
+    assert(ur(m, reg.ISR_OFFSET, 50000) & reg.ISR_RXNE_MASK == 0, "nothing more was typed")
+    assert(console_status(&m.console) == ENDED)
+    assert(output(m).view().len == 0, "nothing was sent")
+
+// A two-M0+ chip at 64 MHz with GPIOA and a USART on IRQ 0, its kernel clock the chip's; `more` adds
+// peripherals, `parts` the board's parts and `buses` its routes.
+private usart_board(usart: string, more: string, parts: string, buses: string) -> string = s"""
+    board {
+      name = u
+      mcu {
+        name = u, clock-hz = 64000000, cores = [cortex-m0plus, cortex-m0plus]
+        pins { PA = 16 }
+        peripherals {
+          ram    { peripheral = ram, at = 0x00000000, size = 1M }
+          gpioa  { peripheral = stm32-gpio, at = 0x58020000, bank = PA }
+          usart1 { peripheral = stm32-usart, at = 0x40011000, irq = 0, $usart
+                   signals { tx = [PA9, PA2], rx = [PA10, PA3] } }
+    $more
+        }
+      }
+      parts { $parts }
+      buses { $buses }
+    }
+    """
+
+const CLOCKED = "kernel-clock-hz = 64000000"
+const VCP = "vcp { part = terminal, wire { uart = usart1 } }"
+const ROUTES = "usart1 { tx = PA9, rx = PA10 }"
+
+// The guest: enable IRQ 0 (STR r6, [r7]) and wait for it (WFI, and back to it); the handler reads
+// RDR into r4 (LDR r4, [r5, #RDR]) and stops at a breakpoint.
+private val WAITER: [3]u16 = [0x603E, 0xBF30, 0xE7FD]
+private val READER: [2]u16 = [u16(0x6800 | ((reg.RDR_OFFSET / 4) << 6) | (5 << 3) | 4), 0xBE00]
+
+// The USART board booted with the waiter, `keys` typed, and USART1 enabled with CR1's `bits`.
+private waiting(m: *Machine, keys: string, bits: u32)
+    on_board(m, "u.hocon", usart_board(CLOCKED, "", VCP, ROUTES).bytes)
+    var image: [0x240]u8
+    for i in 0..<image.len do image[i] = 0
+    for (at, word) in [(0usize, RAM_BYTES), (4, 0x101u32), (0x40, 0x201)]
+        for i in 0..<4 do image[at + i] = u8(word >> (u32(i) * 8) & 0xFF)
+    for (base, code) in [(0x100usize, WAITER[..]), (0x200, READER[..])]
+        for i in 0..<code.len
+            image[base + 2 * i] = u8(code[i] & 0xFF)
+            image[base + 2 * i + 1] = u8(code[i] >> 8)
+    open_console(m)
+    capture(m)
+    type_in(m, keys.bytes)
+    boot(m, image[..])
+    val cpu = core0(m)
+    cpu.r[5] = USART
+    cpu.r[6] = 1
+    cpu.r[7] = NVIC_ISER
+    route(m, cpu, [9, 10], 7, 0)
+    enable(m, bits, 0)
+
+@test("USART: a core in WFI with RXNEIE set wakes on typed input and reads it")
+usart_wakes_on_typed_input()
+    val board = machine()
+    val m = &*board
+    val cpu = core0(m)
+    waiting(m, "Z", reg.CR1_RE_MASK | reg.CR1_RXNEIE_MASK)
+    run_board(m)
+    assert(cpu.stop == Stop.Breakpoint, s"${cpu.stop}")
+    assert(cpu.r[4] == u32('Z'), s"${cpu.r[4]}")
+
+@test("USART: with input ended, or the receiver's interrupt off, a waiting core is reported asleep")
+usart_asleep_without_input()
+    val board = machine()
+    val m = &*board
+    val cpu = core0(m)
+    waiting(m, "", reg.CR1_RE_MASK | reg.CR1_RXNEIE_MASK)
+    run_board(m)
+    assert(cpu.stop == Stop.Asleep && cpu.stop_at == 0x104, s"${cpu.stop}")
+    // Something typed, but nothing that would wake the core: the receiver takes it, and the core
+    // sleeps on.
+    waiting(m, "Z", reg.CR1_RE_MASK)
+    run_board(m)
+    assert(cpu.stop == Stop.Asleep && cpu.stop_at == 0x104, s"${cpu.stop}")
+    assert(console_status(&m.console) == ENDED)
+    assert(ur(m, reg.RDR_OFFSET, cpu.retired) == u32('Z'))
+
+// What `board_from` says about a description, or "" where it runs.
+private refused(text: string) -> string
+    val board = machine()
+    board_from(&*board, "u.hocon", text.bytes) match
+        Ok(_) -> ""
+        Err(why) -> why
+
+@test("USART: a board benchtop cannot run is refused with the reason")
+usart_refusals()
+    assert(refused(usart_board(CLOCKED, "", VCP, ROUTES)) == "")
+    assert(refused(usart_board(CLOCKED, "", "", "")) == "", "a USART with no terminal runs")
+    val second = "usart2 { peripheral = stm32-usart, at = 0x40004400, irq = 1, kernel-clock-hz = 64000000 }"
+    var why = refused(usart_board(CLOCKED, second, VCP, ROUTES))
+    assert(why.contains("benchtop runs one `stm32-usart`"), why)
+    why = refused(usart_board("", "", VCP, ROUTES))
+    assert(why.contains("kernel-clock-hz"), why)
+    why = refused(usart_board(CLOCKED, "", VCP, ""))
+    assert(why.contains("which `buses` does not wire"), why)
+    // RX on no pin: the chip lists two it could be on.
+    why = refused(usart_board(CLOCKED, "", VCP, "usart1 { tx = PA9 }"))
+    assert(why.contains("needs its tx and rx on pins"), why)
+    // Routed to a bank the chip has no GPIO for.
+    why = refused(usart_board(CLOCKED, "", VCP, "usart1 { tx = PA2, rx = PB3 }"))
+    assert(why != "", "a route to a pin the chip does not list is refused")
