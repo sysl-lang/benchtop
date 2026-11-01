@@ -85,6 +85,7 @@ Each model's header lists its own divergences. The current ones:
 | `peripheral/dma` | refuses FIFO/burst/unequal-width/memory-to-memory streams; ignores writes to the read-only LISR/HISR, as the silicon does |
 | `peripheral/stm32_spi` | refuses CRC, DMA, hardware NSS, finite TSIZE and non-8-bit frames |
 | `peripheral/dsi` | refuses video mode, more than two lanes and out-of-range PLL settings |
+| `virt/h7` (`stm32h7-rcc`) | stores the peripheral clock enables and refuses their unimplemented bits, but gates nothing: enable bits are stored; peripherals run regardless. Refuses every other RCC register but GCR |
 | `parts/wm8994` | NACKs an unmodelled register address and configurations outside the 48 kHz slave subset |
 | `parts/ds3231` | none: it keeps the chip's own leap-year rule (2100 is a leap year), not the Gregorian one |
 
