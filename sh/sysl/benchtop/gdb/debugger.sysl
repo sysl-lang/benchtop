@@ -1,0 +1,532 @@
+module sh.sysl.benchtop.gdb
+
+// gdb's side of a board: one gdb per core, each on a port of its own (`Server`), answered here packet by
+// packet against the board (`Target`).
+//
+// **All-stop.** The board runs while any attached gdb has resumed its core, and stops as a whole: when
+// a core reaches a breakpoint its own gdb set, when a core stops for any other reason (a fault, the
+// guest's `BKPT`), when a gdb sends Ctrl-C, and when a gdb attaches. Every gdb waiting on a resume is
+// then told why its core stopped: `T05` with `swbreak`/`hwbreak` at its breakpoint, `T02` (SIGINT)
+// where the board stopped on another core's account or for Ctrl-C, `T04` at an undefined instruction,
+// `T0b` at a fault. A step runs the stepped core's one instruction and nothing else.
+//
+// **A breakpoint is its core's.** The board keeps one set for both cores (v6m/debug.sysl), and a core
+// that reaches one only the other core's gdb set runs on past it, unseen.
+//
+// **Everything here runs on the thread that runs the board, between its slices**, so a register, a
+// memory word or a breakpoint is touched only while no core runs and no lock is needed.
+
+import sh.sysl.benchtop.v6m.{Cpu, Memory, Stop, at_debug_break, clear_debug_break, debug_break_at, debug_resume, debug_step, limit_of, load16, load32, load8, set_debug_break, set_limit, store16, store32, store8}
+import sh.sysl.benchtop.virt.stop_message
+import sysl.buf.{Buf, buf}
+import sysl.raw.str_cast
+import sysl.text.Search
+
+/** What gdb needs of a board: its cores, its memory as each core sees it, and a way to run it a little
+ * at a time. */
+trait Target
+    /** How many cores the board has; gdb's port `k` debugs core `k`. */
+    cores(*self) -> u32
+    core(*self, k: u32) -> *Cpu
+    /** Whether core `k` runs yet: a second core waits for the first to launch it. */
+    started(*self, k: u32) -> bool
+    /** The memory the cores share, which holds the breakpoints. */
+    memory(*self) -> &sync Memory
+    /** Run the board one bounded slice, a few thousand instructions, and say what ended it. */
+    slice(*self) -> Slice
+    /** The `width` bytes at `a` as core `k` reads them, through the board's bus; None where nothing
+     * answers there. */
+    read(*self, k: u32, a: u32, width: u32) -> Option[u32] = core_read(self.core(k), a, width)
+    /** `x`'s low `width` bytes stored at `a` as core `k` stores them; false where nothing takes them. */
+    write(*self, k: u32, a: u32, width: u32, x: u32) -> bool = core_write(self.core(k), a, width, x)
+
+/** How a slice of the board ended. */
+enum Slice
+    // Its budget ran out with every core running.
+    Ran
+    // A core stopped: its `stop` says why.
+    Stopped
+    // Every core sleeps with nothing on the board to wake one.
+    Asleep
+    // The board refused something a core did, for the reason given.
+    Failed(why: string)
+
+/** The `width` bytes at `a` as `cpu` reads them: RAM and flash from the memory, the rest from the
+ * bus, as the guest's own load would, with the same effect on a device. None where the access would
+ * have stopped the core; the core's own stop, and its budget, are as they were. */
+core_read(cpu: *Cpu, a: u32, width: u32) -> Option[u32]
+    val (stop, at, limit) = (cpu.stop, cpu.stop_at, limit_of(cpu))
+    cpu.stop = Stop.Running
+    val v = if width == 4 then load32(cpu, a) elif width == 2 then load16(cpu, a) else load8(cpu, a)
+    val failed = cpu.stop != Stop.Running
+    cpu.stop = stop
+    cpu.stop_at = at
+    set_limit(cpu, limit)
+    if failed then None else Some(v)
+
+/** `x`'s low `width` bytes stored at `a` as `cpu` stores them: a store to code makes the records that
+ * read it decode again. Flash is the guest's read-only memory, and refuses the store. */
+core_write(cpu: *Cpu, a: u32, width: u32, x: u32) -> bool
+    val (stop, at, limit) = (cpu.stop, cpu.stop_at, limit_of(cpu))
+    cpu.stop = Stop.Running
+    if width == 4 then store32(cpu, a, x) elif width == 2 then store16(cpu, a, x) else store8(cpu, a, x)
+    val failed = cpu.stop != Stop.Running
+    cpu.stop = stop
+    cpu.stop_at = at
+    set_limit(cpu, limit)
+    !failed
+
+/** A breakpoint a gdb set: where, and whether it asked for a hardware one (`Z1`). */
+struct Break
+    at: u32
+    hardware: bool
+
+/** One gdb's end of one core's port. */
+struct Link
+    attached: bool
+    // The bytes still to send, and the last packet sent, for a `-`.
+    out: Buf[u8]
+    last: Buf[u8]
+    // `D` was answered: close the connection once the answer is sent.
+    closing: bool
+    decoder: Decoder
+    no_ack: bool
+    // gdb said it understands the stop reasons `swbreak` and `hwbreak`.
+    swbreak: bool
+    hwbreak: bool
+    // gdb has resumed the core and waits for a stop reply.
+    waiting: bool
+    breaks: Buf[Break]
+
+link() -> Link = Link(false, buf(), buf(), false, decoder(), false, false, false, false, buf())
+
+impl Link
+    /** The breakpoint this gdb holds at `a`, if any. */
+    held(self, a: u32) -> Option[Break]
+        for b in self.breaks.view() do if b.at == a then return Some(b)
+        None
+
+// Why a stop reply is sent.
+private enum Why
+    // The board stopped as a whole.
+    Halted
+    // The core ran the one instruction asked for.
+    Stepped
+    // gdb asked (`?`).
+    Asked
+
+/** The packet size benchtop takes, said to gdb in hex (`PacketSize=4000`). */
+const PACKET_SIZE: u32 = 0x4000
+
+/** gdb's view of a board: a link per core, and whether the board runs. */
+struct Debugger[T: Target]
+    t: *T
+    links: [2]Link
+    running: bool
+    // The core a step is waiting on to wake, -1 for none.
+    stepping: int
+    // A gdb asked benchtop to end (`k`), or the guest exited; with the status to end with.
+    quit: bool
+    exit_code: int
+
+/** A debugger for `t`'s board, which holds it stopped until a gdb resumes it. */
+debugger[T: Target](t: *T) -> Debugger[T] = Debugger(t, [link(), link()], false, -1, false, 0)
+
+impl[T: Target] Debugger[T]
+    // -------------------------------------------------------------------------------------------
+    // Connections.
+
+    /** A gdb connected to core `k`'s port: false where one is already there. The board stops, as a
+     * probe attaching halts its target. */
+    attach(*self, k: u32) -> bool
+        if self.links[k].attached then return false
+        self.links[k] = link()
+        self.links[k].attached = true
+        if self.running then self.stop_all()
+        true
+
+    /** Core `k`'s gdb has gone: its breakpoints go with it, and with no gdb left the board runs on. */
+    hang_up(*self, k: u32)
+        val l = &self.links[k]
+        for b in l.breaks.view() do self.release(k, b.at)
+        l.breaks = buf()
+        l.attached = false
+        l.waiting = false
+        if !self.links[0].attached && !self.links[1].attached && !self.running && !self.quit then self.start()
+
+    /** Bytes from core `k`'s gdb. */
+    receive(*self, k: u32, bytes: []const u8)
+        for b in bytes
+            val e = self.links[k].decoder.feed(b) match
+                Some(e) -> e
+                None -> continue
+            e match
+                Packet(body) ->
+                    if !self.links[k].no_ack then self.links[k].out.push(u8('+'))
+                    self.packet(k, body.view())
+                Corrupt -> if !self.links[k].no_ack then self.links[k].out.push(u8('-'))
+                Interrupt -> if self.running && self.links[k].waiting then self.stop_all()
+                Ack -> ()
+                Nak -> self.links[k].out.extend(self.links[k].last.view())
+
+    private reply(*self, k: u32, body: []const u8)
+        val f = frame(body)
+        self.links[k].out.extend(f.view())
+        self.links[k].last = f
+
+    private say(*self, k: u32, body: string) = self.reply(k, body.bytes)
+
+    // -------------------------------------------------------------------------------------------
+    // Running.
+
+    /** Run the board one slice, if it runs, and stop it where a core has stopped. Answers whether it
+     * ran anything. */
+    advance(*self) -> bool
+        if !self.running then return false
+        val end = self.t.slice()
+        var stopped = false
+        end match
+            Failed(why) ->
+                eprints(s"\r\nbenchtop: $why\r\n")
+                stopped = true
+            _ -> ()
+        for k in 0u32..<self.t.cores()
+            if !self.t.started(k) then continue
+            val c = self.t.core(k)
+            if c.stop == Stop.Running then continue
+            if c.stop == Stop.Exit
+                self.exited(int(c.exit_code))
+                return true
+            if at_debug_break(c) && self.links[k].held(c.pc).is_none()
+                // A breakpoint only the other core's gdb holds: this core goes on past it.
+                debug_step(c, self.t.memory())
+                if c.stop == Stop.Running then continue
+            stopped = true
+        if self.stepping >= 0 && !self.t.core(u32(self.stepping)).sleeping then stopped = true
+        if stopped
+            if self.links[0].attached || self.links[1].attached then self.stop_all() else self.unattended()
+        !(end is Slice.Asleep)
+
+    // Every core runs from where it is: a stop is cleared, and a core at a breakpoint steps past it
+    // first, as a probe does, so that it does not stop there again at once.
+    private start(*self)
+        val mem = self.t.memory()
+        for k in 0u32..<self.t.cores()
+            if !self.t.started(k) then continue
+            val c = self.t.core(k)
+            if c.stop == Stop.Exit then continue
+            if debug_break_at(c, c.pc) then debug_step(c, mem) else debug_resume(c)
+        self.running = true
+        self.stepping = -1
+
+    /** The board stops, and every gdb waiting on it is told why its core stopped. */
+    stop_all(*self)
+        self.running = false
+        for k in 0u32..<2
+            if !self.links[k].waiting then continue
+            self.links[k].waiting = false
+            val why = if self.stepping == int(k) then Why.Stepped else Why.Halted
+            self.say(k, self.stop_reply(k, why))
+        self.stepping = -1
+
+    // The guest asked to end: every gdb hears it exit, and benchtop ends with its status.
+    private exited(*self, code: int)
+        for k in 0u32..<2
+            if !self.links[k].attached then continue
+            var w: Buf[u8] = buf()
+            w.push(u8('W'))
+            push_byte(&w, u8(code & 0xFF))
+            self.reply(k, w.view())
+            self.links[k].waiting = false
+        self.running = false
+        self.quit = true
+        self.exit_code = code
+
+    // A core stopped with no gdb attached: benchtop ends as `benchtop run` would, 0 at the guest's
+    // `BKPT` and 3 at anything else.
+    private unattended(*self)
+        self.running = false
+        self.quit = true
+        for k in 0u32..<self.t.cores()
+            val c = self.t.core(k)
+            if c.stop == Stop.Running then continue
+            eprints(s"\r\nbenchtop: core $k: ${stop_message(c)}\r\n")
+            self.exit_code = if c.stop == Stop.Breakpoint then 0 else 3
+            return
+        self.exit_code = 3
+
+    /** Why core `k` stopped, as its gdb is told. */
+    private stop_reply(*self, k: u32, why: Why) -> string
+        val c = self.t.core(k)
+        val l = &self.links[k]
+        if at_debug_break(c)
+            l.held(c.pc) match
+                Some(b) ->
+                    if b.hardware && l.hwbreak then return "T05hwbreak:;"
+                    if !b.hardware && l.swbreak then return "T05swbreak:;"
+                    return "T05"
+                None -> ()
+        c.stop match
+            Running -> if why == Why.Halted then "T02" else "T05"
+            Undefined -> "T04"
+            Breakpoint | Reset -> "T05"
+            _ -> "T0b"
+
+    private resume(*self, k: u32, at: Option[u64])
+        at match
+            Some(a) -> self.t.core(k).pc = u32(a & 0xFFFFFFFE)
+            None -> ()
+        self.links[k].waiting = true
+        if !self.running then self.start()
+
+    private step(*self, k: u32, at: Option[u64])
+        if self.running then self.stop_all()
+        if !self.t.started(k) then return self.say(k, "E01")
+        val c = self.t.core(k)
+        at match
+            Some(a) -> c.pc = u32(a & 0xFFFFFFFE)
+            None -> ()
+        if debug_step(c, self.t.memory()) || !c.sleeping then return self.say(k, self.stop_reply(k, Why.Stepped))
+        // Asleep: the board runs until something wakes the core.
+        self.links[k].waiting = true
+        self.start()
+        self.stepping = int(k)
+
+    // -------------------------------------------------------------------------------------------
+    // Packets.
+
+    /** One packet from core `k`'s gdb, answered. */
+    packet(*self, k: u32, p: []const u8)
+        if p.len == 0 then return self.reply(k, p)
+        val rest = p[1..<p.len]
+        str_cast(p[0..<1]) match
+            "?" -> self.say(k, self.stop_reply(k, Why.Asked))
+            "g" -> self.read_registers(k)
+            "G" -> self.write_registers(k, rest)
+            "p" -> self.read_register(k, rest)
+            "P" -> self.write_register(k, rest)
+            "m" -> self.read_memory(k, rest)
+            "M" -> self.write_memory(k, rest, false)
+            "X" -> self.write_memory(k, rest, true)
+            "c" -> self.resume(k, if rest.len == 0 then None else parse_hex(rest))
+            "C" -> self.resume(k, after_semicolon(rest))
+            "s" -> self.step(k, if rest.len == 0 then None else parse_hex(rest))
+            "S" -> self.step(k, after_semicolon(rest))
+            "Z" -> self.breakpoint(k, rest, true)
+            "z" -> self.breakpoint(k, rest, false)
+            "D" -> self.detach(k)
+            "k" -> self.kill()
+            "H" | "T" -> self.say(k, "OK")
+            "q" -> self.query(k, p)
+            "Q" -> self.set(k, p)
+            "v" -> self.verbose(k, p)
+            _ -> self.say(k, "")
+
+    private read_registers(*self, k: u32)
+        val c = self.t.core(k)
+        var out: Buf[u8] = buf()
+        for r in registers(c).view() do push_le(&out, read_reg(c, r), reg_bytes(r))
+        self.reply(k, out.view())
+
+    private write_registers(*self, k: u32, hex: []const u8)
+        val c = self.t.core(k)
+        val regs = registers(c)
+        var at: usize = 0
+        for r in regs.view()
+            val n = usize(reg_bytes(r)) * 2
+            if at + n > hex.len then break
+            parse_le(hex[at..<at + n], reg_bytes(r)) match
+                Some(v) -> write_reg(c, r, v)
+                None -> return self.say(k, "E01")
+            at += n
+        self.say(k, if at == hex.len then "OK" else "E01")
+
+    private read_register(*self, k: u32, hex: []const u8)
+        val c = self.t.core(k)
+        val regs = registers(c)
+        val n = parse_hex(hex) match
+            Some(n) -> n
+            None -> return self.say(k, "E01")
+        if n >= u64(regs.len()) then return self.say(k, "E01")
+        val r = regs.at(usize(n))
+        var out: Buf[u8] = buf()
+        push_le(&out, read_reg(c, r), reg_bytes(r))
+        self.reply(k, out.view())
+
+    private write_register(*self, k: u32, text: []const u8)
+        val c = self.t.core(k)
+        val regs = registers(c)
+        val eq = text.index_of_byte(u8('=')) match
+            Some(i) -> i
+            None -> return self.say(k, "E01")
+        val n = parse_hex(text[0..<eq]) match
+            Some(n) -> n
+            None -> return self.say(k, "E01")
+        if n >= u64(regs.len()) then return self.say(k, "E01")
+        val r = regs.at(usize(n))
+        parse_le(text[eq + 1..<text.len], reg_bytes(r)) match
+            Some(v) ->
+                write_reg(c, r, v)
+                self.say(k, "OK")
+            None -> self.say(k, "E01")
+
+    // `m addr,length`: what the core reads there, in the widest aligned accesses that fit, so a device
+    // register is read whole. A read that fails after the first answers what came before it.
+    private read_memory(*self, k: u32, text: []const u8)
+        val (a, n) = address_length(text) match
+            Some(v) -> v
+            None -> return self.say(k, "E01")
+        if n > PACKET_SIZE / 2 then return self.say(k, "E01")
+        var out: Buf[u8] = buf()
+        var at = a
+        var left = n
+        while left > 0
+            val w = width_at(at, left)
+            self.t.read(k, at, w) match
+                Some(v) -> push_le(&out, u64(v), w)
+                None -> break
+            at +%= w
+            left -= w
+        if out.len() == 0 && n > 0 then return self.say(k, "E01")
+        self.reply(k, out.view())
+
+    // `M addr,length:hex` and `X addr,length:binary`.
+    private write_memory(*self, k: u32, text: []const u8, binary: bool)
+        val colon = text.index_of_byte(u8(':')) match
+            Some(i) -> i
+            None -> return self.say(k, "E01")
+        val (a, n) = address_length(text[0..<colon]) match
+            Some(v) -> v
+            None -> return self.say(k, "E01")
+        val payload = text[colon + 1..<text.len]
+        val data = if binary
+            var d: Buf[u8] = buf()
+            d.extend(payload)
+            d
+        else parse_bytes(payload) match
+            Some(d) -> d
+            None -> return self.say(k, "E01")
+        if data.len() != usize(n) then return self.say(k, "E01")
+        var at = a
+        var i: usize = 0
+        while i < data.len()
+            val w = width_at(at, u32(data.len() - i))
+            var x: u32 = 0
+            for j in 0..<usize(w) do x |= u32(data.at(i + j)) << u32(j * 8)
+            if !self.t.write(k, at, w, x) then return self.say(k, "E01")
+            at +%= w
+            i += usize(w)
+        self.say(k, "OK")
+
+    // `Z0`/`Z1` and `z0`/`z1` `,addr,kind`: a software or a hardware breakpoint, the same thing here.
+    // Watchpoints (`Z2`–`Z4`) are not supported, which an empty reply says.
+    private breakpoint(*self, k: u32, text: []const u8, insert: bool)
+        if text.len < 2 || text[1] != u8(',') then return self.say(k, "E01")
+        val hardware = text[0] == u8('1')
+        if text[0] != u8('0') && !hardware then return self.say(k, "")
+        val spec = text[2..<text.len]
+        val end = spec.index_of_byte(u8(';')) match
+            Some(i) -> i
+            None -> spec.len
+        val (a, kind) = address_length(spec[0..<end]) match
+            Some(v) -> v
+            None -> return self.say(k, "E01")
+        if kind != 2 && kind != 3 && kind != 4 then return self.say(k, "E01")
+        val l = &self.links[k]
+        if !insert
+            var kept: Buf[Break] = buf()
+            for b in l.breaks.view() do if b.at != a then kept.push(b)
+            l.breaks = kept
+            self.release(k, a)
+            return self.say(k, "OK")
+        if l.held(a).is_some() then return self.say(k, "OK")
+        if !set_debug_break(self.t.memory(), a) then return self.say(k, "E01")
+        l.breaks.push(Break(a, hardware))
+        self.say(k, "OK")
+
+    // The board lets go of the breakpoint at `a` unless the gdb of a core other than `k` holds one there.
+    private release(*self, k: u32, a: u32)
+        if self.links[1 - k].held(a).is_none() then clear_debug_break(self.t.memory(), a)
+
+    private detach(*self, k: u32)
+        self.say(k, "OK")
+        self.links[k].closing = true
+        self.hang_up(k)
+
+    private kill(*self)
+        self.running = false
+        self.quit = true
+        self.exit_code = 0
+
+    private query(*self, k: u32, p: []const u8)
+        val q = str_cast(p)
+        if q.starts_with("qSupported")
+            self.links[k].swbreak = q.contains("swbreak+")
+            self.links[k].hwbreak = q.contains("hwbreak+")
+            return self.say(k, "PacketSize=4000;qXfer:features:read+;QStartNoAckMode+;swbreak+;hwbreak+;vContSupported+")
+        if q.starts_with("qXfer:features:read:") then return self.features(k, p[20..<p.len])
+        if q.starts_with("qAttached") then return self.say(k, "1")
+        if q == "qC" then return self.say(k, "QC1")
+        if q == "qfThreadInfo" then return self.say(k, "m1")
+        if q == "qsThreadInfo" then return self.say(k, "l")
+        if q.starts_with("qSymbol") then return self.say(k, "OK")
+        self.say(k, "")
+
+    // `qXfer:features:read:target.xml:offset,length`.
+    private features(*self, k: u32, text: []const u8)
+        val colon = text.index_of_byte(u8(':')) match
+            Some(i) -> i
+            None -> return self.say(k, "E00")
+        if text[0..<colon] != "target.xml".bytes then return self.say(k, "E00")
+        val (off, n) = address_length(text[colon + 1..<text.len]) match
+            Some(v) -> v
+            None -> return self.say(k, "E00")
+        val xml = target_xml(self.t.core(k)).bytes
+        var out: Buf[u8] = buf()
+        if usize(off) >= xml.len
+            out.push(u8('l'))
+        else
+            val end = if usize(off) + usize(n) < xml.len then usize(off) + usize(n) else xml.len
+            out.push(if end < xml.len then u8('m') else u8('l'))
+            out.extend(xml[usize(off)..<end])
+        self.reply(k, out.view())
+
+    // `QStartNoAckMode`: acknowledged once more, then never again either way.
+    private set(*self, k: u32, p: []const u8)
+        if p != "QStartNoAckMode".bytes then return self.say(k, "")
+        self.say(k, "OK")
+        self.links[k].no_ack = true
+
+    private verbose(*self, k: u32, p: []const u8)
+        val v = str_cast(p)
+        if v == "vCont?" then return self.say(k, "vCont;c;C;s;S;t")
+        if v.starts_with("vCont;") && v.len > 6
+            // The first action is this core's: a port debugs one core, which is gdb's one thread.
+            return str_cast(p[6..<7]) match
+                "c" | "C" -> self.resume(k, None)
+                "s" | "S" -> self.step(k, None)
+                "t" ->
+                    if self.running then self.stop_all()
+                    self.say(k, "OK")
+                _ -> self.say(k, "E01")
+        if v.starts_with("vKill")
+            self.say(k, "OK")
+            return self.kill()
+        self.say(k, "")
+
+// The address after `;` in a `C` or `S` packet's `sig;addr`, if one is there.
+private after_semicolon(text: []const u8) -> Option[u64]
+    val semi = text.index_of_byte(u8(';'))?
+    parse_hex(text[semi + 1..<text.len])
+
+// `addr,length`, both hex, the address 32 bits.
+private address_length(text: []const u8) -> Option[(u32, u32)]
+    val comma = text.index_of_byte(u8(','))?
+    val a = parse_hex(text[0..<comma])?
+    val n = parse_hex(text[comma + 1..<text.len])?
+    if a > 0xFFFFFFFF || n > 0xFFFFFFFF then return None
+    Some((u32(a), u32(n)))
+
+// The widest access at `a` that is aligned and no longer than `left` bytes.
+private width_at(a: u32, left: u32) -> u32 =
+    if a % 4 == 0 && left >= 4 then 4 elif a % 2 == 0 && left >= 2 then 2 else 1

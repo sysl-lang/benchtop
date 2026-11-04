@@ -223,7 +223,7 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 
 ```
 sysl build . -o benchtop
-./benchtop run [--board <name | file.hocon>] [--deterministic] <image.elf | image.bin>
+./benchtop run [--board <name | file.hocon>] [--deterministic] [--gdb [port]] <image.elf | image.bin>
 ./benchtop check [--mcu] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
@@ -243,6 +243,10 @@ By default, launched guest cores run on separate host threads. **`--deterministi
 selects reproducible turns on one thread. The explicit **`--threads`** spelling also gives
 each core a host thread of its own once core 1 is launched: faster where both cores are busy, and
 not reproducible, as two real cores are not.
+
+**`--gdb [port]`** serves gdb's remote protocol instead, one TCP port per core from `port` (3333),
+and holds the board at its reset vector until a gdb resumes it: `target remote :3333`. See
+[debugging a guest with gdb](docs/gdb.md).
 
 **`check`** reads a board or product description and holds it to benchtop's part library: it
 prints every mistake with its line and column and exits 1, or prints what the description is.

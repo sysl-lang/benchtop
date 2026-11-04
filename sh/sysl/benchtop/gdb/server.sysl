@@ -1,0 +1,131 @@
+module sh.sysl.benchtop.gdb
+
+// The ports gdb connects to: one TCP listener per core on the loopback, `port` for core 0 and the next
+// for core 1, as OpenOCD numbers a dual-core chip's. Every socket is non-blocking and polled between
+// the board's slices, on the board's own thread, so gdb's packets reach the cores only while they are
+// still.
+
+import sysl.buf.{Buf, buf}
+import sysl.net.{Socket, resolve, socket, would_block}
+import sysl.time.{millis, sleep}
+
+/** The gdb server of one board. */
+struct Server[T: Target]
+    d: Debugger[T]
+    listeners: Buf[Socket]
+    conns: [2]Option[Socket]
+
+/** Listen for gdb on the loopback for each of `t`'s cores, at `port` and on; port 0 takes whatever
+ * ports are free (`port_of` says which). */
+open_server[T: Target](t: *T, port: int) -> Result[Server[T], string]
+    var listeners: Buf[Socket] = buf()
+    for k in 0u32..<t.cores()
+        val p = if port == 0 then 0 else port + int(k)
+        val addrs = resolve("127.0.0.1", p).map_err(e -> s"the loopback: $e")?
+        var s = socket(addrs.at(0)).map_err(e -> s"a socket for port $p: $e")?
+        s.reuse_address().map_err(e -> s"port $p: $e")?
+        s.bind(addrs.at(0)).map_err(e -> s"port $p: $e")?
+        s.listen(4).map_err(e -> s"port $p: $e")?
+        s.non_blocking().map_err(e -> s"port $p: $e")?
+        listeners.push(s)
+    Ok(Server(debugger(t), listeners, [None, None]))
+
+impl[T: Target] Server[T]
+    /** The port core `k`'s gdb connects to. */
+    port_of(self, k: u32) -> int = self.listeners.at(usize(k)).local().map(a -> a.port()).unwrap_or(0)
+
+    /** One turn: take a gdb that has connected, read what each sent and answer it, then run the board
+     * one slice, or rest a millisecond where it is stopped. Answers whether to go on. */
+    turn(*self) -> bool
+        self.exchange()
+        if self.d.quit
+            self.close()
+            return false
+        val ran = self.d.advance()
+        self.exchange()
+        if self.d.quit
+            self.close()
+            return false
+        if !ran then sleep(millis(1))
+        true
+
+    /** Every socket closed. */
+    close(*self)
+        for k in 0u32..<2 do self.drop(k)
+        for i in 0..<self.listeners.len()
+            var s = self.listeners.at(i)
+            s.close().unwrap_or(())
+
+    private exchange(*self)
+        for k in 0u32..<u32(self.listeners.len())
+            self.take(k)
+            self.hear(k)
+        for k in 0u32..<2 do self.send(k)
+
+    // A gdb connecting to core `k`'s port; a second one there is turned away.
+    private take(*self, k: u32)
+        var listener = self.listeners.at(usize(k))
+        val (s, _) = listener.accept() match
+            Ok(v) -> v
+            Err(_) -> return
+        var conn = s
+        if self.conns[k].is_some() || !self.d.attach(k)
+            conn.close().unwrap_or(())
+            return
+        conn.non_blocking().unwrap_or(())
+        self.conns[k] = Some(conn)
+
+    private hear(*self, k: u32)
+        var conn = self.conns[k] match
+            Some(c) -> c
+            None -> return
+        var bytes: [4096]u8
+        loop
+            conn.recv(bytes[..]) match
+                Ok(0) -> return self.lost(k)
+                Ok(n) -> self.d.receive(k, bytes[0..<n])
+                Err(e) -> return if would_block(e) then () else self.lost(k)
+
+    private send(*self, k: u32)
+        val l = &self.d.links[k]
+        var conn = self.conns[k] match
+            Some(c) -> c
+            None ->
+                l.out.clear()
+                return
+        val out = l.out.view()
+        var at: usize = 0
+        while at < out.len
+            conn.send(out[at..<out.len]) match
+                Ok(n) -> at += n
+                Err(e) -> if !would_block(e) then return self.lost(k)
+        l.out.clear()
+        if l.closing then self.drop(k)
+
+    // Core `k`'s gdb went away without detaching: as `D`, unanswered.
+    private lost(*self, k: u32)
+        self.drop(k)
+        if self.d.links[k].attached then self.d.hang_up(k)
+
+    private drop(*self, k: u32)
+        self.conns[k] match
+            Some(c) ->
+                var conn = c
+                conn.close().unwrap_or(())
+            None -> ()
+        self.conns[k] = None
+        self.d.links[k].closing = false
+
+/** Serve gdb for `t`'s board on `port` and on, telling stderr where, until a gdb ends benchtop (`k`)
+ * or the guest exits; answers the status to exit with. */
+serve[T: Target](t: *T, port: int) -> int
+    var server = open_server(t, port) match
+        Ok(s) -> s
+        Err(why) ->
+            eprints(s"benchtop: gdb server: $why\n")
+            return 1
+    for k in 0u32..<t.cores()
+        val p = server.port_of(k)
+        eprints(s"benchtop: gdb for core $k on port $p (target remote :$p); the board waits for it\r\n")
+    while server.turn() do ()
+    server.d.exit_code

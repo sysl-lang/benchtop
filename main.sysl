@@ -1,6 +1,6 @@
 // benchtop: a microcontroller board emulator.
 //
-//     benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] <image.elf | image.bin>
+//     benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] [--gdb [port]] <image.elf | image.bin>
 //         Boot the image on the board `--board` names, the virtual board `virt` where none is named,
 //         its console on this terminal, a keystroke at a time. Ctrl-] ends benchtop whatever the
 //         guest is doing. The exit status is the guest's, written to the console's EXIT register.
@@ -8,7 +8,9 @@
 //         reproducible core turns on one host thread. On a Pico 2 (an RP2350's Cortex-M33 cores)
 //         benchtop's USB host is plugged in: a `stdio_usb` program's serial port prints beside UART0
 //         (`--usb console`, the default), or is a pseudo-terminal whose name is printed on stderr, for
-//         `screen` or `picocom` (`--usb pty`); `--usb off` leaves the USB socket empty.
+//         `screen` or `picocom` (`--usb pty`); `--usb off` leaves the USB socket empty. `--gdb`
+//         serves gdb's remote protocol instead, one port per core from `port` (3333), and holds the
+//         board at reset until a gdb resumes it (docs/gdb.md).
 //
 //     benchtop check [--mcu] <name | file.hocon>
 //         Read a chip, board or product description and hold it to the library: print every mistake,
@@ -56,6 +58,7 @@ import sh.sysl.benchtop.chip as chip
 import sh.sysl.benchtop.ui as ui
 import sh.sysl.benchtop.host as host
 import sh.sysl.benchtop.realtime as rt
+import sh.sysl.benchtop.gdb as gdb
 
 const QUANTUM: u64 = 1000000
 
@@ -69,7 +72,7 @@ usage()
     print("usage: benchtop demo [--headless] [--frames N] [--screenshot out.png]")
     print("       benchtop view <board | file.hocon> [--frames N] [--screenshot out.png]")
     print("       benchtop render <board | file.hocon> <out.png>")
-    print("       benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] <image.elf | image.bin>")
+    print("       benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] [--gdb [port]] <image.elf | image.bin>")
     print("       run --window: [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>] [--instruments <file.hocon>]")
     print("       benchtop check [--mcu] <name | file.hocon>")
     print("       benchtop bench [--core <core>] [--timing unit|estimated] <image.bin> [expected result] [match | threaded]")
@@ -141,6 +144,7 @@ run_command(args: []string)
     var instrument_file = ""
     var usb = UsbMode.Console
     var usb_named = false
+    var gdb_port = 0
     var i = 2
 
     while i < args.len - 1
@@ -191,10 +195,18 @@ run_command(args: []string)
             "--threads" ->
                 parallel = true
                 i += 1
+            "--gdb" ->
+                gdb_port = GDB_PORT
+                i += 1
+                if i < args.len - 1 && is_port(args[i])
+                    gdb_port = parse_int(args[i]).unwrap()
+                    i += 1
             _ -> usage()
 
     if i != args.len - 1 then usage()
 
+    if window && gdb_port != 0 then die("--gdb is for a run without --window")
+    if gdb_port != 0 && usb == UsbMode.Pty then die("--usb pty is for a run without --gdb")
     if window && usb_named then die("--usb is for a run without --window")
     if window
         ui.launch(which, args[i], ui.launch_options(frames = frames, screenshot = screenshot, headless = headless, develop = develop, instrument_file = instrument_file, deterministic = !parallel)) match
@@ -203,7 +215,15 @@ run_command(args: []string)
     if !instrument_file.is_empty() then die("--instruments requires --window")
     if host.enabled(develop) then die("--watch, --build and --watch-source require --window")
     if headless || frames != 0 || !screenshot.is_empty() then die("--headless, --frames and --screenshot require --window")
-    run(which, args[i], parallel, usb, usb_named)
+    run(which, args[i], parallel, usb, usb_named, gdb_port)
+
+// The port gdb connects to for core 0 where `--gdb` names none, OpenOCD's.
+const GDB_PORT = 3333
+
+// Whether `arg` is a TCP port number, which `--gdb` may take before the image.
+is_port(arg: string) -> bool = parse_int(arg) match
+    Ok(n) -> n > 0 && n < 65535
+    Err(_) -> false
 
 // Where `benchtop run` sends a USB device's serial port (`--usb`).
 enum UsbMode
@@ -217,17 +237,18 @@ enum UsbMode
 // Run `file` on the board `which` names, each core on a thread of its own where `parallel` says so.
 // A board of RISC-V cores runs on the RP2350 chip layer, both harts on this thread. `usb` is for an Arm
 // RP2350 board; naming it (`usb_named`) for another is refused.
-run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool)
+run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, gdb_port: int)
     chip.riscv_named(which) match
         Some(Ok(map)) ->
             if usb_named then die("--usb is for a board of an RP2350's Cortex-M33 cores")
+            if gdb_port != 0 then die("--gdb is for a board of Cortex-M cores: the Hazard3 harts have no breakpoints or step for it yet")
             run_riscv(map, file)
         Some(Err(why)) ->
             eprints(why)
             exit(1)
         None -> ()
     chip.arm_named(which) match
-        Some(Ok(map)) -> run_arm(chip.arm_board(map), file, usb)
+        Some(Ok(map)) -> run_arm(chip.arm_board(map), file, usb, gdb_port)
         Some(Err(why)) ->
             eprints(why)
             exit(1)
@@ -235,7 +256,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool)
     chip.pico_named(which) match
         Some(Ok(map)) ->
             if usb_named then die("--usb is for a board of an RP2350's Cortex-M33 cores: the RP2040's USB controller is not on its chip yet")
-            run_arm(chip.pico_board(map), file, UsbMode.Off)
+            run_arm(chip.pico_board(map), file, UsbMode.Off, gdb_port)
         Some(Err(why)) ->
             eprints(why)
             exit(1)
@@ -255,10 +276,15 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool)
 
     open_console(m)
     boot(m, image.view())
-    if parallel then set_threads(m)
+    // Under gdb the cores take turns on this thread, which serves gdb between them.
+    if parallel && gdb_port == 0 then set_threads(m)
     raw()
 
     if !listen(m) then die("cannot start the console's input thread")
+
+    if gdb_port != 0
+        var target = gdb.MachineTarget(m)
+        exit(gdb.serve(&target, gdb_port))
 
     val core = run_board(m)
 
@@ -301,10 +327,14 @@ run_riscv(map: chip.SramMap, file: string) -> never
 // nothing to wake them (exit 4). Unless `usb` is Off (always, on the RP2040), benchtop's USB host is on
 // the bus, and a CDC ACM device's serial port goes to stdout beside UART0, a line at a time, or to a
 // pseudo-terminal whose name goes to stderr.
-run_arm[C: chip.ArmChip](b: &chip.ArmBoard[C], file: string, usb: UsbMode) -> never
+run_arm[C: chip.ArmChip](b: &chip.ArmBoard[C], file: string, usb: UsbMode, gdb_port: int) -> never
     b.boot(read_or_die(file)) match
         Ok(_) -> ()
         Err(why) -> die(s"$file: $why")
+    if gdb_port != 0
+        if usb != UsbMode.Off then b.attach_usb_host(true)
+        var target = gdb.ArmTarget(&*b, 0)
+        exit(gdb.serve(&target, gdb_port))
     var pty: Option[host.Pty] = None
     if usb != UsbMode.Off
         b.attach_usb_host(true)

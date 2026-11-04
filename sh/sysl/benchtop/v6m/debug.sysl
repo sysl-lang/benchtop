@@ -1,0 +1,135 @@
+module sh.sysl.benchtop.v6m
+
+// What a debugger needs of a core besides its registers: breakpoints, and a step of one instruction.
+//
+// **A breakpoint changes no byte of the guest's memory.** The addresses are kept beside the records
+// (`Memory.debug_breaks`), and a record decoded at one is a `Bkpt` marked `DEBUG_BREAK`, which stops
+// the core there with the instruction not run. Setting or clearing one forgets the records that read
+// the address — its own, the compare before it a branch may be fused with, and an IT block it is in —
+// so the next decode sees it; flash and ROM take a breakpoint exactly as RAM does, and a read of the
+// address still answers the guest's instruction.
+//
+// **A guest's own `BKPT` stops the core as before** (`stop_here`); a debugger's stops it without
+// touching anything else, so the guest runs on from it as if nothing had happened.
+
+/** How many breakpoints a debugger may hold at once, for both cores. */
+const DEBUG_BREAKS: usize = 64
+
+/** A `Bkpt` record's `imm` where a debugger's breakpoint made it: no `BKPT` encodes it (its immediate
+ * is 8 bits). */
+const DEBUG_BREAK: u32 = 0x100
+
+/** Whether a debugger holds a breakpoint at `a` on `cpu`'s memory. */
+debug_break_at(cpu: *Cpu, a: u32) -> bool
+    val mem = cpu.mem
+    for i in 0..<mem.debug_break_count do if mem.debug_breaks[i] == a then return true
+    false
+
+/** The record of an instruction a debugger holds a breakpoint at. */
+private[v6m] debug_record(into: *Insn)
+    into.op = Op.Bkpt
+    into.a = 0
+    into.b = 0
+    into.c = 0
+    into.imm = DEBUG_BREAK
+
+/** The core reached a debugger's breakpoint at `ip`, `n` instructions retired: it stops there, the
+ * instruction not run, and nothing else of its state changes. */
+private[v6m] debug_stop(cpu: *Cpu, ip: *Insn, n: u64)
+    if cpu.stop != Stop.Running then return
+
+    val at = addr_of(cpu, ip)
+
+    halt(cpu, Stop.Breakpoint, at)
+    cpu.pc = at
+    cpu.retired = n
+
+/** Whether `cpu` has stopped at a debugger's breakpoint, rather than a `BKPT` of the guest's. */
+at_debug_break(cpu: *Cpu) -> bool = cpu.stop == Stop.Breakpoint && debug_break_at(cpu, cpu.pc)
+
+/** Hold a breakpoint at `a` for every core on `mem`; holding one already is no change. False where `a`
+ * is not code the cores can run, or `DEBUG_BREAKS` are held. Only while no core runs. */
+set_debug_break(mem: &sync Memory, a: u32) -> bool
+    if mem.code_offset(a) == NO_CODE then return false
+    for i in 0..<mem.debug_break_count do if mem.debug_breaks[i] == a then return true
+    if mem.debug_break_count == DEBUG_BREAKS then return false
+
+    mem.debug_breaks[mem.debug_break_count] = a
+    mem.debug_break_count += 1
+    debug_code_changed(mem, a)
+    true
+
+/** Let go of the breakpoint at `a`; false where none is held there. Only while no core runs. */
+clear_debug_break(mem: &sync Memory, a: u32) -> bool
+    for i in 0..<mem.debug_break_count
+        if mem.debug_breaks[i] != a then continue
+        mem.debug_break_count -= 1
+        mem.debug_breaks[i] = mem.debug_breaks[mem.debug_break_count]
+        debug_code_changed(mem, a)
+        return true
+    false
+
+// Every record that reads the instruction at `a`: from 16 bytes before it, for an IT block's, to 20
+// after, on either core.
+private debug_code_changed(mem: &sync Memory, a: u32)
+    val offset = mem.code_offset(a)
+    if offset == NO_CODE then return
+
+    val top = u32(mem.decoded.len - 1) * 2
+    forget_decoded(mem, if offset >= 16 then offset - 16 else 0, if offset + 20 < top then offset + 20 else top)
+
+/** Make a core a debugger has held ready to run again: a stop it made is cleared, and where it is inside
+ * an IT block, the rest of the block is decoded under its ITSTATE again, since a breakpoint set or
+ * cleared there forgot the block's records. */
+debug_resume(cpu: *Cpu)
+    if cpu.stop != Stop.Running
+        cpu.stop = Stop.Running
+        cpu.stop_at = 0
+
+    if cpu.it != 0 && cpu.mem.is_code(cpu.pc) then decode_block(cpu, cpu.pc & ~1, cpu.it)
+
+/** Run one instruction on `cpu`, the one at its `pc` even where a debugger holds a breakpoint there,
+ * which is held again after it. Answers whether the core ran: one stopped, or asleep, runs nothing, and
+ * a sleeping core is woken by its board running, not by a step. An exception pending and enabled is
+ * taken first, as on the hardware, and the step runs its handler's first instruction. */
+debug_step(cpu: *Cpu, mem: &sync Memory) -> bool
+    debug_resume(cpu)
+    if cpu.sleeping then return false
+
+    val at = cpu.pc
+    val held = clear_debug_break(mem, at)
+    val before = cpu.retired
+
+    set_limit(cpu, 0xFFFFFFFFFFFFFFFF)
+    run_single(cpu)
+    if held then set_debug_break(mem, at)
+    // The step's breakpoint, held again, forgot the records of the block the core may now be in.
+    if held && cpu.stop == Stop.Running && cpu.it != 0 && cpu.mem.is_code(cpu.pc) then decode_block(cpu, cpu.pc & ~1, cpu.it)
+
+    cpu.retired != before || cpu.pc != at
+
+/** xPSR written by a debugger: the flags, Q and GE. The exception number, the T bit and ITSTATE are
+ * the core's state, which a debugger does not move. */
+set_debug_xpsr(cpu: *Cpu, psr: u32)
+    set_apsr(cpu, psr)
+    if cpu.dsp then cpu.ge = (psr >> 16) & 0xF
+
+/** The main stack pointer written by a debugger, whichever stack is in use. */
+set_main_sp(cpu: *Cpu, sp: u32)
+    if on_process_stack(cpu) then cpu.sp_other = sp else cpu.r[13] = sp
+
+/** The process stack pointer written by a debugger. */
+set_process_sp(cpu: *Cpu, sp: u32)
+    if on_process_stack(cpu) then cpu.r[13] = sp else cpu.sp_other = sp
+
+/** CONTROL's nPRIV and SPSEL written by a debugger: in thread mode a change of SPSEL changes which
+ * stack pointer `SP` is, as `MSR CONTROL` does. */
+set_debug_control(cpu: *Cpu, x: u32)
+    val switched = cpu.ipsr == 0 && (cpu.control ^ x) & 2 != 0
+
+    if switched
+        val sp = cpu.r[13]
+        cpu.r[13] = cpu.sp_other
+        cpu.sp_other = sp
+
+    cpu.control = (cpu.control & ~3u32) | (x & 3)
