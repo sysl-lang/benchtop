@@ -99,8 +99,17 @@ The built-in description lives in `boards/stm32h747-disco.hocon`, on the built-i
 flash and AXI SRAM addresses, RCC CM4 release, STM32 DSI at 0x50000000, I2C4 at
 0x58001c00, SDMMC1, SPI1, GPIO A to K with their reset modes, and the pins each signal
 can be routed to. The board picks I2C4's pins, PD12/PD13, under `buses`;
-`stm32h747-sd.hocon` and `stm32h747-spi-sd.hocon` are the same board with a card. An FT6206 at address 0x2a supplies touch
+An FT6206 at address 0x2a supplies touch
 reports.
+
+The microSD socket, CN12, is part of the board: a card on SDMMC1's four-bit bus (PC8 to PC11 for
+D0 to D3, PC12 CK, PD2 CMD), its detect switch pulling PI8 low. The card is 32768 sectors
+(16 MiB) and blank, so a board run as it stands boots with a card in the slot that holds
+zeros. To give it a disk image, copy `boards/stm32h747-disco.hocon`, add `image = "<file>"` to
+the `card` part (the file must be exactly `sectors` * 512 bytes; `tools/mk-sd-image` makes a
+FAT16 one) and run that copy with `--board`. Every sector the guest writes is written back to
+the file. `boards/stm32h747-spi-sd.hocon` is the same board with the card instead on an
+external SPI1 module, J2.
 
 The four user LEDs, LD1 to LD4, are on PI12 to PI15 and light while their pin is an output driven
 low. The wake-up button B2 holds PC13 high while pressed (key 1); the reset button B1 (key 2)
@@ -145,6 +154,34 @@ thresholds, and the flags and interrupts a polling or interrupt-driven driver us
 is listed in [peripheral models](peripheral-models.md). Benchtop runs one STM32 USART on a board;
 a second is refused, as is a `stm32-usart` without `kernel-clock-hz` and a terminal on a USART
 whose TX and RX are not routed to pins of the chip's GPIO.
+
+### Forth example
+
+`examples/disco-repl` is a Forth interpreter (the sysl-lang `forth` package) on the virtual COM
+port: USART1 on PA9/PA10 in AF7, receive interrupt enabled, the core in WFI between characters.
+Build it with `sh examples/disco-repl/build.sh` (needs `arm-none-eabi-ld`); the result,
+`repl-disco.elf`, is checked in. Run it with a terminal on stdin:
+
+```
+./benchtop run --board stm32h747-disco examples/disco-repl/repl-disco.elf
+```
+
+Each typed line is echoed and interpreted; backspace edits the line. Besides the standard words,
+the startup defines `LED-ON` and `LED-OFF` (take an LED number 1 to 4, LD1 to LD4, writing GPIOI
+BSRR) and `BUTTON?` (pushes the state of B2, read from GPIOC IDR). When stdin ends the guest is
+asleep in WFI with nothing to wake it, which `run` reports and exits with status 3. A session:
+
+```
+forth on the STM32H747I-DISCO
+2 3 + .
+5  ok
+: SQ DUP * ; 7 SQ .
+49  ok
+1 LED-ON
+ ok
+BUTTON? .
+0  ok
+```
 
 ## Remaining board bring-up
 
