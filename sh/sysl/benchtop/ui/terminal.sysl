@@ -1,0 +1,303 @@
+module sh.sysl.benchtop.ui
+
+import sh.sysl.ui as ui
+import sh.sysl.benchtop.virt as virt
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+import sysl.math.{min, max}
+
+// The Guest tab as a terminal: the guest's console output kept as scrollback, and keys typed while
+// the pane has the keyboard sent to the console's input as a serial terminal sends them -- raw, a
+// byte or an escape sequence per key, with the guest doing its own echo and line editing.
+
+/** How many finished lines the scrollback keeps; the oldest go first. */
+const SCROLLBACK_LINES: usize = 5000
+
+/** The longest line kept whole: a guest that writes more than this without a newline has it broken
+ * here, so one line can never hold the whole history.
+ */
+const LINE_BYTES: usize = 4096
+
+/** How many rows the pane shows. */
+const TERMINAL_ROWS: usize = 12
+
+/** The pane's id in syslUI's focus, which a press inside it takes and a press anywhere else gives up. */
+const TERMINAL_FOCUS: int = 9001
+
+/** The console as the pane keeps it: finished lines in a ring of at most `cap` (`first` the oldest),
+ * the line being written and the column the guest writes at next, how many rows up from the bottom
+ * the view is (0 follows new output), how far into an escape sequence the output is, how much of the
+ * guest's output has been taken (`virt.output_since`), wheel travel not yet a whole row, and whether
+ * the pane has the keyboard or has been told to give it up.
+ */
+struct Terminal
+    lines: Buf[string]
+    first: usize
+    line: Buf[u8]
+    col: usize
+    cap: usize
+    rows: usize
+    offset: usize
+    escape: int
+    seen: u64
+    wheel: int
+    focused: bool
+    leaving: bool
+
+    /** How many finished lines are kept. */
+    kept(self) -> usize = self.lines.len()
+
+    /** Finished line `i`, oldest first. */
+    kept_line(self, i: usize) -> string = self.lines.at((self.first + i) % self.cap)
+
+    /** Every row there is to show: the finished lines, then the one being written. */
+    total(self) -> usize = self.kept() + 1
+
+    /** Row `i` of `total`. */
+    row(self, i: usize) -> string = if i < self.kept() then self.kept_line(i) else from_utf8_lossy(self.line.view())
+
+    /** Whether the guest has written nothing the pane still holds. */
+    empty(self) -> bool = self.kept() == 0 && self.line.len() == 0
+
+    /** How far up the view can go: until the oldest row is the top one. */
+    max_offset(self) -> usize = self.total() - min(self.rows, self.total())
+
+    /** The rows the view shows, as (first, end), `end` exclusive. */
+    window(self) -> (usize, usize)
+        val end = self.total() - self.offset
+        (end - min(self.rows, end), end)
+
+    /** Take what the guest has written since the pane last looked. */
+    pull(*self, m: *virt.Machine)
+        val (bytes, written) = virt.output_since(m, self.seen)
+        self.seen = written
+        self.feed(bytes.view())
+
+    /** The guest wrote `bytes`. */
+    feed(*self, bytes: []const u8)
+        for b in bytes do self.put(b)
+
+    /** One byte of output, as a terminal takes it: a newline ends the line, a carriage return goes
+     * back to its start, a backspace one character left, an escape sequence is not shown (CSI `K`
+     * clears to the end of the line), other control bytes but tab are dropped, and anything else is
+     * written over what is at the column, or added at the end.
+     */
+    private put(*self, b: u8)
+        if self.escape == 1
+            self.escape = if b == u8('[') then 2 else 0
+            return
+        if self.escape == 2
+            if b >= 0x40 && b <= 0x7E
+                if b == u8('K') then self.line.truncate(self.col)
+                self.escape = 0
+            return
+        b match
+            0x1B -> self.escape = 1
+            10 -> self.newline()
+            13 -> self.col = 0
+            8 -> self.back()
+            _ ->
+                if (b < 0x20 && b != 9) || b == 0x7F then return
+                if self.col < self.line.len() then self.line.set(self.col, b) else self.line.push(b)
+                self.col += 1
+                if self.line.len() >= LINE_BYTES then self.newline()
+
+    private back(*self)
+        if self.col == 0 then return
+        self.col -= 1
+        while self.col > 0 && self.col < self.line.len() && (self.line.at(self.col) & 0xC0) == 0x80 do self.col -= 1
+
+    /** The line being written is finished. A view scrolled up stays on the rows it shows; one at the
+     * bottom follows.
+     */
+    private newline(*self)
+        val text = from_utf8_lossy(self.line.view())
+        self.line.clear()
+        self.col = 0
+        if self.lines.len() < self.cap then self.lines.push(text)
+        else
+            self.lines.set(self.first, text)
+            self.first = (self.first + 1) % self.cap
+        if self.offset > 0 then self.offset = min(self.offset + 1, self.max_offset())
+
+    /** Move the view `n` rows up (older) or, negative, down, within the history. */
+    scroll(*self, n: int)
+        val to = int(self.offset) + n
+        self.offset = usize(max(0, min(to, int(self.max_offset()))))
+
+    /** A page: the rows shown, less one kept for context. */
+    page(self) -> int = max(1, int(self.rows) - 1)
+
+    /** The wheel turned `points` (positive shows older rows), at `row` points a row. */
+    spin(*self, points: int, row: int)
+        self.wheel += points
+        val rows = self.wheel / max(1, row)
+        if rows == 0 then return
+        self.wheel -= rows * max(1, row)
+        self.scroll(rows)
+
+    /** Send keys typed at the pane to the guest, the view snapping to the bottom as a terminal's
+     * does. Answers false where the guest's input refused them.
+     */
+    send(*self, m: *virt.Machine, bytes: []const u8) -> bool
+        if bytes.len == 0 then return true
+        self.offset = 0
+        virt.type_keys(m, bytes)
+
+/** Give the keyboard up where the pane was told to, and read whether it has it: once a frame, in an
+ * interactive desktop, whether or not the Guest tab is showing.
+ */
+private[ui] terminal_focus(t: &Terminal, c: *ui.Canvas)
+    if t.leaving
+        c.take_focus(ui.NOBODY)
+        t.leaving = false
+    t.focused = c.focus() == TERMINAL_FOCUS
+
+terminal(cap: usize = SCROLLBACK_LINES, rows: usize = TERMINAL_ROWS) -> &Terminal =
+    Terminal(lines = buf(), first = 0, line = buf(), col = 0, cap = max(1, cap), rows = max(1, rows), offset = 0, escape = 0, seen = 0,
+        wheel = 0, focused = false, leaving = false)
+
+/** What a key pressed in the pane does: bytes for the guest, a page of scrolling, giving the keyboard
+ * up, nothing (a printable key, whose character arrives as typed text), or not the pane's at all (a
+ * ⌘ shortcut, left to the window).
+ */
+enum TermInput
+    Send(bytes: Buf[u8])
+    PageUp
+    PageDown
+    Leave
+    Ignore
+    Pass
+
+private sent(s: string) -> TermInput
+    var bytes: Buf[u8] = buf()
+    bytes.extend(s.bytes)
+    TermInput.Send(bytes)
+
+private sent_byte(b: u8) -> TermInput
+    var bytes: Buf[u8] = buf()
+    bytes.push(b)
+    TermInput.Send(bytes)
+
+/** The key named `key` (`canonical_key`'s lower-case SDL name) with its modifiers, as a serial
+ * terminal in raw mode sends it -- what `benchtop run` passes on from the host's terminal: Enter is a
+ * newline, Backspace DEL, Tab and Escape themselves, the arrows, Home, End and Delete VT100 sequences,
+ * and Ctrl with a letter its control byte (Ctrl-C is 0x03, for the guest). Ctrl-] gives the keyboard
+ * back to the window, as it ends `benchtop run`. PgUp and PgDn scroll the pane.
+ */
+term_key(key: string, ctrl: bool, alt: bool, gui: bool) -> TermInput
+    if gui then return TermInput.Pass
+    key match
+        "return" | "keypad enter" -> return sent("\n")
+        "backspace" -> return sent_byte(0x7F)
+        "tab" -> return sent_byte(9)
+        "escape" -> return sent_byte(0x1B)
+        "up" -> return sent("\u{1b}[A")
+        "down" -> return sent("\u{1b}[B")
+        "right" -> return sent("\u{1b}[C")
+        "left" -> return sent("\u{1b}[D")
+        "home" -> return sent("\u{1b}[H")
+        "end" -> return sent("\u{1b}[F")
+        "delete" -> return sent("\u{1b}[3~")
+        "pageup" -> return TermInput.PageUp
+        "pagedown" -> return TermInput.PageDown
+        _ -> ()
+    if !ctrl || alt then return TermInput.Ignore
+    key match
+        "]" -> TermInput.Leave
+        "[" -> sent_byte(0x1B)
+        "\\" -> sent_byte(0x1C)
+        _ ->
+            val b = key.bytes
+            if b.len == 1 && b[0] >= u8('a') && b[0] <= u8('z') then sent_byte(b[0] - 0x60) else TermInput.Ignore
+
+/** Typed text for the guest: its UTF-8 bytes as they are, control bytes dropped (a control key is
+ * `term_key`'s, so one that also arrived as text is not sent twice).
+ */
+typed_bytes(text: string) -> Buf[u8]
+    var bytes: Buf[u8] = buf()
+    for b in text.bytes do if b >= 0x20 && b != 0x7F then bytes.push(b)
+    bytes
+
+/** How a key in the pane went: taken (with nothing more to say), refused by the guest's input, or
+ * not the pane's.
+ */
+enum Keyed derives Eq
+    Taken
+    Refused
+    NotMine
+
+/** Apply `input` to the pane over machine `m`. */
+terminal_input(t: &Terminal, m: *virt.Machine, input: TermInput) -> Keyed = input match
+    Send(bytes) -> if t.send(m, bytes.view()) then Keyed.Taken else Keyed.Refused
+    PageUp ->
+        t.scroll(t.page())
+        Keyed.Taken
+    PageDown ->
+        t.scroll(-t.page())
+        Keyed.Taken
+    Leave ->
+        t.focused = false
+        t.leaving = true
+        Keyed.Taken
+    Ignore -> Keyed.Taken
+    Pass -> Keyed.NotMine
+
+/** Typed `text` in the pane over machine `m`. */
+terminal_text(t: &Terminal, m: *virt.Machine, text: string) -> Keyed =
+    if t.send(m, typed_bytes(text).view()) then Keyed.Taken else Keyed.Refused
+
+/** The rows the pane shows, as the Guest tab has always drawn them: twelve-point console ink, and
+ * the same hint where there is nothing to show.
+ */
+private[ui] terminal_rows(t: &Terminal) -> Buf[&ui.View]
+    var rows: Buf[&ui.View] = buf()
+    if t.empty() && !t.focused
+        rows.push(ui.text("No guest output.").font_size(12).foreground(MUTED))
+        return rows
+    val (from, end) = t.window()
+    for i in from..<end do rows.push(ui.text(t.row(i)).font_size(12).foreground(CONSOLE_INK))
+    rows
+
+/** The pane: the rows, laid out as a column of them always was; in an interactive desktop also where
+ * a press takes the keyboard and the wheel scrolls, and, while it has the keyboard, a block cursor at
+ * the column the guest writes at next.
+ */
+struct TerminalPane
+    t: &Terminal
+    rows: Buf[&ui.View]
+    interactive: bool
+
+impl ui.View for TerminalPane
+    measure(&self, c: *ui.Canvas, avail: ui.Size) -> ui.Size = ui.column(self.rows.view(), 5).measure(c, avail)
+
+    paint(&self, c: *ui.Canvas, r: ui.Rect)
+        val t = self.t
+        ui.column(self.rows.view(), 5).paint(c, r)
+        if !self.interactive then return
+        if c.tapped(r)
+            c.take_focus(TERMINAL_FOCUS)
+            t.focused = true
+        val v = self.rows.view()
+        if v.len == 0 then return
+        val row_h = v[0].measure(c, ui.Size(r.w, r.h)).h + 5
+        val (_, wy) = c.wheel(r)
+        if wy != 0 then t.spin(wy, row_h)
+        if !t.focused || t.offset != 0 then return
+        // The cursor is on the last row shown, which is the line being written.
+        var y = r.y
+        for i in 0..<v.len - 1 do y += v[i].measure(c, ui.Size(r.w, r.h)).h + 5
+        val h = v[v.len - 1].measure(c, ui.Size(r.w, r.h)).h
+        val col = min(t.col, t.line.len())
+        c.push_font_size(12.0)
+        val x = r.x + c.text_size(from_utf8_lossy(t.line.view()[..<col])).w
+        var next = col
+        if next < t.line.len()
+            next += 1
+            while next < t.line.len() && (t.line.at(next) & 0xC0) == 0x80 do next += 1
+        val under = from_utf8_lossy(t.line.view()[col..<next])
+        val w = max(2, c.text_size(if under.len == 0 then "0" else under).w)
+        c.pop_font_size()
+        val cell = ui.Rect(x, y, w, h)
+        c.fill(cell, CONSOLE_INK)
+        if under.len > 0 then ui.text(under).font_size(12).foreground(PANEL).paint(c, cell)

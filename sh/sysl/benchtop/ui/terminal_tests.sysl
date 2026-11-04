@@ -1,0 +1,262 @@
+module sh.sysl.benchtop.ui
+@tests
+
+// The Guest tab's terminal: its scrollback, the bytes a key sends, and keys typed through the pane
+// reaching a guest that echoes them, whose output comes back into the scrollback.
+
+import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.v6m.{Stop, run_threaded}
+import sysl.buf.{Buf, buf}
+
+private val ECHO = embed("../../../../examples/virt/echo.elf")
+
+private fed(t: &Terminal, s: string) = t.feed(s.bytes)
+
+/** The rows the view shows, joined by `|`. */
+private shown(t: &Terminal) -> string
+    val (from, end) = t.window()
+    var out = ""
+    for i in from..<end
+        if i > from then out += "|"
+        out += t.row(i)
+    out
+
+/** The bytes `input` sends, or a word for what else it is. */
+private said(input: TermInput) -> string = input match
+    Send(bytes) ->
+        var out = ""
+        for b in bytes do out += s"${b};"
+        out
+    PageUp -> "pageup"
+    PageDown -> "pagedown"
+    Leave -> "leave"
+    Ignore -> "ignore"
+    Pass -> "pass"
+
+private key(name: string, ctrl: bool = false, alt: bool = false, gui: bool = false) -> string = said(term_key(name, ctrl, alt, gui))
+
+@test("terminal: a newline ends a line, and the line being written is the last row")
+term_lines()
+    val t = terminal()
+    assert(t.empty())
+    fed(t, "one\ntwo\nthr")
+    assert(t.kept() == 2 && !t.empty())
+    assert(shown(t) == "one|two|thr", shown(t))
+    fed(t, "ee\n")
+    assert(shown(t) == "one|two|three|", shown(t))
+    assert(t.col == 0)
+
+@test("terminal: the history keeps at most its cap of lines, the oldest let go first")
+term_cap()
+    val t = terminal(cap = 3, rows = 10)
+    for i in 1..5 do fed(t, s"$i\n")
+    assert(t.kept() == 3)
+    assert(shown(t) == "3|4|5|", shown(t))
+    assert(t.kept_line(0) == "3" && t.kept_line(2) == "5")
+    fed(t, "6\n7\n8\n9\n")
+    assert(shown(t) == "7|8|9|", shown(t))
+
+@test("terminal: the default history is five thousand lines")
+term_default_cap()
+    val t = terminal()
+    for i in 0..<5100 do fed(t, s"$i\n")
+    assert(t.kept() == 5000)
+    assert(t.kept_line(0) == "100" && t.kept_line(4999) == "5099")
+
+@test("terminal: the view shows the tail and scrolls within the history, never past either end")
+term_scroll()
+    val t = terminal(rows = 3)
+    for i in 1..5 do fed(t, s"$i\n")
+    assert(shown(t) == "4|5|", shown(t))
+    t.scroll(2)
+    assert(shown(t) == "2|3|4", shown(t))
+    t.scroll(100)
+    assert(t.offset == t.max_offset() && shown(t) == "1|2|3", shown(t))
+    t.scroll(-1)
+    assert(shown(t) == "2|3|4", shown(t))
+    t.scroll(-100)
+    assert(t.offset == 0 && shown(t) == "4|5|", shown(t))
+
+@test("terminal: new output follows at the bottom, and leaves a view scrolled up where it is")
+term_snap()
+    val t = terminal(rows = 2)
+    for i in 1..4 do fed(t, s"$i\n")
+    fed(t, "5\n")
+    assert(t.offset == 0 && shown(t) == "5|", shown(t))
+    t.scroll(2)
+    assert(shown(t) == "3|4", shown(t))
+    fed(t, "6\n7\n")
+    assert(t.offset == 4 && shown(t) == "3|4", shown(t))
+    fed(t, "partial")
+    assert(shown(t) == "3|4", "a line still being written moves nothing")
+
+@test("terminal: a view scrolled up over a full history keeps its rows until they are let go, then shows the oldest")
+term_snap_full()
+    val t = terminal(cap = 3, rows = 2)
+    fed(t, "a\nb\nc\n")
+    t.scroll(1)
+    assert(shown(t) == "b|c", shown(t))
+    fed(t, "d\n")
+    assert(shown(t) == "b|c", shown(t))
+    fed(t, "e\n")
+    assert(t.offset == t.max_offset() && shown(t) == "c|d", shown(t))
+
+@test("terminal: the wheel scrolls a row for each row's height of travel, keeping the remainder")
+term_wheel()
+    val t = terminal(rows = 2)
+    for i in 1..9 do fed(t, s"$i\n")
+    t.spin(40, 20)
+    assert(t.offset == 2)
+    t.spin(10, 20)
+    assert(t.offset == 2)
+    t.spin(10, 20)
+    assert(t.offset == 3)
+    t.spin(-60, 20)
+    assert(t.offset == 0)
+
+@test("terminal: carriage return, backspace and erase-to-end edit the line as a serial terminal does")
+term_editing()
+    val t = terminal()
+    fed(t, "abc\rX\n")
+    assert(t.kept_line(0) == "Xbc", t.kept_line(0))
+    // A REPL's own backspace: back, blank, back.
+    fed(t, "ab\u{8} \u{8}c\n")
+    assert(t.kept_line(1) == "ac", t.kept_line(1))
+    fed(t, "gone\r\u{1b}[Kkept\n")
+    assert(t.kept_line(2) == "kept", t.kept_line(2))
+    fed(t, "\u{1b}[1;32mgreen\u{1b}[0m\n")
+    assert(t.kept_line(3) == "green", t.kept_line(3))
+    fed(t, "x\u{7}y\u{7f}\tz\n")
+    assert(t.kept_line(4) == "xy\tz", t.kept_line(4))
+    fed(t, "\u{8}\u{8}q")
+    assert(t.col == 1 && shown(t).ends_with("|q"), "a backspace at the start of a line stays there")
+
+@test("terminal: a backspace steps over a whole UTF-8 character")
+term_utf8_back()
+    val t = terminal()
+    fed(t, "aé")
+    assert(t.col == 3)
+    fed(t, "\u{8}")
+    assert(t.col == 1)
+    fed(t, "\u{8}")
+    assert(t.col == 0)
+
+@test("terminal: a line longer than the longest kept whole is broken there")
+term_long_line()
+    val t = terminal()
+    var long: Buf[u8] = buf()
+    for i in 0..<(LINE_BYTES + 10) do long.push(u8('a'))
+    t.feed(long.view())
+    assert(t.kept() == 1 && t.kept_line(0).len == LINE_BYTES && t.line.len() == 10)
+
+@test("terminal keys: Enter, Backspace, Tab, Escape and the cursor keys send what a raw terminal sends")
+term_keys_named()
+    assert(key("return") == "10;", "Enter is a newline, as benchtop run passes it on")
+    assert(key("keypad enter") == "10;")
+    assert(key("backspace") == "127;")
+    assert(key("tab") == "9;")
+    assert(key("escape") == "27;")
+    assert(key("up") == "27;91;65;" && key("down") == "27;91;66;" && key("right") == "27;91;67;" && key("left") == "27;91;68;")
+    assert(key("home") == "27;91;72;" && key("end") == "27;91;70;" && key("delete") == "27;91;51;126;")
+    assert(key("pageup") == "pageup" && key("pagedown") == "pagedown")
+
+@test("terminal keys: Ctrl with a letter is its control byte, Ctrl-] leaves, and printable keys wait for their text")
+term_keys_control()
+    assert(key("c", ctrl = true) == "3;", "Ctrl-C goes to the guest")
+    assert(key("d", ctrl = true) == "4;")
+    assert(key("a", ctrl = true) == "1;" && key("z", ctrl = true) == "26;")
+    assert(key("[", ctrl = true) == "27;" && key("\\", ctrl = true) == "28;")
+    assert(key("]", ctrl = true) == "leave")
+    assert(key("1", ctrl = true) == "ignore" && key("space", ctrl = true) == "ignore")
+    assert(key("a") == "ignore" && key("space") == "ignore", "a printable key's character arrives as typed text")
+    assert(key("a", ctrl = true, alt = true) == "ignore")
+    assert(key("q", gui = true) == "pass" && key("return", gui = true) == "pass", "a ⌘ shortcut is the window's")
+
+@test("terminal keys: typed text goes as its UTF-8 bytes, control bytes dropped")
+term_typed()
+    assert(typed_bytes("a é").view() == "a é".bytes)
+    assert(typed_bytes("é").len() == 2, "non-ASCII is sent, as UTF-8")
+    assert(typed_bytes("\u{3}x\u{7f}\n").view() == "x".bytes)
+    assert(typed_bytes("").len() == 0)
+
+/** `m` a fresh virtual board running echo.elf, its output captured as the desktop captures it. */
+private echoing(m: *virt.Machine)
+    assert(virt.board_named(m, "virt").is_ok())
+    virt.open_console(m)
+    virt.capture_bounded(m, 8192)
+    virt.boot(m, virt.image_of(m, ECHO).unwrap().view())
+
+/** Run core 0 for a slice: echo.elf waits for input by polling, so a bounded slice is enough. */
+private slice(m: *virt.Machine)
+    val cpu = virt.core0(m)
+    cpu.limit = cpu.retired + 2000000
+    run_threaded(cpu)
+
+@test("terminal: keys typed in the pane reach an echoing guest, and what it writes lands in the scrollback")
+term_echo()
+    val board = virt.machine()
+    val m = &*board
+    echoing(m)
+    val t = terminal(rows = 2)
+    slice(m)
+    t.pull(m)
+    assert(t.kept_line(0) == "hello from an M0+ on benchtop's virtual board", t.kept_line(0))
+    assert(shown(t) == "type a line; Ctrl-D ends|> ", shown(t))
+    assert(t.col == 2, "the cursor sits after the prompt")
+    t.scroll(1)
+    assert(t.offset == 1)
+    assert(terminal_text(t, m, "hé") == Keyed.Taken)
+    assert(t.offset == 0, "typing snaps the view to the bottom")
+    assert(terminal_input(t, m, term_key("return", false, false, false)) == Keyed.Taken)
+    slice(m)
+    t.pull(m)
+    assert(shown(t) == "> hé|> ", shown(t))
+    assert(terminal_input(t, m, term_key("d", true, false, false)) == Keyed.Taken)
+    slice(m)
+    assert(virt.core0(m).stop == Stop.Exit && virt.core0(m).exit_code == 0)
+    t.pull(m)
+    assert(shown(t) == "bye after 1 lines|", shown(t))
+    val (rest, written) = virt.output_since(m, t.seen)
+    assert(rest.len() == 0 && written == t.seen, "nothing is taken twice")
+    // The capture the tests read is what it was: everything the guest wrote, in order.
+    val all = virt.output(m)
+    assert(all.view() == "hello from an M0+ on benchtop's virtual board\ntype a line; Ctrl-D ends\n> hé\n> \nbye after 1 lines\n".bytes)
+
+@test("terminal: a reset keeps the history, and the next boot's output follows it")
+term_reset_keeps_history()
+    val board = virt.machine()
+    val m = &*board
+    echoing(m)
+    val t = terminal()
+    slice(m)
+    t.pull(m)
+    virt.open_console(m)
+    virt.capture_bounded(m, 8192)
+    virt.boot(m, virt.image_of(m, ECHO).unwrap().view())
+    slice(m)
+    t.pull(m)
+    assert(t.kept() == 4, s"${t.kept()}")
+    assert(t.kept_line(2) == "> hello from an M0+ on benchtop's virtual board", t.kept_line(2))
+
+@test("terminal: keys after the guest's input has ended are refused, and nothing else changes")
+term_input_ended()
+    val board = virt.machine()
+    val m = &*board
+    echoing(m)
+    val t = terminal()
+    virt.type_in(m, [])
+    assert(terminal_text(t, m, "x") == Keyed.Refused)
+    assert(terminal_input(t, m, term_key("return", false, false, false)) == Keyed.Refused)
+    assert(terminal_text(t, m, "") == Keyed.Taken, "no text is nothing to refuse")
+    assert(terminal_input(t, m, term_key("pageup", false, false, false)) == Keyed.Taken)
+    assert(terminal_input(t, m, term_key("q", false, false, true)) == Keyed.NotMine)
+
+@test("terminal: Ctrl-] gives the keyboard up")
+term_leave()
+    val board = virt.machine()
+    val m = &*board
+    echoing(m)
+    val t = terminal()
+    t.focused = true
+    assert(terminal_input(t, m, term_key("]", true, false, false)) == Keyed.Taken)
+    assert(!t.focused && t.leaving)

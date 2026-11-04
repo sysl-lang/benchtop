@@ -210,15 +210,17 @@ struct Console
     live: Mutex[ConsoleLive]
 
 /** A byte taken from the input to answer STATUS and not yet read through DATA (-1 for none), what the
- * guest has written and not yet flushed, and whether, and how much of, it is kept for `output` instead.
+ * guest has written and not yet flushed, whether, and how much of, it is kept for `output` instead,
+ * and how many bytes the guest has written in all, which a reset does not start again from 0.
  */
 struct ConsoleLive
     held: int
     out: Buf[u8]
     capturing: bool
     capture_limit: usize
+    written: u64
 
-private console_live() -> ConsoleLive = ConsoleLive(-1, buf(), false, 0)
+private console_live(written: u64 = 0) -> ConsoleLive = ConsoleLive(-1, buf(), false, 0, written)
 
 /** A console with no input waiting, its output going to the host, and its interrupt off. */
 console() -> Console
@@ -233,7 +235,7 @@ open_console(m: *Machine)
     pause_workers(m)
     val c = &m.console
     c.typed = c.slots.with(slots -> channel(slots.view()))
-    c.live.with(l -> *l = console_live())
+    c.live.with(l -> *l = console_live(l.written))
     atomic_store(&c.ctrl, 0, Relaxed)
 
 // Keep the guest's output for `output` rather than writing it to the host.
@@ -258,6 +260,18 @@ output_snapshot(m: *Machine) -> Buf[u8] = m.console.live.with(l ->
     bytes.extend(l.out.view())
     bytes)
 
+/** What the guest has written since it had written `seen` bytes in all, as far as the captured output
+ * still holds it, and how many it has written in all now. Where more was written than the capture
+ * kept, the answer starts at the oldest byte kept.
+ */
+output_since(m: *Machine, seen: u64) -> (Buf[u8], u64) = m.console.live.with(l ->
+    var bytes: Buf[u8] = buf()
+    val fresh = if l.written > seen then l.written - seen else 0u64
+    val held = l.out.len()
+    val from = if fresh >= u64(held) then 0 else held - usize(fresh)
+    bytes.extend(l.out.view()[from..])
+    (bytes, l.written))
+
 /** The console's input, which `type_in` and the input thread send to. */
 input(m: *Machine) -> *Channel[u8] = &m.console.typed
 
@@ -265,6 +279,14 @@ input(m: *Machine) -> *Channel[u8] = &m.console.typed
 type_in(m: *Machine, bytes: []const u8)
     for b in bytes do m.console.typed.send(b)
     m.console.typed.close()
+
+/** Give the guest `bytes` to read, keys typed at a terminal, without waiting and without ending its
+ * input. Answers false where the input has ended or is full, and then the bytes from the first refused
+ * one on are not sent.
+ */
+type_keys(m: *Machine, bytes: []const u8) -> bool
+    for b in bytes do if !m.console.typed.try_send(b) then return false
+    true
 
 // The byte that ends benchtop from the keyboard, whatever the guest is doing: Ctrl-], as telnet's.
 const QUIT: u8 = 0x1D
@@ -354,6 +376,7 @@ private put(l: *ConsoleLive, b: u8)
         tail.extend(l.out.view()[(l.out.len() - l.capture_limit / 2)..])
         l.out = tail
     l.out.push(b)
+    l.written += 1
     if b == 10 || l.out.len() >= 4096 then flush_out(l)
 
 /** A byte the board's own serial port (the USART the host's terminal is on) sends to the host: it
