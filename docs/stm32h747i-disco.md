@@ -155,6 +155,34 @@ is listed in [peripheral models](peripheral-models.md). Benchtop runs one STM32 
 a second is refused, as is a `stm32-usart` without `kernel-clock-hz` and a terminal on a USART
 whose TX and RX are not routed to pins of the chip's GPIO.
 
+### Forth example
+
+`examples/disco-repl` is a Forth interpreter (the sysl-lang `forth` package) on the virtual COM
+port: USART1 on PA9/PA10 in AF7, receive interrupt enabled, the core in WFI between characters.
+Build it with `sh examples/disco-repl/build.sh` (needs `arm-none-eabi-ld`); the result,
+`repl-disco.elf`, is checked in. Run it with a terminal on stdin:
+
+```
+./benchtop run --board stm32h747-disco examples/disco-repl/repl-disco.elf
+```
+
+Each typed line is echoed and interpreted; backspace edits the line. Besides the standard words,
+the startup defines `LED-ON` and `LED-OFF` (take an LED number 1 to 4, LD1 to LD4, writing GPIOI
+BSRR) and `BUTTON?` (pushes the state of B2, read from GPIOC IDR). When stdin ends the guest is
+asleep in WFI with nothing to wake it, which `run` reports and exits with status 3. A session:
+
+```
+forth on the STM32H747I-DISCO
+2 3 + .
+5  ok
+: SQ DUP * ; 7 SQ .
+49  ok
+1 LED-ON
+ ok
+BUTTON? .
+0  ok
+```
+
 ## Remaining board bring-up
 
 Real memory banks and external SDRAM; remaining STM32 RCC/PWR behavior;

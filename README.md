@@ -673,6 +673,11 @@ For audible playback with M4 touch controls, build with
 `./examples/touch/build.sh audio` and run `examples/touch/audio-disco.elf` on
 `stm32h747-disco`. Enable TONE in the display UI; startup is silent.
 
+A Forth interpreter on the ST-LINK virtual COM port, with words for the four LEDs and the B2
+button, is in `examples/disco-repl`; see
+[its section](docs/stm32h747i-disco.md#forth-example). Run it with
+`./benchtop run --board stm32h747-disco examples/disco-repl/repl-disco.elf`.
+
 For live microphone effects, build with `./examples/touch/build.sh mic` and run
 `examples/touch/mic-disco.elf` on the same board. M7 captures through SAI/DMA and
 applies dry/low-pass/high-pass processing; M4 shows an input meter and controls
