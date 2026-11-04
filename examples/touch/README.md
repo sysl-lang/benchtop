@@ -236,15 +236,22 @@ and [`fat`](https://github.com/sysl-lang/fat) firmware dependencies.
 ```sh
 sysl run tools/mk-sd-image
 ./examples/touch/build.sh storage
-./benchtop run --window --board boards/stm32h747-sd.hocon examples/touch/storage-disco.elf
+cp boards/stm32h747-disco.hocon target/disco-sd.hocon
+```
+
+Add `image = "target/disco-sd.img"` to the `card` part of `target/disco-sd.hocon`, then run it:
+
+```sh
+./benchtop run --window --board target/disco-sd.hocon examples/touch/storage-disco.elf
 ```
 
 Run these commands from the Benchtop root. The image tool creates a 16 MiB FAT16
 volume at `target/disco-sd.img`; it preserves any existing file. The board's
 `image` and `sectors` parameters must agree exactly. Guest reset preserves the
-card's storage. Restarting Benchtop reloads the disk image. An omitted/empty
-`image` gives volatile zero-filled media instead. Firmware never formats media
-on initialization failure: the UI reports SD ERROR.
+card's storage. Restarting Benchtop reloads the disk image. The default
+`stm32h747-disco` board gives its card no `image`, so the card is volatile
+zero-filled media. Firmware never formats media on initialization failure: the UI
+reports SD ERROR.
 
 The default connection is the Discovery microSD slot CN12: SDMMC1 at
 `0x52007000`, IRQ49, PC8..PC11 D0..D3, PC12 CK and PD2 CMD (AF12), plus
