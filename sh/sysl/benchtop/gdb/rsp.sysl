@@ -1,0 +1,153 @@
+module sh.sysl.benchtop.gdb
+
+// The GDB Remote Serial Protocol's framing: a packet is `$`, its body, `#` and two hex digits of the
+// body's checksum (the sum of its bytes, modulo 256). The receiver answers `+` for a packet whose
+// checksum held and `-` for one to send again, until both ends agree to stop (`QStartNoAckMode`). A
+// body escapes `#`, `$`, `}` and `*` as `}` and the byte exclusive-or 0x20; benchtop never sends
+// run-length encoding, which a sender may use and a receiver must not assume. Ctrl-C, 0x03, outside a
+// packet, is gdb asking the target to stop.
+
+import sysl.buf.{Buf, buf}
+
+/** What bytes from gdb came to, once a whole unit of the protocol has arrived. */
+enum Event
+    // A packet whose checksum held, its body unescaped.
+    Packet(body: Buf[u8])
+    // A packet whose checksum did not hold, or was not hex: answered `-`, for gdb to send again.
+    Corrupt
+    // Ctrl-C, between packets.
+    Interrupt
+    // gdb's `+` and `-` for a packet of ours.
+    Ack
+    Nak
+
+private enum Phase: u8
+    Idle
+    Body
+    High
+    Low
+
+/** Bytes from gdb gathered into `Event`s, one byte at a time. */
+struct Decoder
+    private phase: Phase
+    private body: Buf[u8]
+    private sum: u8
+    private told: u8
+
+decoder() -> Decoder = Decoder(Phase.Idle, buf(), 0, 0)
+
+impl Decoder
+    /** Take one more byte; answer the event it completes, if any. A `$` inside a packet starts it over,
+     * since gdb sends one only to begin a packet it has given up waiting on. */
+    feed(*self, b: u8) -> Option[Event]
+        if b == u8('$')
+            self.phase = Phase.Body
+            self.body = buf()
+            self.sum = 0
+            return None
+        self.phase match
+            Idle ->
+                if b == 3 then return Some(Event.Interrupt)
+                if b == u8('+') then return Some(Event.Ack)
+                if b == u8('-') then return Some(Event.Nak)
+                None
+            Body ->
+                if b == u8('#')
+                    self.phase = Phase.High
+                else
+                    self.body.push(b)
+                    self.sum +%= b
+                None
+            High ->
+                self.phase = Phase.Low
+                self.told = nibble(b)
+                None
+            Low ->
+                self.phase = Phase.Idle
+                val low = nibble(b)
+                if self.told > 15 || low > 15 || (self.told << 4 | low) != self.sum then return Some(Event.Corrupt)
+                Some(Event.Packet(unescaped(self.body.view())))
+
+/** A hex digit's value, or 16 for a byte that is not one. */
+nibble(b: u8) -> u8 = b.digit_value(16) match
+    Some(v) -> u8(v)
+    None -> 16
+
+/** `body` with each `}` escape undone. */
+unescaped(body: []const u8) -> Buf[u8]
+    var out: Buf[u8] = buf()
+    var i: usize = 0
+    while i < body.len
+        if body[i] == u8('}') && i + 1 < body.len
+            out.push(body[i + 1] ^ 0x20)
+            i += 2
+        else
+            out.push(body[i])
+            i += 1
+    out
+
+/** The checksum of a packet's body as sent: its bytes' sum, modulo 256. */
+checksum(body: []const u8) -> u8
+    var sum: u8 = 0
+    for b in body do sum +%= b
+    sum
+
+/** Whether a byte of a body is sent escaped. */
+escaped(b: u8) -> bool = b == u8('#') || b == u8('$') || b == u8('}') || b == u8('*')
+
+/** `body` as a packet: `$`, the body escaped, `#` and its checksum. */
+frame(body: []const u8) -> Buf[u8]
+    var sent: Buf[u8] = buf()
+    for b in body
+        if escaped(b)
+            sent.push(u8('}'))
+            sent.push(b ^ 0x20)
+        else
+            sent.push(b)
+    var out: Buf[u8] = buf()
+    out.push(u8('$'))
+    out.extend(sent.view())
+    out.push(u8('#'))
+    push_byte(&out, checksum(sent.view()))
+    out
+
+/** The lowercase hex digit for `n`, 0 to 15. */
+digit(n: u32) -> u8 = if n < 10 then u8('0') + u8(n) else u8('a') + u8(n - 10)
+
+/** One byte as two hex digits. */
+push_byte(out: *Buf[u8], b: u8)
+    out.push(digit(u32(b) >> 4))
+    out.push(digit(u32(b) & 15))
+
+/** The low `bytes` bytes of `v`, least significant first, as the target's registers and memory go. */
+push_le(out: *Buf[u8], v: u64, bytes: u32)
+    for i in 0u32..<bytes do push_byte(out, u8((v >> u64(i * 8)) & 0xFF))
+
+/** Hex digits as a number, most significant first: none but digits, and at most 16 of them. */
+parse_hex(text: []const u8) -> Option[u64]
+    if text.len == 0 || text.len > 16 then return None
+    var v: u64 = 0
+    for b in text
+        val d = nibble(b)
+        if d > 15 then return None
+        v = v << 4 | u64(d)
+    Some(v)
+
+/** Pairs of hex digits as bytes. */
+parse_bytes(text: []const u8) -> Option[Buf[u8]]
+    if text.len % 2 != 0 then return None
+    var out: Buf[u8] = buf()
+    for i in 0..<text.len / 2
+        val hi = nibble(text[2 * i])
+        val lo = nibble(text[2 * i + 1])
+        if hi > 15 || lo > 15 then return None
+        out.push(hi << 4 | lo)
+    Some(out)
+
+/** `bytes` pairs of hex digits as a little-endian value. */
+parse_le(text: []const u8, bytes: u32) -> Option[u64]
+    if text.len != usize(bytes) * 2 then return None
+    val b = parse_bytes(text)?
+    var v: u64 = 0
+    for i in 0..<b.len() do v |= u64(b.at(i)) << u64(i * 8)
+    Some(v)
