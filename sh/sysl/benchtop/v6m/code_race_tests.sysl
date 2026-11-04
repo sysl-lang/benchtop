@@ -37,30 +37,51 @@ private race_reader(r: *CodeRace)
         val a = slot_address(i)
         decode(c, a, &c.dec[c.mem.code_offset(a) >> 1])
 
+// movs r0, #1 at every slot, on lines no record has been decoded from, and the reader's ISB.
+private lay_slots(writer: *Cpu, reader: *Cpu)
+    val mem = writer.mem
+    for i in 0..<RACE_SLOTS
+        val a = slot_address(i)
+        atomic_store(&mem.code_lines[a >> LINE_SHIFT], 0, Relaxed)
+        store16(writer, a, 0x2001)
+        reader.dec[mem.code_offset(a) >> 1] = undecoded()
+    barrier(reader)
+
+// The reader's ISB, and then the slots whose record the reader would run is not what the bytes now hold.
+private stale_slots(reader: *Cpu) -> u32
+    val mem = reader.mem
+    var stale: u32 = 0
+    barrier(reader)
+    for i in 0..<RACE_SLOTS
+        val a = slot_address(i)
+        val kept = reader.dec[mem.code_offset(a) >> 1]
+        if kept.op == Op.Undecoded then continue
+        var now = undecoded()
+        decode(reader, a, &now)
+        if kept.op != now.op || kept.imm != now.imm || kept.a != now.a then stale += 1
+    stale
+
+// Two cores of one memory, each with records of its own, the second's thread the reader.
+private paired_cores(mem: &sync Memory, writer: *Cpu, reader: *Cpu)
+    reset(writer, mem, [], 0)
+    attach_memory(reader, mem)
+    clear(reader, 0)
+    reader.core = 1
+    reader.bus = &nothing_attached
+    pair(writer, reader)
+
 @test("code decoded by one core's thread while the other's stores over it is never kept stale past the writer's barrier and the reader's")
 code_store_races_first_decode()
     val mem = memory()
     var writer: Cpu
     var reader: Cpu
-
-    reset(&writer, mem, [], 0)
-    attach_memory(&reader, mem)
-    clear(&reader, 0)
-    reader.core = 1
-    reader.bus = &nothing_attached
-    pair(&writer, &reader)
+    paired_cores(mem, &writer, &reader)
 
     var race = CodeRace(&writer, &reader, 0)
-    var stale = 0
+    var stale: u32 = 0
 
     for round in 0..<RACE_ROUNDS
-        // movs r0, #1 at every slot, on lines no record has been decoded from.
-        for i in 0..<RACE_SLOTS
-            val a = slot_address(i)
-            atomic_store(&mem.code_lines[a >> LINE_SHIFT], 0, Relaxed)
-            store16(&writer, a, 0x2001)
-            reader.dec[mem.code_offset(a) >> 1] = undecoded()
-        barrier(&reader)
+        lay_slots(&writer, &reader)
         race.met = 0
 
         val other = spawn(&race_reader, &race, 1 << 20).unwrap()
@@ -71,15 +92,36 @@ code_store_races_first_decode()
         barrier(&writer)
         other.join()
 
-        // The reader's ISB: what it runs at each slot from here is what the bytes now hold.
-        barrier(&reader)
+        stale += stale_slots(&reader)
+
+    unpair(&writer, &reader)
+    assert(stale == 0, s"$stale of ${RACE_ROUNDS * RACE_SLOTS} decodes kept the old bytes")
+
+@test("code decoded by a core's thread while another bus master's thread stores over it (master_stored) is never kept stale past the core's next barrier")
+code_master_store_races_first_decode()
+    val mem = memory()
+    var writer: Cpu
+    var reader: Cpu
+    paired_cores(mem, &writer, &reader)
+
+    var race = CodeRace(&writer, &reader, 0)
+    var stale: u32 = 0
+
+    for round in 0..<RACE_ROUNDS
+        lay_slots(&writer, &reader)
+        race.met = 0
+
+        val other = spawn(&race_reader, &race, 1 << 20).unwrap()
+        // This thread is a DMA: it writes the low byte of each, making it movs r0, #2, past the cores'
+        // own store path, as the reader decodes it.
         for i in 0..<RACE_SLOTS
+            meet(&race, i)
             val a = slot_address(i)
-            val kept = reader.dec[mem.code_offset(a) >> 1]
-            if kept.op == Op.Undecoded then continue
-            var now = undecoded()
-            decode(&reader, a, &now)
-            if kept.op != now.op || kept.imm != now.imm || kept.a != now.a then stale += 1
+            atomic_store(&mem.ram[mem.ram_offset(a, 1)], 2, Relaxed)
+            master_stored(mem, a, 1)
+        other.join()
+
+        stale += stale_slots(&reader)
 
     unpair(&writer, &reader)
     assert(stale == 0, s"$stale of ${RACE_ROUNDS * RACE_SLOTS} decodes kept the old bytes")

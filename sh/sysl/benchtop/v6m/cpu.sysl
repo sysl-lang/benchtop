@@ -139,6 +139,13 @@ struct Memory
     // cores: a record decoded at one stops the core there without running it (debug.sysl).
     debug_breaks: [DEBUG_BREAKS]u32
     debug_break_count: usize
+    // Whether the cores have records of their own (`pair`), so each may run on a thread of its own:
+    // then a store another bus master makes cannot forget a core's records in place, and posts the
+    // lines it wrote for each core to forget at its next barrier or between runs (`master_stored`).
+    paired: u32
+    // Those lines, per core, one bit per line, and whether any bit is set.
+    posted: [2][256]u64
+    posted_any: [2]u32
 
     @inline
     ram_offset(*self, a: u32, width: u32) -> u32
@@ -222,7 +229,7 @@ end Memory
 memory() -> &sync Memory =
     Memory(0, RAM_BYTES, 0x10000000, 0, [RamBank(0, 0, 0); 7], 0, 0, [0; 1048576], [0; 4194304], [0; 1048576], [0; 16384], [0; 16384], [0; 16],
         [[0; 16384]; 2], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442], [Insn(null, 0, Op.Undecoded, 0, 0, 0); 2621442],
-        [null; 2621442], [null; 2621442], [null; 2], [null; 2], [null; 2], [0; DEBUG_BREAKS], 0)
+        [null; 2621442], [null; 2621442], [null; 2], [null; 2], [null; 2], [0; DEBUG_BREAKS], 0, 0, [[0; 256]; 2], [0; 2])
 
 
 // One page-table entry per 4 KB page of the 4 GB address space. An entry is the host address of the
@@ -658,6 +665,7 @@ pair(first: *Cpu, second: *Cpu)
     second.predicated = &mem.predicated_own[0]
     first.peer = second
     second.peer = first
+    atomic_store(&mem.paired, 1, Release)
 
 /** Undo `pair` before `second` has run on its own records: both cores share the machine's again. */
 unpair(first: *Cpu, second: *Cpu)
@@ -665,6 +673,7 @@ unpair(first: *Cpu, second: *Cpu)
     second.predicated = &second.mem.predicated[0]
     first.peer = null
     second.peer = null
+    atomic_store(&second.mem.paired, 0, Release)
 
 // `limit`, read and written by the core's own thread while another may cut it. Relaxed: the plain
 // load and store of the host.
@@ -897,13 +906,34 @@ private drop_records(cpu: *Cpu, a: u32, width: u32)
     val other = if cpu.ns then cpu.secure_records else cpu.ns_records
     for i in first..(last_reached(cpu, a, width) >> 1) do if other[i].op != Op.Undecoded then other[i] = undecoded()
 
-/** Forget the core's own records on every line the other core has posted since the last time, so a
- * record of code the other core has written is decoded afresh. The core's own thread calls it, at a
- * barrier and between runs.
+/** Forget the core's own records on every line the other core, or another bus master, has posted since
+ * the last time, so a record of code the other has written is decoded afresh. The core's own thread
+ * calls it, at a barrier and between runs.
  */
 @inline
 refresh(cpu: *Cpu)
     if atomic_load(&cpu.stale_any, Relaxed) != 0 then drop_stale(cpu)
+    if atomic_load(&cpu.mem.posted_any[cpu.core], Relaxed) != 0 then drop_posted(cpu)
+
+// The lines another bus master has posted for this core (`master_stored`), forgotten as `drop_stale`
+// forgets the other core's.
+@noinline
+@cold
+private drop_posted(cpu: *Cpu)
+    val mem = cpu.mem
+    val k = cpu.core
+    if atomic_swap(&mem.posted_any[k], 0, Acquire) == 0 then return
+
+    for w in 0..<mem.posted[k].len
+        if atomic_load(&mem.posted[k][w], Relaxed) == 0 then continue
+
+        var lines = atomic_swap(&mem.posted[k][w], 0, Acquire)
+        var line = u32(w) << 6
+
+        while lines != 0
+            if lines & 1 != 0 then drop_records(cpu, line << LINE_SHIFT, 1 << LINE_SHIFT)
+            lines >>= 1
+            line += 1
 
 /** A `DMB`, `DSB` or `ISB`: a full host fence, so the guest's accesses on each side of it are ordered
  * as the architecture orders them, and the point at which code the other core has written is seen.
@@ -1367,10 +1397,18 @@ fetch_changed(mem: &sync Memory, address: u32, length: u32)
  * control next reaches it, on either core; where its line is watched by a load-exclusive, it counts as a
  * store by each core, so that neither core's store-exclusive succeeds over it. A store to a line of
  * neither costs one test.
+ *
+ * Where the cores share their records, the store is made on the thread that runs them, and the records
+ * are forgotten in place. Where each core has its own (`pair`), a core may be running, or decoding the
+ * very bytes stored, on a thread of its own: the store is fenced before its mark is read, as a core's
+ * first mark of a line is before its bytes are read (`holds_code`), and the lines are posted for each
+ * core to forget on its own thread, at its next barrier or between runs (`refresh`).
  */
 master_stored(mem: &sync Memory, address: u32, width: u32)
     val a = mem.ram_offset(address, width)
     if a == NO_RAM then return
+    val paired = atomic_load(&mem.paired, Relaxed) != 0
+    if paired then atomic_fence(SeqCst)
     val line = a >> LINE_SHIFT
     val last = (a + width - 1) >> LINE_SHIFT
     val mark = atomic_load(&mem.code_lines[line], Relaxed) | atomic_load(&mem.code_lines[last], Relaxed)
@@ -1379,7 +1417,18 @@ master_stored(mem: &sync Memory, address: u32, width: u32)
         for k in 0..<2
             atomic_add(&mem.line_stores[k][line], 1, SeqCst)
             if last != line then atomic_add(&mem.line_stores[k][last], 1, SeqCst)
-    if mark & LINE_CODE != 0 then forget_decoded(mem, if a >= 16 then a - 16 else 0, if a + width + 18 < RAM_BYTES then a + width + 18 else RAM_BYTES)
+    if mark & LINE_CODE == 0 then return
+    val from = if a >= 16 then a - 16 else 0
+    val end = if a + width + 18 < RAM_BYTES then a + width + 18 else RAM_BYTES
+    if paired then post_master(mem, from, end) else forget_decoded(mem, from, end)
+
+// The lines holding code offsets `from` to `end`, posted to both cores for `drop_posted`.
+@noinline
+@cold
+private post_master(mem: &sync Memory, from: u32, end: u32)
+    for k in 0..<2
+        for line in (from >> LINE_SHIFT)..((end - 1) >> LINE_SHIFT) do atomic_or(&mem.posted[k][line >> 6], u64(1) << u64(line & 63), Relaxed)
+        atomic_store(&mem.posted_any[k], 1, Release)
 
 // The records of both record sets from code offset `from` to `end`, put back to "not decoded". A
 // record a core is executing (the store that unpinned its own line) keeps its operands, so its
