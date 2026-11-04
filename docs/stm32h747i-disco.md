@@ -99,8 +99,17 @@ The built-in description lives in `boards/stm32h747-disco.hocon`, on the built-i
 flash and AXI SRAM addresses, RCC CM4 release, STM32 DSI at 0x50000000, I2C4 at
 0x58001c00, SDMMC1, SPI1, GPIO A to K with their reset modes, and the pins each signal
 can be routed to. The board picks I2C4's pins, PD12/PD13, under `buses`;
-`stm32h747-sd.hocon` and `stm32h747-spi-sd.hocon` are the same board with a card. An FT6206 at address 0x2a supplies touch
+An FT6206 at address 0x2a supplies touch
 reports.
+
+The microSD socket, CN12, is part of the board: a card on SDMMC1's four-bit bus (PC8 to PC11 for
+D0 to D3, PC12 CK, PD2 CMD), its detect switch pulling PI8 low. The card is 32768 sectors
+(16 MiB) and blank, so a board run as it stands boots with a card in the slot that holds
+zeros. To give it a disk image, copy `boards/stm32h747-disco.hocon`, add `image = "<file>"` to
+the `card` part (the file must be exactly `sectors` * 512 bytes; `tools/mk-sd-image` makes a
+FAT16 one) and run that copy with `--board`. Every sector the guest writes is written back to
+the file. `boards/stm32h747-spi-sd.hocon` is the same board with the card instead on an
+external SPI1 module, J2.
 
 The four user LEDs, LD1 to LD4, are on PI12 to PI15 and light while their pin is an output driven
 low. The wake-up button B2 holds PC13 high while pressed (key 1); the reset button B1 (key 2)
