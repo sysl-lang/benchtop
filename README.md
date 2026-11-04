@@ -89,6 +89,28 @@ states, and actual guest console
 output; LEDs reflect actual GPIO output and direction registers. The layout adapts
 to the window, with fonts rasterized at the display density.
 
+The **Guest** console is a terminal on the board's console — the same one `benchtop
+run` connects to the host's terminal, so on the STM32H747I-DISCO it is the USART1
+virtual COM port. Click in it to type: a block cursor shows at the column the guest
+writes next, and every key goes to the guest, raw, as a serial terminal sends it.
+The guest echoes and edits the line itself. **Enter** sends a newline (`\n`, as
+`benchtop run` passes Enter on), **Backspace** DEL (0x7F), **Tab** and **Escape**
+themselves, the arrows, **Home**, **End** and **Delete** VT100 sequences, and
+**Ctrl** with a letter its control byte, so **Ctrl-C** reaches the guest. Typed text
+is sent as UTF-8. While the console has the keyboard, Space, N, R, S, B, Escape and
+the board's key bindings go to the guest instead; **Ctrl-]** (which ends `benchtop
+run`) or a click anywhere else gives the keyboard back to the window. ⌘ shortcuts
+stay the window's.
+
+The console keeps the last 5,000 lines. The wheel over it, or **PgUp** / **PgDn**
+while it has the keyboard, scrolls through them; new output follows at the bottom
+unless you have scrolled up, and typing returns to the bottom. A carriage return,
+backspace and erase-to-end-of-line edit the line as a terminal does; other escape
+sequences are not shown. Long lines are not wrapped, and one longer than 4,096 bytes
+is broken there. The history survives a reset or a reload. A windowed session does
+not read the host's standard input, so the console is the guest's only input, and
+keys sent after the guest's input has ended are refused with a notice.
+
 ```sh
 ./benchtop view pico2
 ./benchtop view pico-breadboard-kit

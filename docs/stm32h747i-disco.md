@@ -146,7 +146,8 @@ BRR and PRESC set; what is typed into the console reaches the receiver, one char
 character crosses only while its pin is in AF7, as on the board: a guest that leaves PA9 analogue
 sends to no one, and typed input waits in the console while the receiver is off or PA10 is not
 routed. A core in WFI with RXNEIE set is woken by typing; with the input ended, or with nothing
-enabled that typing would raise, it is reported asleep.
+enabled that typing would raise, it is reported asleep. In a window the console is the **Guest**
+tab's terminal: click in it and type (see the [README](../README.md#try-the-visual-workbench)).
 
 The register model is the STM32H7 USART in asynchronous mode: 7, 8 or 9 data bits with even or odd
 parity, 0.5 to 2 stop bits, 16 or 8 times oversampling and the prescaler, the 16-deep FIFOs and their
