@@ -66,8 +66,19 @@ newlib and PlutoVG; both vectors and code reside in the real internal-flash
 address range. Runtime data uses 512 KB AXI SRAM, with separate stacks.
 
 The boot configuration corresponds to BCM4 disabled in option bytes. The current
-`stm32h7-rcc` adapter implements GCR boot control only; oscillator, PLL and other
-RCC accesses fail explicitly. Clock rates are supplied by the description.
+`stm32h7-rcc` adapter implements GCR boot control and the peripheral clock enables;
+oscillator, PLL, reset (`xxxRSTR`), sleep-mode enable (`xxxLPENR`) and other RCC
+accesses fail explicitly. Clock rates are supplied by the description.
+
+The enables are the nine registers AHB3ENR, AHB1ENR, AHB2ENR, AHB4ENR, APB3ENR, APB1LENR,
+APB1HENR, APB2ENR and APB4ENR, in both cores' copies: `RCC_C1_xxxENR` at 0x134-0x154 (the
+M7) and `RCC_C2_xxxENR` at 0x194-0x1B4 (the M4), which either core may read and write. The
+plain `RCC_xxxENR` at 0xD4-0xF4 is the accessing core's own copy. Each starts at zero
+except APB4ENR, whose RTCAPBEN is set from reset (0x00010000). A write that sets a bit
+the register does not implement (per ST's `stm32h747xx.h`) faults, like any other
+unsupported write. **The enable bits are stored; peripherals run regardless**: no
+peripheral model is gated by its clock, so firmware that forgets an enable still works
+here and will not on the board.
 
 The UI executes on M4. In images built without the `audio` feature M7 only spins;
 `audio-disco.elf` (built with `audio`) runs sine DSP on M7 and sleeps in `wfi`
@@ -112,7 +123,7 @@ are used. Two FT6206 contacts are modeled; desktop pointer input supplies one.
 I2C DMA, IRQ, slave operation and SCL timing remain unsupported.
 
 The demonstration ELF has real flash load addresses and ARMv7E-M instructions,
-but complete physical-board startup is not ready: RCC clock/gating/pin-mux setup
+but complete physical-board startup is not ready: RCC oscillator/PLL setup, pin-mux setup
 and the panel-specific vendor initialization sequence remain to be implemented
 before this example can boot unchanged on a physical Discovery board.
 
