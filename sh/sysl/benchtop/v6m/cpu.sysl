@@ -421,6 +421,12 @@ struct Cpu
     // one bit per line, and whether any bit is set.
     stale: [256]u64
     stale_any: u32
+    // The lines of RAM this core has marked as holding code for the first time (`holds_code`) since
+    // the other core's last barrier, one bit per line, and whether any bit is set: a store the other
+    // core made to one of them just then may have missed the mark, and the other core's barrier posts
+    // them back here as stale (`post_fresh`).
+    fresh: [256]u64
+    fresh_any: u32
     // What the core is. `reset` and `clear` leave it, so whoever makes a core of another kind sets it
     // before resetting it.
     kind: Kind
@@ -605,6 +611,8 @@ clear(cpu: *Cpu, entry: u32)
     cpu.peer = null
     for w in 0..<cpu.stale.len do cpu.stale[w] = 0
     cpu.stale_any = 0
+    for w in 0..<cpu.fresh.len do cpu.fresh[w] = 0
+    cpu.fresh_any = 0
     cpu.it = 0
     cpu.it_own = 0
     cpu.it_at = ~0
@@ -749,6 +757,13 @@ undecoded() -> Insn = Insn(&h_decode, 0, Op.Undecoded, 0, 0, 0)
 // The record at RAM address `pc` is being decoded from the bytes `pc` to `pc + 3`. A store whose
 // first byte is within 3 of them may write one of them, so the lines holding `pc - 3` to `pc + 3` are
 // marked as holding code. A record of flash marks its page (`flash_code_pages`).
+//
+// Where the other core runs on a thread of its own, the mark and its store are each a write followed by
+// a read of what the other wrote, and either thread may see the other's write late: this core can read
+// the old bytes while the store reads no mark and forgets nothing. Once a line is marked, a store to it
+// sees the mark; the window is a line's first mark, which is posted for the other core's next barrier
+// (`fresh`) and fenced before the bytes are read, so either those reads see the store, or that barrier
+// sees the line and has the records on it decoded again.
 holds_code(cpu: *Cpu, address: u32)
     val mem = cpu.mem
 
@@ -761,7 +776,24 @@ holds_code(cpu: *Cpu, address: u32)
     val from = if pc >= 4 then pc - 4 else 0
     val to = if pc + 2 < RAM_BYTES then pc + 2 else RAM_BYTES - 1
 
-    for a in from..to do atomic_or(&mem.code_lines[a >> LINE_SHIFT], LINE_CODE, Relaxed)
+    var first = false
+
+    for a in from..to
+        val line = a >> LINE_SHIFT
+        if atomic_or(&mem.code_lines[line], LINE_CODE, Relaxed) & LINE_CODE == 0 && cpu.peer != null
+            atomic_or(&cpu.fresh[line >> 6], u64(1) << u64(line & 63), Release)
+            first = true
+
+    if first then marked_first(cpu)
+
+// Lines `holds_code` has just marked for the first time are posted (`fresh`), and the fence orders the
+// marks before the reads of the bytes, as the other core's barrier orders its stores before its read of
+// `fresh_any` (`post_fresh`).
+@noinline
+@cold
+private marked_first(cpu: *Cpu)
+    atomic_store(&cpu.fresh_any, 1, Release)
+    atomic_fence(SeqCst)
 
 // A load-exclusive of the `width` bytes at RAM address `a`: watch the lines a store touching them
 // can start on, as `holds_code` marks code, and answer the other core's count of stores to `a`'s line.
@@ -882,6 +914,34 @@ refresh(cpu: *Cpu)
 barrier(cpu: *Cpu)
     atomic_fence(SeqCst)
     refresh(cpu)
+
+    val other = cpu.peer
+    if other != null && atomic_load(&other.fresh_any, Relaxed) != 0 then post_fresh(other)
+
+/** Post back to `other` as stale every line it has marked as holding code for the first time since
+ * this core's last barrier (`holds_code`): a store this core made before the barrier may have missed
+ * the mark, and `other` decoded those lines' bytes, so it decodes them again at its next barrier. The
+ * line on each side is posted too, for a record that starts on the line before (a 32-bit instruction,
+ * an IT block's) or reaches into the line after. Each line is posted once, its first time.
+ */
+@noinline
+@cold
+private post_fresh(other: *Cpu)
+    // Pairs with the release in `holds_code`, so the marks behind the bits are seen too.
+    if atomic_swap(&other.fresh_any, 0, Acquire) == 0 then return
+
+    for w in 0..<other.fresh.len
+        if atomic_load(&other.fresh[w], Relaxed) == 0 then continue
+
+        var lines = atomic_swap(&other.fresh[w], 0, Acquire)
+        var line = u32(w) << 6
+
+        while lines != 0
+            if lines & 1 != 0 then for near in (if line > 0 then line - 1 else line)..(if line + 1 < RAM_BYTES >> LINE_SHIFT then line + 1 else line) do atomic_or(&other.stale[near >> 6], u64(1) << (near & 63), Relaxed)
+            lines >>= 1
+            line += 1
+
+    atomic_store(&other.stale_any, 1, Release)
 
 @noinline
 @cold
