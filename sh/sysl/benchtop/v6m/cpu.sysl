@@ -559,6 +559,20 @@ struct Cpu
     // The Non-secure SysTick, which counts while either state runs: swapped into the `tick_*` fields
     // to be read, written or brought up to the clock (`ns_tick`).
     ns_tick: Tick
+    // A debugger's watchpoints on this core's data accesses, the first `watch_count` of them, and the
+    // tables the core reads through while it holds any: copies of the memory's page table and of its
+    // own Non-secure one with the pages the watchpoints cover cleared (debug.sysl). A reset keeps them,
+    // as the hardware's debug domain does.
+    watches: [DEBUG_WATCHES]Watch
+    watch_count: u32
+    watch_secure: *usize
+    watch_ns: *usize
+    // A watchpoint of kind `watch_hit` stopped the core before an access its instruction at `pc` makes,
+    // at `watch_at`; once the instruction has run, unwatched (`watch_off`), the kind is in `watch_done`.
+    watch_hit: u32
+    watch_done: u32
+    watch_at: u32
+    watch_off: bool
 
 const LINE_CODE: u8 = 1
 const LINE_WATCHED: u8 = 2
@@ -647,6 +661,7 @@ clear(cpu: *Cpu, entry: u32)
     cpu.excl_value = 0
     cpu.excl_stores = 0
     clear_exceptions(cpu)
+    if cpu.watch_count != 0 then watch_views(cpu)
 
 /** Give each of two cores records of its own, so each can run on a thread of its own: `first` keeps
  * the machine's, and `second` starts with its own, all "not decoded". A store from then on forgets
@@ -806,13 +821,18 @@ private marked_first(cpu: *Cpu)
 
 // A load-exclusive of the `width` bytes at RAM address `a`: watch the lines a store touching them
 // can start on, as `holds_code` marks code, and answer the other core's count of stores to `a`'s line.
+// The storage offset is read from the table a debugger's watchpoints leave whole.
 watch(cpu: *Cpu, address: u32, width: u32) -> u32
+    val seen = cpu.pages
+    if cpu.watch_count != 0 then cpu.pages = unwatched_table(cpu)
     val a = ram_storage_offset(cpu, address)
     val from = if a >= 3 then a - 3 else 0
 
     for b in from..(a + width - 1) do atomic_or(&cpu.mem.code_lines[b >> LINE_SHIFT], LINE_WATCHED, SeqCst)
 
-    others_stores(cpu, address)
+    val stores = others_stores(cpu, address)
+    cpu.pages = seen
+    stores
 
 // The other core's count of stores to the line of RAM address `a`.
 // Valid RAM accesses already have a page mapping. Reuse it for bookkeeping
@@ -1045,14 +1065,19 @@ store_page(cpu: *Cpu, a: u32, width: u32) -> usize
         return if (mem.bank_store_pages[page >> 6] >> u64(page & 63)) & 1 != 0 then page_of(cpu, a) else 0
     if mem.extra_store_range(a, width) && page_of(cpu, a + width - 1) != 0 then page_of(cpu, a) else 0
 
-// The slow path of a read, `width` bytes at `a`.
+// The slow path of a read, `width` bytes at `a`. A page only a debugger's watchpoint took off the
+// fast path is read in place, as the fast path would have.
 slow_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if cpu.watch_count != 0
+        val page = unwatched_page(cpu, a, width)
+        if page != 0 then return host_read(page, a, width)
     if a >= SCS && a < PPB_NS_END then return ppb_read(cpu, a, width, n)
     if cpu.ns then return ns_read(cpu, a, width, n)
 
     cpu.bus.read(cpu, a, width, n)
 
 slow_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if cpu.watch_count != 0 && unwatched_write(cpu, a, width, x) then return
     if cpu.ns && !(a >= SCS && a < PPB_NS_END) then return ns_write(cpu, a, width, x, n)
     if cpu.mem.flash_overlaps(a, width)
         halt(cpu, Stop.Fault, a)
@@ -1131,9 +1156,13 @@ load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
     true
 
 // The slow path of `load`, kept out of line so the fast path inlined into each handler stays small. A
-// SecureFault the access took (`access_faulted`) does not complete it, as a stop does not.
+// SecureFault the access took (`access_faulted`) does not complete it, as a stop does not. Neither does
+// one a debugger's watchpoint stops the core before (`watch_reached`): the pages its watchpoints cover
+// are the only ones it takes off the fast path, so an instruction's access to any other pays nothing.
 @noinline
 slow_load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
+    if cpu.watch_count != 0 && watch_reached(cpu, a, width, false) then return false
+
     val x = slow_read(cpu, a, width, n)
 
     if cpu.stop != Stop.Running || cpu.access_faulted then return false
@@ -1154,6 +1183,7 @@ store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
 // The slow path of `store`, out of line as `slow_load` is.
 @noinline
 slow_store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
+    if cpu.watch_count != 0 && watch_reached(cpu, a, width, true) then return false
     slow_write(cpu, a, width, low_bytes(x, width), n)
     cpu.stop == Stop.Running && !cpu.access_faulted
 

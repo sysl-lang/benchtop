@@ -11,6 +11,19 @@ module sh.sysl.benchtop.v6m
 //
 // **A guest's own `BKPT` stops the core as before** (`stop_here`); a debugger's stops it without
 // touching anything else, so the guest runs on from it as if nothing had happened.
+//
+// **A watchpoint is its core's, and costs an access nothing unless the access is to a page it covers.**
+// While a core holds any, it reads through tables of its own (`watch_views`): copies of the page table
+// it would read by, with every page a watchpoint covers cleared, from 3 bytes before the range so that
+// a store straddling into it is caught too. An access to such a page takes the slow path, as one to a
+// device does, and only the slow path looks at the watchpoints: an instruction's load or store that
+// reaches one stops the core before it (`watch_reached`), as an access nothing answers does; any other
+// access there, the instruction's own fetch, exception stacking or the host's, is made in place
+// through the table left whole. The debugger then runs the instruction once with the watchpoints not
+// looked at (`debug_step`), so the core stops after it, the access made. The other core, and a DMA or
+// any other bus master writing the memory itself, never see the copies.
+
+import sysl.raw.ptr_cast
 
 /** How many breakpoints a debugger may hold at once, for both cores. */
 const DEBUG_BREAKS: usize = 64
@@ -82,6 +95,8 @@ private debug_code_changed(mem: &sync Memory, a: u32)
  * an IT block, the rest of the block is decoded under its ITSTATE again, since a breakpoint set or
  * cleared there forgot the block's records. */
 debug_resume(cpu: *Cpu)
+    cpu.watch_hit = 0
+    cpu.watch_done = 0
     if cpu.stop != Stop.Running
         cpu.stop = Stop.Running
         cpu.stop_at = 0
@@ -91,8 +106,12 @@ debug_resume(cpu: *Cpu)
 /** Run one instruction on `cpu`, the one at its `pc` even where a debugger holds a breakpoint there,
  * which is held again after it. Answers whether the core ran: one stopped, or asleep, runs nothing, and
  * a sleeping core is woken by its board running, not by a step. An exception pending and enabled is
- * taken first, as on the hardware, and the step runs its handler's first instruction. */
+ * taken first, as on the hardware, and the step runs its handler's first instruction.
+ *
+ * An instruction that reaches a watchpoint, this one or the one a watchpoint stopped the core before,
+ * runs with the watchpoints not looked at, so it completes, and its kind is left in `watch_done`. */
 debug_step(cpu: *Cpu, mem: &sync Memory) -> bool
+    val reached = cpu.watch_hit
     debug_resume(cpu)
     if cpu.sleeping then return false
 
@@ -101,7 +120,20 @@ debug_step(cpu: *Cpu, mem: &sync Memory) -> bool
     val before = cpu.retired
 
     set_limit(cpu, 0xFFFFFFFFFFFFFFFF)
+    cpu.watch_off = reached != 0
     run_single(cpu)
+    cpu.watch_off = false
+    var done = reached
+    if done == 0 && cpu.watch_hit != 0
+        done = cpu.watch_hit
+        cpu.watch_hit = 0
+        cpu.stop = Stop.Running
+        cpu.stop_at = 0
+        set_limit(cpu, 0xFFFFFFFFFFFFFFFF)
+        cpu.watch_off = true
+        run_single(cpu)
+        cpu.watch_off = false
+    cpu.watch_done = done
     if held then set_debug_break(mem, at)
     // The step's breakpoint, held again, forgot the records of the block the core may now be in.
     if held && cpu.stop == Stop.Running && cpu.it != 0 && cpu.mem.is_code(cpu.pc) then decode_block(cpu, cpu.pc & ~1, cpu.it)
@@ -133,3 +165,132 @@ set_debug_control(cpu: *Cpu, x: u32)
         cpu.sp_other = sp
 
     cpu.control = (cpu.control & ~3u32) | (x & 3)
+
+// ---------------------------------------------------------------------------------------------------
+// Watchpoints.
+
+/** How many watchpoints a debugger may hold on each core: the Cortex-M7's DWT has four comparators. */
+const DEBUG_WATCHES: usize = 4
+
+/** A watchpoint's kind, numbered as gdb's `Z2`, `Z3` and `Z4` number them. */
+const WATCH_WRITE: u32 = 2
+const WATCH_READ: u32 = 3
+const WATCH_ACCESS: u32 = 4
+
+/** The `len` bytes at `at`, watched for stores (`WATCH_WRITE`), loads (`WATCH_READ`) or either. */
+struct Watch
+    at: u32
+    len: u32
+    kind: u32
+
+/** Watch the `len` bytes at `a` on `cpu` for `kind`; holding the same one already is no change. False
+ * where `len` is 0, `kind` is not a watchpoint's, or `DEBUG_WATCHES` are held. Only while no core runs. */
+set_debug_watch(cpu: *Cpu, kind: u32, a: u32, len: u32) -> bool
+    if len == 0 || kind < WATCH_WRITE || kind > WATCH_ACCESS then return false
+    for i in 0..<usize(cpu.watch_count) do if same_watch(cpu.watches[i], kind, a, len) then return true
+    if usize(cpu.watch_count) == DEBUG_WATCHES then return false
+
+    cpu.watches[usize(cpu.watch_count)] = Watch(a, len, kind)
+    cpu.watch_count += 1
+    watch_views(cpu)
+    true
+
+/** Let go of the watchpoint of `kind` on the `len` bytes at `a`; false where none is held. Only while
+ * no core runs. */
+clear_debug_watch(cpu: *Cpu, kind: u32, a: u32, len: u32) -> bool
+    for i in 0..<usize(cpu.watch_count)
+        if !same_watch(cpu.watches[i], kind, a, len) then continue
+        cpu.watch_count -= 1
+        cpu.watches[i] = cpu.watches[usize(cpu.watch_count)]
+        watch_views(cpu)
+        return true
+    false
+
+/** Let go of every watchpoint on `cpu`. Only while no core runs. */
+clear_debug_watches(cpu: *Cpu)
+    if cpu.watch_count == 0 then return
+    cpu.watch_count = 0
+    watch_views(cpu)
+
+private same_watch(w: Watch, kind: u32, a: u32, len: u32) -> bool = w.kind == kind && w.at == a && w.len == len
+
+/** The page table the core reads by with no watchpoint held: the memory's, or its own Non-secure one. */
+private[v6m] unwatched_table(cpu: *Cpu) -> *usize =
+    if cpu.ns then cpu.mem.ns_page_table[usize(cpu.core & 1)] else &cpu.mem.page_table[0]
+
+/** Make the tables the core reads through agree with its watchpoints and with the tables they copy:
+ * called when either changes. With none held, the core reads the memory's own again. */
+private[v6m] watch_views(cpu: *Cpu)
+    val mem = cpu.mem
+    val ns_table = mem.ns_page_table[usize(cpu.core & 1)]
+    if cpu.watch_count == 0
+        if cpu.ns_ready && cpu.ns_pages != ns_table then cpu.ns_pages = ns_table
+        val table = if cpu.ns then cpu.ns_pages else &mem.page_table[0]
+        if cpu.pages != table then cpu.pages = table
+        return
+
+    if cpu.watch_secure == null then cpu.watch_secure = ptr_cast(c_calloc(usize(PAGES), sizeof(usize)))
+    watched_copy(cpu, &mem.page_table[0], cpu.watch_secure)
+    if cpu.ns_ready
+        if cpu.watch_ns == null then cpu.watch_ns = ptr_cast(c_calloc(usize(PAGES), sizeof(usize)))
+        watched_copy(cpu, ns_table, cpu.watch_ns)
+        if cpu.ns_pages != cpu.watch_ns then cpu.ns_pages = cpu.watch_ns
+    val table = if cpu.ns then cpu.ns_pages else cpu.watch_secure
+    if cpu.pages != table then cpu.pages = table
+
+// `from` into `to`, each entry written once, with every page a watchpoint covers 0.
+private watched_copy(cpu: *Cpu, from: *usize, to: *usize)
+    var first: [DEBUG_WATCHES]u32 = [0; DEBUG_WATCHES]
+    var last: [DEBUG_WATCHES]u32 = [0; DEBUG_WATCHES]
+    val count = usize(cpu.watch_count)
+    for i in 0..<count
+        val w = cpu.watches[i]
+        first[i] = (if w.at >= 3 then w.at - 3 else 0) >> PAGE_SHIFT
+        val end = u64(w.at) + u64(w.len) - 1
+        last[i] = u32(if end > 0xFFFFFFFF then 0xFFFFFFFF else end) >> PAGE_SHIFT
+    for p in 0..<PAGES
+        var covered = false
+        for i in 0..<count do if u32(p) >= first[i] && u32(p) <= last[i] then covered = true
+        to[p] = if covered then 0 else from[p]
+
+/** The page the `width` bytes at `a` are on in the table the watchpoints leave whole, 0 where that
+ * table has none either. */
+@noinline
+@cold
+private[v6m] unwatched_page(cpu: *Cpu, a: u32, width: u32) -> usize
+    val seen = cpu.pages
+    cpu.pages = unwatched_table(cpu)
+    val page = page_for(cpu, a, width)
+    cpu.pages = seen
+    page
+
+/** A store made in place through the table the watchpoints leave whole, as the fast path would make
+ * it; false where that table has no page for it either. */
+@noinline
+@cold
+private[v6m] unwatched_write(cpu: *Cpu, a: u32, width: u32, x: u32) -> bool
+    val seen = cpu.pages
+    cpu.pages = unwatched_table(cpu)
+    val page = store_page(cpu, a, width)
+    if page != 0
+        host_write(page, a, width, x)
+        stored(cpu, a, width)
+    cpu.pages = seen
+    page != 0
+
+/** The instruction's load (`store` false) or store of the `width` bytes at `a` reaches a watchpoint of
+ * the kind: the core stops before it, the first watched byte in `watch_at`. False where none is
+ * reached, or the instruction runs with the watchpoints not looked at. */
+@noinline
+@cold
+private[v6m] watch_reached(cpu: *Cpu, a: u32, width: u32, store: bool) -> bool
+    if cpu.watch_off || cpu.stop != Stop.Running then return false
+    val other = if store then WATCH_READ else WATCH_WRITE
+    for i in 0..<usize(cpu.watch_count)
+        val w = cpu.watches[i]
+        if w.kind == other || u64(a) >= u64(w.at) + u64(w.len) || u64(w.at) >= u64(a) + u64(width) then continue
+        cpu.watch_hit = w.kind
+        cpu.watch_at = if a > w.at then a else w.at
+        halt(cpu, Stop.Breakpoint, cpu.watch_at)
+        return true
+    false

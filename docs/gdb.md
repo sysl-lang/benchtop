@@ -69,6 +69,8 @@ both cores — when:
 
 - a core reaches a breakpoint its own gdb set: that gdb hears `T05` with `swbreak` (or `hwbreak` for an
   `hbreak`), and the pc is the breakpoint's, the instruction not yet run;
+- a core's load or store reaches a watchpoint its own gdb set: that gdb hears `T05` with `watch`,
+  `rwatch` or `awatch` and the address, and the pc is the next instruction's, the access made;
 - a core stops for any other reason: the guest's own `BKPT` (`T05`), an undefined instruction (`T04`,
   SIGILL), or a fault, an access nothing answers or a lockup (`T0b`, SIGSEGV);
 - a gdb sends Ctrl-C (`T02`, SIGINT);
@@ -85,6 +87,24 @@ RAM, and `x` at its address still shows the guest's instruction. A core that rea
 the *other* core's gdb set runs on past it. Up to 64 are held at once, both cores together; `break` and
 `hbreak` are the same mechanism. On a Cortex-M33, M4 or M7, a breakpoint on an instruction inside an IT
 block stops there only when the instruction's condition holds.
+
+**A watchpoint is its core's too.** `watch`, `rwatch` and `awatch` (`Z2`, `Z3`, `Z4`) watch any range
+of any address — RAM, flash, a peripheral's registers — for the core's stores, its loads, or either.
+An access that shares one byte with the range stops the core, whatever its width, a store straddling
+into the range included; the address gdb hears is the first watched byte it touched. The core stops
+*after* the instruction that made the access, as a DWT watchpoint does, so a write watchpoint's new
+value is already in memory. **Each core holds four**, as the Cortex-M7's DWT has four comparators; a
+fifth, or one of no length, is refused (`E01`), and gdb then says it could not insert it. Tell gdb the
+limit so that it says so before resuming:
+
+```
+(gdb) set remote hardware-watchpoint-limit 4
+```
+
+Only the core's own instructions are watched: not the other core's accesses, nor a DMA's or any other
+bus master's writes, nor the exception entry's stacking, nor gdb's own `x` and `set`. A watchpoint
+costs nothing while none is set, and an access to a page no watchpoint covers costs nothing while one
+is: the core's accesses to the pages it covers alone take the slow path, where it is looked at.
 
 **The clock.** Under gdb the board is not paced to the host's clock: it runs as fast as the host lets
 it, as `benchtop run` does, and the guest's time is its cores' cycles. A stop holds every clock exactly
@@ -123,13 +143,12 @@ and stay. Writing control's SPSEL in thread mode changes which stack `sp` is, as
 
 `qSupported` (`PacketSize=4000`, `qXfer:features:read+`, `QStartNoAckMode+`, `swbreak+`, `hwbreak+`),
 `qXfer:features:read:target.xml`, `QStartNoAckMode`, `?`, `g`, `G`, `p`, `P`, `m`, `M`, `X`, `c`, `C`,
-`s`, `S`, `vCont?` and `vCont` (`c`, `C`, `s`, `S`, `t`), `Z0`/`z0`, `Z1`/`z1`, Ctrl-C, `D`, `k`,
+`s`, `S`, `vCont?` and `vCont` (`c`, `C`, `s`, `S`, `t`), `Z0`–`Z4` and `z0`–`z4`, Ctrl-C, `D`, `k`,
 `vKill`, `qAttached`, `qC`, `qfThreadInfo`/`qsThreadInfo` (one thread per port), `H` and `T`. Any other
 packet is answered empty, which gdb reads as unsupported. benchtop never sends run-length encoding.
 
 ## Not yet
 
-- watchpoints (`Z2`–`Z4`, `watch`, `rwatch`, `awatch`);
 - semihosting, ITM/SWO trace, and the CoreSight debug registers (DHCSR, DEMCR, the FPB and DWT) as the
   guest would see them;
 - `monitor` commands (`qRcmd`), among them `monitor reset`;
