@@ -1,11 +1,12 @@
 module sh.sysl.benchtop.virt
 
-import sh.sysl.benchtop.{Board, ChipForm, Core, Description, Peripheral as DescribedPeripheral, ProductForm, Registry, article_of, built_in_shelf, core_option, library, param_named, part_model, part_whole, load, open_description, unemulated_core_option}
+import sh.sysl.benchtop.{Board, ChipForm, Core, Description, Peripheral as DescribedPeripheral, Param, ProductForm, Registry, Setting, article_of, built_in_shelf, core_option, library, param_named, part_model, part_whole, load, open_description, unemulated_core_option}
 import sh.sysl.benchtop.v6m.{Kind, RAM_BYTES, default_priority_bits, has_fixed_dsp, model_named, model_names}
 import sh.sysl.parsing.{Diagnostic, Source, Span, source}
 import sh.sysl.benchtop.v6m.{Cpu, Fpu, Memory, MemoryMap, RamBank, memory, ram_only}
 import sysl.buf.{Buf, buf}
 import sysl.math.min
+import sysl.fs
 
 // A board description made into the machine benchtop runs.
 //
@@ -22,10 +23,64 @@ import sysl.math.min
 board_from(m: *Machine, name: string, text: []const u8) -> Result[Board, string] = board_of(m, source(name, text))
 
 /** `board_from` for the description `which` names: one built into benchtop, or a file's path. */
-board_named(m: *Machine, which: string) -> Result[Board, string]
+board_named(m: *Machine, which: string) -> Result[Board, string] = board_named_sd(m, which, SdChoice.Described)
+
+/** What `benchtop run --sd` says about the board's microSD card. */
+enum SdChoice
+    /** The card the board's description gives. */
+    Described
+    /** No card in the slot: the detect switch is open and the SDMMC's commands time out. */
+    Absent
+    /** A card backed by this file, read and written through, as large as the file. */
+    Image(file: string)
+end SdChoice
+
+/** What `--sd`'s argument means: `none` is an empty slot, anything else the card image's file. */
+sd_choice(arg: string) -> SdChoice = if arg == "none" then SdChoice.Absent else SdChoice.Image(arg)
+
+/** `board_named` with the board's microSD card as `sd` says. */
+board_named_sd(m: *Machine, which: string, sd: SdChoice) -> Result[Board, string]
     open_description(built_in_shelf(), which, "", Span(0, 0)) match
-        Ok(src) -> board_of(m, src)
+        Ok(src) -> board_with_sd(m, src, sd)
         Err(d) -> Err(described_error(d))
+
+private board_with_sd(m: *Machine, src: Source, sd: SdChoice) -> Result[Board, string]
+    sd match
+        Described -> board_of(m, src)
+        _ -> board_of_sd(m, src, sd)
+
+/** `params` with `name` set to `value`, added where there is none. */
+private with_param(params: *Buf[Param], name: string, value: Setting)
+    for i in 0..<params.len()
+        if params[i].name == name
+            params[i].value = value
+            return
+    params.push(Param(name, Span(0, 0), value, Span(0, 0)))
+
+private apply_sd(b: *Board, sd: SdChoice) -> Result[unit, string]
+    sd match
+        Described -> return Ok(())
+        _ -> ()
+    var found = false
+    for i in 0..<b.parts.len()
+        if part_model(b.parts[i]) != "sd-card" then continue
+        found = true
+        val params = &b.parts[i].params
+        sd match
+            Absent -> with_param(params, "inserted", Setting.Flag(false))
+            Image(file) ->
+                val bytes = fs.read_bytes(file) match
+                    Ok(read) -> read
+                    Err(_) -> return Err(s"--sd: cannot read the SD image `$file`")
+                if bytes.len == 0 || bytes.len % 512 != 0 then return Err(s"--sd: `$file` is ${bytes.len} bytes, and an SD card image is a whole number of 512-byte sectors")
+                val sectors = bytes.len / 512
+                if sectors % 1024 != 0 || sectors > 131072 then return Err(s"--sd: `$file` is ${bytes.len} bytes, and a card is a multiple of 512 KiB (1024 sectors) up to 64 MiB")
+                with_param(params, "sectors", Setting.Whole(long(sectors)))
+                with_param(params, "image", Setting.Text(file))
+                with_param(params, "inserted", Setting.Flag(true))
+            Described -> ()
+    if !found then return Err("--sd: this board has no microSD card")
+    Ok(())
 
 /** A mistake in naming a description on the command line, where there is no file to point into. */
 described_error(d: Diagnostic) -> string
@@ -33,16 +88,19 @@ described_error(d: Diagnostic) -> string
 
     s"benchtop: ${d.message}$label\n  = note: ${d.note}\n"
 
-private board_of(m: *Machine, src: Source) -> Result[Board, string]
+private board_of(m: *Machine, src: Source) -> Result[Board, string] = board_of_sd(m, src, SdChoice.Described)
+
+private board_of_sd(m: *Machine, src: Source, sd: SdChoice) -> Result[Board, string]
     val reg = library()
     val got = load(src, reg)
 
     if got.report.has_errors() then return Err(got.report.render(src))
 
-    val b = runnable(got.description) match
+    var b = runnable(got.description) match
         Ok(b) -> b
         Err(why) -> return Err(s"${src.name}: $why\n")
 
+    apply_sd(&b, sd)?
     assemble(m, b, reg) match
         Ok(_) -> Ok(b)
         Err(why) -> Err(s"${src.name}: $why\n")

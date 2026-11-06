@@ -223,7 +223,7 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 
 ```
 sysl build . -o benchtop
-./benchtop run [--board <name | file.hocon>] [--deterministic] [--gdb [port]] <image.elf | image.bin>
+./benchtop run [--board <name | file.hocon>] [--deterministic] [--gdb [port]] [--sd <card.img | none>] <image.elf | image.bin>
 ./benchtop check [--mcu] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
@@ -247,6 +247,12 @@ not reproducible, as two real cores are not.
 **`--gdb [port]`** serves gdb's remote protocol instead, one TCP port per core from `port` (3333),
 and holds the board at its reset vector until a gdb resumes it: `target remote :3333`. See
 [debugging a guest with gdb](docs/gdb.md).
+
+**`--sd <card.img | none>`** sets the microSD card of a board that has a socket (the STM32H747I-DISCO's
+CN12), with or without `--window`. A file backs the card, read and written through, and its size is the
+card's: a whole number of 512-byte sectors, a multiple of 512 KiB and at most 64 MiB, or the run is
+refused saying which. `none` leaves the slot empty: the detect pin PI8 reads high and SDMMC commands
+time out. Without `--sd` the board's own card is in the slot. A board with no socket refuses the option.
 
 **`check`** reads a board or product description and holds it to benchtop's part library: it
 prints every mistake with its line and column and exits 1, or prints what the description is.
