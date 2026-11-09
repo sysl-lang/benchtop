@@ -13,10 +13,16 @@ module sh.sysl.benchtop.gdb
 // **A breakpoint is its core's.** The board keeps one set for both cores (v6m/debug.sysl), and a core
 // that reaches one only the other core's gdb set runs on past it, unseen.
 //
+// **A watchpoint is its core's too, and is kept on the core itself**, `DEBUG_WATCHES` of them, as a
+// Cortex-M7's DWT has four comparators: `Z2` (write), `Z3` (read) and `Z4` (access) on any range. A
+// core whose load or store reaches one stops after the instruction, the access made, and its gdb is
+// told `T05watch:<addr>;`, `rwatch:` or `awatch:`, the address the first watched byte the access
+// touched. Only the core's own accesses are watched: not the other core's, nor a DMA's.
+//
 // **Everything here runs on the thread that runs the board, between its slices**, so a register, a
 // memory word or a breakpoint is touched only while no core runs and no lock is needed.
 
-import sh.sysl.benchtop.v6m.{Cpu, Memory, Stop, at_debug_break, clear_debug_break, debug_break_at, debug_resume, debug_step, limit_of, load16, load32, load8, set_debug_break, set_limit, store16, store32, store8}
+import sh.sysl.benchtop.v6m.{Cpu, Memory, Stop, WATCH_ACCESS, WATCH_READ, WATCH_WRITE, at_debug_break, clear_debug_break, clear_debug_watch, clear_debug_watches, debug_break_at, debug_resume, debug_step, limit_of, load16, load32, load8, set_debug_break, set_debug_watch, set_limit, store16, store32, store8}
 import sh.sysl.benchtop.virt.stop_message
 import sysl.buf.{Buf, buf}
 import sysl.raw.str_cast
@@ -145,11 +151,13 @@ impl[T: Target] Debugger[T]
         if self.running then self.stop_all()
         true
 
-    /** Core `k`'s gdb has gone: its breakpoints go with it, and with no gdb left the board runs on. */
+    /** Core `k`'s gdb has gone: its breakpoints and watchpoints go with it, and with no gdb left the
+     * board runs on. */
     hang_up(*self, k: u32)
         val l = &self.links[k]
         for b in l.breaks.view() do self.release(k, b.at)
         l.breaks = buf()
+        clear_debug_watches(self.t.core(k))
         l.attached = false
         l.waiting = false
         if !self.links[0].attached && !self.links[1].attached && !self.running && !self.quit then self.start()
@@ -197,7 +205,11 @@ impl[T: Target] Debugger[T]
             if c.stop == Stop.Exit
                 self.exited(int(c.exit_code))
                 return true
-            if at_debug_break(c) && self.links[k].held(c.pc).is_none()
+            if c.watch_hit != 0
+                // A watchpoint stopped it before the access: the instruction completes, and the core
+                // stops after it.
+                debug_step(c, self.t.memory())
+            elif at_debug_break(c) && self.links[k].held(c.pc).is_none()
                 // A breakpoint only the other core's gdb holds: this core goes on past it.
                 debug_step(c, self.t.memory())
                 if c.stop == Stop.Running then continue
@@ -208,16 +220,20 @@ impl[T: Target] Debugger[T]
         !(end is Slice.Asleep)
 
     // Every core runs from where it is: a stop is cleared, and a core at a breakpoint steps past it
-    // first, as a probe does, so that it does not stop there again at once.
+    // first, as a probe does, so that it does not stop there again at once. Where that step reached a
+    // watchpoint, the board stops again at once.
     private start(*self)
         val mem = self.t.memory()
+        var watched = false
         for k in 0u32..<self.t.cores()
             if !self.t.started(k) then continue
             val c = self.t.core(k)
             if c.stop == Stop.Exit then continue
             if debug_break_at(c, c.pc) then debug_step(c, mem) else debug_resume(c)
+            if c.watch_done != 0 then watched = true
         self.running = true
         self.stepping = -1
+        if watched then self.stop_all()
 
     /** The board stops, and every gdb waiting on it is told why its core stopped. */
     stop_all(*self)
@@ -259,6 +275,7 @@ impl[T: Target] Debugger[T]
     private stop_reply(*self, k: u32, why: Why) -> string
         val c = self.t.core(k)
         val l = &self.links[k]
+        if c.watch_done != 0 && c.stop == Stop.Running then return watch_reply(c.watch_done, c.watch_at)
         if at_debug_break(c)
             l.held(c.pc) match
                 Some(b) ->
@@ -419,11 +436,18 @@ impl[T: Target] Debugger[T]
         self.say(k, "OK")
 
     // `Z0`/`Z1` and `z0`/`z1` `,addr,kind`: a software or a hardware breakpoint, the same thing here.
-    // Watchpoints (`Z2`–`Z4`) are not supported, which an empty reply says.
+    // `Z2`–`Z4` and `z2`–`z4` `,addr,length`: a write, read or access watchpoint on core `k`'s own data
+    // accesses, refused (`E01`) past `DEBUG_WATCHES`, or before the core runs. Another kind is not
+    // supported, which an empty reply says.
     private breakpoint(*self, k: u32, text: []const u8, insert: bool)
         if text.len < 2 || text[1] != u8(',') then return self.say(k, "E01")
         val hardware = text[0] == u8('1')
-        if text[0] != u8('0') && !hardware then return self.say(k, "")
+        val watch = text[0] match
+            u8('2') -> WATCH_WRITE
+            u8('3') -> WATCH_READ
+            u8('4') -> WATCH_ACCESS
+            _ -> 0u32
+        if text[0] != u8('0') && !hardware && watch == 0 then return self.say(k, "")
         val spec = text[2..<text.len]
         val end = spec.index_of_byte(u8(';')) match
             Some(i) -> i
@@ -431,6 +455,7 @@ impl[T: Target] Debugger[T]
         val (a, kind) = address_length(spec[0..<end]) match
             Some(v) -> v
             None -> return self.say(k, "E01")
+        if watch != 0 then return self.watchpoint(k, watch, a, kind, insert)
         if kind != 2 && kind != 3 && kind != 4 then return self.say(k, "E01")
         val l = &self.links[k]
         if !insert
@@ -443,6 +468,13 @@ impl[T: Target] Debugger[T]
         if !set_debug_break(self.t.memory(), a) then return self.say(k, "E01")
         l.breaks.push(Break(a, hardware))
         self.say(k, "OK")
+
+    private watchpoint(*self, k: u32, kind: u32, a: u32, length: u32, insert: bool)
+        val c = self.t.core(k)
+        if !insert
+            clear_debug_watch(c, kind, a, length)
+            return self.say(k, "OK")
+        self.say(k, if self.t.started(k) && set_debug_watch(c, kind, a, length) then "OK" else "E01")
 
     // The board lets go of the breakpoint at `a` unless the gdb of a core other than `k` holds one there.
     private release(*self, k: u32, a: u32)
@@ -526,6 +558,13 @@ private address_length(text: []const u8) -> Option[(u32, u32)]
     val n = parse_hex(text[comma + 1..<text.len])?
     if a > 0xFFFFFFFF || n > 0xFFFFFFFF then return None
     Some((u32(a), u32(n)))
+
+// The stop reply for a watchpoint of `kind` an access reached at `a`.
+private watch_reply(kind: u32, a: u32) -> string
+    var hex: Buf[u8] = buf()
+    for i in 0u32..<4 do push_byte(&hex, u8.wrap(a >> ((3 - i) * 8)))
+    val name = if kind == WATCH_WRITE then "watch" elif kind == WATCH_READ then "rwatch" else "awatch"
+    "T05" + name + ":" + str_cast(hex.view()) + ";"
 
 // The widest access at `a` that is aligned and no longer than `left` bytes.
 private width_at(a: u32, left: u32) -> u32 =
