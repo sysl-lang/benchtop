@@ -108,7 +108,10 @@ D0 to D3, PC12 CK, PD2 CMD), its detect switch pulling PI8 low. The card is 3276
 zeros. To give it a disk image, copy `boards/stm32h747-disco.hocon`, add `image = "<file>"` to
 the `card` part (the file must be exactly `sectors` * 512 bytes; `tools/mk-sd-image` makes a
 FAT16 one) and run that copy with `--board`. Every sector the guest writes is written back to
-the file. `boards/stm32h747-spi-sd.hocon` is the same board with the card instead on an
+the file. `run --sd <card.img>` does the same without a copy of the board, taking the card's size from
+the file (a multiple of 512 KiB, up to 64 MiB), and `run --sd none` takes the card out: PI8 reads high (the
+board's pull-up) and SDMMC1 commands time out. A description does the same with `inserted = false` on
+the `card` part. `boards/stm32h747-spi-sd.hocon` is the same board with the card instead on an
 external SPI1 module, J2.
 
 The four user LEDs, LD1 to LD4, are on PI12 to PI15 and light while their pin is an output driven

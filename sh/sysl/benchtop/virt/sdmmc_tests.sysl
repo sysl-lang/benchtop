@@ -6,6 +6,8 @@ import sh.sysl.fat as fat
 import sh.sysl.elf as elf
 import sysl.raw.str_cast
 import sysl.text.replace_all
+import sysl.fs
+import sysl.buf.{buf, Buf, buf_filled}
 
 private val NATIVE_GUEST = embed("../../../../examples/touch/storage-disco.elf")
 private val SPI_GUEST = embed("../../../../examples/touch/storage-spi-disco.elf")
@@ -20,31 +22,39 @@ private sreg(m: *Machine, c: *cpu.Cpu, offset: u32, value: u32) = board_write(m,
 private sread(m: *Machine, c: *cpu.Cpu, offset: u32) -> u32 = board_read(m,c,0x52007000 + offset,4,c.retired)
 // Reads sector 0 into `base` through the IDMA: `c` programs the host, and `runner` is the core whose
 // signals bring the transfer in.
-private request_block(m: *Machine, c: *cpu.Cpu, base: u32, runner: *cpu.Cpu)
+private request_block(m: *Machine, c: *cpu.Cpu, base: u32, runner: *cpu.Cpu) = request_sector(m,c,base,runner,0)
+private request_sector(m: *Machine, c: *cpu.Cpu, base: u32, runner: *cpu.Cpu, sector: u32)
     sreg(m,c,0x38,0x1fe00fff)
     sreg(m,c,0x24,1000000)
     sreg(m,c,0x28,512)
     sreg(m,c,0x2c,0x92)
     sreg(m,c,0x58,base)
     sreg(m,c,0x50,1)
-    sreg(m,c,8,0)
+    sreg(m,c,8,sector)
     sreg(m,c,12,17 | 64 | 256 | 4096)
     sdmmc_step(m,runner)
     while m.devices.sdmmc.live.with(l -> l.host.data_due) != NEVER do sdmmc_step(m,runner)
 // A machine on the SD board that has run the native storage firmware, its card on a four-bit bus.
 private sd_machine() -> &Machine
-    val description = str_cast(embed("../../../../boards/stm32h747-disco.hocon"))
+    val board = sd_machine_with(SdChoice.Described)
+    assert(board.devices.sdmmc.live.with(l -> l.host.wiring.card.is_some() && l.host.wiring.card.unwrap().width == 4))
+    board
+
+// The same, with the card as `benchtop run --sd` says.
+private sd_machine_with(sd: SdChoice) -> &Machine
     val board = machine()
     val m = &*board
-    board_from(m, "sdmmc-bus.hocon",description.bytes).unwrap()
+    board_named_sd(m, "stm32h747-disco", sd).unwrap()
     boot(m,image_of(m, NATIVE_GUEST).unwrap().view())
     start_workers(m).unwrap()
     submit_workers(m,240000000)
     wait_workers(m)
     pause_workers(m)
     stop_workers(m)
-    assert(m.devices.sdmmc.live.with(l -> l.host.wiring.card.is_some() && l.host.wiring.card.unwrap().width == 4))
     board
+
+// PI8, the card-detect switch: low with a card in the slot.
+private detect_high(m: *Machine, c: *cpu.Cpu) -> bool = board_read(m,c,0x58022010,4,c.retired) & (1 << 8) != 0
 
 @test("SDMMC bus: the IDMA moves RAM through the core each signal hands it, not the one that programmed it")
 sdmmc_runs_on_the_core_handed()
@@ -148,3 +158,73 @@ spi_storage_retained()
     val status = u32(elf.read(SPI_GUEST).unwrap().symbol_named("storage_status").unwrap().unwrap().value)
     assert(cpu.load32(core0(m),status) == 1,"retained SPI firmware must mount its FAT card")
     assert(!m.devices.storage.is_native && with_sd_card(m, c -> c.stats.reads) > 0,"the retained firmware must read sectors through SPI")
+
+// A card image of `sectors` sectors in which every byte of sector `n` is `n + 1`, in a fresh directory.
+private card_image(dir: string, sectors: usize) -> string
+    var bytes: Buf[u8] = buf()
+    for sector in 0..<sectors do for _ in 0..<512 do bytes.push(u8((sector + 1) % 256))
+    val file = s"$dir/card.img"
+    fs.write_bytes(file,bytes.view()).unwrap()
+    file
+
+@test("run --sd <image>: the guest finds the card the file backs, sized by the file, and reads its sectors through SDMMC1")
+sd_option_image()
+    val dir = fs.make_temp_dir("benchtop-sd-option").unwrap()
+    defer fs.remove_dir_all(dir).unwrap()
+    val file = card_image(dir,2048)
+    val board = sd_machine_with(sd_choice(file))
+    val m = &*board
+    assert(m.devices.storage.has_card && m.devices.storage.image.has_file)
+    assert(m.devices.storage.image.bytes.with(bytes -> bytes.len()) == 2048 * 512, "the file's size is the card's")
+    val c = core1(m)
+    assert(!detect_high(m,c), "a card in the slot pulls PI8 low")
+    assert(m.devices.sdmmc.live.with(l -> l.host.wiring.card.is_some()))
+    cpu.set_pending(c,cpu.IRQ0 + 49,false)
+    for i in 0u32..<128 do cpu.store32(c,0x24002000 + i * 4,0)
+    request_sector(m,c,0x24002000,c,3)
+    assert(sread(m,c,0x34) & 256 != 0, "the transfer ended")
+    assert(cpu.load32(c,0x24002000) == 0x04040404 && cpu.load32(c,0x24002000 + 508) == 0x04040404, "sector 3 of the file arrived")
+
+@test("run --sd none: PI8 reads high and an SDMMC command gets no answer, as with an empty slot")
+sd_option_none()
+    val board = sd_machine_with(sd_choice("none"))
+    val m = &*board
+    assert(!m.devices.storage.has_card)
+    val c = core1(m)
+    assert(detect_high(m,c), "no card: the pull-up holds PI8 high")
+    assert(m.devices.sdmmc.live.with(l -> l.host.wiring.card.is_none()))
+    sreg(m,c,0,3)
+    sreg(m,c,0x38,0x1fe00fff)
+    sreg(m,c,0x3c,4)
+    sreg(m,c,8,0x12340000)
+    sreg(m,c,12,13 | 256 | 4096)
+    sdmmc_step(m,c)
+    assert(sread(m,c,0x34) & 4 != 0, "CTIMEOUT")
+    assert(sread(m,c,0x34) & 1 == 0, "no CCRCFAIL: nothing answered")
+
+@test("run --sd: without the option the board's own blank card is in the slot")
+sd_option_default()
+    val board = sd_machine_with(SdChoice.Described)
+    assert(!detect_high(&*board,core1(&*board)))
+
+@test("run --sd: a missing file, a size that is not whole sectors, and a size no card has are refused with their reason")
+sd_option_errors()
+    val dir = fs.make_temp_dir("benchtop-sd-errors").unwrap()
+    defer fs.remove_dir_all(dir).unwrap()
+    val board = machine()
+    val m = &*board
+    val missing = board_named_sd(m, "stm32h747-disco", sd_choice(s"$dir/absent.img"))
+    assert(missing.is_err() && missing.unwrap_err().contains("cannot read the SD image"))
+    val ragged = s"$dir/ragged.img"
+    fs.write_bytes(ragged,buf_filled(1000,u8(0)).view()).unwrap()
+    val odd = board_named_sd(m, "stm32h747-disco", sd_choice(ragged))
+    assert(odd.is_err() && odd.unwrap_err().contains("whole number of 512-byte sectors"))
+    val small = s"$dir/small.img"
+    fs.write_bytes(small,buf_filled(512 * 100,u8(0)).view()).unwrap()
+    val tiny = board_named_sd(m, "stm32h747-disco", sd_choice(small))
+    assert(tiny.is_err() && tiny.unwrap_err().contains("multiple of 512 KiB"))
+    val empty = s"$dir/empty.img"
+    fs.write_bytes(empty,buf_filled(0,u8(0)).view()).unwrap()
+    assert(board_named_sd(m, "stm32h747-disco", sd_choice(empty)).is_err())
+    val bare = board_named_sd(m, "virt", sd_choice("none"))
+    assert(bare.is_err() && bare.unwrap_err().contains("no microSD card"))
