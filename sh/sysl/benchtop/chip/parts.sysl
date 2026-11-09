@@ -1,0 +1,344 @@
+module sh.sysl.benchtop.chip
+
+// The parts of an RP2040 or RP2350 board on its chip's pins: buttons and switches that drive a GPIO
+// from off the chip, leaving it to the pad's pulls when open; potentiometers and joysticks that put a
+// level on an ADC input; seven-segment displays and HD44780s that watch the GPIOs they are wired to;
+// buzzers that sound the PWM's waveform or a pin's level; LEDs that show a pin.
+//
+// `PartPins` is the one seam between them and the chip: a part model never reaches past it, so every
+// part runs on both chips and on every board built on them (`ArmBoard`, `RiscvBoard`). The models are
+// the workbench's own (`virt.Displays`, `virt.pot_voltage`, `audio.Synth`, `virt.PartInput`), shown the
+// chip's pins instead of the workbench's GPIO panel.
+
+import sh.sysl.benchtop.{Board, Part, Target, article_of, part_model, part_text, part_whole}
+import sh.sysl.benchtop.audio as audio
+import sh.sysl.benchtop.parts.hd44780.Lcd
+import sh.sysl.benchtop.peripheral.rp2040.{ADC_BASE_GPIO, Pwm, pwm_slice_of}
+import sh.sysl.benchtop.peripheral.rp2350 as rp
+import sh.sysl.benchtop.peripheral.rp2350.Pin
+import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.virt.PartInput
+import sysl.buf.{Buf, buf}
+
+/** A change in what the GPIOs a `PinWatch` watches show: from clk_sys cycle `cycle` on, the level of
+ * each (bit n for GPIO n) and whether the chip drives it.
+ */
+struct PinChange
+    cycle: u64
+    levels: u64
+    driven: u64
+
+/** What a board's parts watch of the chip's GPIOs (`part_watch`): which, what they last showed, and
+ * each change since the parts last looked. It is the board's, as the wires are: a reset of the chip
+ * keeps it.
+ */
+struct PinWatch
+    mask: u64
+    levels: u64
+    driven: u64
+    changes: Buf[PinChange]
+
+/** Watching no GPIO. */
+pin_watch() -> PinWatch = PinWatch(0, 0, 0, buf())
+
+impl PinWatch
+    // The watched GPIOs show `levels`, the chip driving `driven`, at `cycle`: a change is kept.
+    private[chip] note(*self, cycle: u64, levels: u64, driven: u64)
+        if levels == self.levels && driven == self.driven && !self.changes.is_empty() then return
+        self.levels = levels
+        self.driven = driven
+        self.changes.push(PinChange(cycle, levels, driven))
+
+/** The seam between a board's parts and its RP chip (`Rp2350`, `Rp2040`): everything a part does to the
+ * chip, or learns from it, goes through these.
+ */
+trait PartPins
+    /** clk_sys cycles since power-on. */
+    part_clock(*self) -> u64
+    /** clk_sys's rate now, in Hz. */
+    part_hz(*self) -> u64
+    /** What GPIO `n` is doing: whether its pad drives, its level, and what its input reads. */
+    part_pin(*self, n: u32) -> Pin
+    /** Drive GPIO `n` from off the chip at `level`, as a closed button does, or let it go with None,
+     * leaving it to its pad's pulls.
+     */
+    part_drive(*self, n: u32, level: Option[bool])
+    /** Put `uv` microvolts on ADC input `input` (GPIO 26 + `input`) from off the chip, or nothing. */
+    part_analog(*self, input: u32, uv: Option[u32])
+    /** Watch the GPIOs of `mask`, bit n for GPIO n, noting what they show now and each change after. */
+    part_watch(*self, mask: u64)
+    /** The changes on the watched GPIOs since the last call, oldest first. */
+    part_changes(*self) -> Buf[PinChange]
+    /** The waveform the PWM puts on GPIO `n`, where FUNCSEL gives it a free-running slice: its period and
+     * the part of it the pin is high, in sixteenths of a clk_sys cycle. None otherwise.
+     */
+    part_pwm(*self, n: u32) -> Option[(u64, u64)]
+
+impl Rp2350
+    // What the watched GPIOs show now, kept where it changed.
+    private[chip] note_pins(*self)
+        val (levels, driven) = shown(self.watch.mask, n -> self.pin(n))
+        self.watch.note(self.now, levels, driven)
+
+impl Rp2040
+    private[chip] note_pins(*self)
+        val (levels, driven) = shown(self.watch.mask, n -> self.pin(n))
+        self.watch.note(self.now, levels, driven)
+
+// The levels of `mask`'s GPIOs and the ones the chip drives, bit n for GPIO n, as `pin` gives each.
+private shown(mask: u64, pin: (u32) -> Pin) -> (u64, u64)
+    var levels: u64 = 0
+    var driven: u64 = 0
+    var bits = mask
+    while bits != 0
+        val n = u32(bits.trailing_zeros())
+        bits &= bits - 1
+        val p = pin(n)
+        if p.level then levels |= 1u64 << n
+        if p.drives then driven |= 1u64 << n
+    (levels, driven)
+
+// A free-running slice's waveform on GPIO `n`, where FUNCSEL routes the PWM to it.
+private pwm_on(f: u32, n: u32, pwm: *Pwm) -> Option[(u64, u64)] =
+    if rp.route(n, f) != rp.Route.Pwm then None else pwm.wave(pwm_slice_of(n), n & 1 == 1)
+
+impl PartPins for Rp2350
+    part_clock(*self) -> u64 = self.now
+    part_hz(*self) -> u64 = self.sys_hz()
+    part_pin(*self, n: u32) -> Pin = self.pin(n)
+    part_drive(*self, n: u32, level: Option[bool]) = self.drive_from_outside(n, level)
+    part_analog(*self, input: u32, uv: Option[u32]) = self.set_analog(input, uv)
+    part_watch(*self, mask: u64)
+        self.watch = PinWatch(mask, 0, 0, buf())
+        if mask != 0 then self.note_pins()
+    part_changes(*self) -> Buf[PinChange]
+        val all = self.watch.changes
+        self.watch.changes = buf()
+        all
+    part_pwm(*self, n: u32) -> Option[(u64, u64)] = pwm_on(self.io.function(n), n, &self.pwm)
+
+impl PartPins for Rp2040
+    part_clock(*self) -> u64 = self.now
+    part_hz(*self) -> u64 = self.sys_hz()
+    part_pin(*self, n: u32) -> Pin = self.pin(n)
+    part_drive(*self, n: u32, level: Option[bool]) = self.drive_from_outside(n, level)
+    part_analog(*self, input: u32, uv: Option[u32]) = self.set_analog(input, uv)
+    part_watch(*self, mask: u64)
+        self.watch = PinWatch(mask, 0, 0, buf())
+        if mask != 0 then self.note_pins()
+    part_changes(*self) -> Buf[PinChange]
+        val all = self.watch.changes
+        self.watch.changes = buf()
+        all
+    part_pwm(*self, n: u32) -> Option[(u64, u64)] = pwm_on(self.io.function(n), n, &self.pwm)
+
+// ---------------------------------------------------------------------------------------------------
+// Which parts run on an RP board.
+
+// The parts that work through a pin or an ADC input, which run on an RP board.
+private pin_level(model: string) -> bool = model match
+    "led" | "button" | "switch" | "potentiometer" | "joystick" | "buzzer" | "seven-segment" | "hd44780" -> true
+    _ -> false
+
+// The parts that work through the chip's I2C, SPI or PIO, which come to an RP board next.
+private on_a_bus(model: string) -> bool = model match
+    "ssd1306" | "st7789" | "st7796" | "gt911" | "ft6x06" | "ds3231" | "ws2812" -> true
+    _ -> false
+
+/** Why benchtop cannot run board `b`'s parts on its RP chip, or None where it can. A part whose pins
+ * are GPIOs runs; an LED may also be wired to another part's port, which shows nothing until that part
+ * runs. The checker has already held each wire to a pin the board has, and a potentiometer's or a
+ * joystick's to an ADC pin.
+ */
+rp_parts_refusal(b: Board) -> Option[string]
+    val chip = b.chip.name
+    for p in b.parts
+        val model = part_model(p)
+        if pin_level(model)
+            if model == "led" then continue
+            for w in p.wires
+                if virt.connection_pin(w.to) < 0 then return Some(s"`${p.name}.${w.port}` is wired to ${wired_to(w.to)}, and on an $chip board a ${model}'s wires go to the chip's GPIOs")
+            continue
+        if on_a_bus(model) then return Some(s"`${p.name}` is ${article_of(model)} $model, which works through the $chip's I2C, SPI or PIO: benchtop runs an RP board's pin-level parts (LEDs, buttons, switches, potentiometers, joysticks, buzzers, seven-segment displays and HD44780s), and those parts come next")
+        return Some(s"benchtop does not emulate the parts on an $chip board yet, and `${p.name}` is ${article_of(p.kind)} ${p.kind}")
+    None
+
+private wired_to(t: Target) -> string = t match
+    Pin(n) -> n
+    Bus(n) -> s"the bus `$n`"
+    Port(part, port) -> s"`$part.$port`"
+
+// ---------------------------------------------------------------------------------------------------
+// The parts on the chip.
+
+/** A buzzer on the chip's pins, sounding through benchtop's synthesiser as the workbench's do
+ * (`virt/sound.sysl`): the PWM's waveform where a free-running slice drives its pin, otherwise the
+ * pin's level, or an active buzzer's own tone while the pin is high. Its clock is sixteenths of a
+ * clk_sys cycle (`hz` of them a second), the PWM divider's unit; a new clk_sys rate starts it again.
+ */
+struct RpBuzzer
+    name: string
+    pin: u32
+    active: bool
+    tone: u64
+    gain: real
+    synth: &audio.Synth
+    hz: u64
+    level: bool
+    driven: bool
+
+/** The parts of an RP board on its chip: each part's control as the window or a script sets it (as the
+ * workbench's session keeps them), the displays its GPIOs drive and its buzzers.
+ */
+struct RpParts
+    parts: Buf[Part]
+    inputs: Buf[PartInput]
+    displays: virt.Displays
+    buzzers: Buf[RpBuzzer]
+
+/** The parts of `b`, which `rp_parts_refusal` has passed, every control at rest, on no chip yet. */
+rp_parts(b: Board) -> RpParts
+    var inputs: Buf[PartInput] = buf()
+    var buzzers: Buf[RpBuzzer] = buf()
+    for p in b.parts
+        inputs.push(virt.resting(p))
+        if part_model(p) != "buzzer" then continue
+        val pin = virt.terminal_pin(p, "pin")
+        if pin < 0 then continue
+        val gain = real(part_whole(p, "gain", 12)) / 100.0
+        buzzers.push(RpBuzzer(p.name, u32(pin), part_text(p, "kind", "passive") == "active", u64(part_whole(p, "tone", 4000)),
+            gain, audio.synth(48000, 48000, gain), 0, false, false))
+    RpParts(b.parts, inputs, virt.displays_of(b), buzzers)
+
+impl RpParts
+    /** The part named `name`, if the board has it. */
+    part(*self,name: string) -> Option[Part]
+        for p in self.parts do if p.name == name then return Some(p)
+        None
+
+    /** What the named part's control is doing; `Inert` for a part with none. */
+    input(*self,name: string) -> PartInput
+        for i in 0..<self.parts.len() do if self.parts[i].name == name then return self.inputs[i]
+        PartInput.Inert
+
+    /** Set the named part's control; `apply_parts` puts it on the chip. A position is held to the
+     * control's travel.
+     */
+    set_input(*self,name: string, input: PartInput)
+        for i in 0..<self.parts.len()
+            if self.parts[i].name == name
+                self.inputs[i] = input match
+                    Position(at) -> PartInput.Position(travel(at))
+                    Axes(x, y) -> PartInput.Axes(travel(x), travel(y))
+                    other -> other
+
+    /** What each digit of the seven-segment display `name` shows at clk_sys cycle `cycle`: its
+     * segments, bit i for a..g, dp.
+     */
+    segments(*self,name: string, cycle: u64) -> [8]u8 = virt.segments_of(&self.displays, name, cycle)
+
+    /** The HD44780 `name`, as its controller stands. */
+    lcd(*self,name: string) -> Option[Lcd] = virt.lcd_of(&self.displays, name)
+
+    /** What the buzzer `name` has sounded since the last call, at 48 kHz. */
+    sound(*self,name: string) -> Buf[f32]
+        for b in self.buzzers do if b.name == name then return audio.take(b.synth)
+        buf()
+
+private travel(at: int) -> int = if at < 0 then 0 elif at > virt.POSITION_MAX then virt.POSITION_MAX else at
+
+/** Put the parts on chip `c`: it watches the pins the displays and buzzers are wired to, and every
+ * control is put on its pins as it stands.
+ */
+connect_parts[C: PartPins](ps: *RpParts, c: *C)
+    var mask: u64 = 0
+    for p in ps.parts
+        val model = part_model(p)
+        if model != "seven-segment" && model != "hd44780" && model != "buzzer" then continue
+        for w in p.wires
+            val n = virt.connection_pin(w.to)
+            if n >= 0 then mask |= 1u64 << u64(n)
+    c.part_watch(mask)
+    apply_parts(ps, c)
+
+/** Put every part's control on chip `c`'s pins: a closed button or switch drives its GPIO to its active
+ * level and an open one lets it go; a potentiometer or a joystick puts its wiper's level on its ADC
+ * inputs.
+ */
+apply_parts[C: PartPins](ps: *RpParts, c: *C)
+    for i in 0..<ps.parts.len()
+        val p = ps.parts[i]
+        ps.inputs[i] match
+            Pressed(down) -> close(c, p, down)
+            Closed(on) -> close(c, p, on)
+            Position(at) -> analog(c, virt.terminal_pin(p, "wiper"), virt.pot_voltage(p, at))
+            Axes(x, y) ->
+                analog(c, virt.terminal_pin(p, "x"), virt.pot_voltage(p, x))
+                analog(c, virt.terminal_pin(p, "y"), virt.pot_voltage(p, y))
+            Inert -> ()
+
+private close[C: PartPins](c: *C, p: Part, closed: bool)
+    val pin = virt.terminal_pin(p, "pin")
+    if pin >= 0 then c.part_drive(u32(pin), if closed then Some(part_text(p, "active", "low") == "high") else None)
+
+private analog[C: PartPins](c: *C, pin: int, uv: u32)
+    if pin >= int(ADC_BASE_GPIO) then c.part_analog(u32(pin) - ADC_BASE_GPIO, Some(uv))
+
+/** The parts see what chip `c`'s pins have done since they last looked: the displays each change, and
+ * the buzzers the sound up to the chip's clock.
+ */
+observe_parts[C: PartPins](ps: *RpParts, c: *C)
+    for ch in c.part_changes()
+        sound_to(ps, c, ch.cycle)
+        for i in 0..<ps.buzzers.len()
+            val bit = 1u64 << u64(ps.buzzers[i].pin)
+            ps.buzzers[i].level = ch.levels & bit != 0
+            ps.buzzers[i].driven = ch.driven & bit != 0
+        virt.observe_pins(&ps.displays, u32.wrap(ch.levels), u32.wrap(ch.driven), ch.cycle)
+    sound_to(ps, c, c.part_clock())
+
+// The buzzers sounded up to clk_sys cycle `cycle`, each as it stands.
+private sound_to[C: PartPins](ps: *RpParts, c: *C, cycle: u64)
+    val hz = c.part_hz() * 16
+    if hz < 48000 then return
+    for i in 0..<ps.buzzers.len()
+        if ps.buzzers[i].hz != hz
+            ps.buzzers[i].synth = audio.synth(hz, 48000, ps.buzzers[i].gain)
+            ps.buzzers[i].hz = hz
+            audio.clear(ps.buzzers[i].synth, cycle * 16)
+        val b = ps.buzzers[i]
+        audio.advance(b.synth, cycle * 16, wave(b, c))
+
+// What buzzer `b` sounds while its pin stands as it does.
+private wave[C: PartPins](b: RpBuzzer, c: *C) -> audio.Wave
+    c.part_pwm(b.pin) match
+        Some((period, high)) -> return audio.Wave(true, period, high, 0, false)
+        None -> ()
+    if b.active
+        val period = b.hz / b.tone
+        return audio.Wave(b.driven && b.level, period, period / 2, 0, false)
+    audio.Wave(b.driven, 0, 0, 0, b.level)
+
+/** The pitch the buzzer `name` sounds on chip `c` now, in Hz: the PWM's rate where a free-running slice
+ * drives its pin with a duty between none and all, an active buzzer's tone while its pin is high, and
+ * otherwise 0.
+ */
+pitch[C: PartPins](ps: *RpParts, c: *C, name: string) -> u64
+    for b in ps.buzzers
+        if b.name != name then continue
+        c.part_pwm(b.pin) match
+            Some((period, high)) -> return if high == 0 || high >= period then 0 else c.part_hz() * 16 / period
+            None -> ()
+        val p = c.part_pin(b.pin)
+        return if b.active && p.drives && p.level then b.tone else 0
+    0
+
+/** Whether the LED `name` is lit on chip `c`: its anode's GPIO driven to its active level. */
+lit[C: PartPins](ps: *RpParts, c: *C, name: string) -> bool
+    val p = ps.part(name) match
+        Some(p) -> p
+        None -> return false
+    val pin = virt.terminal_pin(p, "anode")
+    if pin < 0 then return false
+    val s = c.part_pin(u32(pin))
+    s.drives && s.level == (part_text(p, "active", "high") == "high")

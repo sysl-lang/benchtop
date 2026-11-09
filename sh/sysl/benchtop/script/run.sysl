@@ -6,7 +6,7 @@ module sh.sysl.benchtop.script
 // which runs it a slice and answers its clock, its console and its inputs; `drive` takes the steps over
 // any of them, so the rules of a script are the same on every board.
 
-import sh.sysl.benchtop.Part
+import sh.sysl.benchtop.{Part, article_of, part_model}
 import sh.sysl.benchtop.chip as chip
 import sh.sysl.benchtop.chip.RunEnd
 import sh.sysl.benchtop.peripheral.rp2350.Frame
@@ -68,7 +68,8 @@ run(which: string, file: string, sc: Script, setup: Setup) -> Outcome
     val image = read_bytes(file) match
         Ok(b) -> b
         Err(e) -> return refused(s"cannot read $file: $e")
-    val (parts, chip_name, name) = chip.described(which) match
+    val found = chip.described(which)
+    val (parts, chip_name, name) = found match
         Some((b, n)) -> (b.parts, b.chip.name, n)
         None -> (buf(), "", which)
     chip.riscv_named(which) match
@@ -79,7 +80,8 @@ run(which: string, file: string, sc: Script, setup: Setup) -> Outcome
             b.boot(image) match
                 Ok(_) -> ()
                 Err(why) -> return refused(s"$file: $why")
-            var rig = RiscvRig(b, 0, b.chip.now, 0, buf(), parts, name)
+            var rig = RiscvRig(b, 0, b.chip.now, 0, buf(), buf(), chip.rp_parts(found.unwrap().0), name)
+            chip.connect_parts(&rig.parts, &rig.b.chip)
             return drive(&rig, sc)
         Some(Err(why)) -> return refused(why)
         None -> ()
@@ -91,7 +93,8 @@ run(which: string, file: string, sc: Script, setup: Setup) -> Outcome
                 Ok(_) -> ()
                 Err(why) -> return refused(s"$file: $why")
             if setup.usb_host then b.attach_usb_host(true)
-            var rig = ArmRig(b, 0, b.chip.clock(), 0, buf(), parts, name)
+            var rig = ArmRig(b, 0, b.chip.clock(), 0, buf(), buf(), chip.rp_parts(found.unwrap().0), name)
+            chip.connect_parts(&rig.parts, &rig.b.chip)
             return drive(&rig, sc)
         Some(Err(why)) -> return refused(why)
         None -> ()
@@ -103,7 +106,8 @@ run(which: string, file: string, sc: Script, setup: Setup) -> Outcome
             b.boot(image) match
                 Ok(_) -> ()
                 Err(why) -> return refused(s"$file: $why")
-            var rig = ArmRig(b, 0, b.chip.clock(), 0, buf(), parts, name)
+            var rig = ArmRig(b, 0, b.chip.clock(), 0, buf(), buf(), chip.rp_parts(found.unwrap().0), name)
+            chip.connect_parts(&rig.parts, &rig.b.chip)
             return drive(&rig, sc)
         Some(Err(why)) -> return refused(why)
         None -> ()
@@ -119,7 +123,7 @@ run(which: string, file: string, sc: Script, setup: Setup) -> Outcome
     virt.open_console(m)
     virt.capture_bounded(m, 1 << 20)
     virt.boot(m, placed.view())
-    var rig = VirtRig(session, 0, buf(), name)
+    var rig = VirtRig(session, 0, buf(), buf(), name)
     drive(&rig, sc)
 
 // ---------------------------------------------------------------------------------------------------
@@ -160,6 +164,11 @@ private trait Rig
     /** What `--press` holds, ready to `hold`, as an index; or why the board has nothing of that name. */
     resolve(*self, t: Target) -> Result[usize, string]
     hold(*self, k: usize, down: bool)
+    /** What `--set` sets the part `name` to (`at` ten-thousandths of its travel), ready to `turn`, as an
+     * index; or why the board has no such control.
+     */
+    knob(*self, name: string, at: int) -> Result[usize, string]
+    turn(*self, k: usize)
     /** The board is `Stalled` while something from outside is due: time passes. */
     idle(*self)
     /** The console's input has ended. */
@@ -235,7 +244,7 @@ private waiting_for(sc: *Script, step: usize, ended: bool = false) -> string =
     else sc.steps[step] match
         Expect(text) -> s"${if ended then " before" else " waiting for"} ${quoted(text)}${if ended then " appeared" else ""}"
         Press(t, _, _) -> s"${if ended then " before pressing" else " waiting to press"} ${target_text(t)}"
-        Type(_) -> ""
+        Type(_) | Set(_, _) -> ""
 
 private target_text(t: Target) -> string = t match
     Part(name) -> name
@@ -250,6 +259,10 @@ private drive[R: Rig](r: *R, sc: Script) -> Outcome
         s match
             Press(t, _, _) ->
                 r.resolve(t) match
+                    Ok(k) -> targets.push(k)
+                    Err(why) -> return refused(why)
+            Set(name, at) ->
+                r.knob(name, at) match
                     Ok(k) -> targets.push(k)
                     Err(why) -> return refused(why)
             Type(_) ->
@@ -283,6 +296,9 @@ private drive[R: Rig](r: *R, sc: Script) -> Outcome
                 Expect(text) -> consume(&seen, text)
                 Type(text) ->
                     typing.extend(text.bytes)
+                    true
+                Set(_, _) ->
+                    r.turn(targets[step])
                     true
                 Press(_, at, hold) ->
                     val k = targets[step]
@@ -386,39 +402,104 @@ end drive
 // ---------------------------------------------------------------------------------------------------
 // The boards.
 
+// What a press holds, on any board: a part's control, with it at rest and pressed, or a pin of the chip
+// at a level, by its name.
+private enum Hold
+    Control(name: string, rest: PartInput, pressed: PartInput)
+    Pin(name: string, high: bool)
+
+// The part a press names, and the direction where it names one of a joystick's (`stick.up`): `has`
+// says whether the board has a part of a name.
+private part_and_direction(name: string, has: (string) -> bool) -> (string, string)
+    if has(name) then return (name, "")
+    val b = name.bytes
+    var dot = b.len
+    for i in 0..<b.len do if b[i] == u8('.') then dot = i
+    if dot == b.len then (name, "") else (name[..<dot], name[(dot + 1)..])
+
+// What pressing the part `name`, of kind `kind` (empty where the board has no such part) with its control
+// at `rest`, does to that control; `direction` is a joystick's.
+private pressing(name: string, kind: string, direction: string, rest: PartInput, board: string) -> Result[PartInput, string]
+    if kind.is_empty() then return Err(s"$board has no part `$name`")
+    if !direction.is_empty() && kind != "joystick" then return Err(s"`$name` on $board is ${article_of(kind)} $kind, which is not held in a direction: --press $name holds it")
+    kind match
+        "button" -> Ok(PartInput.Pressed(true))
+        "switch" -> Ok(PartInput.Closed(rest != PartInput.Closed(true)))
+        "joystick" -> direction match
+            "up" -> Ok(PartInput.Axes(virt.POSITION_CENTRE, 0))
+            "down" -> Ok(PartInput.Axes(virt.POSITION_CENTRE, virt.POSITION_MAX))
+            "left" -> Ok(PartInput.Axes(0, virt.POSITION_CENTRE))
+            "right" -> Ok(PartInput.Axes(virt.POSITION_MAX, virt.POSITION_CENTRE))
+            "" -> Err(s"`$name` on $board is a joystick: --press holds it in a direction, as $name.up (up, down, left or right)")
+            _ -> Err(s"`$name.$direction`: a joystick is held up, down, left or right")
+        _ -> Err(s"`$name` on $board is ${article_of(kind)} $kind: --press holds a button, a switch or a joystick")
+
+// What `--set` does to the part `name`, of kind `kind` (empty where the board has no such part): its
+// control at `at` ten-thousandths of its travel.
+private turning(name: string, kind: string, at: int, board: string) -> Result[PartInput, string] = kind match
+    "potentiometer" -> Ok(PartInput.Position(at))
+    "" -> Err(s"$board has no part `$name`")
+    _ -> Err(s"`$name` on $board is ${article_of(kind)} $kind: --set sets a potentiometer")
+
+// The kind of `parts`' part `name`, empty where there is none.
+private kind_of(parts: *Buf[Part], name: string) -> string
+    for p in parts do if p.name == name then return part_model(p)
+    ""
+
+// What a press finds of target `t` on an RP2040 or RP2350 board, whose GPIOs number below `count`: a
+// part's control, or a GPIO and its level.
+private rp_hold(t: Target, parts: *chip.RpParts, board: string, count: u32) -> Result[Hold, string]
+    t match
+        Part(full) ->
+            val (name, direction) = part_and_direction(full, n -> kind_of(&parts.parts, n) != "")
+            val rest = parts.input(name)
+            Ok(Hold.Control(name, rest, pressing(name, kind_of(&parts.parts, name), direction, rest, board)?))
+        Pin(name, high) ->
+            rp_pin(name, board, count)?
+            Ok(Hold.Pin(name, high))
+
+// The GPIO `name` (`GP2`) of an RP2040 or RP2350 board whose GPIOs number below `count`.
+private rp_pin(name: string, board: string, count: u32) -> Result[u32, string]
+    val b = name.bytes
+    if b.len > 2 && b.len <= 4 && b[0] == u8('G') && b[1] == u8('P')
+        var n: u32 = 0
+        var digits = true
+        for c in b[2..] do if c < u8('0') || c > u8('9') then digits = false else n = n * 10 + u32(c - u8('0'))
+        if digits && n < count then return Ok(n)
+    Err(s"$name is not one of $board's GPIOs: they are GP0 to GP${count - 1}")
+
+// Hold or let go of `h` on an RP chip: a part's control, put on the pins by the parts, or a GPIO.
+private rp_press[C: chip.PartPins](h: Hold, down: bool, parts: *chip.RpParts, c: *C)
+    h match
+        Control(name, rest, pressed) ->
+            parts.set_input(name, if down then pressed else rest)
+            chip.apply_parts(parts, c)
+        Pin(name, high) -> c.part_drive(rp_pin(name, "", 48).unwrap(), if down then Some(high) else None)
+
+// What `--set` finds of part `name` on an RP2040 or RP2350 board.
+private rp_knob(parts: *chip.RpParts, name: string, at: int, board: string) -> Result[Hold, string]
+    val set = turning(name, kind_of(&parts.parts, name), at, board)?
+    Ok(Hold.Control(name, parts.input(name), set))
+
 // An RP2350's chip on its Cortex-M33s, or an RP2040's on its Cortex-M0+s.
-private struct ArmRig[C: chip.ArmChip]
+private struct ArmRig[C: chip.ArmChip + chip.PartPins]
     b: &chip.ArmBoard[C]
     shown: usize
     at: u64
     ns: u64
-    pins: Buf[(u32, bool)]
-    parts: Buf[Part]
+    holds: Buf[Hold]
+    knobs: Buf[Hold]
+    parts: chip.RpParts
     name: string
-
-// What a press finds of target `t` on an RP2040 or RP2350 board, whose GPIOs number below `count`:
-// the GPIO and its level.
-private rp_pin(t: Target, parts: *Buf[Part], board: string, count: u32) -> Result[(u32, bool), string]
-    t match
-        Part(name) ->
-            for p in parts do if p.name == name then return Err(s"`$name` on $board is a ${p.kind}: on an RP2040 or RP2350 board, --press holds a pin, as GP2=low")
-            Err(s"$board has no part `$name`: on an RP2040 or RP2350 board, --press holds a pin, as GP2=low")
-        Pin(name, high) ->
-            val b = name.bytes
-            if b.len > 2 && b.len <= 4 && b[0] == u8('G') && b[1] == u8('P')
-                var n: u32 = 0
-                var digits = true
-                for c in b[2..] do if c < u8('0') || c > u8('9') then digits = false else n = n * 10 + u32(c - u8('0'))
-                if digits && n < count then return Ok((n, high))
-            Err(s"$name is not one of $board's GPIOs: they are GP0 to GP${count - 1}")
 
 // The nanoseconds `cycles` of a clock at `hz` come to.
 private nanos(cycles: u64, hz: u64) -> u64 = if hz == 0 then 0 else u64(u128(cycles) * 1000000000 / u128(hz))
 
-impl[C: chip.ArmChip] Rig for ArmRig[C]
+impl[C: chip.ArmChip + chip.PartPins] Rig for ArmRig[C]
     advance(*self) -> Standing
         val b = &*self.b
         val end = b.run(SLICE)
+        chip.observe_parts(&self.parts, &b.chip)
         // At a breakpoint the chip runs on, as under a debugger, until UART0 has sent what it holds.
         if end == RunEnd.Breakpoint && !b.finish_sending() then return Standing.Faulted(b.refused)
         b.usb_host.take_note() match
@@ -465,12 +546,16 @@ impl[C: chip.ArmChip] Rig for ArmRig[C]
 
     resolve(*self, t: Target) -> Result[usize, string]
         val count: u32 = if const C.rp2350() then 48 else 30
-        self.pins.push(rp_pin(t, &self.parts, self.name, count)?)
-        Ok(self.pins.len() - 1)
+        self.holds.push(rp_hold(t, &self.parts, self.name, count)?)
+        Ok(self.holds.len() - 1)
 
-    hold(*self, k: usize, down: bool)
-        val (n, high) = self.pins[k]
-        self.b.chip.drive_pin(n, if down then Some(high) else None)
+    hold(*self, k: usize, down: bool) = rp_press(self.holds[k], down, &self.parts, &self.b.chip)
+
+    knob(*self, name: string, at: int) -> Result[usize, string]
+        self.knobs.push(rp_knob(&self.parts, name, at, self.name)?)
+        Ok(self.knobs.len() - 1)
+
+    turn(*self, k: usize) = rp_press(self.knobs[k], true, &self.parts, &self.b.chip)
 
     idle(*self) = self.b.wait_outside(SLICE)
 
@@ -482,14 +567,16 @@ private struct RiscvRig
     shown: usize
     at: u64
     ns: u64
-    pins: Buf[(u32, bool)]
-    parts: Buf[Part]
+    holds: Buf[Hold]
+    knobs: Buf[Hold]
+    parts: chip.RpParts
     name: string
 
 impl Rig for RiscvRig
     advance(*self) -> Standing
         val b = &*self.b
         val end = b.run(SLICE)
+        chip.observe_parts(&self.parts, &b.chip)
         if end == RunEnd.Breakpoint && !b.finish_sending() then return Standing.Faulted(b.refused)
         end match
             Budget -> Standing.Running
@@ -515,12 +602,16 @@ impl Rig for RiscvRig
     send(*self, c: u8) -> Result[bool, string] = self.b.chip.line_in(1, Frame(c, 0))
 
     resolve(*self, t: Target) -> Result[usize, string]
-        self.pins.push(rp_pin(t, &self.parts, self.name, 48)?)
-        Ok(self.pins.len() - 1)
+        self.holds.push(rp_hold(t, &self.parts, self.name, 48)?)
+        Ok(self.holds.len() - 1)
 
-    hold(*self, k: usize, down: bool)
-        val (n, high) = self.pins[k]
-        self.b.chip.drive_from_outside(n, if down then Some(high) else None)
+    hold(*self, k: usize, down: bool) = rp_press(self.holds[k], down, &self.parts, &self.b.chip)
+
+    knob(*self, name: string, at: int) -> Result[usize, string]
+        self.knobs.push(rp_knob(&self.parts, name, at, self.name)?)
+        Ok(self.knobs.len() - 1)
+
+    turn(*self, k: usize) = rp_press(self.knobs[k], true, &self.parts, &self.b.chip)
 
     idle(*self) = self.b.wait_outside(SLICE)
 
@@ -531,14 +622,9 @@ impl Rig for RiscvRig
 private struct VirtRig
     session: &Session
     seen: u64
-    holds: Buf[VirtHold]
+    holds: Buf[Hold]
+    knobs: Buf[Hold]
     name: string
-
-// What a press holds on the Cortex-M machine: a part, with its control at rest and pressed, or an STM32
-// pin at a level.
-private enum VirtHold
-    Control(name: string, rest: PartInput, pressed: PartInput)
-    Pin(name: string, high: bool)
 
 impl Rig for VirtRig
     advance(*self) -> Standing
@@ -573,29 +659,35 @@ impl Rig for VirtRig
     resolve(*self, t: Target) -> Result[usize, string]
         val s = self.session
         val held = t match
-            Part(name) ->
-                var kind = ""
-                for p in s.parts do if p.name == name then kind = p.kind
-                if kind.is_empty() then return Err(s"${self.name} has no part `$name`")
+            Part(full) ->
+                val (name, direction) = part_and_direction(full, n -> kind_of(&s.parts, n) != "")
                 val rest = s.part_input(name)
-                kind match
-                    "button" -> VirtHold.Control(name, rest, PartInput.Pressed(true))
-                    "switch" -> VirtHold.Control(name, rest, PartInput.Closed(!s.closed(name)))
-                    _ -> return Err(s"`$name` on ${self.name} is a $kind: --press holds a button or a switch")
+                Hold.Control(name, rest, pressing(name, kind_of(&s.parts, name), direction, rest, self.name)?)
             Pin(name, high) ->
                 if !virt.hold_pin(s.board(), name, None) then return Err(s"$name is not a pin of ${self.name}'s chip: --press holds an STM32 pin such as PC13, or a part by its name")
-                VirtHold.Pin(name, high)
+                Hold.Pin(name, high)
         self.holds.push(held)
         Ok(self.holds.len() - 1)
 
-    hold(*self, k: usize, down: bool)
+    hold(*self, k: usize, down: bool) = self.press(self.holds[k], down)
+
+    knob(*self, name: string, at: int) -> Result[usize, string]
         val s = self.session
-        self.holds[k] match
-            Control(name, rest, pressed) ->
-                s.set_part_input(name, if down then pressed else rest)
-                s.apply_inputs()
-            Pin(name, high) -> virt.hold_pin(s.board(), name, if down then Some(high) else None)
+        self.knobs.push(Hold.Control(name, s.part_input(name), turning(name, kind_of(&s.parts, name), at, self.name)?))
+        Ok(self.knobs.len() - 1)
+
+    turn(*self, k: usize) = self.press(self.knobs[k], true)
 
     idle(*self) = ()
 
     end_input(*self) = virt.type_in(self.session.board(), [])
+
+impl VirtRig
+    // Hold or let go of `h`: a part's control, through the session's inputs, or an STM32 pin.
+    private press(*self, h: Hold, down: bool)
+        val s = self.session
+        h match
+            Control(name, rest, pressed) ->
+                s.set_part_input(name, if down then pressed else rest)
+                s.apply_inputs()
+            Pin(name, high) -> virt.hold_pin(s.board(), name, if down then Some(high) else None)

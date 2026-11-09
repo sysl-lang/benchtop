@@ -228,7 +228,7 @@ sysl build . -o benchtop
 ./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
-               [--press <part | pin=high|low>[@<dur>][:<dur>]] [--quiet] ... <image>
+               [--press <part[.direction] | pin=high|low>[@<dur>][:<dur>]] [--set <part>=<0..1>] [--quiet] ... <image>
 ./benchtop check [--mcu] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
@@ -267,9 +267,9 @@ empty.
 
 ### Running firmware headless
 
-`--expect`, `--type`, `--press`, `--timeout` and `--quiet` make a **scripted run**: no window, no
+`--expect`, `--type`, `--press`, `--set`, `--timeout` and `--quiet` make a **scripted run**: no window, no
 keyboard, and an exit status that says whether the firmware did what was expected, for a CI job or an
-agent that cannot look at a screen. Each `--expect`, `--type` and `--press` is a step, and the steps
+agent that cannot look at a screen. Each `--expect`, `--type`, `--press` and `--set` is a step, and the steps
 are taken in the order they are written, each once the one before it is done:
 
 - **`--expect <text>`** waits for `text` to appear on the console after what the step before it saw.
@@ -279,10 +279,12 @@ are taken in the order they are written, each once the one before it is done:
   read as escapes. A script with no `--expect` ends the console's input once its steps are done, and
   runs until the guest ends the run.
 - **`--press <part>[@<at>][:<hold>]`** presses a button, or closes a switch, of the board by its part
-  name (`wakeup` on the DISCO, `button1` on the workbench) at the board's time `at` from power-on, or as
-  soon as the step is reached, and lets it go `hold` later (100 ms by default). `--press PC13=high` or
-  `--press GP2=low` drives a pin of the chip instead; on an RP2040 or RP2350 board, whose described
-  parts are LEDs only, the pin is the way.
+  name (`wakeup` on the DISCO, `button1` on the workbench, `btn` on a Pico with a button wired to it)
+  at the board's time `at` from power-on, or as soon as the step is reached, and lets it go `hold`
+  later (100 ms by default). A joystick is held in a direction: `--press stick.up` (`up`, `down`,
+  `left` or `right`). `--press PC13=high` or `--press GP2=low` drives a pin of the chip instead.
+- **`--set <part>=<level>`** turns a potentiometer to `level`, from 0 to 1 to four places
+  (`--set pot=0.7`), where it stays.
 - **`--timeout <dur>`** ends a run that is not over by then with **status 124**, as `timeout(1)` does.
 - **`--quiet`** stops the console being copied to stdout.
 
@@ -322,6 +324,41 @@ pin is pressed with the level its button would give:
   --press GP2=high:10ms --expect "EDGE_RISE" --expect "EDGE_FALL" examples/pico2/hello_gpio_irq.elf
 ./benchtop run --board stm32h747-disco --quiet --timeout 2s --expect "DISCO" --press wakeup:1s \
   --type "BUTTON? .\n" --expect "-1  ok" examples/disco-repl/repl-disco.elf
+```
+
+#### Parts on a Pico, Pico 2 or Pico 2 RISC-V board
+
+The RP boards carry benchtop's **pin-level parts**: `led`, `button`, `switch`, `joystick`,
+`potentiometer`, `buzzer`, `seven-segment` and `hd44780`. Wire them to the chip's GPIOs in a board of
+your own (`mcu = rp2040`, `wire { pin = GP14 }`), or to the header pins a Pico board exposes in a
+product around it (`wire { pin = pico.GP14 }`), as the breadboard kits and `testdata/rp-parts/` do:
+
+```hocon
+product {
+  name = "Pico 2 and parts"
+  boards { pico { board = pico2 } }
+  parts {
+    btn { part = button, active = low, wire { pin = pico.GP14 } }
+    pot { part = potentiometer, position = 25, wire { wiper = pico.GP26 } }
+    bz  { part = buzzer, kind = passive, wire { pin = pico.GP15 } }
+  }
+}
+```
+
+A button or switch drives its GPIO to its active level while closed and leaves it to the pad's pulls
+while open, so the firmware's `gpio_pull_up` and GPIO interrupts behave as on the board. A
+potentiometer's or joystick's wipers go on ADC pins (GP26 to GP29); a buzzer sounds the PWM slice its
+GPIO is routed to, or the pin's level; the seven-segment display and the HD44780 read the GPIOs the
+firmware drives. A pin the board does not expose and a potentiometer off the ADC pins are refused by
+the checker. The parts on the chip's I2C, SPI and PIO (SSD1306, ST7789, ST7796, GT911, DS3231, WS2812)
+are refused by name on an RP board for now; they come next. An RP board runs from the terminal and
+from a scripted run; the window does not run one yet.
+
+```sh
+./benchtop run --board testdata/rp-parts/pico2-parts.hocon --quiet --timeout 2s \
+  --expect "button idle 1" --press btn:10ms --expect "GPIO 14 down" examples/pico2/parts.elf
+./benchtop run --board testdata/rp-parts/pico2-parts.hocon --quiet --timeout 3s \
+  --expect "Raw value: 0x400" --set pot=0.75 --expect "Raw value: 0xc00" examples/pico2/hello_adc.elf
 ```
 
 **`check`** reads a board or product description and holds it to benchtop's part library: it

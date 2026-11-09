@@ -47,6 +47,9 @@ foreach(prog hello_adc onboard_temperature)
     target_link_libraries(${prog} hardware_adc)
 endforeach()
 target_link_libraries(rtc_alarm hardware_rtc)
+# parts: the Pico 2's program, the same on the Pico's header.
+benchtop_program(parts ../pico2/parts.c)
+target_link_libraries(parts hardware_pwm)
 # rom_crosscheck: a flash image with a UF2, for a real Pico as well as benchtop, stdio on UART0 and USB.
 # benchtop's own ROM routines are compiled into it by sysl from rom_crosscheck/ours, an archive it links.
 find_program(SYSL_COMPILER sysl REQUIRED)

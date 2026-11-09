@@ -1,0 +1,153 @@
+module sh.sysl.benchtop.chip
+@tests
+
+// The parts of an RP board on its chip's pins (`chip/parts.sysl`), each through the seam `PartPins`
+// and driven by real SDK firmware: `examples/pico2/parts.c` on the Pico 2 and the Pico (a button on its
+// pad's pull-up and the GPIO interrupt, a seven-segment digit, an HD44780 and a buzzer on the PWM), and
+// pico-examples' adc/hello_adc reading a potentiometer. The boards are `testdata/rp-parts/`.
+
+import sh.sysl.benchtop.{library, load}
+import sh.sysl.benchtop.parts.hd44780 as hd
+import sh.sysl.benchtop.virt.PartInput
+import sh.sysl.parsing.source_of
+import sysl.text.from_utf8_lossy
+
+private val PARTS_ELF = embed("../../../../examples/pico2/parts.elf")
+private val PICO_PARTS_ELF = embed("../../../../examples/pico/parts.elf")
+private val PARTS_HELLO_ADC = embed("../../../../examples/pico2/hello_adc.elf")
+private val PICO_PARTS_HELLO_ADC = embed("../../../../examples/pico/hello_adc.elf")
+private val PICO2_PARTS = "testdata/rp-parts/pico2-parts.hocon"
+private val PICO_PARTS = "testdata/rp-parts/pico-parts.hocon"
+
+// The Pico 2 with its parts, booted with `image`, the parts on the chip.
+private pico2_parts(image: []const u8) -> (&ArmBoard, RpParts)
+    val b = arm_board(arm_named(PICO2_PARTS).unwrap().unwrap())
+    b.boot(image).unwrap()
+    var ps = rp_parts(described(PICO2_PARTS).unwrap().0)
+    connect_parts(&ps, &b.chip)
+    (b, ps)
+
+// The RP2040 board with its parts, booted with `image`.
+private pico_parts(image: []const u8) -> (&ArmBoard[Rp2040], RpParts)
+    val b = pico_board(pico_named(PICO_PARTS).unwrap().unwrap())
+    b.boot(image).unwrap()
+    var ps = rp_parts(described(PICO_PARTS).unwrap().0)
+    connect_parts(&ps, &b.chip)
+    (b, ps)
+
+// Run `b` until its console holds `text`, the parts looking at the pins after each slice of 100 000
+// cycles, at most `slices` of them.
+private parts_until[C: ArmChip + PartPins](b: &ArmBoard[C], ps: *RpParts, text: string, slices: int)
+    for i in 0..<slices
+        val end = b.run(100000)
+        observe_parts(ps, &b.chip)
+        if from_utf8_lossy(b.console.view()).contains(text) then return
+        assert(end == RunEnd.Budget || end == RunEnd.Asleep, s"$end ${b.refused}: ${from_utf8_lossy(b.console.view())}")
+    assert(false, s"never printed \"$text\": ${from_utf8_lossy(b.console.view())}")
+
+// Press or let go of the button `name`, as the window or a script does.
+private push[C: ArmChip + PartPins](b: &ArmBoard[C], ps: *RpParts, name: string, down: bool)
+    ps.set_input(name, PartInput.Pressed(down))
+    apply_parts(ps, &b.chip)
+
+@test("parts: a button let go on the Pico 2 reads its pad's pull-up; pressed by name, each edge reaches the SDK's GPIO interrupt")
+pico2_button_part()
+    val (b, parts) = pico2_parts(PARTS_ELF)
+    var ps = parts
+    parts_until(b, &ps, "digit 7", 400)
+    assert(from_utf8_lossy(b.console.view()).contains("button idle 1\r\n"), from_utf8_lossy(b.console.view()))
+    val idle = b.chip.part_pin(14)
+    assert(idle.level && !idle.drives, "let go, the button leaves GPIO 14 to the pull-up")
+    push(b, &ps, "btn", true)
+    assert(!b.chip.part_pin(14).level, "pressed, the active-low button holds GPIO 14 low")
+    parts_until(b, &ps, "GPIO 14 down", 100)
+    push(b, &ps, "btn", false)
+    parts_until(b, &ps, "GPIO 14 up", 100)
+    assert(!from_utf8_lossy(b.console.view()).contains("GPIO 14 up\r\nGPIO 14"), "one edge each way")
+
+@test("parts: a switch on a pin no program configures follows the pad's reset pull-down while open, and its active level while closed")
+pico2_switch_part()
+    val (b, parts) = pico2_parts(PARTS_ELF)
+    var ps = parts
+    parts_until(b, &ps, "digit 7", 400)
+    assert(!b.chip.part_pin(22).level, "open: the RP2350's pad pulls GPIO 22 down")
+    ps.set_input("flip", PartInput.Closed(true))
+    apply_parts(&ps, &b.chip)
+    assert(b.chip.part_pin(22).level, "closed: the active-high switch holds GPIO 22 high")
+    ps.set_input("flip", PartInput.Closed(false))
+    apply_parts(&ps, &b.chip)
+    assert(!b.chip.part_pin(22).level)
+
+@test("parts: the seven-segment digit and the HD44780 show what the program drives onto their GPIOs")
+pico2_displays()
+    val (b, parts) = pico2_parts(PARTS_ELF)
+    var ps = parts
+    parts_until(b, &ps, "digit 7", 400)
+    val shown = ps.segments("digit", b.chip.part_clock())
+    assert(shown[0] == 0x07, s"segments a, b and c: ${shown[0]}")
+    parts_until(b, &ps, "lcd Hi", 400)
+    val l = ps.lcd("lcd").unwrap()
+    assert(hd.character(l, 0, 0) == u8('H') && hd.character(l, 1, 0) == u8('i'), s"${hd.character(l, 0, 0)} ${hd.character(l, 1, 0)}")
+    assert(ps.lcd("digit").is_none() && ps.segments("lcd", 0)[0] == 0)
+
+@test("parts: the buzzer's pitch follows the PWM slice on its GPIO, 1 kHz and then 2 kHz, and it sounds")
+pico2_buzzer_pitch()
+    val (b, parts) = pico2_parts(PARTS_ELF)
+    var ps = parts
+    parts_until(b, &ps, "lcd Hi", 400)
+    assert(pitch(&ps, &b.chip, "bz") == 0, "silent before its slice runs")
+    parts_until(b, &ps, "tone 1000", 400)
+    assert(pitch(&ps, &b.chip, "bz") == 1000, s"${pitch(&ps, &b.chip, "bz")}")
+    parts_until(b, &ps, "tone 2000", 400)
+    assert(pitch(&ps, &b.chip, "bz") == 2000, s"${pitch(&ps, &b.chip, "bz")}")
+    for _ in 0..<20
+        b.run(100000)
+        observe_parts(&ps, &b.chip)
+    val sound = ps.sound("bz")
+    var loud = false
+    for s in sound do if s > 0.01 || s < -0.01 then loud = true
+    assert(sound.len() > 100 && loud, s"${sound.len()} samples")
+    assert(pitch(&ps, &b.chip, "nothing") == 0 && ps.sound("nothing").is_empty())
+
+@test("parts: hello_adc reads the potentiometer on GPIO 26 at its described position, then where it is turned to; a joystick held up puts 0 V on its Y axis")
+pico2_potentiometer()
+    val (b, parts) = pico2_parts(PARTS_HELLO_ADC)
+    var ps = parts
+    parts_until(b, &ps, "Raw value: 0x400", 400)
+    ps.set_input("pot", PartInput.Position(7500))
+    apply_parts(&ps, &b.chip)
+    // hello_adc converts every 500 ms: up to a second of the board's time.
+    parts_until(b, &ps, "Raw value: 0xc00", 1600)
+    assert(b.chip.analog.level(1, false, false) == 1650000 && b.chip.analog.level(2, false, false) == 1650000, "the joystick at rest is centred")
+    ps.set_input("stick", PartInput.Axes(5000, 0))
+    apply_parts(&ps, &b.chip)
+    assert(b.chip.analog.level(2, false, false) == 0 && b.chip.analog.level(1, false, false) == 1650000)
+
+@test("parts: on the Pico (RP2040) a button reads the pull-up at rest and its press reaches the GPIO interrupt; the buzzer and digit run as on the Pico 2, and hello_adc reads the potentiometer")
+pico_parts_run()
+    val (b, parts) = pico_parts(PICO_PARTS_ELF)
+    var ps = parts
+    parts_until(b, &ps, "digit 7", 400)
+    assert(from_utf8_lossy(b.console.view()).contains("button idle 1\r\n"), from_utf8_lossy(b.console.view()))
+    assert(ps.segments("digit", b.chip.part_clock())[0] == 0x07)
+    push(b, &ps, "btn", true)
+    parts_until(b, &ps, "GPIO 14 down", 100)
+    push(b, &ps, "btn", false)
+    parts_until(b, &ps, "GPIO 14 up", 100)
+    parts_until(b, &ps, "tone 2000", 400)
+    assert(pitch(&ps, &b.chip, "bz") == 2000, s"${pitch(&ps, &b.chip, "bz")}")
+    val (a, adc_parts) = pico_parts(PICO_PARTS_HELLO_ADC)
+    var qs = adc_parts
+    parts_until(a, &qs, "Raw value: 0x400", 400)
+
+@test("parts: an RP board refuses an I2C, SPI or PIO part, saying it comes next, and a part it does not run; the checker refuses an unexposed pin and a potentiometer off the ADC")
+rp_part_refusals()
+    val bus = arm_named("testdata/rp-parts/bus-part.hocon").unwrap().unwrap_err()
+    assert(bus.contains("`rtc` is a ds3231, which works through the rp2350's I2C, SPI or PIO") && bus.contains("come next"), bus)
+    assert(arm_named("testdata/rp-parts/unexposed.hocon").is_none() && arm_named("testdata/rp-parts/pot-not-adc.hocon").is_none(), "the checker refuses both before a plan")
+    val text = "board { name = b, mcu = rp2040, parts { m { part = led-matrix-5x5, wire { row0 = GP0, row1 = GP1, row2 = GP2, row3 = GP3, row4 = GP4, col0 = GP5, col1 = GP6, col2 = GP7, col3 = GP8, col4 = GP9 } } } }"
+    val got = load(source_of("b.hocon", text), library())
+    assert(!got.report.has_errors(), got.report.render(source_of("b.hocon", text)))
+    val why = pico_plan(got.description.board).unwrap_err()
+    assert(why == "benchtop does not emulate the parts on an rp2040 board yet, and `m` is a led-matrix-5x5", why)
+    assert(pico_named(PICO_PARTS).unwrap().is_ok() && arm_named(PICO2_PARTS).unwrap().is_ok())
