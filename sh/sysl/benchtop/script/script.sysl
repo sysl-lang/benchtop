@@ -1,0 +1,226 @@
+module sh.sysl.benchtop.script
+
+// A scripted run (`benchtop run --expect … --type … --press … --timeout …`): the steps that drive a
+// board's inputs and wait on its console, in the order the command line gives them, and the options
+// that frame the run. Each option is one kind of step, so a new kind of input (a sensor's reading, a
+// knob's position) is a new `Step` and a new branch of `take`, and the runner (`run.sysl`) takes it in
+// its turn with the rest.
+
+import sysl.buf.{Buf, buf}
+import sysl.raw.str_cast
+
+/** A span of the board's own time, never the host's. */
+enum Duration derives Eq
+    /** Nanoseconds of the board's time, which its clock's rate gives. */
+    Time(ns: u64)
+    /** Cycles of the board's clock (clk_sys on an RP2040 or RP2350, the mcu's `clock-hz` otherwise):
+     * the unit for a board whose chip names no rate.
+     */
+    Cycles(n: u64)
+
+/** What a `--press` holds: a part of the board by its name, or a pin of the chip at a level. */
+enum Target derives Eq
+    Part(name: string)
+    Pin(name: string, high: bool)
+
+/** One step of a scripted run. The steps are taken one after another, each once the one before it is
+ * done.
+ */
+enum Step derives Eq
+    /** Done once `text` has appeared on the console, after what the step before it saw. */
+    Expect(text: string)
+    /** `text` given to the guest on its console, a character as soon as it can take one; the step is
+     * done once it is queued, and the next steps run while it goes in.
+     */
+    Type(text: string)
+    /** `target` pressed at the board's time `at` (or as soon as the step is reached) and held for `hold`;
+     * done once pressed. A press of a target that is still held waits for its release.
+     */
+    Press(target: Target, at: Option[Duration], hold: Duration)
+
+/** A scripted run: its steps in order, how long it may take, and whether the console is shown. */
+struct Script
+    steps: Buf[Step]
+    timeout: Option[Duration]
+    quiet: bool
+
+/** A script with no steps, no timeout, the console shown: a run that is not scripted. */
+script() -> Script = Script(buf(), None, false)
+
+/** How long a `--press` holds where it does not say. */
+val DEFAULT_HOLD = Duration.Time(100000000)
+
+impl Script
+    /** Whether any scripted run's option was given, which makes the run a scripted one. */
+    active(self) -> bool = !self.steps.is_empty() || self.timeout.is_some() || self.quiet
+
+    /** Whether the run passes once its steps are done, which it does where it waits for any text. */
+    expects(self) -> bool
+        for s in self.steps
+            s match
+                Expect(_) -> return true
+                _ -> ()
+        false
+
+/** The scripted run's options, for `benchtop`'s usage. */
+val OPTIONS = "[--timeout <dur>] [--expect <text>] [--type <text>] [--press <part>|<pin>=high|low[@<dur>][:<dur>]] [--quiet]"
+
+/** Whether `args[i]` is one of a scripted run's options, which it adds to `sc`: None where it is not;
+ * otherwise the index after the option and its value, or why it is refused. The options' values lie
+ * before `end` (the image, on `benchtop run`'s command line).
+ */
+take(sc: *Script, args: []const string, i: usize, end: usize) -> Option[Result[usize, string]]
+    val name = args[i]
+    if name == "--quiet"
+        sc.quiet = true
+        return Some(Ok(i + 1))
+    if name != "--timeout" && name != "--expect" && name != "--type" && name != "--press" then return None
+    if i + 1 >= end then return Some(Err(s"$name takes a value"))
+    val value = args[i + 1]
+    val taken: Result[unit, string] = name match
+        "--timeout" -> duration(value).and_then(d ->
+            if d.is_zero() then Err("--timeout takes a time longer than none")
+            else
+                sc.timeout = Some(d)
+                Ok(()))
+        "--expect" ->
+            if value.is_empty() then Err("--expect takes a text to wait for, and this one is empty")
+            else unescaped(value).map(text -> sc.steps.push(Step.Expect(text)))
+        "--type" -> unescaped(value).map(text -> sc.steps.push(Step.Type(text)))
+        _ -> press(value).map(step -> sc.steps.push(step))
+    Some(taken.map(_ -> i + 2))
+
+/** The script `args` give, every one of them a scripted run's option: the form the tests use. */
+parse(args: []const string) -> Result[Script, string]
+    var sc = script()
+    var i: usize = 0
+    while i < args.len
+        i = take(&sc, args, i, args.len) match
+            Some(Ok(next)) -> next
+            Some(Err(why)) -> return Err(why)
+            None -> return Err(s"${args[i]} is not an option of a scripted run")
+    Ok(sc)
+
+impl Duration
+    /** Whether the duration is no time at all. */
+    is_zero(self) -> bool = self match
+        Time(ns) -> ns == 0
+        Cycles(n) -> n == 0
+
+    /** The duration as `--timeout` writes it. */
+    text(self) -> string = self match
+        Cycles(n) -> s"${n}cycles"
+        Time(ns) ->
+            if ns % 1000000000 == 0 then s"${ns / 1000000000}s"
+            elif ns % 1000000 == 0 then s"${ns / 1000000}ms"
+            elif ns % 1000 == 0 then s"${ns / 1000}us"
+            else s"${ns}ns"
+
+/** A duration as `--timeout`, `--press` and its hold write it: a number and its unit, `ns`, `us`, `ms`,
+ * `s` or `cycles` (`500ms`, `1.5s`, `250us`, `100000cycles`). A fraction is for a unit of time, to
+ * the nanosecond.
+ */
+duration(text: string) -> Result[Duration, string]
+    val b = text.bytes
+    var i: usize = 0
+    var whole: u64 = 0
+    while i < b.len && b[i] >= u8('0') && b[i] <= u8('9')
+        if whole > 1000000000000 then return Err(s"\"$text\" is longer than benchtop counts")
+        whole = whole * 10 + u64(b[i] - u8('0'))
+        i += 1
+    if i == 0 then return Err(not_a_duration(text))
+    // The fraction's digits, as nanoseconds of a second until the unit is known: at most nine count.
+    var fraction: u64 = 0
+    var digits = 0
+    val fractional = i < b.len && b[i] == u8('.')
+    if fractional
+        i += 1
+        while i < b.len && b[i] >= u8('0') && b[i] <= u8('9')
+            if digits < 9
+                fraction = fraction * 10 + u64(b[i] - u8('0'))
+                digits += 1
+            i += 1
+        if digits == 0 then return Err(not_a_duration(text))
+    while digits < 9
+        fraction *= 10
+        digits += 1
+    val scale: u64 = text[i..] match
+        "ns" -> 1
+        "us" -> 1000
+        "ms" -> 1000000
+        "s" -> 1000000000
+        "cycles" ->
+            if fractional then return Err(s"\"$text\": a count of cycles is whole")
+            return Ok(Duration.Cycles(whole))
+        _ -> return Err(not_a_duration(text))
+    // `fraction` is in billionths of the unit.
+    Ok(Duration.Time(whole * scale + fraction * scale / 1000000000))
+
+private not_a_duration(text: string) -> string =
+    s"\"$text\" is not a duration: write a number and its unit, as 500ms, 1.5s, 250us or 100000cycles"
+
+// `--press`'s value: the part or the pin, then `@` and when, then `:` and for how long.
+private press(value: string) -> Result[Step, string]
+    val b = value.bytes
+    var at_mark = b.len
+    var hold_mark = b.len
+    for i in 0..<b.len
+        if b[i] == u8('@') && at_mark == b.len && hold_mark == b.len then at_mark = i
+        elif b[i] == u8(':') && hold_mark == b.len then hold_mark = i
+    val name_end = if at_mark < hold_mark then at_mark else hold_mark
+    val name = value[..<name_end]
+    if name.is_empty() then return Err(s"--press \"$value\" names no part or pin")
+    val at = if at_mark < b.len then Some(duration(value[(at_mark + 1)..<hold_mark])?) else None
+    val hold = if hold_mark < b.len then duration(value[(hold_mark + 1)..])? else DEFAULT_HOLD
+    if hold.is_zero() then return Err(s"--press \"$value\" holds for no time")
+    Ok(Step.Press(target(name)?, at, hold))
+
+// A part's name, or a pin with its level after `=`.
+private target(name: string) -> Result[Target, string]
+    val b = name.bytes
+    for i in 0..<b.len
+        if b[i] != u8('=') then continue
+        val pin = name[..<i]
+        return name[(i + 1)..] match
+            "high" -> Ok(Target.Pin(pin, true))
+            "low" -> Ok(Target.Pin(pin, false))
+            _ -> Err(s"--press $name: a pin is held high or low, as GP2=high")
+    Ok(Target.Part(name))
+
+/** `text` with its escapes read: `\n`, `\r`, `\t`, `\e` (escape), `\\`, and `\xHH` for a character
+ * below 0x80.
+ */
+unescaped(text: string) -> Result[string, string]
+    val b = text.bytes
+    var out: Buf[u8] = buf()
+    var i: usize = 0
+    while i < b.len
+        if b[i] != u8('\\')
+            out.push(b[i])
+            i += 1
+            continue
+        if i + 1 >= b.len then return Err(s"\"$text\" ends in a lone backslash: write \\\\ for one")
+        val c = b[i + 1]
+        i += 2
+        if c == u8('x')
+            if i + 2 > b.len then return Err(s"\"$text\": \\x takes two hex digits")
+            val hi = hex_digit(b[i])
+            val lo = hex_digit(b[i + 1])
+            if hi < 0 || lo < 0 || hi >= 8 then return Err(s"\"$text\": \\x takes two hex digits, below 80")
+            out.push(u8(hi * 16 + lo))
+            i += 2
+            continue
+        out.push(c match
+            u8('n') -> 10
+            u8('r') -> 13
+            u8('t') -> 9
+            u8('e') -> 27
+            u8('\\') -> u8('\\')
+            _ -> return Err(s"\"$text\": \\${str_cast([c][..])} is not an escape: \\n, \\r, \\t, \\e, \\\\ and \\xHH are"))
+    Ok(str_cast(out.view()))
+
+private hex_digit(c: u8) -> int =
+    if c >= u8('0') && c <= u8('9') then int(c - u8('0'))
+    elif c >= u8('a') && c <= u8('f') then int(c - u8('a')) + 10
+    elif c >= u8('A') && c <= u8('F') then int(c - u8('A')) + 10
+    else -1

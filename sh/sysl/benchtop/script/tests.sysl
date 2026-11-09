@@ -1,0 +1,167 @@
+module sh.sysl.benchtop.script
+@tests
+
+// Scripted runs through `run`, the call `benchtop run --expect …` makes, on real firmware: the Pico 2's
+// SDK examples over UART0 and USB, the DISCO's Forth over USART1, and the virtual board's console.
+
+import sh.sysl.benchtop.virt.SdChoice
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, remove_dir_all, write_bytes}
+import sysl.raw.str_cast
+
+// The script `args` give, run quietly on `board` with `image`.
+private scripted(board: string, image: string, args: []const string) -> Outcome
+    var all: Buf[string] = buf()
+    all.push("--quiet")
+    for a in args do all.push(a)
+    val sc = parse(all.view()).unwrap()
+    run(board, image, sc, setup())
+
+// The console an outcome kept, with the SDK's CR LF line ends read as a newline.
+private shown(c: []const u8) -> string
+    var lines: Buf[u8] = buf()
+    for b in c do if b != 13 then lines.push(b)
+    str_cast(lines.view())
+
+// A virtual-board program that writes 7 to the console's EXIT register: `ldr r0, =0x40000008`,
+// `movs r1, #7`, `str r1, [r0]`, then a branch to itself, after a vector table of SP and reset.
+private val EXIT_SEVEN: [20]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x01, 0x48, 0x07, 0x21, 0x01, 0x60, 0xfe, 0xe7, 0x08, 0x00, 0x00, 0x40]
+
+@test("script: options become one list of steps in their order, with escapes read and durations in nanoseconds or cycles")
+script_parse()
+    val sc = parse(["--expect", "> ", "--type", "help\\n", "--press", "b2@1.5ms:20ms", "--press", "GP2=low", "--timeout", "2s"][..]).unwrap()
+    assert(sc.steps.len() == 4 && sc.active() && sc.expects() && !sc.quiet)
+    assert(sc.steps[0] == Step.Expect("> "))
+    assert(sc.steps[1] == Step.Type("help\n"))
+    assert(sc.steps[2] == Step.Press(Target.Part("b2"), Some(Duration.Time(1500000)), Duration.Time(20000000)))
+    assert(sc.steps[3] == Step.Press(Target.Pin("GP2", false), None, DEFAULT_HOLD))
+    assert(sc.timeout == Some(Duration.Time(2000000000)))
+    assert(duration("250us") == Ok(Duration.Time(250000)) && duration("3cycles") == Ok(Duration.Cycles(3)) && duration("7ns") == Ok(Duration.Time(7)))
+    assert(unescaped("a\\tb\\r\\e\\\\\\x41") == Ok("a\tb\r\u{1b}\\A"))
+    assert(!script().active() && parse(["--quiet"][..]).unwrap().active())
+    val typed = parse(["--type", "x"][..]).unwrap()
+    assert(typed.active() && !typed.expects(), "a script that types and waits for nothing runs until the guest ends it")
+
+@test("script: a bad duration, press or escape is refused, saying what was wrong")
+script_parse_refusals()
+    for bad in ["5", "s", "1.5cycles", "2 s", "1.ms", "3h"]
+        assert(duration(bad).unwrap_err().contains("is not a duration") || duration(bad).unwrap_err().contains("whole"), bad)
+    assert(parse(["--timeout", "5"][..]).unwrap_err().contains("\"5\" is not a duration"))
+    assert(parse(["--timeout", "0ms"][..]).unwrap_err().contains("longer than none"))
+    assert(parse(["--press", "GP2=up"][..]).unwrap_err().contains("high or low"))
+    assert(parse(["--press", "b2:0ms"][..]).unwrap_err().contains("no time"))
+    assert(parse(["--press", "@1s"][..]).unwrap_err().contains("names no part"))
+    assert(parse(["--type", "\\q"][..]).unwrap_err().contains("is not an escape"))
+    assert(parse(["--type", "\\x8f"][..]).unwrap_err().contains("below 80"))
+    assert(parse(["--expect", ""][..]).unwrap_err().contains("empty"))
+    assert(parse(["--expect"][..]).unwrap_err().contains("takes a value"))
+    assert(parse(["--window"][..]).is_err())
+
+@test("script: the Pico 2's hello_serial passes once its third line appears on UART0, the console kept")
+script_pico2_expect()
+    val o = scripted("pico2", "examples/pico2/hello_serial.elf", ["--expect", "hello, serial 0\\r\\n", "--expect", "hello, serial 2\\r\\n", "--timeout", "2s"][..])
+    assert(o.status == 0 && o.why.starts_with("passed: every expected text appeared by "), o.why)
+    assert(shown(o.console.view()).starts_with("hello, serial 0\nhello, serial 1\nhello, serial 2"), shown(o.console.view()))
+    assert(!shown(o.console.view()).contains("hello, serial 4"), "the run ends as the last text appears, at about 200 ms of the board's time")
+
+@test("script: a text that never appears times out with status 124 at the board's time, naming what it waited for")
+script_pico2_timeout()
+    val o = scripted("pico2", "examples/pico2/hello_serial.elf", ["--expect", "hello, serial 0", "--expect", "goodbye", "--timeout", "50ms"][..])
+    assert(o.status == 124 && o.why == "timed out at 50ms waiting for \"goodbye\"", o.why)
+
+@test("script: the expected texts are in order: one that appeared only before the last match does not count")
+script_expects_in_order()
+    val o = scripted("pico2", "examples/pico2/hello_serial.elf", ["--expect", "serial 1\r", "--expect", "serial 0\r", "--timeout", "500ms"][..])
+    assert(o.status == 124 && o.why.contains("waiting for \"serial 0\\r\""), o.why)
+
+@test("script: characters typed after an expected text reach the Pico 2's UART0 RX, and its answers come back")
+script_pico2_type()
+    val o = scripted("pico2", "examples/pico2/uart_advanced.elf", ["--expect", "interrupts", "--type", "HAL", "--expect", "IBM", "--timeout", "1s"][..])
+    assert(o.status == 0, o.why)
+    assert(shown(o.console.view()).ends_with("IBM"), shown(o.console.view()))
+
+@test("script: a pin pressed high and let go is seen by the firmware as a rising and then a falling edge")
+script_pico2_press_pin()
+    val o = scripted("pico2", "examples/pico2/hello_gpio_irq.elf", ["--expect", "Hello GPIO IRQ", "--press", "GP2=high:10ms", "--expect", "GPIO 2 EDGE_RISE", "--expect", "GPIO 2 EDGE_FALL", "--timeout", "1s"][..])
+    assert(o.status == 0, s"${o.why}: ${shown(o.console.view())}")
+
+@test("script: a press waits for its time on the board's clock, and the edge comes after it")
+script_pico2_press_at()
+    val early = scripted("pico2", "examples/pico2/hello_gpio_irq.elf", ["--press", "GP2=high@300ms:10ms", "--expect", "EDGE_RISE", "--timeout", "250ms"][..])
+    assert(early.status == 124 && early.why == "timed out at 250ms waiting to press GP2=high", early.why)
+    val late = scripted("pico2", "examples/pico2/hello_gpio_irq.elf", ["--press", "GP2=high@300ms:10ms", "--expect", "EDGE_RISE", "--timeout", "350ms"][..])
+    assert(late.status == 0, late.why)
+
+@test("script: the Pico 2's USB serial port, through benchtop's host, is the console too")
+script_pico2_usb()
+    val o = scripted("pico2", "examples/pico2/hello_usb.elf", ["--expect", "Hello, world!", "--timeout", "3s"][..])
+    assert(o.status == 0, o.why)
+
+@test("script: the DISCO's Forth answers a line typed over USART1, and reads its B2 button pressed by its part's name")
+script_disco_type_and_press()
+    val released = scripted("stm32h747-disco", "examples/disco-repl/repl-disco.elf", ["--expect", "DISCO", "--type", "BUTTON? .\n", "--expect", " ok", "--timeout", "2s"][..])
+    assert(released.status == 0 && shown(released.console.view()).contains("BUTTON? .\n0  ok\n"), s"${released.why}: ${shown(released.console.view())}")
+    val pressed = scripted("stm32h747-disco", "examples/disco-repl/repl-disco.elf", ["--expect", "DISCO", "--press", "wakeup:1s", "--type", "BUTTON? .\n", "--expect", " ok", "--timeout", "2s"][..])
+    assert(pressed.status == 0 && shown(pressed.console.view()).contains("BUTTON? .\n-1  ok\n"), s"${pressed.why}: ${shown(pressed.console.view())}")
+    val pin = scripted("stm32h747-disco", "examples/disco-repl/repl-disco.elf", ["--expect", "DISCO", "--press", "PC13=high:1s", "--type", "BUTTON? .\n", "--expect", " ok", "--timeout", "2s"][..])
+    assert(shown(pin.console.view()).contains("BUTTON? .\n-1  ok\n"), s"${pin.why}: ${shown(pin.console.view())}")
+
+@test("script: where the cores sleep with nothing to wake them before a text appears, the run ends with status 4")
+script_asleep()
+    val o = scripted("stm32h747-disco", "examples/disco-repl/repl-disco.elf", ["--expect", "not in the banner"][..])
+    assert(o.status == 4 && o.why == "the cores sleep, and nothing on the board will wake them waiting for \"not in the banner\"", o.why)
+
+@test("script: typed input with nothing to wait for runs until the guest ends the run, its input ended once typed")
+script_virt_type_to_the_end()
+    val o = scripted("virt", "examples/virt/echo.elf", ["--type", "one\ntwo\n"][..])
+    assert(o.status == 0 && o.why == "the guest exited with status 0", o.why)
+    assert(shown(o.console.view()).contains("> one\n> two\n> \nbye after 2 lines\n"), shown(o.console.view()))
+
+@test("script: a guest's exit status passes through; where an expected text is still missing, the run says so")
+script_virt_exit_status()
+    val dir = make_temp_dir("benchtop-script").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val file = s"$dir/exit7.bin"
+    write_bytes(file, EXIT_SEVEN[..]).unwrap()
+    val ended = scripted("virt", file, ["--timeout", "1000000cycles"][..])
+    assert(ended.status == 7 && ended.why == "the guest exited with status 7", ended.why)
+    val missing = scripted("virt", file, ["--expect", "never"][..])
+    assert(missing.status == 7 && missing.why == "the guest exited with status 7 before \"never\" appeared", missing.why)
+    val zero = scripted("virt", "examples/virt/echo.elf", ["--type", "\\x04", "--expect", "never"][..])
+    assert(zero.status == 1 && zero.why == "the guest exited with status 0 before \"never\" appeared", zero.why)
+
+@test("script: a board with no clock rate counts its time in cycles, and refuses a time in seconds")
+script_virt_cycles()
+    val o = scripted("virt", "examples/virt/echo.elf", ["--expect", "never", "--timeout", "2000000cycles"][..])
+    assert(o.status == 124 && o.why == "timed out at 2000000cycles waiting for \"never\"", o.why)
+    val refused = scripted("virt", "examples/virt/echo.elf", ["--timeout", "1s"][..])
+    assert(refused.status == 1 && refused.why.contains("counted in cycles"), refused.why)
+
+@test("script: a part or pin the board does not have, a part that is not pressed, and a console that takes no input are refused before the run")
+script_refusals()
+    val bootsel = scripted("pico2", "examples/pico2/hello_serial.elf", ["--press", "bootsel"][..])
+    assert(bootsel.status == 1 && bootsel.why.contains("has no part `bootsel`"), bootsel.why)
+    val led = scripted("pico2", "examples/pico2/hello_serial.elf", ["--press", "led"][..])
+    assert(led.status == 1 && led.why.contains("`led`") && led.why.contains("is a led"), led.why)
+    val pin = scripted("pico2", "examples/pico2/hello_serial.elf", ["--press", "GP48=low"][..])
+    assert(pin.status == 1 && pin.why.contains("GP48 is not one of"), pin.why)
+    val unknown = scripted("stm32h747-disco", "examples/disco-repl/repl-disco.elf", ["--press", "nothing"][..])
+    assert(unknown.status == 1 && unknown.why.contains("has no part `nothing`"), unknown.why)
+    val lamp = scripted("stm32h747-disco", "examples/disco-repl/repl-disco.elf", ["--press", "ld1"][..])
+    assert(lamp.status == 1 && (lamp.why.contains("is a led") || lamp.why.contains("has no part")), lamp.why)
+    val stm32_pin = scripted("stm32h747-disco", "examples/disco-repl/repl-disco.elf", ["--press", "PZ3=low"][..])
+    assert(stm32_pin.status == 1 && stm32_pin.why.contains("PZ3 is not a pin"), stm32_pin.why)
+    val no_console = run("boards/stm32h747-spi-sd.hocon", "examples/disco-repl/repl-disco.elf", parse(["--quiet", "--type", "x"][..]).unwrap(), Setup(true, false, SdChoice.Absent, true))
+    assert(no_console.status == 1 && no_console.why.contains("has no console to type into"), no_console.why)
+    val rp2040 = scripted("pico", "examples/pico/hello_serial.elf", ["--type", "x"][..])
+    assert(rp2040.status == 1 && rp2040.why.contains("RP2040's UART0 takes no input"), rp2040.why)
+    val sd = run("pico2", "examples/pico2/hello_serial.elf", parse(["--quiet"][..]).unwrap(), Setup(true, false, SdChoice.Absent, true))
+    assert(sd.status == 1 && sd.why.contains("--sd is for a board with a microSD socket"), sd.why)
+    val missing = scripted("pico2", "examples/pico2/no-such.elf", ["--quiet"][..])
+    assert(missing.status == 1 && missing.why.contains("cannot read examples/pico2/no-such.elf"), missing.why)
+
+@test("script: the RP2040 Pico's UART0 is a console a script waits on")
+script_pico_expect()
+    val o = scripted("pico", "examples/pico/hello_serial.elf", ["--expect", "\n", "--timeout", "2s"][..])
+    assert(o.status == 0, s"${o.why}: ${shown(o.console.view())}")

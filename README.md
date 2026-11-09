@@ -223,7 +223,12 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 
 ```
 sysl build . -o benchtop
-./benchtop run [--board <name | file.hocon>] [--deterministic] [--gdb [port]] [--sd <card.img | none>] <image.elf | image.bin>
+./benchtop run [--board <name | file.hocon>] [--window] [--deterministic | --threads] [--usb console|pty|off]
+               [--gdb [port]] [--sd <card.img | none>] <image.elf | image.bin>
+./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
+               [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
+./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
+               [--press <part | pin=high|low>[@<dur>][:<dur>]] [--quiet] ... <image>
 ./benchtop check [--mcu] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
@@ -253,6 +258,71 @@ CN12), with or without `--window`. A file backs the card, read and written throu
 card's: a whole number of 512-byte sectors, a multiple of 512 KiB and at most 64 MiB, or the run is
 refused saying which. `none` leaves the slot empty: the detect pin PI8 reads high and SDMMC commands
 time out. Without `--sd` the board's own card is in the slot. A board with no socket refuses the option.
+
+**`--window`** opens the board's desktop instead of using this terminal (see the sections above).
+**`--usb console|pty|off`**, on an RP2350 board of Cortex-M33s, says where the board's USB serial port
+goes: `console` (the default) puts benchtop's USB host on the bus and joins a CDC ACM device's output
+to the console; `pty` gives it a pseudo-terminal whose name is printed on stderr; `off` leaves the bus
+empty.
+
+### Running firmware headless
+
+`--expect`, `--type`, `--press`, `--timeout` and `--quiet` make a **scripted run**: no window, no
+keyboard, and an exit status that says whether the firmware did what was expected, for a CI job or an
+agent that cannot look at a screen. Each `--expect`, `--type` and `--press` is a step, and the steps
+are taken in the order they are written, each once the one before it is done:
+
+- **`--expect <text>`** waits for `text` to appear on the console after what the step before it saw.
+  The run **passes, with status 0, once every step is done**, where it has at least one `--expect`.
+- **`--type <text>`** gives `text` to the guest on its console as fast as the console takes it, the
+  next steps running while it goes in. `\n`, `\r`, `\t`, `\e`, `\\` and `\xHH` (below `\x80`) are
+  read as escapes. A script with no `--expect` ends the console's input once its steps are done, and
+  runs until the guest ends the run.
+- **`--press <part>[@<at>][:<hold>]`** presses a button, or closes a switch, of the board by its part
+  name (`wakeup` on the DISCO, `button1` on the workbench) at the board's time `at` from power-on, or as
+  soon as the step is reached, and lets it go `hold` later (100 ms by default). `--press PC13=high` or
+  `--press GP2=low` drives a pin of the chip instead; on an RP2040 or RP2350 board, whose described
+  parts are LEDs only, the pin is the way.
+- **`--timeout <dur>`** ends a run that is not over by then with **status 124**, as `timeout(1)` does.
+- **`--quiet`** stops the console being copied to stdout.
+
+A duration is a number and a unit: `ns`, `us`, `ms`, `s` (`1.5s`, `250us`), or `cycles`. **Every
+time is the board's emulated time**, never the host's: clk_sys on an RP2040 or RP2350 (its rate
+followed as the firmware changes it), the mcu's `clock-hz` on the DISCO and the workbench. A scripted
+run's cores take turns on one thread, as under `--deterministic`, so the same script gives the same
+result every time. A virtual board whose mcu names no `clock-hz` counts its time in `cycles` only, and
+refuses a time in seconds.
+
+The run ends with one line on stderr saying why: `benchtop: passed: every expected text appeared by
+212.351 ms`; `timed out at 2s waiting for "> "`; `the guest exited with status 7`; a fault (status 3);
+or, where every core sleeps with nothing that will wake it, `the cores sleep, and nothing on the board
+will wake them` (status 4). A guest that ends the run before an expected text appears gives its own
+status, or 1 where that is 0. A part or pin the board does not have, a `--type` on a board whose
+console takes no input (no console at all, or an RP2040's UART0), and a bad duration are refused
+before the run, with status 1. Scripted runs do not combine with `--window` or `--gdb`.
+
+**A Pico 2 SDK program ends a run itself by returning from `main` or calling `exit()`**: the SDK's
+`_exit` executes `BKPT`, which ends the run with status 0, whatever status the program gave. A failure
+is therefore told by what the program prints: `--expect` the text that means success. For example, a
+program that prints over UART0 (or over USB, through the default `--usb console`), checked to its
+third line and given 2 seconds of the board's time:
+
+```sh
+./benchtop run --board pico2 --quiet --timeout 2s \
+  --expect "hello, serial 0" --expect "hello, serial 2" examples/pico2/hello_serial.elf
+```
+
+Input goes in on UART0's RX (GPIO 1), or on the USB serial port once the host has enumerated it, and a
+pin is pressed with the level its button would give:
+
+```sh
+./benchtop run --board pico2 --quiet --timeout 1s --expect "interrupts" --type "HAL" \
+  --expect "IBM" examples/pico2/uart_advanced.elf
+./benchtop run --board pico2 --quiet --timeout 1s --expect "Hello GPIO IRQ" \
+  --press GP2=high:10ms --expect "EDGE_RISE" --expect "EDGE_FALL" examples/pico2/hello_gpio_irq.elf
+./benchtop run --board stm32h747-disco --quiet --timeout 2s --expect "DISCO" --press wakeup:1s \
+  --type "BUTTON? .\n" --expect "-1  ok" examples/disco-repl/repl-disco.elf
+```
 
 **`check`** reads a board or product description and holds it to benchtop's part library: it
 prints every mistake with its line and column and exits 1, or prints what the description is.
