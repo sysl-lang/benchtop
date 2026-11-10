@@ -1866,7 +1866,7 @@ board {
   mcu = rp2040
 
   parts {
-    led { part = led, color = green, wire { anode = GP25 } }
+    led { part = led, color = green, package = 0603, wire { anode = GP25 } }
   }
 
   exposes {
@@ -1881,7 +1881,7 @@ board {
 
     elements {
       usb     { box = "#c0c0c0", at = [52, 0], size = [64, 40] }
-      led     { show = led, at = [28, 16], size = [16, 10] }
+      led     { show = led, at = [32, 19] }
       bootsel { box = "#f0f0f0", at = [32, 88], size = [24, 24], label = "BOOTSEL" }
       mcu    { box = "#202020", at = [56, 168], size = [56, 56], label = "RP2040" }
     }
@@ -1957,8 +1957,8 @@ product {
     joystick { part = joystick, wire { x = pico.GP26, y = pico.GP27 } }
     btn1     { part = button, active = low, wire { pin = pico.GP15 } }
     btn2     { part = button, active = low, wire { pin = pico.GP14 } }
-    d1       { part = led, color = red, wire { anode = pico.GP16 } }
-    d2       { part = led, color = red, wire { anode = pico.GP17 } }
+    d1       { part = led, color = red, package = 0603, wire { anode = pico.GP16 } }
+    d2       { part = led, color = red, package = 0603, wire { anode = pico.GP17 } }
     rgb      { part = ws2812, wire { din = pico.GP12 } }
     buzzer   { part = buzzer, kind = active, wire { pin = pico.GP13 } }
     console  { part = terminal, wire { uart = pico.uart0 } }
@@ -1971,23 +1971,23 @@ product {
   }
 
   view {
-    size = [922, 499]
+    size = [922, 530]
     background = black
 
     elements {
       title  { text = "Pico Breadboard Kit", at = [58, 6], size = [262, 23] }
       socket { box = "#1b5e20", at = [124, 54], size = [134, 326], label = "Pico" }
-      led    { show = pico.led, at = [140, 64], size = [16, 10] }
+      led    { show = pico.led, at = [144, 67] }
       bezel  { box = "#202020", at = [364, 44], size = [540, 351] }
-      // The glass is mounted landscape; its size is the part's own.
+      // Every part's size is its own; the glass is mounted landscape.
       screen { show = lcd, at = [379, 58], look { rotate = 90 } }
-      buzzer { show = buzzer, at = [28, 407], size = [77, 77], label = "Beeper", look { shape = round } }
-      d1     { show = d1, at = [175, 425], size = [16, 10], label = "D1" }
-      d2     { show = d2, at = [175, 445], size = [16, 10], label = "D2" }
-      stick  { show = joystick, at = [259, 387], size = [102, 102] }
-      rgb    { show = rgb, at = [431, 405], size = [32, 32], label = "RGB Led" }
-      btn1   { show = btn1, at = [516, 416], size = [38, 38], label = "BTN1" }
-      btn2   { show = btn2, at = [604, 416], size = [38, 38], label = "BTN2" }
+      buzzer { show = buzzer, at = [37, 416], label = "Beeper", look { shape = round } }
+      d1     { show = d1, at = [179, 428], label = "D1" }
+      d2     { show = d2, at = [179, 448], label = "D2" }
+      stick  { show = joystick, at = [232, 392] }
+      rgb    { show = rgb, at = [434, 408], label = "RGB Led" }
+      btn1   { show = btn1, at = [520, 420], label = "BTN1" }
+      btn2   { show = btn2, at = [608, 420], label = "BTN2" }
     }
   }
 

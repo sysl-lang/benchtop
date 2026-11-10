@@ -535,7 +535,7 @@ board {
   name = "Raspberry Pi Pico"
   mcu = rp2040
   parts {
-    led { part = led, color = green, wire { anode = GP25 } }
+    led { part = led, color = green, package = 0603, wire { anode = GP25 } }
   }
   exposes {
     pins  = [GP0, GP1, GP2, GP3, GP4, GP5, GP6, GP7, GP8, GP9, GP10, GP11, GP12, GP13, GP14, GP15,
@@ -544,10 +544,17 @@ board {
   }
   view {
     size = [168, 408]
-    elements { led { show = led, at = [28, 16], size = [16, 10] } }
+    elements { led { show = led, at = [32, 19] } }
   }
 }
 ```
+
+A view places a part and never sizes it: every part is drawn at its real size, 5 pixels to the
+millimetre, so it looks the same on every board. Where a part comes in sizes, a parameter picks one —
+an LED's `package` (`5mm`, `3mm`, `0805`, `0603`), a button's `body` (`6mm`, `12mm`), a
+potentiometer's `body` (`16mm`, `9mm`), a speaker's `diameter`, a seven-segment display's
+`digit-height`, an OLED's `diagonal` (0.96 or 1.3), a character LCD's `columns` and `rows`. A pixel
+display is sized from its resolution instead, so that every pixel can be seen.
 
 A **product** is one or more boards, each under a name of its own, and the parts outside them, wired
 only to pins and buses the boards expose, by qualified name. The breadboard kit is a product around a
