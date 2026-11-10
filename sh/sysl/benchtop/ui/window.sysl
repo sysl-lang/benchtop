@@ -2,6 +2,7 @@ module sh.sysl.benchtop.ui
 
 import sh.sysl.sdl3 as sdl
 import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.chip as chip
 import sh.sysl.benchtop.host as host
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_bytes
@@ -39,8 +40,8 @@ advance(d: &Desktop, step: bool = false, budget: u64 = virt.FALLBACK_BUDGET)
     if session.stopped && !was_stopped then say(d, NoticeKind.Stop, session.message)
 
 /** How `launch` runs: a demo or a firmware file, for how many frames, where its PNG goes, whether
- * it opens a window, the host build workflow, an instrument file, and whether the cores share one
- * thread.
+ * it opens a window, the host build workflow, an instrument file, whether the cores share one
+ * thread, the microSD card, and whether benchtop's USB host is on an RP2350 board's bus.
  */
 struct LaunchOptions
     demo: bool
@@ -52,9 +53,22 @@ struct LaunchOptions
     deterministic: bool
     meter: Option[&rt.Meter]
     sd: virt.SdChoice
+    usb: bool
 
-launch_options(demo: bool = false, frames: u64 = 0, screenshot: string = "", headless: bool = false, develop: host.Config = host.config(), instrument_file: string = "", deterministic: bool = false, meter: Option[&rt.Meter] = None, sd: virt.SdChoice = virt.SdChoice.Described) -> LaunchOptions =
-    LaunchOptions(demo = demo, frames = frames, screenshot = screenshot, headless = headless, develop = develop, instrument_file = instrument_file, deterministic = deterministic, meter = meter, sd = sd)
+launch_options(demo: bool = false, frames: u64 = 0, screenshot: string = "", headless: bool = false, develop: host.Config = host.config(), instrument_file: string = "", deterministic: bool = false, meter: Option[&rt.Meter] = None, sd: virt.SdChoice = virt.SdChoice.Described, usb: bool = true) -> LaunchOptions =
+    LaunchOptions(demo = demo, frames = frames, screenshot = screenshot, headless = headless, develop = develop, instrument_file = instrument_file, deterministic = deterministic, meter = meter, sd = sd, usb = usb)
+
+/** Put the RP board `which` names on `d`'s session, which then runs it rather than its machine (`usb`:
+ * benchtop's USB host on an RP2350's bus). False where `which` is not an RP board; why not where
+ * benchtop cannot run it.
+ */
+private[ui] attach_rp(d: &Desktop, which: string, usb: bool) -> Result[bool, string]
+    chip.rp_guest(which, usb) match
+        Some(Ok(g)) ->
+            d.session.guest = Some(g)
+            Ok(true)
+        Some(Err(why)) -> Err(why)
+        None -> Ok(false)
 
 /** The instructions one frame gives the guest when the UI thread runs it: the paced share of a
  * frame's wall time at the session's clock, or a fixed slice for a board with no clock to pace by.
@@ -78,16 +92,22 @@ launch(which: string, file: string, o: LaunchOptions = launch_options()) -> Resu
     val session = d.session
     val m = session.board()
     if o.meter.is_some() && (!live || o.headless || o.deterministic) then return Err("a timed run needs a firmware on the board's own threads, in a window")
+    val rp = live && !o.demo && attach_rp(d, which, o.usb)?
+    if rp && o.meter.is_some() then return Err("a timed run measures a board of benchtop's virtual machine; an RP board's window runs it paced to the host's clock")
+    if rp && !o.instrument_file.is_empty() then return Err("--instruments plots a board of benchtop's virtual machine; an RP board's window has no instruments yet")
     if live
-        virt.board_named_sd(m, which, o.sd) match
-            Err(why) -> return Err(why)
-            Ok(_) -> ()
+        if !rp
+            virt.board_named_sd(m, which, o.sd) match
+                Err(why) -> return Err(why)
+                Ok(_) -> ()
         val bytes: []const u8 = if o.demo then DEMO else read_bytes(file) match
             Ok(bytes) -> bytes
             Err(why) -> if develop.program.is_empty() then return Err(s"$file: $why") else []
         if bytes.len == 0 && develop.program.is_empty() then return Err("firmware is empty")
         if bytes.len > 0
-            val parsed = if host.enabled(develop) then host.checked_image(m, bytes) else virt.image_of(m, bytes)
+            val parsed = session.guest match
+                Some(g) -> g.checked(bytes)
+                None -> if host.enabled(develop) then host.checked_image(m, bytes) else virt.image_of(m, bytes)
             parsed match
                 Ok(i) ->
                     image = i
@@ -101,7 +121,9 @@ launch(which: string, file: string, o: LaunchOptions = launch_options()) -> Resu
     defer close_instruments(d)
     val active = toolkit.signal(image)
     if host.enabled(develop)
-        d.workflow = Some(host.open(m, develop, file, original)?)
+        d.workflow = Some(session.guest match
+            Some(g) -> host.open_checked(bytes -> g.checked(bytes), develop, file, original)?
+            None -> host.open(m, develop, file, original)?)
         if !develop.program.is_empty() then d.console_tab.set(1)
     defer close_workflow(d)
     if o.headless
@@ -122,8 +144,8 @@ launch(which: string, file: string, o: LaunchOptions = launch_options()) -> Resu
     val path = if o.screenshot.is_empty() then "benchtop.png" else o.screenshot
     val count = toolkit.signal(0u64)
     sdl.set_main_ready()
-    val player = audio_player(m)
-    defer close_audio(m, player)
+    val player = session_audio(session)
+    defer close_session_audio(session, player)
     if !player.error.is_empty() then say(d, NoticeKind.Audio, s"Audio unavailable: ${player.error}")
     val touch = !d.scene.pointers.is_empty()
     o.meter match
@@ -140,7 +162,7 @@ launch(which: string, file: string, o: LaunchOptions = launch_options()) -> Resu
             host_tick(d, active)
             desktop_tick(d, active.read().view(), o.frames, count, path,
                 if session.background then 0u64 else frame_budget(virt.pacing_source(m, touch), pacing, dt))
-            if session.background
+            if session.background && !rp
                 rates match
                     Some(trace) -> trace.sample(m)
                     None -> ()
@@ -194,7 +216,7 @@ private[ui] desktop_tick(d: &Desktop, image: []const u8, frames: u64, count: &to
     if d.session.live
         instrument_tick(d)
         // Every frame, so the scrollback misses nothing the capture lets go while another tab shows.
-        d.terminal.pull(d.session.board())
+        d.terminal.pull(&*d.session)
     if d.saving.read()
         d.saving.set(false)
         save_desktop(d, path) match
@@ -260,11 +282,11 @@ private[ui] canonical_key(scancode: i32) -> string = to_lower(sdl.scancode_name(
  */
 private terminal_event(d: &Desktop, e: sdl.Event) -> bool
     e.kind() match
-        TextInput -> guest_keyed(d, terminal_text(d.terminal, d.session.board(), e.text()))
+        TextInput -> guest_keyed(d, terminal_text(d.terminal, &*d.session, e.text()))
         KeyDown ->
             val mods = e.key_mod()
             val input = term_key(canonical_key(e.key_scancode()), (mods & sdl.KMOD_CTRL) != 0u16, (mods & sdl.KMOD_ALT) != 0u16, (mods & sdl.KMOD_GUI) != 0u16)
-            guest_keyed(d, terminal_input(d.terminal, d.session.board(), input))
+            guest_keyed(d, terminal_input(d.terminal, &*d.session, input))
         KeyUp ->
             var st = d.current.read()
             if key_input(d.scene, &st, canonical_key(e.key_scancode()), false) then d.current.set(st)

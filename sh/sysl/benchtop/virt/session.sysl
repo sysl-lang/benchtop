@@ -6,6 +6,7 @@ module sh.sysl.benchtop.virt
 // of them needs to know which core the board has or how its parts are wired.
 
 import sh.sysl.benchtop.{Part, part_flag, part_whole, param_named}
+import sh.sysl.benchtop.parts.hd44780.Lcd
 import sh.sysl.benchtop.v6m.Stop
 import sysl.buf.{Buf, buf}
 import sysl.sync.*
@@ -76,11 +77,76 @@ pacing_source(m: *Machine, touch: bool) -> PacingSource =
     elif touch then PacingSource.TouchClock
     else PacingSource.Fixed
 
+/** Where a guest's run has got to after a frame: what the desktop shows of it, and why it stopped. */
+struct GuestStanding
+    status: RunStatus
+    message: string
+    pc: u32
+    instructions: u64
+
+/** A board that runs on a chip of its own rather than on the session's machine: an RP2040 or RP2350
+ * board (`chip.rp_guest`). Once started it runs on a host thread of its own, paced to the host's clock,
+ * as the machine's CPU workers do; until then each `advance` runs a sixtieth of a second of its clock on
+ * the caller's thread, so a headless run is the same every time. Every member is called from the
+ * session's thread, and parts are named by the board's own names.
+ */
+trait Guest
+    /** Power the board on again with `image`, or say why it does not boot. */
+    restart(*self, image: []const u8) -> Result[unit, string]
+    /** `image` as a restart takes it, where it boots on a board of this one's kind. */
+    checked(*self, image: []const u8) -> Result[Buf[u8], string]
+    /** Run the board on a host thread of its own from now on. */
+    start(*self) -> Result[unit, string]
+    /** Stop the board's thread and join it. */
+    stop(*self)
+    /** One frame of the run: held while `paused`, or a step of a few cycles. */
+    advance(*self, paused: bool, step: bool) -> GuestStanding
+    /** Set the part `name`'s control; `apply_inputs` puts the controls on the chip's pins. */
+    set_input(*self, name: string, input: PartInput)
+    apply_inputs(*self)
+    /** Whether the LED `name` is lit. */
+    lit(*self, name: string) -> bool
+    /** What each digit of the seven-segment display `name` shows now. */
+    segments(*self, name: string) -> [8]u8
+    /** The HD44780 `name`, as its controller stands. */
+    lcd(*self, name: string) -> Option[Lcd]
+    /** The pitch the buzzer `name` sounds now, in Hz; 0 while it is quiet. */
+    pitch(*self, name: string) -> u64
+    /** Whether the board has anything that sounds. */
+    sounds(*self) -> bool
+    /** What the board's buzzers have sounded since the last call, mixed, at 48 kHz on one channel. */
+    take_sound(*self) -> Buf[f32]
+    /** What the console has shown past the `seen`th byte it ever showed, and how many it has shown. */
+    output_since(*self, seen: u64) -> (Buf[u8], u64)
+    /** Give the guest `bytes` on its console; false where its console takes no input. */
+    type_keys(*self, bytes: []const u8) -> bool
+
+/** A guest's console as the desktop's terminal pane reads and types into it: a machine's, or a session's,
+ * whichever board the session runs.
+ */
+trait GuestConsole
+    console_since(*self, seen: u64) -> (Buf[u8], u64)
+    console_type(*self, bytes: []const u8) -> bool
+
+impl GuestConsole for Machine
+    console_since(*self, seen: u64) -> (Buf[u8], u64) = output_since(self, seen)
+    console_type(*self, bytes: []const u8) -> bool = type_keys(self, bytes)
+
+impl GuestConsole for Session
+    console_since(*self, seen: u64) -> (Buf[u8], u64) = self.guest match
+        Some(g) -> g.output_since(seen)
+        None -> output_since(&*self.machine, seen)
+    console_type(*self, bytes: []const u8) -> bool = self.guest match
+        Some(g) -> g.type_keys(bytes)
+        None -> type_keys(&*self.machine, bytes)
+
 /** A run of a board's firmware: the machine it runs on, which it owns (`board_named` assembles a
- * board on `&session.machine`), its parts' controls and where the run has got to.
+ * board on `&session.machine`), or the `guest` that runs it instead, its parts' controls and where the
+ * run has got to.
  */
 struct Session
     machine: &Machine
+    guest: Option[&Guest]
     parts: Buf[Part]
     chip: string
     inputs: Buf[PartInput]
@@ -117,7 +183,7 @@ resting(p: Part) -> PartInput = p.kind match
 session(parts: Buf[Part], chip: string, live: bool) -> &Session
     var inputs: Buf[PartInput] = buf()
     for p in parts do inputs.push(resting(p))
-    Session(machine = machine(), parts = parts, chip = chip, inputs = inputs, live = live, paused = false, stopped = false,
+    Session(machine = machine(), guest = None, parts = parts, chip = chip, inputs = inputs, live = live, paused = false, stopped = false,
         status = if live then RunStatus.Running else RunStatus.Preview, message = "", background = false, pc = 0, instructions = 0)
 
 impl Session
@@ -171,6 +237,12 @@ impl Session
     /** Drive the board's input pins and analogue sources from the parts' controls. */
     apply_inputs(&self)
         if !self.live then return
+        self.guest match
+            Some(g) ->
+                for i in 0..<self.parts.len() do g.set_input(self.parts[i].name, self.inputs[i])
+                g.apply_inputs()
+                return
+            None -> ()
         var levels: u32 = 0xFFFFFFFF
         for i in 0..<self.parts.len()
             val closed = self.inputs[i] match
@@ -204,6 +276,9 @@ impl Session
     /** Whether an output part (an LED) is lit by the pin it is wired to. */
     lit(&self, p: Part) -> bool
         if !self.live then return false
+        self.guest match
+            Some(g) -> return g.lit(p.name)
+            None -> ()
         val pin = part_pin(p)
         if pin < 0
             val name = terminal_name(p, "anode")
@@ -215,6 +290,26 @@ impl Session
         val high = (panel_levels(self.board()) & (1u32 << u32(pin))) != 0
         if written(p, "active", "high") == "low" then !high else high
 
+    /** What each digit of the seven-segment display `p`, shown as `name`, shows now. */
+    segments(&self, name: string, p: Part) -> [8]u8 = self.guest match
+        Some(g) -> g.segments(p.name)
+        None -> display_segments(self.board(), name)
+
+    /** The HD44780 `p`, shown as `name`, as its controller stands. */
+    lcd(&self, name: string, p: Part) -> Option[Lcd] = self.guest match
+        Some(g) -> g.lcd(p.name)
+        None -> lcd_state(self.board(), name)
+
+    /** Whether the buzzer `p`, shown as `name`, is sounding. */
+    sounding(&self, name: string, p: Part) -> bool = self.guest match
+        Some(g) -> g.pitch(p.name) != 0
+        None -> sound_active(self.board(), name)
+
+    /** Whether the board has anything the host plays. */
+    sounds(&self) -> bool = self.guest match
+        Some(g) -> g.sounds()
+        None -> sound_available(self.board())
+
     /** Whether a reset button is held, which keeps the chip in reset until it is let go. */
     in_reset(&self) -> bool
         for i in 0..<self.parts.len()
@@ -223,17 +318,29 @@ impl Session
 
     /** Boot `image` on the board and run it from the start. */
     restart(&self, image: []const u8)
-        val m = self.board()
-        pause_workers(m)
-        open_console(m)
-        capture_bounded(m, 8192)
-        boot(m, image)
         self.release_buttons()
         self.paused = false
         self.stopped = false
         self.status = RunStatus.Running
         self.message = ""
         self.instructions = 0
+        self.guest match
+            Some(g) ->
+                self.pc = 0
+                g.restart(image) match
+                    Ok(_) -> ()
+                    Err(why) ->
+                        self.stopped = true
+                        self.paused = true
+                        self.status = RunStatus.Fault
+                        self.message = why
+                return
+            None -> ()
+        val m = self.board()
+        pause_workers(m)
+        open_console(m)
+        capture_bounded(m, 8192)
+        boot(m, image)
         self.pc = core0(m).pc
 
     /** A live session with nothing to run until a build delivers an image. */
@@ -246,11 +353,15 @@ impl Session
      * cores itself. `parallel` gives each core a thread of its own.
      */
     start(&self, parallel: bool, hz: u64) -> Result[unit, string]
-        start_workers(self.board(), parallel, hz)?
+        self.guest match
+            Some(g) -> g.start()?
+            None -> start_workers(self.board(), parallel, hz)?
         self.background = true
         Ok(())
 
-    stop(&self) = stop_workers(self.board())
+    stop(&self) = self.guest match
+        Some(g) -> g.stop()
+        None -> stop_workers(self.board())
 
     pause(&self)
         if !self.live || self.stopped then return
@@ -264,6 +375,22 @@ impl Session
     advance(&self, step: bool = false, budget: u64 = FALLBACK_BUDGET) -> Option[WorkerObservation]
         self.apply_inputs()
         if !self.live || self.stopped then return None
+        self.guest match
+            Some(g) ->
+                val s = g.advance(self.paused, step)
+                if step then self.paused = true
+                self.pc = s.pc
+                self.instructions = s.instructions
+                self.status = s.status
+                self.message = s.message
+                s.status match
+                    Running | Waiting -> if self.paused then self.status = RunStatus.Paused
+                    Paused -> ()
+                    _ ->
+                        self.stopped = true
+                        self.paused = true
+                return None
+            None -> ()
         if self.background then return Some(self.observe_workers(step))
         if self.paused && !step
             self.status = RunStatus.Paused

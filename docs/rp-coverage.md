@@ -989,8 +989,9 @@ a run ending `Asleep`.
   stalled bulk endpoint. The host gives up (`take_note`; `benchtop run` prints it on stderr), disables
   the port until the device disconnects, and the program runs on. It does not clear a halt, send
   SET_LINE_CODING, poll the notification endpoint, suspend the bus or reach a hub.
-- **The bridge** (`benchtop run --usb console|pty|off`, Arm RP2350 boards only, refused by name with
-  `--window` or another board). **The default is `console`**: the port's bytes join stdout beside UART0,
+- **The bridge** (`benchtop run --usb console|pty|off`, Arm RP2350 boards only, refused by name for
+  another board; with `--window`, `console` and `off` only). **The default is `console`**: the port's
+  bytes join stdout beside UART0 (or, in the window, the Guest tab, which also types into the port),
   each a line at a time through `show_console`, so neither interleaves inside the other's lines; no
   input reaches the port, as none reaches UART0 in this command. `pty` opens a raw pseudo-terminal
   (`host/pty.sysl`, with `host/__posix__/pty.c` for termios: `posix_openpt`, `cfmakeraw`, non-blocking),

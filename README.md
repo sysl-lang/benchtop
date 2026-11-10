@@ -62,6 +62,13 @@ counter button, toggle a GPIO LED, and drag the brightness slider:
 ./benchtop run --window --board boards/touch.hocon examples/touch/demo.elf
 ```
 
+The real-chip boards run in the same window: a Pico 2 with a button, a seven-segment digit, an
+HD44780 and a buzzer on its header ([parts on a Pico board](#parts-on-a-pico-pico-2-or-pico-2-risc-v-board)):
+
+```sh
+./benchtop run --window --board testdata/rp-parts/pico2-parts.hocon examples/pico2/parts.elf
+```
+
 A separate [digital audio demo](examples/audio/README.md) adds a MAX98357A-style
 PCM amplifier/speaker and an INMP441 MEMS microphone backed by the Mac's input.
 Hold **1** to play a tone; the firmware displays microphone level on GPIO LEDs:
@@ -259,11 +266,12 @@ card's: a whole number of 512-byte sectors, a multiple of 512 KiB and at most 64
 refused saying which. `none` leaves the slot empty: the detect pin PI8 reads high and SDMMC commands
 time out. Without `--sd` the board's own card is in the slot. A board with no socket refuses the option.
 
-**`--window`** opens the board's desktop instead of using this terminal (see the sections above).
+**`--window`** opens the board's desktop instead of using this terminal (see the sections above), for
+a virtual board or an RP board (`pico`, `pico2`, `pico2-riscv`, or a product of one of them).
 **`--usb console|pty|off`**, on an RP2350 board of Cortex-M33s, says where the board's USB serial port
 goes: `console` (the default) puts benchtop's USB host on the bus and joins a CDC ACM device's output
-to the console; `pty` gives it a pseudo-terminal whose name is printed on stderr; `off` leaves the bus
-empty.
+to the console, or to the window's **Guest** tab; `pty` gives it a pseudo-terminal whose name is
+printed on stderr, without `--window`; `off` leaves the bus empty.
 
 ### Running firmware headless
 
@@ -351,10 +359,20 @@ potentiometer's or joystick's wipers go on ADC pins (GP26 to GP29); a buzzer sou
 GPIO is routed to, or the pin's level; the seven-segment display and the HD44780 read the GPIOs the
 firmware drives. A pin the board does not expose and a potentiometer off the ADC pins are refused by
 the checker. The parts on the chip's I2C, SPI and PIO (SSD1306, ST7789, ST7796, GT911, DS3231, WS2812)
-are refused by name on an RP board for now; they come next. An RP board runs from the terminal and
-from a scripted run; the window does not run one yet.
+are refused by name on an RP board for now; they come next. An RP board runs from the terminal, from a
+scripted run and in the window.
+
+**In the window** (`--window`) the board is drawn from its `view`, as the workbench is: click or hold
+**BTN**, flip a switch, drag a potentiometer's dial or a joystick, watch the digit and the LCD, and hear
+the buzzer. The **Guest** tab shows UART0 (and the USB serial port under the default `--usb console`)
+and takes typing on an RP2350's; **Pause**, **Step** (until a core retires an instruction, its sleeping
+cores' time passing to whatever wakes one), **Reset**, **Save PNG** and `--watch`/`--build` reloads
+work as on the virtual boards. The board runs on a host thread of its own, paced to the host's clock;
+the window only looks at it. Not there yet: `--instruments`, `realtime --window`, `--gdb` with
+`--window`, and typing into the Pico's (RP2040's) UART0, which takes no input from benchtop yet.
 
 ```sh
+./benchtop run --window --board testdata/rp-parts/pico2-parts.hocon examples/pico2/parts.elf
 ./benchtop run --board testdata/rp-parts/pico2-parts.hocon --quiet --timeout 2s \
   --expect "button idle 1" --press btn:10ms --expect "GPIO 14 down" examples/pico2/parts.elf
 ./benchtop run --board testdata/rp-parts/pico2-parts.hocon --quiet --timeout 3s \

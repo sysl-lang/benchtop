@@ -1,0 +1,434 @@
+module sh.sysl.benchtop.chip
+
+// An RP board as the window runs it (`virt.Guest`): the Pico, the Pico 2 on its Cortex-M33s or its
+// Hazard3 harts, or a product of one of them with parts on its header. Once started, the board runs on
+// a host thread of its own, paced to the host's clock a millisecond of clk_sys at a time. Everything the
+// two threads share — the board, its parts, the console, where the run has got to — is a `GuestState`
+// behind one `Mutex`, which the board's thread lets go of between slices; the window's thread takes it
+// only to read what the parts show and the console, and to set the parts' controls. Drawing therefore
+// never runs on the board's thread, and the board never waits for a frame.
+
+import sh.sysl.benchtop.parts.hd44780.Lcd
+import sh.sysl.benchtop.peripheral.rp2350.Frame
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.virt.{GuestStanding, PartInput, RunStatus}
+import sysl.buf.{Buf, buf}
+import sysl.math.{min, max}
+import sysl.threads.{Thread, Mutex, Condvar, spawn}
+import sysl.time.{monotonic, sleep, micros}
+
+/** The clk_sys rate a board is paced at before its firmware has set one. */
+private const RESET_HZ: u64 = 12000000
+/** How much console output the guest keeps for a pane that has not looked lately. */
+private const KEPT_OUTPUT: usize = 1 << 20
+/** How far the board's thread lets its clock fall behind the host's before it gives the time up. */
+private const MOST_OWED_US: u64 = 50000
+/** The cycles a step takes at most to find an instruction retired, where something keeps waking a core
+ * that retires none.
+ */
+private const STEP_TURNS = 100000
+/** The cycles a step lets pass on a board with nothing due before it leaves the board asleep. */
+private const IDLE_TURNS = 64
+
+/** One kind of RP board, whichever chip and cores it has, as the guest drives it. */
+private[chip] trait Runner
+    boot(*self, image: []const u8) -> Result[unit, string]
+    run(*self, cycles: u64) -> RunEnd
+    wait_outside(*self, cycles: u64)
+    finish_sending(*self) -> bool
+    /** Why the run ended at `end`, a breakpoint or a fault. */
+    why(*self, end: RunEnd) -> string
+    clock(*self) -> u64
+    hz(*self) -> u64
+    pc(*self) -> u32
+    retired(*self) -> u64
+    /** What the console has shown since the last call, added to `into`. */
+    take_console(*self, into: *Buf[u8])
+    /** The cycles until something wakes a core, 0 while one is awake; None where every core sleeps and
+     * nothing on the chip will wake one.
+     */
+    wake_in(*self) -> Option[u64]
+    takes_input(*self) -> bool
+    send(*self, c: u8) -> Result[bool, string]
+    connect(*self, ps: *RpParts)
+    apply(*self, ps: *RpParts)
+    observe(*self, ps: *RpParts)
+    part_lit(*self, ps: *RpParts, name: string) -> bool
+    part_pitch(*self, ps: *RpParts, name: string) -> u64
+
+// An RP2350 on its Cortex-M33s, or an RP2040 on its Cortex-M0+s.
+private struct ArmRunner[C: ArmChip + PartPins]
+    b: &ArmBoard[C]
+    shown: usize
+
+impl[C: ArmChip + PartPins] Runner for ArmRunner[C]
+    boot(*self, image: []const u8) -> Result[unit, string] = self.b.boot(image)
+    run(*self, cycles: u64) -> RunEnd = self.b.run(cycles)
+    wait_outside(*self, cycles: u64) = self.b.wait_outside(cycles)
+    finish_sending(*self) -> bool = self.b.finish_sending()
+
+    why(*self, end: RunEnd) -> string
+        if end == RunEnd.Breakpoint then return "the program ended (a core executed BKPT, as the SDK's exit does)"
+        if !self.b.refused.is_empty() then return self.b.refused
+        for k in 0..<2 do if self.b.cores[k].stop != Stop.Running then return s"a core stopped: core $k: ${virt.stop_message(&self.b.cores[k])}"
+        "a core stopped"
+
+    clock(*self) -> u64 = self.b.chip.clock()
+    hz(*self) -> u64 = self.b.chip.clock_rate()
+    pc(*self) -> u32 = self.b.cores[0].pc
+    retired(*self) -> u64 = self.b.cores[0].retired + self.b.cores[1].retired
+
+    take_console(*self, into: *Buf[u8])
+        into.extend(self.b.console.view()[self.shown..])
+        self.shown = self.b.console.len()
+        val h = &self.b.usb_host
+        into.extend(h.received.view())
+        h.consume(h.received.len())
+
+    // A core with an interrupt pending wakes now, as `run` wakes it.
+    wake_in(*self) -> Option[u64] = if !self.b.asleep() || !self.b.halted() then Some(0) else self.b.next_wake()
+
+    takes_input(*self) -> bool
+        if const C.rp2350() then return true
+        false
+
+    send(*self, c: u8) -> Result[bool, string]
+        val h = &self.b.usb_host
+        if h.running()
+            if h.room_to_send() == 0 then return Ok(false)
+            h.sending.push(c)
+            return Ok(true)
+        if const C.rp2350() then return self.b.chip.line_in(1, Frame(c, 0))
+        Err("the RP2040's UART0 takes no input from benchtop yet")
+
+    connect(*self, ps: *RpParts) = connect_parts(ps, &self.b.chip)
+    apply(*self, ps: *RpParts) = apply_parts(ps, &self.b.chip)
+    observe(*self, ps: *RpParts) = observe_parts(ps, &self.b.chip)
+    part_lit(*self, ps: *RpParts, name: string) -> bool = lit(ps, &self.b.chip, name)
+    part_pitch(*self, ps: *RpParts, name: string) -> u64 = pitch(ps, &self.b.chip, name)
+
+// An RP2350 on its Hazard3 harts.
+private struct RiscvRunner
+    b: &RiscvBoard
+    shown: usize
+
+impl Runner for RiscvRunner
+    boot(*self, image: []const u8) -> Result[unit, string] = self.b.boot(image)
+    run(*self, cycles: u64) -> RunEnd = self.b.run(cycles)
+    wait_outside(*self, cycles: u64) = self.b.wait_outside(cycles)
+    finish_sending(*self) -> bool = self.b.finish_sending()
+
+    why(*self, end: RunEnd) -> string
+        if end == RunEnd.Breakpoint then return "the program ended (a hart executed EBREAK, as the SDK's exit does)"
+        if self.b.refused.is_empty() then "a hart stopped on a fault" else self.b.refused
+
+    clock(*self) -> u64 = self.b.chip.now
+    hz(*self) -> u64 = self.b.chip.sys_hz()
+    pc(*self) -> u32 = self.b.harts[0].pc
+    retired(*self) -> u64 = self.b.harts[0].retired + self.b.harts[1].retired
+
+    take_console(*self, into: *Buf[u8])
+        into.extend(self.b.console.view()[self.shown..])
+        self.shown = self.b.console.len()
+
+    wake_in(*self) -> Option[u64] = if self.b.asleep() then self.b.chip.next_event() else Some(0)
+    takes_input(*self) -> bool = true
+    send(*self, c: u8) -> Result[bool, string] = self.b.chip.line_in(1, Frame(c, 0))
+    connect(*self, ps: *RpParts) = connect_parts(ps, &self.b.chip)
+    apply(*self, ps: *RpParts) = apply_parts(ps, &self.b.chip)
+    observe(*self, ps: *RpParts) = observe_parts(ps, &self.b.chip)
+    part_lit(*self, ps: *RpParts, name: string) -> bool = lit(ps, &self.b.chip, name)
+    part_pitch(*self, ps: *RpParts, name: string) -> u64 = pitch(ps, &self.b.chip, name)
+
+private arm_runner(map: SramMap, usb: bool) -> &Runner
+    val b = arm_board(map)
+    if usb then b.attach_usb_host(true)
+    ArmRunner(b, 0)
+
+private pico_runner(map: SramMap) -> &Runner = ArmRunner(pico_board(map), 0)
+
+private riscv_runner(map: SramMap) -> &Runner = RiscvRunner(riscv_board(map), 0)
+
+/** What the board's thread and the window's share: the board and its parts, the console it has shown and
+ * the keys waiting to go in, where the run has got to, and the thread's orders.
+ */
+private[chip] struct GuestState
+    runner: &Runner
+    parts: RpParts
+    standing: GuestStanding
+    out: Buf[u8]
+    written: u64
+    typed: Buf[u8]
+    deaf: bool
+    closing: bool
+    paused: bool
+    step: bool
+
+/** The state behind its lock, and the condition the board's thread parks on. */
+private[chip] struct GuestCore
+    state: Mutex[GuestState]
+    changed: Condvar
+
+/** An RP board run for the window: how to make a fresh board of its kind, the shared state and the
+ * board's thread once started.
+ */
+private[chip] struct RpGuest
+    fresh: &Fn() -> &Runner
+    core: &sync GuestCore
+    thread: Option[Thread]
+
+/** The board `which` names, run for the window, with its parts: an RP2350 board on its Cortex-M33s, with
+ * benchtop's USB host on the bus where `usb` says so, an RP2040 board, or an RP2350 board on its Hazard3
+ * harts. None where `which` is not an RP board; why not where benchtop cannot run it.
+ */
+rp_guest(which: string, usb: bool) -> Option[Result[&virt.Guest, string]]
+    val fresh: &Fn() -> &Runner = riscv_named(which) match
+        Some(Ok(map)) -> () -> riscv_runner(map)
+        Some(Err(why)) -> return Some(Err(why))
+        None -> arm_named(which) match
+            Some(Ok(map)) -> () -> arm_runner(map, usb)
+            Some(Err(why)) -> return Some(Err(why))
+            None -> pico_named(which) match
+                Some(Ok(map)) -> () -> pico_runner(map)
+                Some(Err(why)) -> return Some(Err(why))
+                None -> return None
+    val state = GuestState(fresh(), rp_parts(described(which).unwrap().0), GuestStanding(RunStatus.Running, "", 0, 0),
+        buf(), 0, buf(), false, false, true, false)
+    val core: &sync GuestCore = GuestCore(Mutex.new(state), Condvar.new())
+    val g: &RpGuest = RpGuest(fresh, core, None)
+    Some(Ok(g))
+
+impl GuestState
+    // A slice of `cycles` clk_sys cycles, the parts looking at the pins after it, what the console showed
+    // kept and what was typed sent.
+    private[chip] slice(*self, cycles: u64)
+        if self.ended() then return
+        val r = self.runner
+        val before = r.clock()
+        val end = r.run(cycles)
+        if end == RunEnd.Asleep
+            // Nothing on the chip wakes the cores, so the slice's time passes for something from outside:
+            // a button, a key typed.
+            val ran = r.clock() - before
+            if ran < cycles then r.wait_outside(cycles - ran)
+        self.settle(end)
+
+    // A step: the board runs a cycle at a time until a core retires an instruction, its sleeping cores'
+    // time passing to whatever wakes one first; a board asleep with nothing to wake it stays where it is.
+    private[chip] step_one(*self)
+        if self.ended() then return
+        val r = self.runner
+        val before = r.retired()
+        var end = RunEnd.Budget
+        var turns = 0
+        var idle = 0
+        // A wake further off than this is a timer nothing set, as good as none.
+        val farthest = self.rate() * 10
+        while r.retired() == before && turns < STEP_TURNS
+            val n = r.wake_in().unwrap_or(farthest + 1)
+            if n > farthest
+                // Nothing on the chip is due, but a pin driven from outside (a button held) is seen only as
+                // the chip's time passes, so a few cycles pass before the step gives up.
+                idle += 1
+                if idle > IDLE_TURNS
+                    end = RunEnd.Asleep
+                    break
+            elif n > 1 then r.wait_outside(n - 1)
+            end = r.run(1)
+            if end == RunEnd.Breakpoint || end == RunEnd.Fault then break
+            turns += 1
+        self.settle(end)
+
+    // After a run that ended at `ran`: the parts look at the pins, what the console showed is kept, what
+    // was typed is sent, and the standing says where the run has got to.
+    private settle(*self, ran: RunEnd)
+        val r = self.runner
+        var end = ran
+        r.observe(&self.parts)
+        // At a breakpoint the chip runs on, as under a debugger, until UART0 has sent what it holds.
+        if end == RunEnd.Breakpoint && !r.finish_sending() then end = RunEnd.Fault
+        var fresh: Buf[u8] = buf()
+        r.take_console(&fresh)
+        self.keep(fresh.view())
+        while self.typed.len() > 0
+            r.send(self.typed[0]) match
+                Ok(true) -> self.typed.remove(0)
+                Ok(false) -> break
+                Err(_) ->
+                    self.typed.clear()
+                    self.deaf = true
+        val status = end match
+            Budget -> RunStatus.Running
+            Asleep -> RunStatus.Waiting
+            Breakpoint -> RunStatus.Breakpoint
+            Fault -> RunStatus.Fault
+        val why = if end == RunEnd.Breakpoint || end == RunEnd.Fault then r.why(end) else ""
+        self.standing = GuestStanding(status, why, r.pc(), r.retired())
+
+    private[chip] ended(*self) -> bool = self.standing.status == RunStatus.Breakpoint || self.standing.status == RunStatus.Fault
+
+    private keep(*self, bytes: []const u8)
+        self.out.extend(bytes)
+        self.written += u64(bytes.len)
+        if self.out.len() > KEPT_OUTPUT
+            var kept: Buf[u8] = buf()
+            kept.extend(self.out.view()[self.out.len() - KEPT_OUTPUT / 2..])
+            self.out = kept
+
+    // The board's clk_sys rate, or the crystal's before the firmware has set one.
+    private[chip] rate(*self) -> u64
+        val hz = self.runner.hz()
+        if hz == 0 then RESET_HZ else hz
+
+impl virt.Guest for RpGuest
+    restart(*self, image: []const u8) -> Result[unit, string]
+        val make = self.fresh
+        val r = make()
+        r.boot(image)?
+        val s = self.core.state.lock_raw()
+        s.runner = r
+        r.connect(&s.parts)
+        s.typed.clear()
+        s.deaf = false
+        s.standing = GuestStanding(RunStatus.Running, "", r.pc(), 0)
+        self.core.changed.notify_all()
+        self.core.state.unlock_raw()
+        Ok(())
+
+    checked(*self, image: []const u8) -> Result[Buf[u8], string]
+        val make = self.fresh
+        make().boot(image)?
+        var b: Buf[u8] = buf()
+        b.extend(image)
+        Ok(b)
+
+    start(*self) -> Result[unit, string]
+        if self.thread.is_some() then return Ok(())
+        self.thread = spawn(&guest_thread, &*self.core, 1 << 23)
+        if self.thread.is_none() then return Err("cannot create the host thread for the board")
+        Ok(())
+
+    stop(*self)
+        val t = self.thread match
+            Some(t) -> t
+            None -> return
+        val s = self.core.state.lock_raw()
+        s.closing = true
+        self.core.changed.notify_all()
+        self.core.state.unlock_raw()
+        t.join()
+        self.thread = None
+
+    advance(*self, paused: bool, step: bool) -> GuestStanding
+        val s = self.core.state.lock_raw()
+        if self.thread.is_some()
+            s.paused = paused
+            if step then s.step = true
+            self.core.changed.notify_all()
+        elif step then s.step_one()
+        elif !paused then s.slice(s.rate() / 60)
+        val standing = GuestStanding(s.standing.status, s.standing.message.copy(), s.standing.pc, s.standing.instructions)
+        self.core.state.unlock_raw()
+        standing
+
+    set_input(*self, name: string, input: PartInput)
+        val s = self.core.state.lock_raw()
+        s.parts.set_input(name, input)
+        self.core.state.unlock_raw()
+
+    apply_inputs(*self)
+        val s = self.core.state.lock_raw()
+        s.runner.apply(&s.parts)
+        self.core.state.unlock_raw()
+
+    lit(*self, name: string) -> bool
+        val s = self.core.state.lock_raw()
+        val on = s.runner.part_lit(&s.parts, name)
+        self.core.state.unlock_raw()
+        on
+
+    segments(*self, name: string) -> [8]u8
+        val s = self.core.state.lock_raw()
+        val shown = s.parts.segments(name, s.runner.clock())
+        self.core.state.unlock_raw()
+        shown
+
+    lcd(*self, name: string) -> Option[Lcd]
+        val s = self.core.state.lock_raw()
+        val l = s.parts.lcd(name)
+        self.core.state.unlock_raw()
+        l
+
+    pitch(*self, name: string) -> u64
+        val s = self.core.state.lock_raw()
+        val hz = s.runner.part_pitch(&s.parts, name)
+        self.core.state.unlock_raw()
+        hz
+
+    sounds(*self) -> bool
+        val s = self.core.state.lock_raw()
+        val any = s.parts.buzzers.len() > 0
+        self.core.state.unlock_raw()
+        any
+
+    take_sound(*self) -> Buf[f32]
+        var mixed: Buf[f32] = buf()
+        val s = self.core.state.lock_raw()
+        for b in s.parts.buzzers
+            val samples = s.parts.sound(b.name)
+            for i in 0..<samples.len()
+                if i < mixed.len() then mixed[i] = (mixed[i] + samples[i]).min(1.0).max(-1.0) else mixed.push(samples[i])
+        self.core.state.unlock_raw()
+        mixed
+
+    output_since(*self, seen: u64) -> (Buf[u8], u64)
+        var bytes: Buf[u8] = buf()
+        val s = self.core.state.lock_raw()
+        val fresh = if s.written > seen then s.written - seen else 0u64
+        val held = s.out.len()
+        val from = if fresh >= u64(held) then 0 else held - usize(fresh)
+        bytes.extend(s.out.view()[from..])
+        val written = s.written
+        self.core.state.unlock_raw()
+        (bytes, written)
+
+    type_keys(*self, bytes: []const u8) -> bool
+        val s = self.core.state.lock_raw()
+        val taken = s.runner.takes_input() && !s.deaf
+        if taken then s.typed.extend(bytes)
+        self.core.state.unlock_raw()
+        taken
+
+// The board's thread: a millisecond of clk_sys at a time while the host's clock is ahead of the board's,
+// at most `MOST_OWED_US` of it owed, the lock let go between slices; parked while paused or ended, but
+// for a step.
+private guest_thread(core: *GuestCore)
+    val s = core.state.lock_raw()
+    var last = monotonic().us
+    var owed: u64 = 0
+    loop
+        if s.closing then break
+        if s.step
+            s.step = false
+            s.step_one()
+            continue
+        if s.paused || s.ended()
+            core.changed.wait(&core.state)
+            last = monotonic().us
+            owed = 0
+            continue
+        val hz = s.rate()
+        val now = monotonic().us
+        val us = min(u64(max(now - last, 0)), MOST_OWED_US)
+        last = now
+        owed = min(owed + us * hz / 1000000, MOST_OWED_US * hz / 1000000)
+        val piece = max(hz / 1000, 1000)
+        val ran = owed >= piece
+        if ran
+            s.slice(piece)
+            owed -= piece
+        core.state.unlock_raw()
+        if !ran then sleep(micros(500))
+        core.state.lock_raw()
+    core.state.unlock_raw()

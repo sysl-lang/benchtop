@@ -1,0 +1,231 @@
+module sh.sysl.benchtop.ui
+@tests
+
+// The window over an RP board (`virt.Guest`, `chip.rp_guest`): the same desktop the virtual boards get,
+// its session running the Pico 2 or the Pico instead of its machine. Run headless, as the other window
+// tests are: each frame of `desktop_tick` runs a sixtieth of a second of the board's clock on this thread,
+// so every run is the same; one test starts the board's own thread, as a window does. The boards are
+// `testdata/rp-parts/`, the firmware `examples/pico2/parts.c` built for both.
+
+import sh.sysl.benchtop.{Part, Shows}
+import sh.sysl.benchtop.parts.hd44780 as hd
+import sh.sysl.benchtop.realtime as rt
+import sh.sysl.benchtop.virt as virt
+import sh.sysl.ui as ui
+import sysl.fs.{make_temp_dir, read_bytes}
+import sysl.text.Search
+import sysl.time.{monotonic, sleep, millis}
+
+private val PARTS_ELF = embed("../../../../examples/pico2/parts.elf")
+private val PICO_PARTS_ELF = embed("../../../../examples/pico/parts.elf")
+private val UART_ADVANCED = embed("../../../../examples/pico2/uart_advanced.elf")
+private val HELLO_USB = embed("../../../../examples/pico2/hello_usb.elf")
+private val PICO2_PARTS = "testdata/rp-parts/pico2-parts.hocon"
+private val PICO_PARTS = "testdata/rp-parts/pico-parts.hocon"
+
+// A live desktop over the RP board `which`, its session running `image` from power-on.
+private rp_ready(which: string, image: []const u8, usb: bool = true) -> &Desktop
+    val d = desktop(open_scene(which).unwrap(), true)
+    assert(attach_rp(d, which, usb).unwrap(), s"$which is an RP board")
+    d.session.restart(image)
+    assert(!d.session.stopped, d.session.message)
+    d
+
+// Whether the Guest tab's terminal shows `text` on one of its rows.
+private shows(d: &Desktop, text: string) -> bool
+    for i in 0..<d.terminal.total() do if d.terminal.row(i).contains(text) then return true
+    false
+
+// Run frames of `d` until its Guest tab shows `text`, at most `frames` of them.
+private frames_until(d: &Desktop, image: []const u8, text: string, frames: int)
+    val count = ui.signal(0u64)
+    for i in 0..<frames
+        desktop_tick(d, image, 0, count, "unused.png")
+        if shows(d, text) then return
+        assert(!d.session.stopped, d.session.message)
+    var all = ""
+    for i in 0..<d.terminal.total() do all += d.terminal.row(i) + "|"
+    assert(false, s"the Guest tab never showed \"$text\": $all")
+
+// The part `name` of `d`'s scene.
+private part_named(d: &Desktop, name: string) -> Part = d.scene.scope.find(name).unwrap()
+
+// The middle of the element that shows part `name`, in the window's pixels as last drawn.
+private middle_of(d: &Desktop, name: string) -> (int, int)
+    val t = board_transform(d.board_rect.read())
+    for e in d.scene.view.elements
+        e.shows match
+            ShowPart(shown) -> if shown == name
+                val (x, y, w, h) = coords(t, e)
+                return (x + w / 2, y + h / 2)
+            _ -> ()
+    assert(false, s"no element shows $name")
+    (0, 0)
+
+@test("rp window: the Pico 2 runs parts.c in the window; the digit, the LCD and the buzzer show what the firmware drives, and the console lands in the Guest tab")
+rp_window_pico2_parts()
+    val d = rp_ready(PICO2_PARTS, PARTS_ELF)
+    assert(d.session.segments("digit", part_named(d, "digit"))[0] == 0, "nothing lit before the firmware runs")
+    frames_until(d, PARTS_ELF, "digit 7", 200)
+    assert(shows(d, "button idle 1"), "the console's first line is in the Guest tab")
+    assert(d.session.segments("digit", part_named(d, "digit"))[0] == 0x07, s"segments a, b and c: ${d.session.segments("digit", part_named(d, "digit"))[0]}")
+    frames_until(d, PARTS_ELF, "lcd Hi", 200)
+    val l = d.session.lcd("lcd", part_named(d, "lcd")).unwrap()
+    assert(hd.character(l, 0, 0) == u8('H') && hd.character(l, 1, 0) == u8('i'))
+    frames_until(d, PARTS_ELF, "tone 1000", 200)
+    assert(d.session.sounding("bz", part_named(d, "bz")) && d.session.sounds(), "the buzzer sounds while its PWM runs")
+    assert(d.session.status == virt.RunStatus.Running && d.session.instructions > 0 && d.session.pc != 0)
+    // The window paints it all; a PNG of it is the same tree.
+    rasterize(d).unwrap()
+
+@test("rp window: a click on the button reaches the firmware's GPIO interrupt, and letting go raises it again")
+rp_window_pico2_click()
+    val d = rp_ready(PICO2_PARTS, PARTS_ELF)
+    frames_until(d, PARTS_ELF, "digit 7", 200)
+    val tree: &ui.View = Workbench(d, true)
+    var c = ui.recorder()
+    ui.render(tree, &c, ui.Rect(0, 0, WIDTH, HEIGHT))
+    val (x, y) = middle_of(d, "btn")
+    d.pointer_live.set(true)
+    c.point(x, y, true)
+    ui.render(tree, &c, ui.Rect(0, 0, WIDTH, HEIGHT))
+    assert(d.current.read().mouse_part == "btn", d.current.read().mouse_part)
+    frames_until(d, PARTS_ELF, "GPIO 14 down", 30)
+    assert(!shows(d, "GPIO 14 up"), "held, the button stays down")
+    d.pointer_live.set(false)
+    c.point(x, y, false)
+    ui.render(tree, &c, ui.Rect(0, 0, WIDTH, HEIGHT))
+    assert(d.current.read().mouse_part == "")
+    frames_until(d, PARTS_ELF, "GPIO 14 up", 30)
+
+@test("rp window: keys typed in the Guest tab reach the Pico 2's UART0, and USB CDC output joins the tab")
+rp_window_pico2_console()
+    val d = rp_ready("pico2", UART_ADVANCED)
+    frames_until(d, UART_ADVANCED, "interrupts", 200)
+    assert(terminal_text(d.terminal, &*d.session, "HAL") == Keyed.Taken)
+    frames_until(d, UART_ADVANCED, "IBM", 200)
+    val usb = rp_ready("pico2", HELLO_USB)
+    frames_until(usb, HELLO_USB, "Hello, world!", 300)
+    // With benchtop's USB host off the bus, nothing enumerates the port and nothing reaches the tab.
+    val off = rp_ready("pico2", HELLO_USB, false)
+    val count = ui.signal(0u64)
+    for i in 0..<120 do desktop_tick(off, HELLO_USB, 0, count, "unused.png")
+    assert(!shows(off, "Hello, world!"))
+
+@test("rp window: on the Pico the digit, the console and a click run as on the Pico 2, and keys typed are refused, its UART0 taking none")
+rp_window_pico()
+    val d = rp_ready(PICO_PARTS, PICO_PARTS_ELF)
+    frames_until(d, PICO_PARTS_ELF, "digit 7", 300)
+    assert(d.session.segments("digit", part_named(d, "digit"))[0] == 0x07)
+    val tree: &ui.View = Workbench(d, true)
+    var c = ui.recorder()
+    ui.render(tree, &c, ui.Rect(0, 0, WIDTH, HEIGHT))
+    val (x, y) = middle_of(d, "btn")
+    d.pointer_live.set(true)
+    c.point(x, y, true)
+    ui.render(tree, &c, ui.Rect(0, 0, WIDTH, HEIGHT))
+    frames_until(d, PICO_PARTS_ELF, "GPIO 14 down", 30)
+    assert(terminal_text(d.terminal, &*d.session, "x") == Keyed.Refused)
+    // The board's own LED, shown whole on a product, lights from its own name.
+    val pico2 = rp_ready("pico2", embed("../../../../examples/pico2/blink.elf"))
+    var lit = false
+    var dark = false
+    val count = ui.signal(0u64)
+    val led = part_named(pico2, "led")
+    for i in 0..<240
+        desktop_tick(pico2, [], 0, count, "unused.png")
+        if pico2.session.lit(led) then lit = true else dark = true
+        if lit && dark then break
+    assert(lit && dark, "blink lights and darkens GPIO 25's LED")
+
+@test("rp window: the Pico 2 on its Hazard3 harts runs in the window too: its console in the Guest tab and its LED lit by blink")
+rp_window_riscv()
+    val irq = embed("../../../../examples/pico2-riscv/gpio_irq.elf")
+    val d = rp_ready("pico2-riscv", irq)
+    frames_until(d, irq, "Hello GPIO IRQ", 200)
+    val blink = rp_ready("pico2-riscv", embed("../../../../examples/pico2-riscv/blink.elf"))
+    val led = part_named(blink, "led")
+    var lit = false
+    var dark = false
+    val count = ui.signal(0u64)
+    for i in 0..<600
+        desktop_tick(blink, [], 0, count, "unused.png")
+        if blink.session.lit(led) then lit = true else dark = true
+        if lit && dark then break
+    assert(lit && dark && !blink.session.stopped, s"lit $lit dark $dark ${blink.session.message}")
+
+@test("rp window: pause holds the board, step moves it a little, reset boots it again, and a fault stops the session with why")
+rp_window_controls()
+    val d = rp_ready(PICO2_PARTS, PARTS_ELF)
+    frames_until(d, PARTS_ELF, "digit 7", 200)
+    pause(d)
+    val count = ui.signal(0u64)
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    val held = d.session.instructions
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    assert(d.session.paused && d.session.instructions == held && d.session.status == virt.RunStatus.Paused)
+    d.stepping.set(true)
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    assert(d.session.paused && d.session.instructions > held && d.session.instructions < held + 64, s"$held ${d.session.instructions}")
+    d.resetting.set(true)
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    assert(!d.session.paused && d.session.instructions < held, "the board starts over")
+    // The console keeps its history across the reset, and the new boot's output follows it.
+    frames_until(d, PARTS_ELF, "digit 7", 200)
+    var boots = 0
+    for i in 0..<d.terminal.total() do if d.terminal.row(i).contains("button idle 1") then boots += 1
+    assert(boots == 2, s"$boots")
+    // An image that does not boot stops the session, saying why.
+    val junk = [0u8; 16]
+    d.session.restart(junk[..])
+    assert(d.session.stopped && d.session.status == virt.RunStatus.Fault && !d.session.message.is_empty())
+
+@test("rp window: the board's own thread runs it paced to the host's clock while the window's thread only observes, and pause parks it")
+rp_window_threaded()
+    val d = rp_ready(PICO2_PARTS, PARTS_ELF)
+    d.session.start(true, 0).unwrap()
+    val count = ui.signal(0u64)
+    val began = monotonic().us
+    while !shows(d, "tone 2000") && monotonic().us - began < 20000000
+        desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+        sleep(millis(5))
+    assert(shows(d, "tone 2000"), "the board's thread ran parts.c")
+    assert(d.session.segments("digit", part_named(d, "digit"))[0] == 0x07)
+    pause(d)
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    sleep(millis(50))
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    val held = d.session.instructions
+    sleep(millis(50))
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    assert(d.session.instructions == held && d.session.status == virt.RunStatus.Paused)
+    // A step is the board's thread's to take, and the next frame sees it. parts.c has done its work and
+    // waits in WFI for the button, so a step finds nothing to run...
+    d.stepping.set(true)
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    sleep(millis(100))
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    assert(d.session.paused && d.session.instructions == held, s"$held ${d.session.instructions}")
+    // ...until the button is held, whose interrupt wakes a core for the step.
+    edit(d, st -> st.mouse_part = "btn")
+    d.stepping.set(true)
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    sleep(millis(100))
+    desktop_tick(d, PARTS_ELF, 0, count, "unused.png")
+    assert(d.session.paused && d.session.instructions > held && d.session.instructions < held + 64, s"$held ${d.session.instructions}")
+    d.session.stop()
+
+@test("rp window: a headless launch of the Pico 2 saves its PNG; refused are a part the RP board does not run yet, a timed run and instruments")
+rp_window_launch()
+    val dir = make_temp_dir("benchtop-rp-window").unwrap()
+    val png = s"$dir/pico2.png"
+    assert(launch(PICO2_PARTS, "examples/pico2/parts.elf", launch_options(frames = 30, screenshot = png, headless = true)).unwrap() == 0)
+    assert(read_bytes(png).unwrap().len > 1000)
+    val bus = launch("testdata/rp-parts/bus-part.hocon", "examples/pico2/parts.elf", launch_options(frames = 1, headless = true))
+    assert(bus.is_err() && bus.unwrap_err().contains("I2C, SPI or PIO"), s"$bus")
+    val instruments = launch(PICO2_PARTS, "examples/pico2/parts.elf", launch_options(frames = 1, headless = true, instrument_file = "instruments/workbench.hocon"))
+    assert(instruments.is_err() && instruments.unwrap_err().contains("--instruments"), s"$instruments")
+    val timed = launch(PICO2_PARTS, "examples/pico2/parts.elf", launch_options(meter = Some(rt.meter(rt.options()))))
+    assert(timed.is_err())
+    // The layout preview of an RP board is the window's own, with no board running.
+    assert(launch(PICO2_PARTS, "", launch_options(frames = 1, headless = true)).is_ok())
