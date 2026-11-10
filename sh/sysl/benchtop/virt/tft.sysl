@@ -1,6 +1,6 @@
 module sh.sysl.benchtop.virt
 
-import sh.sysl.benchtop.{Board, part_model, part_whole}
+import sh.sysl.benchtop.{Board, Part, part_flag, part_model, part_whole}
 import sh.sysl.benchtop.parts.mipi_dcs as tft
 import sh.sysl.benchtop.parts.spi as spi
 import sysl.buf.{Buf, buf}
@@ -15,49 +15,106 @@ struct TftBinding
     x: int
     y: int
     dsi_channel: int
+    // The glass shows each colour inverted, as an IPS panel does to what its controller sends.
+    invert: bool
 
 struct TftFrame
     width: int
     height: int
     pixels: Buf[u32]
 
-// The MIPI DCS panels `b` has: on the DSI, or on SPI wired to its chip (an ST7789).
+// The bus `p`'s `port` is wired to, or "".
+private bus_of(p: Part, port: string) -> string
+    for w in p.wires
+        if w.port != port then continue
+        return w.to match
+            Bus(name) -> name
+            _ -> ""
+    ""
+
+/** Why the SPI panels of `b` cannot work on the buses they are wired to, and its I2C touch controllers
+ * too where `i2c` says the chip finds them by their pins, or None where they can: each bus routes to a
+ * pin every signal its part listens on, a panel's clock and data, a touch controller's SDA and SCL.
+ */
+bus_part_refusal(b: Board, i2c: bool) -> Option[string]
+    for p in b.parts
+        val model = part_model(p)
+        val (port, signals) = model match
+            "st7796" -> ("spi", ["sck", "tx"])
+            "gt911" | "ft6x06" -> if i2c then ("i2c", ["sda", "scl"]) else continue
+            _ -> continue
+        val bus = bus_of(p, port)
+        if bus.is_empty() then continue
+        for signal in signals
+            if spi_pin(b, bus, signal) < 0
+                return Some(s"`${p.name}` is ${if port == "spi" then "a panel" else "a touch controller"} on `$bus`, and the board's `buses` routes `$bus.$signal` to no pin: the part listens on ${signals[0]} and ${signals[1]}, so say which pins they are on, as `buses { $bus { $signal = GP... } }`")
+    None
+
+// A `width` by `height` panel `p` of the controller `controller`, on SPI wired to `pins`.
+private spi_panel(p: Part, controller: tft.Controller, pins: PortPins, width: int, height: int) -> TftBinding
+    val (columns, rows) = tft.memory_of(controller)
+    TftBinding(p.name, tft.display(columns, rows, controller), Some(spi.port()), pins, width, height,
+        int(part_whole(p, "column-offset", 0)), int(part_whole(p, "row-offset", 0)), -1, part_flag(p, "invert", false))
+
+// The panel `p` of `b`, where it is one benchtop runs on SPI: an ST7789 on its four GPIO terminals, or
+// an ST7796 (or ILI9488) on the SPI bus its `spi` names, its clock and data the bus's `sck` and `tx`.
+private spi_panel_of(b: Board, p: Part) -> Option[TftBinding]
+    part_model(p) match
+        "st7789" -> Some(spi_panel(p, tft.St7789, port_pins(p), int(part_whole(p, "width", 240)), int(part_whole(p, "height", 240))))
+        "st7796" ->
+            val bus = bus_of(p, "spi")
+            val pins = PortPins(terminal_pin(p, "cs"), spi_pin(b, bus, "sck"), spi_pin(b, bus, "tx"), terminal_pin(p, "dc"), terminal_pin(p, "reset"))
+            Some(spi_panel(p, tft.St7796, pins, int(part_whole(p, "width", 320)), int(part_whole(p, "height", 480))))
+        _ -> None
+
+// The MIPI DCS panels `b` has: on the DSI, or on SPI wired to its chip.
 private[virt] tfts_of(b: Board) -> Buf[TftBinding]
     var tfts: Buf[TftBinding] = buf()
     for p in b.parts
         if part_model(p) == "mipi-dcs-display"
             val w = int(part_whole(p,"width",800))
             val h = int(part_whole(p,"height",480))
-            tfts.push(TftBinding(p.name,tft.display(w,h),None,PortPins(-1,-1,-1,-1,-1),w,h,0,0,int(part_whole(p,"channel",0))))
+            tfts.push(TftBinding(p.name,tft.display(w,h),None,PortPins(-1,-1,-1,-1,-1),w,h,0,0,int(part_whole(p,"channel",0)),false))
             continue
-        if part_model(p) != "st7789" then continue
-        tfts.push(TftBinding(p.name, tft.display(240, 320, tft.St7789), Some(spi.port()), port_pins(p),
-            int(part_whole(p, "width", 240)), int(part_whole(p, "height", 240)),
-            int(part_whole(p, "column-offset", 0)), int(part_whole(p, "row-offset", 0)), -1))
+        spi_panel_of(b, p) match
+            Some(panel) -> tfts.push(panel)
+            None -> ()
     tfts
 
+// A new board gets fresh controllers, each with its own memory.
+private restarted(b: TftBinding) -> TftBinding
+    var fresh = b
+    fresh.model = tft.display(b.model.width, b.model.height, b.model.controller)
+    b.port match
+        Some(port) ->
+            var wire = port
+            spi.restart(&wire)
+            fresh.port = Some(wire)
+        None -> ()
+    fresh
+
 private[virt] reset_tfts(s: *DisplayState)
-    for i in 0..<s.tfts.len()
-        var b = s.tfts[i]
-        b.model = tft.display(if b.dsi_channel >= 0 then b.width else 240, if b.dsi_channel >= 0 then b.height else 320, b.model.controller)
-        b.port match
-            Some(port) ->
-                var wire = port
-                spi.restart(&wire)
-                b.port = Some(wire)
-            None -> ()
-        s.tfts[i] = b
+    for i in 0..<s.tfts.len() do s.tfts[i] = restarted(s.tfts[i])
+
+// The SPI panel `b` sees its port's wires at `w`.
+private hear_wires(b: *TftBinding, w: spi.Wires)
+    if b.port.is_none() then return
+    var wire = b.port.unwrap()
+    spi.transfer(&wire, w) match
+        Reset -> tft.reset(&b.model)
+        Byte(data, byte) -> tft.write(&b.model, data, byte)
+        Idle -> ()
+    b.port = Some(wire)
 
 private[virt] observe_tfts(s: *DisplayState, levels: u32, driven: u32)
-    for i in 0..<s.tfts.len()
-        val b = &s.tfts[i]
-        if b.port.is_none() then continue
-        var wire = b.port.unwrap()
-        spi.transfer(&wire, port_wires(b.pins, levels, driven)) match
-            Reset -> tft.reset(&b.model)
-            Byte(data, byte) -> tft.write(&b.model, data, byte)
-            Idle -> ()
-        b.port = Some(wire)
+    for i in 0..<s.tfts.len() do hear_wires(&s.tfts[i], port_wires(s.tfts[i].pins, levels, driven))
+
+// Copy the panel's window of memory into `into`: its size, how its glass shows a colour, and where the
+// window lies on the memory.
+private copied(b: *TftBinding, into: *Buf[u32]) -> (int, int, tft.Look, tft.Inside)
+    var look = tft.look(&b.model)
+    if b.invert then look.inverse = !look.inverse
+    (b.width, b.height, look, tft.copy_window(&b.model, b.x, b.y, b.width, b.height, into))
 
 /** Consistent RGB snapshot; no peripheral execution or framebuffer aliases escape the lock. The lock
  * is held for a copy of the panel's memory only, so the DSI worker applying packets, and a core
@@ -72,9 +129,48 @@ tft_frame(m: *Machine, name: string) -> Option[TftFrame]
         for i in 0..<s.tfts.len()
             val b = &s.tfts[i]
             if b.name != name then continue
-            found = Some((b.width, b.height, tft.look(&b.model), tft.copy_window(&b.model, b.x, b.y, b.width, b.height, into)))
+            found = Some(copied(b, into))
             break
         found)
     val (width, height, look, inside) = found?
     tft.show(look, inside, width, &pixels)
     Some(TftFrame(width, height, pixels))
+
+/** An SPI panel on the GPIOs of a chip other than benchtop's machine (an RP2040's or RP2350's), which
+ * shows it its pins as they change (`hear`); the window reads its glass (`glass`). Its model and its
+ * wire are the machine's own.
+ */
+struct Panel
+    binding: TftBinding
+
+/** The panel `p` of `b`, where it is an SPI panel: one the chip's pin hook and the window share. */
+panel_of(b: Board, p: Part) -> Option[&Panel]
+    val binding = spi_panel_of(b, p)?
+    val panel: &Panel = Panel(binding)
+    Some(panel)
+
+/** The GPIO the bus `p`'s `port` is wired to carries `signal` on, as `b`'s `buses` route it; -1 for
+ * none.
+ */
+bus_signal_pin(b: Board, p: Part, port: string, signal: string) -> int = spi_pin(b, bus_of(p, port), signal)
+
+impl Panel
+    /** The panel's name on its board. */
+    name(*self) -> string = self.binding.name
+
+    /** Its port's terminals: chip select, clock, data, data/command and reset, each a GPIO or -1. */
+    pins(*self) -> PortPins = self.binding.pins
+
+    /** A new board: a fresh controller and wire. */
+    restart(*self) = self.binding = restarted(self.binding)
+
+    /** The GPIOs stand at `levels`, the chip driving those of `driven` (bit n for GPIO n). */
+    hear(*self, levels: u64, driven: u64) =
+        hear_wires(&self.binding, port_wires(self.binding.pins, u32.wrap(levels), u32.wrap(driven)))
+
+    /** What the glass shows now. */
+    glass(*self) -> TftFrame
+        var pixels: Buf[u32] = buf()
+        val (width, height, look, inside) = copied(&self.binding, &pixels)
+        tft.show(look, inside, width, &pixels)
+        TftFrame(width, height, pixels)

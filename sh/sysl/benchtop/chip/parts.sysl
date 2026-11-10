@@ -13,9 +13,10 @@ module sh.sysl.benchtop.chip
 import sh.sysl.benchtop.{Board, Part, Target, article_of, part_model, part_text, part_whole}
 import sh.sysl.benchtop.audio as audio
 import sh.sysl.benchtop.parts.hd44780.Lcd
+import sh.sysl.benchtop.peripheral.i2c.Device
 import sh.sysl.benchtop.peripheral.rp2040.{ADC_BASE_GPIO, Pwm, pwm_slice_of}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
-import sh.sysl.benchtop.peripheral.rp2350.Pin
+import sh.sysl.benchtop.peripheral.rp2350.{I2cPart, Pin}
 import sh.sysl.benchtop.virt as virt
 import sh.sysl.benchtop.virt.PartInput
 import sysl.buf.{Buf, buf}
@@ -28,18 +29,31 @@ struct PinChange
     levels: u64
     driven: u64
 
+/** A part that hears the GPIOs of `mask` (bit n for GPIO n) as they change rather than when the parts
+ * next look: an SPI panel, whose every byte is sixteen edges of a clock at megahertz. `heard` is told
+ * their levels and the ones the chip drives each time something that decides one may have changed,
+ * and at each edge an SPI controller makes.
+ */
+struct PinHook
+    mask: u64
+    heard: &Fn(u64, u64) -> unit
+
 /** What a board's parts watch of the chip's GPIOs (`part_watch`): which, what they last showed, and
- * each change since the parts last looked. It is the board's, as the wires are: a reset of the chip
- * keeps it.
+ * each change since the parts last looked; and the parts that hear them as they change (`part_hook`),
+ * and whether anything watches or hears at all, which is the one test the chip makes for them. It is
+ * the board's, as the wires are: a reset of the chip keeps it.
  */
 struct PinWatch
     mask: u64
     levels: u64
     driven: u64
     changes: Buf[PinChange]
+    hooks: Buf[PinHook]
+    watching: bool
+    hooked: bool
 
 /** Watching no GPIO. */
-pin_watch() -> PinWatch = PinWatch(0, 0, 0, buf())
+pin_watch() -> PinWatch = PinWatch(0, 0, 0, buf(), buf(), false, false)
 
 impl PinWatch
     // The watched GPIOs show `levels`, the chip driving `driven`, at `cycle`: a change is kept.
@@ -73,17 +87,38 @@ trait PartPins
      * the part of it the pin is high, in sixteenths of a clk_sys cycle. None otherwise.
      */
     part_pwm(*self, n: u32) -> Option[(u64, u64)]
+    /** Tell `h` what its GPIOs show now and each time they may have changed from now on. */
+    part_hook(*self, h: PinHook)
+    /** Put the part `p` on the chip's I2C lines, on the GPIOs it names. */
+    part_i2c(*self, p: I2cPart)
 
 impl Rp2350
-    // What the watched GPIOs show now, kept where it changed.
+    // What the watched GPIOs show now, kept where it changed; and the hooks hear it.
     private[chip] note_pins(*self)
-        val (levels, driven) = shown(self.watch.mask, n -> self.pin(n))
-        self.watch.note(self.now, levels, driven)
+        if self.watch.mask != 0
+            val (levels, driven) = shown(self.watch.mask, n -> self.pin(n))
+            self.watch.note(self.now, levels, driven)
+        if self.watch.hooked then self.tell_hooks()
+
+    // Each hook hears its GPIOs as they stand now.
+    @noinline
+    private[chip] tell_hooks(*self)
+        for h in self.watch.hooks
+            val (levels, driven) = shown(h.mask, n -> self.pin(n))
+            (h.heard)(levels, driven)
 
 impl Rp2040
     private[chip] note_pins(*self)
-        val (levels, driven) = shown(self.watch.mask, n -> self.pin(n))
-        self.watch.note(self.now, levels, driven)
+        if self.watch.mask != 0
+            val (levels, driven) = shown(self.watch.mask, n -> self.pin(n))
+            self.watch.note(self.now, levels, driven)
+        if self.watch.hooked then self.tell_hooks()
+
+    @noinline
+    private[chip] tell_hooks(*self)
+        for h in self.watch.hooks
+            val (levels, driven) = shown(h.mask, n -> self.pin(n))
+            (h.heard)(levels, driven)
 
 // The levels of `mask`'s GPIOs and the ones the chip drives, bit n for GPIO n, as `pin` gives each.
 private shown(mask: u64, pin: (u32) -> Pin) -> (u64, u64)
@@ -109,13 +144,19 @@ impl PartPins for Rp2350
     part_drive(*self, n: u32, level: Option[bool]) = self.drive_from_outside(n, level)
     part_analog(*self, input: u32, uv: Option[u32]) = self.set_analog(input, uv)
     part_watch(*self, mask: u64)
-        self.watch = PinWatch(mask, 0, 0, buf())
+        self.watch = PinWatch(mask, 0, 0, buf(), buf(), mask != 0, false)
         if mask != 0 then self.note_pins()
     part_changes(*self) -> Buf[PinChange]
         val all = self.watch.changes
         self.watch.changes = buf()
         all
     part_pwm(*self, n: u32) -> Option[(u64, u64)] = pwm_on(self.io.function(n), n, &self.pwm)
+    part_hook(*self, h: PinHook)
+        self.watch.hooks.push(h)
+        self.watch.watching = true
+        self.watch.hooked = true
+        self.tell_hooks()
+    part_i2c(*self, p: I2cPart) = self.attach_i2c(p)
 
 impl PartPins for Rp2040
     part_clock(*self) -> u64 = self.now
@@ -124,13 +165,19 @@ impl PartPins for Rp2040
     part_drive(*self, n: u32, level: Option[bool]) = self.drive_from_outside(n, level)
     part_analog(*self, input: u32, uv: Option[u32]) = self.set_analog(input, uv)
     part_watch(*self, mask: u64)
-        self.watch = PinWatch(mask, 0, 0, buf())
+        self.watch = PinWatch(mask, 0, 0, buf(), buf(), mask != 0, false)
         if mask != 0 then self.note_pins()
     part_changes(*self) -> Buf[PinChange]
         val all = self.watch.changes
         self.watch.changes = buf()
         all
     part_pwm(*self, n: u32) -> Option[(u64, u64)] = pwm_on(self.io.function(n), n, &self.pwm)
+    part_hook(*self, h: PinHook)
+        self.watch.hooks.push(h)
+        self.watch.watching = true
+        self.watch.hooked = true
+        self.tell_hooks()
+    part_i2c(*self, p: I2cPart) = self.attach_i2c(p)
 
 // ---------------------------------------------------------------------------------------------------
 // Which parts run on an RP board.
@@ -140,28 +187,43 @@ private pin_level(model: string) -> bool = model match
     "led" | "button" | "switch" | "potentiometer" | "joystick" | "buzzer" | "seven-segment" | "hd44780" -> true
     _ -> false
 
-// The parts that work through the chip's I2C, SPI or PIO, which come to an RP board next.
-private on_a_bus(model: string) -> bool = model match
-    "ssd1306" | "st7789" | "st7796" | "gt911" | "ft6x06" | "ds3231" | "ws2812" -> true
+// The parts benchtop does not run on an RP board yet: an OLED and a clock.
+private not_yet(model: string) -> bool = model match
+    "ssd1306" | "ds3231" -> true
     _ -> false
 
 /** Why benchtop cannot run board `b`'s parts on its RP chip, or None where it can. A part whose pins
  * are GPIOs runs; an LED may also be wired to another part's port, which shows nothing until that part
- * runs. The checker has already held each wire to a pin the board has, and a potentiometer's or a
- * joystick's to an ADC pin.
+ * runs. An SPI panel runs with its terminals on GPIOs (an ST7796's clock and data the SPI bus's), and a
+ * touch controller on an I2C bus that routes SDA and SCL; a terminal is the console on UART0; a WS2812
+ * is shown dark, with a note (`RpParts.note`). The checker has already held each wire to a pin the
+ * board has, and a potentiometer's or a joystick's to an ADC pin.
  */
 rp_parts_refusal(b: Board) -> Option[string]
     val chip = b.chip.name
     for p in b.parts
         val model = part_model(p)
-        if pin_level(model)
+        if pin_level(model) || model == "st7789" || model == "st7796"
             if model == "led" then continue
             for w in p.wires
+                if model == "st7796" && w.port == "spi" then continue
                 if virt.connection_pin(w.to) < 0 then return Some(s"`${p.name}.${w.port}` is wired to ${wired_to(w.to)}, and on an $chip board a ${model}'s wires go to the chip's GPIOs")
             continue
-        if on_a_bus(model) then return Some(s"`${p.name}` is ${article_of(model)} $model, which works through the $chip's I2C, SPI or PIO: benchtop runs an RP board's pin-level parts (LEDs, buttons, switches, potentiometers, joysticks, buzzers, seven-segment displays and HD44780s), and those parts come next")
+        if model == "gt911" || model == "ft6x06"
+            for w in p.wires
+                if w.port != "i2c" then return Some(s"`${p.name}.${w.port}` is wired, and benchtop's ${model} is polled over I2C: its INT and RESET are left unwired")
+            continue
+        if model == "terminal"
+            for w in p.wires
+                val on_uart0 = w.to match
+                    Bus(name) -> name == "uart0"
+                    _ -> false
+                if !on_uart0 then return Some(s"`${p.name}` is a terminal on ${wired_to(w.to)}, and an $chip board's console is UART0")
+            continue
+        if model == "ws2812" then continue
+        if not_yet(model) then return Some(s"`${p.name}` is ${article_of(model)} $model, which benchtop does not run on an $chip board yet: it runs an RP board's pin-level parts, its SPI panels and its I2C touch controllers, and the rest come next")
         return Some(s"benchtop does not emulate the parts on an $chip board yet, and `${p.name}` is ${article_of(p.kind)} ${p.kind}")
-    None
+    virt.bus_part_refusal(b, true)
 
 private wired_to(t: Target) -> string = t match
     Pin(n) -> n
@@ -187,28 +249,49 @@ struct RpBuzzer
     level: bool
     driven: bool
 
+/** A touch controller of an RP board and the GPIOs its bus's SDA and SCL are on. */
+struct RpTouch
+    model: &virt.Touchscreen
+    sda: u32
+    scl: u32
+
 /** The parts of an RP board on its chip: each part's control as the window or a script sets it (as the
- * workbench's session keeps them), the displays its GPIOs drive and its buzzers.
+ * workbench's session keeps them), the displays its GPIOs drive, its buzzers, its SPI panels, its I2C
+ * touch controllers, and a note for the person running it, given once.
  */
 struct RpParts
     parts: Buf[Part]
     inputs: Buf[PartInput]
     displays: virt.Displays
     buzzers: Buf[RpBuzzer]
+    panels: Buf[&virt.Panel]
+    touches: Buf[RpTouch]
+    note: Option[string]
 
 /** The parts of `b`, which `rp_parts_refusal` has passed, every control at rest, on no chip yet. */
 rp_parts(b: Board) -> RpParts
     var inputs: Buf[PartInput] = buf()
     var buzzers: Buf[RpBuzzer] = buf()
+    var panels: Buf[&virt.Panel] = buf()
+    var touches: Buf[RpTouch] = buf()
+    var note: Option[string] = None
     for p in b.parts
         inputs.push(virt.resting(p))
+        virt.panel_of(b, p) match
+            Some(panel) -> panels.push(panel)
+            None -> ()
+        virt.touchscreen_of(p) match
+            Some(t) -> touches.push(RpTouch(t, u32(virt.bus_signal_pin(b, p, "i2c", "sda")), u32(virt.bus_signal_pin(b, p, "i2c", "scl"))))
+            None -> ()
+        if part_model(p) == "ws2812" && note.is_none()
+            note = Some(s"`${p.name}` (ws2812) is shown dark: benchtop does not decode a WS2812's waveform on an RP board yet")
         if part_model(p) != "buzzer" then continue
         val pin = virt.terminal_pin(p, "pin")
         if pin < 0 then continue
         val gain = real(part_whole(p, "gain", 12)) / 100.0
         buzzers.push(RpBuzzer(p.name, u32(pin), part_text(p, "kind", "passive") == "active", u64(part_whole(p, "tone", 4000)),
             gain, audio.synth(48000, 48000, gain), 0, false, false))
-    RpParts(b.parts, inputs, virt.displays_of(b), buzzers)
+    RpParts(b.parts, inputs, virt.displays_of(b), buzzers, panels, touches, note)
 
 impl RpParts
     /** The part named `name`, if the board has it. */
@@ -245,10 +328,29 @@ impl RpParts
         for b in self.buzzers do if b.name == name then return audio.take(b.synth)
         buf()
 
+    /** What the glass of the panel `name` shows now; None where the board has no such panel. */
+    frame(*self, name: string) -> Option[virt.TftFrame]
+        for p in self.panels do if p.name() == name then return Some(p.glass())
+        None
+
+    /** The touch controller `name`'s coordinate range as its configuration stands. */
+    touch_size(*self, name: string) -> Option[(int, int)]
+        for t in self.touches do if t.model.name == name then return Some(t.model.size())
+        None
+
+    /** A finger at (x, y) on the touch controller `name`, or lifted. */
+    touch(*self, name: string, x: int, y: int, down: bool)
+        for t in self.touches do if t.model.name == name then t.model.point(x, y, down)
+
+    /** Every finger lifted from every touch controller. */
+    lift_touches(*self)
+        for t in self.touches do t.model.lift()
+
 private travel(at: int) -> int = if at < 0 then 0 elif at > virt.POSITION_MAX then virt.POSITION_MAX else at
 
-/** Put the parts on chip `c`: it watches the pins the displays and buzzers are wired to, and every
- * control is put on its pins as it stands.
+/** Put the parts on chip `c`, a new board: it watches the pins the displays and buzzers are wired to,
+ * each SPI panel, its controller fresh, hears its terminals' GPIOs, each touch controller, booted, goes
+ * on the I2C lines, and every control is put on its pins as it stands.
  */
 connect_parts[C: PartPins](ps: *RpParts, c: *C)
     var mask: u64 = 0
@@ -259,6 +361,17 @@ connect_parts[C: PartPins](ps: *RpParts, c: *C)
             val n = virt.connection_pin(w.to)
             if n >= 0 then mask |= 1u64 << u64(n)
     c.part_watch(mask)
+    for panel in ps.panels
+        panel.restart()
+        val pins = panel.pins()
+        var heard: u64 = 0
+        for n in [pins.cs, pins.sck, pins.mosi, pins.dc, pins.reset] do if n >= 0 then heard |= 1u64 << u64(n)
+        c.part_hook(PinHook(heard, (levels, driven) -> panel.hear(levels, driven)))
+    for t in ps.touches
+        val model = t.model
+        model.boot()
+        c.part_i2c(I2cPart(t.sda, t.scl, Device(model.address, (w, reading, time) -> model.start(reading),
+            (w, byte, time) -> model.write(byte), (w, time) -> model.read()), true))
     apply_parts(ps, c)
 
 /** Put every part's control on chip `c`'s pins: a closed button or switch drives its GPIO to its active

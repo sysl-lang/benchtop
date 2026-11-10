@@ -1,0 +1,183 @@
+module sh.sysl.benchtop.chip
+@tests
+
+// The bus parts of an RP board at the chip's own registers (`chip/parts.sysl`): an ST7796 that hears its
+// GPIOs through a pin hook, at every SPI edge and every GPIO change, and a GT911 on I2C0, both the
+// workbench's models, on the Pico 2 with the kit's wiring (`testdata/rp-parts/pico2-kit.hocon`); the
+// parts that are refused on an RP board, each by name; and a chip with no bus part paying nothing.
+
+import sh.sysl.benchtop.{library, load}
+import sh.sysl.parsing.source_of
+import sh.sysl.rp2350.clocks as clk
+import sh.sysl.rp2350.i2c0 as ir
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.sio as sio
+import sh.sysl.rp2350.spi0 as sp
+
+private val KIT2 = "testdata/rp-parts/pico2-kit.hocon"
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const CS: u32 = 5
+private const DC: u32 = 6
+private const RESET: u32 = 7
+// One SCL bit in clk_sys cycles at the counts `master` sets: HCNT 9, LCNT 8, SPKLEN 1, plus 8.
+private const BIT: u64 = 26
+
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+
+// The Pico 2 with the kit's screen and touch panel on it: the pads, SPI0, I2C0 and clk_peri out of reset,
+// GP2 and GP3 SPI0's, GP8 and GP9 I2C0's with their pull-ups, and CS, D/C and RESET outputs of the SIO,
+// chip select and reset high.
+private kit_chip(ps: *RpParts) -> Rp2350
+    var c = rp2350()
+    connect_parts(ps, &c)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK | rr.RESET_SPI0_MASK | rr.RESET_I2C0_MASK)
+    wr(&c, clk.BASE + clk.CLK_PERI_CTRL_OFFSET, clk.CLK_PERI_CTRL_ENABLE_MASK)
+    for n in [2u32, 3] do function(&c, n, io.GPIO0_CTRL_FUNCSEL_SPI0_RX)
+    for n in [8u32, 9]
+        wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET, pads.GPIO0_PUE_MASK)
+        function(&c, n, 3)
+    wr(&c, sio.BASE + sio.GPIO_OUT_SET_OFFSET, (1 << CS) | (1 << RESET))
+    wr(&c, sio.BASE + sio.GPIO_OE_SET_OFFSET, (1 << CS) | (1 << DC) | (1 << RESET))
+    for n in [CS, DC, RESET] do function(&c, n, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    // SPI0 in mode 0, eight bits a word, two clk_peri cycles a bit.
+    wr(&c, sp.BASE + sp.SSPCR0_OFFSET, 7)
+    wr(&c, sp.BASE + sp.SSPCPSR_OFFSET, 2)
+    wr(&c, sp.BASE + sp.SSPCR1_OFFSET, 2)
+    c
+
+// GPIO `n` given to function `f` as the SDK's gpio_set_function leaves it.
+private function(c: *Rp2350, n: u32, f: u32)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + CLR, pads.GPIO0_OD_MASK | pads.GPIO0_ISO_MASK)
+    wr(c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET, pads.GPIO0_IE_MASK)
+    wr(c, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * n, f)
+
+// The SIO output `n` set to `high`.
+private out(c: *Rp2350, n: u32, high: bool) = wr(c, sio.BASE + (if high then sio.GPIO_OUT_SET_OFFSET else sio.GPIO_OUT_CLR_OFFSET), 1 << n)
+
+// `bytes` over SPI0 with D/C at `data`, each word shifted out before the next goes in.
+private send(c: *Rp2350, data: bool, bytes: []const u32)
+    out(c, DC, data)
+    for b in bytes
+        wr(c, sp.BASE + sp.SSPDR_OFFSET, b)
+        while rd(c, sp.BASE + sp.SSPSR_OFFSET) & 16 != 0 do c.advance(4)
+        rd(c, sp.BASE + sp.SSPDR_OFFSET)
+
+// What the glass shows at its top-left pixel.
+private corner(ps: *RpParts) -> u32 = ps.frame("lcd").unwrap().pixels[0]
+
+// Woken, in 16-bit colour, one red pixel written at the top left.
+private red_pixel(c: *Rp2350)
+    send(c, false, [0x11, 0x29, 0x3A])
+    send(c, true, [0x55])
+    send(c, false, [0x2C])
+    send(c, true, [0xF8, 0x00])
+
+@test("an ST7796 on the Pico 2's SPI0: chip select high ignores every byte; D/C low makes a command and high its data; RESET held low resets the controller, its memory kept")
+rp_st7796_framing()
+    var ps = rp_parts(described(KIT2).unwrap().0)
+    var c = kit_chip(&ps)
+    assert(ps.frame("lcd").unwrap().width == 320 && ps.frame("lcd").unwrap().height == 480)
+    red_pixel(&c)
+    assert(corner(&ps) == 0, "chip select high: the panel heard nothing, and is still asleep and dark")
+    out(&c, CS, false)
+    // RAMWR sent as data starts no write: the pixel's bytes land nowhere.
+    send(&c, false, [0x11, 0x29, 0x3A])
+    send(&c, true, [0x55, 0x2C, 0xF8, 0x00])
+    assert(corner(&ps) == 0, s"RAMWR as data: ${corner(&ps)}")
+    send(&c, false, [0x2C])
+    send(&c, true, [0xF8, 0x00])
+    assert(corner(&ps) == 0xFF0000, s"${corner(&ps)}")
+    // RESET low, with no SPI edge after it: the controller is asleep again and the glass dark.
+    out(&c, RESET, false)
+    assert(corner(&ps) == 0, "held in reset")
+    out(&c, RESET, true)
+    send(&c, false, [0x11, 0x29])
+    assert(corner(&ps) == 0xFF0000, "the memory outlives the reset")
+    // Deselected in the middle of the stream: the bytes after are ignored again.
+    out(&c, CS, true)
+    send(&c, false, [0x28])
+    assert(corner(&ps) == 0xFF0000, "DISPOFF with chip select high is not heard")
+
+// I2C0 a master at the shortest SCL the counts allow, addressing `tar`.
+private master(c: *Rp2350, tar: u32)
+    wr(c, ir.BASE + ir.IC_ENABLE_OFFSET, 0)
+    wr(c, ir.BASE + ir.IC_CON_OFFSET, 0x165)
+    wr(c, ir.BASE + ir.IC_FS_SCL_HCNT_OFFSET, 9)
+    wr(c, ir.BASE + ir.IC_FS_SCL_LCNT_OFFSET, 8)
+    wr(c, ir.BASE + ir.IC_FS_SPKLEN_OFFSET, 1)
+    wr(c, ir.BASE + ir.IC_TAR_OFFSET, tar)
+    wr(c, ir.BASE + ir.IC_ENABLE_OFFSET, 1)
+
+// The `n` bytes from register `reg` of the part at I2C0's target on: its two address bytes written, a
+// repeated START and `n` reads, the last with a STOP.
+private registers(c: *Rp2350, reg: u32, n: u32) -> [4]u32
+    wr(c, ir.BASE + ir.IC_DATA_CMD_OFFSET, reg >> 8)
+    wr(c, ir.BASE + ir.IC_DATA_CMD_OFFSET, reg & 0xFF)
+    for i in 0..<n
+        val restart = if i == 0 then ir.IC_DATA_CMD_RESTART_MASK else 0
+        val stop = if i == n - 1 then ir.IC_DATA_CMD_STOP_MASK else 0
+        wr(c, ir.BASE + ir.IC_DATA_CMD_OFFSET, ir.IC_DATA_CMD_CMD_MASK | restart | stop)
+    c.advance(u64(4 + 2 * n) * 9 * BIT)
+    var got: [4]u32 = [0; 4]
+    for i in 0..<n do got[i] = rd(c, ir.BASE + ir.IC_DATA_CMD_OFFSET) & 0xFF
+    got
+
+@test("a GT911 on the Pico 2's I2C0: a wrong address is NACKed with ABRT_7B_ADDR_NOACK; at 0x5d it reads its product ID, a status of 0 with no touch, and a touch as ready with its point")
+rp_gt911_reads()
+    var ps = rp_parts(described(KIT2).unwrap().0)
+    var c = kit_chip(&ps)
+    master(&c, 0x14)
+    wr(&c, ir.BASE + ir.IC_DATA_CMD_OFFSET, 0x81 | ir.IC_DATA_CMD_STOP_MASK)
+    c.advance(4 * 9 * BIT)
+    assert(rd(&c, ir.BASE + ir.IC_RAW_INTR_STAT_OFFSET) & ir.IC_RAW_INTR_STAT_TX_ABRT_MASK != 0, "nobody answers 0x14")
+    assert(rd(&c, ir.BASE + ir.IC_TX_ABRT_SOURCE_OFFSET) & ir.IC_TX_ABRT_SOURCE_ABRT_7B_ADDR_NOACK_MASK != 0)
+    rd(&c, ir.BASE + ir.IC_CLR_TX_ABRT_OFFSET)
+    master(&c, 0x5d)
+    val id = registers(&c, 0x8140, 3)
+    assert(id[0] == u32('9') && id[1] == u32('1') && id[2] == u32('1'), s"${id[0]} ${id[1]} ${id[2]}")
+    assert(rd(&c, ir.BASE + ir.IC_RAW_INTR_STAT_OFFSET) & ir.IC_RAW_INTR_STAT_TX_ABRT_MASK == 0, "0x5d is acknowledged")
+    assert(registers(&c, 0x814e, 1)[0] == 0, "no touch: STATUS reads 0")
+    ps.touch("touch", 123, 456, true)
+    assert(registers(&c, 0x814e, 1)[0] == 0x81, "a touch: ready, one point")
+    val p = registers(&c, 0x8150, 4)
+    assert(p[0] | (p[1] << 8) == 123 && p[2] | (p[3] << 8) == 456, s"${p[0]} ${p[1]} ${p[2]} ${p[3]}")
+    assert(ps.touch_size("touch") == Some((320, 480)) && ps.touch_size("lcd").is_none() && ps.frame("touch").is_none())
+
+@test("a chip with no SPI panel has no pin hook, so an SPI edge and a GPIO change cost it one test each; one with a panel hears both")
+rp_hook_costs_nothing_without_a_panel()
+    var none = rp_parts(described("testdata/rp-parts/pico2-parts.hocon").unwrap().0)
+    var c = rp2350()
+    connect_parts(&none, &c)
+    assert(!c.watch.hooked && c.watch.hooks.is_empty(), "no panel, no hook")
+    var ps = rp_parts(described(KIT2).unwrap().0)
+    var k = rp2350()
+    connect_parts(&ps, &k)
+    assert(k.watch.hooked && k.watch.watching && k.watch.hooks.len() == 1 && k.watch.hooks[0].mask == 0xEC, s"${k.watch.hooks[0].mask}")
+
+// The refusal benchtop gives for the parts `parts` and buses `buses` on a Pico 2.
+private refusal(parts: string, buses: string) -> Option[string]
+    val text = s"product { name = p, boards { pico { board = pico2 } }, parts { $parts }, buses { $buses } }"
+    val got = load(source_of("p.hocon", text), library())
+    assert(!got.report.has_errors(), got.report.render(source_of("p.hocon", text)))
+    rp_parts_refusal(on_rp_board(got.description).unwrap())
+
+@test("bus parts refused on an RP board, each by name: a panel or touch controller on a bus that routes no clock, data, SDA or SCL; a GT911 with INT wired; a terminal off UART0; an SSD1306")
+rp_bus_part_refusals()
+    val lcd = "lcd { part = st7796, width = 320, height = 480, wire { spi = pico.spi0, cs = pico.GP5, dc = pico.GP6 } }"
+    assert(refusal(lcd, "pico.spi0 { sck = GP2, tx = GP3 }").is_none())
+    val no_tx = refusal(lcd, "pico.spi0 { sck = GP2 }").unwrap()
+    assert(no_tx.contains("`lcd` is a panel on `spi0`, and the board's `buses` routes `spi0.tx` to no pin"), no_tx)
+    val touch = "t { part = gt911, wire { i2c = pico.i2c0 } }"
+    assert(refusal(touch, "pico.i2c0 { sda = GP8, scl = GP9 }").is_none())
+    val no_scl = refusal(touch, "pico.i2c0 { sda = GP8 }").unwrap()
+    assert(no_scl.contains("routes `i2c0.scl` to no pin"), no_scl)
+    val int = refusal("t { part = gt911, wire { i2c = pico.i2c0, int = pico.GP10 } }", "pico.i2c0 { sda = GP8, scl = GP9 }").unwrap()
+    assert(int.contains("`t.int` is wired") && int.contains("INT and RESET are left unwired"), int)
+    val uart1 = refusal("c { part = terminal, wire { uart = pico.uart1 } }", "pico.uart1 { tx = GP4, rx = GP5 }").unwrap()
+    assert(uart1.contains("console is UART0"), uart1)
+    val oled = refusal("o { part = ssd1306, wire { sck = pico.GP2, mosi = pico.GP3, cs = pico.GP5, dc = pico.GP6, reset = pico.GP7 } }", "").unwrap()
+    assert(oled.contains("ssd1306, which benchtop does not run on an rp2350 board yet"), oled)

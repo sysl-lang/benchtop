@@ -50,6 +50,9 @@ target_link_libraries(rtc_alarm hardware_rtc)
 # parts: the Pico 2's program, the same on the Pico's header.
 benchtop_program(parts ../pico2/parts.c)
 target_link_libraries(parts hardware_pwm)
+# breadboard_kit: the Pico Breadboard Kit's ST7796 screen on SPI0 and GT911 touch panel on I2C0.
+benchtop_program(breadboard_kit breadboard_kit.c)
+target_link_libraries(breadboard_kit hardware_spi hardware_i2c)
 # rom_crosscheck: a flash image with a UF2, for a real Pico as well as benchtop, stdio on UART0 and USB.
 # benchtop's own ROM routines are compiled into it by sysl from rom_crosscheck/ours, an archive it links.
 find_program(SYSL_COMPILER sysl REQUIRED)

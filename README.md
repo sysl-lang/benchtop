@@ -358,9 +358,21 @@ while open, so the firmware's `gpio_pull_up` and GPIO interrupts behave as on th
 potentiometer's or joystick's wipers go on ADC pins (GP26 to GP29); a buzzer sounds the PWM slice its
 GPIO is routed to, or the pin's level; the seven-segment display and the HD44780 read the GPIOs the
 firmware drives. A pin the board does not expose and a potentiometer off the ADC pins are refused by
-the checker. The parts on the chip's I2C, SPI and PIO (SSD1306, ST7789, ST7796, GT911, DS3231, WS2812)
-are refused by name on an RP board for now; they come next. An RP board runs from the terminal, from a
-scripted run and in the window.
+the checker. An SPI panel (an ST7789 on its four GPIO terminals, an ST7796 on an SPI bus with its chip
+select, D/C and reset on GPIOs) hears its pins edge by edge as the chip's SPI controller or the SIO
+drives them, and a touch controller (GT911, FT6x06) answers on the I2C bus its `buses` route — the same
+models the virtual boards run, so a panel looks and touches the same on every board. A `terminal` on
+UART0 is the board's console. The SSD1306 and the DS3231 are refused by name on an RP board for now, and
+a WS2812 is shown dark, with a note; they come next. An RP board runs from the terminal, from a scripted
+run and in the window.
+
+The Pico Breadboard Kit (`boards/pico-breadboard-kit.hocon`, a product: the ST7796 and GT911 on the Pico's
+SPI0 and I2C0) runs `examples/pico/breadboard_kit.c`, which fills the screen, prints the GT911's product
+ID and then each touch, and draws a square under the finger:
+
+```
+./benchtop run --window --board boards/pico-breadboard-kit.hocon examples/pico/breadboard_kit.elf
+```
 
 **In the window** (`--window`) the board is drawn from its `view`, as the workbench is: click or hold
 **BTN**, flip a switch, drag a potentiometer's dial or a joystick, watch the digit and the LCD, and hear
