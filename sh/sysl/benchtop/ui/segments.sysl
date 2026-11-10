@@ -1,0 +1,193 @@
+module sh.sysl.benchtop.ui
+
+import sh.sysl.ui as ui
+import sh.sysl.plutovg as vg
+import sysl.buf.{Buf, buf}
+import sysl.math.{min, max, Float}
+
+/** A real LED digit leans forward by 10 degrees; this is tan(10°), how far right a point moves per
+ * unit it sits above the digit's baseline.
+ */
+const SEGMENT_LEAN: real = 0.17632698
+
+/** The lit colour a part asking for "red" gets: the slightly pink red of a lit red LED segment, not
+ * the brighter red an indicator LED is drawn in.
+ */
+const SEGMENT_RED: u32 = 0xE8585F
+
+/** Where the digits of a seven-segment part sit inside its box, in the box's own coordinates.
+ *
+ * Each digit is drawn first upright, `w` wide and `h` tall, its top-left at (`x` + i × `pitch`, `y`),
+ * and then leaned: a point `up` above the digit's baseline moves right by `up` × SEGMENT_LEAN. A
+ * segment is `stroke` thick and its neighbours are `gap` away from it across the mitred joints.
+ */
+struct DigitLayout
+    x: real
+    y: real
+    w: real
+    h: real
+    stroke: real
+    gap: real
+    pitch: real
+
+/** The layout of `count` digits centred in a `width` × `height` box: each digit 0.6:1, its stroke a
+ * seventh and a half of its width, the joints a third of a stroke, and a pitch that leaves room for
+ * the lean and the decimal point, as on a 0.56" part.
+ */
+private[ui] digit_layout(width: real, height: real, count: int) -> DigitLayout
+    val pad = (width.min(height) * 0.12).max(3.0)
+    val n = real(max(1, count))
+    val span = (n - 1.0) * 0.88 + 0.6 + SEGMENT_LEAN
+    val h = (height - 2.0 * pad).min((width - 2.0 * pad) / span).max(4.0)
+    val w = 0.6 * h
+    val stroke = w / 7.5
+    DigitLayout((width - span * h) / 2.0, (height - h) / 2.0, w, h, stroke, stroke / 3.0, 0.88 * h)
+
+/** Digit `digit`'s upright point (`px`, `py`) placed in the box: offset to the digit and leaned. */
+private[ui] digit_point(l: DigitLayout, digit: int, px: real, py: real) -> (real, real) =
+    (l.x + real(digit) * l.pitch + px + (l.h - py) * SEGMENT_LEAN, l.y + py)
+
+/** Segment `bit` (a..g = 0..6) of an upright digit, as a tile of a partition of the digit's outline.
+ *
+ * The tiles are drawn as thick as a stroke plus a gap and share their edges exactly: two segments
+ * meeting at a corner split it along the diagonal from the outer corner to the inner one, and the
+ * middle bar meets the four uprights at a point. The outline's outer corners are chamfered, so the
+ * digit's silhouette reads as a rounded rectangle. Shrinking each tile by half a gap is what opens
+ * the joints.
+ */
+private segment_tile(l: DigitLayout, bit: int) -> Buf[(real, real)]
+    val w = l.w
+    val h = l.h
+    val t = l.stroke + l.gap
+    val ch = 0.8 * t
+    val m = h / 2.0
+    val a = [(ch, 0.0), (w - ch, 0.0), (w - ch / 2.0, ch / 2.0), (w - t, t), (t, t), (ch / 2.0, ch / 2.0)]
+    val f = [(0.0, ch), (ch / 2.0, ch / 2.0), (t, t), (t, m - t / 2.0), (t / 2.0, m), (0.0, m - t / 2.0)]
+    val g = [(t / 2.0, m), (t, m - t / 2.0), (w - t, m - t / 2.0), (w - t / 2.0, m), (w - t, m + t / 2.0), (t, m + t / 2.0)]
+    var out: Buf[(real, real)] = buf()
+    for i in 0..<6
+        out.push(bit match
+            0 -> a[i]
+            1 -> (w - f[i].0, f[i].1)
+            2 -> (w - f[i].0, h - f[i].1)
+            3 -> (a[i].0, h - a[i].1)
+            4 -> (f[i].0, h - f[i].1)
+            5 -> f[i]
+            _ -> g[i])
+    out
+
+/** A convex polygon moved inward by `d` along every edge's normal, whichever way round it winds. */
+private[ui] inset_polygon(p: Buf[(real, real)], d: real) -> Buf[(real, real)]
+    val n = p.len()
+    var area = 0.0
+    for i in 0..<n
+        val (x0, y0) = p[i]
+        val (x1, y1) = p[(i + 1) % n]
+        area += x0 * y1 - x1 * y0
+    val side = if area > 0.0 then 1.0 else -1.0
+    // Each edge as a line n·p = k, its normal pointing into the polygon and k moved in by `d`.
+    var lines: Buf[(real, real, real)] = buf()
+    for i in 0..<n
+        val (x0, y0) = p[i]
+        val (x1, y1) = p[(i + 1) % n]
+        val len = ((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0)).sqrt().max(1e-9)
+        val nx = -(y1 - y0) / len * side
+        val ny = (x1 - x0) / len * side
+        lines.push((nx, ny, nx * x0 + ny * y0 + d))
+    var out: Buf[(real, real)] = buf()
+    for i in 0..<n
+        val (ax, ay, ak) = lines[(i + n - 1) % n]
+        val (bx, by, bk) = lines[i]
+        val det = ax * by - ay * bx
+        if det.abs() < 1e-9 then out.push(p[i])
+        else out.push(((ak * by - ay * bk) / det, (ax * bk - ak * bx) / det))
+    out
+
+/** Segment `bit` of digit `digit` as drawn: its tile leaned into place, then shrunk by half a gap. */
+private[ui] segment_shape(l: DigitLayout, digit: int, bit: int) -> Buf[(real, real)]
+    val tile = segment_tile(l, bit)
+    var leaned: Buf[(real, real)] = buf()
+    for i in 0..<tile.len()
+        val (px, py) = tile[i]
+        leaned.push(digit_point(l, digit, px, py))
+    inset_polygon(leaned, l.gap / 2.0)
+
+/** The middle of segment `bit` of digit `digit`, the average of its corners. */
+private[ui] segment_centre(l: DigitLayout, digit: int, bit: int) -> (real, real)
+    val shape = segment_shape(l, digit, bit)
+    var sx = 0.0
+    var sy = 0.0
+    for i in 0..<shape.len()
+        sx += shape[i].0
+        sy += shape[i].1
+    (sx / real(shape.len()), sy / real(shape.len()))
+
+/** Digit `digit`'s decimal point: its centre and radius, below and right of the digit's leaned box. */
+private[ui] point_dot(l: DigitLayout, digit: int) -> (real, real, real)
+    val radius = 0.65 * l.stroke
+    val (x, y) = digit_point(l, digit, l.w + 0.25 * l.stroke + radius, l.h - radius)
+    (x, y, radius)
+
+/** A colour `k` of the way from `a` to `b`, channel by channel. */
+private[ui] blend_color(a: u32, b: u32, k: real) -> u32
+    var out = 0u32
+    for shift in [0u32, 8, 16]
+        val from = real((a >> shift) & 255)
+        val to = real((b >> shift) & 255)
+        out |= u32(from + (to - from) * k + 0.5) << shift
+    out
+
+private paint(cv: &vg.Canvas, color: u32, alpha: real) =
+    cv.rgba(f32((color >> 16) & 255) / 255.0, f32((color >> 8) & 255) / 255.0, f32(color & 255) / 255.0, f32(alpha))
+
+private trace(cv: &vg.Canvas, shape: Buf[(real, real)])
+    cv.begin()
+    cv.move_to(f32(shape[0].0), f32(shape[0].1))
+    for i in 1..<shape.len() do cv.line_to(f32(shape[i].0), f32(shape[i].1))
+    cv.close_path()
+
+/** Draw `count` digits laid out by `l` into `cv`: lit segments in `lit` with a faint halo that the
+ * neighbouring segments, drawn over it, keep to the gaps and the outside; unlit ones in `unlit`.
+ */
+private[ui] paint_digits(cv: &vg.Canvas, l: DigitLayout, count: int, masks: [8]u8, lit: u32, unlit: u32)
+    cv.line_join(vg.LineJoin.Round)
+    cv.line_width(f32(l.stroke * 0.7))
+    paint(cv, lit, 0.10)
+    for digit in 0..<count
+        for bit in 0..<7
+            if (masks[digit] & (1u8 << bit)) == 0 then continue
+            trace(cv, segment_shape(l, digit, bit))
+            cv.stroke()
+        if (masks[digit] & 128) != 0
+            val (x, y, radius) = point_dot(l, digit)
+            cv.begin()
+            cv.circle(f32(x), f32(y), f32(radius + l.stroke * 0.35))
+            cv.fill()
+    for digit in 0..<count
+        for bit in 0..<7
+            trace(cv, segment_shape(l, digit, bit))
+            paint(cv, if (masks[digit] & (1u8 << bit)) != 0 then lit else unlit, 1.0)
+            cv.fill()
+        val (x, y, radius) = point_dot(l, digit)
+        cv.begin()
+        cv.circle(f32(x), f32(y), f32(radius))
+        paint(cv, if (masks[digit] & 128) != 0 then lit else unlit, 1.0)
+        cv.fill()
+
+/** A seven-segment part as a real common-cathode LED digit: a matte grey face, leaned segments with
+ * mitred joints, a round decimal point, and unlit segments barely lighter than the face. The digits
+ * are drawn into a picture at the canvas's pixel density and laid over the part's module.
+ */
+private[ui] draw_digits(c: *ui.Canvas, r: ui.Rect, count: int, masks: [8]u8, color: u32)
+    draw_module(c, r, SEGMENT_FACE, SEGMENT_EDGE)
+    if r.w < 8 || r.h < 8 then return
+    val scale = c.pixel_scale().max(1.0)
+    val surface = vg.surface(int((real(r.w) * scale).ceil()), int((real(r.h) * scale).ceil())) match
+        Some(s) -> s
+        None -> return
+    val cv = vg.canvas(surface) match
+        Some(cv) -> cv
+        None -> return
+    cv.scale(f32(scale), f32(scale))
+    paint_digits(cv, digit_layout(real(r.w), real(r.h), count), count, masks, color, blend_color(SEGMENT_FACE, color, 0.10))
+    c.draw_image(r, ui.Image(surface))
