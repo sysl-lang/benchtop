@@ -1,0 +1,180 @@
+module sh.sysl.benchtop.virt
+
+// The board interface: a board as every front end drives it — the window, a headless script and gdb —
+// whichever engine runs it. Two engines implement it: benchtop's Cortex-M machine (`machine_guest`, the
+// virtual boards, the workbench, the STM32H747I-DISCO) and the RP2040 and RP2350 chips' own boards
+// (`chip.rp_guest`). A feature or a part written against `Guest` therefore runs on every board, with
+// nothing between it and the engine but this trait.
+//
+// Nothing here is on an emulator's hot path: each member is called once a frame, once a slice of
+// thousands of cycles, once a gdb packet or once a part's control changes. The cores run inside the
+// engine, never through the trait.
+
+import sh.sysl.benchtop.Part
+import sh.sysl.benchtop.parts.hd44780.Lcd
+import sh.sysl.benchtop.v6m.{Cpu, Memory, Stop, limit_of, load16, load32, load8, set_limit, store16, store32, store8}
+import sysl.buf.Buf
+
+/** Where a guest's run has got to after a frame: what the desktop shows of it, why it stopped, and
+ * what the machine's CPU workers were doing where they run it.
+ */
+struct GuestStanding
+    status: RunStatus
+    message: string
+    pc: u32
+    instructions: u64
+    observation: Option[WorkerObservation]
+
+/** How a slice of a board run on the caller's thread ended. */
+enum SliceEnd
+    /** Its budget ran out with every core running. */
+    Ran
+    /** Every core sleeps, and nothing on the board will wake one: only something from outside will. */
+    Asleep
+    /** The guest ended the run itself — an exit, a `BKPT` or `EBREAK`, a reset request — with this
+     * status, for this reason. */
+    Ended(status: int, why: string)
+    /** A core faulted, or the chip refused something benchtop does not model. */
+    Faulted(why: string)
+
+/** A board, as the window, a headless script and gdb drive it. Every member is called from one thread,
+ * the front end's; a board the window has `start`ed runs on threads of its own behind it. Parts are
+ * named by the board's own names.
+ */
+trait Guest
+    // ---------------------------------------------------------------------------------------------
+    // Power.
+
+    /** `image` as `restart` takes it, where it boots on a board of this one's kind; or why it does not. */
+    checked(*self, image: []const u8) -> Result[Buf[u8], string]
+    /** Power the board on again with `image`, as `checked` answered it. Answers the PC to show until the
+     * board first reports where it is, or why it does not boot.
+     */
+    restart(*self, image: []const u8) -> Result[u32, string]
+
+    // ---------------------------------------------------------------------------------------------
+    // Paced, for the window.
+
+    /** Run the board on host threads of its own from now on, paced to `hz` where the engine paces by
+     * the caller's clock; `parallel` gives each core a thread.
+     */
+    start(*self, parallel: bool, hz: u64) -> Result[unit, string]
+    /** Stop the board's threads and join them. */
+    stop(*self)
+    /** The window paused the run: hold the board where it is now. */
+    pause(*self)
+    /** One frame of the run: held while `paused`, one instruction where `step`, otherwise up to `budget`
+     * instructions where the board runs on the caller's thread.
+     */
+    advance(*self, paused: bool, step: bool, budget: u64) -> GuestStanding
+
+    // ---------------------------------------------------------------------------------------------
+    // Unpaced, on the caller's thread: a headless script and gdb.
+
+    /** A slice as `benchtop run` takes them, the parts looking at the pins after it. */
+    run_slice(*self) -> SliceEnd
+    /** A short slice, so that a debugger answers gdb between them. */
+    debug_slice(*self) -> SliceEnd
+    /** At the end of a run, let the board finish sending what its console holds, as under a debugger;
+     * or why it cannot.
+     */
+    finish_sending(*self) -> Result[unit, string]
+    /** Every core sleeps but something from outside is due: a slice's time passes. */
+    idle(*self)
+    /** Whether the board's chip names its clock's rate, so a time in seconds means something on it. */
+    rated(*self) -> bool
+    /** The board's clock: cycles since power-on, and the nanoseconds they come to. */
+    now(*self) -> (u64, u64)
+    /** A note the board has for the person running it (a USB device enumerated), once. */
+    take_note(*self) -> Option[string]
+
+    // ---------------------------------------------------------------------------------------------
+    // Parts.
+
+    /** Put the parts' controls on the board's pins: `inputs[i]` is `parts[i]`'s. */
+    apply_inputs(*self, parts: []const Part, inputs: []const PartInput)
+    /** Whether the LED `p` is lit. */
+    lit(*self, p: Part) -> bool
+    /** What each digit of the seven-segment display `p`, shown as `name`, shows now. */
+    segments(*self, name: string, p: Part) -> [8]u8
+    /** The HD44780 `p`, shown as `name`, as its controller stands. */
+    lcd(*self, name: string, p: Part) -> Option[Lcd]
+    /** Whether the buzzer `p`, shown as `name`, is sounding. */
+    sounding(*self, name: string, p: Part) -> bool
+    /** Whether the board has anything the host plays. */
+    sounds(*self) -> bool
+    /** What the board's buzzers have sounded since the last call, mixed, at 48 kHz on one channel. */
+    take_sound(*self) -> Buf[f32]
+    /** Whether the board `board` has a pin `name` a press can hold, or why not. */
+    find_pin(*self, name: string, board: string) -> Result[unit, string]
+    /** Drive the pin `name` from off the chip at `level`, or let it go with None. */
+    drive_pin(*self, name: string, level: Option[bool])
+
+    // ---------------------------------------------------------------------------------------------
+    // The console.
+
+    /** What the console has shown past the `seen`th byte it ever showed, and how many it has shown. */
+    output_since(*self, seen: u64) -> (Buf[u8], u64)
+    /** Give the guest `bytes` on its console, queued; false where its console takes no input. */
+    type_keys(*self, bytes: []const u8) -> bool
+    /** Give the guest `c` on its console now: true once it is on its way, false where the console
+     * cannot take it yet, or why benchtop cannot send it.
+     */
+    send(*self, c: u8) -> Result[bool, string]
+    /** Why the board `board`'s console takes no typed input; empty where it does. */
+    console_refusal(*self, board: string) -> string
+    /** The console's input has ended. */
+    end_input(*self)
+
+    // ---------------------------------------------------------------------------------------------
+    // Debugging, while the board runs on the caller's thread.
+
+    /** How many Cortex-M cores gdb can debug; port `k` debugs core `k`. */
+    cores(*self) -> u32
+    core(*self, k: u32) -> *Cpu
+    /** Whether core `k` runs yet: a second core waits for the first to launch it. */
+    started(*self, k: u32) -> bool
+    /** The memory the cores share, which holds the breakpoints. */
+    memory(*self) -> &sync Memory
+    /** The `width` bytes at `a` as core `k` reads them, through the board's bus; None where nothing
+     * answers there. */
+    read(*self, k: u32, a: u32, width: u32) -> Option[u32]
+    /** `x`'s low `width` bytes stored at `a` as core `k` stores them; false where nothing takes them. */
+    write(*self, k: u32, a: u32, width: u32, x: u32) -> bool
+
+    // ---------------------------------------------------------------------------------------------
+    // What only benchtop's machine has yet.
+
+    /** The machine the board runs on, where it runs on benchtop's: the window draws its screens, its
+     * touch panels and its instruments, and plays its sound peripheral, from it. None for a board on a
+     * chip of its own.
+     */
+    machine(*self) -> Option[*Machine]
+
+/** The nanoseconds `cycles` of a clock at `hz` come to. */
+nanos(cycles: u64, hz: u64) -> u64 = if hz == 0 then 0 else u64(u128(cycles) * 1000000000 / u128(hz))
+
+/** The `width` bytes at `a` as `cpu` reads them: RAM and flash from the memory, the rest from the
+ * bus, as the guest's own load would, with the same effect on a device. None where the access would
+ * have stopped the core; the core's own stop, and its budget, are as they were. */
+core_read(cpu: *Cpu, a: u32, width: u32) -> Option[u32]
+    val (stop, at, limit) = (cpu.stop, cpu.stop_at, limit_of(cpu))
+    cpu.stop = Stop.Running
+    val v = if width == 4 then load32(cpu, a) elif width == 2 then load16(cpu, a) else load8(cpu, a)
+    val failed = cpu.stop != Stop.Running
+    cpu.stop = stop
+    cpu.stop_at = at
+    set_limit(cpu, limit)
+    if failed then None else Some(v)
+
+/** `x`'s low `width` bytes stored at `a` as `cpu` stores them: a store to code makes the records that
+ * read it decode again. Flash is the guest's read-only memory, and refuses the store. */
+core_write(cpu: *Cpu, a: u32, width: u32, x: u32) -> bool
+    val (stop, at, limit) = (cpu.stop, cpu.stop_at, limit_of(cpu))
+    cpu.stop = Stop.Running
+    if width == 4 then store32(cpu, a, x) elif width == 2 then store16(cpu, a, x) else store8(cpu, a, x)
+    val failed = cpu.stop != Stop.Running
+    cpu.stop = stop
+    cpu.stop_at = at
+    set_limit(cpu, limit)
+    !failed

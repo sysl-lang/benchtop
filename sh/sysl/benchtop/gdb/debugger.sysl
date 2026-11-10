@@ -1,7 +1,8 @@
 module sh.sysl.benchtop.gdb
 
 // gdb's side of a board: one gdb per core, each on a port of its own (`Server`), answered here packet by
-// packet against the board (`Target`).
+// packet against the board (`virt.Guest`), which it runs unpaced on this thread a short slice at a
+// time (`debug_slice`), its console on stdout a line at a time.
 //
 // **All-stop.** The board runs while any attached gdb has resumed its core, and stops as a whole: when
 // a core reaches a breakpoint its own gdb set, when a core stops for any other reason (a fault, the
@@ -22,65 +23,13 @@ module sh.sysl.benchtop.gdb
 // **Everything here runs on the thread that runs the board, between its slices**, so a register, a
 // memory word or a breakpoint is touched only while no core runs and no lock is needed.
 
-import sh.sysl.benchtop.v6m.{Cpu, Memory, Stop, WATCH_ACCESS, WATCH_READ, WATCH_WRITE, at_debug_break, clear_debug_break, clear_debug_watch, clear_debug_watches, debug_break_at, debug_resume, debug_step, limit_of, load16, load32, load8, set_debug_break, set_debug_watch, set_limit, store16, store32, store8}
-import sh.sysl.benchtop.virt.stop_message
+import sh.sysl.benchtop.host as host
+import sh.sysl.benchtop.v6m.{Cpu, Stop, WATCH_ACCESS, WATCH_READ, WATCH_WRITE, at_debug_break, clear_debug_break, clear_debug_watch, clear_debug_watches, debug_break_at, debug_resume, debug_step, set_debug_break, set_debug_watch}
+import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.virt.{SliceEnd, stop_message}
 import sysl.buf.{Buf, buf}
 import sysl.raw.str_cast
 import sysl.text.Search
-
-/** What gdb needs of a board: its cores, its memory as each core sees it, and a way to run it a little
- * at a time. */
-trait Target
-    /** How many cores the board has; gdb's port `k` debugs core `k`. */
-    cores(*self) -> u32
-    core(*self, k: u32) -> *Cpu
-    /** Whether core `k` runs yet: a second core waits for the first to launch it. */
-    started(*self, k: u32) -> bool
-    /** The memory the cores share, which holds the breakpoints. */
-    memory(*self) -> &sync Memory
-    /** Run the board one bounded slice, a few thousand instructions, and say what ended it. */
-    slice(*self) -> Slice
-    /** The `width` bytes at `a` as core `k` reads them, through the board's bus; None where nothing
-     * answers there. */
-    read(*self, k: u32, a: u32, width: u32) -> Option[u32] = core_read(self.core(k), a, width)
-    /** `x`'s low `width` bytes stored at `a` as core `k` stores them; false where nothing takes them. */
-    write(*self, k: u32, a: u32, width: u32, x: u32) -> bool = core_write(self.core(k), a, width, x)
-
-/** How a slice of the board ended. */
-enum Slice
-    // Its budget ran out with every core running.
-    Ran
-    // A core stopped: its `stop` says why.
-    Stopped
-    // Every core sleeps with nothing on the board to wake one.
-    Asleep
-    // The board refused something a core did, for the reason given.
-    Failed(why: string)
-
-/** The `width` bytes at `a` as `cpu` reads them: RAM and flash from the memory, the rest from the
- * bus, as the guest's own load would, with the same effect on a device. None where the access would
- * have stopped the core; the core's own stop, and its budget, are as they were. */
-core_read(cpu: *Cpu, a: u32, width: u32) -> Option[u32]
-    val (stop, at, limit) = (cpu.stop, cpu.stop_at, limit_of(cpu))
-    cpu.stop = Stop.Running
-    val v = if width == 4 then load32(cpu, a) elif width == 2 then load16(cpu, a) else load8(cpu, a)
-    val failed = cpu.stop != Stop.Running
-    cpu.stop = stop
-    cpu.stop_at = at
-    set_limit(cpu, limit)
-    if failed then None else Some(v)
-
-/** `x`'s low `width` bytes stored at `a` as `cpu` stores them: a store to code makes the records that
- * read it decode again. Flash is the guest's read-only memory, and refuses the store. */
-core_write(cpu: *Cpu, a: u32, width: u32, x: u32) -> bool
-    val (stop, at, limit) = (cpu.stop, cpu.stop_at, limit_of(cpu))
-    cpu.stop = Stop.Running
-    if width == 4 then store32(cpu, a, x) elif width == 2 then store16(cpu, a, x) else store8(cpu, a, x)
-    val failed = cpu.stop != Stop.Running
-    cpu.stop = stop
-    cpu.stop_at = at
-    set_limit(cpu, limit)
-    !failed
 
 /** A breakpoint a gdb set: where, and whether it asked for a hardware one (`Z1`). */
 struct Break
@@ -125,8 +74,8 @@ private enum Why
 const PACKET_SIZE: u32 = 0x4000
 
 /** gdb's view of a board: a link per core, and whether the board runs. */
-struct Debugger[T: Target]
-    t: *T
+struct Debugger
+    t: &virt.Guest
     links: [2]Link
     running: bool
     // The core a step is waiting on to wake, -1 for none.
@@ -134,11 +83,15 @@ struct Debugger[T: Target]
     // A gdb asked benchtop to end (`k`), or the guest exited; with the status to end with.
     quit: bool
     exit_code: int
+    // How much of the board's console `output_since` has given, and what of it is still to go to stdout:
+    // an unfinished line waits for its end.
+    seen: u64
+    unshown: Buf[u8]
 
 /** A debugger for `t`'s board, which holds it stopped until a gdb resumes it. */
-debugger[T: Target](t: *T) -> Debugger[T] = Debugger(t, [link(), link()], false, -1, false, 0)
+debugger(t: &virt.Guest) -> Debugger = Debugger(t, [link(), link()], false, -1, false, 0, 0, buf())
 
-impl[T: Target] Debugger[T]
+impl Debugger
     // -------------------------------------------------------------------------------------------
     // Connections.
 
@@ -191,10 +144,15 @@ impl[T: Target] Debugger[T]
      * ran anything. */
     advance(*self) -> bool
         if !self.running then return false
-        val end = self.t.slice()
+        val end = self.t.debug_slice()
+        self.show_console(!(end is SliceEnd.Ran))
+        self.t.take_note() match
+            Some(n) -> eprints(s"benchtop: $n\r\n")
+            None -> ()
         var stopped = false
         end match
-            Failed(why) ->
+            // The board refused something no core did: no core stopped to say why.
+            Faulted(why) -> if !self.core_stopped()
                 eprints(s"\r\nbenchtop: $why\r\n")
                 stopped = true
             _ -> ()
@@ -217,7 +175,24 @@ impl[T: Target] Debugger[T]
         if self.stepping >= 0 && !self.t.core(u32(self.stepping)).sleeping then stopped = true
         if stopped
             if self.links[0].attached || self.links[1].attached then self.stop_all() else self.unattended()
-        !(end is Slice.Asleep)
+        !(end is SliceEnd.Asleep)
+
+    // Whether any core of the board has stopped.
+    private core_stopped(*self) -> bool
+        for k in 0u32..<self.t.cores() do if self.t.core(k).stop != Stop.Running then return true
+        false
+
+    // What the board's console has shown since the last slice, on stdout a line at a time; the rest of an
+    // unfinished line too where `last`.
+    private show_console(*self, last: bool)
+        val (fresh, total) = self.t.output_since(self.seen)
+        self.seen = total
+        self.unshown.extend(fresh.view())
+        val shown = host.show_console(self.unshown.view(), 0, last, b -> putbytes(b), () -> flush())
+        if shown == 0 then return
+        var rest: Buf[u8] = buf()
+        rest.extend(self.unshown.view()[shown..])
+        self.unshown = rest
 
     // Every core runs from where it is: a stop is cleared, and a core at a breakpoint steps past it
     // first, as a probe does, so that it does not stop there again at once. Where that step reached a

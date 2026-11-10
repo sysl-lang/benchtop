@@ -1,0 +1,139 @@
+module sh.sysl.benchtop.chip
+@tests
+
+// The board interface (`virt.Guest`), the same assertions on both engines: a part pressed through the
+// session reaches the firmware, an LED reads lit, keys typed on the console are answered, and a
+// register and a word of RAM read and written the way gdb reaches them. The machine's board is the
+// STM32H747I-DISCO running its Forth; the RP board is the Pico 2 running SDK examples.
+
+import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.virt.{PartInput, SdChoice, Session, SliceEnd}
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_bytes
+import sysl.raw.str_cast
+import sysl.text.Search
+
+// The most slices a step waits for what it expects.
+private const SLICES = 400
+
+// The board `which`, on the engine that runs it, booted with the image in `file`, through a session as a
+// script drives one.
+private booted(which: string, file: string) -> &Session
+    val (b, _) = described(which).unwrap()
+    val s = virt.session(b.parts, b.chip.name, true, 1 << 20)
+    rp_guest(which, false) match
+        Some(g) -> s.guest = g.unwrap()
+        None -> virt.board_named_sd(s.board(), which, SdChoice.Described).unwrap()
+    val image = s.guest.checked(read_bytes(file).unwrap().view()).unwrap()
+    s.restart(image.view())
+    s
+
+// Run `s`'s board until its console has shown `text` since `seen`, and answer how far it has shown.
+private shows(s: &Session, seen: u64, text: string) -> u64
+    var shown: Buf[u8] = buf()
+    var at = seen
+    for _ in 0..<SLICES
+        val end = s.guest.run_slice()
+        val (bytes, total) = s.guest.output_since(at)
+        shown.extend(bytes.view())
+        at = total
+        if shown.view().index_of(text.bytes).is_some() then return at
+        end match
+            Ended(_, why) -> assert(false, s"the run ended before \"$text\": $why: ${str_cast(shown.view())}")
+            Faulted(why) -> assert(false, s"the run faulted before \"$text\": $why: ${str_cast(shown.view())}")
+            Asleep -> s.guest.idle()
+            Ran -> ()
+    assert(false, s"never shown \"$text\": ${str_cast(shown.view())}")
+    at
+
+// Give `s`'s board `text` on its console, a byte at a time as it takes them.
+private type_in(s: &Session, text: string)
+    for c in text.bytes
+        var sent = false
+        for _ in 0..<SLICES
+            sent = s.guest.send(c).unwrap()
+            if sent then break
+            s.guest.run_slice()
+        assert(sent, s"the console never took ${c}")
+
+// The part `name` of `s`'s board.
+private part(s: &Session, name: string) -> sh.sysl.benchtop.Part
+    for p in s.parts do if p.name == name then return p
+    assert(false, s"no part $name")
+    s.parts[0]
+
+/** Keys typed on the console reach the firmware, which answers `answer` once it has shown `ready`. */
+private answers(which: string, file: string, ready: string, typed: string, answer: string)
+    val s = booted(which, file)
+    assert(s.guest.console_refusal(which).is_empty(), s.guest.console_refusal(which))
+    val seen = shows(s, 0, ready)
+    type_in(s, typed)
+    shows(s, seen, answer)
+
+/** The button `button` held through the session reaches the firmware, which says `pressed` (after
+ * being asked `ask` on its console, where it needs asking).
+ */
+private presses(which: string, file: string, ready: string, button: string, ask: string, pressed: string)
+    val s = booted(which, file)
+    val seen = shows(s, 0, ready)
+    s.set_part_input(button, PartInput.Pressed(true))
+    s.apply_inputs()
+    assert(s.pressed(button))
+    if !ask.is_empty() then type_in(s, ask)
+    shows(s, seen, pressed)
+
+/** The LED `led` reads lit once the firmware drives it (after `ask` on its console, where it needs
+ * asking), and not before.
+ */
+private lights(which: string, file: string, ready: string, led: string, ask: string)
+    val s = booted(which, file)
+    val p = part(s, led)
+    assert(!s.lit(p), s"$led is dark at power-on")
+    val seen = shows(s, 0, ready)
+    if !ask.is_empty()
+        type_in(s, ask)
+        shows(s, seen, " ok")
+    var on = false
+    for _ in 0..<SLICES
+        if s.lit(p) then on = true
+        if on then break
+        s.guest.run_slice()
+    assert(on, s"$led never lit")
+
+/** gdb's view of the board: two Cortex-M cores, core 0 running; its PC's halfword read through the
+ * bus; a word of RAM below its stack written and read back, and put back as it was.
+ */
+private debugs(which: string, file: string, ready: string)
+    val s = booted(which, file)
+    shows(s, 0, ready)
+    val g = s.guest
+    assert(g.cores() == 2 && g.started(0))
+    val c = g.core(0)
+    assert(g.read(0, c.pc & 0xFFFFFFFE, 2).is_some(), s"core 0's code at ${c.pc} reads")
+    val a = (c.r[13] - 256) & 0xFFFFFFFC
+    val was = g.read(0, a, 4).unwrap()
+    assert(g.write(0, a, 4, 0x5AA5C33C) && g.read(0, a, 4) == Some(0x5AA5C33Cu32))
+    assert(g.write(0, a, 4, was) && g.read(0, a, 4) == Some(was))
+
+private val DISCO = "stm32h747-disco"
+private val FORTH = "examples/disco-repl/repl-disco.elf"
+
+@test("board interface: keys typed on the console are answered, on the DISCO's machine and on the Pico 2")
+board_iface_types()
+    answers(DISCO, FORTH, "DISCO", "2 3 + .\n", "5  ok")
+    answers("pico2", "examples/pico2/uart_advanced.elf", "interrupts", "HAL", "IBM")
+
+@test("board interface: a button held through the session reaches the firmware, on the DISCO's machine and on the Pico 2")
+board_iface_presses()
+    presses(DISCO, FORTH, "DISCO", "wakeup", "BUTTON? .\n", "-1  ok")
+    presses("testdata/rp-parts/pico2-parts.hocon", "examples/pico2/parts.elf", "button idle 1", "btn", "", "GPIO 14 down")
+
+@test("board interface: an LED reads lit once the firmware drives it, on the DISCO's machine and on the Pico 2")
+board_iface_lights()
+    lights(DISCO, FORTH, "DISCO", "led1", "1 LED-ON\n")
+    lights("pico2", "examples/pico2/blink.elf", "", "led", "")
+
+@test("board interface: gdb's reads and writes reach the cores and RAM, on the DISCO's machine and on the Pico 2")
+board_iface_debugs()
+    debugs(DISCO, FORTH, "DISCO")
+    debugs("pico2", "examples/pico2/hello_serial.elf", "hello, serial 0")

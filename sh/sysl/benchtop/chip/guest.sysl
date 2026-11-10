@@ -1,18 +1,20 @@
 module sh.sysl.benchtop.chip
 
-// An RP board as the window runs it (`virt.Guest`): the Pico, the Pico 2 on its Cortex-M33s or its
-// Hazard3 harts, or a product of one of them with parts on its header. Once started, the board runs on
+// An RP board as every front end drives it (`virt.Guest`): the Pico, the Pico 2 on its Cortex-M33s or
+// its Hazard3 harts, or a product of one of them with parts on its header. A script and gdb run it on
+// their own thread, a slice at a time; the window starts it. Once started, the board runs on
 // a host thread of its own, paced to the host's clock a millisecond of clk_sys at a time. Everything the
 // two threads share — the board, its parts, the console, where the run has got to — is a `GuestState`
 // behind one `Mutex`, which the board's thread lets go of between slices; the window's thread takes it
 // only to read what the parts show and the console, and to set the parts' controls. Drawing therefore
 // never runs on the board's thread, and the board never waits for a frame.
 
+import sh.sysl.benchtop.Part
 import sh.sysl.benchtop.parts.hd44780.Lcd
 import sh.sysl.benchtop.peripheral.rp2350.Frame
-import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.benchtop.v6m.{Cpu, Memory, Stop}
 import sh.sysl.benchtop.virt as virt
-import sh.sysl.benchtop.virt.{GuestStanding, PartInput, RunStatus}
+import sh.sysl.benchtop.virt.{GuestStanding, Machine, PartInput, RunStatus, SliceEnd, nanos}
 import sysl.buf.{Buf, buf}
 import sysl.math.{min, max}
 import sysl.threads.{Thread, Mutex, Condvar, spawn}
@@ -30,6 +32,12 @@ private const MOST_OWED_US: u64 = 50000
 private const STEP_TURNS = 100000
 /** The cycles a step lets pass on a board with nothing due before it leaves the board asleep. */
 private const IDLE_TURNS = 64
+/** The clk_sys cycles of a slice as `benchtop run` takes them. */
+private const RUN_SLICE: u64 = 100000
+/** The clk_sys cycles of a debugger's slice. */
+private const DEBUG_SLICE: u64 = 16000
+/** Why a debugger asks a board on its Hazard3 harts for a Cortex-M core in vain. */
+private const NO_CORTEX = "an RP2350 on its Hazard3 harts has no Cortex-M core for gdb"
 
 /** One kind of RP board, whichever chip and cores it has, as the guest drives it. */
 private[chip] trait Runner
@@ -56,6 +64,20 @@ private[chip] trait Runner
     observe(*self, ps: *RpParts)
     part_lit(*self, ps: *RpParts, name: string) -> bool
     part_pitch(*self, ps: *RpParts, name: string) -> u64
+    /** Why the chip refused what it refused; empty where it refused nothing. */
+    refused(*self) -> string
+    take_note(*self) -> Option[string]
+    /** How many GPIOs the chip has. */
+    gpios(*self) -> u32
+    /** Drive GPIO `n` from off the chip, or let it go. */
+    drive(*self, n: u32, level: Option[bool])
+    /** The Cortex-M cores gdb debugs: none on the Hazard3 harts. */
+    cores(*self) -> u32
+    core(*self, k: u32) -> *Cpu
+    started(*self, k: u32) -> bool
+    memory(*self) -> &sync Memory
+    debug_read(*self, k: u32, a: u32, width: u32) -> Option[u32]
+    debug_write(*self, k: u32, a: u32, width: u32, x: u32) -> bool
 
 // An RP2350 on its Cortex-M33s, or an RP2040 on its Cortex-M0+s.
 private struct ArmRunner[C: ArmChip + PartPins]
@@ -107,6 +129,27 @@ impl[C: ArmChip + PartPins] Runner for ArmRunner[C]
     observe(*self, ps: *RpParts) = observe_parts(ps, &self.b.chip)
     part_lit(*self, ps: *RpParts, name: string) -> bool = lit(ps, &self.b.chip, name)
     part_pitch(*self, ps: *RpParts, name: string) -> u64 = pitch(ps, &self.b.chip, name)
+    refused(*self) -> string = self.b.refused
+    take_note(*self) -> Option[string] = self.b.usb_host.take_note()
+    gpios(*self) -> u32 = if const C.rp2350() then 48 else 30
+    drive(*self, n: u32, level: Option[bool]) = self.b.chip.part_drive(n, level)
+    cores(*self) -> u32 = 2
+    core(*self, k: u32) -> *Cpu = &self.b.cores[k]
+    started(*self, k: u32) -> bool = self.b.started[k]
+    memory(*self) -> &sync Memory = self.b.mem
+
+    // The chip says why it refused an access in `why`, which a run would take as its own fault.
+    debug_read(*self, k: u32, a: u32, width: u32) -> Option[u32]
+        val v = virt.core_read(self.core(k), a, width)
+        if self.b.why.is_empty() then return v
+        self.b.why = ""
+        None
+
+    debug_write(*self, k: u32, a: u32, width: u32, x: u32) -> bool
+        val made = virt.core_write(self.core(k), a, width, x)
+        if self.b.why.is_empty() then return made
+        self.b.why = ""
+        false
 
 // An RP2350 on its Hazard3 harts.
 private struct RiscvRunner
@@ -140,6 +183,16 @@ impl Runner for RiscvRunner
     observe(*self, ps: *RpParts) = observe_parts(ps, &self.b.chip)
     part_lit(*self, ps: *RpParts, name: string) -> bool = lit(ps, &self.b.chip, name)
     part_pitch(*self, ps: *RpParts, name: string) -> u64 = pitch(ps, &self.b.chip, name)
+    refused(*self) -> string = self.b.refused
+    take_note(*self) -> Option[string] = None
+    gpios(*self) -> u32 = 48
+    drive(*self, n: u32, level: Option[bool]) = self.b.chip.part_drive(n, level)
+    cores(*self) -> u32 = 0
+    core(*self, k: u32) -> *Cpu = panic(NO_CORTEX)
+    started(*self, k: u32) -> bool = false
+    memory(*self) -> &sync Memory = panic(NO_CORTEX)
+    debug_read(*self, k: u32, a: u32, width: u32) -> Option[u32] = None
+    debug_write(*self, k: u32, a: u32, width: u32, x: u32) -> bool = false
 
 private arm_runner(map: SramMap, usb: bool) -> &Runner
     val b = arm_board(map)
@@ -164,6 +217,9 @@ private[chip] struct GuestState
     closing: bool
     paused: bool
     step: bool
+    // Where the board's clock stood when last read (`now`), and the nanoseconds it had come to.
+    at: u64
+    ns: u64
 
 /** The state behind its lock, and the condition the board's thread parks on. */
 private[chip] struct GuestCore
@@ -175,7 +231,7 @@ private[chip] struct GuestCore
  */
 private[chip] struct RpGuest
     fresh: &Fn() -> &Runner
-    core: &sync GuestCore
+    shared: &sync GuestCore
     thread: Option[Thread]
 
 /** The board `which` names, run for the window, with its parts: an RP2350 board on its Cortex-M33s, with
@@ -193,8 +249,8 @@ rp_guest(which: string, usb: bool) -> Option[Result[&virt.Guest, string]]
                 Some(Ok(map)) -> () -> pico_runner(map)
                 Some(Err(why)) -> return Some(Err(why))
                 None -> return None
-    val state = GuestState(fresh(), rp_parts(described(which).unwrap().0), GuestStanding(RunStatus.Running, "", 0, 0),
-        buf(), 0, buf(), false, false, true, false)
+    val state = GuestState(fresh(), rp_parts(described(which).unwrap().0), GuestStanding(RunStatus.Running, "", 0, 0, None),
+        buf(), 0, buf(), false, false, true, false, 0, 0)
     val core: &sync GuestCore = GuestCore(Mutex.new(state), Condvar.new())
     val g: &RpGuest = RpGuest(fresh, core, None)
     Some(Ok(g))
@@ -264,7 +320,7 @@ impl GuestState
             Breakpoint -> RunStatus.Breakpoint
             Fault -> RunStatus.Fault
         val why = if end == RunEnd.Breakpoint || end == RunEnd.Fault then r.why(end) else ""
-        self.standing = GuestStanding(status, why, r.pc(), r.retired())
+        self.standing = GuestStanding(status, why, r.pc(), r.retired(), None)
 
     private[chip] ended(*self) -> bool = self.standing.status == RunStatus.Breakpoint || self.standing.status == RunStatus.Fault
 
@@ -281,20 +337,40 @@ impl GuestState
         val hz = self.runner.hz()
         if hz == 0 then RESET_HZ else hz
 
+// How a run on the caller's thread that ended at `end` stands.
+private sliced(r: &Runner, end: RunEnd) -> SliceEnd = end match
+    Budget -> SliceEnd.Ran
+    Asleep -> SliceEnd.Asleep
+    Breakpoint -> SliceEnd.Ended(0, r.why(end))
+    Fault -> SliceEnd.Faulted(r.why(end))
+
+// The GPIO `name` (`GP2`) of a board `board` whose GPIOs number below `count`.
+private rp_pin(name: string, board: string, count: u32) -> Result[u32, string]
+    val b = name.bytes
+    if b.len > 2 && b.len <= 4 && b[0] == u8('G') && b[1] == u8('P')
+        var n: u32 = 0
+        var digits = true
+        for c in b[2..] do if c < u8('0') || c > u8('9') then digits = false else n = n * 10 + u32(c - u8('0'))
+        if digits && n < count then return Ok(n)
+    Err(s"$name is not one of $board's GPIOs: they are GP0 to GP${count - 1}")
+
 impl virt.Guest for RpGuest
-    restart(*self, image: []const u8) -> Result[unit, string]
+    restart(*self, image: []const u8) -> Result[u32, string]
         val make = self.fresh
         val r = make()
         r.boot(image)?
-        val s = self.core.state.lock_raw()
+        val s = self.shared.state.lock_raw()
         s.runner = r
         r.connect(&s.parts)
         s.typed.clear()
         s.deaf = false
-        s.standing = GuestStanding(RunStatus.Running, "", r.pc(), 0)
-        self.core.changed.notify_all()
-        self.core.state.unlock_raw()
-        Ok(())
+        s.standing = GuestStanding(RunStatus.Running, "", r.pc(), 0, None)
+        s.at = r.clock()
+        s.ns = 0
+        self.shared.changed.notify_all()
+        self.shared.state.unlock_raw()
+        // The board's own thread says where it is from its first frame on.
+        Ok(0)
 
     checked(*self, image: []const u8) -> Result[Buf[u8], string]
         val make = self.fresh
@@ -303,9 +379,10 @@ impl virt.Guest for RpGuest
         b.extend(image)
         Ok(b)
 
-    start(*self) -> Result[unit, string]
+    // The board paces itself to the host's clock at its own clk_sys rate, its cores on one thread.
+    start(*self, parallel: bool, hz: u64) -> Result[unit, string]
         if self.thread.is_some() then return Ok(())
-        self.thread = spawn(&guest_thread, &*self.core, 1 << 23)
+        self.thread = spawn(&guest_thread, &*self.shared, 1 << 23)
         if self.thread.is_none() then return Err("cannot create the host thread for the board")
         Ok(())
 
@@ -313,92 +390,211 @@ impl virt.Guest for RpGuest
         val t = self.thread match
             Some(t) -> t
             None -> return
-        val s = self.core.state.lock_raw()
+        val s = self.shared.state.lock_raw()
         s.closing = true
-        self.core.changed.notify_all()
-        self.core.state.unlock_raw()
+        self.shared.changed.notify_all()
+        self.shared.state.unlock_raw()
         t.join()
         self.thread = None
 
-    advance(*self, paused: bool, step: bool) -> GuestStanding
-        val s = self.core.state.lock_raw()
+    // `advance` carries the pause to the board's thread.
+    pause(*self) = ()
+
+    advance(*self, paused: bool, step: bool, budget: u64) -> GuestStanding
+        val s = self.shared.state.lock_raw()
         if self.thread.is_some()
             s.paused = paused
             if step then s.step = true
-            self.core.changed.notify_all()
+            self.shared.changed.notify_all()
         elif step then s.step_one()
         elif !paused then s.slice(s.rate() / 60)
-        val standing = GuestStanding(s.standing.status, s.standing.message.copy(), s.standing.pc, s.standing.instructions)
-        self.core.state.unlock_raw()
+        val standing = GuestStanding(s.standing.status, s.standing.message.copy(), s.standing.pc, s.standing.instructions, None)
+        self.shared.state.unlock_raw()
         standing
 
-    set_input(*self, name: string, input: PartInput)
-        val s = self.core.state.lock_raw()
-        s.parts.set_input(name, input)
-        self.core.state.unlock_raw()
+    run_slice(*self) -> SliceEnd
+        val s = self.shared.state.lock_raw()
+        val r = s.runner
+        val end = r.run(RUN_SLICE)
+        r.observe(&s.parts)
+        val out = sliced(r, end)
+        self.shared.state.unlock_raw()
+        out
 
-    apply_inputs(*self)
-        val s = self.core.state.lock_raw()
+    debug_slice(*self) -> SliceEnd
+        val s = self.shared.state.lock_raw()
+        val out = sliced(s.runner, s.runner.run(DEBUG_SLICE))
+        self.shared.state.unlock_raw()
+        out
+
+    finish_sending(*self) -> Result[unit, string]
+        val s = self.shared.state.lock_raw()
+        val sent = s.runner.finish_sending()
+        val why = s.runner.refused()
+        self.shared.state.unlock_raw()
+        if sent then Ok(()) else Err(why)
+
+    idle(*self)
+        val s = self.shared.state.lock_raw()
+        s.runner.wait_outside(RUN_SLICE)
+        self.shared.state.unlock_raw()
+
+    rated(*self) -> bool
+        val s = self.shared.state.lock_raw()
+        val hz = s.runner.hz()
+        self.shared.state.unlock_raw()
+        hz != 0
+
+    // The nanoseconds are counted at each rate clk_sys has run at since they were last read.
+    now(*self) -> (u64, u64)
+        val s = self.shared.state.lock_raw()
+        val c = s.runner.clock()
+        if c > s.at
+            s.ns += nanos(c - s.at, s.runner.hz())
+            s.at = c
+        val ns = s.ns
+        self.shared.state.unlock_raw()
+        (c, ns)
+
+    take_note(*self) -> Option[string]
+        val s = self.shared.state.lock_raw()
+        val note = s.runner.take_note()
+        self.shared.state.unlock_raw()
+        note
+
+    apply_inputs(*self, parts: []const Part, inputs: []const PartInput)
+        val s = self.shared.state.lock_raw()
+        for i in 0..<parts.len do s.parts.set_input(parts[i].name, inputs[i])
         s.runner.apply(&s.parts)
-        self.core.state.unlock_raw()
+        self.shared.state.unlock_raw()
 
-    lit(*self, name: string) -> bool
-        val s = self.core.state.lock_raw()
-        val on = s.runner.part_lit(&s.parts, name)
-        self.core.state.unlock_raw()
+    lit(*self, p: Part) -> bool
+        val s = self.shared.state.lock_raw()
+        val on = s.runner.part_lit(&s.parts, p.name)
+        self.shared.state.unlock_raw()
         on
 
-    segments(*self, name: string) -> [8]u8
-        val s = self.core.state.lock_raw()
-        val shown = s.parts.segments(name, s.runner.clock())
-        self.core.state.unlock_raw()
+    segments(*self, name: string, p: Part) -> [8]u8
+        val s = self.shared.state.lock_raw()
+        val shown = s.parts.segments(p.name, s.runner.clock())
+        self.shared.state.unlock_raw()
         shown
 
-    lcd(*self, name: string) -> Option[Lcd]
-        val s = self.core.state.lock_raw()
-        val l = s.parts.lcd(name)
-        self.core.state.unlock_raw()
+    lcd(*self, name: string, p: Part) -> Option[Lcd]
+        val s = self.shared.state.lock_raw()
+        val l = s.parts.lcd(p.name)
+        self.shared.state.unlock_raw()
         l
 
-    pitch(*self, name: string) -> u64
-        val s = self.core.state.lock_raw()
-        val hz = s.runner.part_pitch(&s.parts, name)
-        self.core.state.unlock_raw()
-        hz
+    sounding(*self, name: string, p: Part) -> bool
+        val s = self.shared.state.lock_raw()
+        val hz = s.runner.part_pitch(&s.parts, p.name)
+        self.shared.state.unlock_raw()
+        hz != 0
 
     sounds(*self) -> bool
-        val s = self.core.state.lock_raw()
+        val s = self.shared.state.lock_raw()
         val any = s.parts.buzzers.len() > 0
-        self.core.state.unlock_raw()
+        self.shared.state.unlock_raw()
         any
 
     take_sound(*self) -> Buf[f32]
         var mixed: Buf[f32] = buf()
-        val s = self.core.state.lock_raw()
+        val s = self.shared.state.lock_raw()
         for b in s.parts.buzzers
             val samples = s.parts.sound(b.name)
             for i in 0..<samples.len()
                 if i < mixed.len() then mixed[i] = (mixed[i] + samples[i]).min(1.0).max(-1.0) else mixed.push(samples[i])
-        self.core.state.unlock_raw()
+        self.shared.state.unlock_raw()
         mixed
 
+    find_pin(*self, name: string, board: string) -> Result[unit, string]
+        val s = self.shared.state.lock_raw()
+        val count = s.runner.gpios()
+        self.shared.state.unlock_raw()
+        rp_pin(name, board, count)?
+        Ok(())
+
+    drive_pin(*self, name: string, level: Option[bool])
+        val s = self.shared.state.lock_raw()
+        rp_pin(name, "", s.runner.gpios()) match
+            Ok(n) -> s.runner.drive(n, level)
+            Err(_) -> ()
+        self.shared.state.unlock_raw()
+
+    // What the board has shown since its thread last kept it is kept first.
     output_since(*self, seen: u64) -> (Buf[u8], u64)
         var bytes: Buf[u8] = buf()
-        val s = self.core.state.lock_raw()
+        val s = self.shared.state.lock_raw()
+        var fresh_out: Buf[u8] = buf()
+        s.runner.take_console(&fresh_out)
+        s.keep(fresh_out.view())
         val fresh = if s.written > seen then s.written - seen else 0u64
         val held = s.out.len()
         val from = if fresh >= u64(held) then 0 else held - usize(fresh)
         bytes.extend(s.out.view()[from..])
         val written = s.written
-        self.core.state.unlock_raw()
+        self.shared.state.unlock_raw()
         (bytes, written)
 
     type_keys(*self, bytes: []const u8) -> bool
-        val s = self.core.state.lock_raw()
+        val s = self.shared.state.lock_raw()
         val taken = s.runner.takes_input() && !s.deaf
         if taken then s.typed.extend(bytes)
-        self.core.state.unlock_raw()
+        self.shared.state.unlock_raw()
         taken
+
+    send(*self, c: u8) -> Result[bool, string]
+        val s = self.shared.state.lock_raw()
+        val sent = s.runner.send(c)
+        self.shared.state.unlock_raw()
+        sent
+
+    console_refusal(*self, board: string) -> string
+        val s = self.shared.state.lock_raw()
+        val takes = s.runner.takes_input()
+        self.shared.state.unlock_raw()
+        if takes then "" else "the RP2040's UART0 takes no input from benchtop yet, so --type has nowhere to go: --expect and --press work"
+
+    end_input(*self) = ()
+
+    cores(*self) -> u32
+        val s = self.shared.state.lock_raw()
+        val n = s.runner.cores()
+        self.shared.state.unlock_raw()
+        n
+
+    core(*self, k: u32) -> *Cpu
+        val s = self.shared.state.lock_raw()
+        val c = s.runner.core(k)
+        self.shared.state.unlock_raw()
+        c
+
+    started(*self, k: u32) -> bool
+        val s = self.shared.state.lock_raw()
+        val on = s.runner.started(k)
+        self.shared.state.unlock_raw()
+        on
+
+    memory(*self) -> &sync Memory
+        val s = self.shared.state.lock_raw()
+        val mem = s.runner.memory()
+        self.shared.state.unlock_raw()
+        mem
+
+    read(*self, k: u32, a: u32, width: u32) -> Option[u32]
+        val s = self.shared.state.lock_raw()
+        val v = s.runner.debug_read(k, a, width)
+        self.shared.state.unlock_raw()
+        v
+
+    write(*self, k: u32, a: u32, width: u32, x: u32) -> bool
+        val s = self.shared.state.lock_raw()
+        val made = s.runner.debug_write(k, a, width, x)
+        self.shared.state.unlock_raw()
+        made
+
+    machine(*self) -> Option[*Machine] = None
 
 // The board's thread: a millisecond of clk_sys at a time while the host's clock is ahead of the board's,
 // at most `MOST_OWED_US` of it owed, the lock let go between slices; parked while paused or ended, but

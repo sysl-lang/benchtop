@@ -1,0 +1,204 @@
+module sh.sysl.benchtop.virt
+
+// benchtop's Cortex-M machine as a board (`Guest`): the virtual boards, the workbench and the
+// STM32H747I-DISCO. In the window its cores run a frame's budget at a time on the caller's thread, or
+// on the machine's CPU workers once started; a script and gdb run it in core turns on their own
+// thread. Its parts are the workbench's: buttons on the GPIO panel or an STM32 pin, potentiometers and
+// joysticks on its analogue inputs, displays and buzzers on its peripherals.
+
+import sh.sysl.benchtop.{Part, param_named}
+import sh.sysl.benchtop.parts.hd44780.Lcd
+import sh.sysl.benchtop.v6m.{Cpu, Memory, Stop}
+import sysl.buf.{Buf, buf}
+
+// Turns of the machine's scheduler a debugger's slice runs: each is a round of its quantum, 1000
+// instructions a core, as `benchtop run` takes them.
+private const DEBUG_TURNS = 16
+private const DEBUG_QUANTUM: u64 = 1000
+
+/** benchtop's machine `m` as a board, its console's output kept, at most `capture` bytes of it, for the
+ * front end to read; with `capture` 0 the console goes straight to the host's stdout, as `benchtop run`
+ * has it, and `output_since` answers nothing.
+ */
+struct MachineGuest
+    m: &Machine
+    capture: usize
+    background: bool
+    last: GuestStanding
+
+/** `m` as a board, its console kept as `MachineGuest` says. */
+machine_guest(m: &Machine, capture: usize) -> &Guest
+    val g: &MachineGuest = MachineGuest(m, capture, false, GuestStanding(RunStatus.Running, "", 0, 0, None))
+    g
+
+private written(p: Part, key: string, fallback: string) -> string = param_named(p.params, key) match
+    Some(param) -> param.value match
+        Text(value) -> value
+        _ -> fallback
+    None -> fallback
+
+// The core that stopped `m`: core 0 where it has, otherwise core 1.
+private stopped_core(m: *Machine) -> *Cpu = if core0(m).stop != Stop.Running then core0(m) else core1(m)
+
+// How a slice that stopped a core of `m` ended.
+private stopped_end(m: *Machine) -> SliceEnd
+    val c = stopped_core(m)
+    c.stop match
+        Exit -> SliceEnd.Ended(int(c.exit_code), s"the guest exited with status ${c.exit_code}")
+        Breakpoint | Reset -> SliceEnd.Ended(0, stop_message(c))
+        _ -> SliceEnd.Faulted(stop_message(c))
+
+// The standing of `m` once a core has stopped it, at `pc` with `instructions` retired.
+private halted(m: *Machine, pc: u32, instructions: u64, observation: Option[WorkerObservation]) -> GuestStanding
+    val c = stopped_core(m)
+    val status = c.stop match
+        Breakpoint -> RunStatus.Breakpoint
+        Exit -> RunStatus.Exit(int(c.exit_code))
+        Reset -> RunStatus.ResetRequest
+        _ -> RunStatus.Fault
+    GuestStanding(status, stop_message(c), pc, instructions, observation)
+
+impl Guest for MachineGuest
+    checked(*self, image: []const u8) -> Result[Buf[u8], string] = image_of(&*self.m, image)
+
+    restart(*self, image: []const u8) -> Result[u32, string]
+        val m = &*self.m
+        pause_workers(m)
+        open_console(m)
+        if self.capture != 0 then capture_bounded(m, self.capture)
+        boot(m, image)
+        self.last = GuestStanding(RunStatus.Running, "", core0(m).pc, 0, None)
+        Ok(core0(m).pc)
+
+    start(*self, parallel: bool, hz: u64) -> Result[unit, string]
+        start_workers(&*self.m, parallel, hz)?
+        self.background = true
+        Ok(())
+
+    stop(*self) = stop_workers(&*self.m)
+
+    pause(*self) = pause_workers(&*self.m)
+
+    advance(*self, paused: bool, step: bool, budget: u64) -> GuestStanding
+        val m = &*self.m
+        if self.background
+            if step then step_workers(m)
+            elif paused then pause_workers(m)
+            else resume_workers(m)
+            val snapshot = workers_observe(m)
+            val pc = snapshot.cores[0].pc
+            val instructions = snapshot.cores[0].retired + snapshot.cores[1].retired
+            if !snapshot.running then return halted(m, pc, instructions, Some(snapshot))
+            val asleep = snapshot.cores[0].sleeping && (!snapshot.launched || snapshot.cores[1].sleeping)
+            return GuestStanding(if asleep then RunStatus.Waiting else RunStatus.Running, "", pc, instructions, Some(snapshot))
+        if paused && !step then return GuestStanding(RunStatus.Paused, "", self.last.pc, self.last.instructions, None)
+        val c = core0(m)
+        val running = pump_board(m, if step then 1 else budget)
+        val pc = c.pc
+        val instructions = c.retired + core1(m).retired
+        val status = if c.sleeping then RunStatus.Waiting else RunStatus.Running
+        self.last = if running then GuestStanding(status, "", pc, instructions, None) else halted(m, pc, instructions, None)
+        GuestStanding(self.last.status, self.last.message, pc, instructions, None)
+
+    run_slice(*self) -> SliceEnd
+        val m = &*self.m
+        if script_round(m) then return if stalled(m) then SliceEnd.Asleep else SliceEnd.Ran
+        stopped_end(m)
+
+    debug_slice(*self) -> SliceEnd
+        val m = &*self.m
+        for _ in 0..<DEBUG_TURNS do if !pump_board(m, DEBUG_QUANTUM) then return stopped_end(m)
+        SliceEnd.Ran
+
+    finish_sending(*self) -> Result[unit, string] = Ok(())
+    idle(*self) = ()
+    rated(*self) -> bool = clock_hz(&*self.m) != 0
+
+    now(*self) -> (u64, u64)
+        val m = &*self.m
+        val c = board_now(m)
+        (c, nanos(c, clock_hz(m)))
+
+    take_note(*self) -> Option[string] = None
+
+    apply_inputs(*self, parts: []const Part, inputs: []const PartInput)
+        val m = &*self.m
+        var levels: u32 = 0xFFFFFFFF
+        for i in 0..<parts.len
+            val closed = inputs[i] match
+                Pressed(down) -> down
+                Closed(on) -> on
+                _ -> continue
+            val p = parts[i]
+            val pin = part_pin(p)
+            val active_high = written(p, "active", "low") == "high"
+            if pin < 0
+                // A button on an STM32 pin holds it at its active level while closed and lets it go
+                // when open.
+                stm32_hold(&m.devices.storage, terminal_name(p, "pin"), if closed then Some(active_high) else None)
+                continue
+            val high = if active_high then closed else !closed
+            if high then levels |= 1u32 << u32(pin) else levels &= ~(1u32 << u32(pin))
+        panel_inputs(m, levels)
+        for i in 0..<parts.len
+            val p = parts[i]
+            inputs[i] match
+                Axes(x, y) ->
+                    for (axis, at) in [("x", x), ("y", y)]
+                        val pin = terminal_pin(p, axis)
+                        if pin >= 0 then set_analog_pin(m, pin, pot_voltage(p, at))
+                Position(at) ->
+                    val pin = part_pin(p)
+                    if pin >= 0 then set_analog_pin(m, pin, pot_voltage(p, at))
+                _ -> ()
+
+    lit(*self, p: Part) -> bool
+        val m = &*self.m
+        val pin = part_pin(p)
+        if pin < 0
+            val name = terminal_name(p, "anode")
+            if name.is_empty() then return false
+            return stm32_output(&m.devices.storage, name) match
+                Some((driven, high)) -> driven && (if written(p, "active", "high") == "low" then !high else high)
+                None -> false
+        if (panel_drive_mask(m) & (1u32 << u32(pin))) == 0 then return false
+        val high = (panel_levels(m) & (1u32 << u32(pin))) != 0
+        if written(p, "active", "high") == "low" then !high else high
+
+    segments(*self, name: string, p: Part) -> [8]u8 = display_segments(&*self.m, name)
+    lcd(*self, name: string, p: Part) -> Option[Lcd] = lcd_state(&*self.m, name)
+    sounding(*self, name: string, p: Part) -> bool = sound_active(&*self.m, name)
+    sounds(*self) -> bool = sound_available(&*self.m)
+    // The window plays the machine's sound peripheral from the machine itself (`machine`).
+    take_sound(*self) -> Buf[f32] = buf()
+
+    find_pin(*self, name: string, board: string) -> Result[unit, string]
+        if !hold_pin(&*self.m, name, None) then return Err(s"$name is not a pin of $board's chip: --press holds an STM32 pin such as PC13, or a part by its name")
+        Ok(())
+
+    drive_pin(*self, name: string, level: Option[bool])
+        hold_pin(&*self.m, name, level)
+
+    output_since(*self, seen: u64) -> (Buf[u8], u64)
+        if self.capture == 0 then return (buf(), seen)
+        output_since(&*self.m, seen)
+
+    type_keys(*self, bytes: []const u8) -> bool = type_keys(&*self.m, bytes)
+
+    send(*self, c: u8) -> Result[bool, string]
+        val one: [1]u8 = [c]
+        Ok(type_keys(&*self.m, one[..]))
+
+    console_refusal(*self, board: string) -> string =
+        if has_console(&*self.m) then "" else s"$board has no console to type into: no debug console, and no terminal on a USART"
+
+    end_input(*self) = type_in(&*self.m, [])
+
+    cores(*self) -> u32 = 2
+    core(*self, k: u32) -> *Cpu = &self.m.cores[k]
+    started(*self, k: u32) -> bool = k == 0 || running_both(&*self.m)
+    memory(*self) -> &sync Memory = self.m.memory
+    read(*self, k: u32, a: u32, width: u32) -> Option[u32] = core_read(self.core(k), a, width)
+    write(*self, k: u32, a: u32, width: u32, x: u32) -> bool = core_write(self.core(k), a, width, x)
+
+    machine(*self) -> Option[*Machine] = Some(&*self.m)

@@ -2,17 +2,14 @@ module sh.sysl.benchtop.script
 
 // A scripted run: the board runs on this thread a slice at a time, and between slices its console's
 // output is matched against the step waiting for it, typed characters go in as the console can take
-// them, and parts and pins are pressed and let go at the board's time. Each kind of board is a `Rig`,
+// them, and parts and pins are pressed and let go at the board's time. The board is a `virt.Guest`,
 // which runs it a slice and answers its clock, its console and its inputs; `drive` takes the steps over
-// any of them, so the rules of a script are the same on every board.
+// it, so the rules of a script are the same on every board.
 
 import sh.sysl.benchtop.{Part, article_of, part_model}
 import sh.sysl.benchtop.chip as chip
-import sh.sysl.benchtop.chip.RunEnd
-import sh.sysl.benchtop.peripheral.rp2350.Frame
-import sh.sysl.benchtop.v6m.Stop
 import sh.sysl.benchtop.virt as virt
-import sh.sysl.benchtop.virt.{PartInput, SdChoice, Session}
+import sh.sysl.benchtop.virt.{PartInput, SdChoice, Session, SliceEnd}
 import sysl.buf.{Buf, buf}
 import sysl.fs.read_bytes
 import sysl.raw.str_cast
@@ -51,15 +48,14 @@ setup() -> Setup = Setup(true, false, SdChoice.Described, false)
 
 // How much of the console an outcome keeps.
 const KEPT: usize = 65536
-// The clock cycles an RP2040 or RP2350 board runs between looks at the script.
-const SLICE: u64 = 100000
+// How much of the console a machine's board keeps between looks at the script.
+const CAPTURE: usize = 1 << 20
 
 private refused(why: string) -> Outcome
     val b = why.bytes
     var n = b.len
     while n > 0 && b[n - 1] == 10 do n -= 1
     Outcome(FAILED, why[..<n], buf())
-
 /** Run the image in `file` on the board `which` names, as `sc` scripts it, its console on stdout unless
  * the script is quiet. `benchtop run` exits with the outcome's status after writing why on stderr; a
  * board or an option it refuses is status 1.
@@ -72,107 +68,126 @@ run(which: string, file: string, sc: Script, setup: Setup) -> Outcome
     val (parts, chip_name, name) = found match
         Some((b, n)) -> (b.parts, b.chip.name, n)
         None -> (buf(), "", which)
-    chip.riscv_named(which) match
-        Some(Ok(map)) ->
+    val session = virt.session(parts, chip_name, true, CAPTURE)
+    chip.rp_guest(which, setup.usb_host) match
+        Some(Ok(g)) ->
+            if setup.usb_named
+                if chip.riscv_named(which).is_some() then return refused("--usb is for a board of an RP2350's Cortex-M33 cores")
+                if chip.pico_named(which).is_some() then return refused("--usb is for a board of an RP2350's Cortex-M33 cores: the RP2040's USB controller is not on its chip yet")
+            if setup.sd_named then return refused("--sd is for a board with a microSD socket")
+            session.guest = g
+        Some(Err(why)) -> return refused(why)
+        None ->
             if setup.usb_named then return refused("--usb is for a board of an RP2350's Cortex-M33 cores")
-            if setup.sd_named then return refused("--sd is for a board with a microSD socket")
-            val b = chip.riscv_board(map)
-            b.boot(image) match
+            virt.board_named_sd(session.board(), which, setup.sd) match
                 Ok(_) -> ()
-                Err(why) -> return refused(s"$file: $why")
-            var rig = RiscvRig(b, 0, b.chip.now, 0, buf(), buf(), chip.rp_parts(found.unwrap().0), name)
-            chip.connect_parts(&rig.parts, &rig.b.chip)
-            return drive(&rig, sc)
-        Some(Err(why)) -> return refused(why)
-        None -> ()
-    chip.arm_named(which) match
-        Some(Ok(map)) ->
-            if setup.sd_named then return refused("--sd is for a board with a microSD socket")
-            val b = chip.arm_board(map)
-            b.boot(image) match
-                Ok(_) -> ()
-                Err(why) -> return refused(s"$file: $why")
-            if setup.usb_host then b.attach_usb_host(true)
-            var rig = ArmRig(b, 0, b.chip.clock(), 0, buf(), buf(), chip.rp_parts(found.unwrap().0), name)
-            chip.connect_parts(&rig.parts, &rig.b.chip)
-            return drive(&rig, sc)
-        Some(Err(why)) -> return refused(why)
-        None -> ()
-    chip.pico_named(which) match
-        Some(Ok(map)) ->
-            if setup.usb_named then return refused("--usb is for a board of an RP2350's Cortex-M33 cores: the RP2040's USB controller is not on its chip yet")
-            if setup.sd_named then return refused("--sd is for a board with a microSD socket")
-            val b = chip.pico_board(map)
-            b.boot(image) match
-                Ok(_) -> ()
-                Err(why) -> return refused(s"$file: $why")
-            var rig = ArmRig(b, 0, b.chip.clock(), 0, buf(), buf(), chip.rp_parts(found.unwrap().0), name)
-            chip.connect_parts(&rig.parts, &rig.b.chip)
-            return drive(&rig, sc)
-        Some(Err(why)) -> return refused(why)
-        None -> ()
-    if setup.usb_named then return refused("--usb is for a board of an RP2350's Cortex-M33 cores")
-    val session = virt.session(parts, chip_name, true)
-    val m = session.board()
-    virt.board_named_sd(m, which, setup.sd) match
-        Ok(_) -> ()
-        Err(why) -> return refused(why)
-    val placed = virt.image_of(m, image) match
+                Err(why) -> return refused(why)
+    val placed = session.guest.checked(image) match
         Ok(b) -> b
         Err(why) -> return refused(s"$file: $why")
-    virt.open_console(m)
-    virt.capture_bounded(m, 1 << 20)
-    virt.boot(m, placed.view())
-    var rig = VirtRig(session, 0, buf(), buf(), name)
+    session.restart(placed.view())
+    var rig = Rig(session, 0, buf(), buf(), name)
     drive(&rig, sc)
 
 // ---------------------------------------------------------------------------------------------------
 // The steps, over any board.
 
 /** Where a board's clock stands: cycles since power-on, and the nanoseconds they come to where its
- * chip names its clock's rate (`Rig.rated`).
+ * chip names its clock's rate (`Guest.rated`).
  */
 private struct Clock
     cycles: u64
     ns: u64
 
-/** How a board stands after a slice. */
-private enum Standing
-    Running
-    /** Every core sleeps, and nothing on the board will wake one: only something from outside will. */
-    Stalled
-    /** The guest ended the run itself, with this status, for this reason. */
-    Ended(status: int, why: string)
-    /** A core faulted, or the chip refused something benchtop does not model. */
-    Faulted(why: string)
+/** A board a script drives, through its session: the session's input model presses its parts, as the
+ * desktop presses them, and the board (`virt.Guest`) runs it a slice at a time and answers its clock
+ * and its console. `holds` and `knobs` are what the script's presses and settings resolved to.
+ */
+private struct Rig
+    session: &Session
+    seen: u64
+    holds: Buf[Hold]
+    knobs: Buf[Hold]
+    name: string
 
-/** A board a script drives. */
-private trait Rig
+impl Rig
     /** Run the board on a slice. */
-    advance(*self) -> Standing
+    advance(*self) -> SliceEnd
+        val g = self.session.guest
+        val end = g.run_slice()
+        end match
+            // At the end of the run the chip runs on, as under a debugger, until its console has sent
+            // what it holds.
+            Ended(_, _) -> g.finish_sending() match
+                Ok(_) -> ()
+                Err(why) -> return SliceEnd.Faulted(why)
+            _ -> ()
+        g.take_note() match
+            Some(n) -> eprints(s"benchtop: $n\n")
+            None -> ()
+        end
+
     /** Whether the board's chip names its clock's rate, so a time in seconds means something on it. */
-    rated(*self) -> bool
+    rated(*self) -> bool = self.session.guest.rated()
+
     now(*self) -> Clock
+        val (cycles, ns) = self.session.guest.now()
+        Clock(cycles, ns)
+
     /** What the console has shown since the last call, added to `into`. */
     take_output(*self, into: *Buf[u8])
+        val (bytes, total) = self.session.guest.output_since(self.seen)
+        into.extend(bytes.view())
+        self.seen = total
+
     /** Why the board's console takes no typed input; empty where it does. */
-    console_refusal(*self) -> string
+    console_refusal(*self) -> string = self.session.guest.console_refusal(self.name)
+
     /** Give the guest `c` on its console: true once it is on its way, false where the console cannot
      * take it yet, or why benchtop cannot send it now.
      */
-    send(*self, c: u8) -> Result[bool, string]
+    send(*self, c: u8) -> Result[bool, string] = self.session.guest.send(c)
+
     /** What `--press` holds, ready to `hold`, as an index; or why the board has nothing of that name. */
     resolve(*self, t: Target) -> Result[usize, string]
-    hold(*self, k: usize, down: bool)
+        val s = self.session
+        val held = t match
+            Part(full) ->
+                val (name, direction) = part_and_direction(full, n -> kind_of(&s.parts, n) != "")
+                val rest = s.part_input(name)
+                Hold.Control(name, rest, pressing(name, kind_of(&s.parts, name), direction, rest, self.name)?)
+            Pin(name, high) ->
+                s.guest.find_pin(name, self.name)?
+                Hold.Pin(name, high)
+        self.holds.push(held)
+        Ok(self.holds.len() - 1)
+
+    hold(*self, k: usize, down: bool) = self.press(self.holds[k], down)
+
     /** What `--set` sets the part `name` to (`at` ten-thousandths of its travel), ready to `turn`, as an
      * index; or why the board has no such control.
      */
     knob(*self, name: string, at: int) -> Result[usize, string]
-    turn(*self, k: usize)
-    /** The board is `Stalled` while something from outside is due: time passes. */
-    idle(*self)
+        val s = self.session
+        self.knobs.push(Hold.Control(name, s.part_input(name), turning(name, kind_of(&s.parts, name), at, self.name)?))
+        Ok(self.knobs.len() - 1)
+
+    turn(*self, k: usize) = self.press(self.knobs[k], true)
+
+    /** The board is asleep while something from outside is due: time passes. */
+    idle(*self) = self.session.guest.idle()
+
     /** The console's input has ended. */
-    end_input(*self)
+    end_input(*self) = self.session.guest.end_input()
+
+    // Hold or let go of `h`: a part's control, through the session's inputs, or a pin of the chip.
+    private press(*self, h: Hold, down: bool)
+        val s = self.session
+        h match
+            Control(name, rest, pressed) ->
+                s.set_part_input(name, if down then pressed else rest)
+                s.apply_inputs()
+            Pin(name, high) -> s.guest.drive_pin(name, if down then Some(high) else None)
 
 // A press being held: what `resolve` made of its target, and when it is let go.
 private struct Held
@@ -216,7 +231,7 @@ private text_of(c: u8) -> string
     str_cast(one[..])
 
 // The board's time as a message gives it.
-private time_text[R: Rig](r: *R, now: Clock) -> string =
+private time_text(r: *Rig, now: Clock) -> string =
     if !r.rated() then s"${now.cycles} cycles"
     else
         val us = now.ns / 1000
@@ -251,7 +266,7 @@ private target_text(t: Target) -> string = t match
     Pin(name, high) -> s"$name=${if high then "high" else "low"}"
 
 /** Take `sc`'s steps on the board `r` runs, until they pass, the guest ends the run, or the timeout. */
-private drive[R: Rig](r: *R, sc: Script) -> Outcome
+private drive(r: *Rig, sc: Script) -> Outcome
     if timed(&sc) && !r.rated()
         return refused("this board's mcu names no clock rate (no `clock-hz`), so its time is counted in cycles: write --timeout and --press's times in cycles, as 5000000cycles")
     var targets: Buf[usize] = buf()
@@ -359,8 +374,8 @@ private drive[R: Rig](r: *R, sc: Script) -> Outcome
                         if seen.view().index_of(text.bytes).is_none() && seen.len() >= text.bytes.len then drop_front(&seen, seen.len() - text.bytes.len + 1)
                     _ -> if seen.len() > KEPT then drop_front(&seen, seen.len() - KEPT)
         standing match
-            Running -> stalled_at = -1
-            Stalled ->
+            Ran -> stalled_at = -1
+            Asleep ->
                 var outside = !held.is_empty() || (typed < typing.len() && blocked.is_empty())
                 if step < sc.steps.len()
                     sc.steps[step] match
@@ -445,249 +460,3 @@ private turning(name: string, kind: string, at: int, board: string) -> Result[Pa
 private kind_of(parts: *Buf[Part], name: string) -> string
     for p in parts do if p.name == name then return part_model(p)
     ""
-
-// What a press finds of target `t` on an RP2040 or RP2350 board, whose GPIOs number below `count`: a
-// part's control, or a GPIO and its level.
-private rp_hold(t: Target, parts: *chip.RpParts, board: string, count: u32) -> Result[Hold, string]
-    t match
-        Part(full) ->
-            val (name, direction) = part_and_direction(full, n -> kind_of(&parts.parts, n) != "")
-            val rest = parts.input(name)
-            Ok(Hold.Control(name, rest, pressing(name, kind_of(&parts.parts, name), direction, rest, board)?))
-        Pin(name, high) ->
-            rp_pin(name, board, count)?
-            Ok(Hold.Pin(name, high))
-
-// The GPIO `name` (`GP2`) of an RP2040 or RP2350 board whose GPIOs number below `count`.
-private rp_pin(name: string, board: string, count: u32) -> Result[u32, string]
-    val b = name.bytes
-    if b.len > 2 && b.len <= 4 && b[0] == u8('G') && b[1] == u8('P')
-        var n: u32 = 0
-        var digits = true
-        for c in b[2..] do if c < u8('0') || c > u8('9') then digits = false else n = n * 10 + u32(c - u8('0'))
-        if digits && n < count then return Ok(n)
-    Err(s"$name is not one of $board's GPIOs: they are GP0 to GP${count - 1}")
-
-// Hold or let go of `h` on an RP chip: a part's control, put on the pins by the parts, or a GPIO.
-private rp_press[C: chip.PartPins](h: Hold, down: bool, parts: *chip.RpParts, c: *C)
-    h match
-        Control(name, rest, pressed) ->
-            parts.set_input(name, if down then pressed else rest)
-            chip.apply_parts(parts, c)
-        Pin(name, high) -> c.part_drive(rp_pin(name, "", 48).unwrap(), if down then Some(high) else None)
-
-// What `--set` finds of part `name` on an RP2040 or RP2350 board.
-private rp_knob(parts: *chip.RpParts, name: string, at: int, board: string) -> Result[Hold, string]
-    val set = turning(name, kind_of(&parts.parts, name), at, board)?
-    Ok(Hold.Control(name, parts.input(name), set))
-
-// An RP2350's chip on its Cortex-M33s, or an RP2040's on its Cortex-M0+s.
-private struct ArmRig[C: chip.ArmChip + chip.PartPins]
-    b: &chip.ArmBoard[C]
-    shown: usize
-    at: u64
-    ns: u64
-    holds: Buf[Hold]
-    knobs: Buf[Hold]
-    parts: chip.RpParts
-    name: string
-
-// The nanoseconds `cycles` of a clock at `hz` come to.
-private nanos(cycles: u64, hz: u64) -> u64 = if hz == 0 then 0 else u64(u128(cycles) * 1000000000 / u128(hz))
-
-impl[C: chip.ArmChip + chip.PartPins] Rig for ArmRig[C]
-    advance(*self) -> Standing
-        val b = &*self.b
-        val end = b.run(SLICE)
-        chip.observe_parts(&self.parts, &b.chip)
-        // At a breakpoint the chip runs on, as under a debugger, until UART0 has sent what it holds.
-        if end == RunEnd.Breakpoint && !b.finish_sending() then return Standing.Faulted(b.refused)
-        b.usb_host.take_note() match
-            Some(n) -> eprints(s"benchtop: $n\n")
-            None -> ()
-        end match
-            Budget -> Standing.Running
-            Breakpoint -> Standing.Ended(0, "the program ended (a core executed BKPT, as the SDK's exit does)")
-            Asleep -> Standing.Stalled
-            Fault ->
-                if !b.refused.is_empty() then return Standing.Faulted(b.refused)
-                for k in 0..<2 do if b.cores[k].stop != Stop.Running then return Standing.Faulted(s"a core stopped: core $k: ${virt.stop_message(&b.cores[k])}")
-                Standing.Faulted("a core stopped")
-
-    rated(*self) -> bool = self.b.chip.clock_rate() != 0
-
-    now(*self) -> Clock
-        val c = self.b.chip.clock()
-        if c > self.at
-            self.ns += nanos(c - self.at, self.b.chip.clock_rate())
-            self.at = c
-        Clock(c, self.ns)
-
-    take_output(*self, into: *Buf[u8])
-        val b = &*self.b
-        into.extend(b.console.view()[self.shown..])
-        self.shown = b.console.len()
-        val h = &b.usb_host
-        into.extend(h.received.view())
-        h.consume(h.received.len())
-
-    console_refusal(*self) -> string
-        if const C.rp2350() then return ""
-        "the RP2040's UART0 takes no input from benchtop yet, so --type has nowhere to go: --expect and --press work"
-
-    send(*self, c: u8) -> Result[bool, string]
-        val h = &self.b.usb_host
-        if h.running()
-            if h.room_to_send() == 0 then return Ok(false)
-            h.sending.push(c)
-            return Ok(true)
-        if const C.rp2350() then return self.b.chip.line_in(1, Frame(c, 0))
-        Err("the RP2040's UART0 takes no input from benchtop yet")
-
-    resolve(*self, t: Target) -> Result[usize, string]
-        val count: u32 = if const C.rp2350() then 48 else 30
-        self.holds.push(rp_hold(t, &self.parts, self.name, count)?)
-        Ok(self.holds.len() - 1)
-
-    hold(*self, k: usize, down: bool) = rp_press(self.holds[k], down, &self.parts, &self.b.chip)
-
-    knob(*self, name: string, at: int) -> Result[usize, string]
-        self.knobs.push(rp_knob(&self.parts, name, at, self.name)?)
-        Ok(self.knobs.len() - 1)
-
-    turn(*self, k: usize) = rp_press(self.knobs[k], true, &self.parts, &self.b.chip)
-
-    idle(*self) = self.b.wait_outside(SLICE)
-
-    end_input(*self) = ()
-
-// An RP2350's chip on its Hazard3 cores.
-private struct RiscvRig
-    b: &chip.RiscvBoard
-    shown: usize
-    at: u64
-    ns: u64
-    holds: Buf[Hold]
-    knobs: Buf[Hold]
-    parts: chip.RpParts
-    name: string
-
-impl Rig for RiscvRig
-    advance(*self) -> Standing
-        val b = &*self.b
-        val end = b.run(SLICE)
-        chip.observe_parts(&self.parts, &b.chip)
-        if end == RunEnd.Breakpoint && !b.finish_sending() then return Standing.Faulted(b.refused)
-        end match
-            Budget -> Standing.Running
-            Breakpoint -> Standing.Ended(0, "the program ended (a hart executed EBREAK, as the SDK's exit does)")
-            Asleep -> Standing.Stalled
-            Fault -> Standing.Faulted(if b.refused.is_empty() then "a hart stopped on a fault" else b.refused)
-
-    rated(*self) -> bool = self.b.chip.sys_hz() != 0
-
-    now(*self) -> Clock
-        val c = self.b.chip.now
-        if c > self.at
-            self.ns += nanos(c - self.at, self.b.chip.sys_hz())
-            self.at = c
-        Clock(c, self.ns)
-
-    take_output(*self, into: *Buf[u8])
-        into.extend(self.b.console.view()[self.shown..])
-        self.shown = self.b.console.len()
-
-    console_refusal(*self) -> string = ""
-
-    send(*self, c: u8) -> Result[bool, string] = self.b.chip.line_in(1, Frame(c, 0))
-
-    resolve(*self, t: Target) -> Result[usize, string]
-        self.holds.push(rp_hold(t, &self.parts, self.name, 48)?)
-        Ok(self.holds.len() - 1)
-
-    hold(*self, k: usize, down: bool) = rp_press(self.holds[k], down, &self.parts, &self.b.chip)
-
-    knob(*self, name: string, at: int) -> Result[usize, string]
-        self.knobs.push(rp_knob(&self.parts, name, at, self.name)?)
-        Ok(self.knobs.len() - 1)
-
-    turn(*self, k: usize) = rp_press(self.knobs[k], true, &self.parts, &self.b.chip)
-
-    idle(*self) = self.b.wait_outside(SLICE)
-
-    end_input(*self) = ()
-
-// A board on benchtop's Cortex-M machine: the virtual boards, the workbench, the STM32H747I-DISCO. Its
-// parts are pressed through the session's input model, as the desktop presses them.
-private struct VirtRig
-    session: &Session
-    seen: u64
-    holds: Buf[Hold]
-    knobs: Buf[Hold]
-    name: string
-
-impl Rig for VirtRig
-    advance(*self) -> Standing
-        val m = self.session.board()
-        if virt.script_round(m) then return if virt.stalled(m) then Standing.Stalled else Standing.Running
-        val c = if virt.core0(m).stop != Stop.Running then virt.core0(m) else virt.core1(m)
-        c.stop match
-            Exit -> Standing.Ended(int(c.exit_code), s"the guest exited with status ${c.exit_code}")
-            Breakpoint | Reset -> Standing.Ended(0, virt.stop_message(c))
-            _ -> Standing.Faulted(virt.stop_message(c))
-
-    rated(*self) -> bool = virt.clock_hz(self.session.board()) != 0
-
-    now(*self) -> Clock
-        val m = self.session.board()
-        val c = virt.board_now(m)
-        Clock(c, nanos(c, virt.clock_hz(m)))
-
-    take_output(*self, into: *Buf[u8])
-        val (bytes, total) = virt.output_since(self.session.board(), self.seen)
-        into.extend(bytes.view())
-        self.seen = total
-
-    console_refusal(*self) -> string =
-        if virt.has_console(self.session.board()) then ""
-        else s"${self.name} has no console to type into: no debug console, and no terminal on a USART"
-
-    send(*self, c: u8) -> Result[bool, string]
-        val one: [1]u8 = [c]
-        Ok(virt.type_keys(self.session.board(), one[..]))
-
-    resolve(*self, t: Target) -> Result[usize, string]
-        val s = self.session
-        val held = t match
-            Part(full) ->
-                val (name, direction) = part_and_direction(full, n -> kind_of(&s.parts, n) != "")
-                val rest = s.part_input(name)
-                Hold.Control(name, rest, pressing(name, kind_of(&s.parts, name), direction, rest, self.name)?)
-            Pin(name, high) ->
-                if !virt.hold_pin(s.board(), name, None) then return Err(s"$name is not a pin of ${self.name}'s chip: --press holds an STM32 pin such as PC13, or a part by its name")
-                Hold.Pin(name, high)
-        self.holds.push(held)
-        Ok(self.holds.len() - 1)
-
-    hold(*self, k: usize, down: bool) = self.press(self.holds[k], down)
-
-    knob(*self, name: string, at: int) -> Result[usize, string]
-        val s = self.session
-        self.knobs.push(Hold.Control(name, s.part_input(name), turning(name, kind_of(&s.parts, name), at, self.name)?))
-        Ok(self.knobs.len() - 1)
-
-    turn(*self, k: usize) = self.press(self.knobs[k], true)
-
-    idle(*self) = ()
-
-    end_input(*self) = virt.type_in(self.session.board(), [])
-
-impl VirtRig
-    // Hold or let go of `h`: a part's control, through the session's inputs, or an STM32 pin.
-    private press(*self, h: Hold, down: bool)
-        val s = self.session
-        h match
-            Control(name, rest, pressed) ->
-                s.set_part_input(name, if down then pressed else rest)
-                s.apply_inputs()
-            Pin(name, high) -> virt.hold_pin(s.board(), name, if down then Some(high) else None)
