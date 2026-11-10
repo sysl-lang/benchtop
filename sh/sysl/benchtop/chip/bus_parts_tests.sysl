@@ -3,8 +3,10 @@ module sh.sysl.benchtop.chip
 
 // The bus parts of an RP board at the chip's own registers (`chip/parts.sysl`): an ST7796 that hears its
 // GPIOs through a pin hook, at every SPI edge and every GPIO change, and a GT911 on I2C0, both the
-// workbench's models, on the Pico 2 with the kit's wiring (`testdata/rp-parts/pico2-kit.hocon`); the
-// parts that are refused on an RP board, each by name; and a chip with no bus part paying nothing.
+// workbench's models, on the Pico 2 with the kit's wiring (`testdata/rp-parts/pico2-kit.hocon`); an
+// SSD1306 on SPI0's pins and a DS3231 on I2C0 (`testdata/rp-parts/pico2-oled-clock.hocon`); the kit's
+// WS2812 driven from the SIO and an LED matrix; the parts that are refused on an RP board, each by name;
+// and a chip with no bus part paying nothing.
 
 import sh.sysl.benchtop.{library, load}
 import sh.sysl.parsing.source_of
@@ -165,7 +167,7 @@ private refusal(parts: string, buses: string) -> Option[string]
     assert(!got.report.has_errors(), got.report.render(source_of("p.hocon", text)))
     rp_parts_refusal(on_rp_board(got.description).unwrap())
 
-@test("bus parts refused on an RP board, each by name: a panel or touch controller on a bus that routes no clock, data, SDA or SCL; a GT911 with INT wired; a terminal off UART0; an SSD1306")
+@test("bus parts refused on an RP board, each by name: a panel or touch controller on a bus that routes no clock, data, SDA or SCL; a GT911 with INT wired; a terminal off UART0")
 rp_bus_part_refusals()
     val lcd = "lcd { part = st7796, width = 320, height = 480, wire { spi = pico.spi0, cs = pico.GP5, dc = pico.GP6 } }"
     assert(refusal(lcd, "pico.spi0 { sck = GP2, tx = GP3 }").is_none())
@@ -179,5 +181,180 @@ rp_bus_part_refusals()
     assert(int.contains("`t.int` is wired") && int.contains("INT and RESET are left unwired"), int)
     val uart1 = refusal("c { part = terminal, wire { uart = pico.uart1 } }", "pico.uart1 { tx = GP4, rx = GP5 }").unwrap()
     assert(uart1.contains("console is UART0"), uart1)
-    val oled = refusal("o { part = ssd1306, wire { sck = pico.GP2, mosi = pico.GP3, cs = pico.GP5, dc = pico.GP6, reset = pico.GP7 } }", "").unwrap()
-    assert(oled.contains("ssd1306, which benchtop does not run on an rp2350 board yet"), oled)
+
+// ---------------------------------------------------------------------------------------------------
+// The SSD1306, the DS3231 and the WS2812, on the Pico 2 wired as `testdata/rp-parts/pico2-oled-clock.hocon`
+// and `testdata/rp-parts/pico2-kit.hocon` wire them.
+
+private val CLOCK2 = "testdata/rp-parts/pico2-oled-clock.hocon"
+private const OLED_CS: u32 = 17
+private const OLED_DC: u32 = 20
+private const OLED_RESET: u32 = 21
+private const RGB: u32 = 12
+
+// The Pico 2 with the clock's parts on it: the pads, SPI0, I2C0 and clk_peri out of reset, GP18 and GP19
+// SPI0's, GP4 and GP5 I2C0's with their pull-ups, and the OLED's CS, D/C and RESET outputs of the SIO,
+// chip select and reset high; SPI0 in mode 0 as `kit_chip` sets it.
+private clock_chip(ps: *RpParts) -> Rp2350
+    var c = rp2350()
+    connect_parts(ps, &c)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK | rr.RESET_SPI0_MASK | rr.RESET_I2C0_MASK)
+    wr(&c, clk.BASE + clk.CLK_PERI_CTRL_OFFSET, clk.CLK_PERI_CTRL_ENABLE_MASK)
+    for n in [18u32, 19] do function(&c, n, io.GPIO0_CTRL_FUNCSEL_SPI0_RX)
+    for n in [4u32, 5]
+        wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET, pads.GPIO0_PUE_MASK)
+        function(&c, n, 3)
+    wr(&c, sio.BASE + sio.GPIO_OUT_SET_OFFSET, (1 << OLED_CS) | (1 << OLED_RESET))
+    wr(&c, sio.BASE + sio.GPIO_OE_SET_OFFSET, (1 << OLED_CS) | (1 << OLED_DC) | (1 << OLED_RESET))
+    for n in [OLED_CS, OLED_DC, OLED_RESET] do function(&c, n, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    wr(&c, sp.BASE + sp.SSPCR0_OFFSET, 7)
+    wr(&c, sp.BASE + sp.SSPCPSR_OFFSET, 2)
+    wr(&c, sp.BASE + sp.SSPCR1_OFFSET, 2)
+    c
+
+// `bytes` to the OLED over SPI0, D/C at `data`, its chip selected for them.
+private oled_send(c: *Rp2350, data: bool, bytes: []const u32)
+    out(c, OLED_CS, false)
+    out(c, OLED_DC, data)
+    for b in bytes
+        wr(c, sp.BASE + sp.SSPDR_OFFSET, b)
+        while rd(c, sp.BASE + sp.SSPSR_OFFSET) & 16 != 0 do c.advance(4)
+        rd(c, sp.BASE + sp.SSPDR_OFFSET)
+    out(c, OLED_CS, true)
+
+@test("an SSD1306 on the Pico 2's SPI0 pins: D/C low makes a command and high its data, a command byte sent as data lands in its memory, and RESET keeps the memory")
+rp_ssd1306_command_and_data()
+    var ps = rp_parts(described(CLOCK2).unwrap().0)
+    var c = clock_chip(&ps)
+    assert(!ps.oled("oled").unwrap().enabled && ps.oled("rtc").is_none())
+    oled_send(&c, false, [0xAF])
+    assert(ps.oled("oled").unwrap().enabled, "DISPLAY ON as a command")
+    oled_send(&c, true, [0xFF, 0xA7])
+    val d = ps.oled("oled").unwrap()
+    assert(d.ram[0] == 0xFF && d.ram[1] == 0xA7 && !d.inverse, s"${d.ram[0]} ${d.ram[1]}")
+    oled_send(&c, false, [0xA7, 0x81, 0x10])
+    assert(ps.oled("oled").unwrap().inverse && ps.oled("oled").unwrap().contrast == 0x10, "INVERSE, and CONTRAST with its argument")
+    out(&c, OLED_RESET, false)
+    out(&c, OLED_RESET, true)
+    oled_send(&c, false, [0xAE])
+    val after = ps.oled("oled").unwrap()
+    assert(!after.inverse && after.ram[0] == 0xFF, "reset clears the configuration and keeps the memory")
+
+// `bytes` written to the part I2C0 addresses, a STOP after the last.
+private i2c_write(c: *Rp2350, bytes: []const u32)
+    for i in 0..<bytes.len
+        wr(c, ir.BASE + ir.IC_DATA_CMD_OFFSET, bytes[i] | (if i == bytes.len - 1 then ir.IC_DATA_CMD_STOP_MASK else 0))
+    c.advance(u64(2 + bytes.len) * 9 * BIT)
+
+// `n` registers from `reg` on, of a part whose register pointer is one byte.
+private i2c_read(c: *Rp2350, reg: u32, n: u32) -> [7]u32
+    wr(c, ir.BASE + ir.IC_DATA_CMD_OFFSET, reg)
+    for i in 0..<n
+        val restart = if i == 0 then ir.IC_DATA_CMD_RESTART_MASK else 0
+        val stop = if i == n - 1 then ir.IC_DATA_CMD_STOP_MASK else 0
+        wr(c, ir.BASE + ir.IC_DATA_CMD_OFFSET, ir.IC_DATA_CMD_CMD_MASK | restart | stop)
+    c.advance(u64(3 + 2 * n) * 9 * BIT)
+    var got: [7]u32 = [0; 7]
+    for i in 0..<n do got[i] = rd(c, ir.BASE + ir.IC_DATA_CMD_OFFSET) & 0xFF
+    got
+
+@test("a DS3231 on the Pico 2's I2C0: 0x69 is NACKed; at 0x68 its fixed date reads back, a time written reads back and a second later has ticked, and an invalid minute is ignored")
+rp_ds3231_registers()
+    var ps = rp_parts(described(CLOCK2).unwrap().0)
+    var c = clock_chip(&ps)
+    master(&c, 0x69)
+    wr(&c, ir.BASE + ir.IC_DATA_CMD_OFFSET, ir.IC_DATA_CMD_STOP_MASK)
+    c.advance(4 * 9 * BIT)
+    assert(rd(&c, ir.BASE + ir.IC_TX_ABRT_SOURCE_OFFSET) & ir.IC_TX_ABRT_SOURCE_ABRT_7B_ADDR_NOACK_MASK != 0, "nobody answers 0x69")
+    rd(&c, ir.BASE + ir.IC_CLR_TX_ABRT_OFFSET)
+    master(&c, 0x68)
+    val first = i2c_read(&c, 0, 7)
+    assert(first[0] == 0 && first[4] == 1 && first[5] == 1 && first[6] == 0x26, s"${first[0]} ${first[4]} ${first[5]} ${first[6]}")
+    assert(rd(&c, ir.BASE + ir.IC_RAW_INTR_STAT_OFFSET) & ir.IC_RAW_INTR_STAT_TX_ABRT_MASK == 0, "0x68 is acknowledged")
+    i2c_write(&c, [0, 0x30, 0x59, 0x23])
+    val set = i2c_read(&c, 0, 3)
+    assert(set[0] == 0x30 && set[1] == 0x59 && set[2] == 0x23, s"${set[0]} ${set[1]} ${set[2]}")
+    c.advance(c.part_hz())
+    observe_parts(&ps, &c)
+    assert(i2c_read(&c, 0, 1)[0] == 0x31, "a second of clk_sys later")
+    assert(ps.rtc("rtc", c.now).unwrap()[0] == 0x31 && ps.rtc("oled", c.now).is_none())
+    i2c_write(&c, [1, 0x7A])
+    assert(i2c_read(&c, 1, 1)[0] == 0x59, "minute 7A is no minute")
+
+// GPIO 12 an SIO output.
+private rgb_chip(ps: *RpParts, output: bool) -> Rp2350
+    var c = rp2350()
+    connect_parts(ps, &c)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK)
+    function(&c, RGB, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    if output then wr(&c, sio.BASE + sio.GPIO_OE_SET_OFFSET, 1 << RGB)
+    c
+
+// The 24 bits of `grb` on GPIO 12 from the SIO, a 0 high for 0.3 us and a 1 for 0.9 us, in clk_sys cycles.
+private rgb_word(c: *Rp2350, grb: u32)
+    val per_us = c.part_hz() / 1000000
+    for i in 0..<24
+        val one = (grb >> u32(23 - i)) & 1 != 0
+        out(c, RGB, true)
+        c.advance(per_us * (if one then 9 else 3) / 10)
+        out(c, RGB, false)
+        c.advance(per_us * (if one then 4 else 10) / 10)
+
+@test("a WS2812 on the Pico 2's GPIO 12, driven from the SIO: a frame shows once the line has been low for a reset, a second frame replaces it, and on a GPIO that drives nothing the LED stays dark")
+rp_ws2812_from_the_sio()
+    var ps = rp_parts(described(KIT2).unwrap().0)
+    var c = rgb_chip(&ps, true)
+    assert(c.watch.mask & (1 << RGB) != 0, "the chip watches DIN")
+    rgb_word(&c, 0x102030)
+    observe_parts(&ps, &c)
+    assert(ps.pixels("rgb", c.now)[0] == 0, "not latched yet")
+    c.advance(c.part_hz() / 10000)
+    observe_parts(&ps, &c)
+    assert(ps.pixels("rgb", c.now)[0] == 0x201030, s"${ps.pixels("rgb", c.now)[0]}")
+    rgb_word(&c, 0x0000FF)
+    c.advance(c.part_hz() / 10000)
+    observe_parts(&ps, &c)
+    assert(ps.pixels("rgb", c.now)[0] == 0x0000FF && ps.pixels("lcd", c.now).is_empty())
+    var dark = rp_parts(described(KIT2).unwrap().0)
+    var d = rgb_chip(&dark, false)
+    rgb_word(&d, 0xFFFFFF)
+    d.advance(d.part_hz() / 10000)
+    observe_parts(&dark, &d)
+    assert(dark.pixels("rgb", d.now)[0] == 0, "GPIO 12's output is not enabled: DIN floats, and the LED reads it low")
+
+@test("an LED matrix on the Pico 2: a row driven high and a column low light the LED where they cross, and only it")
+rp_led_matrix()
+    var ps = rp_parts(on_rp_board(load(source_of("p.hocon", "product { name = p, boards { pico { board = pico2 } }, parts { m { part = led-matrix-5x5, wire { row0 = pico.GP2, row1 = pico.GP3, row2 = pico.GP4, row3 = pico.GP5, row4 = pico.GP6, col0 = pico.GP7, col1 = pico.GP8, col2 = pico.GP9, col3 = pico.GP10, col4 = pico.GP11 } } } }"), library()).description).unwrap())
+    var c = rp2350()
+    connect_parts(&ps, &c)
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK)
+    for n in 2u32..<12 do function(&c, n, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    wr(&c, sio.BASE + sio.GPIO_OUT_SET_OFFSET, (1 << 2) | (0xF << 8))
+    wr(&c, sio.BASE + sio.GPIO_OE_SET_OFFSET, (1 << 2) | (1 << 7) | (0xF << 8))
+    c.advance(100000)
+    observe_parts(&ps, &c)
+    val levels = ps.matrix("m", c.now)
+    assert(levels[0] > 0 && levels[1] == 0 && levels[8] == 0, s"${levels[0]} ${levels[1]} ${levels[8]}")
+
+@test("a chip whose board has no WS2812, OLED or panel watches no GPIO, so a PIO block moving a pin costs it one test")
+rp_pixels_cost_nothing_without_a_chain()
+    var none = rp_parts(described("pico2").unwrap().0)
+    var c = rp2350()
+    connect_parts(&none, &c)
+    assert(!c.watch.watching && c.watch.mask == 0)
+
+@test("parts refused on an RP board, each by name: a WS2812's DIN or an SSD1306's terminal off the GPIOs, a DS3231 on a bus that routes no SCL, and two DS3231s")
+rp_more_refusals()
+    val oled = "o { part = ssd1306, wire { sck = pico.GP2, mosi = pico.GP3, cs = pico.GP5, dc = pico.GP6, reset = pico.GP7 } }"
+    assert(refusal(oled, "").is_none())
+    val rtc = "r { part = ds3231, wire { i2c = pico.i2c0 } }"
+    assert(refusal(rtc, "pico.i2c0 { sda = GP4, scl = GP5 }").is_none())
+    val no_scl = refusal(rtc, "pico.i2c0 { sda = GP4 }").unwrap()
+    assert(no_scl.contains("`r` is a clock on `i2c0`, and the board's `buses` routes `i2c0.scl` to no pin"), no_scl)
+    val two = refusal(s"$rtc, q { part = ds3231, wire { i2c = pico.i2c0 } }", "pico.i2c0 { sda = GP4, scl = GP5 }").unwrap()
+    assert(two.contains("two DS3231 parts share the fixed I2C address 0x68"), two)
+    assert(refusal("p { part = ws2812, count = 8, wire { din = pico.GP12 } }", "").is_none())
+    // A DIN off the GPIOs never reaches the plan: the checker refuses it.
+    val text = "product { name = p, boards { pico { board = pico2 } }, parts { l { part = led, wire { anode = pico.GP2 } }, p { part = ws2812, wire { din = l.anode } } } }"
+    val off = load(source_of("p.hocon", text), library()).report.render(source_of("p.hocon", text))
+    assert(off.contains("`l.anode` is not a pin another part can be wired to"), off)

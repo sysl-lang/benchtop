@@ -49,9 +49,14 @@ target_include_directories(hello_sha256 PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CMAK
 target_link_libraries(hello_pwm hardware_pwm)
 benchtop_program(parts parts.c no_flash)
 target_link_libraries(parts hardware_pwm)
-# breadboard_kit: the Pico's program, the same on the Pico 2 in the kit's socket.
+# breadboard_kit: the Pico's program, the same on the Pico 2 in the kit's socket, its RGB LED on PIO0
+# running pio/ws2812.pio.
 benchtop_program(breadboard_kit ../pico/breadboard_kit.c no_flash)
-target_link_libraries(breadboard_kit hardware_spi hardware_i2c)
+target_link_libraries(breadboard_kit hardware_spi hardware_i2c hardware_pio)
+target_include_directories(breadboard_kit PRIVATE ${CMAKE_CURRENT_LIST_DIR}/pio)
+# oled_clock: an SSD1306 on SPI0 and a DS3231 on I2C0 (testdata/rp-parts/pico2-oled-clock.hocon).
+benchtop_program(oled_clock oled_clock.c no_flash)
+target_link_libraries(oled_clock hardware_spi hardware_i2c)
 target_link_libraries(pwm_led_fade hardware_pwm)
 target_link_libraries(measure_duty_cycle hardware_pwm)
 target_link_libraries(pwm_features hardware_pwm hardware_dma)

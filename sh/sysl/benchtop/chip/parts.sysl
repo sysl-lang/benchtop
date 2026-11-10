@@ -12,7 +12,9 @@ module sh.sysl.benchtop.chip
 
 import sh.sysl.benchtop.{Board, Part, Target, article_of, part_model, part_text, part_whole}
 import sh.sysl.benchtop.audio as audio
+import sh.sysl.benchtop.parts.ds3231 as rtc
 import sh.sysl.benchtop.parts.hd44780.Lcd
+import sh.sysl.benchtop.parts.ssd1306 as oled
 import sh.sysl.benchtop.peripheral.i2c.Device
 import sh.sysl.benchtop.peripheral.rp2040.{ADC_BASE_GPIO, Pwm, pwm_slice_of}
 import sh.sysl.benchtop.peripheral.rp2350 as rp
@@ -94,10 +96,13 @@ trait PartPins
 
 impl Rp2350
     // What the watched GPIOs show now, kept where it changed; and the hooks hear it.
-    private[chip] note_pins(*self)
+    private[chip] note_pins(*self) = self.note_pins_at(self.now)
+
+    // The same, as at the end of clk_sys cycle `cycle`: a PIO block's levels as it catches up.
+    private[chip] note_pins_at(*self, cycle: u64)
         if self.watch.mask != 0
             val (levels, driven) = shown(self.watch.mask, n -> self.pin(n))
-            self.watch.note(self.now, levels, driven)
+            self.watch.note(cycle, levels, driven)
         if self.watch.hooked then self.tell_hooks()
 
     // Each hook hears its GPIOs as they stand now.
@@ -146,7 +151,9 @@ impl PartPins for Rp2350
     part_watch(*self, mask: u64)
         self.watch = PinWatch(mask, 0, 0, buf(), buf(), mask != 0, false)
         if mask != 0 then self.note_pins()
+    // The PIO blocks catch up first, so what they gave the pins up to now is among the changes.
     part_changes(*self) -> Buf[PinChange]
+        if self.pio.running then self.pio_catch_up()
         val all = self.watch.changes
         self.watch.changes = buf()
         all
@@ -184,26 +191,22 @@ impl PartPins for Rp2040
 
 // The parts that work through a pin or an ADC input, which run on an RP board.
 private pin_level(model: string) -> bool = model match
-    "led" | "button" | "switch" | "potentiometer" | "joystick" | "buzzer" | "seven-segment" | "hd44780" -> true
-    _ -> false
-
-// The parts benchtop does not run on an RP board yet: an OLED and a clock.
-private not_yet(model: string) -> bool = model match
-    "ssd1306" | "ds3231" -> true
+    "led" | "button" | "switch" | "potentiometer" | "joystick" | "buzzer" | "seven-segment" | "hd44780" | "led-matrix-5x5" -> true
     _ -> false
 
 /** Why benchtop cannot run board `b`'s parts on its RP chip, or None where it can. A part whose pins
  * are GPIOs runs; an LED may also be wired to another part's port, which shows nothing until that part
- * runs. An SPI panel runs with its terminals on GPIOs (an ST7796's clock and data the SPI bus's), and a
- * touch controller on an I2C bus that routes SDA and SCL; a terminal is the console on UART0; a WS2812
- * is shown dark, with a note (`RpParts.note`). The checker has already held each wire to a pin the
- * board has, and a potentiometer's or a joystick's to an ADC pin.
+ * runs. An SPI panel or an SSD1306 runs with its terminals on GPIOs (an ST7796's clock and data the SPI
+ * bus's), a WS2812 with its DIN on one, and a touch controller or a DS3231 on an I2C bus that routes SDA
+ * and SCL; a terminal is the console on UART0. The checker has already held each wire to a pin the board
+ * has, and a potentiometer's or a joystick's to an ADC pin.
  */
 rp_parts_refusal(b: Board) -> Option[string]
     val chip = b.chip.name
+    var clocks = 0
     for p in b.parts
         val model = part_model(p)
-        if pin_level(model) || model == "st7789" || model == "st7796"
+        if pin_level(model) || model == "st7789" || model == "st7796" || model == "ssd1306" || model == "ws2812"
             if model == "led" then continue
             for w in p.wires
                 if model == "st7796" && w.port == "spi" then continue
@@ -213,6 +216,10 @@ rp_parts_refusal(b: Board) -> Option[string]
             for w in p.wires
                 if w.port != "i2c" then return Some(s"`${p.name}.${w.port}` is wired, and benchtop's ${model} is polled over I2C: its INT and RESET are left unwired")
             continue
+        if model == "ds3231"
+            if clocks > 0 then return Some("two DS3231 parts share the fixed I2C address 0x68")
+            clocks += 1
+            continue
         if model == "terminal"
             for w in p.wires
                 val on_uart0 = w.to match
@@ -220,8 +227,6 @@ rp_parts_refusal(b: Board) -> Option[string]
                     _ -> false
                 if !on_uart0 then return Some(s"`${p.name}` is a terminal on ${wired_to(w.to)}, and an $chip board's console is UART0")
             continue
-        if model == "ws2812" then continue
-        if not_yet(model) then return Some(s"`${p.name}` is ${article_of(model)} $model, which benchtop does not run on an $chip board yet: it runs an RP board's pin-level parts, its SPI panels and its I2C touch controllers, and the rest come next")
         return Some(s"benchtop does not emulate the parts on an $chip board yet, and `${p.name}` is ${article_of(p.kind)} ${p.kind}")
     virt.bus_part_refusal(b, true)
 
@@ -255,9 +260,33 @@ struct RpTouch
     sda: u32
     scl: u32
 
+/** A DS3231 of an RP board: the machine's model (`virt.rtc_model`), counting nanoseconds, so a new
+ * clk_sys rate does not change how fast it keeps time; the GPIOs its bus's SDA and SCL are on; and the
+ * clk_sys cycle its count was last brought up to, the nanoseconds that came to and the rate since. A
+ * chip's reset starts its cycles again from 0; the clock, on its own battery, runs on.
+ */
+struct RpRtc
+    name: string
+    model: rtc.Rtc
+    sda: u32
+    scl: u32
+    cycle: u64
+    ns: u64
+    hz: u64
+
+impl RpRtc
+    /** The nanoseconds clk_sys cycle `cycle` comes to. */
+    at(*self, cycle: u64) -> u64 = self.ns + (if cycle > self.cycle then virt.nanos(cycle - self.cycle, self.hz) else 0)
+
+    /** The count brought up to cycle `cycle`, from which clk_sys runs at `hz`. */
+    rate(*self, cycle: u64, hz: u64)
+        self.ns = self.at(cycle)
+        self.cycle = cycle
+        self.hz = hz
+
 /** The parts of an RP board on its chip: each part's control as the window or a script sets it (as the
- * workbench's session keeps them), the displays its GPIOs drive, its buzzers, its SPI panels, its I2C
- * touch controllers, and a note for the person running it, given once.
+ * workbench's session keeps them), the displays its GPIOs drive, its buzzers, its SPI panels and OLEDs,
+ * its I2C touch controllers and its real-time clocks.
  */
 struct RpParts
     parts: Buf[Part]
@@ -265,33 +294,48 @@ struct RpParts
     displays: virt.Displays
     buzzers: Buf[RpBuzzer]
     panels: Buf[&virt.Panel]
+    oleds: Buf[&virt.Oled]
     touches: Buf[RpTouch]
-    note: Option[string]
+    rtcs: Buf[&RpRtc]
 
-/** The parts of `b`, which `rp_parts_refusal` has passed, every control at rest, on no chip yet. */
+/** The parts of `b`, which `rp_parts_refusal` has passed, every control at rest, on no chip yet. A
+ * DS3231 whose `initial-time` is the host's, where the host's time cannot be read, starts from its
+ * `initial-*` date as a fixed one does.
+ */
 rp_parts(b: Board) -> RpParts
     var inputs: Buf[PartInput] = buf()
     var buzzers: Buf[RpBuzzer] = buf()
     var panels: Buf[&virt.Panel] = buf()
+    var oleds: Buf[&virt.Oled] = buf()
     var touches: Buf[RpTouch] = buf()
-    var note: Option[string] = None
+    var rtcs: Buf[&RpRtc] = buf()
     for p in b.parts
         inputs.push(virt.resting(p))
         virt.panel_of(b, p) match
             Some(panel) -> panels.push(panel)
             None -> ()
+        virt.oled_of(p) match
+            Some(o) -> oleds.push(o)
+            None -> ()
         virt.touchscreen_of(p) match
             Some(t) -> touches.push(RpTouch(t, u32(virt.bus_signal_pin(b, p, "i2c", "sda")), u32(virt.bus_signal_pin(b, p, "i2c", "scl"))))
             None -> ()
-        if part_model(p) == "ws2812" && note.is_none()
-            note = Some(s"`${p.name}` (ws2812) is shown dark: benchtop does not decode a WS2812's waveform on an RP board yet")
+        if part_model(p) == "ds3231"
+            val model = virt.rtc_model(p, NANOSECOND_HZ) match
+                Ok(m) -> m
+                Err(_) -> virt.rtc_epoch(p, NANOSECOND_HZ)
+            val r: &RpRtc = RpRtc(p.name, model, u32(virt.bus_signal_pin(b, p, "i2c", "sda")), u32(virt.bus_signal_pin(b, p, "i2c", "scl")), 0, 0, 0)
+            rtcs.push(r)
         if part_model(p) != "buzzer" then continue
         val pin = virt.terminal_pin(p, "pin")
         if pin < 0 then continue
         val gain = real(part_whole(p, "gain", 12)) / 100.0
         buzzers.push(RpBuzzer(p.name, u32(pin), part_text(p, "kind", "passive") == "active", u64(part_whole(p, "tone", 4000)),
             gain, audio.synth(48000, 48000, gain), 0, false, false))
-    RpParts(b.parts, inputs, virt.displays_of(b), buzzers, panels, touches, note)
+    RpParts(b.parts, inputs, virt.displays_of(b), buzzers, panels, oleds, touches, rtcs)
+
+// An RP board's DS3231 counts nanoseconds.
+private const NANOSECOND_HZ: u64 = 1000000000
 
 impl RpParts
     /** The part named `name`, if the board has it. */
@@ -346,33 +390,71 @@ impl RpParts
     lift_touches(*self)
         for t in self.touches do t.model.lift()
 
+    /** The SSD1306 `name`'s controller as it stands; None where the board has no such OLED. */
+    oled(*self, name: string) -> Option[oled.Display]
+        for o in self.oleds do if o.name() == name then return Some(o.display())
+        None
+
+    /** The LED matrix `name`'s brightness at clk_sys cycle `cycle`, row * 8 + column. */
+    matrix(*self, name: string, cycle: u64) -> [64]u8 = virt.brightness_of(&self.displays, name, cycle)
+
+    /** What each LED of the WS2812 chain `name` shows at clk_sys cycle `cycle`, the parts having seen the
+     * pins up to it; empty where the board has no such chain.
+     */
+    pixels(*self, name: string, cycle: u64) -> Buf[u32] = virt.pixels_of(&self.displays, name, cycle)
+
+    /** The DS3231 `name`'s time and date registers at clk_sys cycle `cycle`; None where the board has
+     * no such clock.
+     */
+    rtc(*self, name: string, cycle: u64) -> Option[[7]u8]
+        for r in self.rtcs
+            if r.name != name then continue
+            rtc.advance(&r.model, r.at(cycle))
+            var result: [7]u8 = [0; 7]
+            for i in 0..<7 do result[i] = r.model.registers[i]
+            return Some(result)
+        None
+
 private travel(at: int) -> int = if at < 0 then 0 elif at > virt.POSITION_MAX then virt.POSITION_MAX else at
 
-/** Put the parts on chip `c`, a new board: it watches the pins the displays and buzzers are wired to,
- * each SPI panel, its controller fresh, hears its terminals' GPIOs, each touch controller, booted, goes
- * on the I2C lines, and every control is put on its pins as it stands.
+/** Put the parts on chip `c`, a new board: it watches the pins the displays, WS2812s and buzzers are
+ * wired to, each from power-on; each SPI panel and OLED, its controller fresh, hears its terminals'
+ * GPIOs; each touch controller, booted, and each DS3231, its count running on from where it was, goes
+ * on the I2C lines; and every control is put on its pins as it stands.
  */
 connect_parts[C: PartPins](ps: *RpParts, c: *C)
     var mask: u64 = 0
     for p in ps.parts
         val model = part_model(p)
-        if model != "seven-segment" && model != "hd44780" && model != "buzzer" then continue
+        if model != "seven-segment" && model != "hd44780" && model != "led-matrix-5x5" && model != "ws2812" && model != "buzzer" then continue
         for w in p.wires
             val n = virt.connection_pin(w.to)
             if n >= 0 then mask |= 1u64 << u64(n)
+    virt.restart_pixels(&ps.displays)
     c.part_watch(mask)
     for panel in ps.panels
         panel.restart()
-        val pins = panel.pins()
-        var heard: u64 = 0
-        for n in [pins.cs, pins.sck, pins.mosi, pins.dc, pins.reset] do if n >= 0 then heard |= 1u64 << u64(n)
-        c.part_hook(PinHook(heard, (levels, driven) -> panel.hear(levels, driven)))
+        c.part_hook(PinHook(port_mask(panel.pins()), (levels, driven) -> panel.hear(levels, driven)))
+    for o in ps.oleds
+        o.restart()
+        c.part_hook(PinHook(port_mask(o.pins()), (levels, driven) -> o.hear(levels, driven)))
     for t in ps.touches
         val model = t.model
         model.boot()
         c.part_i2c(I2cPart(t.sda, t.scl, Device(model.address, (w, reading, time) -> model.start(reading),
             (w, byte, time) -> model.write(byte), (w, time) -> model.read()), true))
+    for r in ps.rtcs
+        r.cycle = c.part_clock()
+        r.hz = c.part_hz()
+        c.part_i2c(I2cPart(r.sda, r.scl, Device(0x68, (w, reading, time) -> rtc.start(&r.model, reading, r.at(time)),
+            (w, byte, time) -> rtc.write(&r.model, byte, r.at(time)), (w, time) -> rtc.read(&r.model, r.at(time))), true))
     apply_parts(ps, c)
+
+// The GPIOs a four-wire SPI port's terminals are on, bit n for GPIO n.
+private port_mask(pins: virt.PortPins) -> u64
+    var heard: u64 = 0
+    for n in [pins.cs, pins.sck, pins.mosi, pins.dc, pins.reset] do if n >= 0 then heard |= 1u64 << u64(n)
+    heard
 
 /** Put every part's control on chip `c`'s pins: a closed button or switch drives its GPIO to its active
  * level and an open one lets it go; a potentiometer or a joystick puts its wiper's level on its ADC
@@ -397,18 +479,21 @@ private close[C: PartPins](c: *C, p: Part, closed: bool)
 private analog[C: PartPins](c: *C, pin: int, uv: u32)
     if pin >= int(ADC_BASE_GPIO) then c.part_analog(u32(pin) - ADC_BASE_GPIO, Some(uv))
 
-/** The parts see what chip `c`'s pins have done since they last looked: the displays each change, and
- * the buzzers the sound up to the chip's clock.
+/** The parts see what chip `c`'s pins have done since they last looked: the displays and WS2812s each
+ * change, and the buzzers the sound up to the chip's clock; and the DS3231s' counts are brought up to
+ * it, at the rate clk_sys runs at from now.
  */
 observe_parts[C: PartPins](ps: *RpParts, c: *C)
+    val hz = c.part_hz()
     for ch in c.part_changes()
         sound_to(ps, c, ch.cycle)
         for i in 0..<ps.buzzers.len()
             val bit = 1u64 << u64(ps.buzzers[i].pin)
             ps.buzzers[i].level = ch.levels & bit != 0
             ps.buzzers[i].driven = ch.driven & bit != 0
-        virt.observe_pins(&ps.displays, u32.wrap(ch.levels), u32.wrap(ch.driven), ch.cycle)
+        virt.observe_pins(&ps.displays, u32.wrap(ch.levels), u32.wrap(ch.driven), ch.cycle, hz)
     sound_to(ps, c, c.part_clock())
+    for r in ps.rtcs do r.rate(c.part_clock(), hz)
 
 // The buzzers sounded up to clk_sys cycle `cycle`, each as it stands.
 private sound_to[C: PartPins](ps: *RpParts, c: *C, cycle: u64)

@@ -4,6 +4,7 @@ import sh.sysl.benchtop.{Board, part_model, Part, part_whole, param_named}
 import sh.sysl.benchtop.parts.seven_segment as seven
 import sh.sysl.benchtop.parts.pins.{Line, floating}
 import sh.sysl.benchtop.parts.spi as spi
+import sh.sysl.benchtop.parts.ws2812 as ws
 import sysl.buf.{Buf, buf}
 import sysl.threads.Mutex
 
@@ -49,6 +50,12 @@ private lines(pins: [8]int, levels: u32, driven: u32) -> [8]Line
     for i in 0..<8 do out[i] = line_at(pins[i], levels, driven)
     out
 
+/** A chain of WS2812s and the GPIO its DIN is wired to. */
+struct PixelBinding
+    name: string
+    din: int
+    model: ws.Chain
+
 /** The displays on the board: whether it has any, which the board fixes, and the displays
  * themselves, which the cores drive and the host's renderer and the DSI worker read.
  */
@@ -57,21 +64,28 @@ struct Displays
     live: Mutex[DisplayState]
 
 /** The displays on the board, each watching the pins it is wired to: seven-segment digits and LED
- * matrices, HD44780 LCDs (lcd.sysl), SSD1306 OLEDs (oled.sysl) and MIPI DCS panels (tft.sysl).
+ * matrices, HD44780 LCDs (lcd.sysl), SSD1306 OLEDs (oled.sysl), MIPI DCS panels (tft.sysl) and chains of
+ * WS2812s, and the rate of the clock the pins' changes are timed by.
  */
 struct DisplayState
     sevens: Buf[DisplayBinding]
     lcds: Buf[LcdBinding]
     oleds: Buf[OledBinding]
     tfts: Buf[TftBinding]
+    pixels: Buf[PixelBinding]
+    hz: u64
 
 /** No display on the board. */
-display_state() -> Displays = Displays(false, Mutex.new(DisplayState(buf(), buf(), buf(), buf())))
+display_state() -> Displays = Displays(false, Mutex.new(DisplayState(buf(), buf(), buf(), buf(), buf(), 0)))
 
-// The displays `b` wires to its chip; its SPI panels too where `panels` says so.
-private[virt] check_displays(b: Board, panels: bool = true) -> Displays
-    var s = DisplayState(buf(), lcds_of(b), oleds_of(b), if panels then tfts_of(b) else buf())
+// The displays `b` wires to its chip, their changes timed by a clock at `hz`; its SPI panels and OLEDs
+// too where `panels` says so.
+private[virt] check_displays(b: Board, panels: bool = true, hz: u64 = 0) -> Displays
+    var s = DisplayState(buf(), lcds_of(b), if panels then oleds_of(b) else buf(), if panels then tfts_of(b) else buf(), buf(), hz)
     for p in b.parts
+        if part_model(p) == "ws2812"
+            s.pixels.push(PixelBinding(p.name, terminal_pin(p, "din"), ws.chain(int(part_whole(p, "count", 1)))))
+            continue
         if part_model(p) == "led-matrix-5x5"
             var columns: [8]int = [-1; 8]
             var rows: [8]int = [-1; 8]
@@ -95,7 +109,7 @@ private[virt] check_displays(b: Board, panels: bool = true) -> Displays
             None -> false
         val model = seven.display(int(part_whole(p, "digits", 1)), anode, u64(part_whole(p, "persistence-cycles", 50000)))
         s.sevens.push(DisplayBinding(p.name, model, segments, commons))
-    val present = !s.sevens.is_empty() || !s.lcds.is_empty() || !s.oleds.is_empty() || !s.tfts.is_empty()
+    val present = !s.sevens.is_empty() || !s.lcds.is_empty() || !s.oleds.is_empty() || !s.tfts.is_empty() || !s.pixels.is_empty()
     Displays(present, Mutex.new(s))
 
 private[virt] reset_displays(d: *Displays)
@@ -103,6 +117,7 @@ private[virt] reset_displays(d: *Displays)
         reset_lcds(s)
         reset_oleds(s)
         reset_tfts(s)
+        for i in 0..<s.pixels.len() do ws.restart(&s.pixels[i].model)
         for i in 0..<s.sevens.len()
             var binding = s.sevens[i]
             seven.reset(&binding.model)
@@ -114,6 +129,10 @@ private[virt] observe_displays(d: *Displays, levels: u32, driven: u32, time: u64
         observe_lcds(s, levels, driven, time)
         observe_oleds(s, levels, driven)
         observe_tfts(s, levels, driven)
+        // An undriven DIN floats, which the LED reads as low.
+        for i in 0..<s.pixels.len()
+            val din = line_at(s.pixels[i].din, levels, driven)
+            ws.edge(&s.pixels[i].model, din.driven && din.high, time, s.hz)
         for i in 0..<s.sevens.len()
             var binding = s.sevens[i]
             seven.observe(&binding.model, lines(binding.segments, levels, driven), lines(binding.commons, levels, driven), time)
@@ -121,12 +140,24 @@ private[virt] observe_displays(d: *Displays, levels: u32, driven: u32, time: u64
 
 /** The displays `b` wires to GPIOs, for a chip other than benchtop's Cortex-M machine to drive: an
  * RP2040's or RP2350's (`chip.RpParts`), which shows them its pins with `observe_pins` as it next
- * looks. Its SPI panels, which hear every edge as it happens, are `Panel`s of their own.
+ * looks. Its SPI panels and OLEDs, which hear every edge as it happens, are `Panel`s and `Oled`s of
+ * their own.
  */
 displays_of(b: Board) -> Displays = check_displays(b, false)
 
-/** The displays see the GPIOs at `levels`, the chip driving those of `driven`, from `time` on. */
-observe_pins(d: *Displays, levels: u32, driven: u32, time: u64) = observe_displays(d, levels, driven, time)
+/** Every WS2812 chain as at power-on, dark, its line timed from 0 again: a new chip's clock. */
+restart_pixels(d: *Displays)
+    if !d.present then return
+    d.live.with(s ->
+        for i in 0..<s.pixels.len() do ws.restart(&s.pixels[i].model))
+
+/** The displays see the GPIOs at `levels`, the chip driving those of `driven`, from `time` on, in ticks
+ * of a clock at `hz`.
+ */
+observe_pins(d: *Displays, levels: u32, driven: u32, time: u64, hz: u64)
+    if !d.present then return
+    d.live.with(s -> s.hz = hz)
+    observe_displays(d, levels, driven, time)
 
 /** What each digit of the seven-segment display `name` shows at `time`: its segments, bit i for a..g, dp. */
 segments_of(d: *Displays, name: string, time: u64) -> [8]u8
@@ -140,13 +171,30 @@ segments_of(d: *Displays, name: string, time: u64) -> [8]u8
 /** The renderer reads only physical segment patterns derived from guest GPIO writes. */
 display_segments(m: *Machine, name: string) -> [8]u8 = segments_of(&m.devices.displays, name, observation_time(m))
 
-/** Duty-cycle brightness for GPIO LED components; indices are row * 8 + column. */
-display_brightness(m: *Machine, name: string) -> [64]u8
-    val now = observation_time(m)
-    m.devices.displays.live.with(s ->
+/** The LED matrix `name`'s duty-cycle brightness at `time`; indices are row * 8 + column. */
+brightness_of(d: *Displays, name: string, time: u64) -> [64]u8
+    d.live.with(s ->
         var result: [64]u8 = [0; 64]
         for binding in s.sevens
             if binding.name == name
-                result = seven.brightness(binding.model, now)
+                result = seven.brightness(binding.model, time)
                 break
         result)
+
+/** Duty-cycle brightness for GPIO LED components; indices are row * 8 + column. */
+display_brightness(m: *Machine, name: string) -> [64]u8 = brightness_of(&m.devices.displays, name, observation_time(m))
+
+/** What each LED of the WS2812 chain `name` shows at `time` (0xRRGGBB, the one nearest DIN first), the
+ * line as it stands latching a frame it has finished; empty where the board has no such chain.
+ */
+pixels_of(d: *Displays, name: string, time: u64) -> Buf[u32]
+    d.live.with(s ->
+        var result: Buf[u32] = buf()
+        for i in 0..<s.pixels.len()
+            if s.pixels[i].name != name then continue
+            ws.settle(&s.pixels[i].model, time, s.hz)
+            for c in s.pixels[i].model.colors do result.push(c)
+        result)
+
+/** What the machine's WS2812 chain `name` shows now. */
+display_pixels(m: *Machine, name: string) -> Buf[u32] = pixels_of(&m.devices.displays, name, observation_time(m))

@@ -3,13 +3,16 @@ module sh.sysl.benchtop.chip
 
 // The board interface (`virt.Guest`), the same assertions on both engines: a part pressed through the
 // session reaches the firmware, an LED reads lit, keys typed on the console are answered, and a
-// register and a word of RAM read and written the way gdb reaches them, and an SPI panel drawn and an I2C
-// touch read. The machine's boards are the STM32H747I-DISCO running its Forth and the touch board
-// running its demo; the RP boards are the Pico 2 running SDK examples and the Pico Breadboard Kit.
+// register and a word of RAM read and written the way gdb reaches them, an SPI panel drawn and an I2C
+// touch read, an SSD1306 drawn and a DS3231 read, and a WS2812 chain latched. The machine's boards are
+// the STM32H747I-DISCO running its Forth, the touch board running its demo, the workbench running its own
+// and a board with a WS2812 chain; the RP boards are the Pico 2 running SDK examples and the Pico
+// Breadboard Kit.
 
 import sh.sysl.benchtop.virt as virt
 import sh.sysl.benchtop.virt.{PartInput, SdChoice, Session, SliceEnd}
 import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
 import sysl.fs.read_bytes
 import sysl.raw.str_cast
 import sysl.text.Search
@@ -31,10 +34,10 @@ private booted(which: string, file: string) -> &Session
     s
 
 // Run `s`'s board until its console has shown `text` since `seen`, and answer how far it has shown.
-private shows(s: &Session, seen: u64, text: string) -> u64
+private shows(s: &Session, seen: u64, text: string, slices: int = SLICES) -> u64
     var shown: Buf[u8] = buf()
     var at = seen
-    for _ in 0..<SLICES
+    for _ in 0..<slices
         val end = s.guest.run_slice()
         val (bytes, total) = s.guest.output_since(at)
         shown.extend(bytes.view())
@@ -173,6 +176,77 @@ private draws_and_touches(which: string, file: string, ready: string, panel: str
         slice(s)
     assert(changed, s"a touch at ($x, $y) never changed $panel")
     if !said.is_empty() then shows(s, seen, said)
+
+// Whether the OLED `name` of `s`'s board is on and shows anything.
+private oled_lit(s: &Session, name: string) -> bool
+    val d = s.guest.oled(name) match
+        Some(d) -> d
+        None -> return false
+    if !d.enabled then return false
+    for b in d.ram do if b != 0 then return true
+    false
+
+/** The OLED `oled` comes on and draws once the firmware runs (once it has said `ready`); the DS3231
+ * `rtc` reads its time and date registers, and its seconds move on as the board runs; a name the board
+ * does not have answers nothing.
+ */
+private draws_and_keeps_time(which: string, file: string, ready: string, oled: string, rtc: string)
+    val s = booted(which, file)
+    assert(s.guest.oled("no-such-oled").is_none() && s.guest.rtc("no-such-clock").is_none())
+    assert(s.guest.rtc(oled).is_none() && s.guest.oled(rtc).is_none(), "an OLED is no clock, and a clock no OLED")
+    if !ready.is_empty() then shows(s, 0, ready)
+    var drawn = false
+    for _ in 0..<SLICES
+        if oled_lit(s, oled) then drawn = true
+        if drawn then break
+        slice(s)
+    assert(drawn, s"$oled never drew")
+    val first = s.guest.rtc(rtc).unwrap()
+    var ticked = false
+    for _ in 0..<SLICES * 4
+        if s.guest.rtc(rtc).unwrap()[0] != first[0] then ticked = true
+        if ticked then break
+        slice(s)
+    assert(ticked, s"$rtc's seconds never moved from ${first[0]}")
+
+/** The WS2812 chain `chain` latches `colors`, as the firmware sends them, and was dark before; a name the
+ * board does not have answers no LEDs.
+ */
+private latches(which: string, file: string, chain: string, colors: []const u32)
+    val s = booted(which, file)
+    assert(s.guest.pixels("no-such-chain").is_empty())
+    for c in s.guest.pixels(chain) do assert(c == 0, "dark at power-on")
+    var shown = false
+    for _ in 0..<SLICES * 4
+        val now = s.guest.pixels(chain)
+        if now.len() == colors.len
+            shown = true
+            for i in 0..<colors.len do if now[i] != colors[i] then shown = false
+        if shown then break
+        slice(s)
+    val last = s.guest.pixels(chain)
+    var got = ""
+    for c in last do got = s"$got ${hex(c)}"
+    assert(shown, s"$chain never showed what was sent:$got")
+
+@test("board interface: an SSD1306 draws and a DS3231 keeps time, on the workbench's machine and on a Pico 2")
+oled_and_rtc()
+    draws_and_keeps_time("workbench", "examples/visual/demo.elf", "", "oled", "rtc")
+    draws_and_keeps_time("testdata/rp-parts/pico2-oled-clock.hocon", "examples/pico2/oled_clock.elf", "ready", "oled", "rtc")
+
+@test("board interface: a WS2812 chain latches the colours sent to it, bit-banged on a machine board and on the Pico Breadboard Kit's Pico, and from PIO0 on the kit's Pico 2")
+ws2812_chains()
+    latches("testdata/ws2812-machine.hocon", "examples/pixel/pixel.elf", "strip", [0x400000, 0x004000, 0x000040])
+    latches("boards/pico-breadboard-kit.hocon", "examples/pico/breadboard_kit.elf", "rgb", [0x400000])
+    latches("testdata/rp-parts/pico2-kit.hocon", "examples/pico2/breadboard_kit.elf", "rgb", [0x400000])
+
+@test("board interface: the Pico 2's OLED clock prints the DS3231's fixed date, then the next second")
+pico2_clock_prints()
+    val s = booted("testdata/rp-parts/pico2-oled-clock.hocon", "examples/pico2/oled_clock.elf")
+    val seen = shows(s, 0, "time 00:00:00 2026-01-01")
+    // A second of a Pico 2 at 150 MHz is some 1500 slices.
+    shows(s, seen, "time 00:00:01 2026-01-01", SLICES * 4)
+    assert(s.guest.rtc("rtc").unwrap()[6] == 0x26)
 
 private val DISCO = "stm32h747-disco"
 private val FORTH = "examples/disco-repl/repl-disco.elf"

@@ -1,0 +1,88 @@
+module sh.sysl.benchtop.parts.ws2812
+
+// A chain of WS2812 addressable RGB LEDs, decoded from the level on the first one's DIN as it changes,
+// whatever drives it: a PIO program, a bit-banged GPIO, anything. Worldsemi's WS2812B data sheet: each
+// bit is a high pulse and a low, a high of T0H (0.4 µs ± 150 ns) being a 0 and of T1H (0.8 µs ± 150 ns)
+// a 1, which the LED tells apart by sampling the line between them; the first 24 bits, green, red and
+// blue, most significant first, are the first LED's, and it passes the rest down the chain; the line low
+// for longer than RES (50 µs) latches what each LED has taken onto its outputs.
+
+import sysl.buf.{Buf, buf}
+
+/** Where the LED samples a bit, in nanoseconds after its rising edge: a high this long or longer is a 1. */
+const SAMPLE_NS: u64 = 600
+
+/** The low that latches a frame, in nanoseconds: a reset. */
+const RESET_NS: u64 = 50000
+
+/** A chain of `colors.len()` LEDs: what each shows (0xRRGGBB, the LED nearest DIN first), the 24-bit
+ * words taken since the last latch, the bits of the word being taken, and the line as last seen: its
+ * level, and the times it last rose and fell, in ticks of the clock the edges are timed by.
+ */
+struct Chain
+    colors: Buf[u32]
+    words: Buf[u32]
+    word: u32
+    bits: u32
+    high: bool
+    rose: u64
+    fell: u64
+
+/** `count` LEDs at power-on, dark, the line low since time 0. */
+chain(count: int) -> Chain
+    var colors: Buf[u32] = buf()
+    for _ in 0..<count do colors.push(0)
+    Chain(colors, buf(), 0, 0, false, 0, 0)
+
+/** Power-on again: every LED dark and nothing taken, the line low from time 0. */
+restart(c: *Chain)
+    for i in 0..<c.colors.len() do c.colors[i] = 0
+    c.words = buf()
+    c.word = 0
+    c.bits = 0
+    c.high = false
+    c.rose = 0
+    c.fell = 0
+
+// `ticks` of a clock at `hz`, in nanoseconds.
+private nanos(ticks: u64, hz: u64) -> u64 = if hz == 0 then 0 else u64(u128(ticks) * 1000000000 / u128(hz))
+
+// The ticks from `from` to `to`, none where the clock has started again.
+private since(from: u64, to: u64) -> u64 = if to > from then to - from else 0
+
+/** DIN goes to `high` at `time`, in ticks of a clock at `hz`. A rise after a reset's low latches the
+ * frame before it; a fall ends a bit, a 1 if the line was high for `SAMPLE_NS` or more. A high longer
+ * than a reset is no bit.
+ */
+edge(c: *Chain, high: bool, time: u64, hz: u64)
+    if high == c.high then return
+    c.high = high
+    if high
+        if nanos(since(c.fell, time), hz) >= RESET_NS then latch(c)
+        c.rose = time
+        return
+    c.fell = time
+    val width = nanos(since(c.rose, time), hz)
+    if width >= RESET_NS then return
+    c.word = (c.word << 1) | (if width >= SAMPLE_NS then 1 else 0)
+    c.bits += 1
+    if c.bits < 24 then return
+    c.words.push(c.word & 0xFFFFFF)
+    c.word = 0
+    c.bits = 0
+
+/** The line as it stands at `time`: low since the last fall for a reset or more latches the frame. */
+settle(c: *Chain, time: u64, hz: u64)
+    if !c.high && nanos(since(c.fell, time), hz) >= RESET_NS then latch(c)
+
+// Each LED that has taken a whole word shows it; one that has taken part of a word, or none, keeps what
+// it showed. Words past the end of the chain left its last LED's DOUT.
+private latch(c: *Chain)
+    if c.words.is_empty() && c.bits == 0 then return
+    val n = if c.words.len() < c.colors.len() then c.words.len() else c.colors.len()
+    for i in 0..<n
+        val grb = c.words[i]
+        c.colors[i] = ((grb >> 8) & 0xFF) << 16 | ((grb >> 16) & 0xFF) << 8 | (grb & 0xFF)
+    c.words = buf()
+    c.word = 0
+    c.bits = 0

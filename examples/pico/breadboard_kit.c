@@ -3,12 +3,24 @@
 // on GP6 and reset on GP7: the program resets it, wakes it in 16-bit colour, fills the glass and draws a
 // title bar and four colour blocks, then prints "ready". The GT911 is on I2C0 (SDA GP8, SCL GP9) at
 // 0x5d: the program prints its product ID, then polls its status register every 10 ms, and for each
-// touch reported prints "touch x y" and draws a white square under the finger. Built for the Pico and
-// the Pico 2 from this one file (examples/pico/CMakeLists.txt, examples/pico2/CMakeLists.txt).
+// touch reported prints "touch x y" and draws a white square under the finger. The RGB LED, a WS2812 on
+// GP12, cycles through six colours at a quarter of full, half a second each. Built for the Pico and the
+// Pico 2 from this one file (examples/pico/CMakeLists.txt, examples/pico2/CMakeLists.txt): on the Pico 2
+// the LED is driven by pico-examples' ws2812.pio, as 52Pi's demo drives it; on the Pico it is bit-banged
+// from the SIO, its pulses timed in clk_sys cycles with interrupts off, since benchtop does not model the
+// RP2040's PIO.
 #include <stdio.h>
 #include "pico/stdlib.h"
+#include "hardware/clocks.h"
 #include "hardware/i2c.h"
 #include "hardware/spi.h"
+#include "hardware/sync.h"
+#if PICO_RP2040
+#include "hardware/structs/sio.h"
+#else
+#include "hardware/pio.h"
+#include "ws2812.pio.h"
+#endif
 
 #define PIN_SCK 2
 #define PIN_TX 3
@@ -17,6 +29,7 @@
 #define PIN_RESET 7
 #define PIN_SDA 8
 #define PIN_SCL 9
+#define PIN_RGB 12
 
 #define WIDTH 320
 #define HEIGHT 480
@@ -86,6 +99,46 @@ static void screen_init(void) {
     command(0x29, NULL, 0);
 }
 
+// The RGB LED's colours, red, yellow, green, cyan, blue and magenta, each as the WS2812 takes it: its
+// green byte, then red, then blue.
+static const uint32_t rgb_cycle[6] = {0x004000, 0x404000, 0x400000, 0x400040, 0x000040, 0x004040};
+
+#if PICO_RP2040
+static void rgb_init(void) {
+    gpio_init(PIN_RGB);
+    gpio_set_dir(PIN_RGB, GPIO_OUT);
+    gpio_put(PIN_RGB, 0);
+}
+
+// The 24 bits of `grb`, most significant first: a 0 high for 0.35 us and a 1 for 0.8 us, each bit 1.25 us.
+static void __no_inline_not_in_flash_func(rgb_put)(uint32_t grb) {
+    const uint32_t mask = 1u << PIN_RGB;
+    const uint32_t mhz = clock_get_hz(clk_sys) / 1000000;
+    const uint32_t t0h = 35 * mhz / 100, t0l = 90 * mhz / 100, t1h = 80 * mhz / 100, t1l = 45 * mhz / 100;
+    uint32_t saved = save_and_disable_interrupts();
+    for (int i = 23; i >= 0; i--) {
+        bool one = (grb >> i) & 1;
+        sio_hw->gpio_set = mask;
+        busy_wait_at_least_cycles(one ? t1h : t0h);
+        sio_hw->gpio_clr = mask;
+        busy_wait_at_least_cycles(one ? t1l : t0l);
+    }
+    restore_interrupts(saved);
+}
+#else
+static uint rgb_sm;
+
+static void rgb_init(void) {
+    uint offset = pio_add_program(pio0, &ws2812_program);
+    rgb_sm = pio_claim_unused_sm(pio0, true);
+    ws2812_program_init(pio0, rgb_sm, offset, PIN_RGB, 800000, false);
+}
+
+static void rgb_put(uint32_t grb) {
+    pio_sm_put_blocking(pio0, rgb_sm, grb << 8u);
+}
+#endif
+
 // `n` bytes from the GT911's register `reg` on; false where it does not answer.
 static bool touch_read(uint16_t reg, uint8_t *into, size_t n) {
     const uint8_t address[2] = {reg >> 8, reg & 0xff};
@@ -112,8 +165,11 @@ int main(void) {
     uint8_t id[4] = {0};
     if (touch_read(0x8140, id, 4)) printf("GT911 id %c%c%c\n", id[0], id[1], id[2]);
     else printf("GT911 absent\n");
+    rgb_init();
     printf("ready\n");
-    for (;;) {
+    for (uint32_t tick = 0;; tick++) {
+        // Every half second, the LED's next colour; the 10 ms between latches it.
+        if (tick % 50 == 0) rgb_put(rgb_cycle[tick / 50 % 6]);
         uint8_t status = 0;
         if (touch_read(0x814e, &status, 1) && (status & 0x80)) {
             if ((status & 0x0f) > 0) {
