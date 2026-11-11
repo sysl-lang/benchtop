@@ -1876,14 +1876,12 @@ board {
   }
 
   view {
-    size = [168, 408]
-    background = "#1b5e20"
+    size = [185, 284]
+    background = "#2f7a45"
+    pcb = pico
 
     elements {
-      usb     { box = "#c0c0c0", at = [52, 0], size = [64, 40] }
-      led     { show = led, at = [32, 19] }
-      bootsel { box = "#f0f0f0", at = [32, 88], size = [24, 24], label = "BOOTSEL" }
-      mcu    { box = "#202020", at = [56, 168], size = [56, 56], label = "RP2040" }
+      led { show = led, at = [60, 29] }
     }
   }
 }
@@ -1976,8 +1974,7 @@ product {
 
     elements {
       title  { text = "Pico Breadboard Kit", at = [58, 6], size = [262, 23] }
-      socket { box = "#1b5e20", at = [124, 54], size = [134, 326], label = "Pico" }
-      led    { show = pico.led, at = [144, 67] }
+      pico   { show = pico, at = [98, 82] }
       bezel  { box = "#202020", at = [364, 44], size = [540, 351] }
       // Every part's size is its own; the glass is mounted landscape.
       screen { show = lcd, at = [379, 58], look { rotate = 90 } }
@@ -2058,6 +2055,14 @@ square, rotate = 0 | 90 | 180 | 270 }`. A display part's element may leave out i
 its glass, turned with `rotate`. `input { keys { <key> = <part>[.<control>] }, pointer { <element> =
 <part> } }` binds host keys to a part's controls (a part with one control needs no `.control`) and
 the mouse over an element to a part that takes a point.
+
+A board's view may name the printed circuit drawn under its elements, `pcb = pico | pico2 | pico2w`
+(`pcb.sysl`): the Raspberry Pi board at its real size, 5 px/mm, from the mechanical drawing in its
+datasheet, with its header and debug pads, holes, USB connector, BOOTSEL, packages and (on the Pico 2
+W) the radio's can and antenna keep-out, `background` its solder mask, and each pad's name in a
+gutter beside it. The view is then exactly the drawing's size (185 × 284, or 185 × 262 for the
+Pico 2 W), and its LED part sits on the LED's footprint. Turned a quarter in a product, the board is
+drawn without the pads' names, which would lie across one another.
 
 ### 12.8 Peripherals on the cores' bus
 
