@@ -3,9 +3,10 @@ module sh.sysl.benchtop.peripheral.rp2040
 import sh.sysl.rp2350.adc as reg
 import sysl.math.min
 
-// The ADC of the RP2040 and the RP2350A (datasheets 4.9 and 12.4; `hardware/regs/adc.h`), one model: the
+// The ADC of the RP2040 and the RP2350A and B (datasheets 4.9 and 12.4; `hardware/regs/adc.h`), one model: the
 // registers sit at the same offsets on both, and the RP2350's AINSEL and RROBIN are only wider, for the
-// inputs of the QFN-80 part. Both chips have four GPIO inputs and the temperature sensor on input 4.
+// inputs of the QFN-80 part. The RP2040 and the RP2350A have four GPIO inputs (GPIO 26 to 29) and the
+// temperature sensor on input 4; the RP2350B has eight (GPIO 40 to 47) and the sensor on input 8.
 //
 // **Analogue is ideal and deterministic** (docs/rp-coverage.md, cut line Q8): no noise, no INL, no ERR. A
 // level becomes `floor(uv × 4096 / 3.3 V)`, the inverse of the conversion the SDK's examples print, and
@@ -27,11 +28,14 @@ import sysl.math.min
 // input the chip does not have, a start with EN clear, a START_ONCE during a conversion, a start with
 // clk_adc stopped, and a conversion of the temperature sensor with TS_EN clear.
 
-/** The inputs on the RP2040 and the RP2350A, and the one the temperature sensor is on. */
-const ADC_INPUTS: u32 = 5
-const ADC_TEMPERATURE_INPUT: u32 = 4
-/** The GPIO input 0 is on; the others follow it. */
+/** The GPIO inputs on the RP2040 and the RP2350A, and the GPIO that input 0 is on; the others follow it. */
+const ADC_GPIO_INPUTS: u32 = 4
 const ADC_BASE_GPIO: u32 = 26
+/** The same on the RP2350B. */
+const ADC_GPIO_INPUTS_QFN80: u32 = 8
+const ADC_BASE_GPIO_QFN80: u32 = 40
+/** The most GPIO inputs any chip has. */
+const ADC_MAX_GPIO_INPUTS: u32 = 8
 /** The units `Adc.pass` counts in, to a clk_adc cycle. */
 const ADC_UNITS_PER_CYCLE: u64 = 256
 
@@ -49,17 +53,17 @@ adc_code(uv: u32) -> u32 = u32(min(u64(uv) * 4096 / VREF_UV, 4095))
 /** What the board puts on the ADC's inputs from off the chip; kept across a chip reset, as the board's. */
 struct AnalogIn
     // Each GPIO input's level in microvolts, and which of them something drives, bit n for input n.
-    uv: [4]u32
+    uv: [ADC_MAX_GPIO_INPUTS]u32
     driven: u32
     temperature_uv: u32
 
 /** Nothing on the GPIO inputs, and the chip at 27 °C. */
-analog_in() -> AnalogIn = AnalogIn([0; 4], 0, u32(TEMPERATURE_27C_UV))
+analog_in() -> AnalogIn = AnalogIn([0; ADC_MAX_GPIO_INPUTS], 0, u32(TEMPERATURE_27C_UV))
 
 impl AnalogIn
     /** Drive GPIO input `input` at `level` microvolts, or leave it undriven with None. */
     set(*self, input: u32, level: Option[u32])
-        require input < 4, "an ADC GPIO input is 0 to 3"
+        require input < ADC_MAX_GPIO_INPUTS, "an ADC GPIO input is 0 to 7"
         level match
             Some(uv) ->
                 self.uv[input] = uv
@@ -91,6 +95,10 @@ struct Adc
     chip: string
     ainsel_mask: u32
     rrobin_mask: u32
+    // How many GPIO inputs the chip has, and the first GPIO they are on; the temperature sensor is the
+    // input after the last.
+    gpio_inputs: u32
+    first_gpio: u32
     cs: u32
     result: u32
     fcs: u32
@@ -108,12 +116,21 @@ struct Adc
     /** The input the conversion under way samples, latched as it starts. */
     input: u32
 
-/** An ADC at power-on on `chip`, whose CS fields AINSEL and RROBIN are `ainsel_mask` and `rrobin_mask`. */
-adc(chip: string, ainsel_mask: u32, rrobin_mask: u32) -> Adc =
-    Adc(chip, ainsel_mask, rrobin_mask, 0, 0, 0, false, false, [0; FIFO_DEPTH], 0, 0, 0, 0, 0, AdcPhase.Idle, 0, 0)
+/** An ADC at power-on on `chip`, whose CS fields AINSEL and RROBIN are `ainsel_mask` and `rrobin_mask`,
+ * with `gpio_inputs` GPIO inputs from GPIO `first_gpio`.
+ */
+adc(chip: string, ainsel_mask: u32, rrobin_mask: u32, gpio_inputs: u32, first_gpio: u32) -> Adc =
+    Adc(chip, ainsel_mask, rrobin_mask, gpio_inputs, first_gpio, 0, 0, 0, false, false, [0; FIFO_DEPTH], 0, 0, 0, 0, 0, AdcPhase.Idle, 0, 0)
 
 impl Adc
-    reset(*self) = *self = adc(self.chip, self.ainsel_mask, self.rrobin_mask)
+    reset(*self) = *self = adc(self.chip, self.ainsel_mask, self.rrobin_mask, self.gpio_inputs, self.first_gpio)
+
+    /** The input the temperature sensor is on. */
+    temperature_input(self) -> u32 = self.gpio_inputs
+
+    /** The ADC input GPIO `pin` is on, or None for a GPIO that is not an ADC input. */
+    input_of(self, pin: u32) -> Option[u32] =
+        if pin >= self.first_gpio && pin < self.first_gpio + self.gpio_inputs then Some(pin - self.first_gpio) else None
 
     /** TS_EN: the temperature sensor is powered. */
     temperature_on(self) -> bool = self.cs & reg.CS_TS_EN_MASK != 0
@@ -176,8 +193,9 @@ impl Adc
         val enabled = (self.cs & self.rrobin_mask) >> reg.CS_RROBIN_SHIFT
         if enabled == 0 then return
         val at = (self.cs & reg.CS_AINSEL_MASK) >> reg.CS_AINSEL_SHIFT
-        for i in 1..ADC_INPUTS
-            val next = (at + i) % ADC_INPUTS
+        val inputs = self.gpio_inputs + 1
+        for i in 1..inputs
+            val next = (at + i) % inputs
             if enabled & (1u32 << next) != 0
                 self.cs = (self.cs & ~reg.CS_AINSEL_MASK) | (next << reg.CS_AINSEL_SHIFT)
                 return
@@ -226,9 +244,11 @@ impl Adc
         val data = replicated(value, width)
         val next = written(self.cs, offset, data)
         val ainsel = (next & self.ainsel_mask) >> reg.CS_AINSEL_SHIFT
-        if ainsel >= ADC_INPUTS then return Some(s"CS.AINSEL $ainsel selects an input the ${self.chip} does not have: its inputs are 0 to 3 (GPIO 26 to 29) and 4, the temperature sensor")
+        val inputs = self.gpio_inputs + 1
+        val last = self.gpio_inputs - 1
+        if ainsel >= inputs then return Some(s"CS.AINSEL $ainsel selects an input the ${self.chip} does not have: its inputs are 0 to $last (GPIO ${self.first_gpio} to ${self.first_gpio + last}) and ${self.gpio_inputs}, the temperature sensor")
         val rrobin = (next & self.rrobin_mask) >> reg.CS_RROBIN_SHIFT
-        if rrobin >> ADC_INPUTS != 0 then return Some(s"CS.RROBIN $rrobin enables an input the ${self.chip} does not have: its inputs are 0 to 4")
+        if rrobin >> inputs != 0 then return Some(s"CS.RROBIN $rrobin enables an input the ${self.chip} does not have: its inputs are 0 to ${self.gpio_inputs}")
         val once = triggered(offset, data) & reg.CS_START_ONCE_MASK != 0
         val many = next & reg.CS_START_MANY_MASK != 0
         if (once || many) && next & reg.CS_EN_MASK == 0 then return Some("CS starts a conversion with EN clear, on an ADC powered down and unclocked, which is not modelled")

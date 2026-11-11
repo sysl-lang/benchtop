@@ -1,0 +1,130 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.{library, load}
+import sh.sysl.benchtop.peripheral.rp2040.{ADC_BASE_GPIO, ADC_BASE_GPIO_QFN80, ADC_GPIO_INPUTS, ADC_GPIO_INPUTS_QFN80, adc}
+import sh.sysl.parsing.source_of
+import sh.sysl.rp2350.adc as a
+import sh.sysl.rp2350.sysinfo as si
+import sysl.buf.{Buf, buf}
+import sysl.text.{from_utf8_lossy, replace_all}
+
+// The RP2350B, the RP2350 in its QFN-80 package (`mcus/rp2350b.hocon`, `chip.rp2350b`), and the Pimoroni
+// Pico Plus 2 that carries it (`boards/pico-plus2.hocon`): the package SYSINFO reports, the ADC's eight
+// inputs on GPIO 40 to 47, and the Pico SDK's own build for the board (`examples/rp2350b/high_bank.c`)
+// driving GPIO 40 and reading the B-only inputs.
+
+private val HIGH_BANK = embed("../../../../examples/rp2350b/high_bank.elf")
+private val B_SRAM = SramMap(0x20000000, 520 * 1024)
+private const B_TENTH_MS: u64 = 15000
+private const B_MS: u64 = 150000
+
+private b_crlf(s: string) -> string = replace_all(s, "\n", "\r\n")
+
+private b_console(b: &ArmBoard) -> string = from_utf8_lossy(b.console.view())
+
+private package_of(c: *Rp2350) -> u32 = c.read(0, si.BASE + si.PACKAGE_SEL_OFFSET, 4).unwrap()
+
+@test("the Pico Plus 2 loads as an RP2350B board with the RP2350's SRAM; the Pico 2 and a Pico are not RP2350B boards; GPIO 45 is a pin of the B and not of the A")
+pico_plus2_loads()
+    val m = arm_named("pico-plus2").unwrap().unwrap()
+    assert(m.base == 0x20000000 && m.size == 520 * 1024)
+    assert(qfn80_named("pico-plus2") && !qfn80_named("pico2") && !qfn80_named("pico") && !qfn80_named("no-such-board"))
+    assert(riscv_named("pico-plus2").is_none() && pico_named("pico-plus2").is_none())
+    assert(rp_guest("pico-plus2", false).unwrap().is_ok())
+    val on_b = "board { name = b, mcu = rp2350b, parts { d { part = led, color = red, wire { anode = GP45 } } } }"
+    val on_a = replace_all(on_b, "rp2350b", "rp2350")
+    val got = load(source_of("b.hocon", on_b), library())
+    assert(!got.report.has_errors(), got.report.render(source_of("b.hocon", on_b)))
+    assert(load(source_of("a.hocon", on_a), library()).report.has_errors(), "the RP2350A has no GPIO 45")
+
+@test("SYSINFO.PACKAGE_SEL reads 0 on the RP2350B and 1 on the RP2350A, and a chip reset and a guest boot leave the package as it was")
+rp2350b_package_select()
+    var b = rp2350b()
+    var a_chip = rp2350()
+    assert(package_of(&b) == 0 && package_of(&a_chip) == 1)
+    b.reset()
+    a_chip.reset()
+    assert(package_of(&b) == 0 && package_of(&a_chip) == 1)
+    assert(b.adc.chip == "RP2350B" && a_chip.adc.chip == "RP2350A")
+    val board = arm_board_qfn80(B_SRAM)
+    board.boot(HIGH_BANK).unwrap()
+    assert(package_of(&board.chip) == 0)
+    assert(package_of(&arm_board(B_SRAM).chip) == 1)
+
+@test("the RP2350B's ADC has eight GPIO inputs on GPIO 40 to 47 and the sensor on input 8; the RP2350A's four on GPIO 26 to 29 and the sensor on input 4; AINSEL and RROBIN past them are refused by name")
+rp2350b_adc_inputs()
+    val b = adc("RP2350B", a.CS_AINSEL_MASK, a.CS_RROBIN_MASK, ADC_GPIO_INPUTS_QFN80, ADC_BASE_GPIO_QFN80)
+    val a_adc = adc("RP2350A", a.CS_AINSEL_MASK, a.CS_RROBIN_MASK, ADC_GPIO_INPUTS, ADC_BASE_GPIO)
+    assert(b.temperature_input() == 8 && a_adc.temperature_input() == 4)
+    for pin in 0u32..<48
+        val on_b = if pin >= 40 then Some(pin - 40) else None
+        val on_a = if pin >= 26 && pin <= 29 then Some(pin - 26) else None
+        assert(b.input_of(pin) == on_b, s"GPIO $pin on the B")
+        assert(a_adc.input_of(pin) == on_a, s"GPIO $pin on the A")
+    for input in 0u32..<9
+        assert(b.unmodelled(a.CS_OFFSET, 4, input << a.CS_AINSEL_SHIFT).is_none(), s"AINSEL $input on the B")
+    val past = b.unmodelled(a.CS_OFFSET, 4, 9 << a.CS_AINSEL_SHIFT).unwrap()
+    assert(past.contains("AINSEL 9") && past.contains("RP2350B") && past.contains("GPIO 40 to 47") && past.contains("8, the temperature sensor"), past)
+    assert(b.unmodelled(a.CS_OFFSET, 4, 0x1FF << a.CS_RROBIN_SHIFT).is_none())
+    assert(a_adc.unmodelled(a.CS_OFFSET, 4, 0x20 << a.CS_RROBIN_SHIFT).unwrap().contains("RROBIN"))
+    val on_a = a_adc.unmodelled(a.CS_OFFSET, 4, 5 << a.CS_AINSEL_SHIFT).unwrap()
+    assert(on_a.contains("AINSEL 5") && on_a.contains("RP2350A") && on_a.contains("GPIO 26 to 29"), on_a)
+
+@test("a part's voltage on GPIO 46 reaches the RP2350B's ADC input 6, and one on GPIO 28 reaches nothing; the RP2350A's GPIO 28 is input 2 and GPIO 46 is nothing")
+rp2350b_part_analog()
+    var b = rp2350b()
+    b.part_analog(46, Some(1650000))
+    b.part_analog(28, Some(900000))
+    b.part_analog(39, Some(900000))
+    assert(b.analog.driven == 1u32 << 6 && b.analog.level(6, false, false) == 1650000, "only input 6 is driven")
+    var a_chip = rp2350()
+    a_chip.part_analog(28, Some(900000))
+    a_chip.part_analog(46, Some(1650000))
+    a_chip.part_analog(30, Some(1650000))
+    assert(a_chip.analog.driven == 1u32 << 2 && a_chip.analog.level(2, false, false) == 900000)
+    b.part_analog(46, None)
+    assert(b.analog.driven == 0)
+
+@test("the SDK's build for the Pico Plus 2 on the RP2350B: package_sel 0 and 48 GPIOs, GPIO 46 read as ADC input 6, the sensor as input 8, then GPIO 40 toggling every millisecond")
+rp2350b_high_bank()
+    val b = arm_board_qfn80(B_SRAM)
+    b.boot(HIGH_BANK).unwrap()
+    b.chip.set_analog(6, Some(1650000))
+    val want = b_crlf("package_sel 0, 48 GPIOs, 9 ADC inputs\nGPIO 46 is ADC input 6: 0x800\ntemperature sensor is input 8: 0x36c\ntoggling GPIO 40\n")
+    var steps = 0
+    while !b_console(b).contains(want) && steps < 400
+        val end = b.run(B_MS)
+        assert(end == RunEnd.Budget || end == RunEnd.Asleep, s"$end ${b.refused}: ${b_console(b)}")
+        steps += 1
+    assert(b_console(b).contains(want), b_console(b))
+    // GPIO 40 is driven now, and toggles every millisecond; the other pins of the high bank are not driven.
+    var edges: Buf[u64] = buf()
+    var level = b.chip.pin(40).level
+    val until = b.chip.now + 20 * B_MS
+    while b.chip.now < until
+        assert(b.run(B_TENTH_MS) == RunEnd.Budget, b.refused)
+        val pin = b.chip.pin(40)
+        assert(pin.drives, "GPIO 40 is an output")
+        if pin.level != level
+            edges.push(b.chip.now)
+            level = pin.level
+    assert(edges.len() >= 18 && edges.len() <= 21, s"${edges.len()} edges in 20 ms")
+    for k in 1..<edges.len()
+        val gap = edges[k] - edges[k - 1]
+        assert(gap >= B_MS && gap <= B_MS + 5 * B_TENTH_MS, s"edge $k came $gap cycles after the one before")
+    for n in 30u32..<48
+        if n != 40 then assert(!b.chip.pin(n).drives, s"GPIO $n is not driven")
+    assert(b.chip.sio.oe == 1u64 << 40, "GPIO 40 is the only output")
+
+@test("the same SDK build on an RP2350A refuses the B-only input by name, on the program's first select of input 6, once it has read package_sel 1")
+rp2350a_refuses_high_bank()
+    val b = arm_board(B_SRAM)
+    b.boot(HIGH_BANK).unwrap()
+    var end = RunEnd.Budget
+    var steps = 0
+    while end == RunEnd.Budget && steps < 400
+        end = b.run(B_MS)
+        steps += 1
+    assert(end == RunEnd.Fault, s"$end")
+    assert(b.refused.contains("AINSEL 6") && b.refused.contains("RP2350A"), b.refused)

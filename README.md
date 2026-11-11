@@ -524,7 +524,7 @@ A description is a HOCON file, and the shortest names a board built into benchto
 board = pico2w
 ```
 
-The virtual boards in the core table below, plus `pico`, `pico2`, `pico2w` and `pico-breadboard-kit`,
+The virtual boards in the core table below, plus `pico`, `pico2`, `pico2w`, `pico-plus2` (an RP2350B) and `pico-breadboard-kit`,
 are built in ([boards](boards) has their sources), and so are their MCUs ([mcus](mcus)). **A
 name with a `/` in it, or ending in `.hocon`, is a file; any other name is built in**, on the
 command line and in a file alike, so `--board virt` is the virtual board and `--board ./virt` a

@@ -119,7 +119,7 @@ day. An L is split before it is handed out (§6).
 | HSTX | 12.11 HSTX | full | `peripheral/rp2350/hstx.sysl` (item 29): the FIFO and DREQ_HSTX, the shift register, the clock generator, BIT0–7, the command expander (RAW, RAW_REPEAT, TMDS, TMDS_REPEAT, NOP) with its TMDS encoders, on GPIO 12–19 at FUNCSEL 0; a DVI monitor part (`parts/dvi`) reads the outputs. Refused by name: coupled mode, EXPAND_EN changed while enabled, CLKPHASE of a period or more, reserved opcodes, a count of 0, a narrow FIFO write. | `chip/hstx_tests.sysl` (`hstx/spi_lcd`, `hstx/dvi_out_hstx_encoder`), `peripheral/rp2350/hstx_tests.sysl`, `parts/dvi/tests.sysl` | — | — |
 | TRNG | 12.12 TRNG | full | The 192-bit holding register filled from a seeded SplitMix64 (`TRNG_SEED`, or `seed`), with the sampling time and the interrupt; the CRNGT and autocorrelation failure bits never set. | `rp2350/crypto_tests.sysl`, `chip/crypto_tests.sysl` (`system/rand`) | — | — |
 | SHA-256 | 12.13 SHA-256 | full | START, WDATA in words, halfwords or bytes, BSWAP, the 57-cycle digest, SUM0–7 and the DREQ for the DMA path; the compression is `sha256_compress`. | `rp2350/crypto_tests.sysl`, `chip/crypto_tests.sysl` (`sha/hello_sha256`) | — | DMA (for the SDK's DMA path) |
-| SYSINFO (CHIP_ID, PLATFORM, GITREF) | 12.15 System control | full | CHIP_ID 0x30004927, PACKAGE_SEL 1 (RP2350A), PLATFORM ASIC, GITREF 0; read-only. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
+| SYSINFO (CHIP_ID, PLATFORM, GITREF) | 12.15 System control | full | CHIP_ID 0x30004927, PACKAGE_SEL 1 (RP2350A) or 0 (RP2350B, `rp2350b()`), PLATFORM ASIC, GITREF 0; read-only. | `rp2350/sysctl_tests.sysl`, `chip/startup_tests.sysl` | — | — |
 | SYSCFG (NMI masks, proc in-sync bypass, DBGFORCE, mem power-down) | 12.15 System control | full (stored) | PROC_CONFIG (halted flags read 0), PROC_IN_SYNC_BYPASS(_HI), DBGFORCE, MEMPOWERDOWN (memory is not lost), AUXCTRL stored with their writable bits. | `rp2350/sysctl_tests.sysl` | — | — |
 | TBMAN | 12.15 / 2 System bus | full | PLATFORM reads ASIC; the rest refused (item 28). | `chip/busctrl_tests.sysl` | — | — |
 | Debug: SW-DP, RESCUE, CoreSight trace | 3.5 Debug | missing | Debugger *entry* is how images boot. The probe itself is not modelled. | — | L | — |
@@ -272,7 +272,7 @@ Each of these is a block, or part of one, that could reasonably be left out. All
 | Q8 | analogue stays **ideal and deterministic**; baud rates and PIO timing are **exact** |
 | Q9 | HSTX **later**, once a display part can show it |
 | Q10 | OTP **with ECC** and page locks |
-| Q11 | the RP2350B board **later**; the Pico 2 (RP2350A) now |
+| Q11 | the Pico 2 (RP2350A) first; **the RP2350B board is built too**: the Pimoroni Pico Plus 2 (see "Item, done: the RP2350B board") |
 | Q12 | only the errata the **SDK checks for** (RP2350-E2 behind an option) |
 | Q13 | **Arm first**, then RISC-V |
 | Q14 | the RP2040's chip layer comes **right after the RP2350's start-up items**, so each later peripheral is tested on both chips |
@@ -1894,3 +1894,39 @@ merged into this branch.
 
 **Cost:** the main lines do not enable HSTX, so `hstx_irq_due` answers None at its first test and the
 DMA's paths are unchanged for them; the train's bench of the five main lines covers it.
+
+### Item, done: the RP2350B board
+
+**The board is the Pimoroni Pico Plus 2** (`boards/pico-plus2.hocon`, mcu `mcus/rp2350b.hocon`). It is
+the one RP2350B board whose pinout the Pico SDK carries (`pimoroni_pico_plus2_rp2350.h`, `PICO_RP2350A
+0`): the 26 header GPIOs are the Pico 2's, the LED is GPIO 25, the user switch GPIO 45, the PSRAM's chip
+select GPIO 47, the VSYS sense GPIO 43, and the SP/CE pads carry SPI0 on GPIO 32 to 36. Its view is the
+Pico 2's, with a black PCB. The user switch is not a part on the bare board, because a button is a part of
+a product (`on_rp_board` wires it to the board's pin).
+
+**What the B package needs** was less than the plan feared: the models already carried 48 GPIOs
+(`GPIO_COUNT`, IO_BANK0, PADS, the SIO's high words, the GPIO coprocessor). What was added:
+
+- **`mcus/rp2350b.hocon`**: `pins { GP = 48 }`, the SPI, UART and I2C signal groups continued over
+  GPIO 30 to 47 (the datasheet's function-table pattern: SPI0 on 32 to 39, SPI1 on 24 to 31 and 40 to 47,
+  UART0 on 32 to 35 and 44 to 47, UART1 on 36 to 43, I2C by GPIO modulo 4), and the ADC's channels as
+  GPIO 40 to 47. The cores, SRAM, bases and IRQs are the RP2350A's.
+- **`chip.rp2350b()`**: SYSINFO.PACKAGE_SEL reads 0 (QFN-80; the A reads 1), which is what the SDK and the
+  boot ROM's `get_sys_info` see. A chip reset keeps the package (`Rp2350.fresh`).
+- **The ADC** takes its GPIO inputs and the GPIO of input 0 as parameters: eight inputs from GPIO 40 with
+  the temperature sensor on input 8 on the B, four from GPIO 26 and the sensor on 4 on the A. AINSEL and
+  RROBIN past them are refused by name, naming the chip and its GPIOs. `part_analog` takes the GPIO now,
+  and a pin that is not an ADC input hears nothing, where it used to index past the A's four inputs.
+- **`arm_board_qfn80`** and `qfn80_named`: the board `rp_guest` runs for a description whose mcu is
+  `rp2350b`.
+
+**Limits**: POWMAN's PWRUP sources still ignore GPIO 30 to 47 as the QFN-60's (`powman.sysl`), so a
+wake-up on a B-only pin is not modelled; the RISC-V description (`rp2350-hazard3`) is the A's.
+
+**Tests** (`chip/rp2350b_tests.sysl`, 6): the board loads and is the only RP2350B board, and GPIO 45 is a
+pin of the B and not the A; PACKAGE_SEL 0 against 1, across a reset and a boot; the ADC's input mapping
+for every GPIO and every AINSEL and RROBIN edge on both chips; a part's voltage on GPIO 46 reaching input
+6; and **the SDK's own build for the board** (`examples/rp2350b/high_bank.c`, rebuilt by
+`examples/rp2350b/build.sh`) on the B, which prints `package_sel 0, 48 GPIOs, 9 ADC inputs`, reads
+GPIO 46 as input 6 and the sensor as input 8, and toggles GPIO 40 every millisecond, and the same ELF
+on the A, which stops at its first select of input 6, by name.
