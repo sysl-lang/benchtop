@@ -1315,7 +1315,7 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
 |---|---|---|
 | **micro:bit v1** (nRF51822, M0) | a `V6M` kind exists after milestone 3; the nRF51's UART, GPIO, GPIOTE, TIMER/RTC, the 5×5 LED matrix and two buttons on the panel; QEMU's `microbit` machine is a second oracle | 4–5 |
 | **micro:bit v2** (nRF52833, M4F) | a `V7EM` kind with FPv4-SP exists after milestone 5; the nRF52's UARTE (EasyDMA), GPIO, TIMER/RTC, the LED matrix, buttons, the speaker over PWM; the microphone and radio are out | 4–6 |
-| **CYW43439 on a Pico W / Pico 2 W** | the user's Pico 2 is a W, and `sysl-blink`, `repl` and `picokit` call `cyw43_arch_init` (§9.8, §10.6): PIO-driven gSPI (after PIO), the firmware upload accepted, enough of the chip's bus protocol for init and the LED GPIO; joining a network is out | 5–8 |
+| **CYW43439 on a Pico W / Pico 2 W** | the user's Pico 2 is a W, and `sysl-blink`, `repl` and `picokit` call `cyw43_arch_init` (§9.8, §10.6): **Decided (user, 2026-11-10): two stages.** Stage 1, the item: init and the LED — PIO-driven gSPI, the firmware upload accepted, the chip's bus protocol through bring-up (rp-coverage.md item 33a, done), then the control channel and the LED GPIO (33b). Stage 2, networking, is **pending — Ethernet frames over F2 bridged to the Mac through libslirp, a fake access point; not scheduled**; were it taken up, joined and link-up events are faked, with no real 802.11, no WPA handshake and no Bluetooth | 5–8 |
 | **RP2040/RP2350 USB device controller** | most org Pico programs use `pico_enable_stdio_usb`; the RP-specific controller (not DWC2) plus the bridge built for the H7's USB item below | 4–6, plus the bridge |
 | **Non-secure state** (`security: Full`) | §2.7: both worlds' banked state, SAU/IDAU, secure gateways, the integrity signature on entry | 4–6 |
 | **The boot ROM's own boot path** | core 0 from reset through the real ROM: OTP, the QMI, partition tables, IMAGE_DEF, signature checks (§9.2) | 4–6 |
@@ -1324,7 +1324,7 @@ milestone 6, the frame-heavy one, the M7's figure decides whether a performance 
 | SDRAM/QSPI/SD beyond the display | QUADSPI memory-mapped + indirect (MT25TL01G), SDMMC1 + an image file | 3–4 |
 | audio (SAI1 + WM8994 over I2C4) | SAI's FIFO and frame timing to host audio through `sysl-lang/miniaudio`; the WM8994's register file accepted, volume and routing honoured | 4–5 |
 | **USB (OTG_HS/FS for tinyusb)** | the org's `sysl-lang/tinyusb` already has an `stm32h7` port (Synopsys DWC2), so benchtop models only the **DWC2 core in device mode**: GOTGCTL, GAHBCFG, GUSBCFG, GRSTCTL, GINTSTS/GINTMSK, GRXSTSP, GRXFSIZ, the TX FIFO sizes, DCFG/DCTL/DSTS, the DIEPCTLx/DOEPCTLx/…TSIZ/…INT sets, the FIFO windows, and the interrupt. The host side is a **small USB host inside benchtop**: it enumerates the emulated device through the DWC2 model and bridges each class to the Mac: CDC-ACM to a pty, MSC to a disk-image file, HID to an on-screen log. macOS has no USB/IP client and no way to accept a virtual device without a driver, so a bridge is the honest shape | DWC2 device model 3–4, host enumerator + CDC bridge 2, MSC 1: **6–7** |
-| wifi | module TBD | — |
+| wifi | the CYW43439 row above: its stage 2, pending | — |
 | GDB stub (remote serial protocol over TCP, per core) | very useful for firmware debugging | 2 |
 | `--dcache-model` | §1.5 | 2–3 |
 | a JIT — **not planned** | AArch64 code generation per block behind §2.5 | 15–25 |

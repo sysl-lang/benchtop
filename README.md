@@ -487,7 +487,10 @@ levels. Concurrent host-thread execution is not supported by this RISC-V API.
 
 `run --board pico2` boots an RP2350 firmware ELF on its two Cortex-M33 cores (the programs in
 `examples/pico2` run, with UART0 on stdout), and `pico2-riscv` does the same on the Hazard3 harts.
-`run --board pico2w` is refused: its `wifi` part is a CYW43439, which benchtop does not emulate yet.
+`run --board pico2w` runs its CYW43439 as far as the radio's bring-up: the SDK's PIO gSPI, the bus
+registers, the firmware and NVRAM upload and the firmware's boot (`examples/pico2w/blink.c`). The
+control channel does not answer yet, so the program's first LED call waits for an answer that never
+comes, and the LED stays dark.
 The core's `pair` API itself supplies no boot protocol; the board layer does that.
 
 Every implemented RISC-V mnemonic has a named test in the [base coverage matrix](sh/sysl/benchtop/riscv/COVERAGE.md)
