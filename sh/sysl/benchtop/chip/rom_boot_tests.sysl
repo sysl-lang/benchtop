@@ -1,0 +1,125 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.rp2350.pads_bank0 as pads
+import sh.sysl.rp2350.powman as pm
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.sio as sr
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+// The Arm Pico 2 booted as silicon boots it: both cores from reset in Raspberry Pi's boot ROM, core 0
+// through the ROM's boot path, which finds the flash image's IMAGE_DEF block and enters it.
+
+private val ROM_HELLO_FLASH = embed("../../../../examples/pico2/hello_serial_flash.elf")
+private val ROM_HELLO_UF2 = embed("../../../../examples/pico2/hello_serial_flash.uf2")
+private val ROM_BLINK_FLASH = embed("../../../../examples/pico2/blink_flash.elf")
+private val ROM_HELLO_RAM = embed("../../../../examples/pico2/hello_serial.elf")
+private val ROM_POWMAN = embed("../../../../examples/pico2/powman.elf")
+
+private val ROM_PICO2_SRAM = SramMap(0x20000000, 520 * 1024)
+private const ROM_MS: u64 = 150000
+
+// A Pico 2 holding `image`, powered on with both cores at the boot ROM's reset vector.
+private rom_booted(image: []const u8) -> &ArmBoard
+    val b = arm_board(ROM_PICO2_SRAM)
+    b.rom_boot = true
+    b.boot(image).unwrap()
+    assert(b.cores[0].pc < ROM_BYTES && b.cores[1].pc < ROM_BYTES, s"core 0 starts in the boot ROM, pc 0x${hex(b.cores[0].pc, 8)}")
+    assert(!b.chip.rcp.salted[0], "nothing salted the RCP before the ROM")
+    b
+
+// Run `b` for `ms` of guest time in 0.1 ms steps and answer UART0's text, or fail naming where core 0 stopped.
+private rom_console_after(b: &ArmBoard, ms: u64) -> string
+    while b.chip.now < ms * ROM_MS
+        val end = b.run(ROM_MS / 10)
+        if end == RunEnd.Breakpoint then break
+        assert(end == RunEnd.Budget, s"${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}, pc 0x${hex(b.cores[0].pc, 8)}")
+    from_utf8_lossy(b.console.view())
+
+@test("hello_serial built for flash boots from reset through the boot ROM, which finds its IMAGE_DEF in flash, salts the RCP, reports a normal boot and enters it")
+rom_boot_hello_serial_flash()
+    val b = rom_booted(ROM_HELLO_FLASH)
+    val text = rom_console_after(b, 250)
+    assert(text == "hello, serial 0\r\nhello, serial 1\r\nhello, serial 2\r\n", text)
+    assert(b.chip.rcp.salted[0] && b.chip.rcp.salted[1], "the ROM salted the RCP")
+    val word = b.chip.bootram.words[usize(BOOTRAM_BOOT_WORD / 4)]
+    assert((word >> 8) & 0xFF == BOOT_TYPE_NORMAL, s"BOOT_INFO 0x${hex(word, 8)}")
+
+@test("hello_serial's UF2, written into flash, boots through the boot ROM as the ELF does")
+rom_boot_hello_serial_uf2()
+    val b = rom_booted(ROM_HELLO_UF2)
+    val text = rom_console_after(b, 150)
+    assert(text == "hello, serial 0\r\nhello, serial 1\r\n", text)
+
+@test("blink built for flash, booted through the boot ROM, toggles GPIO 25 every 250 ms of guest time")
+rom_boot_blink_flash()
+    val b = rom_booted(ROM_BLINK_FLASH)
+    var edges = 0
+    var level = false
+    while b.chip.now < 600 * ROM_MS
+        assert(b.run(ROM_MS / 10) == RunEnd.Budget, b.refused)
+        val led = b.chip.pin(25)
+        if led.drives && led.level != level
+            edges += 1
+            level = led.level
+    assert(edges == 3, s"$edges edges")
+
+@test("booting through the boot ROM refuses by name an image that leaves the flash blank, which the ROM would answer with BOOTSEL's USB boot")
+rom_boot_blank_flash()
+    val b = arm_board(ROM_PICO2_SRAM)
+    b.rom_boot = true
+    val why = b.boot(ROM_HELLO_RAM).unwrap_err()
+    assert(why.contains("BOOTSEL's USB boot"), why)
+
+@test("hardware_powman's three power-ups with every boot the boot ROM's own: its BOOT0-3 vector check, BOOTDIS and the flash boot after each power-up")
+rom_boot_powman_program()
+    val b = rom_booted(ROM_POWMAN)
+    var end = RunEnd.Budget
+    var woke: u64 = 0
+    var driven = false
+    var steps = 0
+    while steps < 100000 && (end == RunEnd.Budget || (end == RunEnd.Asleep && !driven))
+        if end == RunEnd.Asleep
+            b.chip.drive_from_outside(14, Some(true))
+            driven = true
+        end = b.run(ROM_MS / 10 * 10)
+        if woke == 0 && b.chip.powman.read(pm.LAST_SWCORE_PWRUP_OFFSET, 4).unwrap() == 0x40 then woke = b.chip.powman.time_ms()
+        steps += 1
+    assert(end == RunEnd.Breakpoint, s"$end ${b.refused}; core 0 stopped ${b.cores[0].stop} at 0x${hex(b.cores[0].stop_at, 8)}\n${from_utf8_lossy(b.console.view())}")
+    val text = from_utf8_lossy(b.console.view())
+    val want = "boot 1: state 0x0 last_swcore_pwrup 0x0 had_swcore_pd 0\r\n" +
+        "xip off: rc -5 state 0x440\r\n" +
+        "gpio 15 high: rc -14 state 0x540 current_pwrup_req 0x2\r\n" +
+        "sleeping until the alarm: valid 1 rc 0 state 0x10f0\r\n" +
+        "boot 2: state 0x0 last_swcore_pwrup 0x40 had_swcore_pd 1\r\n" +
+        "kept 0x0\r\n" +
+        "timer past the alarm: 1\r\n" +
+        "sleeping until gpio 14 rises: valid 1 rc 0 state 0x10d0\r\n" +
+        "boot 3: state 0x0 last_swcore_pwrup 0x2 had_swcore_pd 1\r\n" +
+        "kept 0xc0ffee\r\n" +
+        "bootdis 0x0 boot0 0x12345678 pwrup0 status 1\r\n" +
+        "done\r\n"
+    assert(text == want, text)
+    assert(woke >= 1000 && woke <= 1100, s"powered up at $woke ms")
+
+@test("a write to a block RESETS holds is dropped, as the boot ROM's isolation of PADS_BANK0's pads before their first release needs; a read there is still refused, and the release finds the block at power-on")
+held_block_write_dropped()
+    var c = rp2350()
+    c.reset()
+    val pad = pads.BASE + pads.GPIO0_OFFSET
+    c.write(0, rr.BASE + rr.RESET_OFFSET + 0x2000, 4, rr.RESET_PADS_BANK0_MASK).unwrap()
+    c.write(0, pad + 0x2000, 4, pads.GPIO0_ISO_MASK).unwrap()
+    c.write(0, pad, 4, 0).unwrap()
+    assert(c.read(0, pad, 4).unwrap_err().contains("PADS_BANK0 is held in reset"))
+    c.write(0, rr.BASE + rr.RESET_OFFSET + 0x3000, 4, rr.RESET_PADS_BANK0_MASK).unwrap()
+    var fresh = rp2350()
+    fresh.reset()
+    fresh.write(0, rr.BASE + rr.RESET_OFFSET + 0x3000, 4, rr.RESET_PADS_BANK0_MASK).unwrap()
+    assert(c.read(0, pad, 4).unwrap() == fresh.read(0, pad, 4).unwrap(), "the dropped writes left nothing")
+
+@test("GPIO_HI_IN reads the QSPI chip select high, the BOOTSEL button released, as the boot ROM samples it to choose a flash boot; SCK and the data lines low")
+qspi_csn_reads_high()
+    var c = rp2350()
+    c.reset()
+    assert(c.read(0, sr.BASE + sr.GPIO_HI_IN_OFFSET, 4).unwrap() & 0xFC000000 == sr.GPIO_HI_IN_QSPI_CSN_MASK)

@@ -30,11 +30,14 @@ import sysl.math.min
 // reset in it, and waits there, the ROM's own code, for its salts and then for core 0's launch through
 // the SIO FIFOs (§9.6), asleep in `WFE` between words: each core's `SEV` is the other's event
 // (`Cpu.events`). PSM holding core 1 stops it; releasing it starts it from reset again. Every ROM
-// function the SDK looks up runs as the ROM's code. **Core 0's boot path through the ROM is not run**
-// (it needs the TRNG, SHA-256 and image parsing: rp-coverage items 25 and 30): power-on and the
-// watchdog's reset hand an image over as that path would, and write BOOT_INFO and the chip ID from the
-// OTP where the ROM keeps them (`write_boot_info`), with the QSPI bank's pins out of reset as the path
-// leaves them. The OTP's array is the board's for the run, as the flash's is: each `boot` starts it
+// function the SDK looks up runs as the ROM's code. **Core 0's boot path through the ROM runs where
+// `rom_boot` is set** (`benchtop run --boot rom`): `boot` starts both cores from reset at the ROM's
+// vector with the chip at power-on, and the ROM salts the RCP from the TRNG through SHA-256, reads the
+// OTP's flags, samples BOOTSEL's strap, finds the flash image's IMAGE_DEF and enters it; the watchdog's
+// reset and POWMAN's power-up start core 0 from reset in the ROM again. Otherwise, the default, power-on
+// and the watchdog's reset hand an image over as that path would, and write BOOT_INFO and the chip ID
+// from the OTP where the ROM keeps them (`write_boot_info`), with the QSPI bank's pins out of reset as
+// the path leaves them. The OTP's array is the board's for the run, as the flash's is: each `boot` starts it
 // from the factory image (`factory_otp`), and a reset keeps it.
 //
 // **The watchdog's reset** (`Rp2350.watchdog_reset`) stops each core whose PSM stage it took down at
@@ -221,6 +224,9 @@ struct ArmBoard[C: ArmChip = Rp2350]
     otp_rows: [4096]u32
     // benchtop's USB host (`usb_host.sysl`), off the bus until `attach_usb_host`.
     usb_host: UsbHost
+    // Whether `boot` starts core 0 from reset in the boot ROM, whose boot path finds the image in
+    // flash, rather than at the image's entry as a debugger does.
+    rom_boot: bool
 
 /** A board with `map`'s SRAM, powered on, holding no image. */
 arm_board(map: SramMap) -> &ArmBoard
@@ -228,14 +234,14 @@ arm_board(map: SramMap) -> &ArmBoard
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
     val sram_at = rom_at + ROM_BYTES + arm.GUARD_BYTES
-    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host())
+    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host(), false)
 
 /** A Pico, an RP2040 on its two Cortex-M0+ cores, with `map`'s SRAM, powered on, holding no image. */
 pico_board(map: SramMap) -> &ArmBoard[Rp2040]
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
     val sram_at = rom_at + ROM_BYTES_RP2040 + arm.GUARD_BYTES
-    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host())
+    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host(), false)
 
 impl[C: ArmChip] ArmBoard[C]
     /** Power on with `image`, written where its addresses say: core 0 at its entry, core 1 in the boot
@@ -536,27 +542,31 @@ impl ArmBoard[Rp2350]
         arm.reset_mapped(first, self.mem, packed.view(), MemoryMap(self.map.base, self.map.size, XIP_BASE, FLASH_BYTES, banks.freeze()))
         arm.read_only(self.mem, 0)
         self.chip.reset()
-        self.chip.rom_boot_releases()
+        if !self.rom_boot then self.chip.rom_boot_releases()
         self.chip.flash.connect(&self.mem.flash[0], FLASH_BYTES)
         self.chip.connect_memory(self)
         factory_otp(&self.otp_rows)
         self.chip.otp.connect(&self.otp_rows[0])
         self.chip.otp.runs(ARCH_ARM)
-        if start.pin
+        if start.pin && !self.rom_boot
             for k in 0u32..<(XIP_SRAM_BYTES / 8) do self.chip.xip.maintain(XIP_SRAM_BASE - XIP_BASE + k * 8 + 7).unwrap()
         self.direct = false
         self.xip_epoch = self.chip.xip.epoch +% 1
         self.sram_lines = [0; 32]
         self.sync_xip()
-        if start.handoff then self.chip.rcp.salted = [true, true]
         arm.attach_memory(&self.cores[1], self.mem)
-        self.start_core0(start)
-        self.rom_reset(1)
         self.quantum_at = 0
         self.reached = [0, 0]
         self.why = ""
         self.refused = ""
         self.console.clear()
+        self.rom_reset(1)
+        if self.rom_boot
+            if !self.flash_image() then return Err("the flash holds no image (no block marker 0xffffded3 in its first 4 KB): the boot ROM would enter BOOTSEL's USB boot, which is not modelled")
+            self.rom_reset(0)
+            return Ok(())
+        if start.handoff then self.chip.rcp.salted = [true, true]
+        self.start_core0(start)
         self.write_boot_info(if self.flash_image() then BOOT_TYPE_NORMAL else BOOT_TYPE_BOOTSEL)?
         if start.pc & 1 == 0 then return Err(s"the entry 0x${hex(start.pc, 8)} is not a Thumb address")
         Ok(())
@@ -656,6 +666,9 @@ impl ArmBoard[Rp2350]
         if stages & psm_reg.WDSEL_PROC_COLD_MASK != 0 then self.chip.rcp = rcp()
         if stages & psm_reg.WDSEL_PROC1_MASK != 0 then self.rom_reset(1)
         if stages & psm_reg.WDSEL_PROC0_MASK == 0 then return Ok(())
+        if self.rom_boot
+            self.rom_reset(0)
+            return Ok(())
         val start = self.rom_boot_path("the watchdog's reset")?
         self.chip.rom_boot_releases()
         self.start_core0(start)
@@ -817,6 +830,10 @@ impl ArmBoard[Rp2350]
             return Err(s"POWMAN powers the switched core up with SRAM bank${if state & DOMAIN_SRAM0 != 0 && state & DOMAIN_SRAM1 != 0 then "s 0 and 1" elif state & DOMAIN_SRAM0 != 0 then " 0" else " 1"} still off (SEQ_CFG.HW_PWRUP_SRAM0/1), which is not modelled: the cores reach SRAM on their fast path")
         // Everything in the switched core is at power-on, the RCP's salts with it: the ROM salts them.
         self.chip.rcp = rcp()
+        if self.rom_boot
+            self.rom_reset(0)
+            self.rom_reset(1)
+            return Ok(())
         self.chip.rcp.salted = [true, true]
         val start = self.rom_boot_path("POWMAN's power-up")?
         self.chip.rom_boot_releases()
