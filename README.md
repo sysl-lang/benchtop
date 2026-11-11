@@ -576,8 +576,10 @@ board {
     buses = [spi0, spi1, i2c0, i2c1, uart0, uart1]
   }
   view {
-    size = [168, 408]
-    elements { led { show = led, at = [32, 19] } }
+    size = [185, 284]
+    background = "#2f7a45"
+    pcb = pico
+    elements { led { show = led, at = [60, 29] } }
   }
 }
 ```

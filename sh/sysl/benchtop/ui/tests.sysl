@@ -7,6 +7,7 @@ import sh.sysl.benchtop.v6m.Stop
 import sh.sysl.png as png
 import sh.sysl.sdl3 as sdl
 import sh.sysl.ui as ui
+import sysl.buf.{Buf, buf}
 import sysl.fs.{make_temp_dir, read_bytes}
 import sysl.text.Search
 
@@ -95,20 +96,30 @@ multiple_bindings()
     assert((virt.panel_levels(d.session.board()) & (1 << 8)) != 0)
     assert(!hold(d, "unknown", true))
 
-@test("visual geometry: fixed board scale, clipped hit testing and reverse paint order at multiple sizes")
+@test("visual geometry: the board fits its panel whole, centred, at most twice its size, and hit testing follows it at every scale")
 geometry()
     val s = open_scene("workbench").unwrap()
-    for r in [ui.Rect(24, 150, 760, 500), ui.Rect(10, 10, 360, 220), ui.Rect(0, 0, 1500, 1000)]
-        val t = board_transform(r)
-        assert(t.scale == 1.0 && t.x == f32(r.x) && t.y == f32(r.y))
-        val x = r.x + 567
-        val y = r.y + 192
-        assert(part_at(s, r, x, y) == (if r.holds(x, y) then "button1" else ""))
+    val (vw, vh) = (s.view.width, s.view.height)
+    for r in [ui.Rect(24, 150, 760, 500), ui.Rect(10, 10, 360, 220), ui.Rect(0, 0, 1500, 1000), ui.Rect(7, 9, vw, vh), ui.Rect(0, 0, vw * 3, vh)]
+        val t = board_transform(s, r)
+        val fitted = (f32(r.w) / f32(vw)).min(f32(r.h) / f32(vh)).min(2.0)
+        assert(t.scale == fitted, s"${t.scale} for ${r.w} x ${r.h}")
+        // Whole, and centred to the pixel on both axes.
+        val (w, h) = (f32(vw) * t.scale, f32(vh) * t.scale)
+        assert(t.x >= f32(r.x) && t.y >= f32(r.y) && t.x + w <= f32(r.right()) + 0.5 && t.y + h <= f32(r.bottom()) + 0.5, s"${t.x} ${t.y} at ${t.scale} in ${r.x} ${r.y} ${r.w} ${r.h}")
+        assert((t.x - f32(r.x) - (f32(r.right()) - t.x - w)).abs() <= 1.0 && (t.y - f32(r.y) - (f32(r.bottom()) - t.y - h)).abs() <= 1.0)
+        val x = int(t.x + 567.0 * t.scale)
+        val y = int(t.y + 192.0 * t.scale)
+        assert(part_at(s, r, x, y) == "button1", s"at ${t.scale}")
+        assert(part_at(s, r, int(t.x + 567.0) + 1000, y) == "")
         assert(part_at(s, r, -100, -100) == "")
     val fit1 = fit(WIDTH, HEIGHT, 2400, 1520)
     assert(fit1.scale == 2.0 && fit1.x == 0.0 && fit1.y == 0.0)
     val fit2 = fit(WIDTH, HEIGHT, 2400, 760)
     assert(fit2.scale == 1.0 && fit2.x == 600.0)
+    val capped = fit(100, 50, 1000, 1000, 10, 20, 2.0)
+    assert(capped.scale == 2.0 && capped.x == 410.0 && capped.y == 470.0)
+    assert(board_transform(s, ui.Rect(0, 0, vw * 4, vh * 4)).scale == 2.0)
     var overlapping = s.view.elements[17]
     overlapping.x = 540
     overlapping.y = 165
@@ -146,7 +157,7 @@ framebuffer()
     val d = ready()
     advance(d)
     val first = rasterize(d).unwrap()
-    val t = board_transform(d.board_rect.read())
+    val t = board_transform(d.scene, d.board_rect.read())
     val x = int(t.x + 96.0 * t.scale)
     val y = int(t.y + 226.0 * t.scale)
     val at = usize(y * first.stride() + x * 4)
@@ -188,11 +199,13 @@ pointer_and_resize()
     val d = ready()
     val tree: &ui.View = Workbench(d, true)
     var c = ui.recorder()
-    for size in [ui.Size(1200, 760), ui.Size(700, 900), ui.Size(1500, 1000)]
+    var scales: Buf[f32] = buf()
+    for size in [ui.Size(1200, 760), ui.Size(700, 900), ui.Size(1500, 1000), ui.Size(2600, 1500)]
         ui.render(tree, &c, ui.Rect(0, 0, size.w, size.h))
         val r = d.board_rect.read()
         assert(r.x >= 0 && r.y >= 0 && r.right() <= size.w && r.bottom() <= size.h)
-        val t = board_transform(r)
+        val t = board_transform(d.scene, r)
+        scales.push(t.scale)
         val x = int(t.x + 567.0 * t.scale)
         val y = int(t.y + 192.0 * t.scale)
         d.pointer_live.set(true)
@@ -206,6 +219,11 @@ pointer_and_resize()
         c.point(x, y, false)
         ui.render(tree, &c, ui.Rect(0, 0, size.w, size.h))
         assert(d.current.read().mouse_part == "")
+    var (smaller, larger) = (0, 0)
+    for scale in scales
+        if scale < 1.0 then smaller += 1
+        if scale > 1.0 then larger += 1
+    assert(smaller > 0 && larger > 0, "the button is pressed on a board shrunk and enlarged")
 
 @test("visual desktop: inspector scrolls and dragging from outside never presses GPIO")
 scroll_and_origin()
@@ -257,25 +275,36 @@ private assert_display(d: &Desktop, expected: [4]u8)
     val actual = virt.display_segments(d.session.board(), "readout")
     for i in 0..<4 do assert(actual[i] == expected[i], s"digit $i: expected ${expected[i]}, got ${actual[i]}")
 
-@test("pot ADC: toolkit rotary drag and slider state share the same external analogue source")
+/** Where the board's point (u, v) lands in the panel under `t`. */
+private[ui] board_point(t: Transform, u: int, v: int) -> (int, int) = (int(t.x + f32(u) * t.scale), int(t.y + f32(v) * t.scale))
+
+@test("pot ADC: toolkit rotary drag and slider state share the same external analogue source, at the board's own size and enlarged")
 pot_knob()
     val d = ready()
     val s = d.scene
     val board: &ui.View = BoardView(d, true)
     var c = ui.recorder()
-    val area = ui.Rect(0, 0, s.view.width, s.view.height)
-    d.pointer_live.set(true)
-    c.point(369, 330, true)
-    ui.render(board, &c, area)
-    assert(d.pots[0].position.read() == 5000)
-    c.point(390, 378, true)
-    ui.render(board, &c, area)
-    assert(d.pots[0].position.read() == 10000)
-    advance(d)
-    assert(virt.analog_level(d.session.board(), 26) == 3300000 && d.session.position("volume") == 10000)
-    c.point(348, 378, true)
-    ui.render(board, &c, area)
-    assert(d.pots[0].position.read() == 0)
+    for area in [ui.Rect(0, 0, s.view.width, s.view.height), ui.Rect(30, 20, s.view.width * 2 + 10, s.view.height * 2)]
+        val t = board_transform(s, area)
+        d.pots[0].position.set(1234)
+        d.pointer_live.set(true)
+        val (x0, y0) = board_point(t, 369, 330)
+        c.point(x0, y0, true)
+        ui.render(board, &c, area)
+        assert(d.pots[0].position.read() == 5000, s"at ${t.scale}")
+        val (x1, y1) = board_point(t, 390, 378)
+        c.point(x1, y1, true)
+        ui.render(board, &c, area)
+        assert(d.pots[0].position.read() == 10000)
+        advance(d)
+        assert(virt.analog_level(d.session.board(), 26) == 3300000 && d.session.position("volume") == 10000)
+        val (x2, y2) = board_point(t, 348, 378)
+        c.point(x2, y2, true)
+        ui.render(board, &c, area)
+        assert(d.pots[0].position.read() == 0)
+        c.release(x2, y2)
+        ui.render(board, &c, area)
+    assert(board_transform(s, ui.Rect(30, 20, s.view.width * 2 + 10, s.view.height * 2)).scale == 2.0)
     assert(knob_position(ui.Rect(0, 0, 60, 60), 30, 30, 1234) == 1234)
 
 @test("canonical_key: SDL's capitalised scancode names become the lowercase names the key handler matches")
