@@ -4,8 +4,9 @@ module sh.sysl.benchtop.chip
 // The Pico 2 W's CYW43439 on its chip (`parts/cyw43`, `chip/parts.sysl`): the radio hears GPIO 23, 24,
 // 25 and 29 and answers on GPIO 24 through a `PinAnswer`, so the SIO's GPIO_IN reads what it drives;
 // a radio wired to anything but the chip's GPIOs is refused by name; and examples/pico2w/blink.c, whose
-// first cyw43_arch call brings the radio up over the SDK's PIO gSPI program, runs until its first
-// control-channel message reaches function 2.
+// first cyw43_arch call brings the radio up over the SDK's PIO gSPI program, sends its first
+// control-channel message to function 2, has every ioctl answered, and blinks the LED on the radio's
+// GPIO 0.
 
 import sh.sysl.benchtop.{library, load}
 import sh.sysl.parsing.source_of
@@ -13,6 +14,7 @@ import sh.sysl.rp2350.io_bank0 as io
 import sh.sysl.rp2350.pads_bank0 as pads
 import sh.sysl.rp2350.resets as rr
 import sh.sysl.rp2350.sio as sio
+import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
 import sysl.text.from_utf8_lossy
 
@@ -78,7 +80,7 @@ radio_on_the_sio()
     out(&c, CS, true)
     assert(w == 0xBEADFEED, s"0x${hex(w, 8)}")
     assert(radio.transactions == 1)
-    // Chip select high, the radio lets the line go: GPIO 24 reads its pad's pull-down.
+    // Chip select high, the radio drives the host-wake level: low, with no interrupt pending.
     assert(!data_in(&c))
     out(&c, WL_ON, false)
     assert(!radio.powered && !data_in(&c))
@@ -132,3 +134,47 @@ pico2w_bring_up()
     val name = from_utf8_lossy(f.view()[28..<35])
     assert(name == "clmload" && f[35] == 0, name)
     assert(f[36] & 2 != 0 && f[37] == 0x10, "DL_BEGIN, handler version 1")
+
+// The variable a control frame `f` gets or sets (WLC_GET_VAR 262, WLC_SET_VAR 263), or "".
+private var_name(f: []const u8) -> string
+    val command = le32(f, 12)
+    if command != 262 && command != 263 then return ""
+    var n: usize = 28
+    while n < f.len && f[n] != 0 do n += 1
+    from_utf8_lossy(f[28..<n])
+
+@test("examples/pico2w/blink.c on the Pico 2 W: cyw43_arch_init returns 0, the firmware answers every ioctl the driver sends with none refused (the CLM download, clmload_status, bus:txglom, apsta, cur_etheraddr, gpioout), and the LED wired to the radio's GPIO 0 toggles every 250 ms of virtual time")
+pico2w_blink()
+    val b = arm_board(arm_named("pico2w").unwrap().unwrap())
+    b.boot(BLINK_W).unwrap()
+    var ps = rp_parts(described("pico2w").unwrap().0)
+    connect_parts(&ps, &b.chip)
+    val radio = ps.radio("wifi").unwrap()
+    var toggles: Buf[u64] = buf()
+    var was = lit(&ps, &b.chip, "led")
+    assert(!was)
+    var end = RunEnd.Budget
+    while toggles.len() < 6 && (end == RunEnd.Budget || end == RunEnd.Asleep) && b.chip.now < 8000 * MS
+        end = b.run(MS)
+        val on = lit(&ps, &b.chip, "led")
+        if on == was then continue
+        toggles.push(b.chip.now)
+        was = on
+    val text = from_utf8_lossy(b.console.view())
+    assert(text.contains("cyw43_arch_init 0"), s"$end at ${b.chip.now / MS} ms: ${b.refused} $text")
+    assert(radio.firmware.refused.is_empty(), s"${radio.firmware.refused}")
+    assert(toggles.len() == 6, s"$end at ${b.chip.now / MS} ms, ${toggles.len()} toggles: $text")
+    for i in 1..<toggles.len()
+        val dt = toggles[i] - toggles[i - 1]
+        assert(dt >= 249 * MS && dt <= 253 * MS, s"toggle $i after ${dt * 1000 / MS} us")
+    assert(text.contains("blink 1"), text)
+    // Every frame the driver sent was answered, and these are among the variables it got or set.
+    var names: Buf[string] = buf()
+    for f in radio.frames
+        val n = var_name(f.view())
+        if !n.is_empty() then names.push(n)
+    for want in ["clmload", "clmload_status", "bus:txglom", "apsta", "cur_etheraddr", "gpioout"]
+        var seen = false
+        for n in names do if n == want then seen = true
+        assert(seen, s"`$want` not among $names")
+    assert(radio.firmware.clm_loaded && radio.gpio(0) == was)

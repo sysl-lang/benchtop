@@ -1,0 +1,216 @@
+module sh.sysl.benchtop.parts.cyw43
+@tests
+
+// The CYW43439's firmware on its control channel (`firmware.sysl`), given frames built as cyw43-driver
+// builds them (cyw43_ll.c:698–716, 761–785) and answered as the driver parses the answers
+// (cyw43_ll.c:822–887, 1154–1185).
+
+import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
+
+// The BCDC kinds (cyw43_ll.c:188–189).
+private const GET: u32 = 0
+private const SET: u32 = 2
+
+private push32(f: *Buf[u8], v: u32)
+    for k in 0u32..<4 do f.push(u8.wrap(v >> (8 * k)))
+
+// The driver's control frame: SDPCM header, sequence `sequence`, then the BCDC header for request `id`
+// of `kind` and `command`, and `payload`; padded to four bytes, as the bus writes it.
+private request(sequence: u8, id: u32, kind: u32, command: u32, payload: []const u8) -> Buf[u8]
+    val size = u32(28 + payload.len)
+    var f: Buf[u8] = buf()
+    push32(&f, size | ((~size & 0xFFFF) << 16))
+    f.extend([sequence, CHANNEL_CONTROL, 0, 12, 0, 0, 0, 0])
+    push32(&f, command)
+    push32(&f, u32(payload.len))
+    push32(&f, (id << 16) | kind)
+    push32(&f, 0)
+    f.extend(payload)
+    while f.len() % 4 != 0 do f.push(0xAA)
+    f
+
+// A variable's name, its NUL, then `value`.
+private named(name: string, value: []const u8) -> Buf[u8]
+    var p: Buf[u8] = buf()
+    p.extend(name.bytes)
+    p.push(0)
+    p.extend(value)
+    p
+
+// A 32-bit value's bytes.
+private le(v: u32) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    push32(&b, v)
+    b
+
+// A host talking to the firmware as the driver does: its next frame's sequence and request id.
+struct Driver
+    fw: Firmware
+    sequence: u8
+    id: u32
+
+private driver() -> Driver = Driver(firmware(), 0, 0)
+
+impl Driver
+    // Ioctl `command` of `kind` with `payload`: the answer, which must come, its header checked.
+    ioctl(*self, kind: u32, command: u32, payload: []const u8) -> Buf[u8]
+        self.id += 1
+        val sent = self.sequence
+        val f = request(sent, self.id, kind, command, payload)
+        self.sequence = u8.wrap(u32(sent) + 1)
+        val r = self.fw.take(f.view()).unwrap()
+        val size = le16(r.view(), 0)
+        assert(usize(size) == r.len() && le16(r.view(), 2) == ~size & 0xFFFF, s"size $size of ${r.len()}")
+        assert(r[5] == CHANNEL_CONTROL && r[7] == 12 && r[8] == 0 && r[9] == u8.wrap(u32(sent) + CREDIT_WINDOW))
+        assert(le32(r.view(), 12) == command && le32(r.view(), 16) == u32(payload.len))
+        assert((le32(r.view(), 20) >> 16) == self.id && le32(r.view(), 20) & 0xFFFE == kind, s"flags 0x${hex(le32(r.view(), 20), 8)}")
+        assert(r.len() == 28 + payload.len, "an answer as long as the request")
+        r
+
+    // The value of `name`, read with a request of `room` bytes: the answer's payload.
+    get(*self, name: string, room: usize) -> Buf[u8]
+        var p = named(name, [])
+        while p.len() < room do p.push(0)
+        val r = self.ioctl(GET, WLC_GET_VAR, p.view())
+        assert(le32(r.view(), 24) == 0, s"`$name` answered with status 0x${hex(le32(r.view(), 24), 8)}")
+        var v: Buf[u8] = buf()
+        v.extend(r.view()[28..])
+        v
+
+    // `name` set to `value`, which the answer echoes.
+    set(*self, name: string, value: []const u8)
+        val p = named(name, value)
+        val r = self.ioctl(SET, WLC_SET_VAR, p.view())
+        assert(le32(r.view(), 24) == 0 && le32(r.view(), 20) & IOC_ERROR == 0, s"`$name` refused: ${self.fw.refused}")
+        for i in 0..<p.len() do assert(r[28 + i] == p[i], s"`$name` echoed")
+
+    // A 32-bit variable read back.
+    get32(*self, name: string) -> u32 = le32(self.get(name, name.bytes.len + 5).view(), 0)
+
+// A CLM chunk as cyw43_clm_load sends it after the name `clmload` (cyw43_ll.c:1359–1382): `flags`,
+// type 2, `n` bytes of data, padded so the whole request is a multiple of eight bytes.
+private chunk(flags: u32, n: u32) -> Buf[u8]
+    var a: Buf[u8] = buf()
+    a.extend([u8.wrap(flags), u8.wrap(flags >> 8), 2, 0])
+    a.extend(le(n).view())
+    a.extend(le(0).view())
+    for i in 0..<n do a.push(u8.wrap(i))
+    while (a.len() + 8) % 8 != 0 do a.push(0)
+    a
+
+@test("CYW43439 firmware: each answer is an SDPCM control frame, its size and complement, the firmware's own sequence counting up, a 12-byte header, and a credit eight frames past the host's frame it answers; its BCDC header repeats the command, length and request id")
+sequences_and_credit()
+    var d = driver()
+    for i in 0u32..<300
+        val r = d.ioctl(GET, WLC_GET_VAR, named("cur_etheraddr", [0, 0, 0, 0, 0, 0]).view())
+        assert(u32(r[4]) == i & 0xFF, s"the firmware's frame $i")
+    assert(d.fw.refused.is_empty(), s"${d.fw.refused}")
+
+@test("CYW43439 firmware: the CLM download, DL_BEGIN to DL_END in 1024-byte chunks, then clmload_status reads 0; a download begun and not ended, or a chunk with no DL_BEGIN before it, leaves the status failed")
+clm_download()
+    var d = driver()
+    assert(d.get32("clmload_status") != 0, "no CLM yet")
+    d.set("clmload", chunk(0x1000 | DL_BEGIN, 1024).view())
+    assert(d.get32("clmload_status") != 0, "a download running")
+    d.set("clmload", chunk(0x1000, 1024).view())
+    d.set("clmload", chunk(0x1000 | DL_END, 700).view())
+    assert(d.get32("clmload_status") == 0 && d.fw.clm_loaded && d.fw.clm_bytes == 2748, s"${d.fw.clm_bytes}")
+    // A chunk with no download running is refused, and the status reads failed.
+    var e = driver()
+    val r = e.ioctl(SET, WLC_SET_VAR, named("clmload", chunk(0x1000, 64).view()).view())
+    assert(le32(r.view(), 20) & IOC_ERROR != 0 && le32(r.view(), 24) == UNSUPPORTED)
+    assert(e.fw.refused[0] == "benchtop's CYW43439 does not answer a `clmload` chunk with no DL_BEGIN before it", e.fw.refused[0])
+    assert(e.get32("clmload_status") != 0)
+
+@test("CYW43439 firmware: cur_etheraddr reads the fixed locally administered 02:43:57:43:43:39 until the host sets another; the settings the driver writes read back as written; clmver reads a NUL-terminated name")
+variables()
+    var d = driver()
+    val mac = d.get("cur_etheraddr", 20)
+    assert(mac[0] == 0x02 && mac[1] == 0x43 && mac[2] == 0x57 && mac[3] == 0x43 && mac[4] == 0x43 && mac[5] == 0x39, s"$mac")
+    assert(mac[0] & 0x02 != 0 && mac[0] & 0x01 == 0, "locally administered, unicast")
+    d.set("cur_etheraddr", [0x02, 1, 2, 3, 4, 5])
+    val set = d.get("cur_etheraddr", 20)
+    assert(set[1] == 1 && set[5] == 5)
+    var n: u32 = 1
+    for name in ["bus:txglom", "apsta", "ampdu_ba_wsize", "ampdu_mpdu", "ampdu_rx_factor", "pm2_sleep_ret", "bcn_li_bcn", "bcn_li_dtim", "assoc_listen"]
+        d.set(name, le(n * 10).view())
+        n += 1
+    n = 1
+    for name in ["bus:txglom", "apsta", "ampdu_ba_wsize", "ampdu_mpdu", "ampdu_rx_factor", "pm2_sleep_ret", "bcn_li_bcn", "bcn_li_dtim", "assoc_listen"]
+        assert(d.get32(name) == n * 10, name)
+        n += 1
+    // The country, as cyw43_ll_wifi_on sets it (cyw43_ll.c:1857–1865): `XX`, revision -1.
+    var country: Buf[u8] = buf()
+    country.extend(le(0x5858).view())
+    country.extend(le(0xFFFFFFFF).view())
+    country.extend(le(0x5858).view())
+    d.set("country", country.view())
+    assert(le32(d.get("country", 20).view(), 4) == 0xFFFFFFFF)
+    // The event mask, as the driver sets it (cyw43_ll.c:1893–1904).
+    var events: Buf[u8] = buf()
+    for _ in 0..<23 do events.push(0xFF)
+    d.set("bsscfg:event_msgs", events.view())
+    val v = d.get("clmver", 128)
+    assert(v.len() == 128 && v[0] != 0, "a version")
+    assert(d.fw.refused.is_empty(), s"${d.fw.refused}")
+
+@test("CYW43439 firmware: gpioout sets the GPIOs its mask names to its value and leaves the rest; ccgpioin reads them; the ioctls WLC_UP, WLC_SET_ANTDIV, WLC_SET_PM, WLC_SET_GMODE and WLC_SET_BAND are answered, and ANTDIV and PM read back")
+gpios_and_ioctls()
+    var d = driver()
+    // cyw43_ll_gpio_set (cyw43_ll.c:2352): mask 1 << n, value 1 << n or 0.
+    var on: Buf[u8] = buf()
+    on.extend(le(1).view())
+    on.extend(le(1).view())
+    d.set("gpioout", on.view())
+    assert(d.fw.gpio_high(0) && !d.fw.gpio_high(1) && d.get32("ccgpioin") == 1)
+    var two: Buf[u8] = buf()
+    two.extend(le(6).view())
+    two.extend(le(4).view())
+    d.set("gpioout", two.view())
+    assert(d.fw.gpio_high(0) && !d.fw.gpio_high(1) && d.fw.gpio_high(2) && d.get32("ccgpioin") == 5)
+    var off: Buf[u8] = buf()
+    off.extend(le(1).view())
+    off.extend(le(0).view())
+    d.set("gpioout", off.view())
+    assert(!d.fw.gpio_high(0) && d.fw.gpio_high(2))
+    // WLC_UP takes no payload (cyw43_ll.c:1909).
+    val up = d.ioctl(SET, WLC_UP, [])
+    assert(le32(up.view(), 24) == 0 && d.fw.up)
+    d.ioctl(SET, WLC_SET_ANTDIV, le(0).view())
+    d.ioctl(SET, WLC_SET_PM, le(2).view())
+    d.ioctl(SET, WLC_SET_GMODE, le(1).view())
+    d.ioctl(SET, WLC_SET_BAND, le(0).view())
+    assert(le32(d.ioctl(GET, WLC_GET_PM, le(0).view()).view(), 28) == 2)
+    assert(le32(d.ioctl(GET, WLC_GET_ANTDIV, le(7).view()).view(), 28) == 0)
+    assert(d.fw.refused.is_empty(), s"${d.fw.refused}")
+
+@test("CYW43439 firmware: an ioctl or a variable it does not know is refused by name and answered with the error flag and BCME_UNSUPPORTED; a frame on the event channel, out of sequence, or whose size its complement contradicts is refused by name and not answered; each refusal is noted once")
+refusals()
+    var d = driver()
+    val r = d.ioctl(SET, 26, named("x", []).view())
+    assert(le32(r.view(), 20) & IOC_ERROR != 0 && le32(r.view(), 24) == UNSUPPORTED)
+    d.ioctl(SET, WLC_SET_VAR, named("bcn_timeout", le(10).view()).view())
+    d.ioctl(GET, WLC_GET_VAR, named("nosuchvar", le(0).view()).view())
+    d.ioctl(GET, 300, [])
+    assert(d.fw.refused.len() == 4, s"${d.fw.refused}")
+    assert(d.fw.refused[0] == "benchtop's CYW43439 does not answer the ioctl WLC_SET_SSID (26)", d.fw.refused[0])
+    assert(d.fw.refused[1] == "benchtop's CYW43439 does not answer the iovar `bcn_timeout` (WLC_SET_VAR)", d.fw.refused[1])
+    assert(d.fw.refused[2] == "benchtop's CYW43439 does not answer the iovar `nosuchvar` (WLC_GET_VAR)", d.fw.refused[2])
+    assert(d.fw.refused[3] == "benchtop's CYW43439 does not answer the ioctl 300", d.fw.refused[3])
+    // Frames: the event channel, a sequence out of turn, a size its complement contradicts, too short.
+    var event = request(4, 9, GET, WLC_GET_VAR, named("apsta", le(0).view()).view())
+    event[5] = CHANNEL_EVENT
+    assert(d.fw.take(event.view()).is_none())
+    assert(d.fw.take(request(9, 10, GET, WLC_GET_VAR, named("apsta", le(0).view()).view()).view()).is_none())
+    var bad = request(6, 11, GET, WLC_GET_VAR, named("apsta", le(0).view()).view())
+    bad[2] = 0
+    assert(d.fw.take(bad.view()).is_none())
+    assert(d.fw.take([1, 2, 3]).is_none())
+    assert(d.fw.refused.len() == 8, s"${d.fw.refused}")
+    assert(d.fw.refused[4] == "benchtop's CYW43439 does not take an SDPCM frame on the event channel", d.fw.refused[4])
+    assert(d.fw.refused[5] == "benchtop's CYW43439 does not take an SDPCM frame with sequence 9 where 5 was due", d.fw.refused[5])
+    assert(d.fw.refused[6].starts_with("benchtop's CYW43439 does not take an SDPCM frame whose size"), d.fw.refused[6])
+    assert(d.fw.refused[7] == "benchtop's CYW43439 does not take a function-2 frame of 3 bytes, shorter than its SDPCM header", d.fw.refused[7])
+    for i in 0..<8 do assert(d.fw.take_note() == Some(d.fw.refused[i]))
+    assert(d.fw.take_note().is_none())

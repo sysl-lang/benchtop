@@ -32,13 +32,21 @@ module sh.sysl.benchtop.parts.cyw43
 // the SOCSRAM's wrapper registers, IOCTRL and RESETCTRL, both cores starting in reset; and every other
 // backplane register, kept as written. The WLAN core let out of reset with only its clock enabled, with
 // an NVRAM length token at the top of RAM, is the firmware booted: the HT clock is available and
-// function 2 is ready to take a frame (cyw43_ll.c:1648–1711). A function-2 write is a frame to the
-// firmware, kept in order for whatever answers it.
+// function 2 is ready to take a frame (cyw43_ll.c:1648–1711).
 //
-// What is not here: the firmware's answers on the control channel, the host-wake interrupt on the data
-// line, Bluetooth, and the radio. The data sheet's reset values for the bus registers are not in this
-// tree: each starts at 0, the test registers aside, and the driver checks none of the ones it reads
-// back (cyw43_ll.c:1468).
+// Frames. A function-2 write is a frame to the firmware (`firmware.sysl`), kept in `frames`, and its
+// answer is queued for the host. While one is queued the interrupt register has F2_PACKET_AVAILABLE,
+// and the status register says a packet is available and its length (cyw43_spi.h:89, 112–114), which
+// the driver reads before it reads the frame from function 2 (cyw43_ll.c:1075–1102); that read takes it
+// off the queue. Between transactions the chip drives the data line with the host-wake level: high
+// while an interrupt the host has enabled in the interrupt enable register is pending, which the driver
+// samples before it looks for a frame (cyw43_ll.c:1008, 2378–2381) and which the SDK takes as a GPIO
+// interrupt (pico_cyw43_driver/cyw43_driver.c:46–58). The firmware's `gpioout` drives the chip's GPIOs,
+// which other parts of a board can be wired to (`gpio`).
+//
+// What is not here: events, the data channel, Bluetooth, and the radio. The data sheet's reset values
+// for the bus registers are not in this tree: each starts at 0, the test registers aside, and the
+// driver checks none of the ones it reads back (cyw43_ll.c:1468).
 
 import sysl.buf.{Buf, buf, buf_filled}
 import sysl.fmt.hex
@@ -53,6 +61,7 @@ const WLAN: u32 = 2
 // The bus registers (cyw43_spi.h:46–60).
 const BUS_CONTROL: u32 = 0x00
 const INTERRUPT: u32 = 0x04
+const INTERRUPT_ENABLE: u32 = 0x06
 const STATUS: u32 = 0x08
 const F1_INFO: u32 = 0x0C
 const F2_INFO: u32 = 0x0E
@@ -68,6 +77,11 @@ const TEST_PATTERN: u32 = 0xFEEDBEAD
 const WORD_LENGTH_32: u8 = 0x01
 /** The status register's bit for function 2 ready to take a frame (cyw43_spi.h:109). */
 const STATUS_F2_RX_READY: u32 = 0x20
+/** The status register's bit for a frame waiting on function 2, and where its length is (cyw43_spi.h:112–114). */
+const STATUS_F2_PKT_AVAILABLE: u32 = 0x100
+const STATUS_F2_PKT_LEN_SHIFT: u32 = 9
+/** The interrupt register's bit for a frame waiting on function 2 (cyw43_spi.h:89). */
+const F2_PACKET_AVAILABLE: u8 = 0x20
 /** A function's info register: enabled and ready (cyw43_spi.h:63–64). */
 const FUNCTION_READY: u32 = 0x03
 
@@ -157,7 +171,8 @@ end Phase
 
 /** The chip: its wiring and the pins as it last heard them; the transaction on the bus; its bus
  * registers, the SDIO core's, the backplane's cores, RAM and other registers; the frames the host has
- * written to function 2; and the transactions, counted, and kept in `transcript` while `recording`.
+ * written to function 2, the firmware that answers them and the answers the host has yet to read; and
+ * the transactions, counted, and kept in `transcript` while `recording`.
  */
 struct Cyw43
     wiring: Wiring
@@ -192,6 +207,8 @@ struct Cyw43
     words: Buf[Word]
     frame: Buf[u8]
     frames: Buf[Buf[u8]]
+    firmware: Firmware
+    replies: Buf[Buf[u8]]
     recording: bool
     transcript: Buf[Transaction]
     transactions: u64
@@ -199,7 +216,7 @@ struct Cyw43
 /** The chip wired as `w`, powered down. */
 cyw43(w: Wiring) -> &Cyw43
     val c: &Cyw43 = Cyw43(w, false, false, false, Phase.Idle, 0, 0, false, false, false, 0, 0, 0, 0, 0, 0, buf(), 0, false,
-        [0; 32], [0; 32], false, Core(0, AIRC_RESET), Core(0, AIRC_RESET), buf(), buf(), buf(), buf(), false, buf(), 0)
+        [0; 32], [0; 32], false, Core(0, AIRC_RESET), Core(0, AIRC_RESET), buf(), buf(), buf(), buf(), firmware(), buf(), false, buf(), 0)
     c
 
 impl Cyw43
@@ -213,7 +230,8 @@ impl Cyw43
         self.transactions = 0
 
     /** The GPIOs at `levels`, bit n for GPIO n: the chip hears its wires, and answers how it drives its
-     * data line from now on: at a level while it gives a read's response, and not at all otherwise.
+     * data line from now on: at a level while it gives a read's response, at the host-wake level while
+     * chip select is high, and not at all while the host drives the line or the chip is powered down.
      */
     hear(*self, levels: u64) -> Option[bool]
         val w = self.wiring
@@ -232,14 +250,32 @@ impl Cyw43
         val rising = clock && !self.clock
         self.clock = clock
         if selected && rising then self.edge(high(levels, w.data))
-        if self.phase == Phase.Reading then Some(self.out) else None
+        if self.phase == Phase.Reading then return Some(self.out)
+        if selected then None else Some(self.host_wake())
 
     /** Keep each transaction in the transcript from now on, or stop. */
     record(*self, on: bool)
         self.recording = on
 
-    /** The status register: function 2 ready to take a frame once the firmware has booted. */
-    status(*self) -> u32 = if self.booted() then STATUS_F2_RX_READY else 0
+    /** The status register: function 2 ready to take a frame once the firmware has booted, and the
+     * length of the frame waiting for the host, if one is.
+     */
+    status(*self) -> u32
+        val ready = if self.booted() then STATUS_F2_RX_READY else 0
+        if self.replies.is_empty() then return ready
+        ready | STATUS_F2_PKT_AVAILABLE | (u32(self.replies[0].len()) << STATUS_F2_PKT_LEN_SHIFT)
+
+    /** The host-wake level: an interrupt pending that the interrupt enable register lets through. */
+    host_wake(*self) -> bool
+        val pending = u32(self.bus[INTERRUPT]) | (u32(self.bus[INTERRUPT + 1]) << 8)
+        val enabled = u32(self.bus[INTERRUPT_ENABLE]) | (u32(self.bus[INTERRUPT_ENABLE + 1]) << 8)
+        pending & enabled != 0
+
+    /** Whether the chip's GPIO `n` is high: as the firmware's `gpioout` set it, and low while powered down. */
+    gpio(*self, n: u32) -> bool = self.powered && self.firmware.gpio_high(n)
+
+    /** What the firmware has refused that the board has not yet reported, once. */
+    take_note(*self) -> Option[string] = self.firmware.take_note()
 
     /** Whether the firmware runs: the WLAN core out of reset with its clock enabled, neither forced nor
      * halted (the last write of reset_device_core, cyw43_ll.c:1222–1232, 1655), and an NVRAM length
@@ -261,7 +297,7 @@ impl Cyw43
     ram_byte(*self, a: u32) -> u8 = if usize(a) < self.ram.len() then self.ram[usize(a)] else 0
 
     // Power up or down: nothing on the bus, the bus registers in 16-bit mode, the window at 0, the
-    // cores in reset, the RAM clear, no frames.
+    // cores in reset, the RAM clear, no frames, the firmware not started.
     private reset(*self)
         self.phase = Phase.Idle
         self.bits = 0
@@ -278,6 +314,8 @@ impl Cyw43
         self.words = buf()
         self.frame = buf()
         self.frames = buf()
+        self.firmware = firmware()
+        self.replies = buf()
 
     // Chip select falls: a transaction starts with its command, in the word length set now.
     private begin(*self)
@@ -286,16 +324,28 @@ impl Cyw43
         self.word = 0
         self.wide = self.bus[BUS_CONTROL] & WORD_LENGTH_32 != 0
 
-    // Chip select rises: the transaction ends, a frame written to function 2 goes to the firmware, and
-    // the transaction is counted and kept.
+    // Chip select rises: the transaction ends, a frame written to function 2 goes to the firmware and
+    // its answer waits for the host, a frame read from function 2 is taken, and the transaction is
+    // counted and kept.
     private finish(*self)
         if self.phase == Phase.Writing || self.phase == Phase.Reading
             if self.write && self.function == WLAN
                 self.frames.push(self.frame)
+                self.firmware.take(self.frame.view()) match
+                    Some(f) -> self.reply(f)
+                    None -> ()
                 self.frame = buf()
+            if !self.write && self.function == WLAN && !self.replies.is_empty()
+                self.replies.remove(0)
+                if !self.replies.is_empty() then self.bus[INTERRUPT] |= F2_PACKET_AVAILABLE
             self.transactions += 1
             if self.recording then self.transcript.push(Transaction(self.write, self.function, self.address, self.length, self.first))
         self.phase = Phase.Idle
+
+    // Frame `f` from the firmware waits for the host, and says so in the interrupt register.
+    private reply(*self, f: Buf[u8])
+        self.replies.push(f)
+        self.bus[INTERRUPT] |= F2_PACKET_AVAILABLE
 
     // A rising clock edge with chip select low, the data line at `bit`: a bit given, or one taken.
     private edge(*self, bit: bool)
@@ -359,9 +409,13 @@ impl Cyw43
             self.count += 1
             if self.increment then self.at += 1
 
-    // The byte at address `a` of the command's function.
+    // The byte at address `a` of the command's function: function 2's is the waiting frame's, zero past
+    // its end.
     private read_byte(*self, a: u32) -> u8
         if self.function == BUS then return self.bus_byte(a)
+        if self.function == WLAN
+            if self.replies.is_empty() || usize(a) >= self.replies[0].len() then return 0
+            return self.replies[0][usize(a)]
         if self.function != BACKPLANE then return 0
         if a >= SDIO_REGISTERS then return self.sdio_byte(a)
         self.backplane_byte(self.window() | (a & WINDOW_MASK))

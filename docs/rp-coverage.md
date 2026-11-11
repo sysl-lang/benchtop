@@ -347,7 +347,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 30 | **Boot path** (IMAGE_DEF and partitions; per Q2). | L | 6, 25, 26 |
 | 31 | **Non-secure TrustZone** (Q3 reopened). **Done** (below). | L | 2 |
 | 32 | **USB host mode** (per Q4). | L | 20 |
-| 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED), stage 1: init and the LED. **33a, the gSPI bus and the chip's bring-up, done** (below); 33b, the control channel and the LED, next. Stage 2, networking, is pending: Ethernet frames over F2 bridged to the Mac through libslirp, a fake access point; not scheduled. | L | 14 |
+| 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED), stage 1: init and the LED. **33a, the gSPI bus and the chip's bring-up, done** (below); **33b, the control channel and the LED, done** (below): `cyw43_arch_init` returns 0 and `blink` blinks. Stage 2, networking, is pending: Ethernet frames over F2 bridged to the Mac through libslirp, a fake access point; not scheduled. | L | 14 |
 | 34 | **POWMAN power states**: STATE, PWRUP0–3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS, the P1.x time skip (Q7) and the power-up boot as far as it needs no ROM. **Done** (below). | M | 27 |
 | 35 | **WFE latch and SEVONPEND**, on both Arm boards: a core asleep in `WFE` with nothing enabled latches every chip line that rises while it sleeps as pending in its NVIC, a pulse included, and SEVONPEND makes an interrupt's becoming pending an event. No speed loss. **Done** (below). | S | 6, 22 |
 
@@ -1947,3 +1947,48 @@ and the host-wake level on GP24 between transactions is its interrupt.
 
 **Cost**: a board with no answering part pays one more flag test in `gpio_changed`; the PIO's pin
 moves already told the hooks.
+
+### Item 33b, done: the CYW43439's control channel and the LED
+
+`parts/cyw43/firmware.sysl` is the firmware's side of function 2, as cyw43-driver parses it; the bus
+model queues its answers. `examples/pico2w/blink.elf` now runs as on the board: `cyw43_arch_init`
+returns 0, every ioctl the driver sends is answered, and the LED on `wifi.gpio0` toggles every 250 ms
+of virtual time (the window shows it lit, `led` ON in Parts & signals).
+
+- **Host wake and F2 reads.** An answer waiting sets F2_PACKET_AVAILABLE in the interrupt register and,
+  in the status register, the packet bit and the frame's length (`cyw43_spi.h:89, 112–114`); an F2
+  read of that length gives the frame and takes it, raising the interrupt again while another waits.
+  Between transactions the chip drives GP24 with the host-wake level, high while an interrupt the
+  interrupt enable register lets through is pending, which the driver samples (`cyw43_ll.c:1008`) and
+  the SDK takes as its level-high GPIO interrupt. During a transaction the line is the host's, but for
+  a read's response.
+- **SDPCM.** The 12-byte header, size and complement checked, the host's frames taken in sequence; each
+  answer carries the firmware's own sequence and a bus-data credit eight frames past the frame it
+  answers, so the driver's send never stalls (`cyw43_ll.c:649–651, 843–848`). Only the control channel
+  is taken.
+- **The control channel (BCDC).** The answer repeats command, length and flags (the request id the
+  driver matches) with a payload as long as the request's: a get's value at its start, a set echoed.
+  Answered: the CLM download (`clmload` chunks DL_BEGIN … DL_END, then `clmload_status` 0),
+  `cur_etheraddr` (a fixed locally administered **02:43:57:43:43:39** until the host sets one), `clmver`,
+  the settings `bus:txglom`, `apsta`, `ampdu_ba_wsize`, `ampdu_mpdu`, `ampdu_rx_factor`, `country`,
+  `bsscfg:event_msgs`, `pm2_sleep_ret`, `bcn_li_bcn`, `bcn_li_dtim`, `assoc_listen` (kept and read
+  back), `gpioout` (mask and value onto the chip's GPIOs) and `ccgpioin`, and the ioctls WLC_UP,
+  WLC_GET/SET_ANTDIV, WLC_GET/SET_PM, WLC_SET_GMODE and WLC_SET_BAND: the bring-up, `cyw43_ll_wifi_on`,
+  `cyw43_ll_wifi_pm` and the GPIO calls. `blink` itself sends the CLM chunks, `clmload_status`,
+  `bus:txglom`, `apsta`, two gets of `cur_etheraddr` (`CYW43_USE_OTP_MAC`) and `gpioout`; `wifi_on` is
+  only reached through `cyw43_arch_enable_sta_mode`.
+- **Refused by name.** Any other ioctl or variable (`bcn_timeout` and the join's ioctls among them) is
+  answered with the BCDC error flag and BCME_UNSUPPORTED, so the driver goes on, and named; a frame on
+  the event or data channel, out of sequence or whose header does not hold together is named and not
+  answered. The board reports each once through `take_note` (`RpParts.take_note`, the window's note).
+- **The LED.** `chip.lit` reads an LED wired to a radio's `gpioN` from the radio (`RpParts.radio_gpio`);
+  the chip's GPIOs are low while it is powered down.
+
+Tests: `parts/cyw43/firmware_tests.sysl` (sequences and credit over 300 frames, the CLM download,
+the variables, `gpioout` / `ccgpioin` and the ioctls, every refusal's wording),
+`parts/cyw43/tests.sysl` `host_wake` (interrupt, status length, host-wake level, F2 read, the enable
+mask), and `chip/cyw43_tests.sysl` `pico2w_blink`: `cyw43_arch_init 0` on the console, nothing
+refused, six LED toggles each 249–253 ms apart.
+
+**Not here (stage 2, pending):** events, the data channel (Ethernet frames over F2 to the Mac through
+libslirp, a fake access point), joins and scans, Bluetooth.
