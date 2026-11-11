@@ -344,7 +344,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 27 | **POWMAN AON timer and LPOSC**. **Done** (below). | M | 5 |
 | 28 | **BUSCTRL performance counters, TBMAN, GLITCH_DETECTOR stores**. | S | 11 |
 | 29 | **HSTX and the SIO TMDS encoder** (per Q9). | M | 11 |
-| 30 | **Boot path** (IMAGE_DEF and partitions; per Q2). | L | 6, 25, 26 |
+| 30 | **Boot path** (IMAGE_DEF and partitions; per Q2). First slice **done** (below): `--boot rom` boots core 0 from reset through the ROM into a flash image's IMAGE_DEF. Partition tables, signatures, encrypted boot and nsboot remain. | L | 6, 25, 26 |
 | 31 | **Non-secure TrustZone** (Q3 reopened). **Done** (below). | L | 2 |
 | 32 | **USB host mode** (per Q4). | L | 20 |
 | 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED), stage 1: init and the LED. **33a, the gSPI bus and the chip's bring-up, done** (below); 33b, the control channel and the LED, next. Stage 2, networking, is pending: Ethernet frames over F2 bridged to the Mac through libslirp, a fake access point; not scheduled. | L | 14 |
@@ -1983,3 +1983,61 @@ and the host-wake level on GP24 between transactions is its interrupt.
 
 **Cost**: a board with no answering part pays one more flag test in `gpio_changed`; the PIO's pin
 moves already told the hooks.
+
+### Item 30, done (first slice): core 0 boots through the boot ROM
+
+**The run mode.** `benchtop run --boot rom` (`--boot debugger` is the default and unchanged), on an Arm
+RP2350 board, with or without `--window`, `--gdb` or a script; the Pico, the RISC-V Pico 2 and a virtual
+board refuse it by name. It sets `ArmBoard.rom_boot`: `boot` writes the image into flash and SRAM as
+before, puts the chip at power-on (RESETS holding every block, the QSPI bank's included), and starts
+**both** cores from reset at the ROM's vector, nothing salted, no BOOT_INFO written, no XIP lines
+pinned. The ROM's own boot path does the rest: the boot salts from the TRNG through SHA-256 into the
+RCP, OTP's boot flags and BOOTDIS, POWMAN's BOOT0–3 and the watchdog's SCRATCH vectors, the SRAM power-up,
+the main resets, BOOTSEL's strap, the flash probed through the QMI, the image's IMAGE_DEF found, BOOT_INFO
+written, and the image entered. The watchdog's reset (PROC0 in WDSEL) and POWMAN's power-up then start
+core 0 from reset in the ROM again rather than through `rom_boot_path`. An image that leaves the flash
+with no block marker in its first 4 KB is refused at `boot`: the ROM would enter BOOTSEL's USB boot.
+
+**The census**, what the ROM's path touched that benchtop answered wrongly, in the order it met them
+(the ROM's source, `varm_boot_path.c` at tag `A4`, says why each is right):
+
+| what | where | was | now |
+|---|---|---|---|
+| TRNG_SW_RESET read back (the salt loop's count is 0xc9 + the read, which an RCP check then requires; ROM 0x3940, 0x39b6) | `peripheral/rp2350/trng.sysl` | stored: read 1, the loop ran once too often, `rcp_iequal` faulted | self-clearing: a 1 resets the collection, the register reads 0 |
+| OTP BOOTDIS (step 9 writes 0x5afe0001 to it and to POWMAN's) | `peripheral/rp2350/otp.sysl` | refused by name | NEXT set by a 1 and never cleared by software, NOW cleared by a 1; the OTP's reset (the watchdog's OTP stage, a power-down) ORs NEXT into NOW and clears NEXT; power-on clears both |
+| a write to a block RESETS holds (step 11 isolates PADS_BANK0's pads before their first release: "if the pads registers are already in reset (e.g. first boot) then this operation should be harmless") | `chip/rp2350.sysl` `write` | refused, as the bus hang the comment assumed | dropped; a read of a held block is still refused |
+| GPIO_HI_IN's QSPI bank (step 12 samples chip select 21 times as BOOTSEL's strap) | `chip/rp2350.sysl` `sio_inputs` | every QSPI bit 0: BOOTSEL read as pressed, and nsboot ran | chip select reads high (the board's pull-up, the button released), SCK and SD0–3 low, through SIO and the GPIO coprocessor alike |
+
+**What came for free**: everything else on the path ran as it stood — the TRNG and SHA-256 (item 25)
+making the salts, the OTP's guarded reads and ECC (item 26), POWMAN's vectors and BOOTDIS (item 34),
+PSM, RESETS, the QMI's direct mode probing the flash and the XIP set-up (item 4), the RCP's checks
+throughout (item 3), and the IMAGE_DEF parse of the SDK's own images: `hello_serial_flash` as an ELF and as
+a UF2, and `blink_flash`. `powman.c`'s three power-ups run through the ROM's own vector check, BOOTDIS and
+flash boot, with the same output as under the debugger entry.
+
+**Tests**: `chip/rom_boot_tests.sysl` boots `hello_serial_flash` (ELF and UF2), `blink_flash` and
+`powman.c` through the ROM and asserts every line and edge as the debugger-entry tests do, that the ROM
+salted the RCP and wrote a NORMAL BOOT_INFO, and the blank-flash refusal; with the chip-level checks of
+the dropped write and of GPIO_HI_IN. `script/boot_rom_tests.sysl` runs `--boot rom` as a scripted run
+and the refusals. TRNG_SW_RESET (`rp2350/crypto_tests.sysl`) and OTP BOOTDIS (`rp2350/otp_tests.sysl`)
+register by register.
+
+**What remains of item 30:**
+
+- **Partition tables** run as the ROM's code, but no image here has one: an image with a PARTITION_TABLE
+  block (picotool's `partition create`), and `load_partition_table` and `chain_image` from a program,
+  are the next slice's oracles. A UF2 placed elsewhere in flash still needs that search under
+  `--boot debugger`.
+- **Signature checks and secure boot**: OTP's CRIT1.SECURE_BOOT_ENABLE and the boot key rows cannot be
+  programmed (item 26 refuses them by name), so a signed image's path is not reached.
+- **Encrypted boot**: not reached (it needs the same OTP rows and a signed decryption stage).
+- **BOOTSEL's USB boot (nsboot)**: refused at `boot` for a blank flash. Reached otherwise (BOOTSEL held,
+  or no image found), the ROM's nsboot runs Non-secure with its stack in USB RAM and stops at a
+  SecureFault (AUVIOL at 0x50100ffc): the SAU regions it sets for itself are not yet what attribution
+  sees there.
+- **A typed watchdog boot** (SCRATCH7 the magic: a RAM image, or BOOTSEL) is still refused by name under
+  `--boot debugger`; under `--boot rom` it is the ROM's code, not yet exercised.
+- **The RISC-V Pico 2**: hart 0's boot path (the ROM's Armv8-M emulator) is not run (Q13).
+
+**Fidelity**: under `--boot rom` the boot salts are the ROM's, from the seeded TRNG, where the debugger
+entry sets fixed ones; the boot takes the ROM's own time before the image's first instruction.

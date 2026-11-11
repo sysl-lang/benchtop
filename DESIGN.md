@@ -1455,7 +1455,11 @@ The user's images are UF2 and ELF. Three ways to start, and the one chosen:
    leaves them (the SDK reprograms them anyway), the QMI set up for the flash (not modelled), the
    boot-lock and the RCP state. These are a table in the board description, each checked against the
    real board by reading the registers at `_entry_point` with the debug probe, or with a first
-   instruction that dumps them over UART. Option 1 is a costed later item (§7).
+   instruction that dumps them over UART.
+
+   Option 1 is built beside it, behind `benchtop run --boot rom` on the Arm Pico 2 (`ArmBoard.rom_boot`):
+   both cores from reset at the ROM's vector, core 0's boot path the ROM's own, through a flash image's
+   `IMAGE_DEF` (docs/rp-coverage.md, item 30). Option 3 stays the default.
 
 ### 9.3 SIO
 
@@ -2161,6 +2165,8 @@ Each points at the name or value it is about; `<x>` is the name in the file.
   ``, `` benchtop does not emulate the parts on a board yet, and `wifi` is a cyw43439 ``, `benchtop
   runs one board, and this product has 2`, and a chip file: `` this is the chip `virt`, and benchtop
   runs a board ``).
+- `benchtop run --boot rom` boots an Arm RP2350 board through Raspberry Pi's boot ROM from reset rather
+  than entering the image as a debugger does (§9.2); any other board refuses it with the reason.
 - `benchtop render` — drawing a description's view to an image — comes with the window (§4).
 
 ### 12.11 The chip as a description

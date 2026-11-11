@@ -231,7 +231,7 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 ```
 sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--window] [--deterministic | --threads] [--usb console|pty|off]
-               [--gdb [port]] [--sd <card.img | none>] <image.elf | image.bin>
+               [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] <image.elf | image.bin>
 ./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
@@ -272,6 +272,13 @@ a virtual board or an RP board (`pico`, `pico2`, `pico2-riscv`, or a product of 
 goes: `console` (the default) puts benchtop's USB host on the bus and joins a CDC ACM device's output
 to the console, or to the window's **Guest** tab; `pty` gives it a pseudo-terminal whose name is
 printed on stderr, without `--window`; `off` leaves the bus empty.
+**`--boot debugger|rom`**, on an RP2350 board of Cortex-M33s, says how core 0 starts. `debugger` (the
+default) enters the image as a debug probe does: an ELF at its entry, a flash UF2 at its vector table.
+`rom` starts both cores from reset in Raspberry Pi's boot ROM, which runs its own boot path (the boot
+salts from the TRNG through SHA-256, OTP's flags, BOOTSEL's strap) and finds the image's `IMAGE_DEF` in
+flash; an image that leaves the flash blank is refused, since the ROM would enter BOOTSEL's USB boot.
+The watchdog's reset and POWMAN's power-up then boot through the ROM too. With `--window`, `--gdb` and
+a scripted run alike.
 
 ### Running firmware headless
 
