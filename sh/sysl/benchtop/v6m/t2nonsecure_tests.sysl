@@ -350,3 +350,86 @@ ns_refused()
     // The same PRIGROUP, and SYSRESETREQS, are taken.
     c = run_both8([0x6008], [0x05FA0008, SCB_AIRCR], 0, [], &secure)
     assert(c.stop == Stop.Breakpoint && load32(&c, SCB_AIRCR) & 8 == 8, "SYSRESETREQS")
+
+// ---------------------------------------------------------------------------------------------------
+// The IDAU's Exempt ranges.
+
+// An IDAU shaped as the RP2350's: its Non-secure-callable region at 0x7E00–0x7FFF, number 2; Exempt
+// for loads and stores 0x3000–0x3FFF (a whole page) and 0x4800–0x480F (part of one); Exempt for
+// fetches 0x0A00–0x0A3F only; and its map below 0x10000 mirrored every 32 KB.
+exempting(cpu: *Cpu)
+    cpu.idau = Idau(0x7E00, 0x7FFF, 2, [0x3000, 0x4800, 0, 0], [0x3FFF, 0x480F, 0, 0], 2, 0x0A00, 0x0A3F, 0x10000, 0x7FFF)
+
+// The Non-secure layout, the IDAU above, and words at both Exempt data ranges: ldr r2, [r1];
+// ldr r3, [r3]; ldr r1, [r7].
+exempt_loads(cpu: *Cpu)
+    ns_code(cpu, [0x680A, 0x681B, 0x6839, BKPT])
+    exempting(cpu)
+    store32(cpu, 0x3010, 0x11223344)
+    store32(cpu, 0x4800, 0x55667788)
+
+@test("Non-secure loads from the IDAU's Exempt ranges are made, though the SAU makes them Secure: a whole Exempt page on the Non-secure page table, a partly Exempt one off it; the byte past a range is SecureFault AUVIOL")
+ns_exempt_loads()
+    // bxns r6
+    var c = run_both8([0x4734], [0, 0x3010, 0, 0x4800, LOG, SCB_SFSR, NS_CODE, 0x4810], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &exempt_loads)
+    assert(secure_fault_from_ns(&c, SFSR_AUVIOL | SFSR_SFARVALID, NS_CODE + 4), s"${c.stop} at 0x${c.stop_at}")
+    assert(c.sfar == 0x4810, "SFAR names the byte past the range")
+    assert(c.r[2] == 0x11223344 && c.r[3] == 0x55667788, "both Exempt loads made")
+    assert(c.ns_pages[3] != 0 && c.ns_pages[4] == 0, "page 3 whole, page 4 partly Exempt")
+
+// The Non-secure layout, the IDAU above, and at the fetch-Exempt 0x0A00: movs r0, #7; bkpt. bx r3.
+exempt_fetch(cpu: *Cpu)
+    branch_code(cpu)
+    exempting(cpu)
+    put(cpu, 0x0A00, [0x2007, BKPT])
+    put(cpu, 0x3000, [0x2007, BKPT])
+
+// The same with SAU region 3 Non-secure over 0x0A00–0x0A3F.
+exempt_fetch_ns_region(cpu: *Cpu)
+    exempt_fetch(cpu)
+    region(cpu, 3, 0x0A00, 0x0A20, 1)
+
+@test("an IDAU range Exempt for fetches runs in the state that reaches it: Non-secure code branching there stays Non-secure, and Secure code stays Secure though an SAU region makes it Non-secure; a range Exempt only for loads and stores is fetched as the SAU says, INVEP")
+ns_exempt_fetch()
+    // bxns r1 to the Non-secure bx r3.
+    var c = run_both8([0x470C], [0, NS_CODE, 0, 0x0A01, LOG, SCB_SFSR], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &exempt_fetch)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 0x0A02 && c.ns && c.r[0] == 7 && c.sfsr == 0, s"Non-secure: ${c.stop} at 0x${c.stop_at}")
+    c = run_both8([0x470C], [0, NS_CODE, 0, 0x3001, LOG, SCB_SFSR], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &exempt_fetch)
+    assert(secure_fault_from_ns(&c, SFSR_INVEP, 0x3000), s"Exempt for data only: ${c.stop} at 0x${c.stop_at}")
+    // bx r3 from Secure state.
+    c = run_both8([0x4718], [0, 0, 0, 0x0A01, LOG, SCB_SFSR], 0, [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &exempt_fetch_ns_region)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 0x0A02 && !c.ns && c.r[0] == 7 && c.sfsr == 0, s"Secure: ${c.stop} at 0x${c.stop_at}")
+
+// The IDAU above with SAU region 3 Non-secure over 0x2000–0x3FFF, the SAU enabled.
+exempt_under_region(cpu: *Cpu)
+    secure(cpu)
+    exempting(cpu)
+    region(cpu, 3, 0x2000, 0x3FE0, 1)
+    store32(cpu, SAU_CTRL, 1)
+
+// The IDAU above with the SAU disabled and ALLNS set, its fetch-Exempt range from 0 so that the test's
+// Secure code there, which ALLNS makes Non-secure, runs in Secure state.
+exempt_all_ns(cpu: *Cpu)
+    secure(cpu)
+    exempting(cpu)
+    cpu.idau.fetch_lo = 0
+    store32(cpu, SAU_CTRL, 2)
+
+// The IDAU above, the SAU disabled with ALLNS clear.
+exempt_sau_off(cpu: *Cpu)
+    secure(cpu)
+    exempting(cpu)
+
+@test("TT of an Exempt address from Secure state answers Secure, with no SAU region and NSR and NSRW clear, whether an SAU region or ALLNS would make it Non-secure; the byte before the range is the SAU's; the IDAU's map mirrors below its mirror's end")
+ns_exempt_tt()
+    val s = TT_S | TT_RW
+    val idau = s | TT_IRVALID | (2 << 24)
+    assert(answers(0x3000, &exempt_under_region, s), "the range's first byte, under an SAU region")
+    assert(answers(0x3FFF, &exempt_under_region, s), "its last byte")
+    assert(answers(0x2FFF, &exempt_under_region, TT_NS_RW | TT_SRVALID | (3 << 8)), "the byte before it, the SAU's Non-secure")
+    assert(answers(0x3000, &exempt_all_ns, s), "under ALLNS")
+    assert(answers(0x2FFF, &exempt_all_ns, TT_NS_RW), "ALLNS outside it")
+    assert(answers(0x3000, &exempt_sau_off, s), "the SAU disabled")
+    assert(answers(0xFE00, &exempt_sau_off, idau), "the Non-secure-callable region mirrored at 0xFE00")
+    assert(answers(0xB000, &exempt_all_ns, s), "the Exempt page mirrored at 0xB000")
+    assert(answers(0x13000, &exempt_all_ns, TT_NS_RW), "no mirror past its end")
