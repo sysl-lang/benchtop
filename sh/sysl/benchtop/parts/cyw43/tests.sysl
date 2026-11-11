@@ -1,0 +1,241 @@
+module sh.sysl.benchtop.parts.cyw43
+@tests
+
+// The CYW43439 at its pins, driven as the SDK's PIO program drives them (`spi_gap01_sample0`): each bit
+// out set while the clock is low and taken at its rising edge; for a read, the host lets the line go
+// on a falling edge, makes one more rising edge, then samples each bit on a falling edge and makes the
+// rising edge that brings the next. Every register and word value is what cyw43-driver writes or
+// expects (`cyw43_ll.c`, `cyw43_spi.h`).
+
+import sysl.buf.{Buf, buf}
+import sysl.fmt.hex
+
+// The Pico 2 W's wiring: WL_ON on GPIO 23, data 24, chip select 25, clock 29.
+private const ON: u64 = 1 << 23
+private const DATA: u64 = 1 << 24
+private const CS: u64 = 1 << 25
+private const CLK: u64 = 1 << 29
+
+// The command word (cyw43_bus_pio_spi.c:371).
+private cmd(write: bool, function: u32, address: u32, length: u32) -> u32 =
+    (if write then 1u32 << 31 else 0) | (1 << 30) | (function << 28) | ((address & 0x1FFFF) << 11) | (length & 0x7FF)
+
+// A host on the chip's four wires, which it last set to `levels`; `wide` once it has switched the bus
+// to 32-bit words; `raw` while it puts words on the wire as they are and reads them as they come.
+struct Host
+    chip: &Cyw43
+    levels: u64
+    wide: bool
+    raw: bool
+
+// A chip on its wires, WL_ON raised and chip select high, as cyw43_spi_reset leaves them.
+private host() -> Host
+    val c = cyw43(Wiring(23, 24, 25, 29))
+    c.restart()
+    var h = Host(c, CS, false, false)
+    h.set(ON | CS)
+    h
+
+impl Host
+    // The wires at `levels`: what the chip answers on the data line.
+    set(*self, levels: u64) -> Option[bool]
+        self.levels = levels
+        self.chip.hear(levels)
+
+    // Word `v` on the wire, as the host's word length puts it.
+    wire(*self, v: u32) -> u32 = if self.raw then v else on_wire(self.wide, v)
+
+    // One bit out: the data line while the clock is low, then the rising edge.
+    bit(*self, b: bool)
+        val data = if b then DATA else 0
+        self.set((self.levels & ~(CLK | DATA)) | data)
+        self.set(self.levels | CLK)
+
+    // Word `v` out, most significant bit first.
+    send(*self, v: u32)
+        val w = self.wire(v)
+        for i in 0u32..<32 do self.bit((w >> (31 - i)) & 1 != 0)
+
+    // A transaction: chip select low, the words of `out`, then `words` words read back; chip select high.
+    transfer(*self, out: []const u32, words: u32) -> Buf[u32]
+        self.set(self.levels & ~(CS | CLK))
+        for v in out do self.send(v)
+        var got: Buf[u32] = buf()
+        if words > 0
+            self.set(self.levels & ~CLK)
+            self.set(self.levels | CLK)
+            for _ in 0..<words
+                var w: u32 = 0
+                for _ in 0..<32
+                    val answer = self.set(self.levels & ~CLK)
+                    w = (w << 1) | (if answer == Some(true) then 1 else 0)
+                    self.set(self.levels | CLK)
+                got.push(self.wire(w))
+        self.set((self.levels & ~CLK) | CS)
+        got
+
+    // A read of `length` bytes of `function` at `address`: the words after the command.
+    read(*self, function: u32, address: u32, length: u32, words: u32) -> Buf[u32] =
+        self.transfer([cmd(false, function, address, length)], words)
+
+    // A 32-bit register: a backplane read skips the 16 bytes of padding the driver asks for.
+    reg(*self, function: u32, address: u32, length: u32) -> u32
+        if function == BACKPLANE then return self.read(function, address, length, 5)[4]
+        self.read(function, address, length, 1)[0]
+
+    // `value` written to the register of `length` bytes.
+    put(*self, function: u32, address: u32, length: u32, value: u32) = self.transfer([cmd(true, function, address, length), value], 0)
+
+    // The bus brought up as cyw43_ll_bus_init does (cyw43_ll.c:1433–1489): 32-bit words, then the F1
+    // response delay of 16 bytes.
+    up(*self)
+        self.put(BUS, BUS_CONTROL, 4, 0x000204B3)
+        self.wide = true
+        self.put(BUS, RESP_DELAY_F1, 1, 16)
+
+    // A backplane byte or word at `a`, through the window, as cyw43_write_backplane does.
+    backplane(*self, a: u32, length: u32, value: u32)
+        self.put(BACKPLANE, WINDOW_LOW, 1, (a >> 8) & 0xFF)
+        self.put(BACKPLANE, WINDOW_MID, 1, (a >> 16) & 0xFF)
+        self.put(BACKPLANE, WINDOW_HIGH, 1, a >> 24)
+        self.put(BACKPLANE, (a & WINDOW_MASK) | 0x8000, length, value)
+
+    // The backplane word at `a`.
+    backplane_word(*self, a: u32, length: u32) -> u32
+        self.put(BACKPLANE, WINDOW_LOW, 1, (a >> 8) & 0xFF)
+        self.put(BACKPLANE, WINDOW_MID, 1, (a >> 16) & 0xFF)
+        self.put(BACKPLANE, WINDOW_HIGH, 1, a >> 24)
+        self.reg(BACKPLANE, (a & WINDOW_MASK) | 0x8000, length)
+
+@test("CYW43439 gSPI: after WL_ON rises the test register reads 0xFEEDBEAD in 16-bit words, the low half first on the wire; in 32-bit words a value's bytes go least significant first; with WL_ON low the chip never drives the line")
+test_pattern()
+    var h = host()
+    // The words exactly as they go on the wire: the command 0x4000A004, its low half first.
+    h.raw = true
+    val raw = h.transfer([0xA0044000], 1)[0]
+    assert(raw == 0xBEADFEED, s"0x${hex(raw, 8)}")
+    h.raw = false
+    assert(on_wire(true, 0x11223344) == 0x44332211 && on_wire(false, 0x11223344) == 0x33441122)
+    // Read again: the pattern is fixed.
+    assert(h.reg(BUS, READ_TEST, 4) == TEST_PATTERN)
+    h.set(CS)
+    assert(!h.chip.powered)
+    h.set(0)
+    for _ in 0..<64
+        assert(h.set(h.levels | CLK).is_none() && h.set(h.levels & ~CLK).is_none())
+
+@test("CYW43439 gSPI: the bus control write switches to 32-bit words from the next transaction; the R/W test register keeps a word; status, info and the test pattern ignore writes; the interrupt register clears the bits written as 1")
+bus_registers()
+    var h = host()
+    h.put(BUS, BUS_CONTROL, 4, 0x000204B3)
+    // In 16-bit words still, the 32-bit command is misread and answers nothing that matches.
+    assert(h.reg(BUS, READ_TEST, 4) != TEST_PATTERN)
+    h.wide = true
+    assert(h.reg(BUS, READ_TEST, 4) == TEST_PATTERN)
+    assert(h.reg(BUS, BUS_CONTROL, 4) == 0x000204B3)
+    h.put(BUS, RW_TEST, 4, 0x12345678)
+    assert(h.reg(BUS, RW_TEST, 4) == 0x12345678)
+    h.put(BUS, READ_TEST, 4, 0)
+    h.put(BUS, STATUS, 4, 0xFFFFFFFF)
+    assert(h.reg(BUS, READ_TEST, 4) == TEST_PATTERN && h.reg(BUS, STATUS, 4) == 0)
+    assert(h.reg(BUS, F1_INFO, 2) == FUNCTION_READY && h.reg(BUS, F2_INFO, 2) == 0)
+    h.chip.bus[INTERRUPT] = 0x91
+    h.put(BUS, INTERRUPT, 2, 0x0011)
+    assert(h.reg(BUS, INTERRUPT, 2) == 0x80)
+    // A one-byte write in a whole word writes its one byte.
+    h.put(BUS, RESP_DELAY_F1, 1, 0xAABBCC10)
+    assert(h.chip.bus[RESP_DELAY_F1] == 0x10 && h.chip.bus[RESP_DELAY_F1 + 1] == 0)
+
+@test("CYW43439 gSPI: a backplane read gives the F1 response delay's 16 bytes of padding before its data; the window places 32 KB of the backplane, and SOCSRAM written across two windows reads back")
+backplane_window()
+    var h = host()
+    h.up()
+    val padded = h.read(BACKPLANE, CHIP_CLOCK_CSR, 1, 6)
+    for i in 0..<4 do assert(padded[i] == 0)
+    h.put(BACKPLANE, CHIP_CLOCK_CSR, 1, u32(ALP_AVAIL_REQ))
+    val with_alp = h.read(BACKPLANE, CHIP_CLOCK_CSR, 1, 6)
+    assert(with_alp[4] == u32(ALP_AVAIL_REQ | ALP_AVAIL) && with_alp[5] == 0, s"${with_alp}")
+    h.backplane(0x7FFC, 4, 0x11223344)
+    h.backplane(0x8000, 4, 0x55667788)
+    assert(h.chip.window() == 0x8000)
+    assert(h.chip.ram_word(0x7FFC) == 0x11223344 && h.chip.ram_word(0x8000) == 0x55667788)
+    assert(h.backplane_word(0x7FFC, 4) == 0x11223344 && h.backplane_word(0x8000, 4) == 0x55667788)
+    // A 64-byte block, as the firmware download writes it (cyw43_ll.c:433–453), lands byte for byte.
+    var block: Buf[u32] = buf()
+    block.push(cmd(true, BACKPLANE, 0x0100 | 0x8000, 64))
+    for i in 0u32..<16 do block.push(0x03020100 + 0x04040404 * i)
+    h.transfer(block.view(), 0)
+    for i in 0u32..<64 do assert(h.chip.ram_byte(0x8100 + i) == u8(i), s"byte $i")
+    // Another backplane register keeps what is written.
+    h.backplane(0x18000508, 4, 0xCAFE0001)
+    assert(h.backplane_word(0x18000508, 4) == 0xCAFE0001)
+
+// The download's end, as cyw43_ll.c:1628–1656 writes it: the cores reset, an NVRAM token of `n` words at
+// the top of RAM, and the WLAN core let out of reset with only its clock enabled.
+private boot(h: *Host, token: u32)
+    for core in [WLAN_WRAPPER, SOCSRAM_WRAPPER]
+        assert(h.backplane_word(core + RESETCTRL, 1) & 0xFF == u32(AIRC_RESET), "a core starts in reset")
+        h.backplane(core + IOCTRL, 1, u32(SICF_FGC | SICF_CLOCK_EN))
+        h.backplane(core + RESETCTRL, 1, 0)
+        h.backplane(core + IOCTRL, 1, u32(SICF_CLOCK_EN))
+    h.backplane(RAM_SIZE - 4, 4, token)
+
+@test("CYW43439 gSPI: the firmware boots when the WLAN core leaves reset with only its clock enabled and an NVRAM token at the top of RAM: HT then reads available and function 2 ready; not without the token, nor with the core halted")
+boots()
+    var h = host()
+    h.up()
+    assert(h.backplane_word(CHIP_CLOCK_CSR, 1) & u32(HT_AVAIL) == 0)
+    boot(&h, 0xFF9E0060)
+    assert(!h.chip.booted(), "a token whose halves disagree")
+    h.backplane(RAM_SIZE - 4, 4, 0xFF9F0060)
+    assert(h.chip.booted())
+    assert(h.reg(BACKPLANE, CHIP_CLOCK_CSR, 1) & u32(HT_AVAIL) != 0)
+    assert(h.reg(BUS, STATUS, 4) & STATUS_F2_RX_READY != 0 && h.reg(BUS, F2_INFO, 2) == FUNCTION_READY)
+    h.backplane(WLAN_WRAPPER + IOCTRL, 1, u32(SICF_CLOCK_EN | SICF_CPUHALT))
+    assert(!h.chip.booted() && h.reg(BUS, STATUS, 4) == 0)
+    h.backplane(WLAN_WRAPPER + IOCTRL, 1, u32(SICF_CLOCK_EN))
+    h.backplane(WLAN_WRAPPER + RESETCTRL, 1, u32(AIRC_RESET))
+    assert(!h.chip.booted())
+
+@test("CYW43439 gSPI: the sleep CSR reads the device on while the bus is kept on, as the driver's KSO wake reads back for")
+sleep_csr()
+    var h = host()
+    h.up()
+    h.put(BACKPLANE, SLEEP_CSR, 1, u32(KEEP_SDIO_ON))
+    assert(h.reg(BACKPLANE, SLEEP_CSR, 1) & 0xFF == u32(KEEP_SDIO_ON | DEVICE_ON))
+    h.put(BACKPLANE, SLEEP_CSR, 1, u32(DEVICE_ON))
+    assert(h.reg(BACKPLANE, SLEEP_CSR, 1) & 0xFF == 0)
+
+@test("CYW43439 gSPI: a function-2 write is a frame to the firmware, its length the command's, delivered when chip select rises; WL_ON low powers the chip down and clears it")
+frames()
+    var h = host()
+    h.up()
+    h.transfer([cmd(true, WLAN, 0, 6), 0x44332211, 0xAAAA6655], 0)
+    assert(h.chip.frames.len() == 1 && h.chip.frames[0].len() == 6, s"${h.chip.frames.len()}")
+    for i in 0..<6 do assert(h.chip.frames[0][i] == u8(0x11 * (i + 1)), s"${h.chip.frames[0]}")
+    h.backplane(0x10, 4, 0xDEADBEEF)
+    h.set(CS)
+    h.set(ON | CS)
+    assert(h.chip.frames.is_empty() && h.chip.ram_word(0x10) == 0 && h.chip.bus[BUS_CONTROL] == 0)
+    h.wide = false
+    assert(h.reg(BUS, READ_TEST, 4) == TEST_PATTERN)
+
+@test("CYW43439 gSPI: the transcript keeps each transaction while recording, a line each, for setting beside a board's own trace; every transaction is counted")
+transcript()
+    var h = host()
+    h.chip.record(true)
+    h.reg(BUS, READ_TEST, 4)
+    h.up()
+    h.put(BACKPLANE, CHIP_CLOCK_CSR, 1, u32(ALP_AVAIL_REQ))
+    h.reg(BACKPLANE, CHIP_CLOCK_CSR, 1)
+    h.chip.record(false)
+    h.reg(BUS, READ_TEST, 4)
+    var lines: Buf[string] = buf()
+    for t in h.chip.transcript do lines.push(t.line())
+    assert(lines.len() == 5, s"${lines}")
+    assert(lines[0] == "R F0 0x00014 4 0xfeedbead", lines[0])
+    assert(lines[1] == "W F0 0x00000 4 0x000204b3", lines[1])
+    assert(lines[2] == "W F0 0x0001d 1 0x00000010", lines[2])
+    assert(lines[3] == "W F1 0x1000e 1 0x00000008", lines[3])
+    assert(lines[4] == "R F1 0x1000e 1 0x00000048", lines[4])
+    assert(h.chip.transactions == 6)

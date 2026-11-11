@@ -3,7 +3,8 @@ module sh.sysl.benchtop.chip
 // The parts of an RP2040 or RP2350 board on its chip's pins: buttons and switches that drive a GPIO
 // from off the chip, leaving it to the pad's pulls when open; potentiometers and joysticks that put a
 // level on an ADC input; seven-segment displays and HD44780s that watch the GPIOs they are wired to;
-// buzzers that sound the PWM's waveform or a pin's level; LEDs that show a pin.
+// buzzers that sound the PWM's waveform or a pin's level; LEDs that show a pin; a CYW43439 that hears
+// its gSPI terminals and answers on its data line.
 //
 // `PartPins` is the one seam between them and the chip: a part model never reaches past it, so every
 // part runs on both chips and on every board built on them (`ArmBoard`, `RiscvBoard`). The models are
@@ -12,6 +13,7 @@ module sh.sysl.benchtop.chip
 
 import sh.sysl.benchtop.{Board, Part, Target, article_of, part_model, part_text, part_whole}
 import sh.sysl.benchtop.audio as audio
+import sh.sysl.benchtop.parts.cyw43 as cyw43
 import sh.sysl.benchtop.parts.ds3231 as rtc
 import sh.sysl.benchtop.parts.hd44780.Lcd
 import sh.sysl.benchtop.parts.ssd1306 as oled
@@ -40,10 +42,22 @@ struct PinHook
     mask: u64
     heard: &Fn(u64, u64) -> unit
 
+/** A part that drives a GPIO back as it hears the GPIOs of `mask` change: a gSPI device, which turns its
+ * data line at a clock edge a PIO block makes and which the block reads at the next. `heard` is told
+ * their levels where a hook is, and answers how the part drives GPIO `pin` from then on: at a level, or
+ * not at all. The chip takes the answer as of the cycle the levels were heard, before anything runs
+ * on, so a PIO block reads it on the next cycle of its own.
+ */
+struct PinAnswer
+    mask: u64
+    pin: u32
+    heard: &Fn(u64) -> Option[bool]
+
 /** What a board's parts watch of the chip's GPIOs (`part_watch`): which, what they last showed, and
- * each change since the parts last looked; and the parts that hear them as they change (`part_hook`),
- * and whether anything watches or hears at all, which is the one test the chip makes for them. It is
- * the board's, as the wires are: a reset of the chip keeps it.
+ * each change since the parts last looked; the parts that hear them as they change (`part_hook`) and
+ * those that answer on a GPIO (`part_answer`), and whether an answer has moved a GPIO the chip has not
+ * yet taken in; and whether anything watches or hears at all, which is the one test the chip makes for
+ * them. It is the board's, as the wires are: a reset of the chip keeps it.
  */
 struct PinWatch
     mask: u64
@@ -51,11 +65,28 @@ struct PinWatch
     driven: u64
     changes: Buf[PinChange]
     hooks: Buf[PinHook]
+    answers: Buf[PinAnswer]
     watching: bool
     hooked: bool
+    answered: bool
 
 /** Watching no GPIO. */
-pin_watch() -> PinWatch = PinWatch(0, 0, 0, buf(), buf(), false, false)
+pin_watch() -> PinWatch = PinWatch(0, 0, 0, buf(), buf(), buf(), false, false, false)
+
+/** Watching the GPIOs of `mask`, hearing and answering nothing. */
+private watching(mask: u64) -> PinWatch = PinWatch(mask, 0, 0, buf(), buf(), buf(), mask != 0, false, false)
+
+// Drive GPIO `n` from off the chip as `answer` says, in the chip's `driven` and `level` bits, and say
+// whether that changed either.
+private take_answer(driven: *u64, level: *u64, n: u32, answer: Option[bool]) -> bool
+    val bit = 1u64 << u64(n)
+    val (d, l) = answer match
+        Some(v) -> (*driven | bit, if v then *level | bit else *level & ~bit)
+        None -> (*driven & ~bit, *level)
+    if d == *driven && l == *level then return false
+    *driven = d
+    *level = l
+    true
 
 impl PinWatch
     // The watched GPIOs show `levels`, the chip driving `driven`, at `cycle`: a change is kept.
@@ -91,6 +122,10 @@ trait PartPins
     part_pwm(*self, n: u32) -> Option[(u64, u64)]
     /** Tell `h` what its GPIOs show now and each time they may have changed from now on. */
     part_hook(*self, h: PinHook)
+    /** Let `a` hear its GPIOs now and each time they may have changed from now on, and drive its GPIO as
+     * it answers.
+     */
+    part_answer(*self, a: PinAnswer)
     /** Put the part `p` on the chip's I2C lines, on the GPIOs it names. */
     part_i2c(*self, p: I2cPart)
 
@@ -105,12 +140,16 @@ impl Rp2350
             self.watch.note(cycle, levels, driven)
         if self.watch.hooked then self.tell_hooks()
 
-    // Each hook hears its GPIOs as they stand now.
+    // Each hook hears its GPIOs as they stand now, and each answer is taken; the caller settles a GPIO
+    // an answer moved (`answered`).
     @noinline
     private[chip] tell_hooks(*self)
         for h in self.watch.hooks
             val (levels, driven) = shown(h.mask, n -> self.pin(n))
             (h.heard)(levels, driven)
+        for a in self.watch.answers
+            val (levels, _) = shown(a.mask, n -> self.pin(n))
+            if take_answer(&self.outside_driven, &self.outside_level, a.pin, (a.heard)(levels)) then self.watch.answered = true
 
 impl Rp2040
     private[chip] note_pins(*self)
@@ -124,6 +163,9 @@ impl Rp2040
         for h in self.watch.hooks
             val (levels, driven) = shown(h.mask, n -> self.pin(n))
             (h.heard)(levels, driven)
+        for a in self.watch.answers
+            val (levels, _) = shown(a.mask, n -> self.pin(n))
+            if take_answer(&self.outside_driven, &self.outside_level, a.pin, (a.heard)(levels)) then self.watch.answered = true
 
 // The levels of `mask`'s GPIOs and the ones the chip drives, bit n for GPIO n, as `pin` gives each.
 private shown(mask: u64, pin: (u32) -> Pin) -> (u64, u64)
@@ -149,7 +191,7 @@ impl PartPins for Rp2350
     part_drive(*self, n: u32, level: Option[bool]) = self.drive_from_outside(n, level)
     part_analog(*self, input: u32, uv: Option[u32]) = self.set_analog(input, uv)
     part_watch(*self, mask: u64)
-        self.watch = PinWatch(mask, 0, 0, buf(), buf(), mask != 0, false)
+        self.watch = watching(mask)
         if mask != 0 then self.note_pins()
     // The PIO blocks catch up first, so what they gave the pins up to now is among the changes.
     part_changes(*self) -> Buf[PinChange]
@@ -163,6 +205,14 @@ impl PartPins for Rp2350
         self.watch.watching = true
         self.watch.hooked = true
         self.tell_hooks()
+        if self.watch.answered then self.settle_answers()
+    part_answer(*self, a: PinAnswer)
+        if self.pio.running then self.pio_catch_up()
+        self.watch.answers.push(a)
+        self.watch.watching = true
+        self.watch.hooked = true
+        self.tell_hooks()
+        if self.watch.answered then self.settle_answers()
     part_i2c(*self, p: I2cPart) = self.attach_i2c(p)
 
 impl PartPins for Rp2040
@@ -172,7 +222,7 @@ impl PartPins for Rp2040
     part_drive(*self, n: u32, level: Option[bool]) = self.drive_from_outside(n, level)
     part_analog(*self, input: u32, uv: Option[u32]) = self.set_analog(input, uv)
     part_watch(*self, mask: u64)
-        self.watch = PinWatch(mask, 0, 0, buf(), buf(), mask != 0, false)
+        self.watch = watching(mask)
         if mask != 0 then self.note_pins()
     part_changes(*self) -> Buf[PinChange]
         val all = self.watch.changes
@@ -184,6 +234,13 @@ impl PartPins for Rp2040
         self.watch.watching = true
         self.watch.hooked = true
         self.tell_hooks()
+        if self.watch.answered then self.settle_answers()
+    part_answer(*self, a: PinAnswer)
+        self.watch.answers.push(a)
+        self.watch.watching = true
+        self.watch.hooked = true
+        self.tell_hooks()
+        if self.watch.answered then self.settle_answers()
     part_i2c(*self, p: I2cPart) = self.attach_i2c(p)
 
 // ---------------------------------------------------------------------------------------------------
@@ -206,7 +263,7 @@ rp_parts_refusal(b: Board) -> Option[string]
     var clocks = 0
     for p in b.parts
         val model = part_model(p)
-        if pin_level(model) || model == "st7789" || model == "st7796" || model == "ssd1306" || model == "ws2812"
+        if pin_level(model) || model == "st7789" || model == "st7796" || model == "ssd1306" || model == "ws2812" || model == "cyw43439"
             if model == "led" then continue
             for w in p.wires
                 if model == "st7796" && w.port == "spi" then continue
@@ -284,9 +341,14 @@ impl RpRtc
         self.cycle = cycle
         self.hz = hz
 
+/** A CYW43439 of an RP board, on the GPIOs its terminals are wired to (`parts/cyw43`). */
+struct RpRadio
+    name: string
+    chip: &cyw43.Cyw43
+
 /** The parts of an RP board on its chip: each part's control as the window or a script sets it (as the
  * workbench's session keeps them), the displays its GPIOs drive, its buzzers, its SPI panels and OLEDs,
- * its I2C touch controllers and its real-time clocks.
+ * its I2C touch controllers, its real-time clocks and its radios.
  */
 struct RpParts
     parts: Buf[Part]
@@ -297,6 +359,7 @@ struct RpParts
     oleds: Buf[&virt.Oled]
     touches: Buf[RpTouch]
     rtcs: Buf[&RpRtc]
+    radios: Buf[RpRadio]
 
 /** The parts of `b`, which `rp_parts_refusal` has passed, every control at rest, on no chip yet. A
  * DS3231 whose `initial-time` is the host's, where the host's time cannot be read, starts from its
@@ -309,8 +372,12 @@ rp_parts(b: Board) -> RpParts
     var oleds: Buf[&virt.Oled] = buf()
     var touches: Buf[RpTouch] = buf()
     var rtcs: Buf[&RpRtc] = buf()
+    var radios: Buf[RpRadio] = buf()
     for p in b.parts
         inputs.push(virt.resting(p))
+        if part_model(p) == "cyw43439"
+            val w = cyw43.Wiring(radio_pin(p, "wl-on"), radio_pin(p, "data"), radio_pin(p, "cs"), radio_pin(p, "clock"))
+            radios.push(RpRadio(p.name, cyw43.cyw43(w)))
         virt.panel_of(b, p) match
             Some(panel) -> panels.push(panel)
             None -> ()
@@ -332,15 +399,23 @@ rp_parts(b: Board) -> RpParts
         val gain = real(part_whole(p, "gain", 12)) / 100.0
         buzzers.push(RpBuzzer(p.name, u32(pin), part_text(p, "kind", "passive") == "active", u64(part_whole(p, "tone", 4000)),
             gain, audio.synth(48000, 48000, gain), 0, false, false))
-    RpParts(b.parts, inputs, virt.displays_of(b), buzzers, panels, oleds, touches, rtcs)
+    RpParts(b.parts, inputs, virt.displays_of(b), buzzers, panels, oleds, touches, rtcs, radios)
 
 // An RP board's DS3231 counts nanoseconds.
 private const NANOSECOND_HZ: u64 = 1000000000
+
+// The GPIO a CYW43439's `terminal` is wired to, which `rp_parts_refusal` has seen is one of the chip's.
+private radio_pin(p: Part, terminal: string) -> u32 = u32(virt.terminal_pin(p, terminal))
 
 impl RpParts
     /** The part named `name`, if the board has it. */
     part(*self,name: string) -> Option[Part]
         for p in self.parts do if p.name == name then return Some(p)
+        None
+
+    /** The CYW43439 named `name`, if the board has it. */
+    radio(*self, name: string) -> Option[&cyw43.Cyw43]
+        for r in self.radios do if r.name == name then return Some(r.chip)
         None
 
     /** What the named part's control is doing; `Inert` for a part with none. */
@@ -419,8 +494,9 @@ private travel(at: int) -> int = if at < 0 then 0 elif at > virt.POSITION_MAX th
 
 /** Put the parts on chip `c`, a new board: it watches the pins the displays, WS2812s and buzzers are
  * wired to, each from power-on; each SPI panel and OLED, its controller fresh, hears its terminals'
- * GPIOs; each touch controller, booted, and each DS3231, its count running on from where it was, goes
- * on the I2C lines; and every control is put on its pins as it stands.
+ * GPIOs; each CYW43439, powered down, hears its terminals' GPIOs and answers on its data line; each
+ * touch controller, booted, and each DS3231, its count running on from where it was, goes on the I2C
+ * lines; and every control is put on its pins as it stands.
  */
 connect_parts[C: PartPins](ps: *RpParts, c: *C)
     var mask: u64 = 0
@@ -438,6 +514,12 @@ connect_parts[C: PartPins](ps: *RpParts, c: *C)
     for o in ps.oleds
         o.restart()
         c.part_hook(PinHook(port_mask(o.pins()), (levels, driven) -> o.hear(levels, driven)))
+    for r in ps.radios
+        val radio = r.chip
+        radio.restart()
+        val w = radio.wiring
+        val mask = (1u64 << u64(w.wl_on)) | (1u64 << u64(w.data)) | (1u64 << u64(w.cs)) | (1u64 << u64(w.clock))
+        c.part_answer(PinAnswer(mask, w.data, levels -> radio.hear(levels)))
     for t in ps.touches
         val model = t.model
         model.boot()

@@ -1,0 +1,134 @@
+module sh.sysl.benchtop.chip
+@tests
+
+// The Pico 2 W's CYW43439 on its chip (`parts/cyw43`, `chip/parts.sysl`): the radio hears GPIO 23, 24,
+// 25 and 29 and answers on GPIO 24 through a `PinAnswer`, so the SIO's GPIO_IN reads what it drives;
+// a radio wired to anything but the chip's GPIOs is refused by name; and examples/pico2w/blink.c, whose
+// first cyw43_arch call brings the radio up over the SDK's PIO gSPI program, runs until its first
+// control-channel message reaches function 2.
+
+import sh.sysl.benchtop.{library, load}
+import sh.sysl.parsing.source_of
+import sh.sysl.rp2350.io_bank0 as io
+import sh.sysl.rp2350.pads_bank0 as pads
+import sh.sysl.rp2350.resets as rr
+import sh.sysl.rp2350.sio as sio
+import sysl.fmt.hex
+import sysl.text.from_utf8_lossy
+
+private val BLINK_W = embed("../../../../examples/pico2w/blink.elf")
+private const MS: u64 = 150000
+private const SET: u32 = 0x2000
+private const CLR: u32 = 0x3000
+private const WL_ON: u32 = 23
+private const DATA: u32 = 24
+private const CS: u32 = 25
+private const CLOCK: u32 = 29
+
+private rd(c: *Rp2350, a: u32) -> u32 = c.read(0, a, 4).unwrap()
+private wr(c: *Rp2350, a: u32, x: u32) = c.write(0, a, 4, x).unwrap()
+
+// The SIO output `n` set to `high`.
+private out(c: *Rp2350, n: u32, high: bool) = wr(c, sio.BASE + (if high then sio.GPIO_OUT_SET_OFFSET else sio.GPIO_OUT_CLR_OFFSET), 1 << n)
+
+// A rising clock edge, then the falling one.
+private tick(c: *Rp2350)
+    out(c, CLOCK, true)
+    out(c, CLOCK, false)
+
+// The little-endian word of `f` at `i`.
+private le32(f: []const u8, i: usize) -> u32 = u32(f[i]) | (u32(f[i + 1]) << 8) | (u32(f[i + 2]) << 16) | (u32(f[i + 3]) << 24)
+
+// The level GPIO 24 reads through its pad, as the SIO's GPIO_IN has it.
+private data_in(c: *Rp2350) -> bool = rd(c, sio.BASE + sio.GPIO_IN_OFFSET) & (1 << DATA) != 0
+
+@test("the Pico 2 W's radio on its chip, bit-banged from the SIO: GPIO_IN reads the CYW43439's answer on GPIO 24, the test pattern in 16-bit words once WL_ON is high; with WL_ON low, or chip select high, it drives nothing")
+radio_on_the_sio()
+    var ps = rp_parts(described("pico2w").unwrap().0)
+    var c = rp2350()
+    connect_parts(&ps, &c)
+    val radio = ps.radio("wifi").unwrap()
+    assert(ps.radio("led").is_none())
+    wr(&c, rr.BASE + rr.RESET_OFFSET + CLR, rr.RESET_IO_BANK0_MASK | rr.RESET_PADS_BANK0_MASK)
+    for n in [WL_ON, DATA, CS, CLOCK]
+        wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + CLR, pads.GPIO0_OD_MASK | pads.GPIO0_ISO_MASK)
+        wr(&c, pads.BASE + pads.GPIO0_OFFSET + 4 * n + SET, pads.GPIO0_IE_MASK)
+        wr(&c, io.BASE + io.GPIO0_CTRL_OFFSET + 8 * n, io.GPIO0_CTRL_FUNCSEL_SIO_0)
+    out(&c, CS, true)
+    wr(&c, sio.BASE + sio.GPIO_OE_SET_OFFSET, (1 << WL_ON) | (1 << DATA) | (1 << CS) | (1 << CLOCK))
+    assert(!radio.powered)
+    out(&c, WL_ON, true)
+    assert(radio.powered)
+    // The command for a 4-byte read of the test register, in 16-bit words: its low half first.
+    val command: u32 = 0xA0044000
+    out(&c, CS, false)
+    for i in 0u32..<32
+        out(&c, DATA, (command >> (31 - i)) & 1 != 0)
+        tick(&c)
+    // The host lets the line go, then one rising edge brings the first bit.
+    wr(&c, sio.BASE + sio.GPIO_OE_CLR_OFFSET, 1 << DATA)
+    out(&c, CLOCK, true)
+    var w: u32 = 0
+    for _ in 0..<32
+        out(&c, CLOCK, false)
+        w = (w << 1) | (if data_in(&c) then 1 else 0)
+        out(&c, CLOCK, true)
+    out(&c, CLOCK, false)
+    assert(c.pin(DATA).level == data_in(&c))
+    out(&c, CS, true)
+    assert(w == 0xBEADFEED, s"0x${hex(w, 8)}")
+    assert(radio.transactions == 1)
+    // Chip select high, the radio lets the line go: GPIO 24 reads its pad's pull-down.
+    assert(!data_in(&c))
+    out(&c, WL_ON, false)
+    assert(!radio.powered && !data_in(&c))
+
+@test("a CYW43439 on an RP board whose terminal is wired to another part's port is refused by name; the Pico 2 W's own wiring is not")
+radio_refusals()
+    val text = "board { name = b, mcu = rp2350, parts { a { part = cyw43439, wire { wl-on = GP23, data = GP24, cs = GP25, clock = GP29 } }, " +
+        "b { part = cyw43439, wire { wl-on = a.gpio0, data = GP2, cs = GP3, clock = GP4 } } } }"
+    val got = load(source_of("b.hocon", text), library())
+    assert(!got.report.has_errors(), got.report.render(source_of("b.hocon", text)))
+    val why = rp_parts_refusal(got.description.board).unwrap()
+    assert(why == "`b.wl-on` is wired to `a.gpio0`, and on an rp2350 board a cyw43439's wires go to the chip's GPIOs", why)
+    assert(rp_parts_refusal(described("pico2w").unwrap().0).is_none())
+
+@test("examples/pico2w/blink.c on the Pico 2 W: its first cyw43_arch call brings the CYW43439 up over the SDK's PIO gSPI program, from the test pattern through the firmware and NVRAM upload to the WLAN core booted, until its first control-channel message, the CLM download's first clmload, reaches function 2")
+pico2w_bring_up()
+    val b = arm_board(arm_named("pico2w").unwrap().unwrap())
+    b.boot(BLINK_W).unwrap()
+    var ps = rp_parts(described("pico2w").unwrap().0)
+    connect_parts(&ps, &b.chip)
+    val radio = ps.radio("wifi").unwrap()
+    radio.record(true)
+    var end = RunEnd.Budget
+    while radio.frames.is_empty() && (end == RunEnd.Budget || end == RunEnd.Asleep) && b.chip.now < 2000 * MS do end = b.run(MS)
+    val text = from_utf8_lossy(b.console.view())
+    // On failure, the last transactions say how far the bring-up got.
+    var last = ""
+    val t = radio.transcript
+    for i in (if t.len() > 8 then t.len() - 8 else 0)..<t.len() do last = s"$last\n${t[i].line()}"
+    assert(!radio.frames.is_empty(), s"$end at ${b.chip.now / MS} ms, ${radio.transactions} transactions, core 0 at 0x${hex(b.cores[0].pc, 8)}: ${b.refused} $text$last")
+    assert(text.contains("pico2w blink"), text)
+    // The bus came up as cyw43_ll_bus_init brings it (cyw43_ll.c:1451–1489).
+    assert(t[0].line() == "R F0 0x00014 4 0xfeedbead", t[0].line())
+    assert(t[1].line() == "W F0 0x00000 4 0x000204b3", t[1].line())
+    assert(t[2].line() == "R F0 0x00000 4 0x000204b3", t[2].line())
+    assert(t[3].line() == "W F0 0x0001d 1 0x00000010", t[3].line())
+    // The firmware went up in 64-byte blocks (cyw43_ll.c:433–453), and it booted.
+    var blocks = 0
+    for x in t do if x.write && x.function == 1 && x.length == 64 then blocks += 1
+    assert(blocks * 64 > 200000, s"$blocks blocks")
+    assert(radio.booted())
+    // The first frame: an SDPCM header on the control channel (cyw43_ll.c:626–716), a BCDC ioctl header
+    // setting a variable (cyw43_ll.c:761–785), and the first CLM chunk's `clmload` (cyw43_ll.c:1351–1382).
+    val f = radio.frames[0]
+    val size = u32(f[0]) | (u32(f[1]) << 8)
+    assert((u32(f[2]) | (u32(f[3]) << 8)) == ~size & 0xFFFF, s"$f")
+    assert(f.len() == usize((size + 3) & ~3), s"${f.len()} bytes for an SDPCM size of $size")
+    assert(f[4] == 0 && f[5] == 0 && f[7] == 12, "sequence 0, the control channel, a 12-byte header")
+    assert(le32(f.view(), 12) == 263, s"cmd ${le32(f.view(), 12)}")
+    assert(le32(f.view(), 20) & 0xFFFF == 2, s"flags 0x${hex(le32(f.view(), 20), 8)}")
+    val name = from_utf8_lossy(f.view()[28..<35])
+    assert(name == "clmload" && f[35] == 0, name)
+    assert(f[36] & 2 != 0 && f[37] == 0x10, "DL_BEGIN, handler version 1")

@@ -347,7 +347,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 30 | **Boot path** (IMAGE_DEF and partitions; per Q2). | L | 6, 25, 26 |
 | 31 | **Non-secure TrustZone** (Q3 reopened). **Done** (below). | L | 2 |
 | 32 | **USB host mode** (per Q4). | L | 20 |
-| 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED). | L | 14 |
+| 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED), stage 1: init and the LED. **33a, the gSPI bus and the chip's bring-up, done** (below); 33b, the control channel and the LED, next. Stage 2, networking, is pending: Ethernet frames over F2 bridged to the Mac through libslirp, a fake access point; not scheduled. | L | 14 |
 | 34 | **POWMAN power states**: STATE, PWRUP0–3, CURRENT_PWRUP_REQ, LAST_SWCORE_PWRUP and BOOTDIS, the P1.x time skip (Q7) and the power-up boot as far as it needs no ROM. **Done** (below). | M | 27 |
 | 35 | **WFE latch and SEVONPEND**, on both Arm boards: a core asleep in `WFE` with nothing enabled latches every chip line that rises while it sleeps as pending in its NVIC, a pulse included, and SEVONPEND makes an interrupt's becoming pending an event. No speed loss. **Done** (below). | S | 6, 22 |
 
@@ -1894,3 +1894,56 @@ merged into this branch.
 
 **Cost:** the main lines do not enable HSTX, so `hstx_irq_due` answers None at its first test and the
 DMA's paths are unchanged for them; the train's bench of the five main lines covers it.
+
+### Item 33a, done: the CYW43439's gSPI bus and its bring-up
+
+`parts/cyw43/cyw43.sysl` is the Pico 2 W's radio as its host sees it: not the chip's firmware but the
+contract cyw43-driver depends on, each value the driver expects cited at its line in `cyw43_ll.c`,
+`cyw43_spi.h` or the SDK's `cyw43_bus_pio_spi.c` (the data sheet is not in the tree). It is a part of
+the `cyw43439` kind on four of the chip's GPIOs, so `boards/pico2w.hocon` loads and runs; the LED on
+`wifi.gpio0` stays dark until the control channel answers (33b).
+
+- **The bus**, driven by the SDK's own `spi_gap01_sample0` PIO program on GP23 (WL_ON), GP24 (data,
+  half-duplex), GP25 (CS) and GP29 (clock): WL_ON low holds the chip powered down and its rise powers
+  it up afresh; chip select low starts a transaction; the chip takes a bit at each rising edge, the
+  32-bit command first (write, increment, function, 17-bit address, 11-bit length); for a read it
+  drives a bit at each rising edge after the command and the host samples at the falling edge between.
+  A backplane read gives SPI_RESP_DELAY_F1's bytes of padding first. 16-bit word mode at power-up (a
+  value's low half first on the wire), 32-bit words (bytes in order) once the bus control register
+  says so.
+- **F0**, the bus registers: bus control, the response delays, the interrupt register cleared by
+  writing 1, the status (F2_RX_READY once the firmware runs), F1 and F2 info, the 0xFEEDBEAD test
+  register and the read/write test register.
+- **F1**, the backplane: the window registers placing 32 KB of it; the chip clock CSR, ALP available
+  once requested and HT once the firmware runs; the sleep CSR reading DEVICE_ON while KEEP_SDIO_ON is
+  set, as the driver's KSO wake reads back for; the 512 KB SOCSRAM keeping the firmware and NVRAM,
+  uninterpreted; the WLAN ARM core's and the SOCSRAM's IOCTRL and RESETCTRL, both cores starting in
+  reset; any other backplane register kept as written. The firmware **boots** when the WLAN core leaves
+  reset with only its clock enabled and an NVRAM length token sits at the top of RAM.
+- **F2**: each write is a frame to the firmware, kept in order (`Cyw43.frames`) for the control
+  channel to answer. Nothing answers yet, and the host-wake interrupt on GP24 is absent.
+- **The seam for a real board's trace**: `Cyw43.record(true)` keeps every transaction as a line,
+  `W F1 0x1000e 1 0x00000008`, to be set beside a logic-analyser decode of the real bus.
+
+A part answers on a GPIO through `chip.PinAnswer` (`PartPins.part_answer`): it hears its GPIOs where a
+hook does and says how it drives one of them, and the chip takes the answer as of the cycle it heard,
+so a PIO block reads the chip's bit on its next cycle. Two PIO fixes came with it, each with its test in
+`chip/pio_tests.sysl`: an instruction written to SMx_INSTR of a disabled state machine runs on the
+next cycle whatever its divider, so the SDK's PINCTRL / SET PINDIRS / PINCTRL sequence sets the pins it
+named; and such a machine refills its OSR by autopull for that instruction, so `put` then
+`out x, 32` loads X as the driver's transfers need.
+
+The oracle is the driver: `examples/pico2w/blink.c` (`pico_cyw43_arch_none`, built by
+`examples/pico2w/build.sh`) runs on `pico2w` until its first control-channel message reaches F2: the
+test pattern read in 16-bit words, the bus switched to 32-bit words, the firmware uploaded in 64-byte
+blocks, the WLAN core booted, then an SDPCM frame on the control channel carrying a BCDC
+`WLC_SET_VAR` of `clmload`, the first CLM chunk (`chip/cyw43_tests.sysl`, 2.5 s of host time). The
+register-level tests drive the pins as the PIO program does (`parts/cyw43/tests.sysl`), and the SIO
+bit-bangs a read on the chip, GPIO_IN reading the radio's answer.
+
+**Where 33b starts**: the first ioctl, `WLC_SET_VAR "clmload"`, lands in `Cyw43.frames[0]`; the driver
+then polls F0's interrupt and status registers for F2_PACKET_AVAILABLE and reads the response from F2,
+and the host-wake level on GP24 between transactions is its interrupt.
+
+**Cost**: a board with no answering part pays one more flag test in `gpio_changed`; the PIO's pin
+moves already told the hooks.

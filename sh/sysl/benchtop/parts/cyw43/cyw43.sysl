@@ -1,0 +1,478 @@
+module sh.sysl.benchtop.parts.cyw43
+
+// The Infineon CYW43439 of a Raspberry Pi Pico W or Pico 2 W, as its host sees it over gSPI: not the
+// chip's own firmware but the contract the open-source cyw43-driver (pico-sdk's `lib/cyw43-driver`)
+// depends on. A value that comes from what the driver expects, rather than from a register
+// description, cites the driver line that expects it: `cyw43_ll.c`, `cyw43_spi.h`, and the SDK's PIO
+// host `src/rp2_common/pico_cyw43_driver/cyw43_bus_pio_spi.c`.
+//
+// The bus. WL_ON low holds the chip powered down, and raising it powers it up afresh. Chip select low
+// starts a transaction, and the chip takes the data line at each rising clock edge, most significant
+// bit first. The first 32 bits are the command (cyw43_bus_pio_spi.c:371): write, increment, the
+// function (0 the bus's own registers, 1 the backplane, 2 WLAN data), a 17-bit address and an 11-bit
+// length in bytes, 0 meaning 2048. A write's payload follows it. For a read the chip drives the data
+// line from the next rising edge on, a bit an edge, and the host samples it at the falling edge
+// between (the SDK's `spi_gap01_sample0` program, cyw43_bus_pio_spi.pio, which the driver selects at
+// cyw43_bus_pio_spi.c:37). A backplane read gives the F1 response delay's bytes of padding first:
+// SPI_RESP_DELAY_F1, which the driver sets to the 16 bytes it skips (cyw43_ll.c:1471,
+// cyw43_bus_pio_spi.c:408). Chip select high ends the transaction and lets the line go.
+//
+// Words. In 32-bit word mode the wire carries bytes in order, each most significant bit first, and a
+// 32-bit value is its bytes least significant first: the host's DMA swaps the bytes of each word it
+// moves (cyw43_bus_pio_spi.c:265, 271). The chip powers up in 16-bit word mode, in which a 32-bit
+// value's low 16-bit half goes first, each half most significant bit first: what the driver's SWAP32
+// (a `rev16`, cyw43_bus_pio_spi.c:82–94, 391–448) and the DMA's swap make of it together. Setting
+// WORD_LENGTH_32 in the bus control register makes words 32 bits from the next transaction
+// (cyw43_ll.c:1433–1468).
+//
+// The backplane. A function-1 address of 0x10000 or above is one of the SDIO core's registers: the
+// backplane window, the chip clock CSR, the sleep CSR. Below it, the low 15 bits are an offset in the
+// 32 KB window the window registers place (cyw43_ll.c:349–393). The backplane holds the 512 KB SOCSRAM
+// at 0, which keeps the firmware and NVRAM the driver uploads, uninterpreted; the WLAN ARM core's and
+// the SOCSRAM's wrapper registers, IOCTRL and RESETCTRL, both cores starting in reset; and every other
+// backplane register, kept as written. The WLAN core let out of reset with only its clock enabled, with
+// an NVRAM length token at the top of RAM, is the firmware booted: the HT clock is available and
+// function 2 is ready to take a frame (cyw43_ll.c:1648–1711). A function-2 write is a frame to the
+// firmware, kept in order for whatever answers it.
+//
+// What is not here: the firmware's answers on the control channel, the host-wake interrupt on the data
+// line, Bluetooth, and the radio. The data sheet's reset values for the bus registers are not in this
+// tree: each starts at 0, the test registers aside, and the driver checks none of the ones it reads
+// back (cyw43_ll.c:1468).
+
+import sysl.buf.{Buf, buf, buf_filled}
+import sysl.fmt.hex
+
+/** The function that reaches the bus's own registers. */
+const BUS: u32 = 0
+/** The function that reaches the backplane. */
+const BACKPLANE: u32 = 1
+/** The function that carries frames to and from the firmware. */
+const WLAN: u32 = 2
+
+// The bus registers (cyw43_spi.h:46–60).
+const BUS_CONTROL: u32 = 0x00
+const INTERRUPT: u32 = 0x04
+const STATUS: u32 = 0x08
+const F1_INFO: u32 = 0x0C
+const F2_INFO: u32 = 0x0E
+const READ_TEST: u32 = 0x14
+const RW_TEST: u32 = 0x18
+const RESP_DELAY_F1: u32 = 0x1D
+
+/** What the read-only test register reads, which the driver polls for after power-up (cyw43_spi.h:43,
+ * cyw43_ll.c:1451).
+ */
+const TEST_PATTERN: u32 = 0xFEEDBEAD
+/** The bus control bit that makes words 32 bits (cyw43_spi.h:67). */
+const WORD_LENGTH_32: u8 = 0x01
+/** The status register's bit for function 2 ready to take a frame (cyw43_spi.h:109). */
+const STATUS_F2_RX_READY: u32 = 0x20
+/** A function's info register: enabled and ready (cyw43_spi.h:63–64). */
+const FUNCTION_READY: u32 = 0x03
+
+// The SDIO core's registers, function 1 at 0x10000 and up (cyw43_ll.c:132–138, 234).
+const SDIO_REGISTERS: u32 = 0x10000
+const WINDOW_LOW: u32 = 0x1000A
+const WINDOW_MID: u32 = 0x1000B
+const WINDOW_HIGH: u32 = 0x1000C
+const CHIP_CLOCK_CSR: u32 = 0x1000E
+const SLEEP_CSR: u32 = 0x1001F
+
+// The chip clock CSR (cyw43_ll.c:160–163, 238–241).
+const FORCE_ALP: u8 = 0x01
+const ALP_AVAIL_REQ: u8 = 0x08
+const ALP_AVAIL: u8 = 0x40
+const HT_AVAIL: u8 = 0x80
+// The sleep CSR (cyw43_ll.c:258–259): the device reports itself on while the host keeps the bus on,
+// which the driver reads back for (cyw43_ll.c:1260–1282).
+const KEEP_SDIO_ON: u8 = 0x01
+const DEVICE_ON: u8 = 0x02
+
+/** A function-1 address below 0x10000 is an offset of these bits in the window (cyw43_ll.c:147); the
+ * driver sets 0x8000 beside it to ask for a 32-bit access (cyw43_ll.c:150).
+ */
+const WINDOW_MASK: u32 = 0x7FFF
+
+/** The SOCSRAM's size; it is at backplane address 0 (cyw43_ll.c:64). */
+const RAM_SIZE: u32 = 512 * 1024
+
+// The cores' wrapper registers (cyw43_ll.c:145–148, 165–170).
+const WLAN_WRAPPER: u32 = 0x18103000
+const SOCSRAM_WRAPPER: u32 = 0x18104000
+const IOCTRL: u32 = 0x408
+const RESETCTRL: u32 = 0x800
+const SICF_CLOCK_EN: u8 = 0x01
+const SICF_FGC: u8 = 0x02
+const SICF_CPUHALT: u8 = 0x20
+const AIRC_RESET: u8 = 0x01
+
+/** The GPIOs the chip's terminals are wired to: WL_ON, its power; the half-duplex data line; chip
+ * select; and the clock.
+ */
+struct Wiring
+    wl_on: u32
+    data: u32
+    cs: u32
+    clock: u32
+
+/** A transaction as the transcript keeps it: a write or a read, its function, the command's address
+ * and length, and the first four bytes of the payload, least significant first; a read's, after the
+ * padding. A board's own gSPI trace can be set beside it, a line each.
+ */
+struct Transaction
+    write: bool
+    function: u32
+    address: u32
+    length: u32
+    first: u32
+
+impl Transaction
+    /** The transaction as one line: `W F1 0x1000e 1 0x00000008`. */
+    line(self) -> string
+        val kind = if self.write then "W" else "R"
+        s"$kind F${self.function} 0x${hex(self.address, 5)} ${self.length} 0x${hex(self.first, 8)}"
+
+/** A backplane core's wrapper: its IO control (clock enable, forced gated clocks, halt) and its reset. */
+struct Core
+    ioctrl: u8
+    resetctrl: u8
+
+/** A word of the backplane outside the RAM and the cores' wrappers, as last written. */
+struct Word
+    address: u32
+    value: u32
+
+/** Where a transaction stands. */
+enum Phase
+    // Not selected, or not powered.
+    Idle
+    // Taking the 32-bit command.
+    Command
+    // Taking a write's payload.
+    Writing
+    // Driving a read's response.
+    Reading
+end Phase
+
+/** The chip: its wiring and the pins as it last heard them; the transaction on the bus; its bus
+ * registers, the SDIO core's, the backplane's cores, RAM and other registers; the frames the host has
+ * written to function 2; and the transactions, counted, and kept in `transcript` while `recording`.
+ */
+struct Cyw43
+    wiring: Wiring
+    powered: bool
+    selected: bool
+    clock: bool
+    phase: Phase
+    // The bits taken or given of the word on the wire, and the word.
+    bits: u32
+    word: u32
+    // Whether this transaction's words are 32 bits, as the bus control register said when it began.
+    wide: bool
+    // The command, and how far it has gone: payload bytes handled and the address reached.
+    write: bool
+    increment: bool
+    function: u32
+    address: u32
+    length: u32
+    count: u32
+    at: u32
+    first: u32
+    // A read's response, padding first, the bits of it given, and the level on the data line.
+    response: Buf[u8]
+    given: u32
+    out: bool
+    bus: [32]u8
+    sdio: [32]u8
+    alp: bool
+    wlan: Core
+    socsram: Core
+    ram: Buf[u8]
+    words: Buf[Word]
+    frame: Buf[u8]
+    frames: Buf[Buf[u8]]
+    recording: bool
+    transcript: Buf[Transaction]
+    transactions: u64
+
+/** The chip wired as `w`, powered down. */
+cyw43(w: Wiring) -> &Cyw43
+    val c: &Cyw43 = Cyw43(w, false, false, false, Phase.Idle, 0, 0, false, false, false, 0, 0, 0, 0, 0, 0, buf(), 0, false,
+        [0; 32], [0; 32], false, Core(0, AIRC_RESET), Core(0, AIRC_RESET), buf(), buf(), buf(), buf(), false, buf(), 0)
+    c
+
+impl Cyw43
+    /** A new board: powered down, nothing on the bus, nothing counted or kept. */
+    restart(*self)
+        self.powered = false
+        self.selected = false
+        self.clock = false
+        self.reset()
+        self.transcript = buf()
+        self.transactions = 0
+
+    /** The GPIOs at `levels`, bit n for GPIO n: the chip hears its wires, and answers how it drives its
+     * data line from now on: at a level while it gives a read's response, and not at all otherwise.
+     */
+    hear(*self, levels: u64) -> Option[bool]
+        val w = self.wiring
+        val on = high(levels, w.wl_on)
+        if on != self.powered
+            self.powered = on
+            self.selected = false
+            self.clock = high(levels, w.clock)
+            self.reset()
+        if !on then return None
+        val selected = !high(levels, w.cs)
+        if selected != self.selected
+            self.selected = selected
+            if selected then self.begin() else self.finish()
+        val clock = high(levels, w.clock)
+        val rising = clock && !self.clock
+        self.clock = clock
+        if selected && rising then self.edge(high(levels, w.data))
+        if self.phase == Phase.Reading then Some(self.out) else None
+
+    /** Keep each transaction in the transcript from now on, or stop. */
+    record(*self, on: bool)
+        self.recording = on
+
+    /** The status register: function 2 ready to take a frame once the firmware has booted. */
+    status(*self) -> u32 = if self.booted() then STATUS_F2_RX_READY else 0
+
+    /** Whether the firmware runs: the WLAN core out of reset with its clock enabled, neither forced nor
+     * halted (the last write of reset_device_core, cyw43_ll.c:1222–1232, 1655), and an NVRAM length
+     * token at the top of RAM, the word count below its complement (cyw43_ll.c:1652–1653).
+     */
+    booted(*self) -> bool
+        if !self.powered || self.wlan.resetctrl & AIRC_RESET != 0 then return false
+        if self.wlan.ioctrl & (SICF_CLOCK_EN | SICF_FGC | SICF_CPUHALT) != SICF_CLOCK_EN then return false
+        val token = self.ram_word(RAM_SIZE - 4)
+        token & 0xFFFF != 0 && (token >> 16) == (~token & 0xFFFF)
+
+    /** The little-endian word of RAM at `a`; 0 while powered down. */
+    ram_word(*self, a: u32) -> u32
+        var v: u32 = 0
+        for k in 0u32..<4 do v |= u32(self.ram_byte(a + k)) << (8 * k)
+        v
+
+    /** The byte of RAM at `a`; 0 while powered down. */
+    ram_byte(*self, a: u32) -> u8 = if usize(a) < self.ram.len() then self.ram[usize(a)] else 0
+
+    // Power up or down: nothing on the bus, the bus registers in 16-bit mode, the window at 0, the
+    // cores in reset, the RAM clear, no frames.
+    private reset(*self)
+        self.phase = Phase.Idle
+        self.bits = 0
+        self.word = 0
+        self.response = buf()
+        self.given = 0
+        self.out = false
+        self.bus = [0; 32]
+        self.sdio = [0; 32]
+        self.alp = false
+        self.wlan = Core(0, AIRC_RESET)
+        self.socsram = Core(0, AIRC_RESET)
+        self.ram = if self.powered then buf_filled(usize(RAM_SIZE), u8(0)) else buf()
+        self.words = buf()
+        self.frame = buf()
+        self.frames = buf()
+
+    // Chip select falls: a transaction starts with its command, in the word length set now.
+    private begin(*self)
+        self.phase = Phase.Command
+        self.bits = 0
+        self.word = 0
+        self.wide = self.bus[BUS_CONTROL] & WORD_LENGTH_32 != 0
+
+    // Chip select rises: the transaction ends, a frame written to function 2 goes to the firmware, and
+    // the transaction is counted and kept.
+    private finish(*self)
+        if self.phase == Phase.Writing || self.phase == Phase.Reading
+            if self.write && self.function == WLAN
+                self.frames.push(self.frame)
+                self.frame = buf()
+            self.transactions += 1
+            if self.recording then self.transcript.push(Transaction(self.write, self.function, self.address, self.length, self.first))
+        self.phase = Phase.Idle
+
+    // A rising clock edge with chip select low, the data line at `bit`: a bit given, or one taken.
+    private edge(*self, bit: bool)
+        if self.phase == Phase.Reading
+            self.out = self.next_bit()
+            return
+        self.word = (self.word << 1) | (if bit then 1 else 0)
+        self.bits += 1
+        if self.bits < 32 then return
+        self.bits = 0
+        val value = on_wire(self.wide, self.word)
+        if self.phase == Phase.Command then self.command(value) else self.take(value)
+
+    // The command `c`: a write takes its payload from here; a read's response is gathered at once.
+    private command(*self, c: u32)
+        self.write = c >> 31 != 0
+        self.increment = (c >> 30) & 1 != 0
+        self.function = (c >> 28) & 3
+        self.address = (c >> 11) & 0x1FFFF
+        self.length = if c & 0x7FF == 0 then 2048 else c & 0x7FF
+        self.count = 0
+        self.at = self.address
+        self.first = 0
+        if self.write
+            self.phase = Phase.Writing
+            return
+        self.response = buf()
+        val pad = if self.function == BACKPLANE then u32(self.bus[RESP_DELAY_F1]) else 0
+        for _ in 0..<pad do self.response.push(0)
+        for i in 0..<self.length
+            val b = self.read_byte(self.at)
+            if i < 4 then self.first |= u32(b) << (8 * i)
+            self.response.push(b)
+            if self.increment then self.at += 1
+        self.given = 0
+        self.phase = Phase.Reading
+
+    // The response's next bit, each word on the wire most significant bit first.
+    private next_bit(*self) -> bool
+        if self.given % 32 == 0 then self.word = self.wire_word(self.given / 8)
+        val bit = (self.word >> (31 - self.given % 32)) & 1 != 0
+        self.given += 1
+        bit
+
+    // The response's 32-bit word from byte `i` on, as the wire carries it; zeros past its end.
+    private wire_word(*self, i: u32) -> u32
+        var v: u32 = 0
+        for k in 0u32..<4
+            val j = usize(i + k)
+            if j < self.response.len() then v |= u32(self.response[j]) << (8 * k)
+        on_wire(self.wide, v)
+
+    // A word of a write's payload: each byte, least significant first, to the command's address, up to
+    // the command's length; the rest of the word is padding.
+    private take(*self, value: u32)
+        for k in 0u32..<4
+            if self.count >= self.length then return
+            val b = byte_of(value, k)
+            if self.count < 4 then self.first |= u32(b) << (8 * self.count)
+            self.write_byte(self.at, b)
+            self.count += 1
+            if self.increment then self.at += 1
+
+    // The byte at address `a` of the command's function.
+    private read_byte(*self, a: u32) -> u8
+        if self.function == BUS then return self.bus_byte(a)
+        if self.function != BACKPLANE then return 0
+        if a >= SDIO_REGISTERS then return self.sdio_byte(a)
+        self.backplane_byte(self.window() | (a & WINDOW_MASK))
+
+    // Byte `b` to address `a` of the command's function; a function-2 byte joins the frame.
+    private write_byte(*self, a: u32, b: u8)
+        if self.function == BUS then return self.write_bus(a, b)
+        if self.function == WLAN then return self.frame.push(b)
+        if self.function != BACKPLANE then return
+        if a >= SDIO_REGISTERS then self.write_sdio(a, b) else self.write_backplane(self.window() | (a & WINDOW_MASK), b)
+
+    // A byte of the bus registers: the status and the functions' info as the chip stands, the test
+    // pattern fixed, the rest as written.
+    private bus_byte(*self, a: u32) -> u8
+        if a >= 32 then return 0
+        if a >= STATUS && a < STATUS + 4 then return byte_of(self.status(), a - STATUS)
+        if a >= F1_INFO && a < F1_INFO + 2 then return byte_of(FUNCTION_READY, a - F1_INFO)
+        if a >= F2_INFO && a < F2_INFO + 2 then return byte_of(if self.booted() then FUNCTION_READY else 0, a - F2_INFO)
+        if a >= READ_TEST && a < READ_TEST + 4 then return byte_of(TEST_PATTERN, a - READ_TEST)
+        self.bus[a]
+
+    // A byte written to the bus registers: the interrupt register's bits are cleared by writing 1
+    // (cyw43_spi.h:84–91, cyw43_ll.c:1476); the status, the info and the test pattern are read-only.
+    private write_bus(*self, a: u32, b: u8)
+        if a >= 32 then return
+        if a == INTERRUPT || a == INTERRUPT + 1
+            self.bus[a] &= ~b
+            return
+        if a >= STATUS && a < RW_TEST then return
+        self.bus[a] = b
+
+    // A byte of the SDIO core's registers: the chip clock CSR with the clocks the chip has available,
+    // the sleep CSR with the device on while the bus is kept on, the rest as written.
+    private sdio_byte(*self, a: u32) -> u8
+        val r = a - SDIO_REGISTERS
+        if r >= 32 then return 0
+        val v = self.sdio[r]
+        if a == CHIP_CLOCK_CSR
+            var csr = v
+            if self.alp then csr |= ALP_AVAIL
+            if self.booted() then csr |= HT_AVAIL
+            return csr
+        if a == SLEEP_CSR && v & KEEP_SDIO_ON != 0 then return v | DEVICE_ON
+        v
+
+    // A byte written to the SDIO core's registers. The chip clock CSR's available bits are the chip's to
+    // say, and a request for the ALP clock is granted at once (cyw43_ll.c:1583–1609).
+    private write_sdio(*self, a: u32, b: u8)
+        val r = a - SDIO_REGISTERS
+        if r >= 32 then return
+        if a == CHIP_CLOCK_CSR
+            self.sdio[r] = b & ~(ALP_AVAIL | HT_AVAIL)
+            if b & (ALP_AVAIL_REQ | FORCE_ALP) != 0 then self.alp = true
+            return
+        self.sdio[r] = if a == SLEEP_CSR then b & ~DEVICE_ON else b
+
+    /** The backplane address the window starts at, from its three registers (cyw43_ll.c:349–364). */
+    window(*self) -> u32
+        val high = u32(self.sdio[WINDOW_HIGH - SDIO_REGISTERS]) << 24
+        val mid = u32(self.sdio[WINDOW_MID - SDIO_REGISTERS]) << 16
+        val low = u32(self.sdio[WINDOW_LOW - SDIO_REGISTERS]) << 8
+        (high | mid | low) & ~WINDOW_MASK
+
+    // The byte at backplane address `a`.
+    private backplane_byte(*self, a: u32) -> u8
+        if a < RAM_SIZE then return self.ram_byte(a)
+        if a == WLAN_WRAPPER + IOCTRL then return self.wlan.ioctrl
+        if a == WLAN_WRAPPER + RESETCTRL then return self.wlan.resetctrl
+        if a == SOCSRAM_WRAPPER + IOCTRL then return self.socsram.ioctrl
+        if a == SOCSRAM_WRAPPER + RESETCTRL then return self.socsram.resetctrl
+        for w in self.words do if w.address == a & ~3 then return byte_of(w.value, a & 3)
+        0
+
+    // Byte `b` to backplane address `a`.
+    private write_backplane(*self, a: u32, b: u8)
+        if a < RAM_SIZE
+            if usize(a) < self.ram.len() then self.ram[usize(a)] = b
+            return
+        if a == WLAN_WRAPPER + IOCTRL
+            self.wlan.ioctrl = b
+            return
+        if a == WLAN_WRAPPER + RESETCTRL
+            self.wlan.resetctrl = b
+            return
+        if a == SOCSRAM_WRAPPER + IOCTRL
+            self.socsram.ioctrl = b
+            return
+        if a == SOCSRAM_WRAPPER + RESETCTRL
+            self.socsram.resetctrl = b
+            return
+        self.write_word_byte(a, b)
+
+    // Byte `b` into the backplane word that holds address `a`.
+    private write_word_byte(*self, a: u32, b: u8)
+        val shift = 8 * (a & 3)
+        for i in 0..<self.words.len()
+            var w = self.words[i]
+            if w.address != a & ~3 then continue
+            w.value = (w.value & ~(0xFFu32 << shift)) | (u32(b) << shift)
+            self.words[i] = w
+            return
+        self.words.push(Word(a & ~3, u32(b) << shift))
+
+// Whether GPIO `n` is high in `levels`.
+private high(levels: u64, n: u32) -> bool = (levels >> u64(n)) & 1 != 0
+
+// Byte `i` of `v`, least significant first.
+private byte_of(v: u32, i: u32) -> u8 = u8.wrap(v >> (8 * i))
+
+/** The 32-bit value `v` as the wire carries it, most significant bit first, in 32-bit words (`wide`):
+ * its bytes least significant first; or in 16-bit words: its low half first. The same turns a word off
+ * the wire back into its value.
+ */
+on_wire(wide: bool, v: u32) -> u32 = if wide then v.swap_bytes() else v.rotate_left(16)
