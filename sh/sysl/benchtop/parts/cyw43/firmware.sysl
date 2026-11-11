@@ -1,0 +1,320 @@
+module sh.sysl.benchtop.parts.cyw43
+
+// The CYW43439's firmware as its host sees it over function 2: the SDPCM frames cyw43-driver writes and
+// reads, and the answers to the BCDC ioctls on the control channel. Not the firmware itself, which the
+// driver uploads to RAM and which stays uninterpreted there, but the replies `cyw43_ll.c` parses.
+//
+// Frames. A frame starts with a 12-byte SDPCM header (cyw43_ll.c:626–636): its size and the size's
+// complement, a sequence number, the channel (control 0, event 1, data 2) in the low four bits of the
+// next byte, the header's length, a flow-control byte and the bus-data credit. The host's frames are
+// taken in the order of their sequence numbers. Each answer carries a credit `CREDIT_WINDOW` past the
+// sequence of the frame it answers: the driver sends while its last credit differs from its next
+// sequence number (cyw43_ll.c:649–651) and takes a credit no more than 20 ahead (cyw43_ll.c:843–848).
+//
+// The control channel. After the SDPCM header a control frame has a 16-byte BCDC header
+// (cyw43_ll.c:719–724): the command, the payload's length, flags holding the request's id in the high
+// half and its kind (get 0, set 2) and interface below it (cyw43_ll.c:184–189, 766–768), and a status.
+// The answer repeats the command, the length and the flags, whose id the driver matches against its
+// last request (cyw43_ll.c:870–875), and carries a payload as long as the request's: for a get, the
+// value at its start, which the driver copies back over its request (cyw43_ll.c:1171–1172); for a set,
+// the request as sent.
+//
+// What is answered is what the driver sends to bring the chip up, switch the radio on, set its power
+// management and drive its GPIOs (cyw43_ll.c:1351–1394, 1767–1790, 1843–1927, 1979–2021, 2346–2373):
+// the CLM download (`clmload` in chunks, then `clmload_status`, 0 once a download has run from its
+// DL_BEGIN chunk to its DL_END one); `cur_etheraddr`, a fixed locally administered MAC address,
+// 02:43:57:43:43:39, until the host sets another; `clmver`; the settings `bus:txglom`, `apsta`,
+// `ampdu_ba_wsize`, `ampdu_mpdu`, `ampdu_rx_factor`, `country`, `bsscfg:event_msgs`, `pm2_sleep_ret`,
+// `bcn_li_bcn`, `bcn_li_dtim` and `assoc_listen`, each kept as set and read back as kept; `gpioout`,
+// a mask and a value, which drives the chip's GPIOs, and `ccgpioin`, which reads them; and the ioctls
+// WLC_UP, WLC_GET_ANTDIV / WLC_SET_ANTDIV, WLC_GET_PM / WLC_SET_PM, WLC_SET_GMODE and WLC_SET_BAND.
+//
+// Anything else is refused by name, kept in `refused` for the board to report: another command or
+// variable, a frame on the event or data channel, a frame out of sequence or whose header does not
+// hold together. A refused ioctl is still answered, with the BCDC error flag and BCME_UNSUPPORTED (-23)
+// as a chip that does not support it answers, so the driver goes on; a refused frame is not answered.
+// No events are sent, and the data channel, the radio's network side, is not here.
+
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+
+/** The SDPCM channels (cyw43_ll.c:180–182). */
+const CHANNEL_CONTROL: u8 = 0
+const CHANNEL_EVENT: u8 = 1
+const CHANNEL_DATA: u8 = 2
+
+/** The SDPCM header's length (cyw43_ll.c:626–636), and the BCDC ioctl header's (cyw43_ll.c:719–724). */
+const SDPCM_HEADER: usize = 12
+const IOCTL_HEADER: usize = 16
+
+/** How many frames past the one it answers an answer's credit lets the host send. */
+const CREDIT_WINDOW: u32 = 8
+
+/** The BCDC flags' kind bit for a set (cyw43_ll.c:189), and the error bit an answer carries. */
+const IOC_SET: u32 = 2
+const IOC_ERROR: u32 = 1
+/** The status of an ioctl the firmware does not support, BCME_UNSUPPORTED. */
+const UNSUPPORTED: u32 = 0xFFFFFFE9
+
+// The ioctl commands the driver sends (cyw43_ll.c:191–211).
+const WLC_UP: u32 = 2
+const WLC_GET_ANTDIV: u32 = 63
+const WLC_SET_ANTDIV: u32 = 64
+const WLC_GET_PM: u32 = 85
+const WLC_SET_PM: u32 = 86
+const WLC_SET_GMODE: u32 = 110
+const WLC_SET_BAND: u32 = 142
+const WLC_GET_VAR: u32 = 262
+const WLC_SET_VAR: u32 = 263
+
+// The CLM download's chunk flags (cyw43_ll.c:1360–1366).
+const DL_BEGIN: u32 = 0x2
+const DL_END: u32 = 0x4
+
+/** The MAC address `cur_etheraddr` reads until the host sets one: locally administered, fixed. */
+val MAC: [6]u8 =[0x02, 0x43, 0x57, 0x43, 0x43, 0x39]
+
+/** What `clmver` reads. */
+const CLM_VERSION = "benchtop CYW43439 model"
+
+/** A variable as the host last set it. */
+struct Var
+    name: string
+    value: Buf[u8]
+
+/** An ioctl setting as the host last set it, by its set command. */
+struct Setting
+    command: u32
+    value: u32
+
+/** The firmware's side of the control channel: the sequence number the host's next frame carries and
+ * the one the firmware's next frame carries; the CLM download, running and done, and its bytes; whether
+ * the host has brought the interface up; the MAC address; the GPIOs' levels, bit n for GPIO n; the
+ * variables and ioctl settings as set; and what it has refused, with how many of those the board has
+ * reported.
+ */
+struct Firmware
+    expected: u8
+    sequence: u8
+    clm_loading: bool
+    clm_loaded: bool
+    clm_bytes: u32
+    up: bool
+    mac: [6]u8
+    gpio: u32
+    vars: Buf[Var]
+    settings: Buf[Setting]
+    refused: Buf[string]
+    noted: usize
+
+/** The firmware as it starts: nothing taken, the CLM not loaded, the GPIOs low. */
+firmware() -> Firmware = Firmware(0, 0, false, false, 0, false, MAC, 0, buf(), buf(), buf(), 0)
+
+impl Firmware
+    /** The answer to frame `f` from the host, or None where it has none: a frame it refuses. */
+    take(*self, f: []const u8) -> Option[Buf[u8]]
+        if f.len < SDPCM_HEADER then return self.refuse_frame(s"a function-2 frame of ${f.len} bytes, shorter than its SDPCM header")
+        val size = le16(f, 0)
+        if size != ~le16(f, 2) & 0xFFFF then return self.refuse_frame(s"an SDPCM frame whose size $size its complement contradicts")
+        val sequence = f[4]
+        if sequence != self.expected then return self.refuse_frame(s"an SDPCM frame with sequence $sequence where ${self.expected} was due")
+        self.expected = u8.wrap(u32(sequence) + 1)
+        val channel = f[5] & 0x0F
+        if channel != CHANNEL_CONTROL then return self.refuse_frame(s"an SDPCM frame on the ${channel_name(channel)} channel")
+        val at = usize(f[7])
+        if usize(size) > f.len || usize(size) < at + IOCTL_HEADER then return self.refuse_frame(s"a control frame of $size bytes, too short for its BCDC header")
+        val command = le32(f, at)
+        val length = le32(f, at + 4)
+        val flags = le32(f, at + 8)
+        val start = at + IOCTL_HEADER
+        val end = usize(size).min(start + usize(length & 0xFFFF))
+        Some(self.ioctl(sequence, command, length, flags, f[start..<end]))
+
+    /** Whether the chip's GPIO `n` is high. */
+    gpio_high(*self, n: u32) -> bool = n < 32 && (self.gpio >> n) & 1 != 0
+
+    /** The next refusal the board has not reported, once. */
+    take_note(*self) -> Option[string]
+        if self.noted >= self.refused.len() then return None
+        self.noted += 1
+        Some(self.refused[self.noted - 1])
+
+    // Frame `why` refused, and not answered.
+    private refuse_frame(*self, why: string) -> Option[Buf[u8]]
+        self.refused.push(s"benchtop's CYW43439 does not take $why")
+        None
+
+    // The answer to the ioctl `command` of the host's frame `sequence`, its length and flags as sent,
+    // with `payload`: the value or the request echoed, or the refusal's error.
+    private ioctl(*self, sequence: u8, command: u32, length: u32, flags: u32, payload: []const u8) -> Buf[u8]
+        val got = if command == WLC_GET_VAR || command == WLC_SET_VAR then self.iovar(command == WLC_SET_VAR, payload) else self.command(command, payload)
+        got match
+            Ok(value) -> answer(sequence, self.next(), command, length, flags, 0, value.view(), payload.len)
+            Err(what) ->
+                self.refused.push(s"benchtop's CYW43439 does not answer $what")
+                answer(sequence, self.next(), command, length, flags | IOC_ERROR, UNSUPPORTED, [], payload.len)
+
+    // The sequence number of the firmware's next frame.
+    private next(*self) -> u8
+        val s = self.sequence
+        self.sequence = u8.wrap(u32(s) + 1)
+        s
+
+    // A variable got or set, its name and value in `payload`: the value got, or the request echoed.
+    private iovar(*self, set: bool, payload: []const u8) -> Result[Buf[u8], string]
+        val name = c_name(payload)
+        val arg = payload[payload.len.min(name.bytes.len + 1)..]
+        if !set then return self.get_var(name)
+        if name == "clmload"
+            self.clmload(arg)?
+        else if name == "gpioout"
+            if arg.len < 8 then return Err(s"`gpioout` with ${arg.len} bytes, short of its mask and value")
+            val mask = le32(arg, 0)
+            self.gpio = (self.gpio & ~mask) | (le32(arg, 4) & mask)
+        else if name == "cur_etheraddr"
+            if arg.len < 6 then return Err(s"`cur_etheraddr` with ${arg.len} bytes, short of an address")
+            for i in 0..<6 do self.mac[i] = arg[i]
+        else if setting(name)
+            self.keep(name, arg)
+        else
+            return Err(s"the iovar `$name` (WLC_SET_VAR)")
+        Ok(bytes(payload))
+
+    // The value of the variable `name`.
+    private get_var(*self, name: string) -> Result[Buf[u8], string]
+        if name == "clmload_status" then return Ok(word(if self.clm_loaded then 0 else 1))
+        if name == "cur_etheraddr" then return Ok(bytes(self.mac))
+        if name == "ccgpioin" then return Ok(word(self.gpio))
+        if name == "clmver"
+            var v = bytes(CLM_VERSION.bytes)
+            v.push(0)
+            return Ok(v)
+        if !setting(name) then return Err(s"the iovar `$name` (WLC_GET_VAR)")
+        for v in self.vars do if v.name == name then return Ok(bytes(v.value.view()))
+        Ok(buf())
+
+    // A CLM chunk (cyw43_ll.c:1368–1377): its flags, its type, its length and its data. DL_BEGIN starts
+    // a download, and DL_END ends the one running, done.
+    private clmload(*self, arg: []const u8) -> Result[unit, string]
+        if arg.len < 12 then return Err(s"a `clmload` chunk of ${arg.len} bytes, short of its header")
+        val flags = le16(arg, 0)
+        val length = le32(arg, 4)
+        if flags & DL_BEGIN != 0
+            self.clm_loading = true
+            self.clm_loaded = false
+            self.clm_bytes = 0
+        if !self.clm_loading then return Err("a `clmload` chunk with no DL_BEGIN before it")
+        self.clm_bytes += length
+        if flags & DL_END != 0
+            self.clm_loading = false
+            self.clm_loaded = true
+        Ok(())
+
+    // Variable `name` set to `value`.
+    private keep(*self, name: string, value: []const u8)
+        for i in 0..<self.vars.len()
+            if self.vars[i].name != name then continue
+            self.vars[i] = Var(name, bytes(value))
+            return
+        self.vars.push(Var(name, bytes(value)))
+
+    // An ioctl other than a variable's: the value got, or the request echoed.
+    private command(*self, command: u32, payload: []const u8) -> Result[Buf[u8], string]
+        if command == WLC_UP
+            self.up = true
+            return Ok(bytes(payload))
+        if command == WLC_GET_ANTDIV || command == WLC_GET_PM
+            for s in self.settings do if s.command == command + 1 then return Ok(word(s.value))
+            return Ok(word(0))
+        val settable = command == WLC_SET_ANTDIV || command == WLC_SET_PM || command == WLC_SET_GMODE || command == WLC_SET_BAND
+        if !settable then return Err(s"the ioctl ${ioctl_name(command)}")
+        if payload.len < 4 then return Err(s"${ioctl_name(command)} with ${payload.len} bytes, short of its value")
+        val value = le32(payload, 0)
+        for i in 0..<self.settings.len()
+            if self.settings[i].command != command then continue
+            self.settings[i] = Setting(command, value)
+            return Ok(bytes(payload))
+        self.settings.push(Setting(command, value))
+        Ok(bytes(payload))
+
+/** An answer on the control channel, the firmware's frame `sequence`, to the host's frame `to`: the
+ * command, length and flags of the request, a status, and `value` at the start of a payload as long as
+ * the request's `room`.
+ */
+answer(to: u8, sequence: u8, command: u32, length: u32, flags: u32, status: u32, value: []const u8, room: usize) -> Buf[u8]
+    val size = u32(SDPCM_HEADER + IOCTL_HEADER + room)
+    var f: Buf[u8] = buf()
+    put16(&f, size)
+    put16(&f, ~size & 0xFFFF)
+    f.extend([sequence, CHANNEL_CONTROL, 0, u8(SDPCM_HEADER), 0, u8.wrap(u32(to) + CREDIT_WINDOW), 0, 0])
+    put32(&f, command)
+    put32(&f, length)
+    put32(&f, flags)
+    put32(&f, status)
+    for i in 0..<room do f.push(if i < value.len then value[i] else 0)
+    f
+
+// The variables kept as the host sets them and read back as kept.
+private setting(name: string) -> bool = name match
+    "bus:txglom" | "apsta" | "ampdu_ba_wsize" | "ampdu_mpdu" | "ampdu_rx_factor" | "country" | "bsscfg:event_msgs" -> true
+    "pm2_sleep_ret" | "bcn_li_bcn" | "bcn_li_dtim" | "assoc_listen" -> true
+    _ -> false
+
+// An ioctl command by the name cyw43-driver gives it (cyw43_ll.c:191–211), with its number.
+private ioctl_name(command: u32) -> string
+    val name = command match
+        2 -> "WLC_UP"
+        20 -> "WLC_SET_INFRA"
+        22 -> "WLC_SET_AUTH"
+        23 -> "WLC_GET_BSSID"
+        25 -> "WLC_GET_SSID"
+        26 -> "WLC_SET_SSID"
+        30 -> "WLC_SET_CHANNEL"
+        52 -> "WLC_DISASSOC"
+        78 -> "WLC_SET_DTIMPRD"
+        108 -> "WLC_SET_MONITOR"
+        134 -> "WLC_SET_WSEC"
+        159 -> "WLC_GET_ASSOCLIST"
+        165 -> "WLC_SET_WPA_AUTH"
+        268 -> "WLC_SET_WSEC_PMK"
+        _ -> ""
+    if name.is_empty() then s"$command" else s"$name ($command)"
+
+// An SDPCM channel by name.
+private channel_name(c: u8) -> string = c match
+    CHANNEL_CONTROL -> "control"
+    CHANNEL_EVENT -> "event"
+    CHANNEL_DATA -> "data"
+    _ -> s"$c"
+
+// The NUL-terminated name at the start of `p`.
+private c_name(p: []const u8) -> string
+    var n: usize = 0
+    while n < p.len && p[n] != 0 do n += 1
+    from_utf8_lossy(p[..<n])
+
+// The bytes of `p`, kept.
+private bytes(p: []const u8) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    b.extend(p)
+    b
+
+// A 32-bit value's four bytes, least significant first.
+private word(v: u32) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    put32(&b, v)
+    b
+
+private put16(b: *Buf[u8], v: u32)
+    b.push(u8.wrap(v))
+    b.push(u8.wrap(v >> 8))
+
+private put32(b: *Buf[u8], v: u32)
+    put16(b, v)
+    put16(b, v >> 16)
+
+/** The little-endian 16-bit value of `f` at `i`. */
+le16(f: []const u8, i: usize) -> u32 = u32(f[i]) | (u32(f[i + 1]) << 8)
+
+/** The little-endian 32-bit value of `f` at `i`. */
+le32(f: []const u8, i: usize) -> u32 = le16(f, i) | (le16(f, i + 2) << 16)
