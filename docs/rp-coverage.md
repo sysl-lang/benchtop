@@ -344,7 +344,7 @@ that must land first. Items with no shared "after" run in parallel.
 | 27 | **POWMAN AON timer and LPOSC**. **Done** (below). | M | 5 |
 | 28 | **BUSCTRL performance counters, TBMAN, GLITCH_DETECTOR stores**. | S | 11 |
 | 29 | **HSTX and the SIO TMDS encoder** (per Q9). | M | 11 |
-| 30 | **Boot path** (IMAGE_DEF and partitions; per Q2). First slice **done** (below): `--boot rom` boots core 0 from reset through the ROM into a flash image's IMAGE_DEF. Partition tables, signatures, encrypted boot and nsboot remain. | L | 6, 25, 26 |
+| 30 | **Boot path** (IMAGE_DEF and partitions; per Q2). First slice **done** (below): `--boot rom` boots core 0 from reset through the ROM into a flash image's IMAGE_DEF. nsboot now runs to its wait for a host, and answers enumeration. Partition tables, signatures and encrypted boot remain. | L | 6, 25, 26 |
 | 31 | **Non-secure TrustZone** (Q3 reopened). **Done** (below). | L | 2 |
 | 32 | **USB host mode** (per Q4). | L | 20 |
 | 33 | **CYW43439 over PIO gSPI** (DESIGN.md §7 "Later"; the `pico2w` LED), stage 1: init and the LED. **33a, the gSPI bus and the chip's bring-up, done** (below); **33b, the control channel and the LED, done** (below): `cyw43_arch_init` returns 0 and `blink` blinks. Stage 2, networking, is pending: Ethernet frames over F2 bridged to the Mac through libslirp, a fake access point; not scheduled. | L | 14 |
@@ -741,7 +741,7 @@ neither on this machine.
 
 | what | where | model |
 |---|---|---|
-| `TT`'s IDAU fields (the ROM checks 0x02ce0700 and 0x02c70703 exactly) | `v6m/t2secure.sysl` | the board's one numbered IDAU region: 0x7e00–0x7fff, region 2, Non-secure callable, outranking the SAU's Non-secure |
+| `TT`'s IDAU fields (the ROM checks 0x02ce0700 and 0x02c70703 exactly) | `v6m/t2secure.sysl` | the board's one numbered IDAU region: 0x7e00–0x7fff, region 2, Non-secure callable, outranking the SAU's Non-secure; its Exempt ranges (datasheet 10.2.2) answered Secure from Secure state, with no SAU region (item 30) |
 | MPU registers and `TT`'s MPU fields | `v6m/t2secure.sysl` | stored, 8 regions; MREGION, MRVALID, R, RW from AP; an overlap names no region; not enforced |
 | NSACR, SCR, the NS alias's CPACR (0xe002ed88) | `v6m/t2secure.sysl` | stored with their bits; the rest of the alias still stops at `NonSecure` |
 | `WFE`, `SEV` (the ROM waits in `WFE`) | `v6m/except.sysl` `hint` | an event register per core where the board sets `Cpu.events`; `WFE` consumes it or sleeps until it, or an interrupt that would wake `WFI`; each core's `SEV` sets the other's (`ArmBoard.event`). Other boards keep both as NOPs |
@@ -1996,7 +1996,7 @@ RCP, OTP's boot flags and BOOTDIS, POWMAN's BOOT0–3 and the watchdog's SCRATCH
 the main resets, BOOTSEL's strap, the flash probed through the QMI, the image's IMAGE_DEF found, BOOT_INFO
 written, and the image entered. The watchdog's reset (PROC0 in WDSEL) and POWMAN's power-up then start
 core 0 from reset in the ROM again rather than through `rom_boot_path`. An image that leaves the flash
-with no block marker in its first 4 KB is refused at `boot`: the ROM would enter BOOTSEL's USB boot.
+with no block marker in its first 4 KB, or BOOTSEL held (`Rp2350.bootsel`), leaves the ROM in its USB boot (nsboot), below.
 
 **The census**, what the ROM's path touched that benchtop answered wrongly, in the order it met them
 (the ROM's source, `varm_boot_path.c` at tag `A4`, says why each is right):
@@ -2006,7 +2006,9 @@ with no block marker in its first 4 KB is refused at `boot`: the ROM would enter
 | TRNG_SW_RESET read back (the salt loop's count is 0xc9 + the read, which an RCP check then requires; ROM 0x3940, 0x39b6) | `peripheral/rp2350/trng.sysl` | stored: read 1, the loop ran once too often, `rcp_iequal` faulted | self-clearing: a 1 resets the collection, the register reads 0 |
 | OTP BOOTDIS (step 9 writes 0x5afe0001 to it and to POWMAN's) | `peripheral/rp2350/otp.sysl` | refused by name | NEXT set by a 1 and never cleared by software, NOW cleared by a 1; the OTP's reset (the watchdog's OTP stage, a power-down) ORs NEXT into NOW and clears NEXT; power-on clears both |
 | a write to a block RESETS holds (step 11 isolates PADS_BANK0's pads before their first release: "if the pads registers are already in reset (e.g. first boot) then this operation should be harmless") | `chip/rp2350.sysl` `write` | refused, as the bus hang the comment assumed | dropped; a read of a held block is still refused |
-| GPIO_HI_IN's QSPI bank (step 12 samples chip select 21 times as BOOTSEL's strap) | `chip/rp2350.sysl` `sio_inputs` | every QSPI bit 0: BOOTSEL read as pressed, and nsboot ran | chip select reads high (the board's pull-up, the button released), SCK and SD0–3 low, through SIO and the GPIO coprocessor alike |
+| GPIO_HI_IN's QSPI bank (step 12 samples chip select 21 times as BOOTSEL's strap) | `chip/rp2350.sysl` `sio_inputs` | every QSPI bit 0: BOOTSEL read as pressed, and nsboot ran | chip select reads high (the board's pull-up, the button released), SCK and SD0–3 low, through SIO and the GPIO coprocessor alike; low while `Rp2350.bootsel` holds the button |
+| the IDAU (nsboot runs Non-secure with its stack at the top of USB RAM, which no SAU region covers; datasheet 10.2.2, Table 943) | `v6m/t2secure.sysl` `Idau`, `chip/bootrom.sysl` `RP2350_IDAU` | only the secure gateways' NSC region: USB RAM was Secure to Non-secure state, SecureFault AUVIOL at 0x50100ffc | the RP2350's map: Exempt for loads and stores the ROM to 0x7dff, APB, AHB (USB RAM among them) and SIO; Exempt for fetches the ROM to 0x42ff; the ROM's map mirrored every 32 KB below 0x10000000. An Exempt address takes the accessing state's own attribution whatever the SAU or ALLNS says (DDI0553 "SecurityCheck"), so `TT` from Secure state answers it Secure with no SAU region, NSR and NSRW clear |
+| benchtop's USB host sending a request's SETUP in the frame the previous request's status stage completed | `chip/usb_host.sysl` `enumerate` | the ROM's interrupt handler took SETUP before the status OUT's BUFF_STATUS, found EP0 OUT with no transfer, and halted it: the configuration descriptor's status stage STALLed | a completed control transfer ends the frame; the next SETUP goes in a later one, as a host's software submits it after the completion |
 
 **What came for free**: everything else on the path ran as it stood — the TRNG and SHA-256 (item 25)
 making the salts, the OTP's guarded reads and ECC (item 26), POWMAN's vectors and BOOTDIS (item 34),
@@ -2017,9 +2019,15 @@ flash boot, with the same output as under the debugger entry.
 
 **Tests**: `chip/rom_boot_tests.sysl` boots `hello_serial_flash` (ELF and UF2), `blink_flash` and
 `powman.c` through the ROM and asserts every line and edge as the debugger-entry tests do, that the ROM
-salted the RCP and wrote a NORMAL BOOT_INFO, and the blank-flash refusal; with the chip-level checks of
-the dropped write and of GPIO_HI_IN. `script/boot_rom_tests.sysl` runs `--boot rom` as a scripted run
-and the refusals. TRNG_SW_RESET (`rp2350/crypto_tests.sysl`) and OTP BOOTDIS (`rp2350/otp_tests.sysl`)
+salted the RCP and wrote a NORMAL BOOT_INFO; nsboot entered with BOOTSEL held and with a blank flash,
+Non-secure in the ROM, its stack in USB RAM, the controller's pull-up on, asleep in `WFE`, and with
+benchtop's host plugged in answering SET_ADDRESS, the device descriptor (0x2e8a:0x000f) and the whole
+configuration descriptor; with the chip-level checks of the dropped write and of GPIO_HI_IN.
+`script/boot_rom_tests.sysl` runs `--boot rom` as a scripted run, a blank flash ending asleep, and the
+refusals. The IDAU's Exempt ranges (`v6m/t2nonsecure_tests.sysl`): Non-secure loads made there under an
+SAU that says Secure, a whole Exempt page on the Non-secure table and a partial one off it, AUVIOL at the
+byte past a range, fetch-Exempt code run in the state that reaches it while a data-only range is INVEP,
+and `TT` under an SAU region, ALLNS and a disabled SAU, at the range's ends and through the mirror. TRNG_SW_RESET (`rp2350/crypto_tests.sysl`) and OTP BOOTDIS (`rp2350/otp_tests.sysl`)
 register by register.
 
 **What remains of item 30:**
@@ -2031,10 +2039,11 @@ register by register.
 - **Signature checks and secure boot**: OTP's CRIT1.SECURE_BOOT_ENABLE and the boot key rows cannot be
   programmed (item 26 refuses them by name), so a signed image's path is not reached.
 - **Encrypted boot**: not reached (it needs the same OTP rows and a signed decryption stage).
-- **BOOTSEL's USB boot (nsboot)**: refused at `boot` for a blank flash. Reached otherwise (BOOTSEL held,
-  or no image found), the ROM's nsboot runs Non-secure with its stack in USB RAM and stops at a
-  SecureFault (AUVIOL at 0x50100ffc): the SAU regions it sets for itself are not yet what attribution
-  sees there.
+- **BOOTSEL's USB boot (nsboot)** runs, with BOOTSEL held (`Rp2350.bootsel`; no command-line switch yet)
+  or a blank flash, to its idle `WFE` with the pull-up on, and answers enumeration up to the
+  configuration descriptor. Its interfaces are mass storage and PICOBOOT, and benchtop's host bridges
+  CDC ACM only, so the host gives up there by name: the UF2 drive (SCSI over bulk-only transport) and
+  PICOBOOT commands need a host side benchtop does not have.
 - **A typed watchdog boot** (SCRATCH7 the magic: a RAM image, or BOOTSEL) is still refused by name under
   `--boot debugger`; under `--boot rom` it is the ROM's code, not yet exercised.
 - **The RISC-V Pico 2**: hart 0's boot path (the ROM's Armv8-M emulator) is not run (Q13).

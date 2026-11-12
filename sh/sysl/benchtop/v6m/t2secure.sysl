@@ -11,10 +11,13 @@ module sh.sysl.benchtop.v6m
 // the M33's eight regions; `TT` answers from it and the core enforces it (t2nonsecure.sysl). Its reset
 // state, disabled with ALLNS clear, makes every address Secure, which is what the SDK runs under.
 //
-// **The IDAU** is the board's: at most one region that reports a number (`Cpu.idau`), Secure
-// Non-secure-callable, which outranks the SAU's Non-secure; every other address is exempt or left to
-// the SAU, with no IDAU region valid. The RP2350's is the boot ROM's 0x7e00–0x7fff, region 2 (its
-// boot ROM's start-up checks `TT` of both answers).
+// **The IDAU** is the board's (`Cpu.idau`, an `Idau`): at most one region that reports a number,
+// Secure Non-secure-callable, which outranks the SAU's Non-secure; Exempt ranges, which neither the SAU
+// nor ALLNS attributes, an access there taking the core's own state ("SecurityCheck": `ns = !isSecure`);
+// and every other address left to the SAU, with no IDAU region valid. The RP2350's (datasheet 10.2.2,
+// `chip/bootrom.sysl` `RP2350_IDAU`) is the boot ROM's 0x7e00–0x7fff, region 2 (its boot ROM's start-up
+// checks `TT` of both answers), and Exempt the ROM below it for loads and stores, below 0x4300 for
+// fetches, the APB and AHB peripherals (USB RAM among them) and SIO.
 //
 // **The MPU** (`MPU_TYPE`, `MPU_CTRL`, `MPU_RNR`, `MPU_RBAR`, `MPU_RLAR` and their three aliases,
 // `MAIR0`, `MAIR1`; `regs/m33.h`, M33_MPU_*) is stored, with the M33's eight regions per state, and
@@ -62,16 +65,50 @@ const SCR_SEVONPEND: u32 = 0x00000010
 const MPU_CTRL_BITS: u32 = 0x7
 const MPU_RLAR_BITS: u32 = 0xFFFFFFEF
 
-/** The IDAU region a board gives its cores: `base` to `limit` inclusive, reporting `number`, Secure
- * Non-secure-callable. `limit` below `base` is none.
+/** The IDAU a board gives its cores, a fixed address decode. Its one region, `base` to `limit`
+ * inclusive (`limit` below `base` is none), reports `number` and is Secure Non-secure-callable. Its
+ * Exempt ranges, `exempt_lo[k]` to `exempt_hi[k]` inclusive for `k` below `exempts`, are not checked
+ * against the core's state: a load or store there is made in the state the core is in, whatever the SAU
+ * says. An instruction fetch is Exempt only from `fetch_lo` to `fetch_hi` inclusive. Addresses below
+ * `mirror_below` repeat the map every `mirror_mask + 1` bytes. Every other address is Non-secure to the
+ * IDAU, which leaves it to the SAU.
  */
-struct IdauRegion
+struct Idau
     base: u32
     limit: u32
     number: u32
+    exempt_lo: [IDAU_EXEMPTS]u32
+    exempt_hi: [IDAU_EXEMPTS]u32
+    exempts: u32
+    fetch_lo: u32
+    fetch_hi: u32
+    mirror_below: u32
+    mirror_mask: u32
 
-/** No IDAU region. */
-val NO_IDAU: IdauRegion = IdauRegion(1, 0, 0)
+/** The most Exempt ranges an IDAU has. */
+const IDAU_EXEMPTS: u32 = 4
+
+/** No IDAU: every address Non-secure to it. */
+val NO_IDAU: Idau = Idau(1, 0, 0, [0; IDAU_EXEMPTS], [0; IDAU_EXEMPTS], 0, 1, 0, 0, 0)
+
+/** The IDAU's three answers. */
+enum IdauAnswer
+    NonSecure
+    Callable
+    Exempt
+
+/** How the IDAU answers for `a`, an instruction fetch where `fetch`: Exempt, Non-secure callable (its
+ * region) or Non-secure.
+ */
+idau_answer(cpu: *Cpu, a: u32, fetch: bool) -> IdauAnswer
+    val idau = &cpu.idau
+    val at = if a < idau.mirror_below then a & idau.mirror_mask else a
+    if fetch
+        if at >= idau.fetch_lo && at <= idau.fetch_hi then return IdauAnswer.Exempt
+    else
+        for k in 0..<idau.exempts
+            if at >= idau.exempt_lo[k] && at <= idau.exempt_hi[k] then return IdauAnswer.Exempt
+    if at >= idau.base && at <= idau.limit then IdauAnswer.Callable else IdauAnswer.NonSecure
 
 const SECURE_FAULT: u32 = 7
 
@@ -330,7 +367,8 @@ attribution(cpu: *Cpu, a: u32) -> Attribution
 /** `TT`'s answer for `a`: `alt` for TTA and TTAT, which from Secure state ask about the Non-secure
  * domain, `unprivileged` for TTT and TTAT. S, SRVALID and SREGION come from the SAU, IRVALID and
  * IREGION from the IDAU, whose Non-secure-callable region makes an address Secure whatever the SAU
- * says; Non-secure state is answered none of them, nor NSR and NSRW. The MPU fields are answered where
+ * says, and whose Exempt ranges are Secure, as the Secure state asking is, with no SAU region (so
+ * NSR and NSRW clear: the ROM's "Exempt regions will always fail TTA checks"); Non-secure state is answered none of them, nor NSR and NSRW. The MPU fields are answered where
  * the domain asked about is privileged (CONTROL.nPRIV clear, or handler mode): with the MPU enabled,
  * the one region of that domain's MPU holding `a` gives MREGION and its AP field R and RW, and an
  * address no region holds has the default map where PRIVDEFENA lets a privileged query use it, and no
@@ -348,8 +386,10 @@ tt_response(cpu: *Cpu, a: u32, alt: bool, unprivileged: bool) -> u32
 
 // `TT` against the live bank's MPU and privilege, the security fields where `secure` asks.
 private tt_domain(cpu: *Cpu, a: u32, unprivileged: bool, secure: bool) -> u32
-    val at = attribution(cpu, a)
-    val idau = a >= cpu.idau.base && a <= cpu.idau.limit
+    // An Exempt address takes the querying state's own, Secure here, with no SAU region.
+    val answer = idau_answer(cpu, a, false)
+    val at = if answer == IdauAnswer.Exempt then Attribution(false, -1, false) else attribution(cpu, a)
+    val idau = answer == IdauAnswer.Callable
     val non_secure = at.non_secure && !idau
     var resp: u32 = 0
 

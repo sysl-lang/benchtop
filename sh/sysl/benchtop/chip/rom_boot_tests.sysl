@@ -5,6 +5,7 @@ import sh.sysl.rp2350.pads_bank0 as pads
 import sh.sysl.rp2350.powman as pm
 import sh.sysl.rp2350.resets as rr
 import sh.sysl.rp2350.sio as sr
+import sh.sysl.rp2350.usb as ur
 import sysl.fmt.hex
 import sysl.text.from_utf8_lossy
 
@@ -65,12 +66,57 @@ rom_boot_blink_flash()
             level = led.level
     assert(edges == 3, s"$edges edges")
 
-@test("booting through the boot ROM refuses by name an image that leaves the flash blank, which the ROM would answer with BOOTSEL's USB boot")
+@test("booting through the boot ROM with the flash blank (an SRAM image), BOOTSEL released, the ROM finds no image and enters its USB boot, Non-secure, as it does with the button held")
 rom_boot_blank_flash()
     val b = arm_board(ROM_PICO2_SRAM)
     b.rom_boot = true
-    val why = b.boot(ROM_HELLO_RAM).unwrap_err()
-    assert(why.contains("BOOTSEL's USB boot"), why)
+    b.boot(ROM_HELLO_RAM).unwrap()
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 50 * ROM_MS do end = b.run(ROM_MS / 10)
+    val c = &b.cores[0]
+    assert(end == RunEnd.Asleep && c.ns && c.pc >= 0x4300 && c.pc < 0x7E00, s"$end ${b.refused}; core 0 at pc 0x${hex(c.pc, 8)}, ns ${c.ns}")
+    assert(b.chip.usb.sie_ctrl & ur.SIE_CTRL_PULLUP_EN_MASK != 0, "the pull-up on")
+
+// A Pico 2 holding `image`, powered on through the boot ROM with the BOOTSEL button held, and run until
+// both cores sleep with nothing due to wake them, benchtop's host (plugged in where `host`) has given up
+// on it, or `ms` of guest time pass.
+private bootsel_booted(image: []const u8, host: bool, ms: u64) -> &ArmBoard
+    val b = arm_board(ROM_PICO2_SRAM)
+    b.rom_boot = true
+    b.chip.bootsel = true
+    b.boot(image).unwrap()
+    if host then b.attach_usb_host(true)
+    while b.chip.now < ms * ROM_MS
+        val end = b.run(ROM_MS / 10)
+        if end == RunEnd.Asleep || b.usb_host.stage == HostStage.Stopped then break
+        val c = &b.cores[0]
+        assert(end == RunEnd.Budget, s"$end at ${b.chip.now / ROM_MS} ms ${b.refused}; core 0 stopped ${c.stop} at 0x${hex(c.stop_at, 8)}, pc 0x${hex(c.pc, 8)}, SFSR 0x${hex(c.sfsr, 8)} SFAR 0x${hex(c.sfar, 8)}")
+    b
+
+@test("with BOOTSEL held, the boot ROM enters its USB boot: core 0 runs Non-secure in the ROM, its stack in USB RAM, which the IDAU makes Exempt, and waits in WFE with the USB controller enabled as a device and its pull-up on, for a host")
+rom_boot_bootsel_held()
+    val b = bootsel_booted(ROM_HELLO_FLASH, false, 50)
+    val c = &b.cores[0]
+    assert(b.chip.now < 50 * ROM_MS, "both cores asleep with nothing to wake them, before 50 ms")
+    assert(c.ns, "core 0 in Non-secure state")
+    assert(c.pc >= 0x4300 && c.pc < 0x7E00, s"in the ROM's Non-secure text, pc 0x${hex(c.pc, 8)}")
+    assert(c.r[13] >= 0x50100000 && c.r[13] <= 0x50101000, s"the stack in USB RAM, sp 0x${hex(c.r[13], 8)}")
+    assert(c.sfsr == 0, s"no SecureFault, SFSR 0x${hex(c.sfsr, 8)}")
+    val usb = &b.chip.usb
+    assert(usb.main_ctrl & ur.MAIN_CTRL_CONTROLLER_EN_MASK != 0 && usb.main_ctrl & ur.MAIN_CTRL_HOST_NDEVICE_MASK == 0, s"MAIN_CTRL 0x${hex(usb.main_ctrl, 8)}")
+    assert(usb.sie_ctrl & ur.SIE_CTRL_PULLUP_EN_MASK != 0, s"SIE_CTRL 0x${hex(usb.sie_ctrl, 8)}")
+
+@test("with BOOTSEL held and benchtop's host plugged in, the boot ROM's USB boot answers enumeration: its address, the device descriptor with Raspberry Pi's vendor ID 0x2e8a and the RP2350's BOOTSEL product 0x000f, and the whole configuration descriptor, where the host, which bridges CDC ACM only, finds none")
+rom_boot_bootsel_enumerated()
+    val b = bootsel_booted(ROM_HELLO_FLASH, true, 1000)
+    val host = &b.usb_host
+    assert(host.stage == HostStage.Stopped && host.note.contains("no CDC ACM interface"), s"host at ${host.stage} after ${b.chip.now / ROM_MS} ms: ${host.note}")
+    assert(host.device_address == 1 && b.chip.usb.addr[0] == 1, "the device took address 1")
+    val d = host.device
+    assert(d.len() == 18, s"${d.len()} device descriptor bytes")
+    assert(d[8] == 0x8A && d[9] == 0x2E && d[10] == 0x0F && d[11] == 0x00, s"VID/PID bytes ${d[8]} ${d[9]} ${d[10]} ${d[11]}")
+    val c = host.data
+    assert(c.len() > 9 && c[1] == 2 && c.len() == usize(c[2]) + (usize(c[3]) << 8), s"the configuration descriptor whole, ${c.len()} bytes")
 
 @test("hardware_powman's three power-ups with every boot the boot ROM's own: its BOOT0-3 vector check, BOOTDIS and the flash boot after each power-up")
 rom_boot_powman_program()

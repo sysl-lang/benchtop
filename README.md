@@ -276,7 +276,7 @@ printed on stderr, without `--window`; `off` leaves the bus empty.
 default) enters the image as a debug probe does: an ELF at its entry, a flash UF2 at its vector table.
 `rom` starts both cores from reset in Raspberry Pi's boot ROM, which runs its own boot path (the boot
 salts from the TRNG through SHA-256, OTP's flags, BOOTSEL's strap) and finds the image's `IMAGE_DEF` in
-flash; an image that leaves the flash blank is refused, since the ROM would enter BOOTSEL's USB boot.
+flash; an image that leaves the flash blank leaves the ROM in BOOTSEL's USB boot, waiting for a host.
 The watchdog's reset and POWMAN's power-up then boot through the ROM too. With `--window`, `--gdb` and
 a scripted run alike.
 
