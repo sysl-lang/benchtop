@@ -76,6 +76,7 @@ clear_exceptions(cpu: *Cpu)
     cpu.ipsr = 0
     cpu.primask = 0
     cpu.vtor = 0
+    if cpu.masking != null then masking_reset(cpu)
     for w in 0..<NVIC_BANKS
         cpu.pending[w] = 0
         cpu.active[w] = 0
@@ -125,6 +126,8 @@ begin_run(cpu: *Cpu) -> bool
     tick(cpu, now)
     // The Non-secure SysTick counts too, and cuts the run at its expiry as the Secure one does.
     val ns_due = if cpu.trustzone then ns_tick_up(cpu, now) else NEVER
+    // What a device or the other core made pending since the last run is recorded as pending from now.
+    if cpu.masking != null then reconcile_pending(cpu, now)
     take_pending(cpu)
 
     if cpu.stop != Stop.Running then return false
@@ -448,6 +451,7 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     set_pending(cpu,to,false)
     // The derived fault: taken now where it arrived late, `e` left pending; otherwise pending itself.
     if derived >= 0 then set_pending(cpu, if to != e then e else u32(derived), true)
+    if cpu.masking != null then entered(cpu, to, n)
     cpu.it = 0
     cpu.excl = false
     cpu.pc = vector & ~1
@@ -568,6 +572,8 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
         cpu.control &= ~2
         cpu.r[13] = sp
 
+    // The return may have cleared FAULTMASK.
+    if cpu.masking != null then masks_changed(cpu, from, n)
     recheck(cpu)
     insn_at(cpu, pc & ~1)
 
@@ -609,9 +615,10 @@ svc(cpu: *Cpu, ip: *Insn, n: u64) -> *Insn
 
     insn_at(cpu, cpu.pc)
 
-// `CPSID i` (imm 1) or `CPSIE i` (imm 0).
-cps(cpu: *Cpu, ip: *Insn)
+// `CPSID i` (imm 1) or `CPSIE i` (imm 0), `n` retired before it.
+cps(cpu: *Cpu, ip: *Insn, n: u64)
     cpu.primask = ip.imm
+    if cpu.masking != null then masks_changed(cpu, addr_of(cpu, ip), n)
     recheck(cpu)
 
 // `MRS`: a PSR view, a stack pointer, PRIMASK or CONTROL. A PSR view has IPSR when SYSm's bit 0 is
@@ -631,8 +638,8 @@ mrs(cpu: *Cpu, ip: *Insn)
             ipsr | apsr
 
 // `MSR`: APSR's flags through a view that has APSR, a stack pointer, PRIMASK or CONTROL. IPSR and
-// EPSR ignore writes, and so does CONTROL.SPSEL in handler mode.
-msr(cpu: *Cpu, ip: *Insn)
+// EPSR ignore writes, and so does CONTROL.SPSEL in handler mode. `n` retired before it.
+msr(cpu: *Cpu, ip: *Insn, n: u64)
     val x = cpu.r[ip.b]
 
     ip.imm match
@@ -657,6 +664,7 @@ msr(cpu: *Cpu, ip: *Insn)
         _ ->
             if ip.imm & 4 == 0 then set_apsr(cpu, x)
 
+    if cpu.masking != null then masks_changed(cpu, addr_of(cpu, ip), n)
     recheck(cpu)
 
 // `WFI`: sleep, to be woken (or stopped at `Asleep`) by the next run's `begin_run`.
@@ -693,7 +701,9 @@ tick(cpu: *Cpu, now: u64)
     if cpu.tick_ctrl & TICK_ENABLE == 0 || now < cpu.tick_zero then return
 
     cpu.tick_flag = true
-    if cpu.tick_ctrl & TICK_INT != 0 then cpu.pending[0] |= u64(1) << SYSTICK
+    if cpu.tick_ctrl & TICK_INT != 0
+        cpu.pending[0] |= u64(1) << SYSTICK
+        if cpu.masking != null then tick_pended(cpu, cpu.tick_zero)
 
     if cpu.tick_reload == 0
         cpu.tick_last = cpu.tick_zero

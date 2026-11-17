@@ -231,14 +231,15 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 ```
 sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--window] [--deterministic | --threads] [--usb console|pty|off]
-               [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] <image.elf | image.bin>
+               [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--report-masking <file>]
+               <image.elf | image.bin>
 ./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
                [--press <part[.direction] | pin=high|low>[@<dur>][:<dur>]] [--set <part>=<0..1>] [--quiet] ... <image>
 ./benchtop check [--mcu] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
-./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
+./benchtop bench-board [--board <name | file.hocon>] [--report-masking <file>] <image.elf> [turns | threads]
 ```
 
 **`run`** boots an image on the board `--board` names — the virtual board, `virt`, where none is
@@ -417,6 +418,60 @@ prints every mistake with its line and column and exits 1, or prints what the de
 **`bench-board`** runs an image on a virtual board (`virt`, or the one `--board` names) to its exit,
 three rounds with the cores taking turns and three with a thread each, and reports both cores'
 speed together. [bench/README.md](bench/README.md) has the numbers.
+
+### The masking report
+
+**`--report-masking <file>`**, on `run` or `bench-board` of a virtual board (`virt`, `virt33`, ...),
+writes each core's masked intervals and interrupt latencies to `file` when the run ends (for
+`bench-board`, the last round's). Threaded or `--deterministic`, either executor, any core model. It is
+off by default, and off it costs nothing: the recording sits only on paths that are already rare
+(`MSR`, `CPS`, exception entry and return, SysTick's expiry, a store's slow path, the start of a run),
+behind one null test. `--window`, `--gdb`, a scripted run and the RP boards refuse it.
+
+- **Masked** means PRIMASK or FAULTMASK set, or BASEPRI not 0 (either security state's, where
+  Non-secure state is in use): the execution priority boost that keeps an interrupt at a kernel's
+  priority out. An interval runs from the instruction that masked (`CPSID`, `MSR`) to the one that
+  unmasked (`CPSIE`, `MSR`, or the exception return that cleared FAULTMASK), in the core's executed
+  cycles — estimated under `instruction-timing = estimated`, one per instruction otherwise. Time
+  asleep in `WFI`/`WFE` does not count. **An exception does not cut an interval**: the masks are not
+  stacked, so a handler that preempts a masked stretch (above BASEPRI, or a fault) runs masked and
+  its time counts; masking inside a handler counts as in thread mode. An interval still open at the
+  end is reported up to the core's clock, `to=end`. A reset drops an open interval.
+- **Latency** is the core's clock (executed cycles plus time asleep) from an exception becoming
+  pending to its handler's first instruction. SysTick is pending from the cycle it reached zero; what
+  a store makes pending (NVIC_ISPR, NVIC_STIR, ICSR's PENDSVSET, a device register) from that store; a
+  device line or the other core's interrupt from the run boundary at which the core takes it in.
+  benchtop charges nothing for the entry itself, so a latency is the wait: the masked remainder, any
+  handler of higher priority (or tail-chained ahead of it), and the instructions up to the next point
+  where the core looks for an interrupt (a taken branch or a system instruction). An exception entered
+  without being pending first (`SVC`) has none.
+
+The file is one fact per line, `key=value` fields after a two-word prefix, core 0's lines first:
+
+```
+masking core=0 timing=estimated cycles=1203 intervals=3 masked=96 longest=48 from=0x00000124 to=0x00000140
+masking core=0 rank=1 cycles=48 from=0x00000124 to=0x00000140
+masking core=0 rank=2 cycles=40 from=0x00000210 to=end
+masking core=0 bucket=32-63 count=3
+latency core=0 exception=systick taken=12 max=51 mean=9
+latency core=0 exception=systick bucket=4-7 count=11
+latency core=0 exception=systick bucket=32-63 count=1
+latency core=0 exception=irq3 taken=2 max=7 mean=6
+latency core=0 exception=irq3 bucket=4-7 count=2
+masking core=1 timing=estimated cycles=980 intervals=0 masked=0 longest=0 from=none to=none
+```
+
+- The summary line: the timing, the core's executed `cycles` at the end, how many `intervals` and
+  their total `masked` cycles, and the longest, with the addresses of the instructions that began and
+  ended it (`from=none to=none` for none).
+- `rank=k`: the eight longest intervals, longest first, the earlier first among equals.
+- `bucket=lo-hi count=n`: a histogram of interval lengths in powers of two (`0-0`, `1-1`, `2-3`,
+  `4-7`, ...), non-empty buckets only.
+- `latency ... exception=<name>`: per exception taken, how many times, the maximum and the mean wait,
+  then its own histogram. Names are `nmi`, `hardfault`, `memmanage`, `busfault`, `usagefault`,
+  `securefault`, `svcall`, `debugmonitor`, `pendsv`, `systick`, `irq<n>`, with `_ns` for a
+  Non-secure copy.
+- Core 1's lines follow where it was launched.
 
 `sysl test .` runs every test.
 

@@ -1,0 +1,269 @@
+module sh.sysl.benchtop.v6m
+
+// The masking report: how long a core runs with interrupts masked, and how long each interrupt waits
+// between becoming pending and its handler's first instruction.
+//
+// **A core is masked while PRIMASK, BASEPRI or FAULTMASK raises its execution priority**: PRIMASK or
+// FAULTMASK set, or BASEPRI not 0, in either security state's bank where Non-secure state is in use.
+// That is the time an interrupt at a kernel's own priority cannot be taken. An interval runs from the
+// instruction that masked (`CPSID`, `MSR`) to the one that unmasked (`CPSIE`, `MSR`, or the exception
+// return that cleared FAULTMASK), and is measured in the core's executed cycles: estimated where the
+// core counts cycles (`instruction-timing = estimated`), one an instruction otherwise. Time asleep in
+// `WFI` or `WFE` is not counted, since a pending interrupt wakes a core whatever its masks. **An
+// exception does not cut an interval**: the masks are not part of the frame, so a handler that
+// preempts a masked stretch (above BASEPRI, or a fault) runs masked too, and its time is part of the
+// stretch; masking inside a handler counts exactly as it does in thread mode. A reset ends an open
+// interval without recording it.
+//
+// **An interrupt's latency is the core's clock (executed cycles and time asleep) from the moment it
+// became pending to its handler's first instruction.** SysTick is pending from the cycle it reached
+// zero; anything a store makes pending (NVIC_ISPR, NVIC_STIR, ICSR, a device's register) from that
+// store; a device's line, or another core's interrupt, from the run boundary at which the core takes
+// it in. benchtop charges no cycles for exception entry itself, so a latency is the wait: the masked
+// remainder, a handler of higher priority, and the instructions up to the next point where the core
+// looks for an interrupt (a taken branch or a system instruction). An exception entered without
+// becoming pending first (SVC) has no latency.
+//
+// **Nothing here runs while recording is off.** Every hook is called from a path that already exists
+// and is rare — `MSR`, `CPS`, exception entry and return, SysTick's expiry, the slow path of a store,
+// the start of a run — behind a test of `cpu.masking`, null until `record_masking`.
+
+import sysl.raw.ptr_cast
+import sysl.text.{StrBuilder, str_builder}
+
+extern "free" c_free(p: *u8)
+
+// Histogram buckets: 0 for nothing, k for 2^(k-1) to 2^k - 1 cycles.
+const MASK_BUCKETS: usize = 48
+// How many of the longest intervals the report keeps.
+const MASKING_TOP: usize = 8
+const EXCEPTIONS: usize = NVIC_BANKS * 64
+
+/** A masked interval: its length in executed cycles, the address of the instruction that masked and of
+ * the one that unmasked, and whether it was still open when reported. */
+struct Interval
+    cycles: u64
+    from: u32
+    to: u32
+    open: bool
+
+/** One exception's latencies: how many times it was taken, their sum and maximum, and a histogram. */
+struct Latency
+    taken: u64
+    total: u64
+    max: u64
+    buckets: [MASK_BUCKETS]u64
+
+/** A core's record, allocated by `record_masking`. */
+struct Masking
+    // The interval open now, if `masked`: the executed cycles and the instruction it began at.
+    masked: bool
+    since: u64
+    since_pc: u32
+    // The closed intervals: how many, their total, the longest few (longest first) and a histogram.
+    intervals: u64
+    total: u64
+    top: [MASKING_TOP]Interval
+    top_count: usize
+    buckets: [MASK_BUCKETS]u64
+    // The exceptions pending with a known start, one bit per exception number as `Cpu.pending`, and
+    // the clock each became pending at.
+    stamped: [NVIC_BANKS]u64
+    pend_at: [EXCEPTIONS]u64
+    // The exception the SysTick in `Cpu.tick_*` makes pending: the Non-secure one while it is swapped
+    // in (t2nonsecure.sysl).
+    tick_slot: u32
+    latency: [EXCEPTIONS]Latency
+
+/** Record `cpu`'s masked intervals and interrupt latencies from now on, from nothing; a second call
+ * starts again. A reset keeps the record. */
+record_masking(cpu: *Cpu)
+    if cpu.masking != null then c_free(ptr_cast(cpu.masking))
+    cpu.masking = ptr_cast(c_calloc(1, sizeof(Masking)))
+    val r = cpu.masking
+    r.tick_slot = SYSTICK
+    r.masked = masks_set(cpu)
+    r.since = cycles(cpu)
+    r.since_pc = cpu.pc
+
+/** Stop recording, and free the record. */
+stop_masking(cpu: *Cpu)
+    if cpu.masking == null then return
+    c_free(ptr_cast(cpu.masking))
+    cpu.masking = null
+
+/** Whether `cpu` records masking. */
+records_masking(cpu: *Cpu) -> bool = cpu.masking != null
+
+// Whether PRIMASK, BASEPRI or FAULTMASK raises the core's execution priority.
+masks_set(cpu: *Cpu) -> bool
+    if cpu.primask | cpu.basepri | cpu.faultmask != 0 then return true
+    cpu.trustzone && cpu.banked.primask | cpu.banked.basepri | cpu.banked.faultmask != 0
+
+// The masks may have changed at the instruction at `pc`, `n` retired before it: open or close an
+// interval where they went on or off.
+@cold
+masks_changed(cpu: *Cpu, pc: u32, n: u64)
+    val r = cpu.masking
+    val on = masks_set(cpu)
+    if on == r.masked then return
+    val now = executed_cycles(cpu, n)
+    if on
+        r.since = now
+        r.since_pc = pc
+    else
+        note_interval(r, Interval(now - r.since, r.since_pc, pc, false))
+    r.masked = on
+
+// A reset: the open interval ends unrecorded, and nothing is pending.
+masking_reset(cpu: *Cpu)
+    val r = cpu.masking
+    r.masked = false
+    for w in 0..<NVIC_BANKS do r.stamped[w] = 0
+    r.tick_slot = SYSTICK
+
+// SysTick reached zero at `at`, making its exception pending.
+@cold
+tick_pended(cpu: *Cpu, at: u64) = stamp(cpu.masking, cpu.masking.tick_slot, at)
+
+// Each exception pending with no start yet started at `now`; one no longer pending forgets its start.
+@cold
+reconcile_pending(cpu: *Cpu, now: u64)
+    val r = cpu.masking
+    for w in 0..<NVIC_BANKS
+        val p = cpu.pending[w]
+        val s = r.stamped[w]
+        if p == s then continue
+        var fresh = p & ~s
+        while fresh != 0
+            r.pend_at[w * 64 + usize(fresh.trailing_zeros())] = now
+            fresh &= fresh - 1
+        r.stamped[w] = p
+
+// Exception `e` is entered, `n` retired: its handler's first instruction is next.
+@cold
+entered(cpu: *Cpu, e: u32, n: u64)
+    val r = cpu.masking
+    val w = nvic_word(e)
+    val bit = nvic_bit(e)
+    if r.stamped[w] & bit == 0 then return
+    r.stamped[w] &= ~bit
+    val now = clock(cpu, n)
+    val at = r.pend_at[usize(e)]
+    val wait = if now > at then now - at else 0
+    val l = &r.latency[usize(e)]
+    l.taken += 1
+    l.total += wait
+    if wait > l.max then l.max = wait
+    l.buckets[bucket(wait)] += 1
+
+// Exception `e` became pending at `at`, unless it already was.
+private stamp(r: *Masking, e: u32, at: u64)
+    val w = nvic_word(e)
+    val bit = nvic_bit(e)
+    if r.stamped[w] & bit != 0 then return
+    r.stamped[w] |= bit
+    r.pend_at[usize(e)] = at
+
+private bucket(x: u64) -> usize
+    if x == 0 then return 0
+    val k = usize(64 - x.leading_zeros())
+    if k < MASK_BUCKETS then k else MASK_BUCKETS - 1
+
+private note_interval(r: *Masking, v: Interval)
+    r.intervals += 1
+    r.total += v.cycles
+    r.buckets[bucket(v.cycles)] += 1
+    keep_longest(&r.top[0], &r.top_count, v)
+
+// Insert `v` into the `count` longest intervals at `top`, longest first, the earlier first among
+// equals, keeping at most `MASKING_TOP`.
+private keep_longest(top: *Interval, count: *usize, v: Interval)
+    var k = count[0]
+    if k == MASKING_TOP
+        if v.cycles <= top[k - 1].cycles then return
+        k -= 1
+    else
+        count[0] = k + 1
+    while k > 0 && top[k - 1].cycles < v.cycles
+        top[k] = top[k - 1]
+        k -= 1
+    top[k] = v
+
+// ---------------------------------------------------------------------------------------------------
+// The report.
+
+/** `cpu`'s record as text, its lines naming it core `core`; empty where it records nothing. An interval
+ * still open is reported as one ending at the core's `pc`, `to=end`. The format is in README.md
+ * ("The masking report"). */
+masking_text(cpu: *Cpu, core: u32) -> string
+    if cpu.masking == null then return ""
+    val r = cpu.masking
+    var top = r.top
+    var count = r.top_count
+    var buckets = r.buckets
+    var intervals = r.intervals
+    var total = r.total
+    val now = cycles(cpu)
+
+    if r.masked
+        val v = Interval(if now > r.since then now - r.since else 0, r.since_pc, cpu.pc, true)
+        intervals += 1
+        total += v.cycles
+        buckets[bucket(v.cycles)] += 1
+        keep_longest(&top[0], &count, v)
+
+    var out = str_builder()
+    val m = s"masking core=$core"
+    val timing = if cpu.instruction_timing then "estimated" else "unit"
+    val longest = if count == 0 then "longest=0 from=none to=none" else s"longest=${top[0].cycles} ${ends(top[0])}"
+
+    out.push(s"$m timing=$timing cycles=$now intervals=$intervals masked=$total $longest\n")
+    for i in 0..<count do out.push(s"$m rank=${i + 1} cycles=${top[i].cycles} ${ends(top[i])}\n")
+    for b in 0..<MASK_BUCKETS do if buckets[b] != 0 then out.push(s"$m bucket=${bucket_range(b)} count=${buckets[b]}\n")
+
+    for e in 0..<EXCEPTIONS
+        val l = &r.latency[e]
+        if l.taken == 0 then continue
+        val x = s"latency core=$core exception=${exception_name(u32(e))}"
+        out.push(s"$x taken=${l.taken} max=${l.max} mean=${l.total / l.taken}\n")
+        for b in 0..<MASK_BUCKETS do if l.buckets[b] != 0 then out.push(s"$x bucket=${bucket_range(b)} count=${l.buckets[b]}\n")
+
+    out.finish()
+
+private ends(v: Interval) -> string = if v.open then f"from=0x${v.from}%08x to=end" else f"from=0x${v.from}%08x to=0x${v.to}%08x"
+
+private bucket_range(b: usize) -> string
+    if b == 0 then return "0-0"
+    val lo = 1u64 << u64(b - 1)
+    s"$lo-${lo * 2 - 1}"
+
+/** The report's name for exception number `e`. */
+exception_name(e: u32) -> string
+    if e >= NS_BANK then return s"${exception_name(e - NS_BANK)}_ns"
+    e match
+        2 -> "nmi"
+        3 -> "hardfault"
+        4 -> "memmanage"
+        5 -> "busfault"
+        6 -> "usagefault"
+        7 -> "securefault"
+        11 -> "svcall"
+        12 -> "debugmonitor"
+        14 -> "pendsv"
+        15 -> "systick"
+        _ -> if e >= IRQ0 then s"irq${e - IRQ0}" else s"exception$e"
+
+/** One recorded statistic, for a test or a tool that reads the record rather than the text. */
+masking_longest(cpu: *Cpu) -> Option[Interval]
+    if cpu.masking == null || cpu.masking.top_count == 0 then return None
+    Some(cpu.masking.top[0])
+
+/** How many intervals have closed, and their total. */
+masking_totals(cpu: *Cpu) -> (u64, u64) = if cpu.masking == null then (0, 0) else (cpu.masking.intervals, cpu.masking.total)
+
+/** Exception `e`'s latencies: taken, maximum, total. */
+latency_of(cpu: *Cpu, e: u32) -> (u64, u64, u64)
+    if cpu.masking == null then return (0, 0, 0)
+    val l = &cpu.masking.latency[usize(e)]
+    (l.taken, l.max, l.total)

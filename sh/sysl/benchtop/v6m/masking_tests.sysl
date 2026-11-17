@@ -1,0 +1,291 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// The masking report (masking.sysl) on one core: masked intervals from PRIMASK, BASEPRI and FAULTMASK,
+// their lengths in the core's cycles and the instructions that began and ended them, and the latency
+// of an interrupt from becoming pending to its handler. Every case runs under both executors, which
+// must report the same, on exceptions.sysl's machine.
+
+import sysl.buf.{Buf, buf}
+
+const NOP: u16 = 0xBF00
+const CPSID_F: u16 = 0xB671
+// msr basepri, r2 (0x80) and msr basepri, r3 (0).
+const MSR_BASEPRI_R2_1: u16 = 0xF382
+const MSR_BASEPRI_R3_1: u16 = 0xF383
+const MSR_BASEPRI_2: u16 = 0x8811
+// ldr r1, [r4]: two cycles under estimated timing.
+const LDR_R1_R4: u16 = 0x6821
+const PENDSVCLR: u32 = 0x08000000
+// movs r7, #9: r7 is not stacked, so a handler's mark survives its return.
+const MOVS_R7_9: u16 = 0x2709
+
+// `code` on a core of kind `kind` under both executors, each recording from the start (after
+// `setup`), required to give the same report; the threaded machine answered.
+recorded(kind: Kind, code: []const u16, regs: []const u32, handlers: [][2]u32, setup: Setup) -> Cpu
+    var a: Cpu
+    var b: Cpu
+
+    a.kind = kind
+    b.kind = kind
+
+    machine(&a, code, regs, 0, handlers, setup)
+    record_masking(&a)
+    finish(&a, &run_match)
+
+    machine(&b, code, regs, 0, handlers, setup)
+    record_masking(&b)
+    finish(&b, &run_threaded)
+
+    val ta = masking_text(&a, 0)
+    val tb = masking_text(&b, 0)
+    assert(ta == tb, s"the executors agree on the report:\n$ta\n$tb")
+    stop_masking(&a)
+    b
+
+// The longest interval's cycles, first and last instruction, or zeros for none.
+longest(c: *Cpu) -> (u64, u32, u32) = masking_longest(c) match
+    Some(v) -> (v.cycles, v.from, v.to)
+    None -> (0, 0, 0)
+
+// IRQ 0 enabled at priority `p`.
+irq0_at(cpu: *Cpu, p: u32)
+    store32(cpu, NVIC_ISER, 1)
+    store32(cpu, NVIC_IPR, p)
+
+irq0_kernel(cpu: *Cpu) = irq0_at(cpu, 0x80)
+irq0_above(cpu: *Cpu) = irq0_at(cpu, 0x40)
+
+timed(cpu: *Cpu) = configure_instruction_timing(cpu, true)
+
+// SysTick reaching zero at clock 10, and every 10 after.
+systick_10(cpu: *Cpu)
+    store32(cpu, SYST_RVR, 9)
+    store32(cpu, SYST_CSR, 7)
+
+// ---------------------------------------------------------------------------------------------------
+// Masked intervals.
+
+@test("PRIMASK alone on the M0+: the interval runs from the CPSID to the CPSIE, in cycles")
+mask_primask_m0()
+    // 0: nop; cpsid i; nop x5; 14: cpsie i; bkpt
+    val code: [9]u16 = [NOP, CPSID, NOP, NOP, NOP, NOP, NOP, CPSIE, BKPT]
+    var c = recorded(Kind.V6m, code[..], [], [], &nothing)
+
+    assert(longest(&c) == (6, 0x2, 0xE), s"${longest(&c)}")
+    assert(masking_totals(&c) == (1, 6))
+    stop_masking(&c)
+
+@test("an interval is measured in the core's estimated cycles where it counts them")
+mask_estimated()
+    // cpsid i; ldr r1, [r4] (2 cycles); nop; cpsie i
+    val code: [4]u16 = [CPSID, LDR_R1_R4, NOP, CPSIE]
+    var c = recorded(Kind.V6m, code[..], [0, 0, 0, 0, LOG], [], &timed)
+    assert(longest(&c) == (4, 0x0, 0x6), s"estimated: ${longest(&c)}")
+    stop_masking(&c)
+
+    c = recorded(Kind.V6m, code[..], [0, 0, 0, 0, LOG], [], &nothing)
+    assert(longest(&c) == (3, 0x0, 0x6), s"unit: ${longest(&c)}")
+    stop_masking(&c)
+
+@test("BASEPRI alone on the M33: from the MSR that set it to the one that cleared it")
+mask_basepri()
+    // 0: msr basepri, r2; nop x3; 10: msr basepri, r3; bkpt
+    val code: [8]u16 = [MSR_BASEPRI_R2_1, MSR_BASEPRI_2, NOP, NOP, NOP, MSR_BASEPRI_R3_1, MSR_BASEPRI_2, BKPT]
+    var c = recorded(Kind.V8mMain, code[..], [0, 0, 0x80, 0], [], &nothing)
+
+    assert(longest(&c) == (4, 0x0, 0xA), s"${longest(&c)}")
+    assert(masking_totals(&c) == (1, 4))
+    stop_masking(&c)
+
+@test("PRIMASK and BASEPRI nested are one interval, until the last of them clears; apart they are two")
+mask_nested()
+    // 0: cpsid i; msr basepri, r2; nop; 8: cpsie i; nop; 12: msr basepri, r3; bkpt
+    val nested: [9]u16 = [CPSID, MSR_BASEPRI_R2_1, MSR_BASEPRI_2, NOP, CPSIE, NOP, MSR_BASEPRI_R3_1, MSR_BASEPRI_2, BKPT]
+    var c = recorded(Kind.V8mMain, nested[..], [0, 0, 0x80, 0], [], &nothing)
+
+    assert(longest(&c) == (5, 0x0, 0xC), s"${longest(&c)}")
+    assert(masking_totals(&c) == (1, 5))
+    stop_masking(&c)
+
+    // 0: cpsid i; nop; 4: cpsie i; 6: msr basepri, r2; nop x3; 16: msr basepri, r3; bkpt
+    val apart: [11]u16 = [CPSID, NOP, CPSIE, MSR_BASEPRI_R2_1, MSR_BASEPRI_2, NOP, NOP, NOP, MSR_BASEPRI_R3_1, MSR_BASEPRI_2, BKPT]
+    c = recorded(Kind.V8mMain, apart[..], [0, 0, 0x80, 0], [], &nothing)
+
+    assert(longest(&c) == (4, 0x6, 0x10), s"${longest(&c)}")
+    assert(masking_totals(&c) == (2, 6))
+    val text = masking_text(&c, 0)
+    assert(text.contains("masking core=0 rank=1 cycles=4 from=0x00000006 to=0x00000010\nmasking core=0 rank=2 cycles=2 from=0x00000000 to=0x00000004\n"), text)
+    assert(text.contains("masking core=0 bucket=2-3 count=1\nmasking core=0 bucket=4-7 count=1\n"), text)
+    stop_masking(&c)
+
+@test("an exception taken above BASEPRI does not cut the interval: its handler's time is masked time")
+mask_spans_exception()
+    // 0: msr basepri, r2; 4: str r6, [r5] (IRQ 0 pending, at 0x40); isb; 10: nop;
+    // 12: msr basepri, r3; bkpt; 18: the handler, movs r7, #9; bx lr
+    val code: [11]u16 = [MSR_BASEPRI_R2_1, MSR_BASEPRI_2, STR_R6_R5, ISB_1, ISB_2, NOP, MSR_BASEPRI_R3_1, MSR_BASEPRI_2, BKPT, MOVS_R7_9, BX_LR]
+    var c = recorded(Kind.V8mMain, code[..], [0, 0, 0x80, 0, LOG, NVIC_ISPR, 1], [[IRQ0, 18]], &irq0_above)
+
+    assert(c.r[7] == 9, "the handler ran")
+    // msr, str, isb, the handler's two, nop.
+    assert(longest(&c) == (6, 0x0, 0xC), s"${longest(&c)}")
+    assert(masking_totals(&c) == (1, 6))
+    // Pending from the store, taken after the ISB.
+    assert(latency_of(&c, IRQ0) == (1, 2, 2), s"${latency_of(&c, IRQ0)}")
+    stop_masking(&c)
+
+@test("on the M0+, a HardFault taken under PRIMASK is inside the interval")
+mask_spans_hardfault()
+    // 0: cpsid i; 2: svc (escalated to HardFault); 4: cpsie i; bkpt; 8: the handler, nop; bx lr
+    val code: [6]u16 = [CPSID, SVC, CPSIE, BKPT, NOP, BX_LR]
+    var c = recorded(Kind.V6m, code[..], [], [[HARD_FAULT, 8]], &nothing)
+
+    assert(longest(&c) == (4, 0x0, 0x4), s"${longest(&c)}")
+    // The SVC was never pending: it has no latency.
+    assert(latency_of(&c, HARD_FAULT) == (0, 0, 0))
+    stop_masking(&c)
+
+@test("masking inside a handler counts as it does in thread mode")
+mask_in_handler()
+    // 0: str r6, [r5] (PendSV); isb; 6: bkpt; 8: PendSV's handler, cpsid i; nop; nop; 14: cpsie i; bx lr
+    val code: [9]u16 = [STR_R6_R5, ISB_1, ISB_2, BKPT, CPSID, NOP, NOP, CPSIE, BX_LR]
+    var c = recorded(Kind.V6m, code[..], [0, 0, 0, 0, LOG, ICSR, PENDSVSET], [[PENDSV, 8]], &nothing)
+
+    assert(longest(&c) == (3, 0x8, 0xE), s"${longest(&c)}")
+    assert(latency_of(&c, PENDSV) == (1, 2, 2), s"${latency_of(&c, PENDSV)}")
+    stop_masking(&c)
+
+@test("the return from an exception that clears FAULTMASK ends the interval, at the return")
+mask_faultmask_return()
+    // 0: str r6, [r5] (PendSV); isb; 6: bkpt; 8: PendSV's handler, cpsid f; nop; 12: bx lr
+    val code: [8]u16 = [STR_R6_R5, ISB_1, ISB_2, BKPT, CPSID_F, NOP, BX_LR, BKPT]
+    var c = recorded(Kind.V8mMain, code[..], [0, 0, 0, 0, LOG, ICSR, PENDSVSET], [[PENDSV, 8]], &nothing)
+
+    assert(c.faultmask == 0 && c.stop == Stop.Breakpoint && c.pc == 6)
+    assert(longest(&c) == (2, 0x8, 0xC), s"${longest(&c)}")
+    stop_masking(&c)
+
+@test("an interval still open when the run ends is reported up to the core's clock, to=end")
+mask_open_at_end()
+    // cpsid i; nop; nop; bkpt
+    val code: [3]u16 = [CPSID, NOP, NOP]
+    var c = recorded(Kind.V6m, code[..], [], [], &nothing)
+
+    assert(masking_longest(&c).is_none() && masking_totals(&c) == (0, 0), "nothing closed")
+    assert(masking_text(&c, 0) == "masking core=0 timing=unit cycles=3 intervals=1 masked=3 longest=3 from=0x00000000 to=end\nmasking core=0 rank=1 cycles=3 from=0x00000000 to=end\nmasking core=0 bucket=2-3 count=1\n", masking_text(&c, 0))
+    assert(masking_text(&c, 3).starts_with("masking core=3 "), "the core named as asked")
+    stop_masking(&c)
+
+@test("the longest few are kept longest first, and every interval counts in the histogram")
+mask_top()
+    // Ten intervals of 1 to 10 nops, shortest first: cpsid i; nop x k; cpsie i.
+    var code: Buf[u16] = buf()
+    for k in 1..10
+        code.push(CPSID)
+        for i in 0..<k do code.push(NOP)
+        code.push(CPSIE)
+    var c = recorded(Kind.V6m, code.view(), [], [], &nothing)
+
+    assert(masking_totals(&c) == (10, 65), s"${masking_totals(&c)}")
+    val text = masking_text(&c, 0)
+    assert(text.contains("rank=1 cycles=11 ") && text.contains("rank=8 cycles=4 ") && !text.contains("rank=9"), text)
+    assert(text.contains("bucket=2-3 count=2\n") && text.contains("bucket=8-15 count=4\n"), text)
+    stop_masking(&c)
+
+// ---------------------------------------------------------------------------------------------------
+// Latency.
+
+@test("an IRQ held off by BASEPRI waits the masked remainder: pending at the store, taken after the MSR that unmasks")
+latency_basepri()
+    // 0: msr basepri, r2; 4: str r6, [r5] (IRQ 0 pending, at 0x80); nop x4; 14: msr basepri, r3; bkpt;
+    // 20: the handler, movs r7, #9; bx lr
+    val code: [12]u16 = [MSR_BASEPRI_R2_1, MSR_BASEPRI_2, STR_R6_R5, NOP, NOP, NOP, NOP, MSR_BASEPRI_R3_1, MSR_BASEPRI_2, BKPT, MOVS_R7_9, BX_LR]
+    var c = recorded(Kind.V8mMain, code[..], [0, 0, 0x80, 0, LOG, NVIC_ISPR, 1], [[IRQ0, 20]], &irq0_kernel)
+
+    assert(c.r[7] == 9, "the handler ran")
+    // Pending at cycle 1; masked until the MSR at cycle 6, which retires at 7; entry takes nothing.
+    assert(latency_of(&c, IRQ0) == (1, 6, 6), s"${latency_of(&c, IRQ0)}")
+    assert(longest(&c) == (6, 0x0, 0xE), s"${longest(&c)}")
+    val text = masking_text(&c, 0)
+    assert(text.contains("latency core=0 exception=irq0 taken=1 max=6 mean=6\nlatency core=0 exception=irq0 bucket=4-7 count=1\n"), text)
+    stop_masking(&c)
+
+@test("two IRQs pending together: the second is tail-chained, and waits the first's handler too")
+latency_tail_chained()
+    // As latency_basepri, with IRQs 0 and 1 pending at once; each handler is two instructions.
+    val code: [12]u16 = [MSR_BASEPRI_R2_1, MSR_BASEPRI_2, STR_R6_R5, NOP, NOP, NOP, NOP, MSR_BASEPRI_R3_1, MSR_BASEPRI_2, BKPT, MOVS_R7_9, BX_LR]
+    var c = recorded(Kind.V8mMain, code[..], [0, 0, 0x80, 0, LOG, NVIC_ISPR, 3], [[IRQ0, 20], [IRQ0 + 1, 20]], &two_irqs)
+
+    assert(latency_of(&c, IRQ0) == (1, 6, 6), s"${latency_of(&c, IRQ0)}")
+    assert(latency_of(&c, IRQ0 + 1) == (1, 8, 8), s"${latency_of(&c, IRQ0 + 1)}")
+    stop_masking(&c)
+
+two_irqs(cpu: *Cpu)
+    store32(cpu, NVIC_ISER, 3)
+    store32(cpu, NVIC_IPR, 0x8080)
+
+@test("on the M0+, PendSV held off by PRIMASK waits from the store that pended it to the CPSIE")
+latency_pendsv()
+    // exc_primask's guest: 0: cpsid i; 2: str r6, [r5]; isb; movs; log; 12: cpsie i; ...; 20: PendSV
+    val code: [13]u16 = [
+        CPSID, STR_R6_R5, ISB_1, ISB_2,
+        MOVS_R0 | 1, LOG_R0, CPSIE,
+        MOVS_R0 | 2, LOG_R0, BKPT,
+        MOVS_R0 | 14, LOG_R0, BX_LR]
+    var c = recorded(Kind.V6m, code[..], [0, 0, 0, 0, LOG, ICSR, PENDSVSET], [[PENDSV, 20]], &nothing)
+
+    assert(logged(&c, [1, 14, 2]))
+    assert(latency_of(&c, PENDSV) == (1, 5, 5), s"${latency_of(&c, PENDSV)}")
+    assert(longest(&c) == (5, 0x0, 0xC), s"${longest(&c)}")
+    stop_masking(&c)
+
+@test("an exception cleared while pending forgets when it became pending; pended again, it waits from then")
+latency_cleared()
+    // 0: cpsid i; str r6, [r5] (set); str r7, [r5] (clear); nop; nop; 10: str r6, [r5]; 12: cpsie i;
+    // bkpt; 16: PendSV, bx lr
+    val code: [9]u16 = [CPSID, STR_R6_R5, STR_R7_R5, NOP, NOP, STR_R6_R5, CPSIE, BKPT, BX_LR]
+    var c = recorded(Kind.V6m, code[..], [0, 0, 0, 0, LOG, ICSR, PENDSVSET, PENDSVCLR], [[PENDSV, 16]], &nothing)
+
+    assert(latency_of(&c, PENDSV) == (1, 2, 2), s"${latency_of(&c, PENDSV)}")
+    stop_masking(&c)
+
+@test("SysTick is pending from the cycle it reached zero, under PRIMASK on the M0+ and on the M33")
+latency_systick()
+    // 0: cpsid i; nop x15; 32: cpsie i; bkpt; 36: SysTick, bx lr
+    var code: Buf[u16] = buf()
+    code.push(CPSID)
+    for i in 0..<15 do code.push(NOP)
+    code.push(CPSIE)
+    code.push(BKPT)
+    code.push(BX_LR)
+
+    for kind in [Kind.V6m, Kind.V8mMain]
+        var c = recorded(kind, code.view(), [], [[SYSTICK, 36]], &systick_10)
+
+        // Zero at 10; the CPSIE at 16 retires at 17.
+        assert(latency_of(&c, SYSTICK) == (1, 7, 7), s"${latency_of(&c, SYSTICK)}")
+        assert(longest(&c) == (16, 0x0, 0x20), s"${longest(&c)}")
+        assert(masking_text(&c, 0).contains("latency core=0 exception=systick taken=1 max=7 mean=7\n"))
+        stop_masking(&c)
+
+// ---------------------------------------------------------------------------------------------------
+// Off.
+
+@test("with the report off nothing is recorded, and the report is empty")
+mask_off()
+    val code: [4]u16 = [CPSID, NOP, CPSIE, BKPT]
+    var c = run_both(code[..], [], 0, [], &nothing)
+
+    assert(c.masking == null && !records_masking(&c))
+    assert(masking_text(&c, 0) == "" && masking_longest(&c).is_none() && latency_of(&c, PENDSV) == (0, 0, 0))
+
+    // Stopped, a core records nothing more.
+    var d = recorded(Kind.V6m, code[..], [], [], &nothing)
+    stop_masking(&d)
+    assert(d.masking == null && masking_text(&d, 0) == "")
+
+@test("exception names: the system exceptions, IRQs by number, and Non-secure copies")
+mask_names()
+    assert(exception_name(SYSTICK) == "systick" && exception_name(PENDSV) == "pendsv" && exception_name(NMI) == "nmi")
+    assert(exception_name(IRQ0) == "irq0" && exception_name(IRQ0 + 42) == "irq42")
+    assert(exception_name(NS_BANK + SYSTICK) == "systick_ns" && exception_name(9) == "exception9")

@@ -1229,6 +1229,28 @@ target that runs benchtop headless with `--deterministic` beside the QEMU machin
 milestone 1–4 and 6 scenarios run on the Pico 2's shape in benchtop before and alongside the board,
 and the board confirms.
 
+### 6.1.1 The masking report (built)
+
+skiff takes a per-object lock by raising BASEPRI over its kernel IRQs, and walks lists under it; it
+needs to see that masked time grows with the number of tasks, and that a fix bounds it. **Built**:
+`--report-masking <file>` on `run` and `bench-board` of a virtual board (README, "The masking
+report"), in `v6m/masking.sysl`, for every core model, both executors, and both cores taking turns or
+on threads. Per core it gives the longest masked intervals (PRIMASK, BASEPRI, FAULTMASK: the execution
+priority boost), with the addresses of the instructions that masked and unmasked, a histogram of their
+lengths, and per exception the latency from pending to the handler's first instruction, with a maximum
+and a histogram.
+
+**It costs nothing while it is off**, the condition it was built under. A core's record is a pointer,
+null by default, and every hook is behind one test of it on a path that is already rare: `MSR`/`CPS`
+(which take `n`, the retired count, so the interval is in the core's own cycles), exception entry and
+return, SysTick's expiry (`tick`), the slow path of a store (`slow_write`, after the store, so whatever
+a store pended or cleared is seen at that store's clock), and `begin_run`, which sees what a device or
+the other core raised since the last run. Nothing is added to the dispatch loop or to a handler's
+fast path. Choices: an exception does not cut a masked interval (the masks are not stacked, so the
+preempting handler runs masked too); exception entry costs no cycles in benchtop's model, so a latency
+is all wait; and the masked interval counts executed cycles, not time asleep, while latency counts
+both. Exclusive-monitor hold and spin times are not part of it.
+
 ### 6.2 The H7
 
 Where skiff stands (`origin/dev` 3cec4b3): milestones 0–4 done; **6 (protection) done on every QEMU
