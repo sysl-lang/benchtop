@@ -3,8 +3,8 @@ module sh.sysl.benchtop.v6m
 
 // Fault explanations (explain.sysl), against the ARMv7-M and ARMv8-M ARMs' descriptions of CFSR (MMFSR,
 // BFSR, UFSR), HFSR and SFSR: every status bit in words, then guests that fault — taken (MemManage,
-// FORCED HardFault, STKOF, SecureFault, an M0+'s HardFault) and stopped on (UNDEFINSTR, DIVBYZERO,
-// UNALIGNED, NOCP, INVSTATE, a bus error, lockups) — their frames on either stack, the backtrace's
+// FORCED HardFault, STKOF, SecureFault, UNDEFINSTR, DIVBYZERO, UNALIGNED, NOCP, INVSTATE, an M0+'s
+// HardFault) and stopped on (a bus error, lockups, a fault a debugger catches) — their frames on either stack, the backtrace's
 // scan through two BL frames with symbols and without, the ring, and first, last and count over a
 // guest that recovers.
 
@@ -121,51 +121,87 @@ explain_reason_order()
     assert(r.len() == 1 && r[0] == "HardFault: ARMv6-M records no cause", r[0])
 
 // ---------------------------------------------------------------------------------------------------
-// Faults benchtop stops on, explained from the stop and the instruction.
+// An instruction's UsageFault, taken: the CFSR the core recorded, and the frame.
 
-@test("explain: an undefined instruction is UsageFault UNDEFINSTR on an M33 and HardFault on an M0+, the live registers its frame")
+// A BKPT at FAULT_AT for the handlers, and the UsageFault enabled.
+private usage_handled(cpu: *Cpu)
+    store16(cpu, FAULT_AT, BKPT)
+    store32(cpu, SCB_SHCSR, SHCSR_USGFAULTENA)
+
+// `usage_handled`, with CCR.DIV_0_TRP.
+private div_handled(cpu: *Cpu)
+    usage_handled(cpu)
+    ccr_traps(cpu)
+
+// A BKPT at FAULT_AT, HardFault's handler.
+private hard_fault_handled(cpu: *Cpu) = store16(cpu, FAULT_AT, BKPT)
+
+// `c` ended in the handler at FAULT_AT, which took one fault: that fault, explained.
+private taken_once(c: *Cpu) -> Fault
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && faults_taken(c) == 1, f"${c.stop} at 0x${c.stop_at}%x, ${faults_taken(c)} faults")
+    last_taken(c)
+
+@test("explain: an undefined instruction is UsageFault UNDEFINSTR taken on an M33, HardFault on an M0+, the frame stacked with the instruction's PC")
 explain_undefined()
     // udf #0
-    var c = m33([0xDE00], [0x11, 0x22], [], &nothing)
-    var f = ended_on(&c)
-    assert(c.stop == Stop.Undefined && f.exception == USAGE_FAULT && !f.taken && !f.lockup && f.mainline, said(&f))
-    assert(f.reasons[0] == "UsageFault: UNDEFINSTR (undefined instruction 0xde00)", said(&f))
-    assert(!f.stacked && f.frame[6] == 0 && f.frame[0] == 0x11 && f.frame[1] == 0x22 && f.sp == 0x2000 && !f.psp, "the live registers")
-    c = m0([0xDE00], [], [], &nothing)
-    f = ended_on(&c)
-    assert(f.exception == HARD_FAULT && !f.mainline && f.reasons[0] == "HardFault: undefined instruction 0xde00 (ARMv6-M records no cause)", said(&f))
+    var c = m33([0xDE00], [0x11, 0x22], [[USAGE_FAULT, FAULT_AT]], &usage_handled)
+    var f = taken_once(&c)
+    assert(f.exception == USAGE_FAULT && f.taken && !f.lockup && f.mainline && f.cfsr == CFSR_UNDEFINSTR && f.hfsr == 0, said(&f))
+    assert(f.reasons.len() == 1 && f.reasons[0] == "UsageFault: UNDEFINSTR (undefined instruction)", said(&f))
+    assert(f.stacked && f.frame[6] == 0 && f.frame[0] == 0x11 && f.frame[1] == 0x22 && f.sp == 0x1FE0 && !f.psp, "the frame")
+    c = m0([0xDE00], [], [[HARD_FAULT, FAULT_AT]], &hard_fault_handled)
+    f = taken_once(&c)
+    assert(f.exception == HARD_FAULT && f.taken && !f.mainline && f.cfsr == 0 && f.frame[6] == 0, said(&f))
 
 @test("explain: a division by zero CCR.DIV_0_TRP traps is UsageFault DIVBYZERO, and with a divisor not zero there is no fault")
 explain_div_by_zero()
     // udiv r0, r1, r2
-    var c = m33([0xFBB1, 0xF0F2], [9, 7, 0], [], &ccr_traps)
-    var f = ended_on(&c)
-    assert(f.exception == USAGE_FAULT && f.reasons[0] == "UsageFault: DIVBYZERO (division by zero with CCR.DIV_0_TRP set, 0xfbb1 0xf0f2)", said(&f))
-    c = m33([0xFBB1, 0xF0F2], [9, 7, 1], [], &ccr_traps)
+    var c = m33([0xFBB1, 0xF0F2], [9, 7, 0], [[USAGE_FAULT, FAULT_AT]], &div_handled)
+    var f = taken_once(&c)
+    assert(f.exception == USAGE_FAULT && f.cfsr == CFSR_DIVBYZERO && f.frame[6] == 0 && f.frame[0] == 9, said(&f))
+    assert(f.reasons[0] == "UsageFault: DIVBYZERO (division by zero with CCR.DIV_0_TRP set)", said(&f))
+    c = m33([0xFBB1, 0xF0F2], [9, 7, 1], [[USAGE_FAULT, FAULT_AT]], &div_handled)
     assert(c.stop == Stop.Breakpoint && faults_of(&c).count == 0, "7 / 1 runs")
 
 @test("explain: an unaligned exclusive access is UsageFault UNALIGNED")
 explain_unaligned()
     // ldrex r0, [r1] at 0x1001
-    var c = m33([0xE851, 0x0F00], [99, 0x1001], [], &nothing)
-    var f = ended_on(&c)
-    assert(f.exception == USAGE_FAULT && !f.lockup && f.reasons[0] == "UsageFault: UNALIGNED (an exclusive or ordered access to an unaligned address, 0xe851 0x0f00)", said(&f))
+    var c = m33([0xE851, 0x0F00], [99, 0x1001], [[USAGE_FAULT, FAULT_AT]], &usage_handled)
+    var f = taken_once(&c)
+    assert(f.exception == USAGE_FAULT && f.cfsr == CFSR_UNALIGNED && f.frame[6] == 0 && f.frame[0] == 99, said(&f))
+    assert(f.reasons[0] == "UsageFault: UNALIGNED (an unaligned access)", said(&f))
 
-@test("explain: a floating-point instruction on an M33 without the FPU is UsageFault NOCP")
+@test("explain: a floating-point instruction on an M33 without the FPU is UsageFault NOCP, escalated to HardFault where the UsageFault is not enabled")
 explain_no_coprocessor()
     // vmov s0, r0
-    var c = m33([0xEE00, 0x0A10], [], [], &nothing)
-    var f = ended_on(&c)
-    assert(f.exception == USAGE_FAULT && f.reasons[0] == "UsageFault: NOCP (no coprocessor: the FPU or coprocessor is absent, or CPACR denies it, 0xee00 0x0a10)", said(&f))
+    var c = m33([0xEE00, 0x0A10], [], [[HARD_FAULT, FAULT_AT]], &hard_fault_handled)
+    var f = taken_once(&c)
+    assert(f.exception == HARD_FAULT && f.cfsr == CFSR_NOCP && f.hfsr == HFSR_FORCED && f.frame[6] == 0, said(&f))
+    assert(f.reasons[0] == "HardFault: FORCED (escalated from UsageFault: NOCP)", said(&f))
+    assert(f.reasons[1] == "UsageFault: NOCP (no coprocessor: the FPU or coprocessor is absent, or CPACR denies it)", said(&f))
 
-@test("explain: an exception whose vector lacks its Thumb bit is UsageFault INVSTATE on an M33, HardFault on an M0+, naming the vector")
+@test("explain: an exception whose vector lacks its Thumb bit is INVSTATE at its handler's first instruction: HardFault FORCED on an M33, HardFault on an M0+")
 explain_bad_vector()
-    var c = m33([SVC, BKPT], [], [], &nothing)
+    // svc, SVCall's vector unset: its handler is at 0, entered with EPSR.T clear.
+    var c = m33([SVC, BKPT], [], [[HARD_FAULT, FAULT_AT]], &hard_fault_handled)
+    var f = taken_once(&c)
+    assert(f.exception == HARD_FAULT && f.cfsr == CFSR_INVSTATE && f.hfsr == HFSR_FORCED && f.frame[6] == 0 && f.frame[7] & 0x010001FF == SVCALL, said(&f))
+    assert(f.reasons[1] == "UsageFault: INVSTATE (invalid state: a branch or a vector without the Thumb bit)", said(&f))
+    c = m0([SVC, BKPT], [], [[HARD_FAULT, FAULT_AT]], &hard_fault_handled)
+    f = taken_once(&c)
+    assert(f.exception == HARD_FAULT && f.frame[6] == 0 && f.frame[7] & 0x010001FF == SVCALL, said(&f))
+
+@test("explain: a fault the core stops on under a debugger (catch_faults) is explained from the stop and the instruction, with the live registers")
+explain_caught()
+    // udf #0, on a core whose faults a debugger catches.
+    var c = m33([0xDE00], [0x11, 0x22], [], &caught)
     var f = ended_on(&c)
-    assert(c.stop == Stop.Fault && f.exception == USAGE_FAULT && f.reasons[0] == "UsageFault: INVSTATE (the vector at 0x00000c2c lacks its Thumb bit)", said(&f))
-    c = m0([SVC, BKPT], [], [], &nothing)
-    f = ended_on(&c)
-    assert(f.exception == HARD_FAULT && f.reasons[0] == "HardFault: the vector at 0x00000c2c lacks its Thumb bit", said(&f))
+    assert(c.stop == Stop.Undefined && f.exception == USAGE_FAULT && !f.taken && !f.lockup && f.mainline, said(&f))
+    assert(f.reasons[0] == "UsageFault: UNDEFINSTR (undefined instruction 0xde00)", said(&f))
+    assert(!f.stacked && f.frame[6] == 0 && f.frame[0] == 0x11 && f.frame[1] == 0x22 && f.sp == 0x2000 && !f.psp, "the live registers")
+
+private caught(cpu: *Cpu)
+    cpu.catch_faults = true
 
 @test("explain: a data access where nothing answers is BusFault PRECISERR with BFAR, a fetch is IBUSERR; an M0+'s are HardFault")
 explain_bus_errors()
@@ -310,11 +346,14 @@ private calls_table(code: []const CodeRange) -> SymbolTable
     for r in code do ranges.push(r)
     SymbolTable(names, ranges)
 
+// CALLS on an M0+, its UDF taking HardFault, whose handler is a BKPT at FAULT_AT.
+private calls_run(ring: u32, table: Option[&SymbolTable]) -> Cpu = explained(Kind.V6m, CALLS[..], [], [[HARD_FAULT, FAULT_AT]], &hard_fault_handled, ring, table)
+
 @test("explain: the backtrace scans through two BL frames: the PC, LR, then each return address pushed above, each marked scan, the pushed copy of LR once")
 explain_scan_backtrace()
-    var c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 0, None)
-    var f = ended_on(&c)
-    assert(c.stop == Stop.Undefined && c.stop_at == 0x32, s"${c.stop} at 0x${c.stop_at}")
+    var c = calls_run(0, None)
+    var f = taken_once(&c)
+    assert(f.exception == HARD_FAULT && f.frame[6] == 0x32, f"HardFault for 0x${f.frame[6]}%x")
     val pcs: [4]u32 = [0x32, 0x26, 0x16, 0x04]
     val vias = [Via.Frame, Via.Lr, Via.Scan, Via.Scan]
     assert(f.trace.len() == 4, s"${f.trace.len()} entries")
@@ -323,8 +362,8 @@ explain_scan_backtrace()
 @test("explain: with symbols the PC, LR and every backtrace entry are named; without, the addresses alone; an executable section bounds the scan")
 explain_symbols()
     val table: &SymbolTable = calls_table([CodeRange(0, 0x40)][..])
-    var c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 0, Some(table))
-    var f = ended_on(&c)
+    var c = calls_run(0, Some(table))
+    var f = taken_once(&c)
     val named = fault_text(&f, table.names.view(), "fault")
     assert(named.contains("pc 0x00000032 f3+0x2   lr 0x00000027 f2+0x6"), named)
     assert(named.contains("0x00000032 f3+0x2 (frame)") && named.contains("0x00000026 f2+0x6 (lr)"), named)
@@ -333,18 +372,18 @@ explain_symbols()
     assert(bare.contains("0x00000016 (scan)") && !bare.contains("f1"), bare)
     // An executable section that leaves main out: its return address is not code, and not scanned.
     val narrow: &SymbolTable = calls_table([CodeRange(0x10, 0x40)][..])
-    c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 0, Some(narrow))
-    var g = ended_on(&c)
+    c = calls_run(0, Some(narrow))
+    var g = taken_once(&c)
     assert(g.trace.len() == 3 && g.trace[2].pc == 0x16, s"${g.trace.len()} entries")
 
 @test("explain: the ring holds the last n instructions the core ran, oldest first, the faulting one last; it is off by default and costs the threaded chain nothing then")
 explain_ring()
-    var c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 4, None)
+    var c = calls_run(4, None)
     assert(c.tracing, "a ring makes the core trace")
-    var f = ended_on(&c)
+    var f = taken_once(&c)
     assert(f.ring.len() == 4 && f.ring[0] == 0x20 && f.ring[1] == 0x22 && f.ring[2] == 0x30 && f.ring[3] == 0x32, s"${f.ring.len()} entries")
-    c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 16, None)
-    f = ended_on(&c)
+    c = calls_run(16, None)
+    f = taken_once(&c)
     val all: [7]u32 = [0x00, 0x10, 0x12, 0x20, 0x22, 0x30, 0x32]
     assert(f.ring.len() == 7, s"${f.ring.len()} entries")
     for k in 0..<7 do assert(f.ring[k] == all[k], f"entry $k: 0x${f.ring[k]}%x")
@@ -354,8 +393,8 @@ explain_ring()
     f = last_taken(&c)
     assert(f.ring.len() == 2 && f.ring[0] == 4 && f.ring[1] == 8, s"${f.ring.len()} entries")
     // Off by default: no tracing, no ring.
-    c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 0, None)
-    assert(!c.tracing && ended_on(&c).ring.is_empty(), "no ring")
+    c = calls_run(0, None)
+    assert(!c.tracing && taken_once(&c).ring.is_empty(), "no ring")
     stop_explaining(&c)
     assert(c.fault_log == null && !c.tracing, "stopped")
 

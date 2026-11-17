@@ -179,11 +179,16 @@ stops_alike(code: []const u16, timed: bool, setup: Setup, resume: Setup) -> Cpu
 // The xPSR an exception stacks at the stop: Z, C and T from the CMP, and ITSTATE `it`.
 xpsr_with(it: u32) -> u32 = 0x61000000 | ((it & 3) << 25) | ((it >> 2) << 10)
 
-@test("a core stopped on any instruction of a block — an access nothing answers, a breakpoint, an undefined one — holds its own ITSTATE, under both executors, timed or not")
+// HardFault's handler a BKPT at FAULT_AT.
+hard_fault_bkpt(cpu: *Cpu)
+    store32(cpu, VECTORS + HARD_FAULT * 4, FAULT_AT | 1)
+    store16(cpu, FAULT_AT, BKPT)
+
+@test("a core stopped on any instruction of a block — an access nothing answers, a breakpoint — holds its own ITSTATE, and an undefined one stacks it, under both executors, timed or not")
 t2e_stop_itstate_every_position()
-    // ldr r3, [r1]; str r3, [r1]; bkpt; udf #0.
-    val stoppers: []const u16 = [0x680B, 0x600B, BKPT, 0xDE00]
-    val stops = [Stop.Unmapped, Stop.Unmapped, Stop.Breakpoint, Stop.Undefined]
+    // ldr r3, [r1]; str r3, [r1]; bkpt.
+    val stoppers: []const u16 = [0x680B, 0x600B, BKPT]
+    val stops = [Stop.Unmapped, Stop.Unmapped, Stop.Breakpoint]
 
     for s in 0..<stoppers.len
         for k in 0u32..<4
@@ -194,6 +199,16 @@ t2e_stop_itstate_every_position()
                 assert(c.stop == stops[s] && c.stop_at == (if s < 2 then 0x50000000 else at), f"stopper ${s} at ${k}: ${c.stop} at 0x${c.stop_at}%x")
                 assert(c.pc == at && c.retired == u64(2 + k) && c.r[2] == k, f"stopper ${s} at ${k}: pc 0x${c.pc}%x after ${c.retired}")
                 assert(c.it == 1 << k, f"stopper ${s} at ${k}, timed ${timed}: ITSTATE 0x${c.it}%02x")
+
+    // udf #0 at each position: UNDEFINSTR, escalated, its frame holding the instruction's own ITSTATE.
+    for k in 0u32..<4
+        for timed in [false, true]
+            var c = stops_alike(block_with(0xDE00, k)[0..<6], timed, &hard_fault_bkpt, null)
+            val at = 4 + 2 * k
+
+            assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == HARD_FAULT && c.it == 0, f"UDF at ${k}: ${c.stop} at 0x${c.stop_at}%x")
+            assert(c.cfsr == CFSR_UNDEFINSTR && c.hfsr == HFSR_FORCED && c.retired == u64(2 + k) && c.r[2] == k, f"UDF at ${k}")
+            assert(load32(&c, c.r[13] + 24) == at && load32(&c, c.r[13] + 28) == xpsr_with(1 << k), f"UDF at ${k}, timed ${timed}: xPSR 0x${load32(&c, c.r[13] + 28)}%08x")
 
 enable_irq0(cpu: *Cpu) = store32(cpu, NVIC_ISER, 1)
 
@@ -663,32 +678,38 @@ t2e_scs_v6m()
 
 ccr_traps(cpu: *Cpu) = store32(cpu, SCB_CCR, 0x10)
 
-@test("with CCR.DIV_0_TRP a division by zero stops on the instruction, the UsageFault benchtop does not take")
+// CCR.DIV_0_TRP, and HardFault's handler a BKPT at FAULT_AT.
+ccr_traps_handled(cpu: *Cpu)
+    ccr_traps(cpu)
+    hard_fault_bkpt(cpu)
+
+@test("with CCR.DIV_0_TRP a division by zero is the UsageFault DIVBYZERO on the instruction, escalated to HardFault where the UsageFault is not enabled")
 t2e_div_trap()
     // udiv r0, r1, r2
-    var c = run_both8([0xFBB1, 0xF0F2], [9, 7, 0], 0, [], &ccr_traps)
+    var c = run_both8([0xFBB1, 0xF0F2], [9, 7, 0], 0, [], &ccr_traps_handled)
 
-    assert(c.stop == Stop.Fault && c.stop_at == 0 && c.r[0] == 9 && c.retired == 0, "stopped")
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == HARD_FAULT && c.r[0] == 9 && c.retired == 0, "taken")
+    assert(c.cfsr == CFSR_DIVBYZERO && c.hfsr == HFSR_FORCED && load32(&c, c.r[13] + 24) == 0, "DIVBYZERO, FORCED, the frame returning to it")
 
-// The one instruction stops the core at `Undefined`, there.
-undefined8(code: []const u16) -> bool
-    var c = run_both8(code, [], 0, [], &nothing)
+// The one instruction raises the UsageFault `bits` on itself: escalated to HardFault, nothing retired.
+undefined8(code: []const u16, bits: u32) -> bool
+    var c = run_both8(code, [], 0, [], &hard_fault_bkpt)
 
-    c.stop == Stop.Undefined && c.stop_at == 0 && c.retired == 0
+    c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.retired == 0 && c.cfsr == bits && c.hfsr == HFSR_FORCED && load32(&c, c.r[13] + 24) == 0
 
-@test("the encodings this kind leaves undefined: UDF, the Security, FP, DSP and coprocessor extensions'")
+@test("the encodings this kind leaves undefined: UDF, the Security, DSP extensions' UNDEFINSTR; the FPU's and a coprocessor's, absent, NOCP")
 t2e_undefined()
-    assert(undefined8([0xDE00]), "UDF")
-    assert(undefined8([0xF7F0, 0xA000]), "UDF.W")
-    assert(undefined8([0xE841, 0xF000]), "TT")
-    assert(undefined8([0xE97F, 0xE97F]), "SG")
-    assert(undefined8([0x4774]), "BXNS")
-    assert(undefined8([0xEE30, 0x0A81]), "VADD.F32")
-    assert(undefined8([0xEE00, 0x0010]), "MCR")
-    assert(undefined8([0xFA82, 0xF081]), "QADD")
-    assert(undefined8([0xFA91, 0xF002]), "SADD16")
-    assert(undefined8([0xF321, 0x0007]), "SSAT16")
-    assert(undefined8([0xFB11, 0x3002]), "SMLABB")
+    assert(undefined8([0xDE00], CFSR_UNDEFINSTR), "UDF")
+    assert(undefined8([0xF7F0, 0xA000], CFSR_UNDEFINSTR), "UDF.W")
+    assert(undefined8([0xE841, 0xF000], CFSR_UNDEFINSTR), "TT")
+    assert(undefined8([0xE97F, 0xE97F], CFSR_UNDEFINSTR), "SG")
+    assert(undefined8([0x4774], CFSR_UNDEFINSTR), "BXNS")
+    assert(undefined8([0xEE30, 0x0A81], CFSR_NOCP), "VADD.F32")
+    assert(undefined8([0xEE00, 0x0010], CFSR_NOCP), "MCR")
+    assert(undefined8([0xFA82, 0xF081], CFSR_UNDEFINSTR), "QADD")
+    assert(undefined8([0xFA91, 0xF002], CFSR_UNDEFINSTR), "SADD16")
+    assert(undefined8([0xF321, 0x0007], CFSR_UNDEFINSTR), "SSAT16")
+    assert(undefined8([0xFB11, 0x3002], CFSR_UNDEFINSTR), "SMLABB")
 
 // ---------------------------------------------------------------------------------------------------
 // The decode cache and IT.

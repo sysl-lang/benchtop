@@ -490,11 +490,15 @@ subset of the above):
   clear, ISRPENDING, VECTPENDING, VECTACTIVE), VTOR, AIRCR (SYSRESETREQ under the key stops the core
   at `Reset`; what a reset means is the board's), SHPR2, SHPR3; SysTick CSR/RVR/CVR/CALIB. Each is a
   word; any other width, or any other address in the system control space, stops at `Unmapped`.
-- **Not modelled**: lockup, the MPU, and HardFault for an undefined instruction or a bad access,
-  which stop the core at `Undefined` or `Unmapped` as they always have. An exception that cannot be
-  taken — `SVC` inside HardFault, an EXC_RETURN naming no return, a return whose stacked IPSR
-  disagrees with the mode it names, a vector without its Thumb bit (an unset one is 0) — stops at
-  `Fault`. An access off the RAM while stacking or unstacking stops at `Unmapped` like any other.
+- **HardFault for an instruction** is taken as silicon takes it: an undefined instruction, a branch
+  to an even address or a vector without its Thumb bit (an unset one is 0) — whose handler's first
+  instruction faults, its frame's xPSR with T clear — and an exception return to a frame whose xPSR
+  has T clear. HardFault within HardFault is a lockup, which stops the core at `Fault` there. Under a
+  debugger or the window (`Cpu.catch_faults`) the core stops on the instruction instead.
+- **Not modelled**: the MPU, and HardFault for a bad access, which stops the core at `Unmapped`. An
+  exception that cannot be taken — `SVC` inside HardFault, an EXC_RETURN naming no return, a return
+  whose stacked IPSR disagrees with the mode it names — stops at `Fault`. An access off the RAM while
+  stacking or unstacking stops at `Unmapped` like any other.
 
 **The clock is the instruction count.** SysTick counts down once per instruction retired, plus the
 time a `WFI` skips; it is worked out from the clock when a register is read, not decremented. A guest
@@ -889,15 +893,23 @@ executes without the FP, Security and MPU extensions; integer DSP is optional vi
   benchtop does not take: **the core stops at `Stop.StackLimit`** on the instruction (or, on entry, the
   address the exception would have returned to), with nothing stored. `MSR` to MSP or PSP is not
   checked.
-- **Faults are stops**, as on ARMv6-M: an undefined instruction stops at `Undefined`, an access where
-  nothing is at `Unmapped`, a division by zero with CCR.DIV_0_TRP at `Fault` (without it the quotient
-  is 0); MemManage, BusFault and UsageFault are never taken, and CFSR, HFSR, MMFAR and BFAR read 0.
-  An unaligned exclusive or ordered access (`LDREX`, `STREX`, `LDA`, `STL` and their sizes) is the
-  UsageFault UNALIGNED whatever CCR.UNALIGN_TRP says, and stops at `Fault` on the instruction with
-  nothing loaded or stored. An unaligned `LDRD` or `LDM`, which also faults on silicon, is made as an
-  unaligned access. An unaligned access whose bytes run past the RAM's last byte stops at
-  `Unmapped`, as an access off the RAM does, on every core kind.
-  These, with the escalation to HardFault and its registers, are a later item.
+- **An instruction's UsageFault is taken** (`usage` in t2secure.sysl, through `fault`): UNDEFINSTR for
+  an undefined instruction; NOCP for one of a coprocessor the core lacks (CP10/11 with no FPU, a CP0–7
+  port with nothing on it), one CPACR denies, or, from Non-secure state, one NSACR denies (Secure
+  state's NOCP); INVSTATE for a branch (`BX`, `BLX`, `POP {pc}`, `LDR pc`) to an even address, a vector
+  without its Thumb bit, or a return to a frame whose xPSR has T clear — taken at the instruction there,
+  its frame's xPSR with T clear; DIVBYZERO for a division by zero with CCR.DIV_0_TRP (without it the
+  quotient is 0); and UNALIGNED for an exclusive or ordered access (`LDREX`, `STREX`, `LDA`, `STL` and
+  their sizes) at an address not its size's, whatever CCR.UNALIGN_TRP says. The bit is recorded in the
+  CFSR of the state the fault arose in (UsageFault is banked), the instruction does not complete and
+  the frame returns to it; where SHCSR.USGFAULTENA is clear or the priority does not preempt, HardFault
+  with HFSR.FORCED; where not even that preempts, a lockup at `Fault`. Under a debugger or the window
+  (`Cpu.catch_faults`) the core stops on the instruction instead, at `Undefined` or `Fault`.
+- **Still stops**: an access where nothing is stops at `Unmapped` (BusFault, BFAR and its stacking
+  faults are not taken), as does a fetch there; an unaligned `LDRD`, `STRD`, `LDM` or `STM`, which
+  faults on silicon, is made as an unaligned access, and CCR.UNALIGN_TRP is stored but does not trap,
+  since checking either would cost every access its alignment test. An unaligned access whose bytes
+  run past the RAM's last byte stops at `Unmapped`, as an access off the RAM does, on every core kind.
 - **Undefined in this kind**: the coprocessor space other than the floating-point unit a board gives the core (§2.13), and, with DSP disabled, the DSP extension (`QADD`,
   `SADD16`, `SSAT16`, `SMLABB`, the extend-and-adds `SXTAB` and its kin), the Security Extension's
   `TT`, `SG`, `BXNS` and `BLXNS`, `UDF`, and the encodings ARMv8-M calls UNPREDICTABLE that a
@@ -1022,7 +1034,7 @@ control space (`v6m/fpu.sysl`).
   invalid (NaN, or past either end, saturating) and inexact (a fraction dropped), and `VCMPE`'s
   invalid on a quiet NaN. A conversion from fixed point rounds to nearest whatever the mode.
 - **Access** follows CPACR.CP10: none, or privileged-only from unprivileged code, is the UsageFault
-  NOCP, which stops the core at `Fault` on the instruction. The first instruction allowed with
+  NOCP, taken on the instruction (and from Non-secure state, NSACR.CP10 clear is Secure state's NOCP). The first instruction allowed with
   FPCCR.ASPEN set and CONTROL.FPCA clear creates a new context: FPCA is set, and FPSCR takes AHP, DN,
   FZ and RMode from FPDSCR.
 - **Exceptions**: with FPCA set, entry stacks the extended frame — S0–S15, FPSCR and a reserved word
