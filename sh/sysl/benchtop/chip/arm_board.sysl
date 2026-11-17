@@ -13,6 +13,7 @@ import sh.sysl.rp2350.psm as psm_reg
 import sysl.buf.{Buf, buf}
 import sysl.fmt.hex
 import sysl.math.min
+import sysl.rand.{Rng, rng}
 
 // An RP2350 booted on its two Cortex-M33 cores (`mcus/rp2350.hocon`, the `pico2` board): the chip, its
 // SRAM as the cores' RAM, and the cores reaching every other address, and their coprocessor ports,
@@ -82,7 +83,8 @@ import sysl.math.min
 // the quantum's end unless an interrupt, its SysTick or (for `WFE`) the other core's `SEV` wakes it;
 // while both sleep the board skips to the next device event or SysTick. A core asleep in `WFE` with
 // no interrupt enabled is not signalled the chip's lines until it wakes. A core that executes `BKPT`
-// ends the run.
+// ends the run. A seeded run (`explore`) draws each quantum's length, 1 to twice `quantum`, and which
+// core runs it first, from its seed.
 //
 // **The board is generic over its chip** (`ArmChip`): `ArmBoard` (`ArmBoard[Rp2350]`) is the Pico 2,
 // and `ArmBoard[Rp2040]` the Pico (`mcus/rp2040.hocon`, the `pico` board): an RP2040 on its two
@@ -166,6 +168,8 @@ trait ArmChip
     shared_lines(*self) -> u64
     /** The lines only core `k` has, high at the moment. */
     core_lines(*self, k: u32) -> u64
+    /** Of core `k`'s lines, those the other core raises through the SIO: its FIFO's and its doorbell's. */
+    sio_lines(*self, k: u32) -> u64
     /** Whether a read of `a` can lower a line the other core shares: a UART's data register, whose read
      * pops the RX FIFO. Every other line falls only on a write or at a settle, so a core polling a flag
      * register (UARTFR while it waits to send) costs nothing here.
@@ -229,6 +233,15 @@ struct ArmBoard[C: ArmChip = Rp2350]
     // Whether `boot` starts core 0 from reset in the boot ROM, whose boot path finds the image in
     // flash, rather than at the image's entry as a debugger does.
     rom_boot: bool
+    // `--seed` (`explore`): each quantum's length, 1 to twice `quantum`, and which core runs it first are
+    // drawn from `turns`.
+    seeded: bool
+    turns: Rng
+    // `--late-irq`, 0 for off: where a core's SIO lines (`ArmChip.sio_lines`) rise from all low, they
+    // reach it a number of cycles later drawn by that core, 0 to `line_late`, at the chip's clock
+    // `line_from[k]`; `NEVER` while they are low.
+    line_late: u64
+    line_from: [2]u64
 
 /** A board with `map`'s SRAM, powered on, holding no image. */
 arm_board(map: SramMap) -> &ArmBoard
@@ -236,7 +249,7 @@ arm_board(map: SramMap) -> &ArmBoard
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
     val sram_at = rom_at + ROM_BYTES + arm.GUARD_BYTES
-    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host(), false)
+    ArmBoard(rp2350(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host(), false, false, rng(0, 0), 0, [NEVER, NEVER])
 
 /** An RP2350B board, the RP2350 in its QFN-80 package: `arm_board` with the chip of `rp2350b`. */
 arm_board_qfn80(map: SramMap) -> &ArmBoard
@@ -249,7 +262,7 @@ pico_board(map: SramMap) -> &ArmBoard[Rp2040]
     var cores: [2]arm.Cpu
     val rom_at = page_up(map.size) + arm.GUARD_BYTES
     val sram_at = rom_at + ROM_BYTES_RP2040 + arm.GUARD_BYTES
-    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host(), false)
+    ArmBoard(rp2040(), cores, arm.memory(), map, [false, false], 0, [0, 0], [0, 0], 1000, "", "", buf(), rom_at, sram_at, false, 0, [0; 32], false, [0; 4096], usb_host(), false, false, rng(0, 0), 0, [NEVER, NEVER])
 
 impl[C: ArmChip] ArmBoard[C]
     /** Power on with `image`, written where its addresses say: core 0 at its entry, core 1 in the boot
@@ -321,17 +334,35 @@ impl[C: ArmChip] ArmBoard[C]
         if !h.timed || !h.framed() then return None
         Some(if h.due > self.chip.clock() then h.due - self.chip.clock() else 0)
 
+    /** Vary the run as `f` says from now on (faults.sysl): where it is seeded, each quantum's length and
+     * which core runs it first; and the faults the cores inject, and the SIO lines' delay. A boot keeps
+     * them; calling it again starts every draw afresh from the seed.
+     */
+    explore(*self, f: arm.Faults)
+        self.seeded = f.seeded
+        self.turns = f.stream(0)
+        self.line_late = f.irq_late
+        self.line_from = [NEVER, NEVER]
+        for k in 0..<2 do arm.inject(&self.cores[k], f, u64(k))
+
     /** Run until `cycles` more clk_sys cycles have passed, or something ends the run first. */
     run(*self, cycles: u64) -> RunEnd
         val limit = self.chip.clock() + cycles
         while self.chip.clock() < limit
-            var q = min(self.quantum, limit - self.chip.clock())
+            var q = min(if self.seeded then 1 + self.turns.below(2 * self.quantum) else self.quantum, limit - self.chip.clock())
             if const C.rp2350()
                 self.chip.hstx_irq_due() match
                     Some(n) -> q = min(q, n)
                     None -> ()
+            // A held SIO line is looked at again when it is due to reach its core.
+            if self.line_late != 0
+                self.lines_due() match
+                    Some(n) -> q = min(q, n)
+                    None -> ()
             self.quantum_at = self.chip.clock()
-            for k in 0..<2
+            val first: usize = if self.seeded && self.turns.boolean() then 1 else 0
+            for i in 0..<2
+                val k = i ^ first
                 if !self.started[k] then continue
                 val end = self.run_core(k, q)
                 if end != RunEnd.Budget
@@ -467,6 +498,7 @@ impl[C: ArmChip] ArmBoard[C]
     // The cycles until a device event or a sleeping core's SysTick could wake a core.
     private[chip] next_wake(*self) -> Option[u64]
         var due = earliest(self.chip.due(), self.next_usb_frame())
+        if self.line_late != 0 then due = earliest(due, self.lines_due())
         for k in 0..<2
             if !self.started[k] then continue
             val c = &self.cores[k]
@@ -493,7 +525,7 @@ impl[C: ArmChip] ArmBoard[C]
         if self.chip.core1_stopped() then self.started[1] = false
         if self.chip.core1_started() then self.rom_reset(1)
         val shared = self.chip.shared_lines()
-        for k in 0..<2 do if self.started[k] then arm.raise_lines(&self.cores[k], shared | self.chip.core_lines(u32(k)))
+        for k in 0..<2 do if self.started[k] then arm.raise_lines(&self.cores[k], self.held_back(k, shared | self.chip.core_lines(u32(k))))
 
     // Before core `cpu`'s write to the chip, or a read that can lower a line (`ArmChip.read_lowers`):
     // either may lower a line a device raised since the last `settle`, as the chip ran up to the access.
@@ -504,7 +536,30 @@ impl[C: ArmChip] ArmBoard[C]
     @noinline
     private latch_for_sleeper(*self, cpu: *arm.Cpu)
         val k = 1 - usize(cpu.core)
-        if self.started[k] && self.cores[k].sleeping then arm.raise_lines(&self.cores[k], self.chip.shared_lines() | self.chip.core_lines(u32(k)))
+        if self.started[k] && self.cores[k].sleeping then arm.raise_lines(&self.cores[k], self.held_back(k, self.chip.shared_lines() | self.chip.core_lines(u32(k))))
+
+    // Core `k`'s `lines`, less its SIO lines while `--late-irq` holds them back.
+    @inline
+    private held_back(*self, k: usize, lines: u64) -> u64 = if self.line_late == 0 then lines else self.hold_lines(k, lines)
+
+    @noinline
+    private hold_lines(*self, k: usize, lines: u64) -> u64
+        val sio = self.chip.sio_lines(u32(k))
+        if lines & sio == 0
+            self.line_from[k] = NEVER
+            return lines
+        val now = self.chip.clock()
+        if self.line_from[k] == NEVER then self.line_from[k] = now + self.cores[k].faults.below(self.line_late + 1)
+        if now >= self.line_from[k] then lines else lines & ~sio
+
+    // The cycles until a held SIO line reaches its core, None for none held.
+    private lines_due(*self) -> Option[u64]
+        var due: Option[u64] = None
+        val now = self.chip.clock()
+        for k in 0..<2
+            val at = self.line_from[k]
+            if self.started[k] && at != NEVER && at > now then due = earliest(due, Some(at - now))
+        due
 
     // The chip's clock at core `cpu`'s `n`th retired instruction.
     private at(*self, cpu: *arm.Cpu, n: u64) -> u64 = self.quantum_at + (arm.clock(cpu, n) - self.clock_at[usize(cpu.core)])

@@ -122,7 +122,16 @@ Sources, and how far each was checked:
   fixed quanta, so a run is reproducible to the instruction. **Tests use it.** QEMU's MTTCG made
   skiff's AN521 boots flaky (skiff `CLAUDE.md`, milestone 2: a tick delivered up to 5 ticks late), and
   benchtop should not repeat that. `--seed n` jitters the quanta, which explores interleavings
-  reproducibly: a skiff race found at seed 1234 recurs at seed 1234.
+  reproducibly: a skiff race found at seed 1234 recurs at seed 1234. Each round's length is drawn
+  from 1 to twice the quantum, and which core takes the first turn, from a generator seeded once
+  (`sysl.rand`'s PCG32, stream 0; `virt/scheduler.sysl`'s `round`, `chip/arm_board.sysl`'s `run`).
+  The same seed also drives the **faults** a run can inject (`v6m/faults.sysl`), each from its core's
+  own stream so that one core's draws never shift the other's: a SysTick exception delivered late,
+  ticks held and delivered back to back (the late, bunched ticks MTTCG gave skiff's core 1), the SIO
+  FIFO and doorbell interrupts raised late, and STREXes that fail though the monitor holds. None of
+  it costs a run that asks for none anything per instruction: the scheduler draws only where a round
+  starts, SysTick's faults are looked at where it is brought up to the clock, and the STREX fault is
+  one test of a zero field in the STREX. README "Exploring interleavings" has the options.
 - **The virtual boards (§11) run their two cores this way by default.** A round gives core
   0 a turn and then core 1, each running until its clock (instructions retired plus the time skipped
   asleep) reaches the round's end, `quantum` past the last one's: 1000 instructions by default, a
@@ -134,8 +143,9 @@ Sources, and how far each was checked:
   roughly 0.7 µs a 1000-instruction turn takes) and how late a core sees the other: at the RP2040's
   125 MHz, a quantum is 8 µs, so a FIFO round trip costs at most two turns, about an interrupt's
   latency. Tests set a quantum of a dozen instructions to pin an exact
-  interleaving. There is no `--seed` yet; the quantum is the one input to the interleaving, and the
-  same image, input and quantum give the same run, counts and all. This single-threaded run is the
+  interleaving. Without a seed the quantum is the one input to the interleaving, and the same image,
+  input and quantum give the same run, counts and all; with one, the same image, input, quantum and
+  seed do. This single-threaded run is the
   oracle the threaded mode is checked against.
 - **`benchtop run --threads` gives each of the virtual board's cores a host thread of its own**
   (`virt/scheduler.sysl`). Core 0 runs alone, exactly as above, until it launches core 1; then core 1
