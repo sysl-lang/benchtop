@@ -1,0 +1,223 @@
+module sh.sysl.benchtop.v6m
+
+// Arm semihosting, for a core whose board turned it on (`Cpu.semihosting`): `BKPT 0xAB` is a call to
+// the host, not a stop. R0 holds the call's number and R1 its argument (a value, or the address of a
+// block of 32-bit words); the answer, where there is one, comes back in R0 and the core runs on from
+// the instruction after the `BKPT`. A `BKPT` of any other immediate, or any `BKPT` of a core that has
+// semihosting off, stops the core as it always has.
+//
+// **The behaviour is QEMU's** (`semihosting/arm-compat-semi.c` and `semihosting/syscalls.c`, as
+// `qemu-system-arm -semihosting` runs them for a 32-bit core), so a guest that ends a run through it
+// ends it the same way on both:
+//
+// * `SYS_EXIT_EXTENDED` (0x20): R1 points at `{type, subcode}`. A type of `ADP_Stopped_ApplicationExit`
+//   (0x20026) ends the run with the subcode as its status; any other type ends it with status 1.
+// * `SYS_EXIT` (0x18) on a 32-bit core has no block: R1 is the reason itself. 0x20026 ends the run
+//   with status 0 and anything else with status 1.
+// * `SYS_WRITEC` (0x03) writes the byte R1 points at, and `SYS_WRITE0` (0x04) the NUL-terminated
+//   string there, to the console. QEMU leaves 0xDEADBEEF in R0 as neither has an answer.
+// * `SYS_OPEN` (0x01) opens only the console, `:tt`, as QEMU does: a read mode (0-3) is standard input,
+//   a write mode (4-7) standard output and an append mode (8-11) standard error. It answers a
+//   descriptor of 1 or more, or -1 for any other name or a mode above 11 (QEMU opens host files for
+//   other names; benchtop does not). `SYS_CLOSE` (0x02) answers 0 for an open descriptor and -1 for
+//   any other.
+// * `SYS_WRITE` (0x05): R1 points at `{descriptor, address, length}`. It answers the number of bytes
+//   *not* written: 0 for all of them, the length where nothing was (a descriptor that is not open, or
+//   one opened for reading, or a buffer that is not all in memory the core can read).
+//
+// A call benchtop does not implement stops the core as an undefined instruction at the `BKPT`, where
+// QEMU aborts. Reading the guest's memory never touches a device and never stops the core: an address
+// with no page on the fast path is a fault the call answers (-1 in R0, or the call's own error).
+
+import sysl.math.min
+
+/** The immediate of the `BKPT` that makes a semihosting call. */
+const SEMIHOST_CALL: u32 = 0xAB
+
+const SYS_OPEN: u32 = 0x01
+const SYS_CLOSE: u32 = 0x02
+const SYS_WRITEC: u32 = 0x03
+const SYS_WRITE0: u32 = 0x04
+const SYS_WRITE: u32 = 0x05
+const SYS_EXIT: u32 = 0x18
+const SYS_EXIT_EXTENDED: u32 = 0x20
+
+/** The reason with which a guest says it ended on purpose, rather than by a failure. */
+const ADP_STOPPED_APPLICATION_EXIT: u32 = 0x20026
+
+/** What a call with no answer leaves in R0. */
+const NO_ANSWER: u32 = 0xDEADBEEF
+const FAILED: u32 = 0xFFFFFFFF
+
+/** The streams a `semihost_out` names. */
+const STREAM_CONSOLE: u32 = 1
+const STREAM_ERROR: u32 = 2
+
+// What an open descriptor is, in `Memory.guest_fds`.
+const FD_FREE: u8 = 0
+const FD_IN: u8 = 1
+const FD_OUT: u8 = 2
+const FD_ERR: u8 = 3
+
+/** How much of a buffer is handed to the board at a time. */
+const CHUNK: u32 = 256
+
+/** The call the `BKPT 0xAB` at `ip` makes, `n` instructions retired before it. True where the core runs
+ * on; false where the call stopped it (an exit, or a call benchtop does not implement), the core
+ * stopped at the `BKPT`.
+ */
+@noinline
+@cold
+semihost(cpu: *Cpu, ip: *Insn, n: u64) -> bool
+    val call = cpu.r[0]
+    val args = cpu.r[1]
+
+    if call == SYS_EXIT || call == SYS_EXIT_EXTENDED
+        var status: u32 = 1
+
+        if call == SYS_EXIT_EXTENDED
+            val kind = peek32(cpu, args)
+            val subcode = peek32(cpu, args +% 4)
+
+            if kind.is_none() || subcode.is_none()
+                cpu.r[0] = FAILED
+                return true
+
+            if kind.unwrap() == ADP_STOPPED_APPLICATION_EXIT then status = subcode.unwrap()
+        elif args == ADP_STOPPED_APPLICATION_EXIT
+            status = 0
+        cpu.exit_code = status
+        stop_here(cpu, ip, n, Stop.Exit)
+        return false
+
+    if call == SYS_WRITEC
+        if peek8(cpu, args).is_some() then write_range(cpu, STREAM_CONSOLE, args, 1)
+        cpu.r[0] = NO_ANSWER
+        return true
+
+    if call == SYS_WRITE0
+        var len: u32 = 0
+
+        loop
+            val c = peek8(cpu, args +% len)
+
+            if c.is_none() || c.unwrap() == 0 then break
+            len += 1
+        // A string that runs into memory with no page has no end to write up to.
+        if peek8(cpu, args +% len).is_some() then write_range(cpu, STREAM_CONSOLE, args, len)
+        cpu.r[0] = NO_ANSWER
+        return true
+
+    if call == SYS_OPEN
+        cpu.r[0] = open_console(cpu, args)
+        return true
+
+    if call == SYS_CLOSE
+        val fd = peek32(cpu, args)
+
+        cpu.r[0] = FAILED
+        if fd.is_some() && fd.unwrap() > 0 && fd.unwrap() < 16 && cpu.mem.guest_fds[usize(fd.unwrap())] != FD_FREE
+            cpu.mem.guest_fds[usize(fd.unwrap())] = FD_FREE
+            cpu.r[0] = 0
+        return true
+
+    if call == SYS_WRITE
+        cpu.r[0] = write_block(cpu, args)
+        return true
+
+    stop_here(cpu, ip, n, Stop.Undefined)
+    false
+
+/** `SYS_OPEN`: the descriptor for the console `:tt`, or -1. The block at `args` is `{name, mode,
+ * name length}`. */
+private open_console(cpu: *Cpu, args: u32) -> u32
+    val name = peek32(cpu, args)
+    val mode = peek32(cpu, args +% 4)
+    val len = peek32(cpu, args +% 8)
+
+    if name.is_none() || mode.is_none() || len.is_none() then return FAILED
+    if mode.unwrap() >= 12 || len.unwrap() != 3 then return FAILED
+    if !is_console_name(cpu, name.unwrap()) then return FAILED
+
+    val kind = if mode.unwrap() < 4 then FD_IN elif mode.unwrap() < 8 then FD_OUT else FD_ERR
+
+    for fd in 1..<16
+        if cpu.mem.guest_fds[fd] == FD_FREE
+            cpu.mem.guest_fds[fd] = kind
+            return u32(fd)
+    FAILED
+
+/** Whether the NUL-terminated string at `a` is `:tt`. */
+private is_console_name(cpu: *Cpu, a: u32) -> bool
+    val want = [u32(':'), u32('t'), u32('t'), 0]
+
+    for i in 0..<4
+        val c = peek8(cpu, a +% u32(i))
+
+        if c.is_none() || c.unwrap() != want[i] then return false
+    true
+
+/** `SYS_WRITE`: the number of bytes of the block `{descriptor, address, length}` at `args` that were
+ * not written. */
+private write_block(cpu: *Cpu, args: u32) -> u32
+    val fd = peek32(cpu, args)
+    val at = peek32(cpu, args +% 4)
+    val len = peek32(cpu, args +% 8)
+
+    if fd.is_none() || at.is_none() || len.is_none() then return 0
+    if fd.unwrap() == 0 || fd.unwrap() >= 16 then return len.unwrap()
+
+    val kind = cpu.mem.guest_fds[usize(fd.unwrap())]
+
+    if kind != FD_OUT && kind != FD_ERR then return len.unwrap()
+    if !readable(cpu, at.unwrap(), len.unwrap()) then return len.unwrap()
+    write_range(cpu, if kind == FD_OUT then STREAM_CONSOLE else STREAM_ERROR, at.unwrap(), len.unwrap())
+    0
+
+/** The `len` bytes at `a`, which `readable` has vouched for, written to `stream` a chunk at a time. */
+private write_range(cpu: *Cpu, stream: u32, a: u32, len: u32)
+    var chunk: [256]u8
+    var done: u32 = 0
+
+    while done < len
+        val k = min(len - done, CHUNK)
+
+        for i in 0..<k
+            val at = a +% done +% i
+
+            chunk[usize(i)] = u8.wrap(host_read(page_of(cpu, at), at, 1))
+        cpu.bus.semihost_out(cpu, stream, chunk[0..<usize(k)])
+        done += k
+
+/** Whether every byte of the `len` at `a` is in a page the core reads on the fast path. */
+private readable(cpu: *Cpu, a: u32, len: u32) -> bool
+    if len == 0 then return true
+
+    val last = u64(a) + u64(len) - 1
+
+    if last > 0xFFFFFFFF then return false
+
+    var page = a >> PAGE_SHIFT
+
+    while page <= u32(last >> u64(PAGE_SHIFT))
+        if cpu.pages[page] == 0 then return false
+        page += 1
+    true
+
+/** The byte at `a`, or None where nothing is on the fast path there. */
+private peek8(cpu: *Cpu, a: u32) -> Option[u32]
+    val page = page_of(cpu, a)
+
+    if page == 0 then return None
+    Some(host_read(page, a, 1))
+
+/** The little-endian word at `a`, or None where any of its bytes is not on the fast path. */
+private peek32(cpu: *Cpu, a: u32) -> Option[u32]
+    var x: u32 = 0
+
+    for i in 0..<4
+        val b = peek8(cpu, a +% u32(i))
+
+        if b.is_none() then return None
+        x |= b.unwrap() << u32(8 * i)
+    Some(x)

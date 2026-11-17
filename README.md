@@ -232,11 +232,13 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--window] [--deterministic | --threads] [--usb console|pty|off]
                [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--report-masking <file>]
-               <image.elf | image.bin>
+               [--semihosting] [--serial uart0|uart1=file:<path>] ... <image.elf | image.bin>
 ./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
                [--press <part[.direction] | pin=high|low>[@<dur>][:<dur>]] [--set <part>=<0..1>] [--quiet] ... <image>
+./benchtop run [--seed <n>] [--late-systick <cycles>] [--bunch-systick <n>] [--late-irq <cycles>]
+               [--strex-fail <percent>] ... <image>
 ./benchtop check [--mcu] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./benchtop bench-board [--board <name | file.hocon>] [--report-masking <file>] <image.elf> [turns | threads]
@@ -256,6 +258,26 @@ By default, launched guest cores run on separate host threads. **`--deterministi
 selects reproducible turns on one thread. The explicit **`--threads`** spelling also gives
 each core a host thread of its own once core 1 is launched: faster where both cores are busy, and
 not reproducible, as two real cores are not.
+
+**`--semihosting`** makes `BKPT 0xAB` an Arm semihosting call rather than a stop, on the Pico and Pico 2
+boards (any other board refuses it), for either core, either executor and `--deterministic` or not. The
+calls are `SYS_WRITEC`, `SYS_WRITE0`, `SYS_OPEN` of `:tt` (the console), `SYS_WRITE`, `SYS_CLOSE`,
+`SYS_EXIT` and `SYS_EXIT_EXTENDED`, as `qemu-system-arm -semihosting` runs them (it is QEMU's
+`semihosting/arm-compat-semi.c` that was followed). Text written to the console joins what UART0 sent, on
+stdout; text written to a descriptor opened for append goes to stderr. **The exit status of the run is
+the guest's**, as QEMU computes it: `SYS_EXIT_EXTENDED` with reason `0x20026` (`ADP_Stopped_ApplicationExit`)
+gives its subcode, any other reason 1; `SYS_EXIT`, whose R1 is the reason itself, gives 0 for `0x20026` and
+1 for any other. A call benchtop does not implement (`SYS_OPEN` of a host file answers -1; the rest stop
+the core as undefined) ends the run with status 3. Without `--semihosting` a `BKPT 0xAB` is any `BKPT`, as
+below, so the SDK's `_exit` is unchanged. A semihosting run is a scripted run too where it has `--expect`
+or `--timeout`; it also works under `--gdb`, but not with `--window`.
+
+**`--serial uartN=file:<path>`**, repeatable, sends what UART `N` (`uart0` or `uart1`, on the Pico and Pico 2
+boards) transmits to `<path>`, which is emptied at the start of the run and appended to as the board runs,
+like QEMU's `-serial file:`. A UART with no `--serial` is as it always was: UART0 is the console, and
+UART1's output is not kept. With UART0 redirected the console carries only what the guest writes through
+semihosting (and the USB serial port), and **`--expect` reads the console only**, so it never sees a UART
+that has a file: check that file after the run instead.
 
 **`--gdb [port]`** serves gdb's remote protocol instead, one TCP port per core from `port` (3333),
 and holds the board at its reset vector until a gdb resumes it: `target remote :3333`. See
@@ -320,7 +342,7 @@ console takes no input (no console at all, or an RP2040's UART0), and a bad dura
 before the run, with status 1. Scripted runs do not combine with `--window` or `--gdb`.
 
 **A Pico 2 SDK program ends a run itself by returning from `main` or calling `exit()`**: the SDK's
-`_exit` executes `BKPT`, which ends the run with status 0, whatever status the program gave. A failure
+`_exit` executes `BKPT`, which ends the run with status 0, whatever status the program gave (`--semihosting` is for a guest that gives its status through a semihosting exit instead). A failure
 is therefore told by what the program prints: `--expect` the text that means success. For example, a
 program that prints over UART0 (or over USB, through the default `--usb console`), checked to its
 third line and given 2 seconds of the board's time:
@@ -341,6 +363,51 @@ pin is pressed with the level its button would give:
 ./benchtop run --board stm32h747-disco --quiet --timeout 2s --expect "DISCO" --press wakeup:1s \
   --type "BUTTON? .\n" --expect "-1  ok" examples/disco-repl/repl-disco.elf
 ```
+
+### Exploring interleavings and injecting faults
+
+Taking turns makes a run repeatable, which also makes it one interleaving. These options vary it, and
+every variation is drawn from one seed, so a failure found at a seed recurs at that seed, output, cycle
+counts and exit status alike. A gate sweeps seeds by running the same script once per `--seed`. Each
+option is off unless named, and a run that names none is the run it always was, to the instruction.
+They apply to a terminal run and a scripted run on a board of Cortex-M cores (not `--window` or
+`--gdb`, and not the RP2350's Hazard3 harts):
+
+- **`--seed <n>`** draws each turn's length, from 1 to twice the quantum, and which core takes the
+  first turn of each round, from `n`. It means turns on one thread, as `--deterministic` does, and
+  refuses `--threads`. Before core 1 is launched, core 0 runs exactly as it does without a seed. `n` also
+  seeds the faults below; without `--seed` they draw from seed 0.
+- **`--late-systick <cycles>`** delivers each SysTick exception up to `cycles` of the core's clock late
+  (drawn per tick, 0 to `cycles`). The counter stays exact: CVR, COUNTFLAG and the reload follow the
+  clock as always, so a handler can measure how late it ran. A core asleep in `WFI` wakes when the tick
+  is delivered, not when it falls due.
+- **`--bunch-systick <n>`** holds ticks and delivers them together: when a tick falls due, a bunch of 1
+  to `n` is drawn, and that tick and the ones after it are held until the last of the bunch is due,
+  then taken back to back, the handler running once for each, each tail-chained to the one before.
+  Combined with `--late-systick`, the bunch is delivered late too. This is a timer's tick on a core
+  whose host thread was descheduled, as under QEMU's multi-threaded TCG.
+- **`--late-irq <cycles>`** raises a core's SIO interrupts up to `cycles` after they rise: the FIFO's
+  on the virtual boards and on the RP2040 and RP2350, and the RP2350's doorbell. On the virtual boards
+  the delay is drawn when a word goes into an empty FIFO; on an RP board, when the core's FIFO and
+  doorbell lines rise from all low.
+- **`--strex-fail <percent>`** fails that share of the STREXes whose exclusive monitor holds, as the
+  architecture allows at any time (a cache line evicted, an interrupt between LDREX and STREX), so a
+  lock's retry loop runs its retry. The store is not made and the status register reads 1.
+
+```sh
+for seed in $(seq 1 50); do
+  ./benchtop run --board pico2 --quiet --timeout 2s --seed $seed --late-systick 2000 \
+    --bunch-systick 3 --strex-fail 5 --expect "PASS" kernel.elf || echo "seed $seed failed"
+done
+```
+
+**Replay is promised only for runs whose cores take turns**: `--deterministic`, `--seed` and every
+scripted run. The fault options also work with each core on a host thread of its own (`--threads`,
+and the default on a virtual board): the SysTick and STREX faults are each core's own, and a held-back
+FIFO interrupt is raised when its core next looks, but what the two threads do around them differs
+from run to run. With every option off the emulator checks nothing more than it did: the STREX fault is
+one test of a field that is zero, in the STREX itself, and the rest are looked at only where a turn
+starts or SysTick is brought up to the clock, never per instruction.
 
 #### Parts on a Pico, Pico 2 or Pico 2 RISC-V board
 
@@ -743,7 +810,12 @@ handlers are shared. M23 is a separate Baseline decoder profile, with two priori
 system-register accesses, fixed CCR and no IT, BASEPRI, FAULTMASK or stack limits in its current
 configuration without the Security Extension. M0/M1 have no VTOR; M3 has the v7-M register profile.
 
-**All models omit the MPU and Security extensions; the floating-point unit is a board option.**
+**All models omit the MPU and Security extensions; the floating-point unit is a board option.** The
+RP2350's Cortex-M33s are the exception: they have the Security Extension and an 8-region PMSAv8 MPU
+per security state, which is enforced on every load, store and instruction fetch (MemManage
+DACCVIOL with MMFAR, or IACCVIOL; PRIVDEFENA, HFNMIENA, AP, XN, overlaps and `LDRT`/`STRT`), but not
+yet on exception stacking and unstacking, lazy floating-point preservation or `BLXNS`'s push. The
+M4's and M7's PMSAv7 MPU and the M0+'s are not enforced.
 M4 and M7 always have integer DSP; M33/M35P/M52/M55/M85 can enable it independently per core. The M52/M55/M85
 models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
 MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. Unsupported instruction
@@ -814,7 +886,8 @@ BASEPRI, FAULTMASK and the stack limits; SysTick counts local core cycles. [DESI
 §2.2 and §2.9 say what is modelled and what is not.
 
 **With `--deterministic`, both cores run on one host thread, taking turns** of 1000 MCU ticks each, so a run is the same
-every time, to the instruction. A core asleep in `WFI` costs nothing while the other runs, and the
+every time, to the instruction. `--seed n` varies the turns' lengths and order reproducibly
+([Exploring interleavings](#exploring-interleavings-and-injecting-faults)). A core asleep in `WFI` costs nothing while the other runs, and the
 board stops at `Asleep` only when both sleep with nothing that can wake them. A program that never
 launches core 1 runs exactly as on a single core. [DESIGN.md](DESIGN.md) §1.1 and §11 have the rest.
 

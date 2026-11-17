@@ -122,7 +122,16 @@ Sources, and how far each was checked:
   fixed quanta, so a run is reproducible to the instruction. **Tests use it.** QEMU's MTTCG made
   skiff's AN521 boots flaky (skiff `CLAUDE.md`, milestone 2: a tick delivered up to 5 ticks late), and
   benchtop should not repeat that. `--seed n` jitters the quanta, which explores interleavings
-  reproducibly: a skiff race found at seed 1234 recurs at seed 1234.
+  reproducibly: a skiff race found at seed 1234 recurs at seed 1234. Each round's length is drawn
+  from 1 to twice the quantum, and which core takes the first turn, from a generator seeded once
+  (`sysl.rand`'s PCG32, stream 0; `virt/scheduler.sysl`'s `round`, `chip/arm_board.sysl`'s `run`).
+  The same seed also drives the **faults** a run can inject (`v6m/faults.sysl`), each from its core's
+  own stream so that one core's draws never shift the other's: a SysTick exception delivered late,
+  ticks held and delivered back to back (the late, bunched ticks MTTCG gave skiff's core 1), the SIO
+  FIFO and doorbell interrupts raised late, and STREXes that fail though the monitor holds. None of
+  it costs a run that asks for none anything per instruction: the scheduler draws only where a round
+  starts, SysTick's faults are looked at where it is brought up to the clock, and the STREX fault is
+  one test of a zero field in the STREX. README "Exploring interleavings" has the options.
 - **The virtual boards (§11) run their two cores this way by default.** A round gives core
   0 a turn and then core 1, each running until its clock (instructions retired plus the time skipped
   asleep) reaches the round's end, `quantum` past the last one's: 1000 instructions by default, a
@@ -134,8 +143,9 @@ Sources, and how far each was checked:
   roughly 0.7 µs a 1000-instruction turn takes) and how late a core sees the other: at the RP2040's
   125 MHz, a quantum is 8 µs, so a FIFO round trip costs at most two turns, about an interrupt's
   latency. Tests set a quantum of a dozen instructions to pin an exact
-  interleaving. There is no `--seed` yet; the quantum is the one input to the interleaving, and the
-  same image, input and quantum give the same run, counts and all. This single-threaded run is the
+  interleaving. Without a seed the quantum is the one input to the interleaving, and the same image,
+  input and quantum give the same run, counts and all; with one, the same image, input, quantum and
+  seed do. This single-threaded run is the
   oracle the threaded mode is checked against.
 - **`benchtop run --threads` gives each of the virtual board's cores a host thread of its own**
   (`virt/scheduler.sysl`). Core 0 runs alone, exactly as above, until it launches core 1; then core 1
@@ -444,8 +454,16 @@ checked against the SVD):
 - **DWT/ITM**: `DWT_CYCCNT` is provided because HAL and benchmarks read it. It is the core's virtual
   cycle count. ITM stimulus port 0 is a second console (SWO), which is cheap and useful. QEMU has
   no DWT (skiff-old's notes), so benchtop improves on that.
-- **Semihosting** (`BKPT 0xAB`, SYS_WRITE0/WRITEC/WRITE/EXIT_EXTENDED) is on by an option. It is how
-  skiff's boot tests halt, so the same scripts can drive benchtop and QEMU.
+- **Semihosting** (`BKPT 0xAB`) is built, behind `--semihosting` (`Cpu.semihosting`, set by the board;
+  `v6m/semihost.sysl`), on the RP2040's and the RP2350's cores under both executors (the `match` loop
+  and the threaded chain share the one routine, so Thumb-2 and gdb's stops see no difference). It
+  implements SYS_WRITEC, SYS_WRITE0, SYS_OPEN (`:tt` only), SYS_WRITE, SYS_CLOSE, SYS_EXIT and
+  SYS_EXIT_EXTENDED as QEMU's `arm-compat-semi.c` does: the exit status is the guest's (the
+  subcode of an `ADP_Stopped_ApplicationExit` extended exit, else 1; for the 32-bit SYS_EXIT, 0 for
+  that reason and 1 otherwise), so the same scripts can drive benchtop and QEMU. Reads of the guest's
+  memory never touch a device or stop the core. Without the option a `BKPT 0xAB` stops the core like
+  any `BKPT`; the option costs nothing on the instruction path, as only the `BKPT` handler tests it.
+  An unimplemented call stops the core as undefined, where QEMU aborts.
 
 **What the ARMv6-M core models** (`sh.sysl.benchtop.v6m`, `except.sysl`; ARMv6-M ARM B1, the M0+
 subset of the above):
@@ -610,6 +628,17 @@ loop
   skiff's per-switch reprogramming of a few regions costs a few hundred entry writes. Pages split by a
   sub-4 KB region are marked slow and checked per access against the region list. skiff's 64-byte
   stack guard makes the page holding each stack's base a slow page, which is acceptable.
+  **Built for the M33's PMSAv8 MPU** (`v6m/mpu.sysl`), over benchtop's real table (one host pointer
+  per page, 0 for the slow path, rather than flag bits): each state's MPU has a privileged and an
+  unprivileged table, copies of the state's own in which a page stays only where one region allows
+  it whole for reading and, where the fast path would store in place, writing (or, privileged under
+  PRIVDEFENA, no region touches it). `Cpu.pages` points at the view's table while the MPU applies and
+  at the state's own otherwise; until an MPU register is first written nothing changes, so a core
+  without an MPU pays nothing (the bench's host instruction counts agree within 0.01%). A region
+  write remakes the entries its old and new extents cover. Fetches are judged when a record is
+  decoded, and unprivileged code runs on records of its own, so a record decoded privileged never
+  runs unprivileged; a region write forgets the records on the pages it covers. skiff's Pico 2 test
+  run, which reprograms regions on every switch, takes about 5% longer than with the MPU ignored.
 
 ### 2.5 The interface a JIT would plug into
 
@@ -713,7 +742,10 @@ Architecture Reference Manual (DDI0553), cited by chapter title. Over §2.1's v7
     context active (lazy preservation and SFPA), AIRCR.BFHFNMINS or PRIS set, a Non-secure PRIGROUP
     other than the Secure one, the FP registers' Non-secure view, the PPB alias outside the system
     control space; on the board, the SIO from Non-secure state and an ACCESSCTRL write restricting a
-    memory device. The MPU is stored and answered by `TT`, not enforced. The boot ROM itself is Secure
+    memory device. The MPU (PMSAv8, a bank per state) is enforced on the core's own loads, stores
+    and fetches (§2.4, `v6m/mpu.sysl`): a refusal is MemManage DACCVIOL with MMFAR, or IACCVIOL.
+    Not yet: the MPU checks of exception stacking and unstacking (MSTKERR, MUNSTKERR), lazy FP
+    preservation (MLSPERR), `BLXNS`'s push and an IT block's later instructions. The boot ROM itself is Secure
     code (§9.2).
 - **The stack-limit registers.** `MSPLIM`/`PSPLIM` make a push, an `SP` write or exception stacking
   below the limit a UsageFault with `UFSR.STKOF`, with `SP` left at the limit, and
@@ -1095,6 +1127,11 @@ The VCP's line goes to one of three back-ends (`--uart`):
   so a program that opens and closes it does not hang it up. Bytes are exchanged between runs of the
   board. The Pico 2's USB serial port uses it today (`benchtop run --usb pty`).
 - **`tcp:PORT`**: a raw socket, for scripted tests (`sysl.net`).
+
+**On the RP boards each UART can go to a file** (`--serial uart0|uart1=file:<path>`, repeatable; built in
+`ArmBoard`, which drains the redirected UART's transmit FIFO into the file every quantum and waits for it
+to finish sending at the end of the run, as it does for UART0's console). UART0 not redirected stays the
+console, and an unredirected UART1 is not read. `--expect` matches the console, never a file.
 
 Tests also use `--expect "line" --timeout 10s`, which exits 0 when every expected line has appeared
 in order and 1 otherwise, as skiff's `boot-test.sh` reads QEMU's output today.

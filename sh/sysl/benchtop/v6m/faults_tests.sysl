@@ -1,0 +1,155 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// The faults a core injects into itself (faults.sysl), each measured by the guest: a SysTick handler
+// logs the counter's value at entry, so a tick taken late reads that much lower, and a bunch of ticks
+// taken back to back reads lower by a handler's length each; a LDREX/STREX loop counts the STREXes that
+// failed. Every case runs under both executors, which must agree, and replays under its seed.
+
+import sysl.buf.{Buf, buf}
+
+// 0: subs r6, #1; bne 0; bkpt — two instructions an iteration, each ending at a taken branch, so a
+// tick is taken exactly where it is delivered. 0x40: the SysTick handler logs CVR and returns.
+val BUSY: [40]u16 = [0x3E01, 0xD1FD, BKPT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x4901, 0x6808, LOG_R0, BX_LR, 0xE018, 0xE000, 0, 0]
+
+// 0: wfi; subs r6, #1; bne 0; bkpt — asleep between ticks, so each tick is the wake.
+val SLEEPY: [40]u16 = [WFI, 0x3E01, 0xD1FC, BKPT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x4901, 0x6808, LOG_R0, BX_LR, 0xE018, 0xE000, 0, 0]
+
+// SysTick every 1000 clocks, its interrupt on.
+start_systick(cpu: *Cpu)
+    store32(cpu, SYST_RVR, 999)
+    store32(cpu, SYST_CSR, 7)
+
+// A run of `code` with `f` injected, `rounds` in r6, under `exec`.
+ticked(code: []const u16, rounds: u32, f: Faults, exec: Exec) -> Cpu
+    var c: Cpu
+    machine(&c, code, [0, 0, 0, 0, LOG, 0, rounds], 0, [[15, 0x40]], &start_systick)
+    inject(&c, f, 0)
+    finish(&c, exec)
+    assert(c.stop == Stop.Breakpoint, s"stopped at ${c.stop}")
+    c
+
+// What the handler logged.
+log_of(c: *Cpu) -> Buf[u32]
+    var b: Buf[u32] = buf()
+    var a = LOG
+    while a < c.r[4]
+        b.push(load32(c, a))
+        a += 4
+    b
+
+// Both executors' logs of the same run, required to agree, and the log.
+both_log(code: []const u16, rounds: u32, f: Faults) -> Buf[u32]
+    var a = ticked(code, rounds, f, &run_match)
+    var b = ticked(code, rounds, f, &run_threaded)
+    val la = log_of(&a)
+    val lb = log_of(&b)
+    assert(la.view() == lb.view() && a.retired == b.retired && a.slept == b.slept, "the executors agree")
+    la
+
+with_late(seed: u64, late: u64) -> Faults = Faults(false, seed, late, 0, 0, 0)
+with_bunch(seed: u64, bunch: u32) -> Faults = Faults(false, seed, 0, bunch, 0, 0)
+
+@test("with no fault, every tick reads the same, and injecting none changes nothing")
+faults_systick_off()
+    val plain = both_log(BUSY[..], 6000, no_faults())
+    assert(plain.len() >= 11, s"${plain.len()} ticks")
+    for x in plain.view() do assert(x == plain[0], "each tick taken at the same point of its period")
+
+    // A seed and no fault: the same run, to the instruction.
+    var a = ticked(BUSY[..], 6000, Faults(false, 99, 0, 0, 0, 0), &run_threaded)
+    var b = ticked(BUSY[..], 6000, no_faults(), &run_threaded)
+    assert(log_of(&a).view() == plain.view() && a.retired == b.retired && a.slept == b.slept)
+
+@test("--late-systick delivers each tick up to its bound late, the counter exact, and a seed replays it")
+faults_systick_late()
+    val on_time = both_log(BUSY[..], 6000, no_faults())[0]
+    val late = both_log(BUSY[..], 6000, with_late(1, 400))
+    var later = 0
+    for x in late.view()
+        assert(x <= on_time && on_time - x <= 400, s"a tick read $x against $on_time")
+        if x < on_time then later += 1
+    assert(later > late.len() / 2, s"only $later of ${late.len()} late")
+
+    // The same seed, the same delays; another seed, others.
+    assert(both_log(BUSY[..], 6000, with_late(1, 400)).view() == late.view())
+    var differs = false
+    for seed in 2u64..6 do if both_log(BUSY[..], 6000, with_late(seed, 400)).view() != late.view() then differs = true
+    assert(differs, "every seed gave the same delays")
+
+@test("--late-systick holds a sleeping core's wake until the tick is delivered")
+faults_systick_late_asleep()
+    val on_time = both_log(SLEEPY[..], 10, no_faults())
+    assert(on_time.len() == 10)
+    for x in on_time.view() do assert(x == on_time[0])
+
+    val late = both_log(SLEEPY[..], 10, with_late(3, 300))
+    assert(late.len() == 10, s"${late.len()} wakes")
+    var later = 0
+    for x in late.view()
+        assert(x <= on_time[0] && on_time[0] - x <= 300, s"a wake read $x against ${on_time[0]}")
+        if x < on_time[0] then later += 1
+    assert(later > 5, s"only $later late")
+    assert(both_log(SLEEPY[..], 10, with_late(3, 300)).view() == late.view())
+
+@test("--bunch-systick holds due ticks and runs the handler back to back for each")
+faults_systick_bunch()
+    val plain = both_log(BUSY[..], 6000, no_faults())
+    val bunched = both_log(BUSY[..], 6000, with_bunch(5, 4))
+
+    // Every tick but those still held at the end is taken, none lost, none added.
+    assert(bunched.len() <= plain.len() && bunched.len() + 3 >= plain.len(), s"${bunched.len()} ticks against ${plain.len()}")
+    // A tick taken straight after another reads the counter a handler's length lower.
+    var back_to_back = 0
+    for i in 1..<bunched.len()
+        if bunched[i] < bunched[i - 1] && bunched[i - 1] - bunched[i] < 50 then back_to_back += 1
+    assert(back_to_back > 0, "no ticks taken back to back")
+    assert(both_log(BUSY[..], 6000, with_bunch(5, 4)).view() == bunched.view())
+
+    // A bunch of 1 is no bunching.
+    assert(both_log(BUSY[..], 6000, with_bunch(5, 1)).view() == plain.view())
+
+// 0: ldrex r0, [r1]; adds r0, #1; strex r2, r0, [r1]; cmp r2, #0; beq 18; adds r3, #1; b 0;
+// 18: adds r5, #1; cmp r5, #100; bne 0; bkpt — a hundred increments, r3 counting the retries.
+val RETRY: [13]u16 = [0xE851, 0x0F00, 0x3001, 0xE841, 0x0200, 0x2A00, 0xD001, 0x3301, 0xE7F6, 0x3501, 0x2D64, 0xD1F3, BKPT]
+
+retried(percent: u32, seed: u64, exec: Exec) -> Cpu
+    var c: Cpu
+    c.kind = Kind.V8mMain
+    prepare(&c, RETRY[..], [0, 0x1000], 0, [[0x1000, 41]])
+    inject(&c, Faults(false, seed, 0, 0, 0, percent), 0)
+    finish(&c, exec)
+    assert(c.stop == Stop.Breakpoint && c.r[5] == 100 && load32(&c, 0x1000) == 141, s"stopped at ${c.stop} with ${c.r[5]} done")
+    c
+
+@test("--strex-fail fails STREXes whose monitor holds, at its rate, and the retry loop still finishes")
+faults_strex()
+    for exec in [&run_match, &run_threaded]
+        assert(retried(0, 1, exec).r[3] == 0, "no fault, no retry")
+        val some = retried(50, 1, exec).r[3]
+        // About one in two of 100 + retries; well inside these bounds at any seed.
+        assert(some > 30 && some < 300, s"$some retries at 50%")
+        assert(retried(50, 1, exec).r[3] == some, "the seed replays them")
+    // Both executors draw the same failures.
+    assert(retried(50, 7, &run_match).r[3] == retried(50, 7, &run_threaded).r[3])
+    var differs = false
+    for seed in 2u64..6 do if retried(50, seed, &run_threaded).r[3] != retried(50, 1, &run_threaded).r[3] then differs = true
+    assert(differs, "every seed failed the same STREXes")
+
+@test("the fault options parse, and refuse what is out of range")
+faults_options()
+    var f = no_faults()
+    assert(!f.any())
+    val args = ["--seed", "1234", "--late-systick", "500", "--bunch-systick", "3", "--late-irq", "200", "--strex-fail", "25", "image.elf"]
+    var i: usize = 0
+    while i < args.len - 1
+        i = take_fault(&f, args[..], i, args.len - 1).unwrap().unwrap()
+    assert(f.seeded && f.seed == 1234 && f.systick_late == 500 && f.systick_bunch == 3 && f.irq_late == 200 && f.strex_fail == 25 && f.any())
+    assert(take_fault(&f, ["--quiet", "x"][..], 0, 1).is_none())
+    assert(take_fault(&f, ["--seed", "x.elf"][..], 0, 1).unwrap().unwrap_err().contains("takes a number"))
+    assert(take_fault(&f, ["--seed", "-1", "x"][..], 0, 2).unwrap().unwrap_err().contains("0 or more"))
+    assert(take_fault(&f, ["--strex-fail", "101", "x"][..], 0, 2).unwrap().unwrap_err().contains("percentage"))
+    assert(take_fault(&f, ["--bunch-systick", "0", "x"][..], 0, 2).unwrap().unwrap_err().contains("1 to 1000"))
+    assert(take_fault(&f, ["--late-irq", "soon", "x"][..], 0, 2).unwrap().unwrap_err().contains("whole number"))

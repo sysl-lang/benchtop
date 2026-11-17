@@ -1,0 +1,119 @@
+module sh.sysl.benchtop.chip
+@tests
+
+// `--seed` and `--late-irq` on the RP boards (`ArmBoard.explore`): a seed varies each quantum's length
+// and which core runs it first, the same seed replaying the run exactly and no seed changing nothing;
+// and a core's SIO FIFO and doorbell lines, held back, reach its NVIC up to the bound later, the RP2350's
+// FIFO and doorbell and the RP2040's FIFO alike.
+
+import sh.sysl.benchtop.v6m.{Faults, no_faults}
+import sh.sysl.rp2350.sio as sio_reg
+import sh.sysl.rp2040.sio as sio40_reg
+import sysl.text.from_utf8_lossy
+
+private val SEED_MULTICORE = embed("../../../../examples/pico/hello_multicore.elf")
+private val SEED_SERIAL40 = embed("../../../../examples/pico/hello_serial.elf")
+private val SEED_SERIAL = embed("../../../../examples/pico2/hello_serial.elf")
+private val SEED_SRAM40 = SramMap(0x20000000, 264 * 1024)
+private val SEED_SRAM = SramMap(0x20000000, 520 * 1024)
+// 0.1 ms of the Pico's 125 MHz clk_sys.
+private const SEED_TENTH_MS: u64 = 12500
+
+private seeded(seed: u64) -> Faults = Faults(true, seed, 0, 0, 0, 0)
+
+// hello_multicore on the Pico, varied as `f` says, run to core 0's BKPT: the console, the chip's clock
+// there and each core's retired count.
+private multicore(f: Faults) -> (string, u64, u64, u64)
+    val b = pico_board(SEED_SRAM40)
+    b.boot(SEED_MULTICORE).unwrap()
+    b.explore(f)
+    var end = RunEnd.Budget
+    while end == RunEnd.Budget && b.chip.now < 1000 * SEED_TENTH_MS do end = b.run(SEED_TENTH_MS)
+    assert(end == RunEnd.Breakpoint, s"${end} ${b.refused}")
+    val at = b.chip.now
+    val retired = (b.cores[0].retired, b.cores[1].retired)
+    b.started[0] = false
+    for i in 0..<20 do assert(b.run(10 * SEED_TENTH_MS) == RunEnd.Budget, b.refused)
+    assert(b.finish_sending(), b.refused)
+    (from_utf8_lossy(b.console.view()), at, retired.0, retired.1)
+
+private same(a: (string, u64, u64, u64), b: (string, u64, u64, u64)) -> bool = a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3
+
+@test("hello_multicore on the Pico under a seed answers each core's word, the same seed replays it, and seeds race the last lines")
+seed_pico_multicore()
+    // The two cores print their last lines at about the same time, so the interleaving decides which
+    // comes first.
+    val want = "Hello, multicore!\r\nIt's all gone well on core 0!Its all gone well on core 1!"
+    val flipped = "Hello, multicore!\r\nIts all gone well on core 1!It's all gone well on core 0!"
+    val plain = multicore(no_faults())
+    assert(plain.0 == want, plain.0)
+    assert(same(multicore(Faults(false, 4, 0, 0, 0, 0)), plain), "nothing varied is the plain run, exactly")
+    val one = multicore(seeded(1))
+    assert(one.0 == want || one.0 == flipped, one.0)
+    assert(same(multicore(seeded(1)), one), "seed 1 replays")
+    var orders = [0, 0]
+    for seed in 1u64..12
+        val other = multicore(Faults(true, seed, 0, 0, 2000, 0))
+        assert(other.0 == want || other.0 == flipped, other.0)
+        assert(same(multicore(Faults(true, seed, 0, 0, 2000, 0)), other), s"seed $seed replays")
+        orders[if other.0 == want then 0 else 1] += 1
+    assert(orders[0] > 0 && orders[1] > 0, s"the seeds gave one order only: ${orders[0]} ${orders[1]}")
+
+// Cycles from a word core 1 writes to the SIO register `reg` until core 0's NVIC has IRQ `irq` pending,
+// the board run 50 cycles at a time.
+private reached[C: ArmChip](b: &ArmBoard[C], reg: u32, irq: u32) -> u64
+    val bit = 1u64 << (16 + u64(irq))
+    b.cores[0].pending[0] &= ~bit
+    b.chip.store(1, reg, 4, 1).unwrap()
+    val from = b.chip.clock()
+    while b.cores[0].pending[0] & bit == 0
+        assert(b.run(50) == RunEnd.Budget, b.refused)
+        assert(b.chip.clock() - from < 1000000, s"IRQ $irq never reached core 0")
+    b.chip.clock() - from
+
+// The Pico 2 running hello_serial for 2 ms, then varied as `f` says: the cycles core 1's write to `reg`
+// takes to raise `irq` in core 0.
+private reached_pico2(f: Faults, reg: u32, irq: u32) -> u64
+    val b = arm_board(SEED_SRAM)
+    b.boot(SEED_SERIAL).unwrap()
+    for i in 0..<20 do assert(b.run(15000) == RunEnd.Budget, b.refused)
+    b.explore(f)
+    reached(b, reg, irq)
+
+// The same on the Pico.
+private reached_pico(f: Faults) -> u64
+    val b = pico_board(SEED_SRAM40)
+    b.boot(SEED_SERIAL40).unwrap()
+    for i in 0..<20 do assert(b.run(SEED_TENTH_MS) == RunEnd.Budget, b.refused)
+    b.explore(f)
+    reached(b, sio40_reg.BASE + sio40_reg.FIFO_WR_OFFSET, 15)
+
+// Each of `measure`'s answers with `--late-irq 5000` under seeds 1 to 5 is later than the line's own
+// time `on_time` by at most the bound, replays under its seed, and they are not all the same.
+private held_back(on_time: u64, measure: (Faults) -> u64)
+    var first: u64 = 0
+    var differs = false
+    for seed in 1u64..5
+        val f = Faults(false, seed, 0, 0, 5000, 0)
+        val t = measure(f)
+        assert(t >= on_time && t <= on_time + 5000 + 50, s"seed $seed: $t cycles against $on_time")
+        assert(measure(f) == t, s"seed $seed replays")
+        if seed == 1 then first = t elif t != first then differs = true
+    assert(differs, "every seed drew the same delay")
+
+@test("--late-irq holds the RP2350's FIFO and doorbell lines back up to its bound, and a seed replays it")
+seed_pico2_late_sio()
+    val fifo = sio_reg.BASE + sio_reg.FIFO_WR_OFFSET
+    val bell = sio_reg.BASE + sio_reg.DOORBELL_OUT_SET_OFFSET
+    val fifo_on_time = reached_pico2(no_faults(), fifo, 25)
+    val bell_on_time = reached_pico2(no_faults(), bell, 26)
+    assert(fifo_on_time <= 50 && bell_on_time <= 50, s"$fifo_on_time $bell_on_time")
+    assert(reached_pico2(Faults(false, 3, 0, 0, 0, 0), bell, 26) == bell_on_time, "no delay is none")
+    held_back(fifo_on_time, f -> reached_pico2(f, fifo, 25))
+    held_back(bell_on_time, f -> reached_pico2(f, bell, 26))
+
+@test("--late-irq holds the RP2040's FIFO line back up to its bound, and a seed replays it")
+seed_pico_late_fifo()
+    val on_time = reached_pico(no_faults())
+    assert(on_time <= 50, s"$on_time")
+    held_back(on_time, f -> reached_pico(f))

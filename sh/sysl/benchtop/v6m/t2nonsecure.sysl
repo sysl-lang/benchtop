@@ -183,10 +183,12 @@ refresh_attribution(cpu: *Cpu)
     val secure = if cpu.ns then cpu.secure_records else cpu.dec
     forget_records(cpu, secure)
     if cpu.ns_ready then forget_records(cpu, cpu.ns_records)
+    // The MPU's records for unprivileged code, and its tables, which copy the state's.
+    if cpu.mpu_used then mpu_attribution_changed(cpu)
 
 // Only where a record has been decoded is there one to forget: the RAM lines marked as holding code,
 // and the flash pages marked so (`holds_code`), which keeps a change to the SAU cheap.
-private forget_records(cpu: *Cpu, records: *Insn)
+private[v6m] forget_records(cpu: *Cpu, records: *Insn)
     if records == null then return
     val mem = cpu.mem
     for line in 0..<mem.code_lines.len
@@ -199,7 +201,7 @@ private forget_records(cpu: *Cpu, records: *Insn)
             if (bits >> u64(k)) & 1 != 0 then forget_range(records, (FLASH_OFFSET >> 1) + ((u32(w) * 64 + k) << (PAGE_SHIFT - 1)), PAGE_BYTES >> 1)
 
 // `count` records from record `first`, put back to "not decoded"; a guard record stays.
-private forget_range(records: *Insn, first: u32, count: u32)
+private[v6m] forget_range(records: *Insn, first: u32, count: u32)
     for i in first..<(first + count)
         if records[i].op != Op.Undecoded && records[i].h != &h_ram_boundary
             records[i].h = &h_decode
@@ -210,6 +212,8 @@ private forget_range(records: *Insn, first: u32, count: u32)
  */
 pages_changed(cpu: *Cpu)
     if cpu.watch_count != 0 then watch_views(cpu)
+    // The MPU's tables copy the state's.
+    if cpu.mpu_used then mpu_rebase(cpu)
     if !cpu.ns_ready then return
     cpu.attribution_stale = true
     if cpu.ns then refresh_attribution(cpu)
@@ -258,7 +262,7 @@ private page_non_secure(cpu: *Cpu, base: u32) -> bool
     whole
 
 // Whether the `width` bytes at `a` are all Non-secure.
-private non_secure_range(cpu: *Cpu, a: u32, width: u32) -> bool =
+private[v6m] non_secure_range(cpu: *Cpu, a: u32, width: u32) -> bool =
     security_of(cpu, a, false) == ATTR_NS && security_of(cpu, a + width - 1, false) == ATTR_NS
 
 // The decoder's question, before it decodes the record at `pc` into `into`: where the address is not
@@ -310,20 +314,25 @@ private secure_load16(cpu: *Cpu, a: u32) -> u32 = if cpu.ns then secure_view_rea
  */
 @cold
 secure_view_read(cpu: *Cpu, a: u32, width: u32) -> u32
+    val seen = cpu.pages
     secure_view(cpu, a, true)
     val x = if width == 4 then read32(cpu, a, cpu.retired) elif width == 2 then read16(cpu, a, cpu.retired) else read8(cpu, a, cpu.retired)
     secure_view(cpu, a, false)
+    cpu.pages = seen
     x
 
 /** The same, written. */
 @cold
 secure_view_write(cpu: *Cpu, a: u32, width: u32, x: u32)
+    val seen = cpu.pages
     secure_view(cpu, a, true)
     write(cpu, a, width, x, cpu.retired)
     secure_view(cpu, a, false)
+    cpu.pages = seen
 
 // Take up (`on`) or put down Secure state's view for the host's access at `a`: the whole page table,
-// and for the private peripheral bus, whose registers the banks hold, the Secure bank live.
+// and for the private peripheral bus, whose registers the banks hold, the Secure bank live. The caller
+// puts back the table the core read through, which may be the MPU's.
 private secure_view(cpu: *Cpu, a: u32, on: bool)
     if a >= PPB && a < PPB_END then exchange_bank(cpu)
     cpu.ns = !on
@@ -331,8 +340,10 @@ private secure_view(cpu: *Cpu, a: u32, on: bool)
 
 // A record made by `attribution_record`, run: SecureFault INVEP (c = 0) or INVTRAN (c = 1) at the
 // address in `imm`, pending, the instruction not executed. A record another core's attribution made
-// (cores of one machine may share records) is decoded again under this core's.
+// (cores of one machine may share records) is decoded again under this core's. One the MPU made (c =
+// 2) is the MPU's to judge (`mpu_fetch_fault`).
 fetch_fault(cpu: *Cpu, ip: *Insn, n: u64) -> bool
+    if ip.c == 2 then return mpu_fetch_fault(cpu, ip, n)
     val at = ip.imm
     val s = security_of(cpu, at, true)
     if (ip.c == 0) == (s == ATTR_NS)
@@ -388,6 +399,7 @@ exchange_bank(cpu: *Cpu)
         swap(&cpu.mpu_rlar[k], &b.mpu_rlar[k])
     swap(&cpu.mpu_mair[0], &b.mpu_mair[0])
     swap(&cpu.mpu_mair[1], &b.mpu_mair[1])
+    cpu.mpu_bank_ns = !cpu.mpu_bank_ns
     cpu.fp_ready = false
 
 @inline
@@ -397,10 +409,11 @@ private swap(a: *u32, b: *u32)
     b[0] = t
 
 /** Change the core to Non-secure state (`ns`) or Secure: the banks exchanged, and the records and page
- * table the state runs on taken up.
+ * table the state runs on taken up, as the new state's MPU sees them.
  */
 switch_state(cpu: *Cpu, ns: bool)
     if cpu.ns == ns then return
+    if cpu.mpu_used then mpu_release(cpu)
     if ns
         cpu.trustzone = true
         prepare_ns(cpu)
@@ -417,6 +430,7 @@ switch_state(cpu: *Cpu, ns: bool)
         cpu.dec = cpu.secure_records
         cpu.predicated = cpu.secure_predicated
         cpu.pages = if cpu.watch_count != 0 then cpu.watch_secure else &cpu.mem.page_table[0]
+    if cpu.mpu_used then mpu_select(cpu)
     recheck(cpu)
 
 // A change of state with a floating-point context active is refused, at `at`: answers whether it was.
@@ -542,11 +556,12 @@ callee_stack(cpu: *Cpu, frame: u32, floor: u32, extended: bool, n: u64)
 // vector is read through the Secure table.
 vector_read(cpu: *Cpu, at: u32, n: u64) -> u32
     if !cpu.ns then return read32(cpu, at, n)
+    val seen = cpu.pages
     cpu.ns = false
     cpu.pages = &cpu.mem.page_table[0]
     val v = read32(cpu, at, n)
     cpu.ns = true
-    cpu.pages = cpu.ns_pages
+    cpu.pages = seen
     v
 
 // ---------------------------------------------------------------------------------------------------
@@ -559,9 +574,10 @@ ns_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
     if !non_secure_range(cpu, a, width)
         auviol(cpu, a)
         return 0
+    val seen = cpu.pages
     cpu.pages = &cpu.mem.page_table[0]
     val page = page_for(cpu, a, width)
-    cpu.pages = cpu.ns_pages
+    cpu.pages = seen
     if page != 0 then return host_read(page, a, width)
     // The board sees the access as the Non-secure one it is.
     cpu.bus.read(cpu, a, width, n)
@@ -569,6 +585,7 @@ ns_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
 @cold
 ns_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
     if !non_secure_range(cpu, a, width) then return auviol(cpu, a)
+    val seen = cpu.pages
     cpu.pages = &cpu.mem.page_table[0]
     cpu.ns = false
     val page = store_page(cpu, a, width)
@@ -582,7 +599,7 @@ ns_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
         cpu.ns = true
         cpu.bus.write(cpu, a, width, x, n)
     cpu.ns = true
-    cpu.pages = cpu.ns_pages
+    cpu.pages = seen
 
 // SecureFault AUVIOL for an access at `a`, SFAR holding it: the instruction does not complete.
 @cold
@@ -722,6 +739,7 @@ ns_view_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
         SCB_SHPR3 -> u32(cpu.prio[ns + PENDSV]) << 16 | u32(cpu.prio[ns + SYSTICK]) << 24
         SCB_SHCSR -> ns_shcsr_value(cpu)
         SCB_CFSR -> cpu.cfsr_ns
+        SCB_MMFAR -> cpu.mmfar_ns
         SCB_NSACR -> cpu.nsacr
         // Secure state's alone: zero to Non-secure state.
         SCB_HFSR | SCB_SFSR | SCB_SFAR | SAU_CTRL | SAU_TYPE | SAU_RNR | SAU_RBAR | SAU_RLAR -> 0
@@ -776,6 +794,7 @@ ns_view_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
         SCB_SHCSR -> ns_shcsr_write(cpu, x)
         // Write one to clear, over the MemManage and UsageFault bytes.
         SCB_CFSR -> cpu.cfsr_ns &= ~(x & 0xFFFF00FF)
+        SCB_MMFAR -> cpu.mmfar_ns = x
         // A software trigger, for an IRQ that targets Non-secure state.
         NVIC_STIR ->
             val irq = x & 0x1FF

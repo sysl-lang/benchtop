@@ -1,0 +1,464 @@
+module sh.sysl.benchtop.v6m
+
+import sysl.raw.ptr_cast
+import sysl.sync.*
+
+// The ARMv8-M MPU (PMSAv8) enforced, on a core whose MPU registers t2secure.sysl stores, against the
+// ARMv8-M ARM (DDI0553: "MPUCheck", "ValidateAddress", "SecurityCheck", "IsReqExcPriNeg", "MemA_with_priv"
+// and the MMFSR and MMFAR descriptions), with QEMU's `pmsav8_mpu_lookup` and
+// `get_phys_addr_pmsav7_default` (target/arm/ptw.c) as a second witness.
+//
+// **What the MPU decides.** While it applies (MPU_CTRL.ENABLE set, and at a negative requested
+// execution priority only under HFNMIENA), an address in the private peripheral bus is always
+// reached; one that two enabled regions hold is refused; one that one region holds is read where its
+// AP lets the privilege (AP bit 1 lets unprivileged code in), written unless AP makes it read-only (bit
+// 2), and fetched unless the region is execute-never; one that no region holds is reached only
+// privileged under PRIVDEFENA, through the default map, whose Peripheral, Device and System spaces are
+// execute-never. The System space, 0xE0000000 up, is execute-never whatever maps it. A refused load or
+// store is MemManage DACCVIOL, MMFAR holding the address and MMARVALID set; a refused fetch is IACCVIOL,
+// with MMFAR not valid. Each security state has its own MPU, CFSR, MMFAR and MemManage, which is taken,
+// escalated to HardFault or a lockup as any fault is (`fault`). An access the SAU refuses takes
+// SecureFault first.
+//
+// **Nothing here runs while no MPU is in use.** Until an MPU register is written after a reset
+// (`Cpu.mpu_used`), the fast path is the one table lookup it always was, and the slow paths and the
+// decoder each test one flag.
+//
+// **Data accesses go through a table per view** (DESIGN §2.4). Each state's MPU has a table for its
+// privileged view and one for its unprivileged view: copies of the state's own table in which a page
+// is kept only where the view lets the fast path make every access there — one region holding the
+// whole page and allowing it, or, privileged under PRIVDEFENA, no region touching it. Every other page
+// is 0, so its accesses take the slow path, which checks each against the regions (`mpu_refuses`) and
+// then makes it through the state's own table. A write to a region's registers remakes only the
+// entries of the pages its old and new extents cover; a change to PRIVDEFENA, to the state's own table
+// (a board's page, the SAU, a debugger's watchpoints) or the MPU's first use has a table made whole
+// when it is next chosen. `Cpu.pages` is the view's table while the MPU applies and the state's own
+// otherwise, chosen again wherever the privilege, the priority or the MPU changes (`mpu_retable`).
+//
+// **Fetches are judged when a record is decoded.** A record the view refuses is MemManage IACCVIOL
+// (`FetchFault`, c = 2), which judges again when it runs. Unprivileged code runs on records of its own,
+// one set per state (`Memory.mpu_decoded`), so a record decoded privileged is never run unprivileged. A
+// change to a region forgets, in every set, the records on the pages its extents cover; a record
+// decoded while the MPU did not apply that its privileged view refuses has the state's records
+// forgotten once it applies (`Cpu.mpu_dirty`). The records the core runs on change only where no
+// handler holds one of the old set: at the start of a run, and where an exception entry or return, or
+// a change of state, answers the record it goes on to. An `MSR` or `CPS` that changes the privilege
+// ends the run after it, so the next one starts on the other set.
+//
+// **Not enforced yet**: the accesses an exception entry or return makes (MSTKERR, MUNSTKERR), lazy
+// floating-point preservation (MLSPERR), `BLXNS`'s push and a Non-secure function return's pop, and
+// the instructions of an IT block, which are decoded, and judged, with their IT. A store-exclusive
+// whose monitor has failed is not checked (QEMU's order; the ARM ARM leaves it IMPLEMENTATION DEFINED).
+// The ARMv7-M MPU (PMSAv7) of the M4 and M7 and the M0+'s are not enforced: each would be another
+// `mpu_data_permits` and `mpu_fetch_permits` over these tables and records. Cores sharing records (a
+// machine not `pair`ed) share the privileged view's judgments of fetches.
+
+// MMFSR, CFSR's low byte.
+const CFSR_IACCVIOL: u32 = 1 << 0
+const CFSR_DACCVIOL: u32 = 1 << 1
+const CFSR_MMARVALID: u32 = 1 << 7
+
+// The System space, execute-never whatever maps it.
+const SYSTEM_SPACE: u32 = 0xE0000000
+
+// An extent of more pages than this is remade, or forgotten, whole rather than page by page.
+const PAGES_PER_CHANGE: u32 = 65536
+
+// ---------------------------------------------------------------------------------------------------
+// What the MPU answers.
+
+// Whether the core runs privileged: in handler mode, or with CONTROL.nPRIV clear.
+@inline
+is_privileged(cpu: *Cpu) -> bool = cpu.ipsr != 0 || cpu.control & 1 == 0
+
+// Whether the MPU of the core's state applies to its accesses ("MPUCheck"): enabled, and where the
+// requested execution priority is negative only under HFNMIENA. It is negative where the state's
+// FAULTMASK is set, and for Secure state where HardFault or NMI is active ("IsReqExcPriNeg"); both
+// are Secure here.
+mpu_applies(cpu: *Cpu) -> bool
+    val ctrl = cpu.mpu_ctrl
+    if ctrl & 1 == 0 then return false
+    if ctrl & 2 != 0 then return true
+    cpu.faultmask == 0 && (cpu.ns || !(exception_active(cpu, HARD_FAULT) || exception_active(cpu, NMI)))
+
+/** Whether the live bank's MPU lets a load (or with `write` a store) reach the byte at `a`, for
+ * unprivileged code where `unpriv` ("MPUCheck"): the private peripheral bus always, under the default
+ * map; an address two enabled regions hold never; one region's by its AP; and an address no region
+ * holds only privileged, under PRIVDEFENA.
+ */
+mpu_data_permits(cpu: *Cpu, a: u32, write: bool, unpriv: bool) -> bool
+    if a >= PPB && a < PPB_END then return true
+    val k = mpu_region(cpu, a)
+    if k == MPU_OVERLAP then return false
+    if k < 0 then return !unpriv && cpu.mpu_ctrl & 4 != 0
+    val ap = (cpu.mpu_rbar[usize(k)] >> 1) & 3
+    (!unpriv || ap & 1 != 0) && !(write && ap & 2 != 0)
+
+/** Whether the live bank's MPU lets the halfword at `a` be fetched, for unprivileged code where
+ * `unpriv` ("MPUCheck"): never from the System space, nor where two regions overlap; from one
+ * region's where it is not execute-never and its AP lets the privilege read; from no region's only
+ * privileged under PRIVDEFENA, outside the default map's Peripheral and Device spaces.
+ */
+mpu_fetch_permits(cpu: *Cpu, a: u32, unpriv: bool) -> bool
+    if a >= SYSTEM_SPACE then return false
+    val k = mpu_region(cpu, a)
+    if k == MPU_OVERLAP then return false
+    if k < 0
+        if unpriv || cpu.mpu_ctrl & 4 == 0 then return false
+        return !(a >= 0x40000000 && a < 0x60000000) && a < 0xA0000000
+    val rbar = cpu.mpu_rbar[usize(k)]
+    rbar & 1 == 0 && (!unpriv || rbar & 2 != 0)
+
+// ---------------------------------------------------------------------------------------------------
+// Data accesses.
+
+/** The slow path's check of an instruction's own access to the `width` bytes at `a` while the MPU
+ * applies ("ValidateAddress"): where the view refuses a byte, MemManage DACCVIOL with MMFAR the
+ * first byte refused, and the access not made (`access_faulted`). Where a byte is Secure to
+ * Non-secure state, the SAU's check comes first, and its SecureFault is the fault.
+ */
+@cold
+@noinline
+mpu_refuses(cpu: *Cpu, a: u32, width: u32, write: bool) -> bool
+    if cpu.ns && !non_secure_range(cpu, a, width) then return false
+    val unpriv = cpu.mpu_unpriv
+    val last = a +% (width - 1)
+    var at = a
+    if mpu_data_permits(cpu, a, write, unpriv)
+        if mpu_data_permits(cpu, last, write, unpriv) then return false
+        at = last & ~0x1F
+    mem_manage(cpu, CFSR_DACCVIOL | CFSR_MMARVALID, at)
+    cpu.access_faulted = true
+    true
+
+/** MemManage of the core's state, `bits` recorded in that state's MMFSR and, with MMARVALID among
+ * them, `at` in its MMFAR: taken, escalated or a lockup at `at`, as `fault` decides.
+ */
+@cold
+mem_manage(cpu: *Cpu, bits: u32, at: u32)
+    if cpu.ns
+        cpu.cfsr_ns |= bits
+        if bits & CFSR_MMARVALID != 0 then cpu.mmfar_ns = at
+    else
+        cpu.cfsr |= bits
+        if bits & CFSR_MMARVALID != 0 then cpu.mmfar = at
+    fault(cpu, in_state(cpu, MEM_MANAGE), at, Stop.Fault)
+
+/** An unprivileged load or store (`LDRT`, `STRT`…), transfer `xfer` of `rt` at `a`: checked as
+ * unprivileged code's access where the MPU applies to privileged code, through the unprivileged
+ * view's table; otherwise the access `transfer` makes ("MemA_with_priv").
+ */
+@noinline
+unprivileged_transfer(cpu: *Cpu, xfer: u32, rt: u4, a: u32, n: u64) -> bool
+    if !cpu.mpu_live || cpu.mpu_unpriv then return transfer(cpu, xfer, rt, a, n)
+    cpu.pages = cpu.mem.mpu_page_table[mpu_table(cpu, cpu.ns, true)]
+    cpu.mpu_unpriv = true
+    val made = transfer(cpu, xfer, rt, a, n)
+    // Back to the privileged view, unless a store to the MPU's own registers has chosen afresh.
+    if cpu.mpu_unpriv then mpu_retable(cpu)
+    made
+
+// ---------------------------------------------------------------------------------------------------
+// Fetches.
+
+// Whether the instruction at `pc` may be fetched: its first halfword, and the second of a 32-bit one
+// that starts on a granule's last halfword.
+private fetch_permits(cpu: *Cpu, pc: u32, unpriv: bool) -> bool
+    if !mpu_fetch_permits(cpu, pc, unpriv) then return false
+    pc & 0x1F != 0x1E || !wide(load16(cpu, pc)) || mpu_fetch_permits(cpu, pc + 2, unpriv)
+
+/** The decoder's question, with the MPU in use, before it decodes the record at `pc`: where the MPU
+ * applies and its view refuses the fetch, the record is MemManage IACCVIOL (`FetchFault`, c = 2).
+ * Where it does not apply, a record its privileged view would refuse leaves the state's records to be
+ * judged again once it does. Answers whether it made the record.
+ */
+@cold
+@noinline
+mpu_fetch_record(cpu: *Cpu, pc: u32, into: *Insn) -> bool
+    if !cpu.mpu_live
+        if !fetch_permits(cpu, pc, false) then cpu.mpu_dirty[state_of(cpu.ns)] = true
+        return false
+    if fetch_permits(cpu, pc, cpu.mpu_unpriv) then return false
+    holds_code(cpu, pc)
+    into.imm = pc
+    into.op = Op.FetchFault
+    into.c = 2
+    into.h = handler_for(cpu, into)
+    true
+
+/** A record `mpu_fetch_record` made, run, `n` retired before it: decoded again where the core may
+ * now fetch there (its privilege, its priority or the regions have changed, or another core's MPU
+ * judged it), and otherwise MemManage IACCVIOL, the instruction not executed.
+ */
+@cold
+mpu_fetch_fault(cpu: *Cpu, ip: *Insn, n: u64) -> bool
+    val at = ip.imm
+    if !cpu.mpu_live || fetch_permits(cpu, at, cpu.mpu_unpriv)
+        ip.h = &h_decode
+        ip.op = Op.Undecoded
+        return true
+    mem_manage(cpu, CFSR_IACCVIOL, at)
+    cpu.pc = at
+    cpu.retired = n
+    false
+
+// ---------------------------------------------------------------------------------------------------
+// The tables.
+
+@inline
+private state_of(ns: bool) -> usize = if ns then 1 else 0
+
+// A view's place among a state's tables and their flags: Secure then Non-secure, privileged then
+// unprivileged.
+@inline
+private view_of(ns: bool, unpriv: bool) -> usize = state_of(ns) * 2 + (if unpriv then 1 else 0)
+
+// The table a state's own accesses go through with no MPU: the memory's or the core's Non-secure
+// one, or the copy a debugger's watchpoints leave of either.
+state_table(cpu: *Cpu, ns: bool) -> *usize
+    if ns then return cpu.ns_pages
+    if cpu.watch_count != 0 then cpu.watch_secure else &cpu.mem.page_table[0]
+
+/** The place in `Memory.mpu_page_table` of the table of a view of the live bank's MPU, made whole
+ * first where it does not match the registers. */
+mpu_table(cpu: *Cpu, ns: bool, unpriv: bool) -> usize
+    val mem = cpu.mem
+    val v = view_of(ns, unpriv)
+    val k = usize(cpu.core & 1) * 4 + v
+    if mem.mpu_page_table[k] == null then mem.mpu_page_table[k] = ptr_cast(c_calloc(usize(PAGES), sizeof(usize)))
+    if !cpu.mpu_valid[v] then make_table(cpu, mem.mpu_page_table[k], ns, unpriv)
+    k
+
+// Every entry of a view's table: where no region touches the page, the state's own entry for the
+// privileged view under PRIVDEFENA and 0 otherwise; each page a region touches, as `entry` has it.
+private make_table(cpu: *Cpu, table: *usize, ns: bool, unpriv: bool)
+    val base = state_table(cpu, ns)
+    val background = !unpriv && cpu.mpu_ctrl & 4 != 0
+    for p in 0..<PAGES do table[p] = if background then base[p] else 0
+    for k in 0..<MPU_REGIONS
+        val limit = cpu.mpu_rlar[k] | 0x1F
+        val from = cpu.mpu_rbar[k] & ~0x1F
+        if cpu.mpu_rlar[k] & 1 == 0 || from > limit then continue
+        for p in (from >> PAGE_SHIFT)..(limit >> PAGE_SHIFT) do table[p] = entry(cpu, base, p, unpriv)
+    cpu.mpu_valid[view_of(ns, unpriv)] = true
+
+// Entry `p` of a view's table, over the state's own `base`: the base entry where one region holds the
+// whole page and lets the view read it, and write it where the fast path would write in place, or
+// where no region touches the page and the privileged view has PRIVDEFENA; 0 where a region holds
+// only part of the page, two hold it, or the view may not use it whole.
+private entry(cpu: *Cpu, base: *usize, p: u32, unpriv: bool) -> usize
+    val e = base[p]
+    if e == 0 then return 0
+    val lo = p << PAGE_SHIFT
+    val hi = lo | PAGE_MASK
+    var hit = -1
+    for k in 0..<MPU_REGIONS
+        val limit = cpu.mpu_rlar[k] | 0x1F
+        val from = cpu.mpu_rbar[k] & ~0x1F
+        if cpu.mpu_rlar[k] & 1 == 0 || from > limit || limit < lo || from > hi then continue
+        if from > lo || limit < hi || hit >= 0 then return 0
+        hit = int(k)
+    if hit < 0 then return if !unpriv && cpu.mpu_ctrl & 4 != 0 then e else 0
+    val ap = (cpu.mpu_rbar[usize(hit)] >> 1) & 3
+    if unpriv && ap & 1 == 0 then return 0
+    if ap & 2 != 0 && stores_in_place(cpu.mem, p) then return 0
+    e
+
+// Whether the fast path stores to page `p` in place: the first RAM region's, or another's that is not
+// read-only (`store_page`).
+private stores_in_place(mem: *Memory, p: u32) -> bool
+    val a = p << PAGE_SHIFT
+    if a >= mem.ram_base && u64(a) + u64(PAGE_BYTES) <= u64(mem.ram_base) + u64(mem.ram_size) then return true
+    (mem.bank_store_pages[p >> 6] >> u64(p & 63)) & 1 != 0
+
+// ---------------------------------------------------------------------------------------------------
+// Choosing the view.
+
+/** The MPU's view as a reset leaves it: not in use, the core on its state's own table and records. */
+clear_mpu(cpu: *Cpu)
+    cpu.mpu_used = false
+    cpu.mpu_live = false
+    cpu.mpu_unpriv = false
+    cpu.mpu_bank_ns = false
+    cpu.mpu_valid = [false, false, false, false]
+    cpu.mpu_ready = [false, false]
+    cpu.mpu_dirty = [false, false]
+    cpu.mpu_held = null
+    cpu.mpu_held_predicated = null
+    cpu.mmfar = 0
+    cpu.mmfar_ns = 0
+
+// An MPU register written for the first time since the reset: the tables are made when first
+// chosen, and records decoded before are judged again once the MPU applies.
+private mpu_start(cpu: *Cpu)
+    if cpu.mpu_used then return
+    cpu.mpu_used = true
+    cpu.mpu_valid = [false, false, false, false]
+    cpu.mpu_dirty = [true, true]
+
+/** Choose the table the core's accesses go through, and the view the slow paths and the decoder judge
+ * by, for the MPU of its state at its privilege and priority as they are now. As the privileged view
+ * comes to apply, the records it has not judged are forgotten. A host access holding the other
+ * state's bank live (`secure_view`, `banked_write`) changes nothing: that MPU is not the core's.
+ */
+mpu_retable(cpu: *Cpu)
+    if cpu.mpu_bank_ns != cpu.ns then return
+    val applies = mpu_applies(cpu)
+    val unpriv = applies && !is_privileged(cpu)
+    cpu.mpu_live = applies
+    cpu.mpu_unpriv = unpriv
+    // Each read where it is stored, as `switch_state` makes it.
+    if applies
+        cpu.pages = cpu.mem.mpu_page_table[mpu_table(cpu, cpu.ns, unpriv)]
+    else
+        cpu.pages = if cpu.ns then cpu.ns_pages elif cpu.watch_count != 0 then cpu.watch_secure else &cpu.mem.page_table[0]
+    val s = state_of(cpu.ns)
+    if applies && !unpriv && cpu.mpu_dirty[s]
+        cpu.mpu_dirty[s] = false
+        forget_everywhere(cpu)
+
+/** Choose the table and the records the core runs on: only where no handler holds a record of the
+ * set it ran on. */
+mpu_select(cpu: *Cpu)
+    mpu_retable(cpu)
+    if cpu.mpu_unpriv == (cpu.mpu_held != null) then return
+    if !cpu.mpu_unpriv then return mpu_release(cpu)
+    val k = unprivileged_records(cpu, cpu.ns)
+    cpu.mpu_held = cpu.dec
+    cpu.mpu_held_predicated = cpu.predicated
+    cpu.dec = cpu.mem.mpu_decoded[k]
+    cpu.predicated = cpu.mem.mpu_predicated[k]
+
+/** Put the core back on its state's own records, before a change of state takes them up. */
+mpu_release(cpu: *Cpu)
+    if cpu.mpu_held == null then return
+    cpu.dec = cpu.mpu_held
+    cpu.predicated = cpu.mpu_held_predicated
+    cpu.mpu_held = null
+
+/** An `MSR` or `CPS` may have changed CONTROL.nPRIV or FAULTMASK: the table changes at once, and where
+ * the records must too, the run ends after the instruction, so that the next starts on them. */
+mpu_privilege_changed(cpu: *Cpu)
+    mpu_retable(cpu)
+    if cpu.mpu_unpriv != (cpu.mpu_held != null) then set_limit(cpu, 0)
+
+// The place in `Memory.mpu_decoded` of the core's records for unprivileged code in state `ns`, which
+// hold this reset's "not decoded" the first time it needs them after one.
+private unprivileged_records(cpu: *Cpu, ns: bool) -> usize
+    val mem = cpu.mem
+    val k = usize(cpu.core & 1) * 2 + state_of(ns)
+    if mem.mpu_decoded[k] == null
+        mem.mpu_decoded[k] = ptr_cast(c_calloc(RECORDS, sizeof(Insn)))
+        mem.mpu_predicated[k] = ptr_cast(c_calloc(RECORDS, sizeof(Handler)))
+    val records = mem.mpu_decoded[k]
+    if !cpu.mpu_ready[state_of(ns)]
+        for i in 0..(RAM_BYTES >> 1) do records[i] = undecoded()
+        for i in (FLASH_OFFSET >> 1)..((FLASH_OFFSET + mem.flash_size) >> 1) do records[i] = undecoded()
+        records[NO_CODE >> 1] = undecoded()
+        mem.install_ram_guards(records)
+        cpu.mpu_ready[state_of(ns)] = true
+    k
+
+// ---------------------------------------------------------------------------------------------------
+// Changes.
+
+/** MPU_CTRL of the live bank has been written, from `was`. PRIVDEFENA changes what the privileged view
+ * reaches through no region, so its table is made whole when next chosen and every record is judged
+ * again; ENABLE and HFNMIENA change only whether the MPU applies.
+ */
+mpu_ctrl_changed(cpu: *Cpu, was: u32)
+    mpu_start(cpu)
+    if (was ^ cpu.mpu_ctrl) & 4 != 0
+        cpu.mpu_valid[view_of(cpu.mpu_bank_ns, false)] = false
+        forget_everywhere(cpu)
+    mpu_retable(cpu)
+
+/** Region `k` of the live bank's MPU has been written, from `was_rbar` and `was_rlar`: the entries of
+ * the pages its old and new extents cover are made again in the state's tables, and every record of
+ * the core's on those pages is forgotten, so each fetch there is judged again.
+ */
+mpu_region_changed(cpu: *Cpu, k: usize, was_rbar: u32, was_rlar: u32)
+    mpu_start(cpu)
+    val rbar = cpu.mpu_rbar[k]
+    val rlar = cpu.mpu_rlar[k]
+    if rbar == was_rbar && rlar == was_rlar then return
+    extent_changed(cpu, was_rbar, was_rlar)
+    extent_changed(cpu, rbar, rlar)
+    mpu_retable(cpu)
+
+// The extent of a region as `rbar` and `rlar` have it, which the region's change may have changed: its
+// pages' entries made again, and their records forgotten. A disabled region has none.
+private extent_changed(cpu: *Cpu, rbar: u32, rlar: u32)
+    val from = rbar & ~0x1F
+    val limit = rlar | 0x1F
+    if rlar & 1 == 0 || from > limit then return
+    val first = from >> PAGE_SHIFT
+    val last = limit >> PAGE_SHIFT
+    val ns = cpu.mpu_bank_ns
+    for unpriv in [false, true]
+        val v = view_of(ns, unpriv)
+        if !cpu.mpu_valid[v] then continue
+        if last - first >= PAGES_PER_CHANGE
+            cpu.mpu_valid[v] = false
+            continue
+        val table = cpu.mem.mpu_page_table[usize(cpu.core & 1) * 4 + v]
+        val base = state_table(cpu, ns)
+        for p in first..last do table[p] = entry(cpu, base, p, unpriv)
+    forget_pages(cpu, first, last)
+
+/** The state's own tables have changed (a board's page, the SAU, a debugger's watchpoints): the MPU's
+ * tables, which copy them, are made whole when next chosen, the one in use at once. */
+mpu_rebase(cpu: *Cpu)
+    cpu.mpu_valid = [false, false, false, false]
+    mpu_retable(cpu)
+
+/** The SAU or a page's mapping has changed: every record the core keeps for unprivileged code is
+ * judged again, and the tables copy the state's afresh. */
+mpu_attribution_changed(cpu: *Cpu)
+    forget_everywhere(cpu)
+    mpu_rebase(cpu)
+
+// ---------------------------------------------------------------------------------------------------
+// Forgetting records.
+
+// The records of the core's, in each set it runs, on pages `first` to `last` that hold code.
+private forget_pages(cpu: *Cpu, first: u32, last: u32)
+    if last - first >= PAGES_PER_CHANGE then return forget_everywhere(cpu)
+    val mem = cpu.mem
+    for p in first..last
+        val offset = mem.code_offset(p << PAGE_SHIFT)
+        if offset == NO_CODE then continue
+        if offset >= FLASH_OFFSET
+            val page = (offset - FLASH_OFFSET) >> PAGE_SHIFT
+            if (atomic_load(&mem.flash_code_pages[page >> 6], Relaxed) >> u64(page & 63)) & 1 != 0 then forget_in_sets(cpu, offset >> 1, PAGE_BYTES >> 1)
+            continue
+        for line in (offset >> LINE_SHIFT)..<((offset + PAGE_BYTES) >> LINE_SHIFT)
+            if atomic_load(&mem.code_lines[line], Relaxed) & LINE_CODE != 0 then forget_in_sets(cpu, line << (LINE_SHIFT - 1), 1 << (LINE_SHIFT - 1))
+
+// `count` records from `first` in every set the core runs: each state's own, and its unprivileged ones.
+private forget_in_sets(cpu: *Cpu, first: u32, count: u32)
+    for k in 0..<6
+        val records = record_set(cpu, k)
+        if records != null then forget_range(records, first, count)
+
+// Every record holding code in every set the core runs.
+private forget_everywhere(cpu: *Cpu)
+    for k in 0..<6 do forget_records(cpu, record_set(cpu, k))
+
+// Set `k` of those the core may run: 0 the one it runs, 1 the state's own while that is unprivileged
+// code's, 2 and 3 Secure and Non-secure state's own, 4 and 5 their unprivileged code's; null where
+// there is none.
+private record_set(cpu: *Cpu, k: int) -> *Insn = k match
+    0 -> cpu.dec
+    1 -> cpu.mpu_held
+    2 -> cpu.secure_records
+    3 -> cpu.ns_records
+    _ -> cpu.mem.mpu_decoded[usize(cpu.core & 1) * 2 + usize(k - 4)]
+
+/** Records `first` to `last` of the sets `drop_records` does not reach: the state's own while the
+ * core runs unprivileged code's, and each state's for unprivileged code, put back to "not decoded". */
+mpu_drop_records(cpu: *Cpu, first: u32, last: u32)
+    for k in [1, 4, 5]
+        val records = record_set(cpu, k)
+        if records == null || records == cpu.dec then continue
+        for i in first..last do if records[i].op != Op.Undecoded then records[i] = undecoded()
