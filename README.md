@@ -579,6 +579,9 @@ status 1, saying so. Without `--report` nothing of it is built. A Pico 2 at its 
     HardFault or a stack-limit violation at a negative priority, or one benchtop does not model;
   - `fault`: a core stopped on a fault the run stops at (an access nothing answers on a virtual board,
     a semihosting call not answered, a hart's trap), or the chip refused something;
+  - `unmodelled`: a core reached an instruction it has on silicon that benchtop does not model (an
+    M52, M55 or M85's low-overhead loop, MVE long shift or MVE vector instruction): benchtop's limit,
+    named with the extension and the encoding, not a fault of the guest's, so no fault is taken;
   - `breakpoint`: a `BKPT` that is not a semihosting call, or a hart's `EBREAK`;
   - `asleep`: every core sleeps in WFI or WFE, and nothing on the board will wake one;
   - `budget`: the run's budget ran out with every core still running;
@@ -978,9 +981,10 @@ yet on exception stacking and unstacking, lazy floating-point preservation or `B
 M4's and M7's PMSAv7 MPU and the M0+'s are not enforced.
 M4 and M7 always have integer DSP; M33/M35P/M52/M55/M85 can enable it independently per core. The M52/M55/M85
 models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
-MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. Unsupported instruction
-encodings take UNDEFINSTR (NOCP in the coprocessor space), as a core without them would; `run` refuses
-descriptions enabling unimplemented extensions.
+MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. A low-overhead loop, long
+shift or MVE instruction stops the core at `Unmodelled`, named, with no fault taken (silicon takes
+none); an encoding UNDEFINED on the core takes UNDEFINSTR (NOCP for an absent coprocessor); `run`
+refuses descriptions enabling unimplemented extensions.
 The conditional-select family treats R15 sources as ZR, preserves NZCV/Q, rejects SP and PC
 destination operands, and stops on AL/NV constrained-unpredictable conditions.
 

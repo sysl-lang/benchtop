@@ -139,6 +139,8 @@ clear_security(cpu: *Cpu)
     cpu.sfsr = 0
     cpu.sfar = 0
     cpu.transition = Transition.None
+    cpu.unmodelled = Extension.None
+    cpu.unmodelled_insn = 0
     cpu.nsacr = 0
     cpu.scr = 0
     cpu.idau = NO_IDAU
@@ -203,11 +205,60 @@ fault_here(cpu: *Cpu, ip: *Insn, n: u64, bits: u32, why: Stop)
     cpu.retired = n
     usage(cpu, bits, at, why)
 
-// The undefined instruction at `ip`, `n` retired before it: UNDEFINSTR, or NOCP for an instruction of
-// a coprocessor the core does not have (`undefined_bits`).
+// The instruction at `ip`, `n` retired before it, which the core's records say it cannot execute. On an
+// ARMv8.1-M core one of an extension it has on silicon that benchtop does not model stops the core at
+// `Unmodelled` (`unmodelled_extension`), whatever runs it: no fault is taken, since silicon takes none.
+// The rest are undefined: UNDEFINSTR, or NOCP for an instruction of a coprocessor the core does not have
+// (`undefined_bits`).
 @cold
 @noinline
-undefined_here(cpu: *Cpu, ip: *Insn, n: u64) = fault_here(cpu, ip, n, undefined_bits(cpu, addr_of(cpu, ip)), Stop.Undefined)
+undefined_here(cpu: *Cpu, ip: *Insn, n: u64)
+    val at = addr_of(cpu, ip)
+    if is_v81m(cpu.kind)
+        val x = unmodelled_extension(cpu, at)
+        if x != Extension.None then return unmodelled_here(cpu, ip, n, x)
+    fault_here(cpu, ip, n, undefined_bits(cpu, at), Stop.Undefined)
+
+// Stop at `Unmodelled` on the instruction at `ip`, `n` retired before it, of extension `x`, with nothing
+// of it done.
+@cold
+unmodelled_here(cpu: *Cpu, ip: *Insn, n: u64, x: Extension)
+    if cpu.stop != Stop.Running then return
+    val at = addr_of(cpu, ip)
+    cpu.pc = at
+    cpu.retired = n
+    cpu.unmodelled = x
+    cpu.unmodelled_insn = halfwords(cpu, at) match
+        Some(h) ->
+            val (h1, h2) = h
+            (h1 << 16) | h2
+        None -> 0
+    halt(cpu, Stop.Unmodelled, at)
+
+// The two halfwords at `at`, read from the memory code is decoded from; None where they are off the
+// page table.
+halfwords(cpu: *Cpu, at: u32) -> Option[(u32, u32)]
+    val page = cpu.mem.page_table[at >> PAGE_SHIFT]
+    if page == 0 || at & PAGE_MASK > PAGE_BYTES - 4 then return None
+    Some((host_read(page, at, 2), host_read(page, at + 2, 2)))
+
+// The ARMv8.1-M extension the 32-bit instruction at `at` is one of where benchtop does not model it, or
+// `None`: the low-overhead loops (1111 0000 0xxx xxxx, 11x0 xxxx xxxx xxx1: WLS, DLS, LE and their
+// tail-predicated forms, where ARMv8-M has its UNDEFINED BLX immediate); MVE's long shifts (ORR's
+// encodings, 1110 1010 010x, with Rm 13 or 15, which ARMv8-M leaves UNPREDICTABLE); and MVE's vector
+// instructions (1110 1111 and 1111 1111 first halfwords, and the coprocessor space's CP8, CP9, CP14 and
+// CP15).
+unmodelled_extension(cpu: *Cpu, at: u32) -> Extension
+    val (hw1, hw2) = halfwords(cpu, at) match
+        Some(h) -> h
+        None -> return Extension.None
+    if hw1 & 0xE000 != 0xE000 || hw1 & 0x1800 == 0 then return Extension.None
+    if hw1 & 0xFF80 == 0xF000 && hw2 & 0xD001 == 0xC001 then return Extension.LowOverheadLoop
+    if hw1 & 0xFFE0 == 0xEA40 && hw2 & 0x8000 == 0 && (hw2 & 0xF == 0xF || hw2 & 0xF == 0xD) then return Extension.LongShift
+    if hw1 & 0xEF00 == 0xEF00 then return Extension.Mve
+    val cp = (hw2 >> 8) & 0xF
+    if hw1 & 0xEC00 == 0xEC00 && (cp == 8 || cp == 9 || cp == 14 || cp == 15) then return Extension.Mve
+    Extension.None
 
 // Why the instruction at `at`, which the core cannot execute, faults: NOCP where it is in the
 // coprocessor space (a first halfword 111x 11xx) and names a coprocessor the core does not have — CP10
@@ -216,10 +267,9 @@ undefined_here(cpu: *Cpu, ip: *Insn, n: u64) = fault_here(cpu, ip, n, undefined_
 // VLSTM and VLLDM (1110 1100 0010 and 0011 Rn, 0000 1010 0000 0000), which a core runs with the FPU
 // absent or denied, are UNDEFINSTR where undefined.
 undefined_bits(cpu: *Cpu, at: u32) -> u32
-    val page = cpu.mem.page_table[at >> PAGE_SHIFT]
-    if page == 0 || at & PAGE_MASK > PAGE_BYTES - 4 then return CFSR_UNDEFINSTR
-    val hw1 = host_read(page, at, 2)
-    val hw2 = host_read(page, at + 2, 2)
+    val (hw1, hw2) = halfwords(cpu, at) match
+        Some(h) -> h
+        None -> return CFSR_UNDEFINSTR
     if hw1 & 0xEC00 != 0xEC00 || (hw1 & 0xFFE0 == 0xEC20 && hw2 == 0x0A00) then return CFSR_UNDEFINSTR
     val cp = (hw2 >> 8) & 0xF
     val present = if cp == 10 || cp == 11 then cpu.fpu != Fpu.Absent else cp < 8 && cpu.coprocessors & (1 << cp) != 0
