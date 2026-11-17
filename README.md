@@ -231,7 +231,7 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 ```
 sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--window] [--deterministic | --threads] [--usb console|pty|off]
-               [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--report-masking <file>]
+               [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--report-masking <file> [--masking-sites] [--masking-ranks <n>]]
                [--report <file.json>] [--explain-faults] [--trace-ring <n>] [--semihosting]
                [--serial uart0|uart1=file:<path>] ... <image.elf | image.bin>
 ./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
@@ -502,6 +502,12 @@ slow path, the start of a run), behind one null test. `--window` and `--gdb` ref
 Pico 2 on its Hazard3 harts (`pico2-riscv`): they mask interrupts through `mstatus` and `mie`, which
 the report does not read.
 
+Two options of `--report-masking`, each off by default, and each costing nothing while off: **`--masking-sites`**
+adds the site table, and **`--masking-ranks <n>`** lists the `n` longest intervals (1 to 4096; 0 and
+larger are refused) where 8 are listed otherwise. Without either the file is byte for byte what it
+is without the options. The site table is opt-in because it keeps a table that grows with the sites and
+adds lines, which would change the file a gate already greps; it is updated only as an interval closes.
+
 - **Masked** means PRIMASK or FAULTMASK set, or BASEPRI not 0 (either security state's, where
   Non-secure state is in use): the execution priority boost that keeps an interrupt at a kernel's
   priority out. An interval runs from the instruction that masked (`CPSID`, `MSR`) to the one that
@@ -526,6 +532,8 @@ The file is one fact per line, `key=value` fields after a two-word prefix, core 
 masking core=0 timing=estimated cycles=1203 intervals=3 masked=96 longest=48 from=0x00000124 to=0x00000140
 masking core=0 rank=1 cycles=48 from=0x00000124 to=0x00000140
 masking core=0 rank=2 cycles=40 from=0x00000210 to=end
+masking core=0 site from=0x00000124 (tick+0x4) to=0x00000140 (tick+0x20) longest=48 count=2
+masking core=0 site from=0x00000210 (sched+0x8) to=end longest=40 count=1
 masking core=0 bucket=32-63 count=3
 latency core=0 exception=systick taken=12 max=51 mean=9
 latency core=0 exception=systick bucket=4-7 count=11
@@ -538,7 +546,12 @@ masking core=1 timing=estimated cycles=980 intervals=0 masked=0 longest=0 from=n
 - The summary line: the timing, the core's executed `cycles` at the end, how many `intervals` and
   their total `masked` cycles, and the longest, with the addresses of the instructions that began and
   ended it (`from=none to=none` for none).
-- `rank=k`: the eight longest intervals, longest first, the earlier first among equals.
+- `rank=k`: the eight longest intervals (`--masking-ranks n`: the n longest), longest first, the earlier first among equals.
+- `site from=<pc> [(name+0xoff)] to=<pc> [(name+0xoff)] longest=<cycles> count=<n>`: with `--masking-sites`, one
+  line per distinct pair of the instruction that masked and the one that unmasked, per core, after the
+  ranks: the longest interval between them and how many closed. Longest first, ties by address. The
+  names are the ELF image's symbols (`name+0xoff`, or the bare name at its start); a raw image or an address
+  no symbol holds has the address alone. An interval still open at the end is its own site, `to=end`, count 1.
 - `bucket=lo-hi count=n`: a histogram of interval lengths in powers of two (`0-0`, `1-1`, `2-3`,
   `4-7`, ...), non-empty buckets only.
 - `latency ... exception=<name>`: per exception taken, how many times, the maximum and the mean wait,

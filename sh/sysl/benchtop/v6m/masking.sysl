@@ -29,14 +29,17 @@ module sh.sysl.benchtop.v6m
 // the start of a run — behind a test of `cpu.masking`, null until `record_masking`.
 
 import sysl.raw.ptr_cast
-import sysl.text.{StrBuilder, str_builder}
+import sysl.buf.{Buf, buf}
+import sysl.text.{StrBuilder, str_builder, parse_int}
 
 extern "free" c_free(p: *u8)
 
 // Histogram buckets: 0 for nothing, k for 2^(k-1) to 2^k - 1 cycles.
 const MASK_BUCKETS: usize = 48
-// How many of the longest intervals the report keeps.
+// How many of the longest intervals the report keeps unless asked for more or fewer, and the most and
+// least it can be asked for.
 const MASKING_TOP: usize = 8
+const MASKING_RANKS_MOST: usize = 4096
 const EXCEPTIONS: usize = NVIC_BANKS * 64
 
 /** A masked interval: its length in executed cycles, the address of the instruction that masked and of
@@ -46,6 +49,38 @@ struct Interval
     from: u32
     to: u32
     open: bool
+
+/** One masking site: a distinct pair of the instruction that masked and the one that unmasked, with the
+ * longest interval between them and how many closed. `used` marks an occupied slot of the table. */
+struct Site
+    from: u32
+    to: u32
+    used: bool
+    open: bool
+    longest: u64
+    count: u64
+
+/** What the masking report records beyond its defaults: `sites` keeps a table of masking sites, `ranks`
+ * is how many of the longest intervals are listed, and `table`, where not null, names the addresses of
+ * the site lines (the caller keeps it alive while the core records). */
+struct MaskingOptions
+    sites: bool
+    ranks: usize
+    table: *SymbolTable
+
+/** The report as it is without options: no site table, the eight longest intervals, no names. */
+masking_defaults() -> MaskingOptions = MaskingOptions(false, MASKING_TOP, null)
+
+impl MaskingOptions
+    /** These options with `table` naming the site lines' addresses. */
+    with_table(self, table: &SymbolTable) -> MaskingOptions = MaskingOptions(self.sites, self.ranks, &*table)
+
+/** The number of longest intervals `text` asks for (`--masking-ranks`), 1 to 4096; or why not. */
+masking_ranks(text: string) -> Result[usize, string]
+    val bad = s"--masking-ranks takes a number from 1 to $MASKING_RANKS_MOST, not $text"
+    parse_int(text) match
+        Ok(n) -> if n >= 1 && n <= int(MASKING_RANKS_MOST) then Ok(usize(n)) else Err(bad)
+        Err(_) -> Err(bad)
 
 /** One exception's latencies: how many times it was taken, their sum and maximum, and a histogram. */
 struct Latency
@@ -63,8 +98,17 @@ struct Masking
     // The closed intervals: how many, their total, the longest few (longest first) and a histogram.
     intervals: u64
     total: u64
-    top: [MASKING_TOP]Interval
+    // `ranks` slots at `top`, `top_count` of them filled.
+    top: *Interval
+    ranks: usize
     top_count: usize
+    // The site table, where asked for: open addressing over `site_cap` slots (a power of two), keyed by
+    // the pair of addresses, `site_count` occupied. Touched only as an interval closes.
+    track_sites: bool
+    sites: *Site
+    site_cap: usize
+    site_count: usize
+    names: *SymbolTable
     buckets: [MASK_BUCKETS]u64
     // The exceptions pending with a known start, one bit per exception number as `Cpu.pending`, and
     // the clock each became pending at.
@@ -77,10 +121,14 @@ struct Masking
 
 /** Record `cpu`'s masked intervals and interrupt latencies from now on, from nothing; a second call
  * starts again. A reset keeps the record. */
-record_masking(cpu: *Cpu)
-    if cpu.masking != null then c_free(ptr_cast(cpu.masking))
+record_masking(cpu: *Cpu, o: MaskingOptions = masking_defaults())
+    stop_masking(cpu)
     cpu.masking = ptr_cast(c_calloc(1, sizeof(Masking)))
     val r = cpu.masking
+    r.ranks = o.ranks
+    r.top = ptr_cast(c_calloc(o.ranks, sizeof(Interval)))
+    r.track_sites = o.sites
+    r.names = o.table
     r.tick_slot = SYSTICK
     r.masked = masks_set(cpu)
     r.since = cycles(cpu)
@@ -89,6 +137,8 @@ record_masking(cpu: *Cpu)
 /** Stop recording, and free the record. */
 stop_masking(cpu: *Cpu)
     if cpu.masking == null then return
+    c_free(ptr_cast(cpu.masking.top))
+    if cpu.masking.sites != null then c_free(ptr_cast(cpu.masking.sites))
     c_free(ptr_cast(cpu.masking))
     cpu.masking = null
 
@@ -174,13 +224,14 @@ private note_interval(r: *Masking, v: Interval)
     r.intervals += 1
     r.total += v.cycles
     r.buckets[bucket(v.cycles)] += 1
-    keep_longest(&r.top[0], &r.top_count, v)
+    keep_longest(r.top, r.ranks, &r.top_count, v)
+    if r.track_sites then note_site(r, v.from, v.to, v.cycles)
 
 // Insert `v` into the `count` longest intervals at `top`, longest first, the earlier first among
-// equals, keeping at most `MASKING_TOP`.
-private keep_longest(top: *Interval, count: *usize, v: Interval)
+// equals, keeping at most `cap`.
+private keep_longest(top: *Interval, cap: usize, count: *usize, v: Interval)
     var k = count[0]
-    if k == MASKING_TOP
+    if k == cap
         if v.cycles <= top[k - 1].cycles then return
         k -= 1
     else
@@ -189,6 +240,32 @@ private keep_longest(top: *Interval, count: *usize, v: Interval)
         top[k] = top[k - 1]
         k -= 1
     top[k] = v
+
+// The slot of the pair (`from`, `to`) in a table of `cap` slots at `t`: where it is, or where it goes.
+private slot_of(t: *Site, cap: usize, from: u32, to: u32) -> usize
+    var k = usize((u64(from) * 0x9E3779B1u64 ^ u64(to) * 0x85EBCA6Bu64) >> 7) & (cap - 1)
+    while t[k].used && !(t[k].from == from && t[k].to == to) do k = (k + 1) & (cap - 1)
+    k
+
+// An interval of `cycles` closed from `from` to `to`: the site's longest and count.
+private note_site(r: *Masking, from: u32, to: u32, cycles: u64)
+    if r.site_count * 2 >= r.site_cap
+        val cap = if r.site_cap == 0 then 64 else r.site_cap * 2
+        val bigger: *Site = ptr_cast(c_calloc(cap, sizeof(Site)))
+        for k in 0..<r.site_cap
+            if r.sites[k].used then bigger[slot_of(bigger, cap, r.sites[k].from, r.sites[k].to)] = r.sites[k]
+        if r.sites != null then c_free(ptr_cast(r.sites))
+        r.sites = bigger
+        r.site_cap = cap
+    val k = slot_of(r.sites, r.site_cap, from, to)
+    val s = &r.sites[k]
+    if !s.used
+        s.used = true
+        s.from = from
+        s.to = to
+        r.site_count += 1
+    s.count += 1
+    if cycles > s.longest then s.longest = cycles
 
 // ---------------------------------------------------------------------------------------------------
 // The report.
@@ -199,8 +276,11 @@ private keep_longest(top: *Interval, count: *usize, v: Interval)
 masking_text(cpu: *Cpu, core: u32) -> string
     if cpu.masking == null then return ""
     val r = cpu.masking
-    var top = r.top
+    val top: *Interval = ptr_cast(c_calloc(r.ranks, sizeof(Interval)))
+    defer c_free(ptr_cast(top))
+    for k in 0..<r.top_count do top[k] = r.top[k]
     var count = r.top_count
+    var open_site: Option[Interval] = None
     var buckets = r.buckets
     var intervals = r.intervals
     var total = r.total
@@ -211,7 +291,8 @@ masking_text(cpu: *Cpu, core: u32) -> string
         intervals += 1
         total += v.cycles
         buckets[bucket(v.cycles)] += 1
-        keep_longest(&top[0], &count, v)
+        keep_longest(top, r.ranks, &count, v)
+        open_site = Some(v)
 
     var out = str_builder()
     val m = s"masking core=$core"
@@ -220,6 +301,7 @@ masking_text(cpu: *Cpu, core: u32) -> string
 
     out.push(s"$m timing=$timing cycles=$now intervals=$intervals masked=$total $longest\n")
     for i in 0..<count do out.push(s"$m rank=${i + 1} cycles=${top[i].cycles} ${ends(top[i])}\n")
+    if r.track_sites then push_sites(&out, r, m, open_site)
     for b in 0..<MASK_BUCKETS do if buckets[b] != 0 then out.push(s"$m bucket=${bucket_range(b)} count=${buckets[b]}\n")
 
     for e in 0..<EXCEPTIONS
@@ -230,6 +312,40 @@ masking_text(cpu: *Cpu, core: u32) -> string
         for b in 0..<MASK_BUCKETS do if l.buckets[b] != 0 then out.push(s"$x bucket=${bucket_range(b)} count=${l.buckets[b]}\n")
 
     out.finish()
+
+// The site lines, longest first (ties by address): each closed site, and `open_site`, the interval
+// still open, as its own site with `to=end`.
+private push_sites(out: *StrBuilder, r: *Masking, m: string, open_site: Option[Interval])
+    var all: Buf[Site] = buf()
+    for k in 0..<r.site_cap do if r.sites[k].used then all.push(r.sites[k])
+    open_site match
+        Some(v) -> all.push(Site(v.from, v.to, true, true, v.cycles, 1))
+        None -> ()
+    for i in 1..<all.len()
+        val x = all[i]
+        var j = i
+        while j > 0 && site_before(x, all[j - 1])
+            all[j] = all[j - 1]
+            j -= 1
+        all[j] = x
+    for i in 0..<all.len()
+        val x = all[i]
+        val to = if x.open then "to=end" else s"to=${hex_at(r, x.to)}"
+        out.push(s"$m site from=${hex_at(r, x.from)} $to longest=${x.longest} count=${x.count}\n")
+
+private site_before(a: Site, b: Site) -> bool
+    if a.longest != b.longest then return a.longest > b.longest
+    if a.from != b.from then return a.from < b.from
+    if a.open != b.open then return b.open
+    a.to < b.to
+
+// `a` as `0x…` and, where the table names it, ` (name+0xoff)`.
+private hex_at(r: *Masking, a: u32) -> string
+    val h = f"0x$a%08x"
+    if r.names == null then return h
+    symbol_at(r.names.names.view(), a) match
+        Some(n) -> s"$h ($n)"
+        None -> h
 
 private ends(v: Interval) -> string = if v.open then f"from=0x${v.from}%08x to=end" else f"from=0x${v.from}%08x to=0x${v.to}%08x"
 

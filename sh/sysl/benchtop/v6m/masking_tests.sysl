@@ -22,7 +22,10 @@ const MOVS_R7_9: u16 = 0x2709
 
 // `code` on a core of kind `kind` under both executors, each recording from the start (after
 // `setup`), required to give the same report; the threaded machine answered.
-recorded(kind: Kind, code: []const u16, regs: []const u32, handlers: [][2]u32, setup: Setup) -> Cpu
+recorded(kind: Kind, code: []const u16, regs: []const u32, handlers: [][2]u32, setup: Setup) -> Cpu = recorded_with(kind, code, regs, handlers, setup, masking_defaults())
+
+// `recorded`, the report taking the options `o`.
+recorded_with(kind: Kind, code: []const u16, regs: []const u32, handlers: [][2]u32, setup: Setup, o: MaskingOptions) -> Cpu
     var a: Cpu
     var b: Cpu
 
@@ -30,11 +33,11 @@ recorded(kind: Kind, code: []const u16, regs: []const u32, handlers: [][2]u32, s
     b.kind = kind
 
     machine(&a, code, regs, 0, handlers, setup)
-    record_masking(&a)
+    record_masking(&a, o)
     finish(&a, &run_match)
 
     machine(&b, code, regs, 0, handlers, setup)
-    record_masking(&b)
+    record_masking(&b, o)
     finish(&b, &run_threaded)
 
     val ta = masking_text(&a, 0)
@@ -267,6 +270,182 @@ latency_systick()
         assert(longest(&c) == (16, 0x0, 0x20), s"${longest(&c)}")
         assert(masking_text(&c, 0).contains("latency core=0 exception=systick taken=1 max=7 mean=7\n"))
         stop_masking(&c)
+
+// ---------------------------------------------------------------------------------------------------
+// The site table and the number of ranks.
+
+val SITES_ON: MaskingOptions = MaskingOptions(true, 8, null)
+// movs r0, #3; subs r0, #1; bne to the CPSID at 0x2 (offset -6); movs r0, #2; beq to 0xE (offset +1);
+// b to the CPSID at 0x2 (offset -7).
+const MOVS_R0_3: u16 = 0x2003
+const MOVS_R0_2: u16 = 0x2002
+const SUBS_R0_1: u16 = 0x3801
+const BNE_BACK_6: u16 = 0xD1FA
+const BEQ_FWD_1: u16 = 0xD001
+const B_BACK_7: u16 = 0xE7F9
+
+// `text` without its site lines.
+without_sites(text: string) -> string
+    var out = ""
+    var from = 0
+    for i in 0..<text.len
+        if text[i] != u8('\n') then continue
+        val line = text[from..<i + 1]
+        if !line.contains(" site from=") then out = s"$out$line"
+        from = i + 1
+    out
+
+// Where `text` lists a line starting `prefix`: how many do.
+lines_with(text: string, prefix: string) -> int
+    var n = 0
+    var from = 0
+    for i in 0..<text.len
+        if text[i] != u8('\n') then continue
+        if text[from..<i + 1].starts_with(prefix) then n += 1
+        from = i + 1
+    n
+
+@test("two sites of different lengths and counts are listed longest first, each with its own longest and count")
+sites_two()
+    // 0: movs r0, #3; 2: cpsid i; 4: nop; 6: cpsie i; 8: subs; A: bne 2 (three times round); C: cpsid i;
+    // E, 10, 12: nop; 14: cpsie i; 16: bkpt
+    val code: [12]u16 = [MOVS_R0_3, CPSID, MASK_NOP, CPSIE, SUBS_R0_1, BNE_BACK_6, CPSID, MASK_NOP, MASK_NOP, MASK_NOP, CPSIE, BKPT]
+    var c = recorded_with(Kind.V6m, code[..], [], [], &nothing, SITES_ON)
+
+    val text = masking_text(&c, 0)
+    assert(text.contains("masking core=0 site from=0x0000000c to=0x00000014 longest=4 count=1\nmasking core=0 site from=0x00000002 to=0x00000006 longest=2 count=3\n"), text)
+    assert(lines_with(text, "masking core=0 site ") == 2, text)
+    assert(masking_totals(&c) == (4, 10), s"${masking_totals(&c)}")
+    stop_masking(&c)
+
+@test("one start with two ends is two sites")
+sites_same_start()
+    // 0: movs r0, #2; 2: cpsid i; 4: nop; 6: subs; 8: beq E; A: cpsie i; C: b 2; E: cpsie i; 10: bkpt
+    val code: [9]u16 = [MOVS_R0_2, CPSID, MASK_NOP, SUBS_R0_1, BEQ_FWD_1, CPSIE, B_BACK_7, CPSIE, BKPT]
+    var c = recorded_with(Kind.V6m, code[..], [], [], &nothing, SITES_ON)
+
+    val text = masking_text(&c, 0)
+    assert(text.contains("site from=0x00000002 to=0x0000000a longest=4 count=1\nmasking core=0 site from=0x00000002 to=0x0000000e longest=4 count=1\n"), text)
+    assert(lines_with(text, "masking core=0 site ") == 2, text)
+    stop_masking(&c)
+
+@test("an interval open at the end is a site of its own, to=end, beside the closed ones")
+sites_open_at_end()
+    // 0: cpsid i; 2: nop; 4: cpsie i; 6: cpsid i; 8, A: nop
+    val code: [6]u16 = [CPSID, MASK_NOP, CPSIE, CPSID, MASK_NOP, MASK_NOP]
+    var c = recorded_with(Kind.V6m, code[..], [], [], &nothing, SITES_ON)
+
+    val text = masking_text(&c, 0)
+    assert(text.contains("masking core=0 site from=0x00000006 to=end longest=3 count=1\nmasking core=0 site from=0x00000000 to=0x00000004 longest=2 count=1\n"), text)
+    // Asking again reports the same: the open interval is not added to the table.
+    assert(masking_text(&c, 0) == text)
+    stop_masking(&c)
+
+@test("each core keeps its own site table")
+sites_per_core()
+    val first: [4]u16 = [CPSID, MASK_NOP, CPSIE, BKPT]
+    val second: [5]u16 = [MASK_NOP, MASK_NOP, CPSID, CPSIE, BKPT]
+    var a = recorded_with(Kind.V6m, first[..], [], [], &nothing, SITES_ON)
+    var b = recorded_with(Kind.V6m, second[..], [], [], &nothing, SITES_ON)
+
+    val ta = masking_text(&a, 0)
+    val tb = masking_text(&b, 1)
+    assert(ta.contains("masking core=0 site from=0x00000000 to=0x00000004 longest=2 count=1\n") && lines_with(ta, "masking core=0 site ") == 1, ta)
+    assert(tb.contains("masking core=1 site from=0x00000004 to=0x00000006 longest=1 count=1\n") && lines_with(tb, "masking core=1 site ") == 1, tb)
+    stop_masking(&a)
+    stop_masking(&b)
+
+@test("a site's addresses are named by the image's symbols where there are any, and bare where not")
+sites_symbols()
+    // 0: nop; 2: cpsid i; 4: nop; 6: cpsie i; 8: bkpt. `tick` holds 0 to 5; 6 is in no symbol.
+    val code: [5]u16 = [MASK_NOP, CPSID, MASK_NOP, CPSIE, BKPT]
+    var names: Buf[ImageSymbol] = buf()
+    names.push(ImageSymbol(0, 6, "tick", 6))
+    val table: &SymbolTable = SymbolTable(names, buf())
+    var named = recorded_with(Kind.V6m, code[..], [], [], &nothing, SITES_ON.with_table(table))
+    assert(masking_text(&named, 0).contains("masking core=0 site from=0x00000002 (tick+0x2) to=0x00000006 longest=2 count=1\n"), masking_text(&named, 0))
+    stop_masking(&named)
+
+    var bare = recorded_with(Kind.V6m, code[..], [], [], &nothing, SITES_ON)
+    assert(masking_text(&bare, 0).contains("masking core=0 site from=0x00000002 to=0x00000006 longest=2 count=1\n"), masking_text(&bare, 0))
+    stop_masking(&bare)
+
+    var starts: Buf[ImageSymbol] = buf()
+    starts.push(ImageSymbol(2, 4, "tick", 6))
+    starts.push(ImageSymbol(6, 4, "tock", 0xA))
+    val both: &SymbolTable = SymbolTable(starts, buf())
+    var at_start = recorded_with(Kind.V6m, code[..], [], [], &nothing, SITES_ON.with_table(both))
+    assert(masking_text(&at_start, 0).contains("site from=0x00000002 (tick) to=0x00000006 (tock) longest=2 count=1\n"), masking_text(&at_start, 0))
+    stop_masking(&at_start)
+
+@test("the site table is the one thing the options add: without sites the report is what it was, and with them it only gains lines")
+sites_report_unchanged()
+    var code: Buf[u16] = buf()
+    for k in 1..4
+        code.push(CPSID)
+        for i in 0..<k do code.push(MASK_NOP)
+        code.push(CPSIE)
+    code.push(CPSID)
+    var plain = recorded(Kind.V6m, code.view(), [], [], &nothing)
+    var explicit = recorded_with(Kind.V6m, code.view(), [], [], &nothing, MaskingOptions(false, 8, null))
+    var sited = recorded_with(Kind.V6m, code.view(), [], [], &nothing, SITES_ON)
+
+    val off = masking_text(&plain, 0)
+    assert(masking_text(&explicit, 0) == off && !off.contains(" site "), off)
+    assert(without_sites(masking_text(&sited, 0)) == off, masking_text(&sited, 0))
+    assert(lines_with(masking_text(&sited, 0), "masking core=0 site ") == 5, masking_text(&sited, 0))
+    stop_masking(&plain)
+    stop_masking(&explicit)
+    stop_masking(&sited)
+
+@test("a table that grows past its first size keeps every site")
+sites_many()
+    // 100 intervals, each from its own CPSID to its own CPSIE: 100 sites.
+    var code: Buf[u16] = buf()
+    for k in 0..<100
+        code.push(CPSID)
+        code.push(CPSIE)
+    code.push(BKPT)
+    var c = recorded_with(Kind.V6m, code.view(), [], [], &nothing, SITES_ON)
+    val text = masking_text(&c, 0)
+    assert(lines_with(text, "masking core=0 site ") == 100, text)
+    assert(text.contains("site from=0x000000c8 to=0x000000ca longest=1 count=1\n"), text)
+    stop_masking(&c)
+
+@test("--masking-ranks: n longest intervals are listed, n from 1 to 4096, and the default is 8")
+ranks_listed()
+    // Twenty-six intervals of 2 to 27 cycles: cpsid i; nop x k; cpsie i.
+    var code: Buf[u16] = buf()
+    for k in 1..26
+        code.push(CPSID)
+        for i in 0..<k do code.push(MASK_NOP)
+        code.push(CPSIE)
+    var one = recorded_with(Kind.V6m, code.view(), [], [], &nothing, MaskingOptions(false, 1, null))
+    val t1 = masking_text(&one, 0)
+    assert(lines_with(t1, "masking core=0 rank=") == 1 && t1.contains("rank=1 cycles=27 "), t1)
+    assert(t1.contains("intervals=26 "), t1)
+    stop_masking(&one)
+
+    var twenty = recorded_with(Kind.V6m, code.view(), [], [], &nothing, MaskingOptions(false, 20, null))
+    val t20 = masking_text(&twenty, 0)
+    assert(lines_with(t20, "masking core=0 rank=") == 20 && t20.contains("rank=20 cycles=8 ") && !t20.contains("rank=21"), t20)
+    stop_masking(&twenty)
+
+    var plain = recorded(Kind.V6m, code.view(), [], [], &nothing)
+    assert(lines_with(masking_text(&plain, 0), "masking core=0 rank=") == 8, masking_text(&plain, 0))
+    stop_masking(&plain)
+
+    var most = recorded_with(Kind.V6m, code.view(), [], [], &nothing, MaskingOptions(true, 4096, null))
+    assert(lines_with(masking_text(&most, 0), "masking core=0 rank=") == 26, masking_text(&most, 0))
+    stop_masking(&most)
+
+@test("--masking-ranks takes 1 to 4096 and refuses anything else, saying so")
+ranks_parsed()
+    assert(masking_ranks("1") == Ok(1) && masking_ranks("8") == Ok(8) && masking_ranks("4096") == Ok(4096))
+    for bad in ["0", "5000", "4097", "-1", "", "many", "3.5"]
+        masking_ranks(bad) match
+            Ok(n) -> assert(false, s"$bad was taken as $n")
+            Err(why) -> assert(why.starts_with("--masking-ranks takes a number from 1 to 4096"), why)
 
 // ---------------------------------------------------------------------------------------------------
 // Off.
