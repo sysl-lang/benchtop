@@ -1,0 +1,77 @@
+module sh.sysl.benchtop.script
+@tests
+
+// `--report-masking` in a scripted run (`run`'s `masking_file`): the report of every Cortex-M core is
+// written whichever way the run ends — its script passing, its `--timeout`, the guest's exit or fault —
+// on the Pico 2, the Pico and the virtual board; and the Hazard3 harts refuse it, saying why.
+
+import sh.sysl.benchtop.v6m.no_faults
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, read_bytes, remove_dir_all, write_bytes}
+import sysl.text.from_utf8_lossy
+
+// The virtual board's raw image: CPSID, a NOP, CPSIE, then the console's EXIT register written with 7
+// (LDR r0, [pc, #8]; MOVS r1, #7; STR r1, [r0]; B .), its address word-aligned after the code.
+private val MASK_EXIT: [28]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x72, 0xb6, 0x00, 0xbf, 0x62, 0xb6, 0x02, 0x48, 0x07, 0x21, 0x01, 0x60, 0xfe, 0xe7, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x40]
+// The same, ending masked: CPSID, two NOPs, then UDF, a fault.
+private val MASK_FAULT: [16]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x72, 0xb6, 0x00, 0xbf, 0x00, 0xbf, 0x00, 0xde]
+
+// The script `args` give, run quietly on `board` with `image`, its masking report written to `file`.
+private masking_reported(board: string, image: string, args: []const string, file: string) -> Outcome
+    var all: Buf[string] = buf()
+    all.push("--quiet")
+    for a in args do all.push(a)
+    run(board, image, parse(all.view()).unwrap(), setup(), no_faults(), file)
+
+private masking_report_of(file: string) -> string = read_bytes(file) match
+    Ok(b) -> from_utf8_lossy(b.view())
+    Err(_) -> ""
+
+@test("script: --report-masking on the Pico 2 and the Pico is written when the run times out, and when its script passes")
+script_masking_rp()
+    val dir = make_temp_dir("benchtop-masking").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    for (board, image) in [("pico2", "examples/pico2/hello_serial.elf"), ("pico", "examples/pico/hello_serial.elf")]
+        val file = s"$dir/$board-timeout.txt"
+        val o = masking_reported(board, image, ["--expect", "never", "--timeout", "20ms"][..], file)
+        assert(o.status == TIMED_OUT, o.why)
+        val text = masking_report_of(file)
+        val timing = if board == "pico2" then "unit" else "estimated"
+        assert(text.starts_with(s"masking core=0 timing=$timing cycles=") && text.contains("\nmasking core=1 "), s"$board: $text")
+
+    val file = s"$dir/pico2-passed.txt"
+    val o = masking_reported("pico2", "examples/pico2/hello_serial.elf", ["--expect", "hello, serial 1", "--timeout", "2s"][..], file)
+    assert(o.status == 0, o.why)
+    assert(masking_report_of(file).starts_with("masking core=0 timing=unit cycles="), masking_report_of(file))
+
+@test("script: --report-masking on the virtual board is written at the guest's exit and at its fault, an open interval to the end")
+script_masking_virt_ends()
+    val dir = make_temp_dir("benchtop-masking").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val exits = s"$dir/exit.bin"
+    write_bytes(exits, MASK_EXIT[..]).unwrap()
+    val exit_report = s"$dir/exit.txt"
+    val o = masking_reported("virt", exits, ["--timeout", "1000000cycles"][..], exit_report)
+    assert(o.status == 7, o.why)
+    assert(masking_report_of(exit_report).contains(" intervals=1 masked=2 longest=2 from=0x00000008 to=0x0000000c\n"), masking_report_of(exit_report))
+
+    val faults = s"$dir/fault.bin"
+    write_bytes(faults, MASK_FAULT[..]).unwrap()
+    val fault_report = s"$dir/fault.txt"
+    val f = masking_reported("virt", faults, ["--timeout", "1000000cycles"][..], fault_report)
+    assert(f.status == FAULTED, f.why)
+    assert(masking_report_of(fault_report).contains(" intervals=1 masked=3 longest=3 from=0x00000008 to=end\n"), masking_report_of(fault_report))
+
+@test("script: the Hazard3 harts refuse --report-masking, naming why, and a report that cannot be written fails the run")
+script_masking_refused()
+    val dir = make_temp_dir("benchtop-masking").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val o = masking_reported("pico2-riscv", "examples/pico2-riscv/blink.elf", ["--timeout", "1ms"][..], s"$dir/riscv.txt")
+    assert(o.status == FAILED && o.why.contains("Cortex-M cores") && o.why.contains("Hazard3"), o.why)
+    assert(masking_report_of(s"$dir/riscv.txt") == "")
+
+    val nowhere = masking_reported("pico2", "examples/pico2/hello_serial.elf", ["--timeout", "1ms"][..], s"$dir/no/such/dir/report.txt")
+    assert(nowhere.status == FAILED && nowhere.why.contains("cannot write") && nowhere.why.contains("timed out"), nowhere.why)

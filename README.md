@@ -488,12 +488,18 @@ speed together. [bench/README.md](bench/README.md) has the numbers.
 
 ### The masking report
 
-**`--report-masking <file>`**, on `run` or `bench-board` of a virtual board (`virt`, `virt33`, ...),
-writes each core's masked intervals and interrupt latencies to `file` when the run ends (for
-`bench-board`, the last round's). Threaded or `--deterministic`, either executor, any core model. It is
-off by default, and off it costs nothing: the recording sits only on paths that are already rare
-(`MSR`, `CPS`, exception entry and return, SysTick's expiry, a store's slow path, the start of a run),
-behind one null test. `--window`, `--gdb`, a scripted run and the RP boards refuse it.
+**`--report-masking <file>`** writes each Cortex-M core's masked intervals and interrupt latencies to
+`file` when the run ends. It works on `run` of a virtual board (`virt`, `virt33`, ...), of a Pico
+(`pico`, the RP2040's Cortex-M0+s, `timing=estimated`) and of a Pico 2 (`pico2`, the RP2350's
+Cortex-M33s, `timing=unit`), both cores of each; threaded or `--deterministic`, seeded or not; and in a
+scripted run (`--expect`, `--type`, `--timeout`), where the file is written however the run ends — the
+script passing, the timeout (status 124), a fault, the guest's exit or a semihosting `SYS_EXIT`. A
+report that cannot be written fails the run (status 1). `bench-board` (a virtual board) takes it too,
+writing the last round's. It is off by default, and off it costs nothing: the recording sits only on
+paths that are already rare (`MSR`, `CPS`, exception entry and return, SysTick's expiry, a store's
+slow path, the start of a run), behind one null test. `--window` and `--gdb` refuse it, and so does a
+Pico 2 on its Hazard3 harts (`pico2-riscv`): they mask interrupts through `mstatus` and `mie`, which
+the report does not read.
 
 - **Masked** means PRIMASK or FAULTMASK set, or BASEPRI not 0 (either security state's, where
   Non-secure state is in use): the execution priority boost that keeps an interrupt at a kernel's

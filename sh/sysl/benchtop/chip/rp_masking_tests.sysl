@@ -1,0 +1,200 @@
+module sh.sysl.benchtop.chip
+@tests
+
+// The masking report on the RP boards (`ArmBoard.record_masking`, `ArmBoard.masking_text`): the Pico
+// 2's Cortex-M33s masked by CPSID and by BASEPRI, the Pico's Cortex-M0+s by CPSID and by PRIMASK, each
+// interval measured in the core's own cycles; a run that masks nothing; one that ends masked, at a
+// breakpoint and at a semihosting exit; and both cores masking, each in its own record.
+
+import sh.sysl.benchtop.v6m as arm
+import sh.sysl.benchtop.v6m.Stop
+import sysl.buf.{Buf, buf}
+import sysl.text.split
+
+private val MASK_PICO2 = embed("../../../../examples/pico2/blink.elf")
+private val MASK_PICO = embed("../../../../examples/pico/blink.elf")
+private const MASK_CODE: u32 = 0x20030000
+private const MASK_CODE1: u32 = 0x20030100
+
+private const T_CPSID: u16 = 0xB672
+private const T_CPSIE: u16 = 0xB662
+private const T_NOP: u16 = 0xBF00
+private const T_BKPT: u16 = 0xBE00
+private const T_BKPT_SEMIHOST: u16 = 0xBEAB
+private const T_SPIN: u16 = 0xE7FE
+// MSR <mask>, r0: the first halfword, then the second's PRIMASK and BASEPRI.
+private const T_MSR_R0: u16 = 0xF380
+private const T_PRIMASK_SYSM: u16 = 0x8810
+private const T_BASEPRI_SYSM: u16 = 0x8811
+
+private masked_nops(b: *Buf[u16], k: int) = for i in 0..<k do b.push(T_NOP)
+
+// The halfwords of `code` at `at`, core `k` starting there, awake.
+private masked_place[C: ArmChip](b: &ArmBoard[C], k: usize, at: u32, code: []const u16)
+    val c = &b.cores[k]
+    for i in 0..<code.len do arm.store16(c, at + u32(2 * i), u32(code[i]))
+    c.pc = at
+    c.stop = Stop.Running
+    c.sleeping = false
+
+// Run until something other than the budget ends the run.
+private masked_ran[C: ArmChip](b: &ArmBoard[C]) -> RunEnd
+    var end = RunEnd.Budget
+    var rounds = 0
+    while end == RunEnd.Budget && rounds < 100
+        end = b.run(10000)
+        rounds += 1
+    end
+
+private masked_pico2() -> &ArmBoard
+    val b = arm_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(MASK_PICO2).unwrap()
+    b
+
+private masked_pico() -> &ArmBoard[Rp2040]
+    val b = pico_board(SramMap(0x20000000, 264 * 1024))
+    b.boot(MASK_PICO).unwrap()
+    b
+
+// The report's line for core `k`'s intervals, from `text`.
+private masked_line_of(text: string, k: u32) -> string
+    val head = s"masking core=$k "
+    for l in split(text, "\n") do if l.starts_with(head) && !l.contains(" rank=") && !l.contains(" bucket=") then return l
+    ""
+
+@test("masking on the Pico 2: CPSID and BASEPRI each make an interval in core 0's cycles, the longest first")
+rp_masking_pico2()
+    val b = masked_pico2()
+    var code: Buf[u16] = buf()
+    code.push(T_CPSID)
+    masked_nops(&code, 2)
+    code.push(T_CPSIE)
+    code.push(0x2040)
+    code.push(T_MSR_R0)
+    code.push(T_BASEPRI_SYSM)
+    masked_nops(&code, 5)
+    code.push(0x2000)
+    code.push(T_MSR_R0)
+    code.push(T_BASEPRI_SYSM)
+    code.push(T_BKPT)
+    masked_place(b, 0, MASK_CODE, code.view())
+    b.record_masking()
+
+    assert(masked_ran(b) == RunEnd.Breakpoint, b.refused)
+    val text = b.masking_text()
+    // CPSID and two NOPs; then MSR, five NOPs and the MOVS before the MSR that clears BASEPRI.
+    assert(masked_line_of(text, 0).contains(" timing=unit ") && masked_line_of(text, 0).ends_with(" intervals=2 masked=10 longest=7 from=0x2003000a to=0x2003001a"), text)
+    assert(text.contains("masking core=0 rank=1 cycles=7 from=0x2003000a to=0x2003001a\n"), text)
+    assert(text.contains("masking core=0 rank=2 cycles=3 from=0x20030000 to=0x20030006\n"), text)
+    // Core 1 waits in the boot ROM, reported with nothing masked.
+    assert(masked_line_of(text, 1).ends_with(" intervals=0 masked=0 longest=0 from=none to=none"), text)
+    assert(arm.masking_longest(&b.cores[0]).unwrap().cycles == 7)
+
+@test("masking on the Pico: CPSID and PRIMASK each make an interval in the M0+'s estimated cycles")
+rp_masking_pico()
+    val b = masked_pico()
+    var code: Buf[u16] = buf()
+    code.push(T_CPSID)
+    masked_nops(&code, 2)
+    code.push(T_CPSIE)
+    code.push(0x2001)
+    code.push(T_MSR_R0)
+    code.push(T_PRIMASK_SYSM)
+    masked_nops(&code, 3)
+    code.push(0x2000)
+    code.push(T_MSR_R0)
+    code.push(T_PRIMASK_SYSM)
+    code.push(T_BKPT)
+    masked_place(b, 0, MASK_CODE, code.view())
+    b.record_masking()
+
+    assert(masked_ran(b) == RunEnd.Breakpoint, b.refused)
+    val text = b.masking_text()
+    // The M0+'s MSR takes 3 cycles (its TRM's table): with three NOPs and a MOVS, 7.
+    assert(masked_line_of(text, 0).contains(" timing=estimated ") && masked_line_of(text, 0).ends_with(" intervals=2 masked=10 longest=7 from=0x2003000a to=0x20030016"), text)
+    assert(text.contains("masking core=0 rank=2 cycles=3 from=0x20030000 to=0x20030006\n"), text)
+    assert(masked_line_of(text, 1).ends_with(" intervals=0 masked=0 longest=0 from=none to=none"), text)
+
+@test("masking on the RP boards: a run that masks nothing reports no interval, and a board that records nothing reports nothing")
+rp_masking_none()
+    for rp2350 in [true, false]
+        var code: Buf[u16] = buf()
+        masked_nops(&code, 4)
+        code.push(T_BKPT)
+        val text = if rp2350
+            val b = masked_pico2()
+            assert(b.masking_text() == "")
+            masked_place(b, 0, MASK_CODE, code.view())
+            b.record_masking()
+            assert(masked_ran(b) == RunEnd.Breakpoint, b.refused)
+            b.masking_text()
+        else
+            val b = masked_pico()
+            assert(b.masking_text() == "")
+            masked_place(b, 0, MASK_CODE, code.view())
+            b.record_masking()
+            assert(masked_ran(b) == RunEnd.Breakpoint, b.refused)
+            b.masking_text()
+        assert(masked_line_of(text, 0).ends_with(" intervals=0 masked=0 longest=0 from=none to=none") && !text.contains(" rank="), text)
+        assert(masked_line_of(text, 1) != "", text)
+
+@test("masking on the RP boards: an interval open when the run ends is reported to the end, at a breakpoint and at a semihosting exit")
+rp_masking_open_at_end()
+    var code: Buf[u16] = buf()
+    code.push(T_CPSID)
+    masked_nops(&code, 2)
+    code.push(T_BKPT)
+    val b = masked_pico()
+    masked_place(b, 0, MASK_CODE, code.view())
+    b.record_masking()
+    assert(masked_ran(b) == RunEnd.Breakpoint, b.refused)
+    assert(masked_line_of(b.masking_text(), 0).ends_with(" intervals=1 masked=3 longest=3 from=0x20030000 to=end"), b.masking_text())
+
+    // SYS_EXIT with ADP_Stopped_ApplicationExit: the run ends `Exit`, core 0 still masked.
+    var exits: Buf[u16] = buf()
+    exits.push(T_CPSID)
+    masked_nops(&exits, 4)
+    exits.push(T_BKPT_SEMIHOST)
+    var o = arm_options()
+    o.semihosting = true
+    val s = arm_board(SramMap(0x20000000, 520 * 1024))
+    s.apply_options(o)
+    s.boot(MASK_PICO2).unwrap()
+    masked_place(s, 0, MASK_CODE, exits.view())
+    s.cores[0].r[0] = 0x18
+    s.cores[0].r[1] = 0x20026
+    s.record_masking()
+    assert(masked_ran(s) == RunEnd.Exit && s.exit_status == 0, s.refused)
+    assert(masked_line_of(s.masking_text(), 0).ends_with(" intervals=1 masked=5 longest=5 from=0x20030000 to=end"), s.masking_text())
+
+@test("masking on the RP boards: both cores mask, each interval in its own core's record")
+rp_masking_both_cores()
+    for rp2350 in [true, false]
+        var first: Buf[u16] = buf()
+        first.push(T_CPSID)
+        masked_nops(&first, 2)
+        first.push(T_CPSIE)
+        first.push(T_SPIN)
+        var second: Buf[u16] = buf()
+        second.push(T_CPSID)
+        masked_nops(&second, 6)
+        second.push(T_CPSIE)
+        second.push(T_BKPT)
+        val text = if rp2350
+            val b = masked_pico2()
+            masked_place(b, 0, MASK_CODE, first.view())
+            masked_place(b, 1, MASK_CODE1, second.view())
+            b.record_masking()
+            assert(masked_ran(b) == RunEnd.Breakpoint, b.refused)
+            b.masking_text()
+        else
+            val b = masked_pico()
+            masked_place(b, 0, MASK_CODE, first.view())
+            masked_place(b, 1, MASK_CODE1, second.view())
+            b.record_masking()
+            assert(masked_ran(b) == RunEnd.Breakpoint, b.refused)
+            b.masking_text()
+        val where = s"RP2350 $rp2350:\n$text"
+        assert(masked_line_of(text, 0).ends_with(" intervals=1 masked=3 longest=3 from=0x20030000 to=0x20030006"), where)
+        assert(masked_line_of(text, 1).ends_with(" intervals=1 masked=7 longest=7 from=0x20030100 to=0x2003010e"), where)
+        assert(text.starts_with("masking core=0 ") && text.contains("\nmasking core=1 "), where)
