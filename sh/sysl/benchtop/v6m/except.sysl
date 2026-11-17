@@ -2,6 +2,7 @@ module sh.sysl.benchtop.v6m
 
 import sysl.sync.*
 import sh.sysl.benchtop.timing.NEVER
+import sysl.math.max
 
 // The ARMv6-M exception model (ARMv6-M ARM, DDI0419, chapter B1): the two stack pointers, handler
 // and thread mode, PRIMASK, the system instructions, exception entry and return, and the system
@@ -97,6 +98,8 @@ clear_exceptions(cpu: *Cpu)
     cpu.tick_value = 0
     cpu.tick_zero = NEVER
     cpu.tick_last = NEVER
+    cpu.tick_owed = 0
+    cpu.tick_held = NEVER
     cpu.basepri = 0
     cpu.faultmask = 0
     cpu.msplim = 0
@@ -135,6 +138,8 @@ begin_run(cpu: *Cpu) -> bool
         lower_limit(cpu, due)
 
     if ns_due != NEVER then lower_limit(cpu, ns_due - cpu.slept)
+    // Ticks held back (faults.sysl) are delivered from their clock, each once the one before is taken.
+    if cpu.tick_owed != 0 then lower_limit(cpu, max(cpu.tick_held, now) - cpu.slept)
 
     true
 
@@ -234,6 +239,8 @@ wake_by(cpu: *Cpu, horizon: u64) -> bool
 
         cpu.slept += due - now
         ticks(cpu, due)
+        // A tick held back (faults.sysl) wakes nothing until it is delivered.
+        if cpu.tick_faults && due > now then return wake_by(cpu, horizon)
 
     cpu.sleeping = false
     cpu.on_event = false
@@ -250,6 +257,7 @@ next_wake(cpu: *Cpu) -> u64
     var due = NEVER
     if cpu.tick_ctrl == TICK_RUNNING && cpu.tick_zero != NEVER && could_wake(cpu, SYSTICK) then due = cpu.tick_zero
     if cpu.trustzone && cpu.ns_tick.ctrl == TICK_RUNNING && cpu.ns_tick.zero < due && could_wake(cpu, NS_BANK + SYSTICK) then due = cpu.ns_tick.zero
+    if cpu.tick_owed != 0 && cpu.tick_held < due && could_wake(cpu, SYSTICK) then due = cpu.tick_held
     due
 
 // Whether exception `e`, were it pending, would wake a sleeping core.
@@ -695,6 +703,7 @@ const HINT_SEV: u32 = 4
 // Bring SysTick up to `now`: each time it reached 0 since it was last brought up sets COUNTFLAG and,
 // with TICKINT, makes SysTick pending. Counting down to 0 with a reload of 0 leaves it at 0.
 tick(cpu: *Cpu, now: u64)
+    if cpu.tick_faults then return held_tick(cpu, now)
     if cpu.tick_ctrl & TICK_ENABLE == 0 || now < cpu.tick_zero then return
 
     cpu.tick_flag = true
@@ -709,6 +718,24 @@ tick(cpu: *Cpu, now: u64)
 
     cpu.tick_last = cpu.tick_zero + (now - cpu.tick_zero) / period * period
     cpu.tick_zero = cpu.tick_last + period
+
+// `tick` where SysTick's exceptions are held back (faults.sysl): the counter and COUNTFLAG follow the
+// clock as `tick` has them, each time it reached 0 with TICKINT set is held, and what is held is
+// delivered once its clock has come.
+@noinline
+private held_tick(cpu: *Cpu, now: u64)
+    if cpu.tick_ctrl & TICK_ENABLE != 0 && now >= cpu.tick_zero
+        val period = u64(cpu.tick_reload) + 1
+        val zeros = if cpu.tick_reload == 0 then 1 else (now - cpu.tick_zero) / period + 1
+        cpu.tick_flag = true
+        if cpu.tick_ctrl & TICK_INT != 0 then hold_ticks(cpu, cpu.tick_zero, period, zeros)
+        if cpu.tick_reload == 0
+            cpu.tick_last = cpu.tick_zero
+            cpu.tick_zero = NEVER
+        else
+            cpu.tick_last = cpu.tick_zero + (zeros - 1) * period
+            cpu.tick_zero = cpu.tick_last + period
+    deliver_ticks(cpu, now)
 
 // The current value at `now`, SysTick having been brought up to it.
 tick_now(cpu: *Cpu, now: u64) -> u32

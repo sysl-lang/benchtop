@@ -5,7 +5,9 @@
 //         its console on this terminal, a keystroke at a time. Ctrl-] ends benchtop whatever the
 //         guest is doing. The exit status is the guest's, written to the console's EXIT register.
 //         Each launched guest core runs on its own host thread. Use `--deterministic` for
-//         reproducible core turns on one host thread. On a Pico 2 (an RP2350's Cortex-M33 cores)
+//         reproducible core turns on one host thread; `--seed n` varies their lengths and order by n,
+//         the same n giving the same run, and `--late-systick`, `--bunch-systick`, `--late-irq` and
+//         `--strex-fail` inject faults (README). On a Pico 2 (an RP2350's Cortex-M33 cores)
 //         benchtop's USB host is plugged in: a `stdio_usb` program's serial port prints beside UART0
 //         (`--usb console`, the default), or is a pseudo-terminal whose name is printed on stderr, for
 //         `screen` or `picocom` (`--usb pty`); `--usb off` leaves the USB socket empty. `--gdb`
@@ -44,8 +46,8 @@
 //         executors, three rounds each, and report each one's speed. Naming one executor runs only
 //         that one, so a process-wide counter (`time -l`'s cycles and instructions) measures it alone.
 
-import sh.sysl.benchtop.v6m.{cycles as memory_cycles,configure_instruction_timing,Cpu, Kind, Memory, Stop, memory, model_named, reset, run_match, run_threaded}
-import sh.sysl.benchtop.virt.{Machine, SdChoice, board_named, board_named_sd, sd_choice, boot, capture, core0, core1, described_error, image_of, listen, machine, machine_guest, open_console, output, run_board, set_threads, stop_message, type_in}
+import sh.sysl.benchtop.v6m.{cycles as memory_cycles,configure_instruction_timing,Cpu, FAULT_OPTIONS, Faults, Kind, Memory, Stop, memory, model_named, no_faults, reset, run_match, run_threaded, take_fault}
+import sh.sysl.benchtop.virt.{Machine, SdChoice, board_named, board_named_sd, sd_choice, boot, capture, core0, core1, described_error, explore, image_of, listen, machine, machine_guest, open_console, output, run_board, set_threads, stop_message, type_in}
 import sh.sysl.benchtop.{built_in_shelf, library, listing, load, open_chip, open_description, summary}
 import sysl.raw.str_cast
 import sh.sysl.parsing.Span
@@ -76,6 +78,7 @@ usage()
     print("       benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--threads] [--usb console|pty|off] [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--semihosting] [--serial uart0|uart1=file:<path>] <image.elf | image.bin>")
     print("       run --window: [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>] [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png]")
     print(s"       run, scripted: ${script.OPTIONS}")
+    print(s"       run, varied: $FAULT_OPTIONS")
     print("       benchtop check [--mcu] <name | file.hocon>")
     print("       benchtop bench [--core <core>] [--timing unit|estimated] <image.bin> [expected result] [match | threaded]")
     print("       benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]")
@@ -151,6 +154,8 @@ run_command(args: []string)
     var sd_named = false
     var rom_boot = false
     var arm = chip.arm_options()
+    var threads_named = false
+    var faults = no_faults()
     var steps = script.script()
     var i = 2
 
@@ -213,6 +218,7 @@ run_command(args: []string)
                 i += 2
             "--threads" ->
                 parallel = true
+                threads_named = true
                 i += 1
             "--semihosting" ->
                 arm.semihosting = true
@@ -229,23 +235,31 @@ run_command(args: []string)
                 if i < args.len - 1 && is_port(args[i])
                     gdb_port = parse_int(args[i]).unwrap()
                     i += 1
-            _ -> script.take(&steps, args, i, args.len - 1) match
+            _ -> take_fault(&faults, args, i, args.len - 1) match
                 Some(Ok(next)) -> i = next
                 Some(Err(why)) -> die(why)
-                None -> usage()
+                None -> script.take(&steps, args, i, args.len - 1) match
+                    Some(Ok(next)) -> i = next
+                    Some(Err(why)) -> die(why)
+                    None -> usage()
 
     if i != args.len - 1 then usage()
+    // A seed is a run that can be repeated: the cores take turns on one thread.
+    if faults.seeded
+        if threads_named then die("--seed is for cores taking turns on one thread: two threads cannot be repeated")
+        parallel = false
 
     if steps.active()
         if window then die("--expect, --type, --press, --timeout and --quiet are for a run without --window")
         if gdb_port != 0 then die("--expect, --type, --press, --timeout and --quiet are for a run without --gdb")
         if usb == UsbMode.Pty then die("--usb pty is for a run without a script: a scripted run types into the console")
-        val outcome = script.run(which, args[i], steps, script.Setup(usb != UsbMode.Off, usb_named, sd, sd_named, rom_boot, arm))
+        val outcome = script.run(which, args[i], steps, script.Setup(usb != UsbMode.Off, usb_named, sd, sd_named, rom_boot, arm), faults)
         eprints(s"benchtop: ${outcome.why}\n")
         exit(outcome.status)
 
     if window && arm.named() then die("--semihosting and --serial are for a run without --window")
     if window && gdb_port != 0 then die("--gdb is for a run without --window")
+    if faults.any() && (window || gdb_port != 0) then die("--seed and the fault options are for a run without --window or --gdb")
     if gdb_port != 0 && usb == UsbMode.Pty then die("--usb pty is for a run without --gdb")
     if window
         val m33 = chip.arm_named(which).is_some()
@@ -259,7 +273,7 @@ run_command(args: []string)
     if !instrument_file.is_empty() then die("--instruments requires --window")
     if host.enabled(develop) then die("--watch, --build and --watch-source require --window")
     if headless || frames != 0 || !screenshot.is_empty() then die("--headless, --frames and --screenshot require --window")
-    run(which, args[i], parallel, usb, usb_named, gdb_port, sd, sd_named, rom_boot, arm)
+    run(which, args[i], parallel, usb, usb_named, gdb_port, sd, sd_named, rom_boot, arm, faults)
 
 // The port gdb connects to for core 0 where `--gdb` names none, OpenOCD's.
 const GDB_PORT = 3333
@@ -281,8 +295,10 @@ enum UsbMode
 // Run `file` on the board `which` names, each core on a thread of its own where `parallel` says so.
 // A board of RISC-V cores runs on the RP2350 chip layer, both harts on this thread. `usb` is for an Arm
 // RP2350 board; naming it (`usb_named`) for another is refused. `rom_boot` boots an Arm RP2350 board's
-// core 0 from reset through the boot ROM (`--boot rom`), and is refused for any other board.
-run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, gdb_port: int, sd: SdChoice, sd_named: bool, rom_boot: bool, arm: chip.ArmOptions)
+// core 0 from reset through the boot ROM (`--boot rom`), and is refused for any other board. `arm` is
+// `--semihosting` and `--serial`, and `faults` varies the run (`--seed` and the fault options), both on
+// a board of Cortex-M cores.
+run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, gdb_port: int, sd: SdChoice, sd_named: bool, rom_boot: bool, arm: chip.ArmOptions, faults: Faults)
     chip.riscv_named(which) match
         Some(Ok(map)) ->
             if arm.named() then die(chip.SEMIHOST_ARM_ONLY)
@@ -290,6 +306,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
             if sd_named then die("--sd is for a board with a microSD socket")
             if gdb_port != 0 then die("--gdb is for a board of Cortex-M cores: the Hazard3 harts have no breakpoints or step for it yet")
             if rom_boot then die(chip.BOOT_ROM_ARM_ONLY)
+            if faults.any() then die("--seed and the fault options are for a board of Cortex-M cores")
             run_riscv(map, file, rp_parts_named(which))
         Some(Err(why)) ->
             eprints(why)
@@ -302,7 +319,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
             val b = chip.arm_board(map)
             b.rom_boot = rom_boot
             b.apply_options(arm)
-            run_arm(b, file, usb, rp_parts_named(which))
+            run_arm(b, file, usb, rp_parts_named(which), faults)
         Some(Err(why)) ->
             eprints(why)
             exit(1)
@@ -315,7 +332,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
             if gdb_port != 0 then serve_rp(which, file, false, gdb_port, false, arm)
             val b = chip.pico_board(map)
             b.apply_options(arm)
-            run_arm(b, file, UsbMode.Off, rp_parts_named(which))
+            run_arm(b, file, UsbMode.Off, rp_parts_named(which), faults)
         Some(Err(why)) ->
             eprints(why)
             exit(1)
@@ -337,6 +354,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
 
     open_console(m)
     boot(m, image.view())
+    if faults.any() then explore(m, faults)
     // Under gdb the cores take turns on this thread, which serves gdb between them.
     if parallel && gdb_port == 0 then set_threads(m)
     raw()
@@ -405,10 +423,11 @@ serve_rp(which: string, file: string, usb: bool, port: int, rom_boot: bool, arm:
 // nothing to wake them (exit 4). Unless `usb` is Off (always, on the RP2040), benchtop's USB host is on
 // the bus, and a CDC ACM device's serial port goes to stdout beside UART0, a line at a time, or to a
 // pseudo-terminal whose name goes to stderr.
-run_arm[C: chip.ArmChip + chip.PartPins](b: &chip.ArmBoard[C], file: string, usb: UsbMode, parts: chip.RpParts) -> never
+run_arm[C: chip.ArmChip + chip.PartPins](b: &chip.ArmBoard[C], file: string, usb: UsbMode, parts: chip.RpParts, faults: Faults) -> never
     b.boot(read_or_die(file)) match
         Ok(_) -> ()
         Err(why) -> die(s"$file: $why")
+    if faults.any() then b.explore(faults)
     // The board's parts at rest: a potentiometer's level on its ADC input, the buttons let go.
     var ps = parts
     chip.apply_parts(&ps, &b.chip)

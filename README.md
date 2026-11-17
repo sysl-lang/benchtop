@@ -237,6 +237,8 @@ sysl build . -o benchtop
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
                [--press <part[.direction] | pin=high|low>[@<dur>][:<dur>]] [--set <part>=<0..1>] [--quiet] ... <image>
+./benchtop run [--seed <n>] [--late-systick <cycles>] [--bunch-systick <n>] [--late-irq <cycles>]
+               [--strex-fail <percent>] ... <image>
 ./benchtop check [--mcu] <name | file.hocon>
 ./benchtop bench [--core <core>] <image.bin> [expected r0] [match | threaded]
 ./benchtop bench-board [--board <name | file.hocon>] <image.elf> [turns | threads]
@@ -361,6 +363,51 @@ pin is pressed with the level its button would give:
 ./benchtop run --board stm32h747-disco --quiet --timeout 2s --expect "DISCO" --press wakeup:1s \
   --type "BUTTON? .\n" --expect "-1  ok" examples/disco-repl/repl-disco.elf
 ```
+
+### Exploring interleavings and injecting faults
+
+Taking turns makes a run repeatable, which also makes it one interleaving. These options vary it, and
+every variation is drawn from one seed, so a failure found at a seed recurs at that seed, output, cycle
+counts and exit status alike. A gate sweeps seeds by running the same script once per `--seed`. Each
+option is off unless named, and a run that names none is the run it always was, to the instruction.
+They apply to a terminal run and a scripted run on a board of Cortex-M cores (not `--window` or
+`--gdb`, and not the RP2350's Hazard3 harts):
+
+- **`--seed <n>`** draws each turn's length, from 1 to twice the quantum, and which core takes the
+  first turn of each round, from `n`. It means turns on one thread, as `--deterministic` does, and
+  refuses `--threads`. Before core 1 is launched, core 0 runs exactly as it does without a seed. `n` also
+  seeds the faults below; without `--seed` they draw from seed 0.
+- **`--late-systick <cycles>`** delivers each SysTick exception up to `cycles` of the core's clock late
+  (drawn per tick, 0 to `cycles`). The counter stays exact: CVR, COUNTFLAG and the reload follow the
+  clock as always, so a handler can measure how late it ran. A core asleep in `WFI` wakes when the tick
+  is delivered, not when it falls due.
+- **`--bunch-systick <n>`** holds ticks and delivers them together: when a tick falls due, a bunch of 1
+  to `n` is drawn, and that tick and the ones after it are held until the last of the bunch is due,
+  then taken back to back, the handler running once for each, each tail-chained to the one before.
+  Combined with `--late-systick`, the bunch is delivered late too. This is a timer's tick on a core
+  whose host thread was descheduled, as under QEMU's multi-threaded TCG.
+- **`--late-irq <cycles>`** raises a core's SIO interrupts up to `cycles` after they rise: the FIFO's
+  on the virtual boards and on the RP2040 and RP2350, and the RP2350's doorbell. On the virtual boards
+  the delay is drawn when a word goes into an empty FIFO; on an RP board, when the core's FIFO and
+  doorbell lines rise from all low.
+- **`--strex-fail <percent>`** fails that share of the STREXes whose exclusive monitor holds, as the
+  architecture allows at any time (a cache line evicted, an interrupt between LDREX and STREX), so a
+  lock's retry loop runs its retry. The store is not made and the status register reads 1.
+
+```sh
+for seed in $(seq 1 50); do
+  ./benchtop run --board pico2 --quiet --timeout 2s --seed $seed --late-systick 2000 \
+    --bunch-systick 3 --strex-fail 5 --expect "PASS" kernel.elf || echo "seed $seed failed"
+done
+```
+
+**Replay is promised only for runs whose cores take turns**: `--deterministic`, `--seed` and every
+scripted run. The fault options also work with each core on a host thread of its own (`--threads`,
+and the default on a virtual board): the SysTick and STREX faults are each core's own, and a held-back
+FIFO interrupt is raised when its core next looks, but what the two threads do around them differs
+from run to run. With every option off the emulator checks nothing more than it did: the STREX fault is
+one test of a field that is zero, in the STREX itself, and the rest are looked at only where a turn
+starts or SysTick is brought up to the clock, never per instruction.
 
 #### Parts on a Pico, Pico 2 or Pico 2 RISC-V board
 
@@ -780,7 +827,8 @@ BASEPRI, FAULTMASK and the stack limits; SysTick counts local core cycles. [DESI
 §2.2 and §2.9 say what is modelled and what is not.
 
 **With `--deterministic`, both cores run on one host thread, taking turns** of 1000 MCU ticks each, so a run is the same
-every time, to the instruction. A core asleep in `WFI` costs nothing while the other runs, and the
+every time, to the instruction. `--seed n` varies the turns' lengths and order reproducibly
+([Exploring interleavings](#exploring-interleavings-and-injecting-faults)). A core asleep in `WFI` costs nothing while the other runs, and the
 board stops at `Asleep` only when both sleep with nothing that can wake them. A program that never
 launches core 1 runs exactly as on a single core. [DESIGN.md](DESIGN.md) §1.1 and §11 have the rest.
 

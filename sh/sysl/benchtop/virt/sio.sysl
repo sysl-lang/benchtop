@@ -4,6 +4,7 @@ module sh.sysl.benchtop.virt
 // core by which one made the access. virt.sysl's header gives the registers and how core 1 is
 // launched. Its state is `Machine.devices.sio`, which `boot` resets.
 
+import sh.sysl.benchtop.timing.NEVER
 import sh.sysl.benchtop.v6m.{Cpu, Stop, halt, raise, set_limit}
 import sysl.sync.*
 
@@ -34,6 +35,11 @@ const FIFO_DEPTH: u32 = 8
  * core k sets and clears. `locks` has bit k set while spinlock k is claimed, claimed and released
  * with atomic operations. `step` is the boot ROM's place in the launch sequence, 0 to 5, and `sent`
  * the VTOR and SP it has taken; only core 0 reaches them, before core 1 runs.
+ *
+ * `late` is `--late-irq` (faults.sysl), 0 for off: a word pushed into an empty FIFO raises its
+ * reader's interrupt a number of clocks later drawn by the pushing core, 0 to `late`, from the board
+ * clock `release[k]`. The pusher writes it before the release that counts the word, so the reader sees
+ * it with the word. A boot keeps `late`.
  */
 struct SioState
     fifo: [2][8]u32
@@ -43,19 +49,26 @@ struct SioState
     locks: u32
     step: int
     sent: [2]u32
+    late: u64
+    release: [2]u64
 
 /** An SIO as at power-on: both FIFOs empty, no error, every spinlock free, the boot ROM waiting. */
-sio_state() -> SioState = SioState([[0; 8]; 2], [0, 0], [0, 0], [0, 0], 0, 0, [0, 0])
+sio_state() -> SioState = SioState([[0; 8]; 2], [0, 0], [0, 0], [0, 0], 0, 0, [0, 0], 0, [0, 0])
 
 impl Peripheral for SioState
-    override boot(*self, m: *Machine) = *self = sio_state()
+    override boot(*self, m: *Machine)
+        val late = self.late
+        *self = sio_state()
+        self.late = late
+    override due(*self, m: *Machine, cpu: *Cpu) -> u64 = if self.late == 0 then NEVER else held_until(self, cpu)
+    override wake(*self, m: *Machine, cpu: *Cpu) -> u64 = if self.late == 0 then NEVER else held_until(self, cpu)
     override signal(*self, m: *Machine, cpu: *Cpu)
         val irq = m.devices.bus.fifo_irq
-        if irq >= 0 && sio_raising(self, cpu) then raise(cpu, u32(irq))
+        if irq >= 0 && sio_raising(self, cpu) && (self.late == 0 || held_until(self, cpu) == NEVER) then raise(cpu, u32(irq))
 
 impl BusWindow for SioState
     read(*self, m: *Machine, cpu: *Cpu, a: u32, o: u32, width: u32, n: u64) -> u32 = sio_read(m, self, cpu, a, o)
-    write(*self, m: *Machine, cpu: *Cpu, a: u32, o: u32, width: u32, x: u32, n: u64) = sio_write(m, self, cpu, a, o, x)
+    write(*self, m: *Machine, cpu: *Cpu, a: u32, o: u32, width: u32, x: u32, n: u64) = sio_write(m, self, cpu, a, o, x, n)
 
 // The core that made an access: 1 for core 1, 0 for core 0.
 private core_of(cpu: *Cpu) -> int = int(cpu.core)
@@ -88,7 +101,7 @@ private sio_read(m: *Machine, s: *SioState, cpu: *Cpu, a: u32, o: u32) -> u32
             halt(cpu, Stop.Unmapped, a)
             0
 
-private sio_write(m: *Machine, s: *SioState, cpu: *Cpu, a: u32, o: u32, x: u32)
+private sio_write(m: *Machine, s: *SioState, cpu: *Cpu, a: u32, o: u32, x: u32, n: u64)
     val k = core_of(cpu)
     val bit = lock_bit(o)
 
@@ -103,12 +116,24 @@ private sio_write(m: *Machine, s: *SioState, cpu: *Cpu, a: u32, o: u32, x: u32)
             val irq = m.devices.bus.fifo_irq
             if k == 0 && !m.scheduler.launched
                 boot_rom(m, s, cpu, x)
+            else if s.late != 0
+                if waiting_in(s, 1 - k) == 0 && room_in(s, 1 - k) then atomic_store(&s.release[1 - k], board_time(cpu, n) + cpu.faults.below(s.late + 1), SeqCst)
+                if !push(s, 1 - k, x) then s.errors[k] |= WOF
+                elif m.scheduler.threaded then rouse_core(m, 1 - k)
             else if push(s, 1 - k, x)
                 if m.scheduler.threaded && irq >= 0 then wake_core(m, 1 - k, u32(irq))
             else
                 s.errors[k] |= WOF
         CPUID | FIFO_RD | SPINLOCK_ST -> ()
         _ -> halt(cpu, Stop.Unmapped, a)
+
+// The board clock at which core `cpu`'s FIFO interrupt, held back (`late`), is raised; `NEVER` where
+// it is not held back now.
+private held_until(s: *SioState, cpu: *Cpu) -> u64
+    val k = core_of(cpu)
+    if waiting_in(s, k) == 0 then return NEVER
+    val at = atomic_load(&s.release[k], SeqCst)
+    if at > board_time(cpu, cpu.retired) then at else NEVER
 
 // Whether the FIFO's interrupt is raised in core `cpu`: its VLD, WOF or ROE is set.
 private sio_raising(s: *SioState, cpu: *Cpu) -> bool

@@ -1,0 +1,112 @@
+module sh.sysl.benchtop.v6m
+
+// What a run varies to explore a guest's races (`benchtop run --seed` and the fault options), and the
+// faults a core injects into itself. Every one is off unless asked for, and every draw comes from a
+// generator seeded once from the run's seed, one stream per core and one for the board's turns, so the
+// same seed meets the same faults at the same points, run after run.
+//
+// - **A SysTick delivered late, and ticks delivered in bunches** (`tick_late`, `tick_bunch`). The
+//   counter itself stays exact: COUNTFLAG, CVR and the reload follow the clock as always; only the
+//   exception is held back. When the timer reaches 0 with TICKINT set and nothing is held, the core
+//   draws a bunch of b ticks, 1 to `tick_bunch`, and a delay of d clocks, 0 to `tick_late`. That tick and
+//   those after it, up to b in all, are held, and delivered from the clock the b-th is due at plus d:
+//   the first made pending then, and each of the rest as soon as the one before it has been taken, so
+//   the handler runs back to back once for each. Ticks that come due beyond b while some are held join
+//   them, as a real tick joins the one already pending.
+// - **A STREX that fails although its monitor holds** (`strex_fail`, a percentage), which the
+//   architecture allows at any time, to exercise a lock's retry loop.
+//
+// No check is made per instruction. The SysTick faults are looked at where SysTick is brought up to the
+// clock and at a run's start; the STREX fault in the STREX, one test of a field that is zero in a run
+// that asked for nothing.
+
+import sh.sysl.benchtop.timing.NEVER
+import sysl.math.min
+import sysl.rand.{Rng, rng}
+import sysl.text.parse_long
+
+/** What a run varies: whether its turns vary with the seed (`seeded`), the seed every draw comes from,
+ * and each fault, off at 0.
+ */
+struct Faults
+    seeded: bool
+    seed: u64
+    // The most clocks a SysTick exception is delivered late.
+    systick_late: u64
+    // The most due SysTicks held and delivered back to back; 0 or 1 holds none together.
+    systick_bunch: u32
+    // The most clocks a core's SIO FIFO or doorbell interrupt is raised late.
+    irq_late: u64
+    // The percentage of STREXes that fail although the monitor holds.
+    strex_fail: u32
+
+/** Nothing varied: a run as one without the options. */
+no_faults() -> Faults = Faults(false, 0, 0, 0, 0, 0)
+
+impl Faults
+    /** Whether anything is varied. */
+    any(self) -> bool = self.seeded || self.systick_late != 0 || self.systick_bunch > 1 || self.irq_late != 0 || self.strex_fail != 0
+
+    /** The generator of stream `k`: 0 for the board's turns, 1 + k for core k's faults. */
+    stream(self, k: u64) -> Rng = rng(self.seed, k)
+
+/** The options that vary a run, as `benchtop run` spells them. */
+const FAULT_OPTIONS = "[--seed <n>] [--late-systick <cycles>] [--bunch-systick <n>] [--late-irq <cycles>] [--strex-fail <percent>]"
+
+/** Where `args[i]` is one of the options that vary a run (`FAULT_OPTIONS`), `f` set by it and the index
+ * after its value, or why its value is refused; None where it is none of them. `end` is the index of the
+ * image, which no value may be.
+ */
+take_fault(f: *Faults, args: []const string, i: usize, end: usize) -> Option[Result[usize, string]]
+    val name = args[i]
+    if name != "--seed" && name != "--late-systick" && name != "--bunch-systick" && name != "--late-irq" && name != "--strex-fail" then return None
+    if i + 1 >= end then return Some(Err(s"$name takes a number"))
+    val n = parse_long(args[i + 1]) match
+        Ok(v) -> v
+        Err(_) -> return Some(Err(s"$name takes a whole number, not ${args[i + 1]}"))
+    if n < 0 then return Some(Err(s"$name takes a number of 0 or more, not $n"))
+    name match
+        "--seed" ->
+            f.seeded = true
+            f.seed = u64(n)
+        "--late-systick" -> f.systick_late = u64(n)
+        "--late-irq" -> f.irq_late = u64(n)
+        "--bunch-systick" ->
+            if n < 1 || n > 1000 then return Some(Err(s"--bunch-systick takes 1 to 1000 ticks, not $n"))
+            f.systick_bunch = u32(n)
+        _ ->
+            if n > 100 then return Some(Err(s"--strex-fail takes a percentage, 0 to 100, not $n"))
+            f.strex_fail = u32(n)
+    Some(Ok(i + 2))
+
+/** Inject `f`'s faults into `cpu`, core `k` of its board, from now on; a run that asks for none leaves
+ * every check off. A reset keeps them.
+ */
+inject(cpu: *Cpu, f: Faults, k: u64)
+    cpu.tick_late = f.systick_late
+    cpu.tick_bunch = if f.systick_bunch == 0 then 1 else f.systick_bunch
+    cpu.tick_faults = f.systick_late != 0 || f.systick_bunch > 1
+    cpu.tick_owed = 0
+    cpu.tick_held = NEVER
+    cpu.strex_fail = f.strex_fail
+    cpu.faults = f.stream(1 + k)
+
+// SysTick has reached 0 `zeros` times since it was last brought up, the first at `first`, `period`
+// clocks apart, with TICKINT set: hold them, drawing the bunch and the delay where none are held.
+private[v6m] hold_ticks(cpu: *Cpu, first: u64, period: u64, zeros: u64)
+    if cpu.tick_owed == 0
+        val bunch = 1 + cpu.faults.below(u64(cpu.tick_bunch))
+        cpu.tick_held = first + (bunch - 1) * period + cpu.faults.below(cpu.tick_late + 1)
+    cpu.tick_owed = u32(min(u64(cpu.tick_owed) + zeros, u64(cpu.tick_bunch)))
+
+// The ticks held whose clock has come are made pending, one at a time: the next once the one before
+// it has been taken.
+private[v6m] deliver_ticks(cpu: *Cpu, now: u64)
+    if cpu.tick_owed == 0 || now < cpu.tick_held || cpu.pending[0] & (u64(1) << SYSTICK) != 0 then return
+    cpu.pending[0] |= u64(1) << SYSTICK
+    cpu.tick_owed -= 1
+
+// Whether this STREX fails although its monitor holds.
+@noinline
+@cold
+private[v6m] spurious_strex(cpu: *Cpu) -> bool = cpu.faults.below(100) < u64(cpu.strex_fail)

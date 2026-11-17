@@ -6,7 +6,8 @@ module sh.sysl.benchtop.virt
 //
 // - **In turns, on the caller's thread** (`run_board`, `pump_board`, `round`, `turn`, `settle`). Core 0
 //   runs alone until it launches core 1; then each round gives core 0 and then core 1 a quantum, each
-//   to the same clock.
+//   to the same clock. A seeded run (`explore`) draws each round's length, 1 to twice the quantum, and
+//   which core goes first, from its seed, so one seed is one interleaving, every time.
 // - **In lockstep, a core per host thread** (`run_core`, after `set_threads`, or for a bounded batch of
 //   the CPU workers). Core 1 gets a thread and records of its own (`pair`), and the two run at once.
 // - **Paced, a core per persistent host thread** (the CPU workers in `workers.sysl`): the same
@@ -38,10 +39,11 @@ module sh.sysl.benchtop.virt
 // store posts the lines it writes to the other core; the FIFOs are single-producer single-consumer
 // rings; a spinlock is an atomic test-and-set; and the console is under its lock.
 
-import sh.sysl.benchtop.v6m.{has_incoming, Cpu, Stop, IRQ0, could_wake, cut, halt, pair, poke, raise, refresh, run_single, run_threaded, set_limit, take_incoming, unpair}
+import sh.sysl.benchtop.v6m.{has_incoming, Cpu, Faults, Stop, IRQ0, could_wake, cut, halt, inject, pair, poke, raise, refresh, run_single, run_threaded, set_limit, take_incoming, unpair}
 import sh.sysl.benchtop.timing as timing
 import sh.sysl.benchtop.timing.NEVER
 import sysl.math.{min, max}
+import sysl.rand.{Rng, rng}
 import sysl.sync.*
 import sysl.threads.{Condvar, Mutex, Thread, spawn}
 
@@ -112,11 +114,15 @@ struct Scheduler
     wakeup: Condvar
     workers: Workers
     dsi: DsiWorker
+    // `--seed`: each round in turns lasts a length drawn from `turns`, 1 to twice the quantum, and
+    // which core takes the first turn is drawn too. A boot keeps both.
+    seeded: bool
+    turns: Rng
 
 /** A scheduler as at power-on, with no worker started. */
 private[virt] scheduler() -> Scheduler = Scheduler(0, QUANTUM, ALONE, false, false, false, false, false, NEVER, false,
     Lockstep([0, 0], [0, 0], [NEVER, NEVER], [0, 0], [0, 0], 0, [0, 0], [0, 0], [0, 0]),
-    Mutex.new(0), Condvar.new(), no_workers(), dsi_worker())
+    Mutex.new(0), Condvar.new(), no_workers(), dsi_worker(), false, rng(0, 0))
 
 /** Every field of `s` as at power-on, keeping the CPU workers' threads where they run. */
 private[virt] reset_scheduler(s: *Scheduler)
@@ -143,6 +149,16 @@ running_both(m: *Machine) -> bool = m.scheduler.launched
 // Set the instructions each of `m`'s cores runs in its turn.
 set_quantum(m: *Machine, n: u64)
     m.scheduler.quantum = n
+
+/** Vary `m`'s run as `f` says from now on (faults.sysl): where it is seeded, the length of each round
+ * in turns and which core takes the first turn; and the faults its cores and its SIO inject. A boot
+ * keeps them; calling it again starts every draw afresh from the seed.
+ */
+explore(m: *Machine, f: Faults)
+    m.scheduler.seeded = f.seeded
+    m.scheduler.turns = f.stream(0)
+    for k in 0..<2 do inject(&m.cores[k], f, u64(k))
+    m.devices.sio.late = f.irq_late
 
 /** Run each of `m`'s cores on a thread of its own in the next `run_board`, until the next `boot`. */
 set_threads(m: *Machine)
@@ -212,17 +228,22 @@ round(m: *Machine) -> bool
     val s = &m.scheduler
     val cpu = &m.cores[0]
     val second = &m.cores[1]
-    val until = s.now + (if s.launched then s.quantum else s.alone_slice)
+    val until = s.now + (if !s.launched then s.alone_slice elif s.seeded then 1 + s.turns.below(2 * s.quantum) else s.quantum)
 
-    turn(m, cpu, until)
+    if s.launched && s.seeded && s.turns.boolean()
+        // The seed's other order: core 1's turn first.
+        turn(m, second, until)
+        if second.stop == Stop.Running then turn(m, cpu, until)
+    else
+        turn(m, cpu, until)
 
-    if s.starting
-        // Core 1 starts at the time core 0 launched it, and the rounds start from there.
-        start_core1(s, second, board_time(cpu, cpu.retired))
-        flush_console(m)
-        return cpu.stop == Stop.Running && second.stop == Stop.Running
+        if s.starting
+            // Core 1 starts at the time core 0 launched it, and the rounds start from there.
+            start_core1(s, second, board_time(cpu, cpu.retired))
+            flush_console(m)
+            return cpu.stop == Stop.Running && second.stop == Stop.Running
 
-    if s.launched && cpu.stop == Stop.Running then turn(m, second, until)
+        if s.launched && cpu.stop == Stop.Running then turn(m, second, until)
 
     flush_console(m)
 
@@ -467,6 +488,12 @@ private[virt] lockstep_alerts(m: *Machine, k: int) -> u64 = atomic_load(&m.sched
 // releasing the workers' control lock.
 private[virt] nudge(s: *Scheduler)
     s.board.with(floor -> s.wakeup.notify_all())
+
+/** Wake `m`'s core k where it sleeps on its thread, raising nothing: it looks at its devices again, as
+ * a core whose FIFO interrupt is held back (`SioState.late`) does to learn when it rises.
+ */
+private[virt] rouse_core(m: *Machine, k: int)
+    if atomic_load(&m.scheduler.lockstep.dozing[k], SeqCst) != 0 then nudge(&m.scheduler)
 
 /** Raise IRQ `irq` in `m`'s core k from the other core's thread, and wake it where it sleeps. */
 private[virt] wake_core(m: *Machine, k: int, irq: u32)

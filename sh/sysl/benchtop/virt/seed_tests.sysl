@@ -1,0 +1,169 @@
+module sh.sysl.benchtop.virt
+@tests
+
+// `--seed` and `--late-irq` on the machine's two cores (`explore`): a seed varies the turns' lengths
+// and order and replays exactly; no seed is today's run to the instruction; a FIFO interrupt held back
+// is measured by the guest that takes it; and the neighbours — core 1 not yet launched, both cores
+// asleep, dual.elf's whole conversation under jitter and under a late FIFO, on one thread and on two.
+
+import sh.sysl.benchtop.v6m.{Faults, NVIC_ISER, Stop, SYST_CSR, SYST_RVR, clock, load32, no_faults, store32}
+import sysl.raw.str_cast
+import sysl.buf.{Buf, Frozen, buf}
+
+seeded(seed: u64) -> Faults = Faults(true, seed, 0, 0, 0, 0)
+
+// What core 1 logged of core 0's writes (dual_tests' WRITER and READER), in 40 rounds of a quantum of
+// 12 varied as `f` says, then each core's retired count and PC.
+interleaving(m: *Machine, f: Faults) -> Buf[u32]
+    started(m, image([(0x100, WRITER[..]), (0x200, READER[..])]).view())
+    launch(m, 0, 0x7000, 0x201)
+    set_quantum(m, 12)
+    explore(m, f)
+    for r in 0..<40 do assert(round(m))
+    var seen: Buf[u32] = buf()
+    for i in 0u32..<64 do seen.push(load32(core0(m), 0x3000 + i * 4))
+    for c in [core0(m), core1(m)]
+        seen.push(u32(c.retired))
+        seen.push(c.pc)
+    seen
+
+@test("a seed varies the turns' lengths and order, and the same seed gives the same run, counts and all")
+seed_interleaving()
+    val board = machine()
+    val m = &*board
+    val plain = interleaving(m, no_faults())
+    val one = interleaving(m, seeded(1))
+
+    assert(interleaving(m, seeded(1)).view() == one.view(), "seed 1 replays")
+    assert(one.view() != plain.view(), "a seed varies the run")
+    var others = 0
+    for seed in 2u64..9 do if interleaving(m, seeded(seed)).view() != one.view() then others += 1
+    assert(others >= 6, s"only $others of 7 seeds differ from seed 1")
+    // Core 1 never sees core 0's count go back, whatever the order of their turns.
+    for i in 1..<64 do assert(one[i] == 0 || one[i] >= one[i - 1], s"log[$i]")
+
+    // Unseeded, and with nothing injected, the run is today's, exactly.
+    assert(interleaving(m, Faults(false, 77, 0, 0, 0, 0)).view() == plain.view())
+
+@test("before core 1 is launched a seed changes nothing: core 0 runs alone as without one")
+seed_core1_unlaunched()
+    var ends: [2][3]u64
+    for k in 0..<2
+        val board = machine()
+        val m = &*board
+        // COUNTER, run by core 0: count to 200 and write it to EXIT.
+        started(m, image([(0x100, COUNTER[..])]).view())
+        if k == 1 then explore(m, seeded(5))
+        val stopped = run_board(m)
+        assert(stopped == core0(m) && stopped.stop == Stop.Exit && stopped.exit_code == 200)
+        ends[k] = [stopped.retired, clock(stopped, stopped.retired), u64(stopped.pc)]
+    assert(ends[0] == ends[1])
+
+@test("under a seed, both cores asleep still skip to the first SysTick that wakes one, at its clock")
+seed_both_asleep()
+    for seed in 1u64..4
+        val board = machine()
+        val m = &*board
+        started(m, image([(0x100, SLEEPER[..]), (0x200, SLEEPER[..])]).view())
+        launch(m, 0, 0x7000, 0x201)
+        explore(m, seeded(seed))
+        store32(core1(m), SYST_RVR, 49999)
+        store32(core1(m), SYST_CSR, 7)
+
+        val stopped = run_board(m)
+
+        assert(stopped == core1(m) && stopped.stop == Stop.Fault && stopped.stop_at == 0x3C)
+        assert(clock(stopped, stopped.retired) == 50000, s"seed $seed: ${clock(stopped, stopped.retired)}")
+
+// dual.elf to its end, varied as `f` says, on two threads where `threads`: its output and each core's
+// count.
+dual_run(m: *Machine, f: Faults, threads: bool) -> (&sync Frozen[u8], u64, u64)
+    on_virt(m)
+    open_console(m)
+    capture(m)
+    type_in(m, [])
+    image_of(m, dual) match
+        Ok(img) -> boot(m, img.view())
+        Err(why) -> assert(false, why)
+    explore(m, f)
+    if threads then set_threads(m)
+    val stopped = run_board(m)
+    assert(stopped == core0(m) && stopped.stop == Stop.Exit && stopped.exit_code == 0, str_cast(output(m).view()))
+    (output(m), core0(m).retired, core1(m).retired)
+
+// Whether `text` has every line of dual.elf's conversation that does not depend on the interleaving.
+whole_conversation(text: []const u8) -> bool
+    val s = str_cast(text)
+    for n in [1, 2, 3, 4] do if !s.contains(s"core 1: squaring $n\n") then return false
+    for sq in [1, 4, 9, 16] do if !s.contains(s"core 0: got back $sq\n") then return false
+    s.contains("core 0: core 1 finished; total 30\n")
+
+@test("dual.elf under a seed holds its whole conversation, and the same seed replays it, output and counts")
+seed_dual()
+    val board = machine()
+    val m = &*board
+    for seed in 1u64..4
+        val (out, a, b) = dual_run(m, seeded(seed), false)
+        assert(whole_conversation(out.view()), str_cast(out.view()))
+        val (again, a2, b2) = dual_run(m, seeded(seed), false)
+        assert(again.view() == out.view() && a2 == a && b2 == b, s"seed $seed replays")
+    // No seed is DUAL_OUTPUT, exactly.
+    val (plain, _, _) = dual_run(m, no_faults(), false)
+    assert(plain.view() == DUAL_OUTPUT.bytes)
+
+// Core 0 counts to 200 and pushes the count to core 1's FIFO, then spins; core 1 sleeps in WFI, and its
+// FIFO handler (IRQ 1, through its vector table at 0x400) logs its own free-running SysTick's CVR at
+// r4 and pops the word.
+// core 0: movs r0, #0; adds r0, #1; cmp r0, #200; bne; ldr r1, [pc, #4]; str r0, [r1]; b .; FIFO_WR
+// handler: ldr r1, =CVR; ldr r0, [r1]; stmia r4!, {r0}; ldr r1, =FIFO_RD; ldr r0, [r1]; bx lr
+val PUSHER: [10]u16 = [0x2000, 0x3001, 0x28C8, 0xD1FC, 0x4901, 0x6008, 0xE7FE, 0, 0x0054, 0xD000]
+val FIFO_HANDLER: [10]u16 = [0x4902, 0x6808, 0xC401, 0x4902, 0x6808, 0x4770, 0xE018, 0xE000, 0x0058, 0xD000]
+// Core 1's vector for IRQ 1, exception 17: the handler at 0x300.
+val FIFO_VECTOR: [2]u16 = [0x0301, 0]
+
+// What core 1's handler read of its counter when the word's interrupt reached it, with `f`.
+fifo_reached(f: Faults) -> u32
+    val board = machine()
+    val m = &*board
+    started(m, image([(0x100, PUSHER[..]), (0x200, SLEEPER[..]), (0x300, FIFO_HANDLER[..]), (0x444, FIFO_VECTOR[..])]).view())
+    launch(m, 0x400, 0x7000, 0x201)
+    explore(m, f)
+    val second = core1(m)
+    second.r[4] = 0x3000
+    store32(second, NVIC_ISER, 2)
+    store32(second, SYST_RVR, 0xFFFFFF)
+    store32(second, SYST_CSR, 5)
+    for r in 0..<20 do assert(round(m))
+    assert(second.r[4] == 0x3004, "one interrupt taken")
+    load32(second, 0x3000)
+
+@test("--late-irq raises a core's FIFO interrupt up to its bound after the word arrives, and a seed replays it")
+seed_late_fifo_irq()
+    val on_time = fifo_reached(no_faults())
+    // Nothing held back: the same as no option at all, whatever the seed.
+    assert(fifo_reached(Faults(false, 9, 0, 0, 0, 0)) == on_time)
+
+    var reads: Buf[u32] = buf()
+    for seed in 1u64..6
+        val read = fifo_reached(Faults(false, seed, 0, 0, 3000, 0))
+        // Later than without the delay (the counter counts down), by the push's time and the delay at most.
+        assert(read < on_time && on_time - read <= 1000 + 3000, s"seed $seed: $read against $on_time")
+        assert(fifo_reached(Faults(false, seed, 0, 0, 3000, 0)) == read, s"seed $seed replays")
+        reads.push(read)
+    var differs = false
+    for x in reads.view() do if x != reads[0] then differs = true
+    assert(differs, "every seed drew the same delay")
+
+@test("dual.elf holds its whole conversation with its FIFO interrupts held back, in turns and on two threads")
+seed_dual_late_irq()
+    val board = machine()
+    val m = &*board
+    val late = Faults(false, 3, 2000, 3, 5000, 0)
+    val (turns, a, b) = dual_run(m, late, false)
+    assert(whole_conversation(turns.view()), str_cast(turns.view()))
+    val (again, a2, b2) = dual_run(m, late, false)
+    assert(again.view() == turns.view() && a2 == a && b2 == b, "the faults replay in turns")
+    for run in 0..<5
+        val fresh = machine()
+        val (threaded, _, _) = dual_run(&*fresh, late, true)
+        assert(whole_conversation(threaded.view()), str_cast(threaded.view()))
