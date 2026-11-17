@@ -357,8 +357,8 @@ limited_usage(cpu: *Cpu)
 // `code` on the main stack at `sp`, MSPLIM at 0x1F00, HardFault's handler a BKPT: the first instruction
 // is the UsageFault STKOF, escalated to HardFault since the UsageFault is not enabled, with nothing of
 // it done. The entry stacks its frame, of which only the words at or above the limit where the frame
-// would cross it, SP then left at the limit and the STKOF that derives pending, as HardFault; nothing
-// is ever stored below the limit.
+// would cross it, SP then left at the limit; the STKOF that derives is HardFault again, the one being
+// taken, so nothing is left pending. Nothing is ever stored below the limit.
 overflowed(code: []const u16, sp: u32, regs: []const u32) -> bool
     var all: [16]u32
 
@@ -379,7 +379,7 @@ overflowed(code: []const u16, sp: u32, regs: []const u32) -> bool
 
     // The return address is the instruction, where it was stacked.
     if frame + 0x18 >= 0x1F00 && load32(&c, frame + 0x18) != 0 then return false
-    if ((c.pending[0] >> HARD_FAULT) & 1 != 0) != crossed then return false
+    if c.pending != [0u64; 8] then return false
 
     for a in 0x1E00u32..<0x1F00
         if load8(&c, a) != 0 then return false
@@ -531,6 +531,75 @@ t2e_stack_limit_late_arrival()
 
     assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == USAGE_FAULT && c.r[13] == 0x1F00, "the UsageFault, at the limit")
     assert((c.pending[0] >> IRQ0) & 1 != 0 && c.cfsr == CFSR_STKOF && c.hfsr == 0, "IRQ 0 still pending")
+
+// A fresh frame at 0x1A00 for a handler to return through, to `pc` with `xpsr`.
+const FRESH: u32 = 0x1A00
+
+fresh_frame(cpu: *Cpu, pc: u32, xpsr: u32)
+    store32(cpu, FRESH + 0x18, pc)
+    store32(cpu, FRESH + 0x1C, xpsr)
+
+// As `limited_usage`, with a fresh frame back to thread mode at 14.
+usage_fresh(cpu: *Cpu)
+    limited_usage(cpu)
+    fresh_frame(cpu, 14, 0x01000000)
+
+// Thread mode on the process stack, PSP and PSPLIM both 0x1800: 0: msr psp, r2; msr psplim, r5;
+// msr control, r6 (SPSEL); 12: `op`; 14: bkpt. 16: the UsageFault handler logs LR, moves PSP to the
+// fresh frame, lifts PSPLIM and returns: mov r0, lr; stmia r4!, {r0}; msr psp, r1; msr psplim, r3;
+// bx lr. 30: SVCall's handler logs LR and stops: mov r0, lr; stmia r4!, {r0}; bkpt.
+process_overflow(op: u16) -> [18]u16 = [0xF382, 0x8809, 0xF385, 0x880B, 0xF386, 0x8814, op, BKPT, MOV_R0_LR, LOG_R0, 0xF381, 0x8809, 0xF383, 0x880B, BX_LR, MOV_R0_LR, LOG_R0, BKPT]
+val PROCESS_REGS: [7]u32 = [0xAA, FRESH, 0x1800, 0, LOG, 0x1800, 2]
+
+@test("STKOF on the process stack whose own frame crosses PSPLIM derives the same UsageFault: it is taken once, nothing left pending, and its return goes back to thread mode")
+t2e_stack_limit_derived_same()
+    val code = process_overflow(PUSH_R0)
+    // At the handler: one UsageFault active, none pending, the process stack at its limit.
+    var c = run_both8(code[..], PROCESS_REGS[..], 0, [[USAGE_FAULT, 14]], &usage_fresh)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 14 && c.ipsr == USAGE_FAULT && c.sp_other == 0x1800, "the UsageFault, PSP at the limit")
+    assert(c.pending == [0u64; 8] && c.cfsr == CFSR_STKOF && c.hfsr == 0, "nothing pending, STKOF recorded")
+    assert(load32(&c, 0x1800 - 4) == 0, "nothing below the limit")
+
+    // Through the handler and back: taken exactly once, and thread mode resumes on the fresh frame.
+    c = run_both8(code[..], PROCESS_REGS[..], 0, [[USAGE_FAULT, 16]], &usage_fresh)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 14 && c.ipsr == 0 && c.r[13] == FRESH + 0x20, "back in thread mode on PSP")
+    assert(logged(&c, [0xFFFFFFFD]), "one UsageFault taken")
+    assert(c.pending == [0u64; 8] && c.active == [0u64; 8] && c.cfsr == CFSR_STKOF, "nothing pending or active after the return")
+
+// As `usage_fresh`, with SVCall at priority 0x80, below the UsageFault's 0.
+svcall_low(cpu: *Cpu)
+    usage_fresh(cpu)
+    store32(cpu, SCB_SHPR2, 0x80000000)
+
+@test("an SVC whose frame crosses PSPLIM gives way to the higher UsageFault it derives; each is taken once, SVCall tail-chained after the UsageFault's return")
+t2e_stack_limit_derived_higher()
+    // PSP at 0x1808 over PSPLIM 0x1800: the SVC itself is clear of the limit, its frame is not.
+    var regs = PROCESS_REGS
+    regs[2] = 0x1808
+    val code = process_overflow(SVC)
+    var c = run_both8(code[..], regs[..], 0, [[USAGE_FAULT, 16], [SVCALL, 30]], &svcall_low)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 34 && c.ipsr == SVCALL, "SVCall's handler")
+    assert(logged(&c, [0xFFFFFFFD, 0xFFFFFFFD]), "the UsageFault, then SVCall")
+    assert(c.pending == [0u64; 8] && c.cfsr == CFSR_STKOF && c.hfsr == 0, "nothing left pending")
+
+// As `irq_low_usage`, with a fresh frame back to IRQ 0's handler at 4.
+irq_low_fresh(cpu: *Cpu)
+    irq_low_usage(cpu)
+    fresh_frame(cpu, 4, 0x01000000 | IRQ0)
+
+@test("STKOF in a handler on the main stack whose own frame crosses MSPLIM derives the same UsageFault: taken once, nothing left pending, the return back in the handler")
+t2e_stack_limit_derived_handler()
+    // 0: thread's bkpt. 2: IRQ 0's handler: sub sp, #0x80; bkpt. 6: the UsageFault handler logs LR,
+    // lifts MSPLIM, moves MSP to the fresh frame and returns: mov r0, lr; stmia r4!, {r0};
+    // msr msplim, r3; mov sp, r1; bx lr.
+    val code: []const u16 = [BKPT, 0xB0A0, BKPT, MOV_R0_LR, LOG_R0, 0xF383, 0x880A, 0x468D, BX_LR]
+    // MSP 0x1F38: IRQ 0's frame leaves it at 0x1F18, and the UsageFault's would go to 0x1EF8.
+    val regs: [14]u32 = [0, FRESH, 0, 0, LOG, 0, 0, 0, 0, 0, 0, 0, 0, 0x1F38]
+    var c = run_both8(code, regs[..], 0, [[USAGE_FAULT, 6], [IRQ0, 2]], &irq_low_fresh)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 4 && c.ipsr == IRQ0 && c.r[13] == FRESH + 0x20, "back in IRQ 0's handler")
+    assert(logged(&c, [0xFFFFFFF1]), "one UsageFault taken")
+    assert(c.pending == [0u64; 8] && c.cfsr == CFSR_STKOF && c.hfsr == 0, "nothing left pending")
+    assert(c.active[0] == u64(1) << IRQ0, "only IRQ 0 active")
 
 // ---------------------------------------------------------------------------------------------------
 // MRS and MSR, and the system control space.
