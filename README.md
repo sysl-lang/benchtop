@@ -688,7 +688,12 @@ handlers are shared. M23 is a separate Baseline decoder profile, with two priori
 system-register accesses, fixed CCR and no IT, BASEPRI, FAULTMASK or stack limits in its current
 configuration without the Security Extension. M0/M1 have no VTOR; M3 has the v7-M register profile.
 
-**All models omit the MPU and Security extensions; the floating-point unit is a board option.**
+**All models omit the MPU and Security extensions; the floating-point unit is a board option.** The
+RP2350's Cortex-M33s are the exception: they have the Security Extension and an 8-region PMSAv8 MPU
+per security state, which is enforced on every load, store and instruction fetch (MemManage
+DACCVIOL with MMFAR, or IACCVIOL; PRIVDEFENA, HFNMIENA, AP, XN, overlaps and `LDRT`/`STRT`), but not
+yet on exception stacking and unstacking, lazy floating-point preservation or `BLXNS`'s push. The
+M4's and M7's PMSAv7 MPU and the M0+'s are not enforced.
 M4 and M7 always have integer DSP; M33/M35P/M52/M55/M85 can enable it independently per core. The M52/M55/M85
 models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
 MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. Unsupported instruction
