@@ -1,0 +1,894 @@
+module sh.sysl.benchtop.v6m
+
+// Fault explanations (README.md, "Fault explanations"): what a fault was, in words, with symbols, so
+// that a person or an agent can act on it without a debugger.
+//
+// **The evidence is taken when the fault is.** A fault exception a core takes (HardFault, MemManage,
+// BusFault, UsageFault, SecureFault) is captured in `enter`, once its frame is stacked and before its
+// handler has run a single instruction: the fault status registers of the state it arose in (CFSR,
+// HFSR, MMFAR, SFSR, SFAR, the Non-secure CFSR and MMFAR where it was Non-secure state's), the eight
+// words of the frame, EXC_RETURN, which stack the frame went to, and a backtrace read from the stack
+// above it. A fault benchtop stops on rather than taking (an undefined instruction, an access nothing
+// answers, a lockup; `Stop`) is captured from the stopped core when the run ends, with nothing stacked:
+// its frame is the live registers, and its reasons come from the stop and the instruction it stopped on.
+//
+// **A core records its first fault, its last and how many** (`FaultLog`), behind a test of
+// `cpu.fault_log` on the exception entry, null until `explain_faults`; a run that names nothing still
+// records them, since a fault the guest recovers from costs only its own capture. `--explain-faults`
+// prints each one as it is taken.
+//
+// **The backtrace is best effort, and says so.** Its first entry is the stacked PC (`frame`), then the
+// stacked LR where it is a return address into code (`lr`), then each word of the faulting stack above
+// the frame that is one: odd, inside an executable section (or, with no ELF, memory that holds code),
+// and just after a BL or BLX (`scan`). A scanned entry may be a stale return address left on the stack;
+// it is a lead, not an unwind.
+//
+// **The ring of the last instructions a core ran** (`--trace-ring <n>`) is recorded only by the `match`
+// executor's tracing instance (switch.sysl), which a core that traces runs instead of the threaded
+// chain: the threaded executor's handlers are untouched, and a run that does not trace pays one test
+// of `cpu.tracing` per run.
+
+import sh.sysl.elf as elf
+import sysl.buf.{Buf, buf}
+import sysl.math.min
+import sysl.raw.ptr_cast
+import sysl.text.{str_builder, from_utf8_lossy, parse_long, replace_all}
+
+// ---------------------------------------------------------------------------------------------------
+// Symbols.
+
+/** A function or label of the image, as the report names an address by it. A label (no size) names
+ * addresses up to `end`, the end of its section.
+ */
+struct ImageSymbol
+    start: u32
+    size: u32
+    name: string
+    end: u32
+
+/** The image's function and label symbols, for `symbol_at`; none where `image` is not an ELF file or
+ * has no symbol table. A Thumb function's address has its low bit cleared. Mapping symbols (`$t`,
+ * `$d`), empty names, absolute symbols and labels outside a section of instructions are left out.
+ */
+image_symbols(image: []const u8) -> Buf[ImageSymbol]
+    var out: Buf[ImageSymbol] = buf()
+    val e = elf.read(image) match
+        Ok(e) -> e
+        Err(_) -> return out
+    val all = e.symbols() match
+        Ok(s) -> s
+        Err(_) -> return out
+    val count = e.header.shnum
+    for s in all
+        if s.kind != elf.STT_FUNC && s.kind != elf.STT_NOTYPE then continue
+        // An undefined symbol (section 0) and an absolute one or another in a reserved section (0xff00
+        // up: a constant, not a place in the image) name no address.
+        if s.name.len == 0 || s.name[0] == u8('$') || s.shndx == 0 || s.shndx >= 0xff00 || s.shndx >= count then continue
+        // A label is code's only in a section of instructions: the linker's data and stack labels
+        // name no pc.
+        val section = e.section(s.shndx)
+        if s.kind == elf.STT_NOTYPE && section.flags & elf.SHF_EXECINSTR == 0 then continue
+        out.push(ImageSymbol(u32(s.value) & ~1u32, u32(s.size), from_utf8_lossy(s.name), u32(section.addr + section.size)))
+    out
+
+/** `a` as `name+0x…` (or the bare name at its start): the symbol whose extent holds it, otherwise the
+ * nearest label at or below it in the same section; None where neither is.
+ */
+symbol_at(symbols: []const ImageSymbol, a: u32) -> Option[string]
+    var best = -1
+    var sized = false
+    for i in 0..<symbols.len
+        val s = symbols[i]
+        if s.start > a then continue
+        val holds = s.size != 0 && a - s.start < s.size
+        if s.size != 0 && !holds then continue
+        if s.size == 0 && a >= s.end then continue
+        // A symbol whose extent holds the address beats a label; between two of the same sort, the
+        // nearer start wins.
+        if best < 0 || (holds && !sized) || (holds == sized && s.start > symbols[best].start)
+            best = int(i)
+            sized = holds
+    if best < 0 then return None
+    val s = symbols[best]
+    val off = a - s.start
+    Some(if off == 0 then s.name else f"${s.name}+0x$off%x")
+
+/** An executable section of the image: its addresses from `start` up to `end`. */
+struct CodeRange
+    start: u32
+    end: u32
+
+/** What the explanations read of the image: its symbols, and its executable sections, which say what
+ * a backtrace's scan takes for code. A raw image has neither.
+ */
+struct SymbolTable
+    names: Buf[ImageSymbol]
+    code: Buf[CodeRange]
+
+/** `image`'s symbol table; an empty one where it is not an ELF file. */
+symbol_table(image: []const u8) -> SymbolTable
+    var code: Buf[CodeRange] = buf()
+    elf.read(image) match
+        Ok(e) ->
+            for k in 0..<e.header.shnum
+                val s = e.section(k)
+                if s.flags & elf.SHF_EXECINSTR != 0 && s.size != 0 then code.push(CodeRange(u32(s.addr), u32(s.addr + s.size)))
+        Err(_) -> ()
+    SymbolTable(image_symbols(image), code)
+
+// ---------------------------------------------------------------------------------------------------
+// The options.
+
+/** What `benchtop run` asks of the explanations beyond the default: each fault printed as it is taken
+ * (`--explain-faults`), and the ring of the last instructions each core ran, `ring` long (`--trace-ring
+ * <n>`; 0 for none).
+ */
+struct ExplainOptions
+    each: bool
+    ring: u32
+
+/** Neither option: faults recorded, and explained only where the run ends on one. */
+explain_defaults() -> ExplainOptions = ExplainOptions(false, 0)
+
+impl ExplainOptions
+    /** Whether either option is named. */
+    named(self) -> bool = self.each || self.ring != 0
+
+/** The longest ring `--trace-ring` takes. */
+const RING_MOST: u32 = 4096
+
+/** The options, as `benchtop run` spells them. */
+const EXPLAIN_OPTIONS = "[--explain-faults] [--trace-ring <n>]"
+
+/** Where `args[i]` is `--explain-faults` or `--trace-ring`, `o` set by it and the index after it, or why
+ * its value is refused; None where it is neither. `end` is the index of the image, which no value may be.
+ */
+take_explain(o: *ExplainOptions, args: []const string, i: usize, end: usize) -> Option[Result[usize, string]]
+    if args[i] == "--explain-faults"
+        o.each = true
+        return Some(Ok(i + 1))
+    if args[i] != "--trace-ring" then return None
+    if i + 1 >= end then return Some(Err("--trace-ring takes a number of instructions"))
+    val n = parse_long(args[i + 1]) match
+        Ok(v) -> v
+        Err(_) -> return Some(Err(s"--trace-ring takes a whole number, not ${args[i + 1]}"))
+    if n < 1 || n > long(RING_MOST) then return Some(Err(s"--trace-ring takes 1 to $RING_MOST instructions, not $n"))
+    o.ring = u32(n)
+    Some(Ok(i + 2))
+
+// ---------------------------------------------------------------------------------------------------
+// The record.
+
+// How many entries a backtrace holds, and how many words of the stack its scan reads at most.
+const TRACE_MOST: usize = 16
+const SCAN_WORDS: u32 = 512
+
+/** What a fault's reasons are read from. A taken fault's are its status registers; a fault benchtop
+ * stops on has its own, from the stop and the instruction (`cause_at` the address the cause names).
+ */
+enum Cause: u8
+    // The status registers, as the fault left them.
+    Registers = 0
+    // A fault that could not be taken, so the core locked up; the status registers say which.
+    Lockup
+    // An SVC where SVCall could not preempt (taken as HardFault), or where HardFault could not either.
+    Svc
+    // A stack-limit violation where not even HardFault could be taken.
+    StackLimit
+    Undefined
+    DivByZero
+    NoCoprocessor
+    Unaligned
+    // An exception's vector at `cause_at` lacks its Thumb bit.
+    BadVector
+    // An exception return the architecture refuses.
+    BadReturn
+    // An instruction fetch from `cause_at`, where nothing answers.
+    Fetch
+    // A data access to `cause_at`, where nothing answers.
+    Data
+    // Stacking an exception's frame at `cause_at`, where nothing answers.
+    Stacking
+    // `BKPT 0xAB`: a semihosting call benchtop does not answer.
+    Semihost
+    // A stop at `Fault` benchtop cannot tell more of.
+    Other
+
+/** How a backtrace entry was found. */
+enum Via: u8
+    // The stacked PC (or a stopped core's own).
+    Frame = 0
+    // The stacked LR (or a stopped core's own).
+    Lr
+    // A return address found on the stack above the frame: a lead, not an unwind.
+    Scan
+
+/** One fault, as captured: in a core's `FaultLog`, or on the stack for a fault a core stopped on. */
+struct FaultCapture
+    // Taken as an exception (a frame was stacked), or stopped on.
+    taken: bool
+    // A lockup: a stop at `Fault` or `StackLimit`.
+    lockup: bool
+    // The architectural exception number: 3 HardFault to 7 SecureFault.
+    exception: u32
+    cause: Cause
+    cause_at: u32
+    // The fault arose in Non-secure state. CFSR's MemManage and UsageFault bytes and MMFAR are the
+    // Non-secure ones where the exception is Non-secure state's, or HardFault escalated from there.
+    ns: bool
+    cfsr: u32
+    hfsr: u32
+    mmfar: u32
+    bfar: u32
+    sfsr: u32
+    sfar: u32
+    // R0–R3, R12, LR, the return address and xPSR: stacked, or live where `stacked` is clear.
+    frame: [8]u32
+    exc_return: u32
+    // Where the frame was stacked, or the live SP; and whether that is the process stack.
+    sp: u32
+    psp: bool
+    stacked: bool
+    // The instruction the cause was read from, 2 or 4 bytes (0 where it could not be read).
+    insn: u32
+    insn_len: u32
+    cycles: u64
+    trace: [TRACE_MOST]u32
+    via: [TRACE_MOST]Via
+    trace_len: usize
+    // The ring's entries at the fault, oldest first.
+    ring: [RING_MOST]u32
+    ring_len: u32
+
+/** A core's record, allocated by `explain_faults`. */
+struct FaultLog
+    count: u64
+    first: FaultCapture
+    last: FaultCapture
+    // `--explain-faults`; and the table the printed explanations and the scan read, null for none.
+    // `crlf` ends each printed line with a carriage return too, for a terminal in raw mode.
+    each: bool
+    crlf: bool
+    table: *SymbolTable
+    // The last fault that could not be taken: its exception and the address the core stopped at.
+    locked: bool
+    lockup: u32
+    lockup_at: u32
+    // The ring: `ring_size` entries, the next written at `ring_next`, `ring_count` written in all.
+    ring_size: u32
+    ring_next: u32
+    ring_count: u64
+    ring: [RING_MOST]u32
+
+/** Record `cpu`'s faults from now on, from nothing, as `o` asks; a second call starts again. `table`,
+ * where there is one, names addresses and says what is code; the caller keeps it alive while the core
+ * records. A reset keeps the record.
+ */
+explain_faults(cpu: *Cpu, o: ExplainOptions, table: Option[&SymbolTable])
+    if cpu.fault_log != null then c_free(ptr_cast(cpu.fault_log))
+    cpu.fault_log = ptr_cast(c_calloc(1, sizeof(FaultLog)))
+    val log = cpu.fault_log
+    log.each = o.each
+    log.table = null
+    table match
+        Some(t) -> log.table = &*t
+        None -> ()
+    log.ring_size = min(o.ring, RING_MOST)
+    cpu.tracing = log.ring_size != 0
+
+/** Stop recording, and free the record. */
+stop_explaining(cpu: *Cpu)
+    if cpu.fault_log == null then return
+    c_free(ptr_cast(cpu.fault_log))
+    cpu.fault_log = null
+    cpu.tracing = false
+
+/** End each line `--explain-faults` prints on `cpu` with a carriage return too. */
+explain_in_raw_mode(cpu: *Cpu) = if cpu.fault_log != null then cpu.fault_log.crlf = true
+
+/** How many faults `cpu` has taken since it began recording. */
+faults_taken(cpu: *Cpu) -> u64 = if cpu.fault_log == null then 0 else cpu.fault_log.count
+
+/** Whether `e` is a fault exception: HardFault, MemManage, BusFault, UsageFault or SecureFault. */
+@inline
+is_fault(e: u32) -> bool = e >= HARD_FAULT && e <= SECURE_FAULT
+
+// Note the instruction at `a` in the ring (the tracing `match` executor, for each one it runs).
+@inline
+private[v6m] ring_note(log: *FaultLog, a: u32)
+    log.ring[log.ring_next] = a
+    log.ring_next = if log.ring_next + 1 == log.ring_size then 0 else log.ring_next + 1
+    log.ring_count += 1
+
+// A fault `fault` could not take, `e`, stopping the core at `at`: a lockup, which `capture_stop`
+// explains once the run has ended.
+@cold
+private[v6m] note_lockup(cpu: *Cpu, e: u32, at: u32)
+    val log = cpu.fault_log
+    log.locked = true
+    log.lockup = e
+    log.lockup_at = at
+
+// The fault exception `e` taken by `enter`, `n` retired: its frame `words` stacked at `frame` (an
+// extended one where `extended`), the words below `floor` left out, and `exc_return` about to go into
+// LR. The core is still in the state, mode and stack the fault arose in.
+@cold
+@noinline
+private[v6m] fault_taken(cpu: *Cpu, e: u32, frame: u32, floor: u32, words: [8]u32, exc_return: u32, extended: bool, n: u64)
+    val log = cpu.fault_log
+    val c = &log.last
+    val ex = architectural(e)
+
+    c.taken = true
+    c.lockup = false
+    c.exception = ex
+    c.cause = Cause.Registers
+    c.cause_at = 0
+    read_status(cpu, c, e >= NS_BANK || (ex == HARD_FAULT && cpu.ns))
+    c.ns = cpu.ns
+    c.frame = words
+    c.exc_return = exc_return
+    c.sp = frame
+    c.psp = on_process_stack(cpu)
+    c.stacked = frame >= floor && c.cfsr & (CFSR_MSTKERR | CFSR_STKERR) == 0
+    c.cycles = clock(cpu, n)
+    read_insn(cpu, c, words[6])
+    // HardFault with nothing in the status registers to say why: on ARMv6-M always, since it has none.
+    // The one benchtop takes so is an SVC that SVCall could not preempt, the instruction before the
+    // return address.
+    if ex == HARD_FAULT && c.cfsr == 0 && c.hfsr & ~HFSR_FORCED == 0 && c.sfsr == 0
+        val before = peek16(cpu, (words[6] & ~1) -% 2)
+        if before.is_some() && before.unwrap() & 0xFF00 == 0xDF00
+            c.cause = Cause.Svc
+            c.insn = before.unwrap()
+            c.insn_len = 2
+    // The stack before the exception lies above the frame: past an extended frame's floating-point
+    // words, and past the word skipped to align it (the stacked xPSR's bit 9).
+    val pad: u32 = if words[7] & 0x200 != 0 then 4 else 0
+    trace_from(cpu, c, words[6], words[5], frame +% (if extended then 0x68 else 0x20) +% pad)
+    snapshot_ring(log, c)
+    log.count += 1
+    if log.count == 1 then copy_capture(&log.first, c)
+    if log.each
+        var f = fault_of(c, cpu, cpu.core)
+        print_explanation(log, fault_text(&f, names_of(log.table), "faulted"))
+
+// `c`'s status registers: the Non-secure CFSR's banked bytes and MMFAR where `ns`. An ARMv6-M core has
+// none.
+private read_status(cpu: *Cpu, c: *FaultCapture, ns: bool)
+    c.cfsr = 0
+    c.hfsr = 0
+    c.mmfar = 0
+    c.bfar = 0
+    c.sfsr = 0
+    c.sfar = 0
+    if is_baseline(cpu.kind) then return
+    // The Non-secure CFSR holds MemManage's and UsageFault's bytes; BusFault's is the Secure one's.
+    val banked = ns && cpu.security
+    c.cfsr = if banked then cpu.cfsr_ns | (cpu.cfsr & 0xFF00) else cpu.cfsr
+    c.hfsr = cpu.hfsr
+    c.mmfar = if banked then cpu.mmfar_ns else cpu.mmfar
+    if cpu.security
+        c.sfsr = cpu.sfsr
+        c.sfar = cpu.sfar
+
+// The instruction at `a` into `c`, both halfwords of a 32-bit one; none where it cannot be read.
+private read_insn(cpu: *Cpu, c: *FaultCapture, a: u32)
+    c.insn = 0
+    c.insn_len = 0
+    val h1 = peek16(cpu, a & ~1) match
+        Some(h) -> h
+        None -> return
+    if !wide(h1)
+        c.insn = h1
+        c.insn_len = 2
+        return
+    peek16(cpu, (a & ~1) +% 2) match
+        Some(h2) ->
+            c.insn = (h1 << 16) | h2
+            c.insn_len = 4
+        None -> ()
+
+// Copy the parts of `from` that hold something into `to`: the ring only as far as it holds entries.
+private copy_capture(to: *FaultCapture, from: *FaultCapture)
+    val ring = from.ring_len
+    to.taken = from.taken
+    to.lockup = from.lockup
+    to.exception = from.exception
+    to.cause = from.cause
+    to.cause_at = from.cause_at
+    to.ns = from.ns
+    to.cfsr = from.cfsr
+    to.hfsr = from.hfsr
+    to.mmfar = from.mmfar
+    to.bfar = from.bfar
+    to.sfsr = from.sfsr
+    to.sfar = from.sfar
+    to.frame = from.frame
+    to.exc_return = from.exc_return
+    to.sp = from.sp
+    to.psp = from.psp
+    to.stacked = from.stacked
+    to.insn = from.insn
+    to.insn_len = from.insn_len
+    to.cycles = from.cycles
+    to.trace = from.trace
+    to.via = from.via
+    to.trace_len = from.trace_len
+    for i in 0..<ring do to.ring[i] = from.ring[i]
+    to.ring_len = ring
+
+// The ring's entries into `c`, oldest first.
+private snapshot_ring(log: *FaultLog, c: *FaultCapture)
+    val size = log.ring_size
+    val held = u32(min(log.ring_count, u64(size)))
+    c.ring_len = held
+    if held == 0 then return
+    var at = (log.ring_next + size - held) % size
+    for i in 0..<held
+        c.ring[i] = log.ring[at]
+        at = if at + 1 == size then 0 else at + 1
+
+// ---------------------------------------------------------------------------------------------------
+// Memory, read as a debugger would: RAM and flash in place, never a device.
+
+// The word at `a`, where it is in RAM or flash.
+private peek32(cpu: *Cpu, a: u32) -> Option[u32]
+    if cpu.mem == null || a & 3 != 0 then return None
+    val page = cpu.mem.page_table[a >> PAGE_SHIFT]
+    if page == 0 then None else Some(host_read(page, a, 4))
+
+// The halfword at `a`, where it is in RAM or flash.
+private peek16(cpu: *Cpu, a: u32) -> Option[u32]
+    if cpu.mem == null || a & 1 != 0 then return None
+    val page = cpu.mem.page_table[a >> PAGE_SHIFT]
+    if page == 0 then None else Some(host_read(page, a, 2))
+
+// Whether `a` is code: in an executable section of the image, or with no sections known, in memory
+// that holds code.
+private code_at(cpu: *Cpu, a: u32) -> bool
+    val t = cpu.fault_log
+    if t != null && t.table != null && t.table.code.len() != 0
+        for r in t.table.code do if a >= r.start && a < r.end then return true
+        return false
+    cpu.mem != null && cpu.mem.is_code(a)
+
+// Whether `w` is a return address: odd, into code, just after a BL or a BLX.
+private returns_to(cpu: *Cpu, w: u32) -> bool
+    if w & 1 == 0 || w < 5 then return false
+    val a = w & ~1
+    if !code_at(cpu, a) then return false
+    // BLX Rm: 0100 0111 1xxx x000.
+    val last = peek16(cpu, a - 2)
+    if last.is_some() && last.unwrap() & 0xFF87 == 0x4780 then return true
+    // BL: 11110 S imm10, then 11 J1 1 J2 imm11.
+    val h1 = peek16(cpu, a - 4)
+    h1.is_some() && last.is_some() && h1.unwrap() & 0xF800 == 0xF000 && last.unwrap() & 0xD000 == 0xD000
+
+// `c`'s backtrace: `pc`, `lr` where it is a return address, then the stack scanned from `from` up.
+private trace_from(cpu: *Cpu, c: *FaultCapture, pc: u32, lr: u32, from: u32)
+    c.trace_len = 0
+    push_trace(c, pc & ~1, Via.Frame)
+    if returns_to(cpu, lr) then push_trace(c, lr & ~1, Via.Lr)
+    var a = (from +% 3) & ~3
+    var k: u32 = 0
+    while k < SCAN_WORDS && c.trace_len < TRACE_MOST
+        val w = peek32(cpu, a) match
+            Some(v) -> v
+            None -> break
+        // The same return address twice running (LR, then the copy its function pushed) is one.
+        if returns_to(cpu, w) && w & ~1 != c.trace[c.trace_len - 1] then push_trace(c, w & ~1, Via.Scan)
+        if a >= 0xFFFFFFFC then break
+        a += 4
+        k += 1
+
+private push_trace(c: *FaultCapture, a: u32, via: Via)
+    if c.trace_len == TRACE_MOST then return
+    c.trace[c.trace_len] = a
+    c.via[c.trace_len] = via
+    c.trace_len += 1
+
+// ---------------------------------------------------------------------------------------------------
+// A fault a core stopped on.
+
+/** Capture into `c` the fault `cpu` stopped on, from the stopped core: answers whether its stop is one
+ * (`Undefined`, `Unmapped`, `Fault`, `StackLimit`). Nothing was stacked; the frame is the live
+ * registers.
+ */
+capture_stop(cpu: *Cpu, c: *FaultCapture) -> bool
+    val at = cpu.stop_at
+    val log = cpu.fault_log
+    val baseline = is_baseline(cpu.kind)
+    val pc = cpu.pc
+    read_insn(cpu, c, pc)
+    c.taken = false
+    c.cause_at = at
+    // The fault each stop would have been, where it could have been taken: HardFault on a Baseline
+    // core, which has no other.
+    var ex = HARD_FAULT
+    cpu.stop match
+        StackLimit ->
+            c.cause = Cause.StackLimit
+            ex = USAGE_FAULT
+        Undefined ->
+            c.cause = undefined_cause(cpu, c)
+            ex = USAGE_FAULT
+        Unmapped ->
+            c.cause = if at == pc then Cause.Fetch elif stacking_at(cpu, at) then Cause.Stacking else Cause.Data
+            ex = BUS_FAULT
+        Fault ->
+            if log != null && log.locked && log.lockup_at == at
+                c.cause = Cause.Lockup
+                ex = architectural(log.lockup)
+            else
+                c.cause = fault_cause(cpu, c, at)
+                ex = if c.cause == Cause.Svc || c.cause == Cause.Other then HARD_FAULT else USAGE_FAULT
+        _ -> return false
+    // A lockup is a fault that could not be taken; the rest are faults benchtop does not take.
+    c.lockup = c.cause == Cause.Lockup || c.cause == Cause.StackLimit || c.cause == Cause.Svc
+    c.exception = if baseline then HARD_FAULT else ex
+    read_status(cpu, c, cpu.ns)
+    c.ns = cpu.ns
+    // The address the precise BusFault would have recorded.
+    if c.cause == Cause.Data && !baseline then c.bfar = at
+    c.frame = [cpu.r[0], cpu.r[1], cpu.r[2], cpu.r[3], cpu.r[12], cpu.r[14], pc, xpsr(cpu)]
+    c.exc_return = 0
+    c.sp = cpu.r[13]
+    c.psp = on_process_stack(cpu)
+    c.stacked = false
+    c.cycles = clock(cpu, cpu.retired)
+    trace_from(cpu, c, pc, cpu.r[14], cpu.r[13])
+    if log != null then snapshot_ring(log, c) else c.ring_len = 0
+    true
+
+// Why an instruction stopped the core at `Undefined`: a division by zero CCR.DIV_0_TRP traps, an
+// instruction for a coprocessor that is absent, a semihosting call not answered, or an encoding
+// that is undefined.
+private undefined_cause(cpu: *Cpu, c: *FaultCapture) -> Cause
+    if divides_by_zero(cpu, c) then return Cause.DivByZero
+    if c.insn_len == 4 && (c.insn >> 16) & 0xEC00 == 0xEC00 then return Cause.NoCoprocessor
+    if c.insn_len == 2 && c.insn == 0xBEAB && cpu.semihosting then return Cause.Semihost
+    Cause.Undefined
+
+// Whether `c`'s instruction is an SDIV or UDIV (1111 1011 1001 or 1011 Rn, 1111 Rd 1111 Rm) by a zero
+// Rm that CCR.DIV_0_TRP traps.
+private divides_by_zero(cpu: *Cpu, c: *FaultCapture) -> bool
+    if c.insn_len != 4 then return false
+    val h1 = c.insn >> 16
+    val h2 = c.insn & 0xFFFF
+    val divide = (h1 & 0xFFF0 == 0xFB90 || h1 & 0xFFF0 == 0xFBB0) && h2 & 0xF0F0 == 0xF0F0
+    divide && cpu.ccr & CCR_DIV_0_TRP != 0 && cpu.r[usize(h2 & 0xF)] == 0
+
+// Why the core stopped at `Fault` on `at`, where no lockup was noted there: an exception's vector
+// without its Thumb bit, an SVC no exception could take, an instruction for a coprocessor CPACR denies,
+// an unaligned exclusive or ordered access, or an exception return refused.
+private fault_cause(cpu: *Cpu, c: *FaultCapture, at: u32) -> Cause
+    if at != cpu.pc && vector_slot(cpu, at)
+        val v = peek32(cpu, at)
+        if v.is_some() && v.unwrap() & 1 == 0 then return Cause.BadVector
+    if c.insn_len == 2 && c.insn & 0xFF00 == 0xDF00 then return Cause.Svc
+    if divides_by_zero(cpu, c) then return Cause.DivByZero
+    if c.insn_len == 4
+        val h1 = c.insn >> 16
+        if h1 & 0xEC00 == 0xEC00 then return Cause.NoCoprocessor
+        // LDREX and STREX (1110 1000 010x), and the byte, halfword and ordered forms (1110 1000 110x).
+        if h1 & 0xFFE0 == 0xE840 || h1 & 0xFFE0 == 0xE8C0 then return Cause.Unaligned
+    if cpu.ipsr != 0 then return Cause.BadReturn
+    Cause.Other
+
+// Whether `a` is a word of a vector table the core reads, Secure or Non-secure.
+private vector_slot(cpu: *Cpu, a: u32) -> bool
+    val words = IRQ0 + cpu.nvic_irqs
+    for base in [cpu.vtor, cpu.banked.vtor]
+        if a >= base && (a - base) >> 2 < words && a & 3 == 0 then return true
+    false
+
+// Whether a stop at `at`, an access nothing answers, was stacking an exception's frame: `at` is in the
+// frame's reach just below SP, and SP itself is in no memory.
+private stacking_at(cpu: *Cpu, at: u32) -> bool
+    val sp = cpu.r[13]
+    at < sp && sp - at <= 0x68 && peek32(cpu, (sp -% 4) & ~3).is_none()
+
+// ---------------------------------------------------------------------------------------------------
+// The explanation.
+
+/** One fault explained: everything the stderr block and the exit report's `fault` object say. */
+struct Fault
+    core: u32
+    taken: bool
+    lockup: bool
+    exception: u32
+    // The core has the Security Extension, and the fault arose in Non-secure state where `ns`.
+    security: bool
+    ns: bool
+    // The core has CFSR and HFSR (ARMv7-M, ARMv8-M Mainline).
+    mainline: bool
+    reasons: Buf[string]
+    cfsr: u32
+    hfsr: u32
+    mmfar: u32
+    bfar: u32
+    sfsr: u32
+    sfar: u32
+    frame: [8]u32
+    exc_return: u32
+    sp: u32
+    psp: bool
+    stacked: bool
+    cycles: u64
+    trace: Buf[TraceEntry]
+    ring: Buf[u32]
+
+/** A backtrace entry: an address and how it was found. */
+struct TraceEntry
+    pc: u32
+    via: Via
+
+impl Fault
+    /** MMFAR holds the address MemManage names (MMARVALID). */
+    mmfar_valid(*self) -> bool = self.cfsr & CFSR_MMARVALID != 0
+    /** BFAR holds the address BusFault names: BFARVALID, or the address a precise BusFault benchtop
+     * stopped on would have recorded. */
+    bfar_valid(*self) -> bool = self.cfsr & CFSR_BFARVALID != 0 || (!self.taken && self.bfar != 0)
+    /** SFAR holds the address SecureFault names (SFARVALID). */
+    sfar_valid(*self) -> bool = self.sfsr & SFSR_SFARVALID != 0
+
+/** `c`, captured on `cpu`, core `core` of its board, explained. */
+fault_of(c: *FaultCapture, cpu: *Cpu, core: u32) -> Fault
+    var trace: Buf[TraceEntry] = buf()
+    for i in 0..<c.trace_len do trace.push(TraceEntry(c.trace[i], c.via[i]))
+    var ring: Buf[u32] = buf()
+    for i in 0..<c.ring_len do ring.push(c.ring[i])
+    Fault(core, c.taken, c.lockup, c.exception, cpu.security, c.ns, !is_baseline(cpu.kind), reasons_of(c, !is_baseline(cpu.kind)),
+        c.cfsr, c.hfsr, c.mmfar, c.bfar, c.sfsr, c.sfar, c.frame, c.exc_return, c.sp, c.psp, c.stacked, c.cycles, trace, ring)
+
+/** The name `exception` and the report give fault exception `e`. */
+fault_name(e: u32) -> string = e match
+    2 -> "NMI"
+    3 -> "HardFault"
+    4 -> "MemManage"
+    5 -> "BusFault"
+    6 -> "UsageFault"
+    7 -> "SecureFault"
+    _ -> s"exception $e"
+
+/** The word the backtrace gives `v`. */
+via_name(v: Via) -> string = v match
+    Frame -> "frame"
+    Lr -> "lr"
+    Scan -> "scan"
+
+// CFSR's bits: MMFSR (bits 0–7), BFSR (8–15) and UFSR (16–31); HFSR's; SFSR's.
+const CFSR_MUNSTKERR: u32 = 1 << 3
+const CFSR_MSTKERR: u32 = 1 << 4
+const CFSR_MLSPERR: u32 = 1 << 5
+const CFSR_IBUSERR: u32 = 1 << 8
+const CFSR_PRECISERR: u32 = 1 << 9
+const CFSR_IMPRECISERR: u32 = 1 << 10
+const CFSR_UNSTKERR: u32 = 1 << 11
+const CFSR_STKERR: u32 = 1 << 12
+const CFSR_LSPERR: u32 = 1 << 13
+const CFSR_BFARVALID: u32 = 1 << 15
+const CFSR_UNDEFINSTR: u32 = 1 << 16
+const CFSR_INVSTATE: u32 = 1 << 17
+const CFSR_NOCP: u32 = 1 << 19
+const CFSR_UNALIGNED: u32 = 1 << 24
+const CFSR_DIVBYZERO: u32 = 1 << 25
+const HFSR_VECTTBL: u32 = 1 << 1
+const HFSR_DEBUGEVT: u32 = 1 << 31
+const SFSR_LSPERR: u32 = 1 << 5
+const SFSR_LSERR: u32 = 1 << 7
+
+/** The reasons for `c` in words, each `<exception>: <BIT> (<what it means>)`: from its status registers
+ * where it was taken or locked up, else from what benchtop stopped on. `mainline` says the core has
+ * the status registers at all.
+ */
+reasons_of(c: *FaultCapture, mainline: bool) -> Buf[string]
+    var out: Buf[string] = buf()
+    val insn = if c.insn_len == 4 then f"0x${c.insn >> 16}%04x 0x${c.insn & 0xFFFF}%04x" elif c.insn_len == 2 then f"0x${c.insn}%04x" else "unreadable"
+    c.cause match
+        Registers -> status_reasons(&out, c, mainline)
+        Lockup ->
+            out.push(s"lockup: ${fault_name(c.exception)} could not be taken (HardFault or NMI running, or FAULTMASK set), so the core stopped")
+            status_reasons(&out, c, mainline)
+        Svc ->
+            if c.taken then out.push("HardFault: SVC where SVCall could not preempt (PRIMASK set, or a handler at or above its priority running)")
+            else out.push("lockup: SVC where neither SVCall nor HardFault could preempt")
+        StackLimit ->
+            out.push("lockup: UsageFault STKOF (stack limit) at a negative priority, where not even HardFault could be taken")
+            status_reasons(&out, c, mainline)
+        Undefined -> out.push(if mainline then s"UsageFault: UNDEFINSTR (undefined instruction $insn)" else s"HardFault: undefined instruction $insn (ARMv6-M records no cause)")
+        DivByZero -> out.push(s"UsageFault: DIVBYZERO (division by zero with CCR.DIV_0_TRP set, $insn)")
+        NoCoprocessor -> out.push(if mainline then s"UsageFault: NOCP (no coprocessor: the FPU or coprocessor is absent, or CPACR denies it, $insn)" else s"HardFault: coprocessor instruction $insn")
+        Unaligned -> out.push(s"UsageFault: UNALIGNED (an exclusive or ordered access to an unaligned address, $insn)")
+        BadVector -> out.push(if mainline then f"UsageFault: INVSTATE (the vector at 0x${c.cause_at}%08x lacks its Thumb bit)" else f"HardFault: the vector at 0x${c.cause_at}%08x lacks its Thumb bit")
+        BadReturn -> out.push(if mainline then f"UsageFault: INVPC (an exception return the architecture refuses, LR 0x${c.frame[5]}%08x)" else f"HardFault: an exception return the architecture refuses, LR 0x${c.frame[5]}%08x")
+        Fetch -> out.push(if mainline then f"BusFault: IBUSERR (instruction fetch from 0x${c.cause_at}%08x, where nothing answers)" else f"HardFault: instruction fetch from 0x${c.cause_at}%08x, where nothing answers")
+        Data -> out.push(if mainline then f"BusFault: PRECISERR (precise data bus error at BFAR 0x${c.cause_at}%08x: nothing answers there)" else f"HardFault: data access to 0x${c.cause_at}%08x, where nothing answers")
+        Stacking -> out.push(if mainline then f"BusFault: STKERR (stacking the exception frame at 0x${c.cause_at}%08x: the stack pointer 0x${c.sp}%08x is in no memory)" else f"HardFault: stacking the exception frame at 0x${c.cause_at}%08x: the stack pointer 0x${c.sp}%08x is in no memory")
+        Semihost -> out.push(f"BKPT 0xAB: a semihosting call benchtop does not answer (operation 0x${c.frame[0]}%x)")
+        Other -> status_reasons(&out, c, mainline)
+    out
+
+// The status registers' reasons: the fault's own register first, then HFSR, UFSR, BFSR, MMFSR and SFSR.
+private status_reasons(out: *Buf[string], c: *FaultCapture, mainline: bool)
+    val before = out.len()
+    if mainline
+        c.exception match
+            4 -> mem_reasons(out, c)
+            5 -> bus_reasons(out, c)
+            6 -> usage_reasons(out, c)
+            7 -> secure_reasons(out, c)
+            _ -> ()
+        hard_reasons(out, c)
+        if c.exception != 6 then usage_reasons(out, c)
+        if c.exception != 5 then bus_reasons(out, c)
+        if c.exception != 4 then mem_reasons(out, c)
+    if c.exception != 7 then secure_reasons(out, c)
+    if out.len() == before
+        out.push(if mainline then s"${fault_name(c.exception)}: no fault status bits set" else s"${fault_name(c.exception)}: ARMv6-M records no cause")
+
+private hard_reasons(out: *Buf[string], c: *FaultCapture)
+    val h = c.hfsr
+    if h & HFSR_VECTTBL != 0 then out.push("HardFault: VECTTBL (a bus fault reading the vector table)")
+    if h & HFSR_FORCED != 0 then out.push(s"HardFault: FORCED (escalated from ${escalated_from(c)})")
+    if h & HFSR_DEBUGEVT != 0 then out.push("HardFault: DEBUGEVT (a debug event)")
+
+// The faults a FORCED HardFault escalated, by the status bits set.
+private escalated_from(c: *FaultCapture) -> string
+    var from: Buf[string] = buf()
+    if c.cfsr >> 16 != 0 then from.push(s"UsageFault: ${bit_names(c.cfsr >> 16, ["UNDEFINSTR", "INVSTATE", "INVPC", "NOCP", "STKOF", "", "", "", "UNALIGNED", "DIVBYZERO"][..])}")
+    if (c.cfsr >> 8) & 0x3F != 0 then from.push(s"BusFault: ${bit_names((c.cfsr >> 8) & 0x3F, ["IBUSERR", "PRECISERR", "IMPRECISERR", "UNSTKERR", "STKERR", "LSPERR"][..])}")
+    if c.cfsr & 0x3B != 0 then from.push(s"MemManage: ${bit_names(c.cfsr & 0x3B, ["IACCVIOL", "DACCVIOL", "", "MUNSTKERR", "MSTKERR", "MLSPERR"][..])}")
+    if from.is_empty() then return "a configurable fault"
+    var out = from[0]
+    for i in 1..<from.len() do out = s"$out and ${from[i]}"
+    out
+
+// The names of `bits`' set bits, bit k named `names[k]`, joined by commas.
+private bit_names(bits: u32, names: []const string) -> string
+    var out = ""
+    for k in 0..<names.len
+        if names[k].is_empty() || (bits >> u32(k)) & 1 == 0 then continue
+        out = if out.is_empty() then names[k] else s"$out, ${names[k]}"
+    out
+
+private mem_reasons(out: *Buf[string], c: *FaultCapture)
+    val m = c.cfsr & 0xFF
+    val pc = c.frame[6]
+    if m & CFSR_IACCVIOL != 0 then out.push(f"MemManage: IACCVIOL (instruction access violation: the MPU refuses execution at 0x$pc%08x)")
+    if m & CFSR_DACCVIOL != 0
+        out.push(if m & CFSR_MMARVALID != 0 then f"MemManage: DACCVIOL (data access violation at MMFAR 0x${c.mmfar}%08x)" else "MemManage: DACCVIOL (data access violation; MMFAR not valid)")
+    if m & CFSR_MUNSTKERR != 0 then out.push("MemManage: MUNSTKERR (a fault unstacking for an exception return)")
+    if m & CFSR_MSTKERR != 0 then out.push("MemManage: MSTKERR (a fault stacking for an exception entry: the frame is the live registers)")
+    if m & CFSR_MLSPERR != 0 then out.push("MemManage: MLSPERR (a fault during lazy floating-point state preservation)")
+
+private bus_reasons(out: *Buf[string], c: *FaultCapture)
+    val b = c.cfsr
+    if b & CFSR_IBUSERR != 0 then out.push("BusFault: IBUSERR (a bus error on an instruction fetch)")
+    if b & CFSR_PRECISERR != 0
+        out.push(if b & CFSR_BFARVALID != 0 then f"BusFault: PRECISERR (precise data bus error at BFAR 0x${c.bfar}%08x)" else "BusFault: PRECISERR (precise data bus error; BFAR not valid)")
+    if b & CFSR_IMPRECISERR != 0 then out.push("BusFault: IMPRECISERR (imprecise data bus error: the stacked PC is past the access that failed)")
+    if b & CFSR_UNSTKERR != 0 then out.push("BusFault: UNSTKERR (a bus error unstacking for an exception return)")
+    if b & CFSR_STKERR != 0 then out.push("BusFault: STKERR (a bus error stacking for an exception entry: the frame is the live registers)")
+    if b & CFSR_LSPERR != 0 then out.push("BusFault: LSPERR (a bus error during lazy floating-point state preservation)")
+
+private usage_reasons(out: *Buf[string], c: *FaultCapture)
+    val u = c.cfsr
+    if u & CFSR_UNDEFINSTR != 0 then out.push("UsageFault: UNDEFINSTR (undefined instruction)")
+    if u & CFSR_INVSTATE != 0 then out.push("UsageFault: INVSTATE (invalid state: a branch or a vector without the Thumb bit)")
+    if u & CFSR_INVPC != 0 then out.push("UsageFault: INVPC (an invalid EXC_RETURN or PC on an exception return)")
+    if u & CFSR_NOCP != 0 then out.push("UsageFault: NOCP (no coprocessor: the FPU or coprocessor is absent, or CPACR denies it)")
+    if u & CFSR_STKOF != 0 then out.push("UsageFault: STKOF (stack limit: SP went below MSPLIM or PSPLIM)")
+    if u & CFSR_UNALIGNED != 0 then out.push("UsageFault: UNALIGNED (an unaligned access)")
+    if u & CFSR_DIVBYZERO != 0 then out.push("UsageFault: DIVBYZERO (division by zero with CCR.DIV_0_TRP set)")
+
+private secure_reasons(out: *Buf[string], c: *FaultCapture)
+    val s = c.sfsr
+    if s & SFSR_INVEP != 0 then out.push("SecureFault: INVEP (invalid entry point: Non-secure code called Secure code at no SG)")
+    if s & SFSR_INVIS != 0 then out.push("SecureFault: INVIS (an invalid integrity signature in an exception frame)")
+    if s & SFSR_INVER != 0 then out.push("SecureFault: INVER (an invalid exception return)")
+    if s & SFSR_AUVIOL != 0
+        out.push(if s & SFSR_SFARVALID != 0 then f"SecureFault: AUVIOL (attribution unit violation at SFAR 0x${c.sfar}%08x)" else "SecureFault: AUVIOL (attribution unit violation; SFAR not valid)")
+    if s & SFSR_INVTRAN != 0 then out.push("SecureFault: INVTRAN (an invalid transition from Secure to Non-secure state)")
+    if s & SFSR_LSPERR != 0 then out.push("SecureFault: LSPERR (an error during lazy floating-point state preservation)")
+    if s & SFSR_LSERR != 0 then out.push("SecureFault: LSERR (a lazy state error)")
+
+private names_of(t: *SymbolTable) -> []const ImageSymbol = if t == null then [][..] else t.names.view()
+
+private named(names: []const ImageSymbol, a: u32) -> string = symbol_at(names, a) match
+    Some(n) -> s" $n"
+    None -> ""
+
+/** `f` as the block benchtop writes on stderr, its first line saying what core `f.core` did: `verb`
+ * ("faulted" as one is taken). `names` names the addresses.
+ */
+fault_text(f: *Fault, names: []const ImageSymbol, verb: string) -> string
+    var out = str_builder()
+    val state = if f.security then (if f.ns then " in Non-secure state" else " in Secure state") else ""
+    val how = if f.taken then s"took ${fault_name(f.exception)}$state" elif f.lockup then s"locked up$state (${fault_name(f.exception)} could not be taken)" else s"stopped$state on what would be ${fault_name(f.exception)} (benchtop stops rather than taking it)"
+    out.push(s"core ${f.core} $verb: $how\n")
+    for r in f.reasons do out.push(s"  $r\n")
+    val pc = f.frame[6]
+    val lr = f.frame[5]
+    out.push(f"  pc 0x$pc%08x${named(names, pc & ~1)}   lr 0x$lr%08x${named(names, lr & ~1)}\n")
+    val stack = if f.psp then "process stack (PSP)" else "main stack (MSP)"
+    if f.taken && f.stacked
+        out.push(f"  frame stacked on the $stack at 0x${f.sp}%08x, EXC_RETURN 0x${f.exc_return}%08x:\n")
+    elif f.taken
+        out.push(f"  frame not wholly stacked on the $stack at 0x${f.sp}%08x (stacking failed); the live registers, EXC_RETURN 0x${f.exc_return}%08x:\n")
+    else
+        out.push(f"  nothing stacked; the live registers, on the $stack, SP 0x${f.sp}%08x:\n")
+    out.push(f"    r0 0x${f.frame[0]}%08x  r1 0x${f.frame[1]}%08x  r2 0x${f.frame[2]}%08x  r3 0x${f.frame[3]}%08x  r12 0x${f.frame[4]}%08x  xpsr 0x${f.frame[7]}%08x\n")
+    out.push("  backtrace (best effort: a scan entry is a return address found on the stack, not an unwind):\n")
+    for t in f.trace do out.push(f"    0x${t.pc}%08x${named(names, t.pc)} (${via_name(t.via)})\n")
+    if !f.ring.is_empty()
+        out.push(s"  the last ${f.ring.len()} instructions the core ran, oldest first:\n")
+        for a in f.ring do out.push(f"    0x$a%08x${named(names, a)}\n")
+    out.finish()
+
+// Write `text` on stderr, each line ended as `log` says.
+private print_explanation(log: *FaultLog, text: string)
+    eprints(if log.crlf then replace_all(s"benchtop: $text", "\n", "\r\n") else s"benchtop: $text")
+
+// ---------------------------------------------------------------------------------------------------
+// A run's faults.
+
+/** A run's faults over its cores: how many, the one to explain (`last`) and the first. `ended`: the run
+ * ended on `last` — a core stopped on it, or the run ended with the core still in its handler.
+ */
+struct FaultSummary
+    count: u64
+    last: Option[Fault]
+    first: Option[Fault]
+    ended: bool
+
+/** No faults. */
+fault_summary() -> FaultSummary = FaultSummary(0, None, None, false)
+
+impl FaultSummary
+    /** `cpu`'s faults, core `core` of its board, added; read once the run has ended. A fault a core
+     * stopped on is the one to explain, then one whose handler a core is still in, then the latest.
+     */
+    add_core(*self, cpu: *Cpu, core: u32)
+        val log = cpu.fault_log
+        var stop: FaultCapture
+        val stopped = capture_stop(cpu, &stop)
+        if log != null && log.count != 0
+            self.count += log.count
+            self.note_first(fault_of(&log.first, cpu, core))
+        if stopped
+            val f = fault_of(&stop, cpu, core)
+            self.count += 1
+            self.note_first(f)
+            if !self.ended
+                self.last = Some(f)
+                self.ended = true
+            return
+        if log == null || log.count == 0 || self.ended then return
+        val last = fault_of(&log.last, cpu, core)
+        if is_fault(cpu.ipsr)
+            self.last = Some(last)
+            self.ended = true
+            return
+        val later = self.last match
+            Some(l) -> last.cycles > l.cycles
+            None -> true
+        if later then self.last = Some(last)
+
+    private note_first(*self, f: Fault)
+        val earlier = self.first match
+            Some(e) -> f.cycles < e.cycles
+            None -> true
+        if earlier then self.first = Some(f)
+
+    /** The block benchtop writes on stderr where the run ended on a fault: empty where it did not. */
+    text(*self, names: []const ImageSymbol) -> string
+        if !self.ended then return ""
+        var last = self.last.unwrap()
+        var out = fault_text(&last, names, if last.taken then "faulted" else "fault")
+        if self.count > 1
+            val first = self.first.unwrap()
+            val why = if first.reasons.is_empty() then "" else s": ${first.reasons[0]}"
+            out = f"${out}  ${self.count} faults in the run; the first, core ${first.core} at pc 0x${first.frame[6]}%08x${named(names, first.frame[6] & ~1)}$why\n"
+        out

@@ -1,0 +1,402 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// Fault explanations (explain.sysl), against the ARMv7-M and ARMv8-M ARMs' descriptions of CFSR (MMFSR,
+// BFSR, UFSR), HFSR and SFSR: every status bit in words, then guests that fault — taken (MemManage,
+// FORCED HardFault, STKOF, SecureFault, an M0+'s HardFault) and stopped on (UNDEFINSTR, DIVBYZERO,
+// UNALIGNED, NOCP, INVSTATE, a bus error, lockups) — their frames on either stack, the backtrace's
+// scan through two BL frames with symbols and without, the ring, and first, last and count over a
+// guest that recovers.
+
+import sysl.buf.{Buf, buf}
+
+// `code` laid out as `machine` lays it out on a core of `kind`, its faults recorded with a ring of
+// `ring` (none at 0) and `table` (null for none), run on the threaded executor to its stop.
+private explained(kind: Kind, code: []const u16, regs: []const u32, handlers: [][2]u32, setup: Setup, ring: u32, table: Option[&SymbolTable]) -> Cpu
+    var c: Cpu
+    c.kind = kind
+    machine(&c, code, regs, 0, handlers, setup)
+    explain_faults(&c, ExplainOptions(false, ring), table)
+    finish(&c, &run_threaded)
+    c
+
+private m33(code: []const u16, regs: []const u32, handlers: [][2]u32, setup: Setup) -> Cpu = explained(Kind.V8mMain, code, regs, handlers, setup, 0, None)
+
+private m0(code: []const u16, regs: []const u32, handlers: [][2]u32, setup: Setup) -> Cpu = explained(Kind.V6m, code, regs, handlers, setup, 0, None)
+
+// The last fault `c` took, explained.
+private last_taken(c: *Cpu) -> Fault = fault_of(&c.fault_log.last, c, 0)
+
+// `c`'s faults once its run has ended.
+private faults_of(c: *Cpu) -> FaultSummary
+    var s = fault_summary()
+    s.add_core(c, 0)
+    s
+
+// The fault `c`'s run ended on.
+private ended_on(c: *Cpu) -> Fault
+    var s = faults_of(c)
+    assert(s.ended, s"the run ended on a fault: ${c.stop} at 0x${c.stop_at}")
+    s.last.unwrap()
+
+// `f`'s reasons, for a message.
+private said(f: *Fault) -> string
+    var out = ""
+    for r in f.reasons do out = s"$out | $r"
+    out
+
+// The first reason of a fault `e` taken with these status registers, MMFAR 0x20001000, BFAR
+// 0x40000010, SFAR 0x10000000 and the stacked PC 0x100.
+private first_reason(e: u32, cfsr: u32, hfsr: u32, sfsr: u32) -> string
+    val r = reasons_for(e, cfsr, hfsr, sfsr, true)
+    r[0]
+
+private reasons_for(e: u32, cfsr: u32, hfsr: u32, sfsr: u32, mainline: bool) -> Buf[string]
+    var c: FaultCapture
+    c.cause = Cause.Registers
+    c.taken = true
+    c.exception = e
+    c.cfsr = cfsr
+    c.hfsr = hfsr
+    c.sfsr = sfsr
+    c.mmfar = 0x20001000
+    c.bfar = 0x40000010
+    c.sfar = 0x10000000
+    c.frame[6] = 0x100
+    reasons_of(&c, mainline)
+
+// ---------------------------------------------------------------------------------------------------
+// Every status bit in words.
+
+@test("explain: every CFSR, HFSR and SFSR bit is named and said in words, with MMFAR, BFAR and SFAR only where their valid bits say")
+explain_status_bits()
+    val cases: [34](u32, u32, u32, u32, string) = [
+        (6, 1 << 16, 0, 0, "UsageFault: UNDEFINSTR (undefined instruction)"),
+        (6, 1 << 17, 0, 0, "UsageFault: INVSTATE (invalid state: a branch or a vector without the Thumb bit)"),
+        (6, 1 << 18, 0, 0, "UsageFault: INVPC (an invalid EXC_RETURN or PC on an exception return)"),
+        (6, 1 << 19, 0, 0, "UsageFault: NOCP (no coprocessor: the FPU or coprocessor is absent, or CPACR denies it)"),
+        (6, 1 << 20, 0, 0, "UsageFault: STKOF (stack limit: SP went below MSPLIM or PSPLIM)"),
+        (6, 1 << 24, 0, 0, "UsageFault: UNALIGNED (an unaligned access)"),
+        (6, 1 << 25, 0, 0, "UsageFault: DIVBYZERO (division by zero with CCR.DIV_0_TRP set)"),
+        (4, 0x01, 0, 0, "MemManage: IACCVIOL (instruction access violation: the MPU refuses execution at 0x00000100)"),
+        (4, 0x82, 0, 0, "MemManage: DACCVIOL (data access violation at MMFAR 0x20001000)"),
+        (4, 0x02, 0, 0, "MemManage: DACCVIOL (data access violation; MMFAR not valid)"),
+        (4, 0x08, 0, 0, "MemManage: MUNSTKERR (a fault unstacking for an exception return)"),
+        (4, 0x10, 0, 0, "MemManage: MSTKERR (a fault stacking for an exception entry: the frame is the live registers)"),
+        (4, 0x20, 0, 0, "MemManage: MLSPERR (a fault during lazy floating-point state preservation)"),
+        (5, 0x0100, 0, 0, "BusFault: IBUSERR (a bus error on an instruction fetch)"),
+        (5, 0x8200, 0, 0, "BusFault: PRECISERR (precise data bus error at BFAR 0x40000010)"),
+        (5, 0x0200, 0, 0, "BusFault: PRECISERR (precise data bus error; BFAR not valid)"),
+        (5, 0x0400, 0, 0, "BusFault: IMPRECISERR (imprecise data bus error: the stacked PC is past the access that failed)"),
+        (5, 0x0800, 0, 0, "BusFault: UNSTKERR (a bus error unstacking for an exception return)"),
+        (5, 0x1000, 0, 0, "BusFault: STKERR (a bus error stacking for an exception entry: the frame is the live registers)"),
+        (5, 0x2000, 0, 0, "BusFault: LSPERR (a bus error during lazy floating-point state preservation)"),
+        (3, 0, 0x2, 0, "HardFault: VECTTBL (a bus fault reading the vector table)"),
+        (3, 1 << 17, 0x40000000, 0, "HardFault: FORCED (escalated from UsageFault: INVSTATE)"),
+        (3, 0x82, 0x40000000, 0, "HardFault: FORCED (escalated from MemManage: DACCVIOL)"),
+        (3, (1 << 16) | 0x8200, 0x40000000, 0, "HardFault: FORCED (escalated from UsageFault: UNDEFINSTR and BusFault: PRECISERR)"),
+        (3, 0, 0x80000000, 0, "HardFault: DEBUGEVT (a debug event)"),
+        (7, 0, 0, 0x01, "SecureFault: INVEP (invalid entry point: Non-secure code called Secure code at no SG)"),
+        (7, 0, 0, 0x02, "SecureFault: INVIS (an invalid integrity signature in an exception frame)"),
+        (7, 0, 0, 0x04, "SecureFault: INVER (an invalid exception return)"),
+        (7, 0, 0, 0x48, "SecureFault: AUVIOL (attribution unit violation at SFAR 0x10000000)"),
+        (7, 0, 0, 0x08, "SecureFault: AUVIOL (attribution unit violation; SFAR not valid)"),
+        (7, 0, 0, 0x10, "SecureFault: INVTRAN (an invalid transition from Secure to Non-secure state)"),
+        (7, 0, 0, 0x20, "SecureFault: LSPERR (an error during lazy floating-point state preservation)"),
+        (7, 0, 0, 0x80, "SecureFault: LSERR (a lazy state error)"),
+        (3, 0, 0, 0, "HardFault: no fault status bits set"),
+    ]
+    for (e, cfsr, hfsr, sfsr, want) in cases
+        val got = first_reason(e, cfsr, hfsr, sfsr)
+        assert(got == want, s"$got, not $want")
+
+@test("explain: the fault's own register's reasons come first, then the rest; FORCED is followed by the fault it escalated; an M0+ records no cause")
+explain_reason_order()
+    // A BusFault with a sticky UNDEFINSTR from before: the BusFault's own reason first.
+    var r = reasons_for(5, (1 << 16) | 0x8200, 0, 0, true)
+    assert(r.len() == 2 && r[0] == "BusFault: PRECISERR (precise data bus error at BFAR 0x40000010)" && r[1] == "UsageFault: UNDEFINSTR (undefined instruction)", r[0])
+    r = reasons_for(3, 1 << 17, 0x40000000, 0, true)
+    assert(r.len() == 2 && r[1] == "UsageFault: INVSTATE (invalid state: a branch or a vector without the Thumb bit)", r[1])
+    r = reasons_for(3, 0, 0, 0, false)
+    assert(r.len() == 1 && r[0] == "HardFault: ARMv6-M records no cause", r[0])
+
+// ---------------------------------------------------------------------------------------------------
+// Faults benchtop stops on, explained from the stop and the instruction.
+
+@test("explain: an undefined instruction is UsageFault UNDEFINSTR on an M33 and HardFault on an M0+, the live registers its frame")
+explain_undefined()
+    // udf #0
+    var c = m33([0xDE00], [0x11, 0x22], [], &nothing)
+    var f = ended_on(&c)
+    assert(c.stop == Stop.Undefined && f.exception == USAGE_FAULT && !f.taken && !f.lockup && f.mainline, said(&f))
+    assert(f.reasons[0] == "UsageFault: UNDEFINSTR (undefined instruction 0xde00)", said(&f))
+    assert(!f.stacked && f.frame[6] == 0 && f.frame[0] == 0x11 && f.frame[1] == 0x22 && f.sp == 0x2000 && !f.psp, "the live registers")
+    c = m0([0xDE00], [], [], &nothing)
+    f = ended_on(&c)
+    assert(f.exception == HARD_FAULT && !f.mainline && f.reasons[0] == "HardFault: undefined instruction 0xde00 (ARMv6-M records no cause)", said(&f))
+
+@test("explain: a division by zero CCR.DIV_0_TRP traps is UsageFault DIVBYZERO, and with a divisor not zero there is no fault")
+explain_div_by_zero()
+    // udiv r0, r1, r2
+    var c = m33([0xFBB1, 0xF0F2], [9, 7, 0], [], &ccr_traps)
+    var f = ended_on(&c)
+    assert(f.exception == USAGE_FAULT && f.reasons[0] == "UsageFault: DIVBYZERO (division by zero with CCR.DIV_0_TRP set, 0xfbb1 0xf0f2)", said(&f))
+    c = m33([0xFBB1, 0xF0F2], [9, 7, 1], [], &ccr_traps)
+    assert(c.stop == Stop.Breakpoint && faults_of(&c).count == 0, "7 / 1 runs")
+
+@test("explain: an unaligned exclusive access is UsageFault UNALIGNED")
+explain_unaligned()
+    // ldrex r0, [r1] at 0x1001
+    var c = m33([0xE851, 0x0F00], [99, 0x1001], [], &nothing)
+    var f = ended_on(&c)
+    assert(f.exception == USAGE_FAULT && !f.lockup && f.reasons[0] == "UsageFault: UNALIGNED (an exclusive or ordered access to an unaligned address, 0xe851 0x0f00)", said(&f))
+
+@test("explain: a floating-point instruction on an M33 without the FPU is UsageFault NOCP")
+explain_no_coprocessor()
+    // vmov s0, r0
+    var c = m33([0xEE00, 0x0A10], [], [], &nothing)
+    var f = ended_on(&c)
+    assert(f.exception == USAGE_FAULT && f.reasons[0] == "UsageFault: NOCP (no coprocessor: the FPU or coprocessor is absent, or CPACR denies it, 0xee00 0x0a10)", said(&f))
+
+@test("explain: an exception whose vector lacks its Thumb bit is UsageFault INVSTATE on an M33, HardFault on an M0+, naming the vector")
+explain_bad_vector()
+    var c = m33([SVC, BKPT], [], [], &nothing)
+    var f = ended_on(&c)
+    assert(c.stop == Stop.Fault && f.exception == USAGE_FAULT && f.reasons[0] == "UsageFault: INVSTATE (the vector at 0x00000c2c lacks its Thumb bit)", said(&f))
+    c = m0([SVC, BKPT], [], [], &nothing)
+    f = ended_on(&c)
+    assert(f.exception == HARD_FAULT && f.reasons[0] == "HardFault: the vector at 0x00000c2c lacks its Thumb bit", said(&f))
+
+@test("explain: a data access where nothing answers is BusFault PRECISERR with BFAR, a fetch is IBUSERR; an M0+'s are HardFault")
+explain_bus_errors()
+    // ldr r0, [r1]
+    var c = m33([0x6808], [0, 0x40000000], [], &nothing)
+    var f = ended_on(&c)
+    assert(c.stop == Stop.Unmapped && f.exception == BUS_FAULT && f.bfar == 0x40000000 && f.bfar_valid(), said(&f))
+    assert(f.reasons[0] == "BusFault: PRECISERR (precise data bus error at BFAR 0x40000000: nothing answers there)", said(&f))
+    assert(f.frame[6] == 0, "the PC is the load's")
+    // bx r1, to 0x00300000
+    c = m33([0x4708], [0, 0x00300001], [], &nothing)
+    f = ended_on(&c)
+    assert(f.exception == BUS_FAULT && f.reasons[0] == "BusFault: IBUSERR (instruction fetch from 0x00300000, where nothing answers)" && !f.bfar_valid(), said(&f))
+    c = m0([0x6808], [0, 0x40000000], [], &nothing)
+    f = ended_on(&c)
+    assert(f.exception == HARD_FAULT && f.reasons[0] == "HardFault: data access to 0x40000000, where nothing answers", said(&f))
+
+// ---------------------------------------------------------------------------------------------------
+// Faults taken.
+
+@test("explain: MemManage DACCVIOL taken from thread mode on MSP: the reason with MMFAR, the frame stacked on the main stack, EXC_RETURN, and the run ended in the handler")
+explain_mem_manage()
+    // msr control, r6 (nPRIV); isb; ldr r0, [r1] of 0x3000, which no region holds
+    var c = m33([DROP[0], DROP[1], DROP[2], DROP[3], 0x6808], [0x10, 0x3000, 0x22, 0x33, 0, 0, 1], [[MEM_MANAGE, FAULT_AT], [HARD_FAULT, FAULT_AT]], &mpu_on)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && faults_taken(&c) == 1, s"${c.stop}")
+    var f = last_taken(&c)
+    assert(f.exception == MEM_MANAGE && f.taken && !f.lockup && f.security && !f.ns, said(&f))
+    assert(f.reasons.len() == 1 && f.reasons[0] == "MemManage: DACCVIOL (data access violation at MMFAR 0x00003000)", said(&f))
+    assert(f.mmfar_valid() && f.mmfar == 0x3000 && f.cfsr == 0x82 && f.hfsr == 0, "the registers")
+    assert(f.stacked && !f.psp && f.sp == 0x1FE0 && f.exc_return == 0xFFFFFFF9, f"frame at 0x${f.sp}%x, EXC_RETURN 0x${f.exc_return}%x")
+    assert(f.frame[0] == 0x10 && f.frame[1] == 0x3000 && f.frame[2] == 0x22 && f.frame[3] == 0x33 && f.frame[6] == 8, "the stacked registers, the PC the load's")
+    assert(f.trace[0].pc == 8 && f.trace[0].via == Via.Frame, "the backtrace starts at the stacked PC")
+    // The run ended in MemManage's handler: explained.
+    var s = faults_of(&c)
+    assert(s.ended && s.count == 1 && s.text([][..]).contains("MemManage: DACCVIOL"), s.text([][..]))
+
+@test("explain: MemManage IACCVIOL for a fetch from an execute-never region names the stacked PC")
+explain_mem_manage_fetch()
+    // bx r1, to 0x1800 in the stack's execute-never region
+    var c = m33([0x4708], [0x10, 0x1801, 0x22, 0x33, 0, 0, 1], [[MEM_MANAGE, FAULT_AT], [HARD_FAULT, FAULT_AT]], &mpu_fetching)
+    var f = last_taken(&c)
+    assert(f.exception == MEM_MANAGE && f.reasons[0] == "MemManage: IACCVIOL (instruction access violation: the MPU refuses execution at 0x00001800)" && !f.mmfar_valid(), said(&f))
+
+// `mpu_on`, with the process stack at 0x1800 for thread mode to switch to.
+private on_process_stack_setup(cpu: *Cpu)
+    mpu_on(cpu)
+    cpu.sp_other = 0x1800
+
+@test("explain: a fault taken from thread mode on PSP stacks its frame on the process stack, EXC_RETURN 0xFFFFFFFD")
+explain_process_stack()
+    // msr control, r6 (nPRIV and SPSEL); isb; ldr r0, [r1]
+    var c = m33([DROP[0], DROP[1], DROP[2], DROP[3], 0x6808], [0x10, 0x3000, 0x22, 0x33, 0, 0, 3], [[MEM_MANAGE, FAULT_AT], [HARD_FAULT, FAULT_AT]], &on_process_stack_setup)
+    var f = last_taken(&c)
+    assert(f.psp && f.stacked && f.sp == 0x17E0 && f.exc_return == 0xFFFFFFFD && f.frame[6] == 8, f"frame at 0x${f.sp}%x, EXC_RETURN 0x${f.exc_return}%x")
+    assert(fault_text(&f, [][..], "faulted").contains("frame stacked on the process stack (PSP) at 0x000017e0, EXC_RETURN 0xfffffffd"), fault_text(&f, [][..], "faulted"))
+
+@test("explain: MemManage not enabled is HardFault FORCED, escalated from MemManage DACCVIOL, both said")
+explain_forced()
+    // str r2, [r1] to the read-only region
+    var c = m33([0x600A], [0x10, 0x4000, 0x22, 0x33], [[MEM_MANAGE, FAULT_AT], [HARD_FAULT, FAULT_AT]], &mpu_escalating)
+    var f = last_taken(&c)
+    assert(f.exception == HARD_FAULT && f.reasons.len() == 2, said(&f))
+    assert(f.reasons[0] == "HardFault: FORCED (escalated from MemManage: DACCVIOL)" && f.reasons[1] == "MemManage: DACCVIOL (data access violation at MMFAR 0x00004000)", said(&f))
+
+// MSPLIM at 0x1F00 and SP on it, HardFault's handler a BKPT.
+private at_the_limit(cpu: *Cpu)
+    limited(cpu)
+    cpu.r[13] = 0x1F00
+
+@test("explain: STKOF escalated to HardFault: FORCED and STKOF said, and the frame not stacked below the limit, so the live registers")
+explain_stack_overflow()
+    // push {r0}
+    var c = m33([PUSH_R0], [0x77], [[HARD_FAULT, FAULT_AT]], &at_the_limit)
+    var f = last_taken(&c)
+    assert(f.exception == HARD_FAULT && f.reasons[0] == "HardFault: FORCED (escalated from UsageFault: STKOF)" && f.reasons[1] == "UsageFault: STKOF (stack limit: SP went below MSPLIM or PSPLIM)", said(&f))
+    assert(!f.stacked && f.frame[0] == 0x77 && f.frame[6] == 0, "not stacked: the registers as they were")
+    assert(fault_text(&f, [][..], "faulted").contains("frame not wholly stacked"), fault_text(&f, [][..], "faulted"))
+
+@test("explain: SecureFault AUVIOL from Non-secure state names SFAR, the frame on the Non-secure main stack")
+explain_secure_fault()
+    // bxns r1 to the Non-secure ldr r0, [r3] of Secure memory
+    var c = m33([0x470C], [0, NS_CODE, 0, LOG, LOG, SCB_SFSR], [[SECURE_FAULT, SECURE_AT], [HARD_FAULT, FAULT_AT]], &auviol_code)
+    var f = last_taken(&c)
+    assert(f.exception == SECURE_FAULT && f.security && f.ns && f.sfar_valid() && f.sfar == LOG, said(&f))
+    assert(f.reasons[0] == "SecureFault: AUVIOL (attribution unit violation at SFAR 0x00001000)", said(&f))
+    assert(f.stacked && f.frame[6] == NS_CODE && f.sp == NS_STACK - 0x20 && f.exc_return == 0xFFFFFFB9, f"0x${f.frame[6]}%x on 0x${f.sp}%x")
+    assert(fault_text(&f, [][..], "faulted").contains("took SecureFault in Non-secure state"), fault_text(&f, [][..], "faulted"))
+
+@test("explain: an M0+'s HardFault, which records no cause, is explained from the instruction before the return address: an SVC")
+explain_m0_hard_fault()
+    // 0: cpsid i; 2: svc; 4: bkpt; 6: HardFault: bkpt
+    var c = m0([CPSID, SVC, BKPT, BKPT], [], [[HARD_FAULT, 6]], &nothing)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 6, s"${c.stop}")
+    var f = last_taken(&c)
+    assert(f.exception == HARD_FAULT && f.taken && !f.mainline && f.stacked && f.frame[6] == 4 && f.exc_return == 0xFFFFFFF9, said(&f))
+    assert(f.reasons[0] == "HardFault: SVC where SVCall could not preempt (PRIMASK set, or a handler at or above its priority running)", said(&f))
+
+// ---------------------------------------------------------------------------------------------------
+// Lockups.
+
+@test("explain: lockups — an M0+'s SVC in HardFault, an MPU refusal under FAULTMASK, STKOF at a negative priority — each said as one, after the fault taken before it")
+explain_lockups()
+    // 6: HardFault: svc
+    var c = m0([CPSID, SVC, BKPT, SVC], [], [[HARD_FAULT, 6]], &nothing)
+    var s = faults_of(&c)
+    var f = s.last.unwrap()
+    assert(c.stop == Stop.Fault && s.ended && s.count == 2 && f.lockup && !f.taken && f.exception == HARD_FAULT, said(&f))
+    assert(f.reasons[0] == "lockup: SVC where neither SVCall nor HardFault could preempt", said(&f))
+    assert(s.first.unwrap().taken && s.first.unwrap().frame[6] == 4, "the first, the HardFault taken")
+    assert(s.text([][..]).contains("2 faults in the run; the first, core 0 at pc 0x00000004: HardFault: SVC"), s.text([][..]))
+    // cpsid f; ldr r0, [r1]
+    c = m33([0xB671, 0x6808], [0x10, 0x3000, 0x22, 0x33], [[MEM_MANAGE, FAULT_AT], [HARD_FAULT, FAULT_AT]], &mpu_hfnmiena)
+    f = ended_on(&c)
+    assert(c.stop == Stop.Fault && f.lockup && f.exception == MEM_MANAGE && f.reasons.len() == 2, said(&f))
+    assert(f.reasons[0] == "lockup: MemManage could not be taken (HardFault or NMI running, or FAULTMASK set), so the core stopped", said(&f))
+    assert(f.reasons[1] == "MemManage: DACCVIOL (data access violation at MMFAR 0x00003000)" && f.frame[6] == 2, said(&f))
+    // cpsid f; push {r0}
+    c = m33([0xB671, PUSH_R0], [0x77], [[HARD_FAULT, FAULT_AT]], &at_the_limit)
+    f = ended_on(&c)
+    assert(c.stop == Stop.StackLimit && f.lockup && f.exception == USAGE_FAULT, said(&f))
+    assert(f.reasons[0] == "lockup: UsageFault STKOF (stack limit) at a negative priority, where not even HardFault could be taken", said(&f))
+    assert(f.reasons[1] == "UsageFault: STKOF (stack limit: SP went below MSPLIM or PSPLIM)", said(&f))
+
+// ---------------------------------------------------------------------------------------------------
+// The backtrace, symbols and the ring.
+
+// main: bl f1 at 0x10. f1: push {lr}; bl f2 at 0x20; pop {pc}. f2: push {lr}; bl f3 at 0x30; pop {pc}.
+// f3: push {lr}; udf.
+val CALLS: [26]u16 = [
+    0xF000, 0xF806, BKPT, 0xBF00, 0xBF00, 0xBF00, 0xBF00, 0xBF00,
+    0xB500, 0xF000, 0xF805, 0xBD00, 0xBF00, 0xBF00, 0xBF00, 0xBF00,
+    0xB500, 0xF000, 0xF805, 0xBD00, 0xBF00, 0xBF00, 0xBF00, 0xBF00,
+    0xB500, 0xDE00]
+
+private calls_table(code: []const CodeRange) -> SymbolTable
+    var names: Buf[ImageSymbol] = buf()
+    names.push(ImageSymbol(0x00, 0x10, "main", 0x40))
+    names.push(ImageSymbol(0x10, 0x10, "f1", 0x40))
+    names.push(ImageSymbol(0x20, 0x10, "f2", 0x40))
+    names.push(ImageSymbol(0x30, 0x10, "f3", 0x40))
+    var ranges: Buf[CodeRange] = buf()
+    for r in code do ranges.push(r)
+    SymbolTable(names, ranges)
+
+@test("explain: the backtrace scans through two BL frames: the PC, LR, then each return address pushed above, each marked scan, the pushed copy of LR once")
+explain_scan_backtrace()
+    var c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 0, None)
+    var f = ended_on(&c)
+    assert(c.stop == Stop.Undefined && c.stop_at == 0x32, s"${c.stop} at 0x${c.stop_at}")
+    val pcs: [4]u32 = [0x32, 0x26, 0x16, 0x04]
+    val vias = [Via.Frame, Via.Lr, Via.Scan, Via.Scan]
+    assert(f.trace.len() == 4, s"${f.trace.len()} entries")
+    for k in 0..<4 do assert(f.trace[k].pc == pcs[k] && f.trace[k].via == vias[k], f"entry $k: 0x${f.trace[k].pc}%x")
+
+@test("explain: with symbols the PC, LR and every backtrace entry are named; without, the addresses alone; an executable section bounds the scan")
+explain_symbols()
+    val table: &SymbolTable = calls_table([CodeRange(0, 0x40)][..])
+    var c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 0, Some(table))
+    var f = ended_on(&c)
+    val named = fault_text(&f, table.names.view(), "fault")
+    assert(named.contains("pc 0x00000032 f3+0x2   lr 0x00000027 f2+0x6"), named)
+    assert(named.contains("0x00000032 f3+0x2 (frame)") && named.contains("0x00000026 f2+0x6 (lr)"), named)
+    assert(named.contains("0x00000016 f1+0x6 (scan)") && named.contains("0x00000004 main+0x4 (scan)"), named)
+    val bare = fault_text(&f, [][..], "fault")
+    assert(bare.contains("0x00000016 (scan)") && !bare.contains("f1"), bare)
+    // An executable section that leaves main out: its return address is not code, and not scanned.
+    val narrow: &SymbolTable = calls_table([CodeRange(0x10, 0x40)][..])
+    c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 0, Some(narrow))
+    var g = ended_on(&c)
+    assert(g.trace.len() == 3 && g.trace[2].pc == 0x16, s"${g.trace.len()} entries")
+
+@test("explain: the ring holds the last n instructions the core ran, oldest first, the faulting one last; it is off by default and costs the threaded chain nothing then")
+explain_ring()
+    var c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 4, None)
+    assert(c.tracing, "a ring makes the core trace")
+    var f = ended_on(&c)
+    assert(f.ring.len() == 4 && f.ring[0] == 0x20 && f.ring[1] == 0x22 && f.ring[2] == 0x30 && f.ring[3] == 0x32, s"${f.ring.len()} entries")
+    c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 16, None)
+    f = ended_on(&c)
+    val all: [7]u32 = [0x00, 0x10, 0x12, 0x20, 0x22, 0x30, 0x32]
+    assert(f.ring.len() == 7, s"${f.ring.len()} entries")
+    for k in 0..<7 do assert(f.ring[k] == all[k], f"entry $k: 0x${f.ring[k]}%x")
+    assert(fault_text(&f, [][..], "fault").contains("the last 7 instructions the core ran, oldest first"), "said")
+    // The ring at a fault taken is the one up to it.
+    c = explained(Kind.V8mMain, [DROP[0], DROP[1], DROP[2], DROP[3], 0x6808], [0x10, 0x3000, 0x22, 0x33, 0, 0, 1], [[MEM_MANAGE, FAULT_AT], [HARD_FAULT, FAULT_AT]], &mpu_on, 2, None)
+    f = last_taken(&c)
+    assert(f.ring.len() == 2 && f.ring[0] == 4 && f.ring[1] == 8, s"${f.ring.len()} entries")
+    // Off by default: no tracing, no ring.
+    c = explained(Kind.V6m, CALLS[..], [], [], &nothing, 0, None)
+    assert(!c.tracing && ended_on(&c).ring.is_empty(), "no ring")
+    stop_explaining(&c)
+    assert(c.fault_log == null && !c.tracing, "stopped")
+
+// ---------------------------------------------------------------------------------------------------
+// First, last and count.
+
+// `mpu_on`, with a MemManage handler at 0x200 that steps over the faulting 16-bit instruction:
+// ldr r0, [sp, #24]; adds r0, #2; str r0, [sp, #24]; bx lr.
+private recovering(cpu: *Cpu)
+    mpu_on(cpu)
+    val handler: [4]u16 = [0x9806, 0x3002, 0x9006, BX_LR]
+    for i in 0..<4 do store16(cpu, 0x200 + u32(i) * 2, handler[i])
+
+@test("explain: a guest that recovers from two faults: both counted, the first and the last kept, and the run, not ending on one, explained by nothing")
+explain_recovered()
+    // nPRIV; ldr r0, [r1] (0x3000); ldr r0, [r2] (0x3004); bkpt
+    var c = m33([DROP[0], DROP[1], DROP[2], DROP[3], 0x6808, 0x6810], [0x10, 0x3000, 0x3004, 0x33, 0, 0, 1], [[MEM_MANAGE, 0x200], [HARD_FAULT, FAULT_AT]], &recovering)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 12 && c.ipsr == 0 && faults_taken(&c) == 2, s"${c.stop} at 0x${c.stop_at}")
+    var s = faults_of(&c)
+    assert(s.count == 2 && !s.ended && s.text([][..]).is_empty(), "two faults, the run ended on neither")
+    val first = s.first.unwrap()
+    val last = s.last.unwrap()
+    assert(first.frame[6] == 8 && first.mmfar == 0x3000 && last.frame[6] == 10 && last.mmfar == 0x3004, f"0x${first.frame[6]}%x then 0x${last.frame[6]}%x")
+    assert(first.cycles < last.cycles, "the first before the last")
+
+@test("explain: --explain-faults and --trace-ring are read with their values checked")
+explain_options()
+    var o = explain_defaults()
+    assert(!o.named(), "neither by default")
+    val args: [5]string = ["--explain-faults", "--trace-ring", "8", "--trace-ring", "x.elf"]
+    assert(answer(take_explain(&o, args[..], 0, 4)) == "next 1" && o.each, "--explain-faults")
+    assert(answer(take_explain(&o, args[..], 1, 4)) == "next 3" && o.ring == 8 && o.named(), "--trace-ring 8")
+    assert(answer(take_explain(&o, args[..], 3, 4)) == "--trace-ring takes a number of instructions", "no value before the image")
+    for (v, why) in [("0", "--trace-ring takes 1 to 4096 instructions, not 0"), ("4097", "--trace-ring takes 1 to 4096 instructions, not 4097"), ("x", "--trace-ring takes a whole number, not x")]
+        val a: [3]string = ["--trace-ring", v, "x.elf"]
+        assert(answer(take_explain(&o, a[..], 0, 2)) == why, why)
+    val other: [3]string = ["--seed", "1", "x.elf"]
+    assert(answer(take_explain(&o, other[..], 0, 2)) == "none", "another option")
+
+// What `take_explain` answered, as text.
+private answer(r: Option[Result[usize, string]]) -> string = r match
+    Some(Ok(n)) -> s"next $n"
+    Some(Err(why)) -> why
+    None -> "none"

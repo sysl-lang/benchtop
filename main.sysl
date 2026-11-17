@@ -1,6 +1,6 @@
 // benchtop: a microcontroller board emulator.
 //
-//     benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--semihosting] [--serial uart0|uart1=file:<path>] [--report-masking <file>] [--report <file.json>] <image.elf | image.bin>
+//     benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--semihosting] [--serial uart0|uart1=file:<path>] [--report-masking <file>] [--report <file.json>] [--explain-faults] [--trace-ring <n>] <image.elf | image.bin>
 //         Boot the image on the board `--board` names, the virtual board `virt` where none is named,
 //         its console on this terminal, a keystroke at a time. Ctrl-] ends benchtop whatever the
 //         guest is doing. The exit status is the guest's, written to the console's EXIT register.
@@ -21,7 +21,14 @@
 //         expect_met, timeout, fault_lockup, fault, breakpoint, asleep, budget, reset or error), the
 //         status, the board's clock and each core's pc, symbol, state and registers, on every board
 //         and its Cortex-M cores or Hazard3 harts, scripted or not; `--window` and `--gdb` refuse it
-//         (README.md, "The exit report").
+//         (README.md, "The exit report"). A Cortex-M core's faults are recorded as they are taken —
+//         the status registers in words, the stacked frame, PC and LR by symbol, a best-effort
+//         backtrace — and where the run ends on one (a fault benchtop stops on, a lockup, or a core
+//         still in its fault handler) the fault is explained on stderr, and in the report's `fault`.
+//         `--explain-faults` explains every fault as it is taken, recovered from or not;
+//         `--trace-ring n` keeps each core's last n instructions (up to 4096) for the explanation, on
+//         the slower `match` executor. `--window`, `--gdb` and the Hazard3 harts refuse both
+//         (README.md, "Fault explanations").
 //
 //     benchtop check [--mcu] <name | file.hocon>
 //         Read a chip, board or product description and hold it to the library: print every mistake,
@@ -56,14 +63,14 @@
 //         executors, three rounds each, and report each one's speed. Naming one executor runs only
 //         that one, so a process-wide counter (`time -l`'s cycles and instructions) measures it alone.
 
-import sh.sysl.benchtop.v6m.{cycles as memory_cycles,configure_instruction_timing,Cpu, FAULT_OPTIONS, Faults, Kind, Memory, Stop, memory, model_named, no_faults, reset, run_match, run_threaded, take_fault}
-import sh.sysl.benchtop.virt.{Machine, SdChoice, board_named, board_named_sd, sd_choice, boot, capture, core0, core1, described_error, explore, image_of, listen, machine, machine_guest, open_console, output, run_board, set_threads, stop_message, type_in, record_board_masking, board_masking_text, MASKING_CORTEX_ONLY, ExitKind, ExitReport, exit_report, exit_report_json, image_symbols, stop_kind, with_machine}
+import sh.sysl.benchtop.v6m.{cycles as memory_cycles,configure_instruction_timing,Cpu, ExplainOptions, FAULT_OPTIONS, Faults, Kind, Memory, Stop, SymbolTable, explain_defaults, explain_in_raw_mode, image_symbols, memory, model_named, no_faults, reset, run_match, run_threaded, symbol_table, take_explain, take_fault}
+import sh.sysl.benchtop.virt.{Machine, SdChoice, board_named, board_named_sd, sd_choice, boot, capture, core0, core1, described_error, explore, image_of, listen, machine, machine_guest, open_console, output, run_board, set_threads, stop_message, type_in, record_board_masking, board_masking_text, MASKING_CORTEX_ONLY, EXPLAIN_CORTEX_ONLY, ExitKind, ExitReport, exit_report, exit_report_json, explain_board_faults, machine_faults, stop_kind, with_machine}
 import sysl.buf.buf
 import sh.sysl.benchtop.{built_in_shelf, library, listing, load, open_chip, open_description, summary}
 import sysl.raw.str_cast
 import sh.sysl.parsing.Span
 import sysl.fs.{read_bytes, write_text}
-import sysl.text.{parse_int, parse_long, Search}
+import sysl.text.{parse_int, parse_long, replace_all, Search}
 import sysl.time.monotonic
 import sysl.tty.raw
 import sh.sysl.benchtop.riscv as rv
@@ -86,7 +93,7 @@ usage()
     print("usage: benchtop demo [--headless] [--frames N] [--screenshot out.png]")
     print("       benchtop view <board | file.hocon> [--frames N] [--screenshot out.png]")
     print("       benchtop render <board | file.hocon> <out.png>")
-    print("       benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--threads] [--usb console|pty|off] [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--semihosting] [--serial uart0|uart1=file:<path>] [--report-masking <file>] [--report <file.json>] <image.elf | image.bin>")
+    print("       benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--threads] [--usb console|pty|off] [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--semihosting] [--serial uart0|uart1=file:<path>] [--report-masking <file>] [--report <file.json>] [--explain-faults] [--trace-ring <n>] <image.elf | image.bin>")
     print("       run --window: [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>] [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png]")
     print(s"       run, scripted: ${script.OPTIONS}")
     print(s"       run, varied: $FAULT_OPTIONS")
@@ -200,6 +207,7 @@ run_command(args: []string)
     var faults = no_faults()
     var masking_file = ""
     var report = ""
+    var explain = explain_defaults()
     var steps = script.script()
     var i = 2
 
@@ -290,10 +298,13 @@ run_command(args: []string)
             _ -> take_fault(&faults, args, i, args.len - 1) match
                 Some(Ok(next)) -> i = next
                 Some(Err(why)) -> die(why)
-                None -> script.take(&steps, args, i, args.len - 1) match
+                None -> take_explain(&explain, args, i, args.len - 1) match
                     Some(Ok(next)) -> i = next
                     Some(Err(why)) -> die(why)
-                    None -> usage()
+                    None -> script.take(&steps, args, i, args.len - 1) match
+                        Some(Ok(next)) -> i = next
+                        Some(Err(why)) -> die(why)
+                        None -> usage()
 
     if i != args.len - 1 then usage()
     // A seed is a run that can be repeated: the cores take turns on one thread.
@@ -304,13 +315,15 @@ run_command(args: []string)
     if !masking_file.is_empty() && (window || gdb_port != 0) then die("--report-masking is for a run without --window or --gdb")
     if !report.is_empty() && window then die("--report is for a run without --window")
     if !report.is_empty() && gdb_port != 0 then die("--report is for a run without --gdb")
+    if explain.named() && (window || gdb_port != 0) then die("--explain-faults and --trace-ring are for a run without --window or --gdb")
 
     if steps.active()
         if window then die("--expect, --type, --press, --timeout and --quiet are for a run without --window")
         if gdb_port != 0 then die("--expect, --type, --press, --timeout and --quiet are for a run without --gdb")
         if usb == UsbMode.Pty then die("--usb pty is for a run without a script: a scripted run types into the console")
-        val outcome = script.run(which, args[i], steps, script.Setup(usb != UsbMode.Off, usb_named, sd, sd_named, rom_boot, arm), faults, masking_file, report)
+        val outcome = script.run(which, args[i], steps, script.Setup(usb != UsbMode.Off, usb_named, sd, sd_named, rom_boot, arm), faults, masking_file, report, explain)
         eprints(s"benchtop: ${outcome.why}\n")
+        if !outcome.explanation.is_empty() then eprints(s"benchtop: ${outcome.explanation}")
         exit(outcome.status)
 
     if window && arm.named() then die("--semihosting and --serial are for a run without --window")
@@ -331,7 +344,7 @@ run_command(args: []string)
     if headless || frames != 0 || !screenshot.is_empty() then die("--headless, --frames and --screenshot require --window")
     report_file = report
     report_image = args[i]
-    run(which, args[i], parallel, usb, usb_named, gdb_port, sd, sd_named, rom_boot, arm, faults, masking_file)
+    run(which, args[i], parallel, usb, usb_named, gdb_port, sd, sd_named, rom_boot, arm, faults, masking_file, explain)
 
 // The port gdb connects to for core 0 where `--gdb` names none, OpenOCD's.
 const GDB_PORT = 3333
@@ -356,9 +369,15 @@ enum UsbMode
 // core 0 from reset through the boot ROM (`--boot rom`), and is refused for any other board. `arm` is
 // `--semihosting` and `--serial`, and `faults` varies the run (`--seed` and the fault options), both on
 // a board of Cortex-M cores. A `masking_file` not empty receives the masking report when the run ends.
-run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, gdb_port: int, sd: SdChoice, sd_named: bool, rom_boot: bool, arm: chip.ArmOptions, faults: Faults, masking_file: string)
+// The cores' faults are recorded and explained as `explain` asks (v6m/explain.sysl).
+run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, gdb_port: int, sd: SdChoice, sd_named: bool, rom_boot: bool, arm: chip.ArmOptions, faults: Faults, masking_file: string, explain: ExplainOptions)
+    // The image's symbols, which name the addresses an explanation gives, alive for the whole run.
+    val table: &SymbolTable = read_bytes(file) match
+        Ok(b) -> symbol_table(b.view())
+        Err(_) -> symbol_table([][..])
     chip.riscv_named(which) match
         Some(Ok(map)) ->
+            if explain.named() then die(EXPLAIN_CORTEX_ONLY)
             if arm.named() then die(chip.SEMIHOST_ARM_ONLY)
             if usb_named then die("--usb is for a board of an RP2350's Cortex-M33 cores")
             if sd_named then die("--sd is for a board with a microSD socket")
@@ -376,7 +395,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
             val b = chip.arm_board(map)
             b.rom_boot = rom_boot
             b.apply_options(arm)
-            run_arm(b, file, usb, rp_parts_named(which), faults, masking_file)
+            run_arm(b, file, usb, rp_parts_named(which), faults, masking_file, explain, table)
         Some(Err(why)) -> refuse(why)
         None -> ()
     chip.pico_named(which) match
@@ -387,7 +406,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
             if gdb_port != 0 then serve_rp(which, file, false, gdb_port, false, arm)
             val b = chip.pico_board(map)
             b.apply_options(arm)
-            run_arm(b, file, UsbMode.Off, rp_parts_named(which), faults, masking_file)
+            run_arm(b, file, UsbMode.Off, rp_parts_named(which), faults, masking_file, explain, table)
         Some(Err(why)) -> refuse(why)
         None -> ()
     if usb_named then die("--usb is for a board of an RP2350's Cortex-M33 cores")
@@ -407,6 +426,10 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
     boot(m, image.view())
     if faults.any() then explore(m, faults)
     if !masking_file.is_empty() then record_board_masking(m)
+    explain_board_faults(m, explain, table)
+    // The console is in raw mode from here, so a fault explained as it is taken ends its lines so.
+    explain_in_raw_mode(&m.cores[0])
+    explain_in_raw_mode(&m.cores[1])
     // Under gdb the cores take turns on this thread, which serves gdb between them.
     if parallel && gdb_port == 0 then set_threads(m)
     raw()
@@ -428,6 +451,10 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
         var r = with_machine(exit_report(stop_kind(core), status, why), m)
         if core.stop == Stop.Exit then r.exit_status = long(core.exit_code)
         report_end(r)
+
+    var faults_seen = machine_faults(m)
+    val explained = faults_seen.text(table.names.view())
+    if !explained.is_empty() then eprints(s"\r\nbenchtop: ${replace_all(explained, "\n", "\r\n")}")
 
     core.stop match
         Exit -> exit(int(core.exit_code))
@@ -494,12 +521,13 @@ serve_rp(which: string, file: string, usb: bool, port: int, rom_boot: bool, arm:
 // the bus, and a CDC ACM device's serial port goes to stdout beside UART0, a line at a time, or to a
 // pseudo-terminal whose name goes to stderr. A `masking_file` not empty receives both cores' masking
 // report as the run ends, whichever way it ends.
-run_arm[C: chip.ArmChip + chip.PartPins](b: &chip.ArmBoard[C], file: string, usb: UsbMode, parts: chip.RpParts, faults: Faults, masking_file: string) -> never
+run_arm[C: chip.ArmChip + chip.PartPins](b: &chip.ArmBoard[C], file: string, usb: UsbMode, parts: chip.RpParts, faults: Faults, masking_file: string, explain: ExplainOptions, table: &SymbolTable) -> never
     b.boot(read_or_die(file)) match
         Ok(_) -> ()
         Err(why) -> die(s"$file: $why")
     if faults.any() then b.explore(faults)
     if !masking_file.is_empty() then b.record_masking()
+    b.record_faults(explain, table)
     // The board's parts at rest: a potentiometer's level on its ADC input, the buttons let go.
     var ps = parts
     chip.apply_parts(&ps, &b.chip)
@@ -544,6 +572,9 @@ run_arm[C: chip.ArmChip + chip.PartPins](b: &chip.ArmBoard[C], file: string, usb
             Asleep -> 4
         if !report_file.is_empty() then report_end(b.end_report(end, status, why))
         if !why.is_empty() then eprints(s"benchtop: $why\n")
+        var faults_seen = b.faults()
+        val explained = faults_seen.text(table.names.view())
+        if !explained.is_empty() then eprints(s"benchtop: $explained")
         exit(status)
 
 // Why an Arm RP run ends asleep.

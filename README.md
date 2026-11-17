@@ -232,7 +232,8 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--window] [--deterministic | --threads] [--usb console|pty|off]
                [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--report-masking <file>]
-               [--report <file.json>] [--semihosting] [--serial uart0|uart1=file:<path>] ... <image.elf | image.bin>
+               [--report <file.json>] [--explain-faults] [--trace-ring <n>] [--semihosting]
+               [--serial uart0|uart1=file:<path>] ... <image.elf | image.bin>
 ./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
@@ -596,9 +597,104 @@ status 1, saying so. Without `--report` nothing of it is built. A Pico 2 at its 
     the security state, on a core with the Security Extension (the M33);
   - on a Hazard3 hart: `mstatus` and `privilege` (`machine`, `user`).
 
+- `fault`: where a Cortex-M core faulted during the run, taken or stopped on, the fault explained
+  ([Fault explanations](#fault-explanations)): `count`, the faults over all cores; `ended`, whether
+  the run ended on this one; the fault's own fields; and `first`, the first fault in the same fields,
+  where there was more than one. Left out where nothing faulted.
+
 Addresses are `"0x…"` strings of eight hex digits, so they stay exact in any reader; a field that does
-not apply is left out, never null. The general registers and the stacked frame are not reported. The
-member `fault` is kept for an explanation of a fault, and is not written yet.
+not apply is left out, never null. The general registers are not reported, but a fault's frame is.
+
+### Fault explanations
+
+When a Cortex-M core faults, benchtop says what happened in words, with symbols, so that a person or
+an agent can act on it without a debugger. It works on every Cortex-M core — the virtual boards' M0
+to M85, the Pico's M0+s, the Pico 2's M33s with TrustZone and the MPU — scripted or not; the Hazard3
+harts' traps are not explained yet, and `--explain-faults` and `--trace-ring` are refused there, as
+under `--window` and `--gdb`.
+
+**The evidence is taken when the fault is.** A fault exception a core takes — HardFault, MemManage,
+BusFault, UsageFault, SecureFault — is captured as it is entered, once its frame is stacked and
+before its handler runs an instruction: the status registers (CFSR's MMFSR, BFSR and UFSR, HFSR,
+MMFAR, BFAR, SFSR, SFAR — on the M33 the banked ones of the state the fault arose in), the stacked
+R0–R3, R12, LR, return address and xPSR, EXC_RETURN, and which stack (MSP or PSP) the frame went to.
+Where stacking failed (STKOF below the limit, MSTKERR, STKERR), the explanation says so and gives the
+live registers. A fault benchtop stops on rather than taking — an undefined instruction, an access
+nothing answers, an unaligned exclusive access, a division CCR.DIV_0_TRP traps, an instruction for an
+absent or denied coprocessor, a vector without its Thumb bit, a lockup — is explained from the
+stopped core: its reasons from the stop and the instruction (`UsageFault: UNDEFINSTR`, `BusFault:
+PRECISERR` with the address as BFAR, ...), its frame the live registers, nothing stacked. An M0+
+records no cause, so its HardFault is explained from the frame and the instruction (an SVC that
+SVCall could not preempt, an undefined instruction, an access nothing answers).
+
+**Each core records its first fault, its last and how many**, whether the guest recovers or not: an
+RTOS that stops a faulting task has not failed. The explanation is printed on stderr when the run
+ends on a fault — a core stopped on one or locked up, or the run ended (an exit, `--timeout`) with a
+core still in its fault handler — and is in the exit report's `fault` object either way.
+**`--explain-faults`** prints every fault as it is taken, recovered from or not.
+
+**The backtrace is best effort, and says so**: the stacked PC (`frame`), the stacked LR where it is a
+return address into code (`lr`), then each word of the faulting stack above the frame that is one —
+odd, inside an executable section of the ELF (or memory that holds code, for a raw image), just after
+a BL or BLX (`scan`). A scanned entry may be a stale return address; it is a lead, not an unwind. (No
+DWARF or `.ARM.exidx` unwinder is built: the ELF package reads the sections, but an EHABI unwinder is
+its own piece of work.)
+
+**`--trace-ring <n>`** keeps the last n instructions each core ran (1 to 4096), oldest first, the
+faulting one last, in the explanation — for a fault just after a context switch. A core that keeps
+the ring runs on the `match` executor, several times slower; without the option the threaded
+executor runs exactly as before, and the ring costs nothing.
+
+A Pico 2 task, unprivileged on PSP, reads memory the MPU refuses; its MemManage handler spins, so
+`benchtop run --board pico2 --deterministic --timeout 20ms --trace-ring 6` times out with the core
+still in the handler, and explains it on stderr:
+
+```
+benchtop: timed out at 20ms
+benchtop: core 0 faulted: took MemManage in Secure state
+  MemManage: DACCVIOL (data access violation at MMFAR 0x20001000)
+  pc 0x20000072 read_secret+0x4   lr 0x2000006d task+0x6
+  frame stacked on the process stack (PSP) at 0x20000ed0, EXC_RETURN 0xfffffffd:
+    r0 0x00000003  r1 0x20001000  r2 0x00000000  r3 0x00000000  r12 0x00000000  xpsr 0x01000000
+  backtrace (best effort: a scan entry is a return address found on the stack, not an unwind):
+    0x20000072 read_secret+0x4 (frame)
+    0x2000006c task+0x6 (lr)
+    0x20000064 _start+0x44 (scan)
+  the last 6 instructions the core ran, oldest first:
+    0x20000060 _start+0x40
+    0x20000066 task
+    0x20000068 task+0x2
+    0x2000006e read_secret
+    0x20000070 read_secret+0x2
+    0x20000072 read_secret+0x4
+```
+
+In the exit report, the `fault` object (one line in the file; the ring shortened here):
+
+```
+"fault":{"count":1,"ended":true,"core":0,"exception":"MemManage","taken":true,"lockup":false,
+ "state":"secure","reasons":["MemManage: DACCVIOL (data access violation at MMFAR 0x20001000)"],
+ "cfsr":"0x00000082","hfsr":"0x00000000","mmfar":"0x20001000","sfsr":"0x00000000",
+ "frame":{"r0":"0x00000003","r1":"0x20001000","r2":"0x00000000","r3":"0x00000000","r12":"0x00000000",
+ "lr":"0x2000006d","pc":"0x20000072","xpsr":"0x01000000","exc_return":"0xfffffffd","sp":"0x20000ed0",
+ "stack":"psp","stacked":true},"pc_symbol":"read_secret+0x4","lr_symbol":"task+0x6",
+ "backtrace":[{"pc":"0x20000072","symbol":"read_secret+0x4","how":"frame"},
+ {"pc":"0x2000006c","symbol":"task+0x6","how":"lr"},{"pc":"0x20000064","symbol":"_start+0x44","how":"scan"}],
+ "ring":[{"pc":"0x20000060","symbol":"_start+0x40"},...,{"pc":"0x20000072","symbol":"read_secret+0x4"}],
+ "cycles":30}
+```
+
+The fields: `core`; `exception` (`HardFault`, `MemManage`, `BusFault`, `UsageFault`, `SecureFault`);
+`taken` (false for a fault benchtop stopped on); `lockup`; `state` (`secure` or `non_secure`, the
+state the fault arose in, on a core with the Security Extension); `reasons`, each `<exception>: <BIT>
+(<what it means>)`, the fault's own register first, a FORCED HardFault naming what it escalated;
+`cfsr` and `hfsr` on a Mainline core, `mmfar`, `bfar` and `sfar` only where valid (MMARVALID,
+BFARVALID, SFARVALID, or the address a precise BusFault benchtop stopped on would have recorded),
+`sfsr` on a core with the Security Extension; `frame` (`r0`–`r3`, `r12`, `lr`, `pc`, `xpsr`,
+`exc_return` for a fault taken, `sp`, `stack`: `msp` or `psp`, `stacked`); `pc_symbol` and
+`lr_symbol`; `backtrace`, each entry's `pc`, `symbol` and `how` (`frame`, `lr`, `scan`); `ring` under
+`--trace-ring`, each entry's `pc` and `symbol`; `cycles`, the core's clock at the fault. CFSR's bits
+are sticky until the guest clears them, so a reason may be an earlier fault's.
 
 `sysl test .` runs every test.
 

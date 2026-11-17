@@ -8,9 +8,9 @@ module sh.sysl.benchtop.script
 
 import sh.sysl.benchtop.{Part, article_of, part_model}
 import sh.sysl.benchtop.chip as chip
-import sh.sysl.benchtop.v6m.{Faults, no_faults}
+import sh.sysl.benchtop.v6m.{ExplainOptions, Faults, SymbolTable, explain_defaults, image_symbols, no_faults, symbol_table}
 import sh.sysl.benchtop.virt as virt
-import sh.sysl.benchtop.virt.{ExitKind, ExitReport, PartInput, SdChoice, Session, SliceEnd, exit_report, exit_report_json, image_symbols, with_guest}
+import sh.sysl.benchtop.virt.{ExitKind, ExitReport, PartInput, SdChoice, Session, SliceEnd, exit_report, exit_report_json, with_guest}
 import sysl.buf.{Buf, buf}
 import sysl.fs.{read_bytes, write_text}
 import sysl.raw.str_cast
@@ -36,6 +36,9 @@ struct Outcome
     console: Buf[u8]
     end: ExitKind
     exit_status: long
+    // The fault the run ended on, explained as the block `benchtop run` writes on stderr after `why`
+    // (v6m/explain.sysl); empty where it did not end on one.
+    explanation: string
 
 /** What else `benchtop run` says about the board: whether benchtop's USB host is on the bus (an
  * RP2350's Cortex-M33 board's, whose CDC serial port then joins the console), whether `--usb` was
@@ -66,18 +69,20 @@ private refused(why: string) -> Outcome
     val b = why.bytes
     var n = b.len
     while n > 0 && b[n - 1] == 10 do n -= 1
-    Outcome(FAILED, why[..<n], buf(), ExitKind.Error, -1)
+    Outcome(FAILED, why[..<n], buf(), ExitKind.Error, -1, "")
 /** Run the image in `file` on the board `which` names, as `sc` scripts it, its console on stdout unless
  * the script is quiet, varied as `faults` says (`--seed` and the fault options). A `masking_file` not
  * empty receives the masking report of the board's Cortex-M cores (`--report-masking`) when the run
  * ends, whichever way it ends: the script passing, the timeout, a fault, an exit. A `report_file` not
  * empty receives the exit report (`--report`, virt/exit_report.sysl) however the run ends, a refusal
- * included. `benchtop run` exits with the outcome's status after writing why on stderr; a board or an
- * option it refuses, or a report it cannot write, is status 1.
+ * included. The Cortex-M cores' faults are recorded and explained as `explain` asks (v6m/explain.sysl),
+ * the one the run ended on in the outcome's `explanation`. `benchtop run` exits with the outcome's
+ * status after writing why on stderr; a board or an option it refuses, or a report it cannot write, is
+ * status 1.
  */
-run(which: string, file: string, sc: Script, setup: Setup, faults: Faults = no_faults(), masking_file: string = "", report_file: string = "") -> Outcome
+run(which: string, file: string, sc: Script, setup: Setup, faults: Faults = no_faults(), masking_file: string = "", report_file: string = "", explain: ExplainOptions = explain_defaults()) -> Outcome
     var report = exit_report(ExitKind.Error, 0, "")
-    val outcome = played(which, file, sc, setup, faults, masking_file, !report_file.is_empty(), &report)
+    val outcome = played(which, file, sc, setup, faults, masking_file, explain, !report_file.is_empty(), &report)
     if report_file.is_empty() then return outcome
     report.exit = outcome.end
     report.status = outcome.status
@@ -88,10 +93,10 @@ run(which: string, file: string, sc: Script, setup: Setup, faults: Faults = no_f
         Err(_) -> buf()
     write_text(report_file, exit_report_json(&report, symbols.view())) match
         Ok(_) -> outcome
-        Err(e) -> Outcome(FAILED, s"cannot write $report_file: $e (the run: ${outcome.why})", outcome.console, outcome.end, outcome.exit_status)
+        Err(e) -> Outcome(FAILED, s"cannot write $report_file: $e (the run: ${outcome.why})", outcome.console, outcome.end, outcome.exit_status, outcome.explanation)
 
 // `run`'s run: where `reporting`, the board's clock and cores go into `report` as the run ends.
-private played(which: string, file: string, sc: Script, setup: Setup, faults: Faults, masking_file: string, reporting: bool, report: *ExitReport) -> Outcome
+private played(which: string, file: string, sc: Script, setup: Setup, faults: Faults, masking_file: string, explain: ExplainOptions, reporting: bool, report: *ExitReport) -> Outcome
     val image = read_bytes(file) match
         Ok(b) -> b
         Err(e) -> return refused(s"cannot read $file: $e")
@@ -128,13 +133,20 @@ private played(which: string, file: string, sc: Script, setup: Setup, faults: Fa
         virt.record_guest_masking(session.guest) match
             Ok(_) -> ()
             Err(why) -> return refused(why)
+    // The image's symbols, which name the addresses an explanation gives, alive for the whole run.
+    val table: &SymbolTable = symbol_table(image.view())
+    virt.explain_guest_faults(session.guest, explain, table) match
+        Ok(_) -> ()
+        Err(why) -> return refused(why)
     var rig = Rig(session, 0, buf(), buf(), name)
-    val outcome = drive(&rig, sc)
+    var outcome = drive(&rig, sc)
+    var faults_seen = virt.guest_faults(session.guest)
+    outcome.explanation = faults_seen.text(table.names.view())
     if reporting then *report = with_guest(*report, session.guest)
     if !masking then return outcome
     write_text(masking_file, virt.guest_masking_text(session.guest)) match
         Ok(_) -> outcome
-        Err(e) -> Outcome(FAILED, s"cannot write $masking_file: $e (the run: ${outcome.why})", outcome.console, outcome.end, outcome.exit_status)
+        Err(e) -> Outcome(FAILED, s"cannot write $masking_file: $e (the run: ${outcome.why})", outcome.console, outcome.end, outcome.exit_status, outcome.explanation)
 
 // ---------------------------------------------------------------------------------------------------
 // The steps, over any board.
@@ -332,7 +344,7 @@ private drive(r: *Rig, sc: Script) -> Outcome
                 if !why.is_empty() then return refused(why)
                 targets.push(0)
             Expect(_) -> targets.push(0)
-    var out = Outcome(0, "", buf(), ExitKind.Budget, -1)
+    var out = Outcome(0, "", buf(), ExitKind.Budget, -1, "")
     // What the console has shown that no expected text has taken yet, and what came in the last slice.
     var seen: Buf[u8] = buf()
     var fresh: Buf[u8] = buf()
