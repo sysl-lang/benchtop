@@ -25,10 +25,11 @@ import sysl.math.max
 // past the expiry: in a loop of branches, exactly RELOAD + 1 instructions after the store that
 // started it.
 //
-// What is not modelled: lockup (an exception that cannot be taken stops the core at `Fault`), the
-// MPU but the ARMv8-M one (mpu.sysl), HardFault for an undefined instruction or a bad access (the core stops at `Undefined` or
-// `Unmapped` instead), and an access off the RAM while stacking or unstacking, which stops at
-// `Unmapped` like any other.
+// An instruction's fault — UNDEFINSTR, INVSTATE, NOCP, DIVBYZERO, UNALIGNED, HardFault on a Baseline
+// core — is taken (t2secure.sysl's `usage`), and a fault that cannot be taken is a lockup, which stops
+// the core at `Fault`. What is not modelled: the MPU but the ARMv8-M one (mpu.sysl), the fault for a
+// bad access (the core stops at `Unmapped` instead), and an access off the RAM while stacking or
+// unstacking, which stops at `Unmapped` like any other.
 
 // The system control space: SysTick, the NVIC and the SCB, all word registers.
 const SCS: u32 = 0xE000E000
@@ -75,6 +76,7 @@ clear_exceptions(cpu: *Cpu)
     cpu.sp_other = 0
     cpu.control = 0
     cpu.ipsr = 0
+    cpu.thumb_off = false
     cpu.primask = 0
     cpu.vtor = 0
     if cpu.masking != null then masking_reset(cpu)
@@ -133,6 +135,10 @@ begin_run(cpu: *Cpu) -> bool
     // What a device or the other core made pending since the last run is recorded as pending from now.
     if cpu.masking != null then reconcile_pending(cpu, now)
     take_pending(cpu)
+    // A handler entered with EPSR.T clear (a vector without its Thumb bit) has INVSTATE pending
+    // (`invalid_state`), taken before its first instruction runs; so is the one that fault's own vector
+    // raises in turn, until a handler can run or the core locks up.
+    while cpu.thumb_off && cpu.stop == Stop.Running && take_pending(cpu) do ()
 
     if cpu.stop != Stop.Running then return false
 
@@ -313,13 +319,14 @@ best_pending(cpu: *Cpu) -> int
     if cpu.pending_banks != 0 then best = extra_best_pending(cpu,best)
     best
 
-// Take the best pending exception if it preempts what is running.
-take_pending(cpu: *Cpu)
+// Take the best pending exception if it preempts what is running, answering whether one was taken.
+take_pending(cpu: *Cpu) -> bool
     val e = best_pending(cpu)
 
     // An entry that stops the core leaves `pc` where the exception would have returned to.
     if e >= 0 && group(cpu, priority(cpu, u32(e))) < running_priority(cpu, true)
-        enter(cpu, u32(e), cpu.pc, cpu.retired)
+        return enter(cpu, u32(e), cpu.pc, cpu.retired)
+    false
 
 // ---------------------------------------------------------------------------------------------------
 // Entry and return.
@@ -338,7 +345,9 @@ xpsr(cpu: *Cpu) -> u32
     val z: u32 = if flag_z(cpu) then 1 else 0
     val it = ((cpu.it & 3) << 25) | ((cpu.it >> 2) << 10)
 
-    (flag_n(cpu) << 31) | (z << 30) | (cpu.c << 29) | (flag_v(cpu) << 28) | (cpu.q << 27) | (cpu.ge << 16) | it | (1 << 24) | cpu.ipsr
+    val t: u32 = if cpu.thumb_off then 0 else 1 << 24
+
+    (flag_n(cpu) << 31) | (z << 30) | (cpu.c << 29) | (flag_v(cpu) << 28) | (cpu.q << 27) | (cpu.ge << 16) | it | t | cpu.ipsr
 
 // The ITSTATE in an xPSR.
 @inline
@@ -471,14 +480,19 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     if cpu.masking != null then entered(cpu, to, n)
     // The handler runs privileged, at its own priority, under the MPU's view of that.
     if cpu.mpu_used then mpu_select(cpu)
+    // Outside any IT block: an instruction of the interrupted block that stopped the core is no longer
+    // the one `end_run` gives its own ITSTATE back to.
     cpu.it = 0
+    cpu.it_at = ~0
     cpu.excl = false
     cpu.pc = vector & ~1
-    if vector & 1 == 0 then halt(cpu, Stop.Fault, at)
+    // EPSR.T is the vector's bit 0: clear, the handler's first instruction takes INVSTATE.
+    cpu.thumb_off = false
+    if vector & 1 == 0 then invalid_state(cpu, cpu.pc, at)
     true
 
-// The record a `BX` or `POP {pc}` at `from` goes to with `v` off the RAM: in handler mode, an
-// EXC_RETURN value returns from the exception; anything else stops the core at `Unmapped`.
+// The record a `BX` or `POP {pc}` at `from` goes to with `v` off the RAM or even: in handler mode, an
+// EXC_RETURN value returns from the exception; anything else is an ordinary branch (`interworked`).
 //
 // With the Security Extension the EXC_RETURN prefix is bits 31–7, and bits 6 (S), 5 (DCRS) and 0
 // (ES) are the extension's (t2nonsecure.sysl). ES must name the state the handler runs in: clear from
@@ -489,10 +503,10 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
 // Non-secure state a branch to FNC_RETURN returns from a Non-secure call (`function_return`).
 exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
     if cpu.ns && (v | 1) == FNC_RETURN then return function_return(cpu, from, n)
-    if cpu.ipsr == 0 then return insn_at(cpu, v & ~1)
+    if cpu.ipsr == 0 then return interworked(cpu, v, from)
 
     if cpu.security
-        if v >> 7 != 0x01FFFFFF then return insn_at(cpu, v & ~1)
+        if v >> 7 != 0x01FFFFFF then return interworked(cpu, v, from)
         if v & 1 == 0 && !cpu.ns
             usage_fault(cpu, CFSR_INVPC, from, Stop.Fault)
             return stopped_on(cpu, from, n)
@@ -501,7 +515,7 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
             return stopped_on(cpu, from, n)
         if v & 0x60 == 0 then return fault_at(cpu, from, n)
     else if v >> 5 != 0x07FFFFFF
-        return insn_at(cpu, v & ~1)
+        return interworked(cpu, v, from)
 
     // Mode and SPSEL, with bit 0 set as ES is on a core without the extension.
     val kind = if cpu.security then (v & 0xE) | 1 else v & 0xF
@@ -599,7 +613,23 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
         mpu_select(cpu)
         if cpu.mpu_held != null && cpu.it != 0 && cpu.mem.is_code(pc) then decode_block(cpu, pc & ~1, cpu.it)
     recheck(cpu)
+    // A frame whose xPSR has T clear returns with EPSR.T clear: the instruction returned to takes
+    // INVSTATE.
+    if psr & (1 << 24) == 0 && cpu.mem.is_code(pc) then invalid_state(cpu, pc & ~1, from)
     insn_at(cpu, pc & ~1)
+
+// The record a branch that is no exception return goes to, `v` its target and `from` the branch: an
+// even target leaves EPSR.T clear, and the instruction there takes INVSTATE (`invalid_state`). A
+// target off the RAM stops the core at `Unmapped` there, as a fetch nothing answers does.
+interworked(cpu: *Cpu, v: u32, from: u32) -> *Insn
+    if v & 1 == 0 && cpu.mem.is_code(v) then invalid_state(cpu, v, from)
+    insn_at(cpu, v & ~1)
+
+// The record a `BLX` at `ip` goes to, `v` its register's value.
+@inline
+call_to(cpu: *Cpu, v: u32, ip: *Insn) -> *Insn
+    if v & 1 != 0 then return insn_at(cpu, v & ~1)
+    interworked(cpu, v, addr_of(cpu, ip))
 
 // Stop at `Fault` on the instruction at `from`, `n` retired before it, answering its record.
 fault_at(cpu: *Cpu, from: u32, n: u64) -> *Insn
@@ -615,11 +645,11 @@ stopped_on(cpu: *Cpu, from: u32, n: u64) -> *Insn
     if cpu.it_at == n then cpu.it = cpu.it_own
     insn_at(cpu, from)
 
-// The record a `BX` or `POP {pc}` at `ip` goes to, given the value `v` it puts in the PC. A value in
-// the RAM is the common case, and its record is one shift away.
+// The record a `BX` or `POP {pc}` at `ip` goes to, given the value `v` it puts in the PC. An odd value
+// in the RAM is the common case, and its record is one shift away.
 @inline
 branch_to(cpu: *Cpu, v: u32, ip: *Insn, n: u64) -> *Insn
-    if cpu.mem.is_code(v) then return insn_at(cpu, v)
+    if v & 1 != 0 && cpu.mem.is_code(v) then return insn_at(cpu, v)
 
     exception_return(cpu, v, addr_of(cpu, ip), n)
 

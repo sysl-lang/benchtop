@@ -1,0 +1,266 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// An instruction's UsageFault, taken as silicon takes it (ARMv7-M ARM B1.5.14 and B3.2.15, ARMv8-M ARM
+// "ExecuteCPCheck", "ExceptionTaken", "UFSR"; QEMU's target/arm/m_helper.c as a second reading):
+// UNDEFINSTR, INVSTATE (a branch to an even address, a vector without its Thumb bit, a return to a
+// frame whose xPSR has T clear), DIVBYZERO under CCR.DIV_0_TRP, UNALIGNED, NOCP — each with its CFSR
+// bit, the frame returning to the instruction, the handler run and able to step over it; escalated to
+// HardFault with HFSR.FORCED where the UsageFault is disabled or masked; a lockup where not even
+// HardFault can be taken; on the M33 the banked UsageFault of the state the fault arose in, and NSACR's
+// NOCP Secure state's; on the M0+ HardFault for each. A core a debugger runs (`catch_faults`) stops on
+// the instruction instead. Every case runs under both executors, which must agree.
+//
+// The layout: the case's code at 0, a handler at HANDLER (0x10), r4 the log (LOG).
+
+import sysl.buf.{Buf, buf}
+
+const HANDLER: u32 = 0x10
+const UDF: u16 = 0xDE00
+
+// The Mainline kinds: the M33, M4, M7 and M3.
+val WITH_USAGE: [4]Kind = [Kind.V8mMain, Kind.V7em, Kind.V7emM7, Kind.M3]
+
+// A handler that logs the stacked PC and steps over the `n`-byte instruction it returns to:
+// ldr r0, [sp, #24]; stmia r4!, {r0}; adds r0, #n; str r0, [sp, #24]; bx lr.
+skipping(n: u16) -> [5]u16 = [0x9806, LOG_R0, 0x3000 | n, 0x9006, BX_LR]
+
+// A handler that logs the stacked PC and xPSR and stops: ldr r0, [sp, #24]; stmia r4!, {r0};
+// ldr r0, [sp, #28]; stmia r4!, {r0}; bkpt (at HANDLER + 8).
+val LOGGING: [5]u16 = [0x9806, LOG_R0, 0x9807, LOG_R0, BKPT]
+
+// `first` at 0, NOPs to HANDLER, and `handler` there.
+laid(first: []const u16, handler: []const u16) -> Buf[u16]
+    var code: Buf[u16] = buf()
+    for h in first do code.push(h)
+    while code.len() < usize(HANDLER / 2) do code.push(NOP)
+    for h in handler do code.push(h)
+    code
+
+// `code` on a core of `kind` under both executors, r4 the log; the M0+ through `run_both`.
+ran(kind: Kind, code: []const u16, regs: []const u32, handlers: [][2]u32, setup: Setup) -> Cpu =
+    if kind == Kind.V6m then run_both(code, regs, 0, handlers, setup) else run_both_thumb2(kind, code, regs, 0, handlers, setup)
+
+// The UsageFault enabled, on a core that has one.
+usage_on(cpu: *Cpu)
+    if !is_baseline(cpu.kind) then store32(cpu, SCB_SHCSR, SHCSR_USGFAULTENA)
+
+// The UsageFault enabled but at priority 0x80, which BASEPRI 0x40 masks.
+usage_masked(cpu: *Cpu)
+    usage_on(cpu)
+    store32(cpu, SCB_SHPR1, 0x00800000)
+    cpu.basepri = 0x40
+
+faults_masked(cpu: *Cpu) = cpu.faultmask = 1
+
+div_trapped(cpu: *Cpu)
+    usage_on(cpu)
+    store32(cpu, SCB_CCR, load32(cpu, SCB_CCR) | CCR_DIV_0_TRP)
+
+fpu_denied(cpu: *Cpu)
+    usage_on(cpu)
+    cpu.fpu = Fpu.Single
+    cpu.cpacr = 0
+
+fpu_single(cpu: *Cpu)
+    usage_on(cpu)
+    cpu.fpu = Fpu.Single
+    cpu.cpacr = 0x00F00000
+
+// SVCall's vector 0x20, without its Thumb bit.
+even_svcall(cpu: *Cpu) = store32(cpu, VECTORS + SVCALL * 4, 0x20)
+
+even_svcall_usage(cpu: *Cpu)
+    even_svcall(cpu)
+    usage_on(cpu)
+
+debugger_catches(cpu: *Cpu) = cpu.catch_faults = true
+
+// `c` came back from its handler to the BKPT at `at`, in thread mode on its own stack, having logged
+// `want`.
+resumed(c: *Cpu, at: u32, want: []const u32) -> bool
+    if c.stop != Stop.Breakpoint || c.stop_at != at || c.ipsr != 0 || c.r[13] != 0x2000
+        print(f"${c.stop} at 0x${c.stop_at}%x, IPSR ${c.ipsr}, SP 0x${c.r[13]}%x")
+        return false
+    logged(c, want)
+
+// ---------------------------------------------------------------------------------------------------
+// UNDEFINSTR, and what any UsageFault does: its handler, escalation, lockup.
+
+@test("UNDEFINSTR: the UsageFault handler runs with CFSR.UNDEFINSTR, the frame returning to the instruction, and stepping over it (+2, +4) resumes")
+uf_undefined_handled()
+    for kind in WITH_USAGE
+        // udf #0; bkpt
+        var c = ran(kind, laid([UDF, BKPT], skipping(2)[..]).view(), [99, 0, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &usage_on)
+        assert(resumed(&c, 2, [0]) && c.r[0] == 99 && c.cfsr == CFSR_UNDEFINSTR && c.hfsr == 0, s"$kind UDF")
+        // udf.w #0; bkpt
+        c = ran(kind, laid([0xF7F0, 0xA000, BKPT], skipping(4)[..]).view(), [99, 0, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &usage_on)
+        assert(resumed(&c, 4, [0]) && c.cfsr == CFSR_UNDEFINSTR && c.hfsr == 0, s"$kind UDF.W")
+
+@test("UNDEFINSTR on an M0+ is HardFault, with no status register to record it; its handler steps over it")
+uf_undefined_m0()
+    var c = ran(Kind.V6m, laid([UDF, BKPT], skipping(2)[..]).view(), [99, 0, 0, 0, LOG], [[HARD_FAULT, HANDLER]], &nothing)
+    assert(resumed(&c, 2, [0]) && c.cfsr == 0 && c.hfsr == 0, "HardFault")
+
+@test("a UsageFault disabled in SHCSR, or masked by BASEPRI, escalates to HardFault with HFSR.FORCED, CFSR still saying why")
+uf_escalated()
+    for kind in WITH_USAGE
+        var c = ran(kind, laid([UDF, BKPT], skipping(2)[..]).view(), [99, 0, 0, 0, LOG], [[HARD_FAULT, HANDLER]], &nothing)
+        assert(resumed(&c, 2, [0]) && c.cfsr == CFSR_UNDEFINSTR && c.hfsr == HFSR_FORCED, s"$kind disabled")
+        c = ran(kind, laid([UDF, BKPT], skipping(2)[..]).view(), [99, 0, 0, 0, LOG], [[USAGE_FAULT, 0x40], [HARD_FAULT, HANDLER]], &usage_masked)
+        assert(resumed(&c, 2, [0]) && c.cfsr == CFSR_UNDEFINSTR && c.hfsr == HFSR_FORCED, s"$kind masked")
+
+@test("a UsageFault where not even HardFault can be taken — in HardFault's handler, or under FAULTMASK — is a lockup on the instruction, with nothing stacked")
+uf_lockup()
+    for kind in [Kind.V8mMain, Kind.V7em, Kind.V7emM7, Kind.M3, Kind.V6m]
+        // udf at 0, taken; HardFault's handler at HANDLER: udf.
+        var c = ran(kind, laid([UDF, BKPT], [UDF]).view(), [], [[HARD_FAULT, HANDLER]], &nothing)
+        assert(c.stop == Stop.Fault && c.stop_at == HANDLER && c.ipsr == HARD_FAULT && c.r[13] == 0x2000 - 0x20, s"$kind in HardFault: ${c.stop} at ${c.stop_at}")
+        if kind != Kind.V6m
+            c = ran(kind, laid([UDF, BKPT], [BKPT]).view(), [], [[HARD_FAULT, HANDLER]], &faults_masked)
+            assert(c.stop == Stop.Fault && c.stop_at == 0 && c.pc == 0 && c.ipsr == 0 && c.r[13] == 0x2000 && c.retired == 0, s"$kind FAULTMASK: ${c.stop} at ${c.stop_at}")
+
+@test("a debugger's core stops on an undefined instruction at Undefined, nothing taken or recorded")
+uf_caught()
+    for kind in [Kind.V8mMain, Kind.V7em, Kind.V6m]
+        var c = ran(kind, laid([UDF, BKPT], [BKPT]).view(), [], [[HARD_FAULT, HANDLER], [USAGE_FAULT, HANDLER]], &debugger_catches)
+        assert(c.stop == Stop.Undefined && c.stop_at == 0 && c.pc == 0 && c.ipsr == 0 && c.cfsr == 0 && c.hfsr == 0 && c.pending[0] == 0, s"$kind")
+
+// ---------------------------------------------------------------------------------------------------
+// INVSTATE.
+
+@test("INVSTATE: BX or BLX to an even address goes there with EPSR.T clear, and the instruction there takes the fault, its frame's xPSR T clear")
+uf_invstate_branch()
+    for kind in [Kind.V8mMain, Kind.V7em, Kind.V7emM7, Kind.M3, Kind.V6m]
+        val e = if kind == Kind.V6m then HARD_FAULT else USAGE_FAULT
+        for code in [0x4708u16, 0x4788]
+            // bx r1 or blx r1, to 0x20
+            var c = ran(kind, laid([code, BKPT], LOGGING[..]).view(), [0, 0x20, 0, 0, LOG], [[e, HANDLER]], &usage_on)
+            assert(c.stop == Stop.Breakpoint && c.stop_at == HANDLER + 8 && c.ipsr == e && c.retired == 5, s"$kind ${code}: ${c.stop} at ${c.stop_at}")
+            assert(logged(&c, [0x20, 0]) && c.cfsr == (if kind == Kind.V6m then 0 else CFSR_INVSTATE), s"$kind ${code}")
+            // BLX completed: the frame's LR is its link.
+            if code == 0x4788 then assert(load32(&c, c.r[13] + 20) == 3, "BLX links")
+
+@test("INVSTATE under a debugger: the BX to an even address stops at Fault on the branch")
+uf_invstate_caught()
+    var c = ran(Kind.V8mMain, laid([0x4708, BKPT], LOGGING[..]).view(), [0, 0x20, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &debugger_catches)
+    assert(c.stop == Stop.Fault && c.stop_at == 0 && c.ipsr == 0 && c.cfsr == 0, s"${c.stop} at ${c.stop_at}")
+
+@test("INVSTATE: a vector without its Thumb bit enters the handler with EPSR.T clear, whose first instruction faults: HardFault FORCED on Mainline, HardFault on the M0+")
+uf_invstate_vector()
+    for kind in [Kind.V8mMain, Kind.V7em, Kind.V7emM7, Kind.M3, Kind.V6m]
+        // svc; bkpt. SVCall's handler at 0x20, its vector even.
+        var c = ran(kind, laid([SVC, BKPT], LOGGING[..]).view(), [0, 0, 0, 0, LOG], [[HARD_FAULT, HANDLER]], &even_svcall_usage)
+        assert(c.stop == Stop.Breakpoint && c.stop_at == HANDLER + 8 && c.ipsr == HARD_FAULT, s"$kind: ${c.stop} at ${c.stop_at}")
+        // The frame returns to the handler's first instruction, in SVCall, T clear.
+        assert(logged(&c, [0x20, SVCALL]), s"$kind")
+        if kind != Kind.V6m then assert(c.cfsr == CFSR_INVSTATE && c.hfsr == HFSR_FORCED, s"$kind")
+
+@test("INVSTATE: an exception return to a frame whose xPSR has T clear faults on the instruction returned to")
+uf_invstate_return()
+    for kind in [Kind.V8mMain, Kind.V7em, Kind.V7emM7, Kind.M3, Kind.V6m]
+        val e = if kind == Kind.V6m then HARD_FAULT else USAGE_FAULT
+        // svc; bkpt. SVCall at HANDLER: movs r0, #0; str r0, [sp, #28]; bx lr. The fault's handler at
+        // HANDLER + 8 logs.
+        val handler = [0x2000u16, 0x9007, BX_LR, NOP, LOGGING[0], LOGGING[1], LOGGING[2], LOGGING[3], LOGGING[4]]
+        var c = ran(kind, laid([SVC, BKPT], handler[..]).view(), [0, 0, 0, 0, LOG], [[SVCALL, HANDLER], [e, HANDLER + 8]], &usage_on)
+        assert(c.stop == Stop.Breakpoint && c.stop_at == HANDLER + 16 && c.ipsr == e, s"$kind: ${c.stop} at ${c.stop_at}")
+        assert(logged(&c, [2, 0]) && c.cfsr == (if kind == Kind.V6m then 0 else CFSR_INVSTATE), s"$kind")
+
+// ---------------------------------------------------------------------------------------------------
+// DIVBYZERO, UNALIGNED, NOCP.
+
+@test("DIVBYZERO: with CCR.DIV_0_TRP a division by zero faults with Rd as it was; with it clear the quotient is 0 and nothing faults")
+uf_divide_by_zero()
+    for kind in WITH_USAGE
+        for first in [0xFBB1u16, 0xFB91]
+            // udiv or sdiv r0, r1, r2; bkpt
+            var c = ran(kind, laid([first, 0xF0F2, BKPT], skipping(4)[..]).view(), [99, 7, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &div_trapped)
+            assert(resumed(&c, 4, [0]) && c.r[0] == 99 && c.cfsr == CFSR_DIVBYZERO, s"$kind trapped")
+            c = ran(kind, laid([first, 0xF0F2, BKPT], skipping(4)[..]).view(), [99, 7, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &usage_on)
+            assert(resumed(&c, 4, []) && c.r[0] == 0 && c.cfsr == 0, s"$kind not trapped")
+
+@test("UNALIGNED: an exclusive at an address not its size's faults, nothing loaded or stored, the monitor left clear; on Baseline, HardFault")
+uf_unaligned()
+    for kind in WITH_USAGE
+        // ldrex r0, [r1]; bkpt
+        var c = ran(kind, laid([0xE851, 0x0F00, BKPT], skipping(4)[..]).view(), [99, 0x1001, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &usage_on)
+        assert(resumed(&c, 4, [0]) && c.cfsr == CFSR_UNALIGNED && !c.excl, s"$kind LDREX")
+        // strex r2, r0, [r1]; bkpt
+        c = ran(kind, laid([0xE841, 0x0200, BKPT], skipping(4)[..]).view(), [99, 0x1002, 9, 0, LOG], [[USAGE_FAULT, HANDLER]], &usage_on)
+        assert(resumed(&c, 4, [0]) && c.r[2] == 9 && c.cfsr == CFSR_UNALIGNED, s"$kind STREX")
+    // The M23's exclusive: HardFault.
+    var c = run_both_thumb2(Kind.M23, laid([0xE851, 0x0F00, BKPT], skipping(4)[..]).view(), [99, 0x1001, 0, 0, LOG], 0, [[HARD_FAULT, HANDLER]], &nothing)
+    assert(resumed(&c, 4, [0]) && c.cfsr == 0, "M23")
+
+@test("NOCP: the FPU absent, or CPACR denying it; a double-precision instruction on a single-precision unit is UNDEFINSTR")
+uf_no_coprocessor()
+    // vadd.f32 s0, s1, s2; bkpt
+    val vadd = laid([0xEE30, 0x0A81, BKPT], skipping(4)[..])
+    for kind in WITH_USAGE
+        var c = ran(kind, vadd.view(), [0, 0, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &usage_on)
+        assert(resumed(&c, 4, [0]) && c.cfsr == CFSR_NOCP, s"$kind absent")
+    for kind in [Kind.V8mMain, Kind.V7em]
+        var c = ran(kind, vadd.view(), [0, 0, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &fpu_denied)
+        assert(resumed(&c, 4, [0]) && c.cfsr == CFSR_NOCP, s"$kind denied")
+        // vadd.f64 d0, d0, d0
+        c = ran(kind, laid([0xEE30, 0x0B00, BKPT], skipping(4)[..]).view(), [0, 0, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &fpu_single)
+        assert(resumed(&c, 4, [0]) && c.cfsr == CFSR_UNDEFINSTR, s"$kind double")
+
+// ---------------------------------------------------------------------------------------------------
+// The M33's banked UsageFault.
+
+// NS_CODE: udf; bkpt. 0x0610: the Non-secure UsageFault's handler, a BKPT, enabled in SHCSR_NS.
+ns_udf(cpu: *Cpu)
+    layout(cpu)
+    put(cpu, NS_CODE, [UDF, BKPT])
+    put(cpu, NS_CODE + 0x10, [BKPT])
+    store32(cpu, NS_VECTORS + USAGE_FAULT * 4, (NS_CODE + 0x10) | 1)
+    store32(cpu, 0xE002ED24, SHCSR_USGFAULTENA)
+    store32(cpu, SCB_SHCSR, SHCSR_USGFAULTENA)
+
+// NS_CODE: mcr p0, #0, r1, c0, c0, on a core with CP0 and NSACR keeping it from Non-secure state.
+ns_mcr(cpu: *Cpu)
+    ns_udf(cpu)
+    put(cpu, NS_CODE, [0xEE00, 0x1010])
+    cpu.coprocessors = 1
+    cpu.cpacr = 3
+
+@test("the M33's UsageFault is banked: Non-secure state's UNDEFINSTR goes to its own handler in CFSR_NS, Secure state's to Secure's in CFSR; NSACR's NOCP is Secure state's")
+uf_banked()
+    // bxns r1 to NS_CODE: udf.
+    var c = run_both8([0x470C], [0, NS_CODE], 0, [[USAGE_FAULT, FAULT_AT], [HARD_FAULT, FAULT_AT]], &ns_udf)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == NS_CODE + 0x10 && c.ns && c.ipsr == USAGE_FAULT, f"${c.stop} at 0x${c.stop_at}%x")
+    assert(c.cfsr_ns == CFSR_UNDEFINSTR && c.cfsr == 0 && c.hfsr == 0 && load32(&c, c.r[13] + 24) == NS_CODE, "Non-secure's")
+    // udf in Secure state.
+    c = run_both8([UDF], [], 0, [[USAGE_FAULT, FAULT_AT], [HARD_FAULT, FAULT_AT]], &ns_udf)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && !c.ns && c.ipsr == USAGE_FAULT, f"${c.stop} at 0x${c.stop_at}%x")
+    assert(c.cfsr == CFSR_UNDEFINSTR && c.cfsr_ns == 0 && load32(&c, c.r[13] + 24) == 0, "Secure's")
+    // The MCR from Non-secure state with NSACR.CP0 clear: Secure state's NOCP, its frame on the
+    // Non-secure stack.
+    c = run_both8([0x470C], [0, NS_CODE], 0, [[USAGE_FAULT, FAULT_AT], [HARD_FAULT, FAULT_AT]], &ns_mcr)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && !c.ns && c.ipsr == USAGE_FAULT, f"${c.stop} at 0x${c.stop_at}%x")
+    assert(c.cfsr == CFSR_NOCP && c.cfsr_ns == 0 && load32(&c, c.banked.msp + 24) == NS_CODE, "NSACR")
+
+// ---------------------------------------------------------------------------------------------------
+// What the core has and benchtop does not model.
+
+@test("on an M55 an MVE instruction stops at Unmodelled, named with its encoding, nothing taken, even with the UsageFault enabled; a truly undefined encoding takes UNDEFINSTR; the M33 takes NOCP for the same MVE encoding")
+uf_unmodelled()
+    // vadd.i32 q0, q1, q2; bkpt
+    val mve = laid([0xEF22, 0x0844, BKPT], skipping(4)[..])
+    var c = ran(Kind.M55, mve.view(), [99, 0, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &usage_on)
+    assert(c.stop == Stop.Unmodelled && c.stop_at == 0 && c.pc == 0 && c.retired == 0 && c.ipsr == 0, s"${c.stop}")
+    assert(c.cfsr == 0 && c.hfsr == 0 && c.pending[0] == 0 && logged(&c, []), "no fault taken")
+    assert(c.unmodelled == Extension.Mve && c.unmodelled_insn == 0xEF220844, "MVE")
+    val said = unmodelled_text(&c)
+    assert(said.contains("MVE") && said.contains("0xef22 0x0844") && said.contains("benchtop does not model") && said.contains("0x00000000"), said)
+    // A debugger's core stops there the same way.
+    c = ran(Kind.M55, mve.view(), [99, 0, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &debugger_catches)
+    assert(c.stop == Stop.Unmodelled && c.unmodelled == Extension.Mve, s"${c.stop}")
+    // udf.w #0, UNDEFINED on every core.
+    c = ran(Kind.M55, laid([0xF7F0, 0xA000, BKPT], skipping(4)[..]).view(), [99, 0, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &usage_on)
+    assert(resumed(&c, 4, [0]) && c.cfsr == CFSR_UNDEFINSTR, "UDF.W on the M55")
+    // The M33 has no MVE: coprocessor 8 is absent, NOCP.
+    c = ran(Kind.V8mMain, mve.view(), [99, 0, 0, 0, LOG], [[USAGE_FAULT, HANDLER]], &usage_on)
+    assert(resumed(&c, 4, [0]) && c.cfsr == CFSR_NOCP && c.unmodelled == Extension.None, "M33")

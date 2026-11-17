@@ -33,16 +33,48 @@ flags(cpu: *Cpu) -> u32
 
     (flag_n(cpu) << 3) | z | (cpu.c << 1) | flag_v(cpu)
 
-// `code` at 0 with a `BKPT` after it; r0 upward from `regs`, SP at 0x2000, the flags `nzcv`, and each
-// `[address, word]` of `mem` stored first.
+// Where a case's faults go: a vector table at FAULT_TABLE whose HardFault, MemManage, BusFault and
+// UsageFault vectors name the BKPT at FAULT_HANDLER, far from any case's code and data, so that a
+// fault a case takes ends its run there (`took`). A case that installs a table of its own (`machine`)
+// replaces it.
+const FAULT_TABLE: u32 = 0xE0000
+const FAULT_HANDLER: u32 = 0xE0100
+
+// `code` at 0 with a `BKPT` after it; r0 upward from `regs`, SP at 0x2000, the flags `nzcv`, each
+// `[address, word]` of `mem` stored first, and the faults' vectors at FAULT_TABLE. VTOR is set as the
+// core holds it, so that the M0 and M1, whose register reads 0, use the table too.
 prepare(cpu: *Cpu, code: []const u16, regs: []const u32, nzcv: u32, mem: [][2]u32)
     reset(cpu, test_memory, [], 0)
     for i in 0..<code.len do store16(cpu, u32(i) * 2, code[i])
     store16(cpu, u32(code.len) * 2, 0xBE00)
+    fault_vectors(cpu)
     cpu.r[13] = 0x2000
     for i in 0..<regs.len do cpu.r[i] = regs[i]
     set_flags(cpu, nzcv)
     for m in mem do store32(cpu, m[0], m[1])
+
+// The faults' vectors at FAULT_TABLE, each the BKPT at FAULT_HANDLER, and VTOR there.
+fault_vectors(cpu: *Cpu)
+    for e in [HARD_FAULT, MEM_MANAGE, BUS_FAULT, USAGE_FAULT] do store32(cpu, FAULT_TABLE + e * 4, FAULT_HANDLER | 1)
+    store16(cpu, FAULT_HANDLER, 0xBE00)
+    cpu.vtor = FAULT_TABLE
+
+// Whether `c` took exception `e` for the instruction at `at` and stopped at FAULT_HANDLER's BKPT, with
+// `cfsr` and `hfsr` in the Secure (or only) status registers: IPSR `e`, and the frame on the stack in
+// use returning to `at`.
+took(c: *Cpu, e: u32, at: u32, cfsr: u32, hfsr: u32) -> bool
+    if c.stop != Stop.Breakpoint || c.stop_at != FAULT_HANDLER || c.ipsr != e || c.cfsr != cfsr || c.hfsr != hfsr
+        print(f"${c.stop} at 0x${c.stop_at}%x, IPSR ${c.ipsr}, CFSR 0x${c.cfsr}%x, HFSR 0x${c.hfsr}%x")
+        return false
+    val ret = load32(c, c.r[13] + 24)
+    if ret != at then print(f"returns to 0x$ret%x, not 0x$at%x")
+    ret == at
+
+// Whether `c` took the UsageFault `bits` for the instruction at `at` as a case leaves the fault, not
+// enabled: HardFault with HFSR.FORCED and the bits in CFSR; on a Baseline core, which has neither,
+// HardFault with nothing recorded.
+usage_taken(c: *Cpu, at: u32, bits: u32) -> bool =
+    if is_baseline(c.kind) then took(c, HARD_FAULT, at, 0, 0) else took(c, HARD_FAULT, at, bits, HFSR_FORCED)
 
 finish(cpu: *Cpu, exec: Exec)
     while cpu.stop == Stop.Running && cpu.retired < 1000000
@@ -539,7 +571,7 @@ ins_conditions()
 
             assert(flags(&c) == nzcv, s"condition $cond leaves the flags")
 
-@test("hints and barriers retire and do nothing, CPS only sets PRIMASK; BKPT and an undefined encoding stop where they are")
+@test("hints and barriers retire and do nothing, CPS only sets PRIMASK; BKPT stops where it is, and an undefined encoding takes HardFault there")
 ins_system()
     // nop; yield; wfe; sev; cpsid i; dsb; dmb; isb; movs r0, #1
     var c = execute([0xBF00, 0xBF10, 0xBF20, 0xBF40, 0xB672, 0xF3BF, 0x8F4F, 0xF3BF, 0x8F5F, 0xF3BF, 0x8F6F, 0x2001], [], 0b1001, [])
@@ -550,8 +582,8 @@ ins_system()
 
     // movs r0, #1; udf
     c = execute([0x2001, 0xDE00], [], 0, [])
-    assert(c.stop == Stop.Undefined && c.stop_at == 2 && c.retired == 1 && c.pc == 2, "UDF")
+    assert(usage_taken(&c, 2, 0) && c.retired == 1 && c.r[0] == 1, "UDF")
 
     // a 32-bit encoding this core has no meaning for
     c = execute([0xF000, 0x0000], [], 0, [])
-    assert(c.stop == Stop.Undefined && c.stop_at == 0 && c.retired == 0, "undefined 32-bit")
+    assert(usage_taken(&c, 0, 0) && c.retired == 0, "undefined 32-bit")

@@ -250,10 +250,14 @@ named — its console on this terminal a keystroke at a time. It runs a board on
 one supported model (the core table below) whose peripherals benchtop all emulates, with modelled peripherals and supported LED, button and potentiometer parts, and refuses other boards with the reason. An ELF file's segments are placed at their physical addresses; any other file is loaded
 as raw bytes from address 0. **Ctrl-]** ends benchtop whatever the guest is doing, with exit status
 130. Otherwise the exit status is the one the guest wrote to the console's EXIT register; a guest
-that stops on a breakpoint, an undefined instruction, an access where nothing is, a `WFI` nothing can
-wake, a fault the core cannot take, (on an M33) a stack-limit violation no fault can be taken for, or
+that stops on a breakpoint, an access where nothing is, a `WFI` nothing can
+wake, a fault the core cannot take (a lockup), (on an M33) a stack-limit violation no fault can be taken for, or
 a Secure-only core asked for Non-secure state gets a message saying
-where, and status 3 for all but the breakpoint. A system reset request (AIRCR) ends it with status 0.
+where, and status 3 for all but the breakpoint. An instruction's UsageFault — an undefined
+instruction, INVSTATE, NOCP, DIVBYZERO under CCR.DIV_0_TRP, an unaligned exclusive — is taken as
+silicon takes it (HardFault on an M0+): the guest's handler runs, and with none the run ends where its
+default handler leads, often a lockup. Under `--window` and `--gdb` the core stops on the instruction
+instead, so that the fault is seen where it arose. A system reset request (AIRCR) ends it with status 0.
 
 By default, launched guest cores run on separate host threads. **`--deterministic`**
 selects reproducible turns on one thread. The explicit **`--threads`** spelling also gives
@@ -586,8 +590,11 @@ status 1, saying so. Without `--report` nothing of it is built. A Pico 2 at its 
   - `timeout`: `--timeout` came first;
   - `fault_lockup`: a core locked up — a fault it could not take, such as an M0+'s HardFault within
     HardFault or a stack-limit violation at a negative priority, or one benchtop does not model;
-  - `fault`: a core stopped on a fault the run stops at (an undefined instruction or an access nothing
-    answers on a virtual board, a hart's trap), or the chip refused something;
+  - `fault`: a core stopped on a fault the run stops at (an access nothing answers on a virtual board,
+    a semihosting call not answered, a hart's trap), or the chip refused something;
+  - `unmodelled`: a core reached an instruction it has on silicon that benchtop does not model (an
+    M52, M55 or M85's low-overhead loop, MVE long shift or MVE vector instruction): benchtop's limit,
+    named with the extension and the encoding, not a fault of the guest's, so no fault is taken;
   - `breakpoint`: a `BKPT` that is not a semihosting call, or a hart's `EBREAK`;
   - `asleep`: every core sleeps in WFI or WFE, and nothing on the board will wake one;
   - `budget`: the run's budget ran out with every core still running;
@@ -632,13 +639,13 @@ before its handler runs an instruction: the status registers (CFSR's MMFSR, BFSR
 MMFAR, BFAR, SFSR, SFAR — on the M33 the banked ones of the state the fault arose in), the stacked
 R0–R3, R12, LR, return address and xPSR, EXC_RETURN, and which stack (MSP or PSP) the frame went to.
 Where stacking failed (STKOF below the limit, MSTKERR, STKERR), the explanation says so and gives the
-live registers. A fault benchtop stops on rather than taking — an undefined instruction, an access
-nothing answers, an unaligned exclusive access, a division CCR.DIV_0_TRP traps, an instruction for an
-absent or denied coprocessor, a vector without its Thumb bit, a lockup — is explained from the
-stopped core: its reasons from the stop and the instruction (`UsageFault: UNDEFINSTR`, `BusFault:
-PRECISERR` with the address as BFAR, ...), its frame the live registers, nothing stacked. An M0+
-records no cause, so its HardFault is explained from the frame and the instruction (an SVC that
-SVCall could not preempt, an undefined instruction, an access nothing answers).
+live registers. An instruction's UsageFault — UNDEFINSTR, INVSTATE, NOCP, DIVBYZERO, UNALIGNED — is
+taken, so it is explained like any other: `taken`, with the CFSR the core recorded (and HFSR.FORCED
+where it escalated). A fault benchtop stops on rather than taking — an access nothing answers, a
+lockup — is explained from the stopped core: its reasons from the stop and the instruction
+(`BusFault: PRECISERR` with the address as BFAR, ...), its frame the live registers, nothing stacked.
+An M0+ records no cause, so its HardFault is explained from the frame and the instruction (an SVC that
+SVCall could not preempt, an access nothing answers).
 
 **Each core records its first fault, its last and how many**, whether the guest recovers or not: an
 RTOS that stops a faulting task has not failed. The explanation is printed on stderr when the run
@@ -987,8 +994,10 @@ yet on exception stacking and unstacking, lazy floating-point preservation or `B
 M4's and M7's PMSAv7 MPU and the M0+'s are not enforced.
 M4 and M7 always have integer DSP; M33/M35P/M52/M55/M85 can enable it independently per core. The M52/M55/M85
 models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
-MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. Unsupported instruction
-encodings stop at `Undefined`; `run` refuses descriptions enabling unimplemented extensions.
+MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. A low-overhead loop, long
+shift or MVE instruction stops the core at `Unmodelled`, named, with no fault taken (silicon takes
+none); an encoding UNDEFINED on the core takes UNDEFINSTR (NOCP for an absent coprocessor); `run`
+refuses descriptions enabling unimplemented extensions.
 The conditional-select family treats R15 sources as ZR, preserves NZCV/Q, rejects SP and PC
 destination operands, and stops on AL/NV constrained-unpredictable conditions.
 
