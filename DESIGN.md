@@ -628,6 +628,17 @@ loop
   skiff's per-switch reprogramming of a few regions costs a few hundred entry writes. Pages split by a
   sub-4 KB region are marked slow and checked per access against the region list. skiff's 64-byte
   stack guard makes the page holding each stack's base a slow page, which is acceptable.
+  **Built for the M33's PMSAv8 MPU** (`v6m/mpu.sysl`), over benchtop's real table (one host pointer
+  per page, 0 for the slow path, rather than flag bits): each state's MPU has a privileged and an
+  unprivileged table, copies of the state's own in which a page stays only where one region allows
+  it whole for reading and, where the fast path would store in place, writing (or, privileged under
+  PRIVDEFENA, no region touches it). `Cpu.pages` points at the view's table while the MPU applies and
+  at the state's own otherwise; until an MPU register is first written nothing changes, so a core
+  without an MPU pays nothing (the bench's host instruction counts agree within 0.01%). A region
+  write remakes the entries its old and new extents cover. Fetches are judged when a record is
+  decoded, and unprivileged code runs on records of its own, so a record decoded privileged never
+  runs unprivileged; a region write forgets the records on the pages it covers. skiff's Pico 2 test
+  run, which reprograms regions on every switch, takes about 5% longer than with the MPU ignored.
 
 ### 2.5 The interface a JIT would plug into
 
@@ -731,7 +742,10 @@ Architecture Reference Manual (DDI0553), cited by chapter title. Over §2.1's v7
     context active (lazy preservation and SFPA), AIRCR.BFHFNMINS or PRIS set, a Non-secure PRIGROUP
     other than the Secure one, the FP registers' Non-secure view, the PPB alias outside the system
     control space; on the board, the SIO from Non-secure state and an ACCESSCTRL write restricting a
-    memory device. The MPU is stored and answered by `TT`, not enforced. The boot ROM itself is Secure
+    memory device. The MPU (PMSAv8, a bank per state) is enforced on the core's own loads, stores
+    and fetches (§2.4, `v6m/mpu.sysl`): a refusal is MemManage DACCVIOL with MMFAR, or IACCVIOL.
+    Not yet: the MPU checks of exception stacking and unstacking (MSTKERR, MUNSTKERR), lazy FP
+    preservation (MLSPERR), `BLXNS`'s push and an IT block's later instructions. The boot ROM itself is Secure
     code (§9.2).
 - **The stack-limit registers.** `MSPLIM`/`PSPLIM` make a push, an `SP` write or exception stacking
   below the limit a UsageFault with `UFSR.STKOF`, with `SP` left at the limit, and
