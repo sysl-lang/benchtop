@@ -444,8 +444,16 @@ checked against the SVD):
 - **DWT/ITM**: `DWT_CYCCNT` is provided because HAL and benchmarks read it. It is the core's virtual
   cycle count. ITM stimulus port 0 is a second console (SWO), which is cheap and useful. QEMU has
   no DWT (skiff-old's notes), so benchtop improves on that.
-- **Semihosting** (`BKPT 0xAB`, SYS_WRITE0/WRITEC/WRITE/EXIT_EXTENDED) is on by an option. It is how
-  skiff's boot tests halt, so the same scripts can drive benchtop and QEMU.
+- **Semihosting** (`BKPT 0xAB`) is built, behind `--semihosting` (`Cpu.semihosting`, set by the board;
+  `v6m/semihost.sysl`), on the RP2040's and the RP2350's cores under both executors (the `match` loop
+  and the threaded chain share the one routine, so Thumb-2 and gdb's stops see no difference). It
+  implements SYS_WRITEC, SYS_WRITE0, SYS_OPEN (`:tt` only), SYS_WRITE, SYS_CLOSE, SYS_EXIT and
+  SYS_EXIT_EXTENDED as QEMU's `arm-compat-semi.c` does: the exit status is the guest's (the
+  subcode of an `ADP_Stopped_ApplicationExit` extended exit, else 1; for the 32-bit SYS_EXIT, 0 for
+  that reason and 1 otherwise), so the same scripts can drive benchtop and QEMU. Reads of the guest's
+  memory never touch a device or stop the core. Without the option a `BKPT 0xAB` stops the core like
+  any `BKPT`; the option costs nothing on the instruction path, as only the `BKPT` handler tests it.
+  An unimplemented call stops the core as undefined, where QEMU aborts.
 
 **What the ARMv6-M core models** (`sh.sysl.benchtop.v6m`, `except.sysl`; ARMv6-M ARM B1, the M0+
 subset of the above):
@@ -1095,6 +1103,11 @@ The VCP's line goes to one of three back-ends (`--uart`):
   so a program that opens and closes it does not hang it up. Bytes are exchanged between runs of the
   board. The Pico 2's USB serial port uses it today (`benchtop run --usb pty`).
 - **`tcp:PORT`**: a raw socket, for scripted tests (`sysl.net`).
+
+**On the RP boards each UART can go to a file** (`--serial uart0|uart1=file:<path>`, repeatable; built in
+`ArmBoard`, which drains the redirected UART's transmit FIFO into the file every quantum and waits for it
+to finish sending at the end of the run, as it does for UART0's console). UART0 not redirected stays the
+console, and an unredirected UART1 is not read. `--expect` matches the console, never a file.
 
 Tests also use `--expect "line" --timeout 10s`, which exits 0 when every expected line has appeared
 in order and 1 otherwise, as skiff's `boot-test.sh` reads QEMU's output today.

@@ -231,7 +231,8 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 ```
 sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--window] [--deterministic | --threads] [--usb console|pty|off]
-               [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] <image.elf | image.bin>
+               [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>]
+               [--semihosting] [--serial uart0|uart1=file:<path>] ... <image.elf | image.bin>
 ./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
@@ -255,6 +256,26 @@ By default, launched guest cores run on separate host threads. **`--deterministi
 selects reproducible turns on one thread. The explicit **`--threads`** spelling also gives
 each core a host thread of its own once core 1 is launched: faster where both cores are busy, and
 not reproducible, as two real cores are not.
+
+**`--semihosting`** makes `BKPT 0xAB` an Arm semihosting call rather than a stop, on the Pico and Pico 2
+boards (any other board refuses it), for either core, either executor and `--deterministic` or not. The
+calls are `SYS_WRITEC`, `SYS_WRITE0`, `SYS_OPEN` of `:tt` (the console), `SYS_WRITE`, `SYS_CLOSE`,
+`SYS_EXIT` and `SYS_EXIT_EXTENDED`, as `qemu-system-arm -semihosting` runs them (it is QEMU's
+`semihosting/arm-compat-semi.c` that was followed). Text written to the console joins what UART0 sent, on
+stdout; text written to a descriptor opened for append goes to stderr. **The exit status of the run is
+the guest's**, as QEMU computes it: `SYS_EXIT_EXTENDED` with reason `0x20026` (`ADP_Stopped_ApplicationExit`)
+gives its subcode, any other reason 1; `SYS_EXIT`, whose R1 is the reason itself, gives 0 for `0x20026` and
+1 for any other. A call benchtop does not implement (`SYS_OPEN` of a host file answers -1; the rest stop
+the core as undefined) ends the run with status 3. Without `--semihosting` a `BKPT 0xAB` is any `BKPT`, as
+below, so the SDK's `_exit` is unchanged. A semihosting run is a scripted run too where it has `--expect`
+or `--timeout`; it also works under `--gdb`, but not with `--window`.
+
+**`--serial uartN=file:<path>`**, repeatable, sends what UART `N` (`uart0` or `uart1`, on the Pico and Pico 2
+boards) transmits to `<path>`, which is emptied at the start of the run and appended to as the board runs,
+like QEMU's `-serial file:`. A UART with no `--serial` is as it always was: UART0 is the console, and
+UART1's output is not kept. With UART0 redirected the console carries only what the guest writes through
+semihosting (and the USB serial port), and **`--expect` reads the console only**, so it never sees a UART
+that has a file: check that file after the run instead.
 
 **`--gdb [port]`** serves gdb's remote protocol instead, one TCP port per core from `port` (3333),
 and holds the board at its reset vector until a gdb resumes it: `target remote :3333`. See
@@ -319,7 +340,7 @@ console takes no input (no console at all, or an RP2040's UART0), and a bad dura
 before the run, with status 1. Scripted runs do not combine with `--window` or `--gdb`.
 
 **A Pico 2 SDK program ends a run itself by returning from `main` or calling `exit()`**: the SDK's
-`_exit` executes `BKPT`, which ends the run with status 0, whatever status the program gave. A failure
+`_exit` executes `BKPT`, which ends the run with status 0, whatever status the program gave (`--semihosting` is for a guest that gives its status through a semihosting exit instead). A failure
 is therefore told by what the program prints: `--expect` the text that means success. For example, a
 program that prints over UART0 (or over USB, through the default `--usb console`), checked to its
 third line and given 2 seconds of the board's time:
