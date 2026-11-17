@@ -1,0 +1,259 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// The M33's MPU enforced (mpu.sysl), against the ARMv8-M ARM (DDI0553: "MPUCheck", "ValidateAddress",
+// "IsReqExcPriNeg", the MMFSR and MMFAR descriptions) and QEMU's `pmsav8_mpu_lookup`: every load and
+// store form refused with nothing done, MemManage's status and MMFAR, the fetches, the controls
+// (privilege, PRIVDEFENA, AP, XN, HFNMIENA, the PPB, overlaps, escalation), the unprivileged forms,
+// and the fast path through a region's change. Every guest case runs under both executors
+// (`run_both8`), which must agree.
+
+const MEMFAULTENA: u32 = 1 << 16
+const MMFSR_REFUSED: u32 = 0x82
+const MMFSR_IACCVIOL: u32 = 0x01
+const NOP: u16 = 0xBF00
+
+// msr control, r6 (r6 = 1: nPRIV); isb. The access after them is at 8.
+val DROP: [4]u16 = [0xF386, 0x8814, 0xF3BF, 0x8F6F]
+
+// What memory holds where the cases look: 0x3000 under no region, 0x4000 read-only.
+const AT_3000: u32 = 0x11223344
+const AT_4000: u32 = 0x55667788
+
+// Regions 0 (0x0000–0x0FFF, read-only, any privilege, executable: the code, the vectors and the
+// handler at FAULT_AT), 1 (0x1000–0x2FFF, read-write, any privilege, execute-never: the stack), 2
+// (0x4000–0x4FFF, read-only, any privilege, execute-never) and 3 (0x5000–0x50FF, read-write,
+// privileged only, execute-never, a part of its page); 0x3000 under none. The MPU on with PRIVDEFENA,
+// MemManage enabled, a BKPT at FAULT_AT.
+mpu_on(cpu: *Cpu)
+    secure(cpu)
+    store16(cpu, FAULT_AT, BKPT)
+    store32(cpu, 0x3000, AT_3000)
+    store32(cpu, 0x4000, AT_4000)
+    store32(cpu, SCB_SHCSR, MEMFAULTENA)
+    mpu_region_at(cpu, 0, 0x0006, 0x0FE1)
+    mpu_region_at(cpu, 1, 0x1003, 0x2FE1)
+    mpu_region_at(cpu, 2, 0x4007, 0x4FE1)
+    mpu_region_at(cpu, 3, 0x5001, 0x50E1)
+    store32(cpu, MPU_CTRL, 5)
+
+// The same without PRIVDEFENA.
+mpu_no_default(cpu: *Cpu)
+    mpu_on(cpu)
+    store32(cpu, MPU_CTRL, 1)
+
+// Without PRIVDEFENA, with HFNMIENA.
+mpu_hfnmiena(cpu: *Cpu)
+    mpu_on(cpu)
+    store32(cpu, MPU_CTRL, 3)
+
+// MemManage not enabled.
+mpu_escalating(cpu: *Cpu)
+    mpu_on(cpu)
+    store32(cpu, SCB_SHCSR, 0)
+
+// Region 4 over the second half of region 2.
+mpu_overlap(cpu: *Cpu)
+    mpu_on(cpu)
+    mpu_region_at(cpu, 4, 0x4800, 0x4FE1)
+
+// The fetch cases' targets: a NOP at 0x1800 (region 1, execute-never) and a BKPT at 0x3000 (no
+// region), overwriting the word there.
+mpu_fetching(cpu: *Cpu)
+    mpu_on(cpu)
+    store16(cpu, 0x1800, 0xBF00)
+    store16(cpu, 0x3000, BKPT)
+
+// Region 5, 0x7000–0x70FF, read-only privileged and executable, holding `bx lr`.
+mpu_privileged_code(cpu: *Cpu)
+    mpu_on(cpu)
+    store16(cpu, 0x7000, BX_LR)
+    mpu_region_at(cpu, 5, 0x7004, 0x70E1)
+
+// Region 4 over the whole page at 0x6000, read-write for any privilege, holding 0xABCD; and an SVCall
+// handler at 0x200 that disables it: str r5, [r4] (RNR = 4); movs r3, #0; str r3, [r7] (RLAR); bx lr.
+mpu_switching(cpu: *Cpu)
+    mpu_on(cpu)
+    store32(cpu, 0x6000, 0xABCD)
+    mpu_region_at(cpu, 4, 0x6003, 0x6FE1)
+    store16(cpu, 0x200, 0x6025)
+    store16(cpu, 0x202, 0x2300)
+    store16(cpu, 0x204, 0x603B)
+    store16(cpu, 0x206, BX_LR)
+
+// The return address MemManage or HardFault stacked: the frame is on the main stack.
+stacked_pc(c: *Cpu) -> u32 = load32(c, c.r[13] + 24)
+
+// `code` run from 0 with r1 = `at` and r0, r2, r3 = 0x10, 0x22, 0x33, under `setup`, MemManage and
+// HardFault both going to the BKPT at FAULT_AT.
+mpu_case(code: []const u16, at: u32, setup: Setup) -> Cpu
+    run_both8(code, [0x10, at, 0x22, 0x33, 0, 0, 1], 0, [[MEM_MANAGE, FAULT_AT], [HARD_FAULT, FAULT_AT]], setup)
+
+// MemManage DACCVIOL taken for an access at `mmfar` by the instruction at `pc`, r0–r3 and the words at
+// 0x3000 and 0x4000 as they were.
+refused(c: *Cpu, pc: u32, mmfar: u32) -> bool
+    c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == MEM_MANAGE && c.cfsr == MMFSR_REFUSED &&
+        c.mmfar == mmfar && load32(c, SCB_MMFAR) == mmfar && stacked_pc(c) == pc && c.r[0] == 0x10 &&
+        c.r[2] == 0x22 && c.r[3] == 0x33 && load32(c, 0x3000) == AT_3000 && load32(c, 0x4000) == AT_4000
+
+// The case ran to the BKPT after it with no fault.
+made(c: *Cpu) -> bool = c.stop == Stop.Breakpoint && c.stop_at != FAULT_AT && c.ipsr == 0 && c.cfsr == 0
+
+// ---------------------------------------------------------------------------------------------------
+// Data accesses.
+
+@test("every load and store form, unprivileged to an address no region holds, is MemManage DACCVIOL with MMFAR, and does nothing")
+mpu_every_form()
+    // Each form's halfwords, a 16-bit one followed by a NOP: ldr, ldrb, ldrh r0, [r1]; str, strb,
+    // strh r2, [r1]; ldm r1, {r2, r3}; stm r1!, {r2, r3}.
+    val forms: [][2]u16 = [
+        [0x6808, NOP], [0x7808, NOP], [0x8808, NOP], [0x600A, NOP], [0x700A, NOP], [0x800A, NOP], [0xC90C, NOP], [0xC10C, NOP],
+        // ldr.w r0, [r1]; lda r0, [r1]; stl r2, [r1]; ldaex r0, [r1]; ldrex r0, [r1]
+        [0xF8D1, 0x0000], [0xE8D1, 0x0FAF], [0xE8C1, 0x2FAF], [0xE8D1, 0x0FEF], [0xE851, 0x0F00],
+        // ldrd r2, r3, [r1]; strd r2, r3, [r1]
+        [0xE9D1, 0x2300], [0xE9C1, 0x2300],
+        // ldm.w r1, {r2, r3}; stm.w r1, {r2, r3}; ldrt r0, [r1]; strt r2, [r1]; ldrb.w r0, [r1]; strh.w r2, [r1]
+        [0xE891, 0x000C], [0xE881, 0x000C], [0xF851, 0x0E00], [0xF841, 0x2E00], [0xF891, 0x0000], [0xF8A1, 0x2000]]
+    for form in forms
+        var c = mpu_case([DROP[0], DROP[1], DROP[2], DROP[3], form[0], form[1]], 0x3000, &mpu_on)
+        assert(refused(&c, 8, 0x3000) && c.r[1] == 0x3000, f"0x${form[0]}%x refused, nothing done")
+        assert(c.hfsr == 0, "MemManage itself, not escalated")
+
+@test("PUSH and POP through an SP no region holds are refused at the word they reach")
+mpu_push_pop()
+    // mov sp, r1; push {r2}  /  mov sp, r1; pop {r2}
+    var c = mpu_case([DROP[0], DROP[1], DROP[2], DROP[3], 0x468D, 0xB404], 0x3800, &mpu_on)
+    assert(refused(&c, 10, 0x37FC), "PUSH")
+    c = mpu_case([DROP[0], DROP[1], DROP[2], DROP[3], 0x468D, 0xBC04], 0x3000, &mpu_on)
+    assert(refused(&c, 10, 0x3000), "POP")
+
+@test("a refused STREX or STLEX whose monitor holds writes neither memory nor its status register")
+mpu_store_exclusive()
+    // ldrex r0, [r1] privileged; msr control, r6; isb; strex r3, r2, [r1]
+    val strex: []const u16 = [0xE851, 0x0F00, DROP[0], DROP[1], DROP[2], DROP[3], 0xE841, 0x2300]
+    var c = mpu_case(strex, 0x3000, &mpu_on)
+    assert(c.ipsr == MEM_MANAGE && c.cfsr == MMFSR_REFUSED && c.mmfar == 0x3000 && stacked_pc(&c) == 12, "refused")
+    assert(c.r[3] == 0x33 && load32(&c, 0x3000) == AT_3000 && c.r[0] == AT_3000, "status and memory as they were")
+    // ldaex r0, [r1]; …; stlex r3, r2, [r1]
+    c = mpu_case([0xE8D1, 0x0FEF, DROP[0], DROP[1], DROP[2], DROP[3], 0xE8C1, 0x2FE3], 0x3000, &mpu_on)
+    assert(c.ipsr == MEM_MANAGE && c.r[3] == 0x33 && load32(&c, 0x3000) == AT_3000, "STLEX")
+
+@test("privileged code reaches an address no region holds under PRIVDEFENA, and a privileged-only region; unprivileged code neither")
+mpu_privilege()
+    var c = mpu_case([0x6808, 0x600A], 0x3000, &mpu_on)
+    assert(made(&c) && c.r[0] == AT_3000 && load32(&c, 0x3000) == 0x22, "privileged, no region")
+    c = mpu_case([0x6808], 0x5000, &mpu_on)
+    assert(made(&c), "privileged, region 3")
+    c = mpu_case([DROP[0], DROP[1], DROP[2], DROP[3], 0x6808], 0x5004, &mpu_on)
+    assert(refused(&c, 8, 0x5004), "unprivileged, region 3")
+    c = mpu_case([DROP[0], DROP[1], DROP[2], DROP[3], 0x6808, 0x600A], 0x1F00, &mpu_on)
+    assert(made(&c) && load32(&c, 0x1F00) == 0x22, "unprivileged, region 1 read and written")
+
+@test("without PRIVDEFENA privileged code reaches no address outside the regions, but the PPB")
+mpu_no_privdefena()
+    var c = mpu_case([0x6808], 0x3000, &mpu_no_default)
+    assert(refused(&c, 0, 0x3000), "no background map")
+    // ldr r0, [r1] of CPUID
+    c = mpu_case([0x6808], 0xE000ED00, &mpu_no_default)
+    assert(made(&c) && c.r[0] == load32(&c, 0xE000ED00), "the PPB is exempt")
+
+@test("a read-only region is read at both privileges and written at neither; two regions over an address refuse it")
+mpu_read_only()
+    var c = mpu_case([0x6808], 0x4000, &mpu_on)
+    assert(made(&c) && c.r[0] == AT_4000, "privileged read")
+    c = mpu_case([0x600A], 0x4000, &mpu_on)
+    assert(refused(&c, 0, 0x4000), "privileged write")
+    c = mpu_case([DROP[0], DROP[1], DROP[2], DROP[3], 0x6808], 0x4000, &mpu_on)
+    assert(made(&c) && c.r[0] == AT_4000, "unprivileged read")
+    c = mpu_case([0x6808], 0x4800, &mpu_overlap)
+    assert(refused(&c, 0, 0x4800), "an overlap")
+    c = mpu_case([0x6808], 0x4400, &mpu_overlap)
+    assert(made(&c), "region 2 alone")
+
+@test("an access that runs from an allowed granule into a refused one names the refused granule in MMFAR")
+mpu_straddling()
+    // ldr r0, [r1] at 0x2FFE: its last bytes are 0x3000 and 0x3001.
+    var c = mpu_case([DROP[0], DROP[1], DROP[2], DROP[3], 0x6808], 0x2FFE, &mpu_on)
+    assert(refused(&c, 8, 0x3000), "MMFAR is the first refused byte's granule")
+
+@test("LDRT and STRT from privileged code are checked as unprivileged code's; LDR is not")
+mpu_unprivileged_forms()
+    var c = mpu_case([0xF851, 0x0E00], 0x3000, &mpu_on)
+    assert(refused(&c, 0, 0x3000), "LDRT")
+    c = mpu_case([0xF841, 0x2E00], 0x5000, &mpu_on)
+    assert(refused(&c, 0, 0x5000), "STRT to a privileged-only region")
+    c = mpu_case([0xF851, 0x0E00, 0x6808], 0x1F00, &mpu_on)
+    assert(made(&c), "LDRT where unprivileged code may read")
+    // ldr r0, [r1, #-4] is the T4 form with U clear, not LDRT.
+    c = mpu_case([0xF851, 0x0C04], 0x3004, &mpu_on)
+    assert(made(&c) && c.r[0] == AT_3000, "a negative offset is an ordinary load")
+
+@test("MemManage not enabled escalates to HardFault, HFSR.FORCED, with MMFSR and MMFAR recorded")
+mpu_escalation()
+    var c = mpu_case([0x600A], 0x4000, &mpu_escalating)
+    assert(c.stop == Stop.Breakpoint && c.ipsr == HARD_FAULT && c.hfsr == HFSR_FORCED, "HardFault")
+    assert(c.cfsr == MMFSR_REFUSED && c.mmfar == 0x4000 && load32(&c, 0x4000) == AT_4000, "MMFSR and MMFAR")
+
+@test("at a negative priority the MPU does not apply unless HFNMIENA; with it, a refusal there is a lockup")
+mpu_hfnmiena()
+    // cpsid f; ldr r0, [r1]
+    var c = mpu_case([0xB671, 0x6808], 0x3000, &mpu_no_default)
+    assert(made(&c) && c.r[0] == AT_3000, "FAULTMASK set: no MPU")
+    c = mpu_case([0xB671, 0x6808], 0x3000, &mpu_hfnmiena)
+    assert(c.stop == Stop.Fault && c.pc == 2 && c.r[0] == 0x10 && c.cfsr == MMFSR_REFUSED, "a lockup, nothing loaded")
+    // cpsid f; cpsie f; ldr r0, [r1]: the MPU applies again.
+    c = mpu_case([0xB671, 0xB661, 0x6808], 0x3000, &mpu_no_default)
+    assert(refused(&c, 4, 0x3000), "FAULTMASK clear again")
+
+// ---------------------------------------------------------------------------------------------------
+// Fetches.
+
+@test("a fetch from an execute-never region is MemManage IACCVIOL, MMFAR not valid, at the address fetched")
+mpu_execute_never()
+    // bx r1, to 0x1800
+    var c = mpu_case([0x4708], 0x1801, &mpu_fetching)
+    assert(c.ipsr == MEM_MANAGE && c.cfsr == MMFSR_IACCVIOL && c.mmfar == 0 && stacked_pc(&c) == 0x1800, "IACCVIOL")
+
+@test("a fetch from no region is made privileged under PRIVDEFENA, and refused unprivileged or without it")
+mpu_fetch_background()
+    var c = mpu_case([0x4708], 0x3001, &mpu_fetching)
+    assert(c.stop == Stop.Breakpoint && c.stop_at == 0x3000 && c.ipsr == 0, "privileged, PRIVDEFENA")
+    c = mpu_case([DROP[0], DROP[1], DROP[2], DROP[3], 0x4708], 0x3001, &mpu_fetching)
+    assert(c.ipsr == MEM_MANAGE && c.cfsr == MMFSR_IACCVIOL && stacked_pc(&c) == 0x3000, "unprivileged")
+
+@test("code a privileged call has decoded in a privileged-only region is refused to the same code unprivileged")
+mpu_fetch_by_privilege()
+    // blx r1 (0x7000: bx lr); msr control, r6; isb; bx r1
+    var c = mpu_case([0x4788, DROP[0], DROP[1], DROP[2], DROP[3], 0x4708], 0x7001, &mpu_privileged_code)
+    assert(c.ipsr == MEM_MANAGE && c.cfsr == MMFSR_IACCVIOL && stacked_pc(&c) == 0x7000, "IACCVIOL unprivileged")
+
+// ---------------------------------------------------------------------------------------------------
+// The tables.
+
+@test("the tables: a page one region allows whole is on the fast path, one a region covers in part or a read-only RAM region is not")
+mpu_tables()
+    var c = secure_core()
+    mpu_on(&c)
+    assert(c.mpu_live && !c.mpu_unpriv && c.pages[1] != 0 && c.pages[3] != 0 && c.pages[5] == 0 && c.pages[4] == 0, "privileged")
+    c.control = 1
+    mpu_select(&c)
+    assert(c.mpu_unpriv && c.pages[1] != 0 && c.pages[3] == 0 && c.pages[5] == 0, "unprivileged")
+    mpu_region_at(&c, 1, 0x1003, 0x1FE0)
+    assert(c.pages[1] == 0 && c.pages[2] == 0, "a region disabled takes its pages off at once")
+    store32(&c, MPU_CTRL, 0)
+    assert(!c.mpu_live && c.pages == &test_memory.page_table[0], "the MPU off: the memory's own table")
+
+@test("a page made forbidden after a fast access traps on the next, on both executors")
+mpu_region_change()
+    // msr control, r6; isb; ldr r0, [r1]; svc 0 (region 4 disabled); ldr r2, [r1]
+    val code: []const u16 = [DROP[0], DROP[1], DROP[2], DROP[3], 0x6808, 0xDF00, 0x680A]
+    var c = run_both8(code, [0x10, 0x6000, 0x22, 0x33, MPU_RNR, 4, 1, MPU_RLAR], 0, [[MEM_MANAGE, FAULT_AT], [SVCALL, 0x200]], &mpu_switching)
+    assert(c.ipsr == MEM_MANAGE && c.cfsr == MMFSR_REFUSED && c.mmfar == 0x6000 && stacked_pc(&c) == 12, "the second load refused")
+    assert(c.r[0] == 0xABCD && c.r[2] == 0x22, "the first made, the second not")
+
+@test("the Non-secure MMFAR is its own: the alias reads and writes it, and the Secure one keeps its value")
+mpu_mmfar_banked()
+    var c = secure_core()
+    store32(&c, SCB_MMFAR, 0x1234)
+    store32(&c, SCB_MMFAR + 0x20000, 0x5678)
+    assert(load32(&c, SCB_MMFAR) == 0x1234 && load32(&c, SCB_MMFAR + 0x20000) == 0x5678 && c.mmfar_ns == 0x5678, "two MMFARs")

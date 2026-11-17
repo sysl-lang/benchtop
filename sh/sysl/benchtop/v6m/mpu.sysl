@@ -151,15 +151,11 @@ mem_manage(cpu: *Cpu, bits: u32, at: u32)
 @noinline
 unprivileged_transfer(cpu: *Cpu, xfer: u32, rt: u4, a: u32, n: u64) -> bool
     if !cpu.mpu_live || cpu.mpu_unpriv then return transfer(cpu, xfer, rt, a, n)
-    val seen = cpu.pages
-    val table = mpu_table(cpu, cpu.ns, true)
-    cpu.pages = table
+    cpu.pages = cpu.mem.mpu_page_table[mpu_table(cpu, cpu.ns, true)]
     cpu.mpu_unpriv = true
     val made = transfer(cpu, xfer, rt, a, n)
-    // A store to the MPU's own registers has chosen afresh.
-    if cpu.pages == table
-        cpu.pages = seen
-        cpu.mpu_unpriv = false
+    // Back to the privileged view, unless a store to the MPU's own registers has chosen afresh.
+    if cpu.mpu_unpriv then mpu_retable(cpu)
     made
 
 // ---------------------------------------------------------------------------------------------------
@@ -223,16 +219,15 @@ state_table(cpu: *Cpu, ns: bool) -> *usize
     if ns then return cpu.ns_pages
     if cpu.watch_count != 0 then cpu.watch_secure else &cpu.mem.page_table[0]
 
-/** The table of a view of the live bank's MPU, made whole first where it does not match the
- * registers. */
-mpu_table(cpu: *Cpu, ns: bool, unpriv: bool) -> *usize
+/** The place in `Memory.mpu_page_table` of the table of a view of the live bank's MPU, made whole
+ * first where it does not match the registers. */
+mpu_table(cpu: *Cpu, ns: bool, unpriv: bool) -> usize
     val mem = cpu.mem
     val v = view_of(ns, unpriv)
     val k = usize(cpu.core & 1) * 4 + v
     if mem.mpu_page_table[k] == null then mem.mpu_page_table[k] = ptr_cast(c_calloc(usize(PAGES), sizeof(usize)))
-    val table = mem.mpu_page_table[k]
-    if !cpu.mpu_valid[v] then make_table(cpu, table, ns, unpriv)
-    table
+    if !cpu.mpu_valid[v] then make_table(cpu, mem.mpu_page_table[k], ns, unpriv)
+    k
 
 // Every entry of a view's table: where no region touches the page, the state's own entry for the
 // privileged view under PRIVDEFENA and 0 otherwise; each page a region touches, as `entry` has it.
@@ -312,7 +307,11 @@ mpu_retable(cpu: *Cpu)
     val unpriv = applies && !is_privileged(cpu)
     cpu.mpu_live = applies
     cpu.mpu_unpriv = unpriv
-    cpu.pages = if applies then mpu_table(cpu, cpu.ns, unpriv) else state_table(cpu, cpu.ns)
+    // Each read where it is stored, as `switch_state` makes it.
+    if applies
+        cpu.pages = cpu.mem.mpu_page_table[mpu_table(cpu, cpu.ns, unpriv)]
+    else
+        cpu.pages = if cpu.ns then cpu.ns_pages elif cpu.watch_count != 0 then cpu.watch_secure else &cpu.mem.page_table[0]
     val s = state_of(cpu.ns)
     if applies && !unpriv && cpu.mpu_dirty[s]
         cpu.mpu_dirty[s] = false
@@ -324,11 +323,10 @@ mpu_select(cpu: *Cpu)
     mpu_retable(cpu)
     if cpu.mpu_unpriv == (cpu.mpu_held != null) then return
     if !cpu.mpu_unpriv then return mpu_release(cpu)
-    val k = usize(cpu.core & 1) * 2 + state_of(cpu.ns)
-    val records = unprivileged_records(cpu, cpu.ns)
+    val k = unprivileged_records(cpu, cpu.ns)
     cpu.mpu_held = cpu.dec
     cpu.mpu_held_predicated = cpu.predicated
-    cpu.dec = records
+    cpu.dec = cpu.mem.mpu_decoded[k]
     cpu.predicated = cpu.mem.mpu_predicated[k]
 
 /** Put the core back on its state's own records, before a change of state takes them up. */
@@ -344,9 +342,9 @@ mpu_privilege_changed(cpu: *Cpu)
     mpu_retable(cpu)
     if cpu.mpu_unpriv != (cpu.mpu_held != null) then set_limit(cpu, 0)
 
-// The core's records for unprivileged code in state `ns`, holding this reset's "not decoded" the first
-// time it needs them after one.
-private unprivileged_records(cpu: *Cpu, ns: bool) -> *Insn
+// The place in `Memory.mpu_decoded` of the core's records for unprivileged code in state `ns`, which
+// hold this reset's "not decoded" the first time it needs them after one.
+private unprivileged_records(cpu: *Cpu, ns: bool) -> usize
     val mem = cpu.mem
     val k = usize(cpu.core & 1) * 2 + state_of(ns)
     if mem.mpu_decoded[k] == null
@@ -359,7 +357,7 @@ private unprivileged_records(cpu: *Cpu, ns: bool) -> *Insn
         records[NO_CODE >> 1] = undecoded()
         mem.install_ram_guards(records)
         cpu.mpu_ready[state_of(ns)] = true
-    records
+    k
 
 // ---------------------------------------------------------------------------------------------------
 // Changes.
@@ -439,20 +437,28 @@ private forget_pages(cpu: *Cpu, first: u32, last: u32)
 
 // `count` records from `first` in every set the core runs: each state's own, and its unprivileged ones.
 private forget_in_sets(cpu: *Cpu, first: u32, count: u32)
-    val c = usize(cpu.core & 1) * 2
-    for records in [cpu.dec, cpu.mpu_held, cpu.secure_records, cpu.ns_records, cpu.mem.mpu_decoded[c], cpu.mem.mpu_decoded[c + 1]]
+    for k in 0..<6
+        val records = record_set(cpu, k)
         if records != null then forget_range(records, first, count)
 
 // Every record holding code in every set the core runs.
 private forget_everywhere(cpu: *Cpu)
-    val c = usize(cpu.core & 1) * 2
-    for records in [cpu.dec, cpu.mpu_held, cpu.secure_records, cpu.ns_records, cpu.mem.mpu_decoded[c], cpu.mem.mpu_decoded[c + 1]]
-        forget_records(cpu, records)
+    for k in 0..<6 do forget_records(cpu, record_set(cpu, k))
+
+// Set `k` of those the core may run: 0 the one it runs, 1 the state's own while that is unprivileged
+// code's, 2 and 3 Secure and Non-secure state's own, 4 and 5 their unprivileged code's; null where
+// there is none.
+private record_set(cpu: *Cpu, k: int) -> *Insn = k match
+    0 -> cpu.dec
+    1 -> cpu.mpu_held
+    2 -> cpu.secure_records
+    3 -> cpu.ns_records
+    _ -> cpu.mem.mpu_decoded[usize(cpu.core & 1) * 2 + usize(k - 4)]
 
 /** Records `first` to `last` of the sets `drop_records` does not reach: the state's own while the
  * core runs unprivileged code's, and each state's for unprivileged code, put back to "not decoded". */
 mpu_drop_records(cpu: *Cpu, first: u32, last: u32)
-    val c = usize(cpu.core & 1) * 2
-    for records in [cpu.mpu_held, cpu.mem.mpu_decoded[c], cpu.mem.mpu_decoded[c + 1]]
+    for k in [1, 4, 5]
+        val records = record_set(cpu, k)
         if records == null || records == cpu.dec then continue
         for i in first..last do if records[i].op != Op.Undecoded then records[i] = undecoded()
