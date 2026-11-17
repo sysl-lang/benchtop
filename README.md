@@ -232,7 +232,7 @@ Host tasks use real time; guest timers still use deterministic emulated time.
 sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--window] [--deterministic | --threads] [--usb console|pty|off]
                [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--report-masking <file>]
-               [--semihosting] [--serial uart0|uart1=file:<path>] ... <image.elf | image.bin>
+               [--report <file.json>] [--semihosting] [--serial uart0|uart1=file:<path>] ... <image.elf | image.bin>
 ./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
@@ -545,6 +545,60 @@ masking core=1 timing=estimated cycles=980 intervals=0 masked=0 longest=0 from=n
   `securefault`, `svcall`, `debugmonitor`, `pendsv`, `systick`, `irq<n>`, with `_ns` for a
   Non-secure copy.
 - Core 1's lines follow where it was launched.
+
+### The exit report
+
+**`--report <file.json>`** writes one small JSON object to `file.json` when the run ends, however it
+ends — the guest's exit, a fault, `--timeout`, an `--expect` met, both cores asleep, a refusal — so a
+shell gate or an agent reads how the run ended without parsing the console. It works on the virtual
+boards, the Pico, the Pico 2 (its Cortex-M33s or its Hazard3 harts), scripted or not, deterministic
+or on threads; `--window` and `--gdb` refuse it. A file that cannot be written fails the run with
+status 1, saying so. Without `--report` nothing of it is built. A Pico 2 at its `--timeout`:
+
+```
+{"exit":"timeout","status":124,"message":"timed out at 20ms waiting for \"never\"","cycles":3100000,
+ "virtual_time_ns":20666646,"cores":[{"core":0,"started":true,"state":"sleeping","pc":"0x20000d58",
+ "symbol":"sleep_ms+0xe0","cycles":3100000,"retired":290249,"sp":"0x20081fd0","msp":"0x20081fd0",
+ "psp":"0x00000000","control":0,"primask":0,"basepri":0,"faultmask":0,"ipsr":0,"exception":"thread",
+ "ns":false},{"core":1,...}]}
+```
+
+(one line in the file; broken here for the page). The fields:
+
+- `exit`: how the run ended, one of
+  - `exit`: the guest ended the run with a status of its own — a semihosting `SYS_EXIT` or
+    `SYS_EXIT_EXTENDED`, the virtual console's EXIT register;
+  - `expect_met`: every `--expect`ed text appeared;
+  - `timeout`: `--timeout` came first;
+  - `fault_lockup`: a core locked up — a fault it could not take, such as an M0+'s HardFault within
+    HardFault or a stack-limit violation at a negative priority, or one benchtop does not model;
+  - `fault`: a core stopped on a fault the run stops at (an undefined instruction or an access nothing
+    answers on a virtual board, a hart's trap), or the chip refused something;
+  - `breakpoint`: a `BKPT` that is not a semihosting call, or a hart's `EBREAK`;
+  - `asleep`: every core sleeps in WFI or WFE, and nothing on the board will wake one;
+  - `budget`: the run's budget ran out with every core still running;
+  - `reset`: the guest asked for a reset the board does not make;
+  - `error`: benchtop refused the run or something it needed (an option, the image, the board).
+- `status`: the status `benchtop run` exits with.
+- `exit_status`: the guest's own status, for `exit` only.
+- `message`: what `benchtop run` says on stderr about the end, where it says something.
+- `cycles`: the board's clock in its cycles since power-on; `virtual_time_ns`, the same in
+  nanoseconds, where the chip names its clock's rate (the virtual boards may not).
+- `cores`: each core, by `core` index, with `started`. A core that never started has only those two.
+  One that did has
+  - `state`: `running`, `sleeping`, `halted` or `locked_up`;
+  - `pc`, and `symbol` as `name+0x…` from the ELF's function symbols where one holds the pc (a raw
+    image, or a pc outside every function, has none);
+  - `cycles` (the core's own clock; a hart's is clk_sys's) and `retired` instructions;
+  - on a Cortex-M core: `sp` (the one in use), `msp`, `psp`, `control`, `primask`, `ipsr` and the
+    `exception` it names (`thread`, `hardfault`, `svcall`, `irq<n>`, ... as the masking report names
+    them); `basepri` and `faultmask` on a Mainline core (M3, M4, M7, M33, ...), not on an M0+; and `ns`,
+    the security state, on a core with the Security Extension (the M33);
+  - on a Hazard3 hart: `mstatus` and `privilege` (`machine`, `user`).
+
+Addresses are `"0x…"` strings of eight hex digits, so they stay exact in any reader; a field that does
+not apply is left out, never null. The general registers and the stacked frame are not reported. The
+member `fault` is kept for an explanation of a fault, and is not written yet.
 
 `sysl test .` runs every test.
 

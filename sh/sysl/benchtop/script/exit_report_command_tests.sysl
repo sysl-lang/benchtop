@@ -1,0 +1,123 @@
+module sh.sysl.benchtop.script
+@tests
+
+// `benchtop run --report` through the command itself: an unscripted run on the virtual board, its
+// cores on two host threads and taking turns on one, a scripted Pico 2 run to its timeout, the
+// refusals of `--window` and `--gdb` by name, a board benchtop refuses, and a file that cannot be
+// written. Needs the binary `sysl build .` writes beside the manifest; exit_report_tests.sysl runs the
+// same report through `run` in every gate.
+
+import sh.sysl.json as json
+import sh.sysl.json.Json
+import sh.sysl.parsing.source_of
+import sysl.fs.{is_file, make_temp_dir, read_bytes, remove_dir_all, write_bytes}
+import sysl.process.{capture, Output, Stdio}
+import sysl.testing.skip
+import sysl.text.from_utf8_lossy
+
+// `ldr r0, =0x40000008; movs r1, #7; str r1, [r0]; b .` on the virtual board: 7 to its EXIT register.
+private val COMMAND_EXIT: [20]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x01, 0x48, 0x07, 0x21, 0x01, 0x60, 0xfe, 0xe7, 0x08, 0x00, 0x00, 0x40]
+// `wfi; b .`.
+private val COMMAND_WFI: [12]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00, 0x30, 0xbf, 0xfe, 0xe7]
+// `udf #0`.
+private val COMMAND_UDF: [10]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0xde]
+
+private benchtop(args: []const string) -> Output =
+    capture("./benchtop", args, stderr = true, timeout = 60000, stdin = Stdio.FromPath("/dev/null")).unwrap()
+
+private exited(o: Output) -> int = o.status match
+    Exited(c) -> c
+    _ -> -1
+
+private err_of(o: Output) -> string = o.err match
+    Some(e) -> e
+    None -> ""
+
+private command_text(file: string) -> string = read_bytes(file) match
+    Ok(b) -> from_utf8_lossy(b.view())
+    Err(_) -> ""
+
+private command_json(file: string) -> Json
+    val text = command_text(file)
+    json.parse(source_of(file, text)) match
+        Ok(j) -> j
+        Err(_) -> panic(s"$file is not JSON:\n$text")
+
+private needs_benchtop()
+    if !is_file("benchtop") || !is_file("examples/pico2/hello_serial.elf")
+        skip("needs ./benchtop built with `sysl build .`")
+
+@test("benchtop run --report: an unscripted virtual-board run writes the report at the guest's exit, deterministic or on threads, and at a fault")
+command_report_unscripted()
+    needs_benchtop()
+    val dir = make_temp_dir("benchtop-report").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val image = s"$dir/exit.bin"
+    write_bytes(image, COMMAND_EXIT[..]).unwrap()
+    for way in ["--deterministic", "--threads"]
+        val file = s"$dir/exit$way.json"
+        val o = benchtop(["run", way, "--report", file, image][..])
+        assert(exited(o) == 7, err_of(o))
+        val j = command_json(file)
+        assert(j.get("exit").unwrap().as_str() == Some("exit") && j.get("status").unwrap().as_int() == Some(7) && j.get("exit_status").unwrap().as_int() == Some(7), command_text(file))
+        val c1 = j.get("cores").unwrap().at(1).unwrap()
+        assert(c1.len() == 2 && c1.get("started").unwrap().as_bool() == Some(false), command_text(file))
+
+    val udf = s"$dir/udf.bin"
+    write_bytes(udf, COMMAND_UDF[..]).unwrap()
+    val file = s"$dir/udf.json"
+    val o = benchtop(["run", "--report", file, udf][..])
+    assert(exited(o) == 3, err_of(o))
+    val j = command_json(file)
+    assert(j.get("exit").unwrap().as_str() == Some("fault") && j.get("status").unwrap().as_int() == Some(3), command_text(file))
+    assert(j.get("message").unwrap().as_str().unwrap().contains("undefined instruction"), command_text(file))
+
+    // `wfi; b .` with the console's input ended (stdin is /dev/null): nothing will wake the core.
+    val wfi = s"$dir/wfi.bin"
+    write_bytes(wfi, COMMAND_WFI[..]).unwrap()
+    val asleep = s"$dir/wfi.json"
+    val a = benchtop(["run", "--deterministic", "--report", asleep, wfi][..])
+    assert(exited(a) == 3, err_of(a))
+    val s = command_json(asleep)
+    assert(s.get("exit").unwrap().as_str() == Some("asleep") && s.get("status").unwrap().as_int() == Some(3), command_text(asleep))
+    assert(s.get("cores").unwrap().at(0).unwrap().get("state").unwrap().as_str() == Some("sleeping"), command_text(asleep))
+
+@test("benchtop run --report: a scripted Pico 2 run to its --timeout writes the report, its status 124")
+command_report_scripted_timeout()
+    needs_benchtop()
+    val dir = make_temp_dir("benchtop-report").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val file = s"$dir/pico2.json"
+    val o = benchtop(["run", "--board", "pico2", "--deterministic", "--quiet", "--timeout", "10ms", "--report", file, "examples/pico2/hello_serial.elf"][..])
+    assert(exited(o) == 124, err_of(o))
+    val j = command_json(file)
+    assert(j.get("exit").unwrap().as_str() == Some("timeout") && j.get("status").unwrap().as_int() == Some(124), command_text(file))
+    assert(j.get("cores").unwrap().len() == 2, command_text(file))
+
+@test("benchtop run --report: --window and --gdb refuse it by name and write nothing; a board benchtop refuses is an error report; a file that cannot be written is status 1, naming it")
+command_report_refusals()
+    needs_benchtop()
+    val dir = make_temp_dir("benchtop-report").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val window = s"$dir/window.json"
+    val w = benchtop(["run", "--board", "pico2", "--window", "--report", window, "examples/pico2/hello_serial.elf"][..])
+    assert(exited(w) == 1 && err_of(w).contains("--report is for a run without --window"), err_of(w))
+    assert(!is_file(window))
+    val gdb = s"$dir/gdb.json"
+    val g = benchtop(["run", "--board", "pico2", "--gdb", "--report", gdb, "examples/pico2/hello_serial.elf"][..])
+    assert(exited(g) == 1 && err_of(g).contains("--report is for a run without --gdb"), err_of(g))
+    assert(!is_file(gdb))
+
+    val board = s"$dir/board.json"
+    val b = benchtop(["run", "--board", "no-such-board", "--report", board, "examples/pico2/hello_serial.elf"][..])
+    assert(exited(b) == 1, err_of(b))
+    val j = command_json(board)
+    assert(j.get("exit").unwrap().as_str() == Some("error") && j.get("status").unwrap().as_int() == Some(1), command_text(board))
+    assert(j.get("message").unwrap().as_str().unwrap().contains("no-such-board") && !j.has("cores"), command_text(board))
+
+    val image = s"$dir/exit.bin"
+    write_bytes(image, COMMAND_EXIT[..]).unwrap()
+    val nowhere = s"$dir/no/such/dir/report.json"
+    val n = benchtop(["run", "--report", nowhere, image][..])
+    assert(exited(n) == 1 && err_of(n).contains("cannot write") && err_of(n).contains("report.json"), err_of(n))

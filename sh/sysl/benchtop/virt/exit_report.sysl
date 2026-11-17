@@ -1,0 +1,320 @@
+module sh.sysl.benchtop.virt
+
+// The exit report (`benchtop run --report <file.json>`): how a run ended, as one small JSON object a
+// shell gate or an agent reads without parsing the console. It is made from the board's state once the
+// run has ended, and from nothing while it runs: a run that names no report never builds one.
+//
+// The object, compact on one line (README.md, "The exit report"):
+//
+//     exit             how the run ended: one of `exit_name`'s words
+//     status           the status `benchtop run` exits with
+//     exit_status      the guest's own status, where it ended the run itself (`exit`)
+//     message          what `benchtop run` says on stderr about the end, where it says something
+//     cycles           the board's clock, in its cycles since power-on
+//     virtual_time_ns  the same in nanoseconds, where the board's chip names its clock's rate
+//     cores            each core: `core`, `started`, and for one that started its `state`, `pc`,
+//                      `symbol`, `cycles`, `retired` and its architecture's registers
+//
+// An address is a "0x…" string of eight hex digits, so that it stays exact in any reader. A field that
+// does not apply is left out, never null. The member `fault` is kept for an explanation of a fault, and
+// is not written yet.
+
+import sh.sysl.benchtop.v6m.{Cpu, Stop, clock, exception_name, is_baseline}
+import sh.sysl.elf as elf
+import sh.sysl.json.{Json, array_builder, object_builder, ObjectBuilder}
+import sysl.buf.{Buf, buf}
+import sysl.text.from_utf8_lossy
+
+/** How a run ended, as the exit report's `exit` says it. */
+enum ExitKind
+    /** The guest ended the run itself with a status: a semihosting `SYS_EXIT`, the virtual console's
+     * EXIT register, a RISC-V hart's exit. */
+    Exit
+    /** Every `--expect`ed text appeared. */
+    ExpectMet
+    /** `--timeout` came first. */
+    Timeout
+    /** A core locked up: a fault it could not take (an M0+'s HardFault within HardFault, a stack-limit
+     * violation at a negative priority), or one benchtop does not model. */
+    FaultLockup
+    /** A core stopped on a fault the run stops at (an undefined instruction, an access nothing
+     * answers, a Security Extension transition not modelled), or the chip refused something. */
+    Fault
+    /** A core executed `BKPT` (or a hart `EBREAK`) that is not a semihosting call. */
+    Breakpoint
+    /** Every core sleeps in WFI or WFE, and nothing on the board will wake one. */
+    Asleep
+    /** The run's budget ran out with every core still running. */
+    Budget
+    /** The guest asked for a reset the board does not make. */
+    Reset
+    /** benchtop refused the run, or something it needed: an option, the image, the board. */
+    Error
+
+/** The word `exit` gives for `k`. */
+exit_name(k: ExitKind) -> string = k match
+    Exit -> "exit"
+    ExpectMet -> "expect_met"
+    Timeout -> "timeout"
+    FaultLockup -> "fault_lockup"
+    Fault -> "fault"
+    Breakpoint -> "breakpoint"
+    Asleep -> "asleep"
+    Budget -> "budget"
+    Reset -> "reset"
+    Error -> "error"
+
+/** What a core is doing at the end of a run, as the report's `state` says it. */
+enum CoreState
+    Running
+    Sleeping
+    Halted
+    LockedUp
+
+private state_name(s: CoreState) -> string = s match
+    Running -> "running"
+    Sleeping -> "sleeping"
+    Halted -> "halted"
+    LockedUp -> "locked_up"
+
+/** Which registers a core's entry carries beside its pc. */
+enum CoreArch
+    /** ARMv6-M or ARMv8-M Baseline: the stack pointers, CONTROL, PRIMASK, IPSR. */
+    Baseline
+    /** ARMv7-M or ARMv8-M Mainline: the same, and BASEPRI and FAULTMASK. */
+    Mainline
+    /** A RISC-V hart: mstatus and the privilege level. */
+    RiscV
+
+/** One core at the end of a run, read from the engine's own state. A core that never started has
+ * nothing but `core` and `started` worth reporting.
+ */
+struct CoreReport
+    core: u32
+    started: bool
+    arch: CoreArch
+    state: CoreState
+    /** The run end this core's stop is, `Budget` while it has not stopped. */
+    stop: ExitKind
+    pc: u32
+    cycles: u64
+    retired: u64
+    // The Cortex-M registers: the stack pointer in use, both banked ones, and the special registers.
+    sp: u32
+    msp: u32
+    psp: u32
+    control: u32
+    primask: u32
+    basepri: u32
+    faultmask: u32
+    ipsr: u32
+    // The core has the Security Extension, and runs in Non-secure state where `ns`.
+    security: bool
+    ns: bool
+    // A RISC-V hart's mstatus and privilege level (0 user, 3 machine).
+    mstatus: u32
+    privilege: u32
+
+/** A core that has not started. */
+unstarted_core(k: u32, arch: CoreArch) -> CoreReport =
+    CoreReport(k, false, arch, CoreState.Halted, ExitKind.Budget, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, false, 0, 0)
+
+/** The run end a Cortex-M core's stop is. */
+stop_kind(cpu: *Cpu) -> ExitKind = cpu.stop match
+    Running -> ExitKind.Budget
+    Breakpoint -> ExitKind.Breakpoint
+    Exit -> ExitKind.Exit
+    Asleep -> ExitKind.Asleep
+    Reset -> ExitKind.Reset
+    Fault | StackLimit -> ExitKind.FaultLockup
+    Undefined | Unmapped | NonSecure -> ExitKind.Fault
+
+/** Cortex-M core `k` as the report gives it: `started` says whether it ever ran. */
+cortex_core_report(cpu: *Cpu, k: u32, started: bool) -> CoreReport
+    val arch = if is_baseline(cpu.kind) then CoreArch.Baseline else CoreArch.Mainline
+    if !started then return unstarted_core(k, arch)
+    val state = cpu.stop match
+        Running -> if cpu.sleeping then CoreState.Sleeping else CoreState.Running
+        Asleep -> CoreState.Sleeping
+        Fault | StackLimit -> CoreState.LockedUp
+        _ -> CoreState.Halted
+    // `r[13]` is the stack pointer in use: the process stack's in thread mode with CONTROL.SPSEL set.
+    val on_psp = cpu.ipsr == 0 && cpu.control & 2 != 0
+    val msp = if on_psp then cpu.sp_other else cpu.r[13]
+    val psp = if on_psp then cpu.r[13] else cpu.sp_other
+    CoreReport(k, true, arch, state, stop_kind(cpu), cpu.pc, clock(cpu, cpu.retired), cpu.retired, cpu.r[13], msp, psp,
+        cpu.control, cpu.primask, cpu.basepri, cpu.faultmask, cpu.ipsr, cpu.security, cpu.ns, 0, 0)
+
+/** The run end the cores' stops make: the first started core that stopped, and `otherwise` where none
+ * did (the board ended the run itself, a chip refusal among them).
+ */
+ended_kind(cores: []const CoreReport, otherwise: ExitKind) -> ExitKind
+    for c in cores do if c.started && c.stop != ExitKind.Budget then return c.stop
+    otherwise
+
+/** Everything the exit report holds. */
+struct ExitReport
+    exit: ExitKind
+    status: int
+    message: string
+    /** The guest's own status where it ended the run itself; -1 for none. */
+    exit_status: long
+    /** The board's clock, and whether its chip names a rate, so that `ns` means something. */
+    cycles: u64
+    rated: bool
+    ns: u64
+    cores: Buf[CoreReport]
+
+/** A report of a run that ended `exit` with `status`, saying `message`, before any board state is
+ * added: a refused run's whole report.
+ */
+exit_report(exit: ExitKind, status: int, message: string) -> ExitReport =
+    ExitReport(exit, status, message, -1, 0, false, 0, buf())
+
+/** `r` with the board `g`'s clock and cores, read now. */
+with_guest(r: ExitReport, g: &Guest) -> ExitReport
+    g.machine() match
+        Some(m) -> return with_machine(r, m)
+        None -> ()
+    var out = r
+    val (cycles, ns) = g.now()
+    out.cycles = cycles
+    out.rated = g.rated()
+    out.ns = ns
+    out.cores = g.report_cores()
+    out
+
+/** `r` with the machine `m`'s clock and both its cores, read now. The machine's clock moves a round
+ * at a time, so where a core stopped inside a round, the board's time is that core's.
+ */
+with_machine(r: ExitReport, m: *Machine) -> ExitReport
+    var out = r
+    out.cores = machine_cores(m)
+    out.cycles = board_now(m)
+    for c in out.cores do if c.started && c.cycles > out.cycles then out.cycles = c.cycles
+    out.rated = clock_hz(m) != 0
+    out.ns = nanos(out.cycles, clock_hz(m))
+    out
+
+/** Both of `m`'s cores as the report gives them. */
+machine_cores(m: *Machine) -> Buf[CoreReport]
+    var cores: Buf[CoreReport] = buf()
+    cores.push(cortex_core_report(&m.cores[0], 0, true))
+    cores.push(cortex_core_report(&m.cores[1], 1, running_both(m)))
+    cores
+
+// ---------------------------------------------------------------------------------------------------
+// Symbols.
+
+/** A function or label of the image, as the report names an address by it. A label (no size) names
+ * addresses up to `end`, the end of its section.
+ */
+struct ImageSymbol
+    start: u32
+    size: u32
+    name: string
+    end: u32
+
+/** The image's function and label symbols, for `symbol_at`; none where `image` is not an ELF file or
+ * has no symbol table. A Thumb function's address has its low bit cleared. Mapping symbols (`$t`,
+ * `$d`), empty names, absolute symbols and labels outside a section of instructions are left out.
+ */
+image_symbols(image: []const u8) -> Buf[ImageSymbol]
+    var out: Buf[ImageSymbol] = buf()
+    val e = elf.read(image) match
+        Ok(e) -> e
+        Err(_) -> return out
+    val all = e.symbols() match
+        Ok(s) -> s
+        Err(_) -> return out
+    val count = e.header.shnum
+    for s in all
+        if s.kind != elf.STT_FUNC && s.kind != elf.STT_NOTYPE then continue
+        // An undefined symbol (section 0) and an absolute one or another in a reserved section (0xff00
+        // up: a constant, not a place in the image) name no address.
+        if s.name.len == 0 || s.name[0] == u8('$') || s.shndx == 0 || s.shndx >= 0xff00 || s.shndx >= count then continue
+        // A label is code's only in a section of instructions: the linker's data and stack labels
+        // name no pc.
+        val section = e.section(s.shndx)
+        if s.kind == elf.STT_NOTYPE && section.flags & elf.SHF_EXECINSTR == 0 then continue
+        out.push(ImageSymbol(u32(s.value) & ~1u32, u32(s.size), from_utf8_lossy(s.name), u32(section.addr + section.size)))
+    out
+
+/** `a` as `name+0x…` (or the bare name at its start): the symbol whose extent holds it, otherwise the
+ * nearest label at or below it in the same section; None where neither is.
+ */
+symbol_at(symbols: []const ImageSymbol, a: u32) -> Option[string]
+    var best = -1
+    var sized = false
+    for i in 0..<symbols.len
+        val s = symbols[i]
+        if s.start > a then continue
+        val holds = s.size != 0 && a - s.start < s.size
+        if s.size != 0 && !holds then continue
+        if s.size == 0 && a >= s.end then continue
+        // A symbol whose extent holds the address beats a label; between two of the same sort, the
+        // nearer start wins.
+        if best < 0 || (holds && !sized) || (holds == sized && s.start > symbols[best].start)
+            best = int(i)
+            sized = holds
+    if best < 0 then return None
+    val s = symbols[best]
+    val off = a - s.start
+    Some(if off == 0 then s.name else f"${s.name}+0x$off%x")
+
+// ---------------------------------------------------------------------------------------------------
+// The JSON.
+
+private hex32(x: u32) -> Json = Json.Str(f"0x$x%08x")
+
+/** The report as its file holds it: one compact JSON object and a line end. `symbols` names the cores'
+ * pcs (`image_symbols`).
+ */
+exit_report_json(r: *ExitReport, symbols: []const ImageSymbol) -> string
+    var o = object_builder()
+    o.put_str("exit", exit_name(r.exit))
+    o.put_int("status", long(r.status))
+    if r.exit_status >= 0 then o.put_int("exit_status", r.exit_status)
+    if !r.message.is_empty() then o.put_str("message", r.message)
+    if r.cores.len() != 0
+        o.put_int("cycles", long(r.cycles))
+        if r.rated then o.put_int("virtual_time_ns", long(r.ns))
+        var cores = array_builder()
+        for c in r.cores do cores.push(core_json(c, symbols))
+        o.put("cores", cores.finish())
+    s"${o.finish()}\n"
+
+private core_json(c: CoreReport, symbols: []const ImageSymbol) -> Json
+    var o = object_builder()
+    o.put_int("core", long(c.core))
+    o.put_bool("started", c.started)
+    if !c.started then return o.finish()
+    o.put_str("state", state_name(c.state))
+    o.put("pc", hex32(c.pc))
+    symbol_at(symbols, c.pc) match
+        Some(name) -> o.put_str("symbol", name)
+        None -> ()
+    o.put_int("cycles", long(c.cycles))
+    o.put_int("retired", long(c.retired))
+    if c.arch == CoreArch.RiscV
+        o.put("mstatus", hex32(c.mstatus))
+        o.put_str("privilege", privilege_name(c.privilege))
+        return o.finish()
+    o.put("sp", hex32(c.sp))
+    o.put("msp", hex32(c.msp))
+    o.put("psp", hex32(c.psp))
+    o.put_int("control", long(c.control))
+    o.put_int("primask", long(c.primask))
+    if c.arch == CoreArch.Mainline
+        o.put_int("basepri", long(c.basepri))
+        o.put_int("faultmask", long(c.faultmask))
+    o.put_int("ipsr", long(c.ipsr))
+    o.put_str("exception", if c.ipsr == 0 then "thread" else exception_name(c.ipsr))
+    if c.security then o.put_bool("ns", c.ns)
+    o.finish()
+
+private privilege_name(p: u32) -> string = p match
+    0 -> "user"
+    1 -> "supervisor"
+    3 -> "machine"
+    _ -> s"$p"

@@ -1,0 +1,148 @@
+module sh.sysl.benchtop.virt
+@tests
+
+// The exit report's parts (exit_report.sysl): the `exit` words, a core's stop as a run end, a pc named
+// by the image's symbols with and without any, and the JSON, read back so that a malformed one fails.
+
+import sh.sysl.benchtop.v6m.{Cpu, Stop}
+import sh.sysl.json as json
+import sh.sysl.json.Json
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.read_bytes
+
+private reread(text: string) -> Json = json.parse(source_of("report.json", text)) match
+    Ok(j) -> j
+    Err(_) -> panic(s"not JSON:\n$text")
+
+private a_core(k: u32, arch: CoreArch, pc: u32) -> CoreReport =
+    CoreReport(k, true, arch, CoreState.Running, ExitKind.Budget, pc, 100, 50, 0x20001000, 0x20001000, 0x20000800, 2, 1, 0x40, 0, 0, true, true, 0x1800, 3)
+
+@test("exit report: the `exit` words are exactly the documented set, one per way a run ends")
+exit_report_words()
+    var words: Buf[string] = buf()
+    for k in [ExitKind.Exit, ExitKind.ExpectMet, ExitKind.Timeout, ExitKind.FaultLockup, ExitKind.Fault, ExitKind.Breakpoint, ExitKind.Asleep, ExitKind.Budget, ExitKind.Reset, ExitKind.Error]
+        words.push(exit_name(k))
+    var all = ""
+    for w in words do all = s"$all $w"
+    assert(all == " exit expect_met timeout fault_lockup fault breakpoint asleep budget reset error", all)
+
+@test("exit report: a Cortex-M core's stop is its run end — a lockup, a fault, a breakpoint, an exit, asleep, a reset — and a core still running is the budget's")
+exit_report_stop_kinds()
+    var cpu: Cpu
+    for (stop, want) in [(Stop.Running, "budget"), (Stop.Breakpoint, "breakpoint"), (Stop.Exit, "exit"), (Stop.Asleep, "asleep"), (Stop.Reset, "reset"), (Stop.Fault, "fault_lockup"), (Stop.StackLimit, "fault_lockup"), (Stop.Undefined, "fault"), (Stop.Unmapped, "fault"), (Stop.NonSecure, "fault")]
+        cpu.stop = stop
+        assert(exit_name(stop_kind(&cpu)) == want, want)
+        val c = cortex_core_report(&cpu, 0, true)
+        val state = if stop == Stop.Running then CoreState.Running elif stop == Stop.Asleep then CoreState.Sleeping elif stop == Stop.Fault || stop == Stop.StackLimit then CoreState.LockedUp else CoreState.Halted
+        assert(c.state == state && c.stop == stop_kind(&cpu), want)
+    cpu.stop = Stop.Running
+    cpu.sleeping = true
+    assert(cortex_core_report(&cpu, 0, true).state == CoreState.Sleeping)
+    // The first started core that stopped decides; none stopped leaves the caller's word.
+    var cores: Buf[CoreReport] = buf()
+    cores.push(unstarted_core(0, CoreArch.Mainline))
+    cores.push(a_core(1, CoreArch.Mainline, 0))
+    assert(ended_kind(cores.view(), ExitKind.Fault) == ExitKind.Fault)
+    cores[1].stop = ExitKind.FaultLockup
+    assert(ended_kind(cores.view(), ExitKind.Fault) == ExitKind.FaultLockup)
+
+@test("exit report: the stack pointers are told apart by CONTROL.SPSEL in thread mode; handler mode is always on the main stack")
+exit_report_stack_pointers()
+    var cpu: Cpu
+    cpu.r[13] = 0x20002000
+    cpu.sp_other = 0x20001000
+    cpu.control = 2
+    var c = cortex_core_report(&cpu, 0, true)
+    assert(c.sp == 0x20002000 && c.psp == 0x20002000 && c.msp == 0x20001000)
+    cpu.ipsr = 3
+    c = cortex_core_report(&cpu, 0, true)
+    assert(c.msp == 0x20002000 && c.psp == 0x20001000)
+    cpu.control = 0
+    cpu.ipsr = 0
+    c = cortex_core_report(&cpu, 0, true)
+    assert(c.msp == 0x20002000 && c.psp == 0x20001000)
+
+@test("exit report: a pc is named by the function whose extent holds it, the nearer start winning, else the nearest label below it; with no symbols, by none")
+exit_report_symbol_at()
+    var syms: Buf[ImageSymbol] = buf()
+    syms.push(ImageSymbol(0x100, 0x20, "outer", 0x400))
+    syms.push(ImageSymbol(0x110, 0x4, "inner", 0x400))
+    syms.push(ImageSymbol(0x200, 0, "label", 0x400))
+    syms.push(ImageSymbol(0x300, 0x10, "late", 0x400))
+    assert(symbol_at(syms.view(), 0x100) == Some("outer"))
+    assert(symbol_at(syms.view(), 0x104) == Some("outer+0x4"))
+    assert(symbol_at(syms.view(), 0x112) == Some("inner+0x2"))
+    assert(symbol_at(syms.view(), 0x11e) == Some("outer+0x1e"))
+    // Past `outer`'s end with no label below: nothing names it.
+    assert(symbol_at(syms.view(), 0x150) == None)
+    assert(symbol_at(syms.view(), 0x2a0) == Some("label+0xa0"))
+    // A sized symbol holding the address beats a label below it.
+    assert(symbol_at(syms.view(), 0x304) == Some("late+0x4"))
+    // A label names nothing past the end of its section.
+    assert(symbol_at(syms.view(), 0x3f0) == Some("label+0x1f0"))
+    assert(symbol_at(syms.view(), 0x400) == None)
+    assert(symbol_at(syms.view(), 0x50) == None)
+    assert(symbol_at([][..], 0x100) == None)
+
+@test("exit report: an ELF's symbols name its functions with the Thumb bit cleared, leaving out absolute symbols; a raw image has none")
+exit_report_image_symbols()
+    val image = read_bytes("examples/pico2/hello_serial.elf").unwrap()
+    val syms = image_symbols(image.view())
+    var main_at: u32 = 0
+    for s in syms
+        assert(s.name != "__arm32_tls_tcb_offset", "an absolute symbol is no place in the image")
+        if s.name == "main" then main_at = s.start
+    assert(main_at != 0 && main_at & 1 == 0, "main is named, at an even address")
+    assert(symbol_at(syms.view(), main_at) == Some("main"))
+    assert(symbol_at(syms.view(), main_at + 2) == Some("main+0x2"))
+    assert(image_symbols([0x00u8, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00][..]).is_empty())
+
+@test("exit report: the JSON reads back, addresses as eight hex digits, the message escaped, a field that does not apply left out, a core not started only its index")
+exit_report_json_shape()
+    var r = exit_report(ExitKind.Fault, 3, "a \"quoted\"\nline\twith a \\ backslash")
+    r.cycles = 1234
+    r.rated = true
+    r.ns = 5678
+    var m33 = a_core(0, CoreArch.Mainline, 0x10000234)
+    m33.ipsr = 3
+    r.cores.push(m33)
+    r.cores.push(unstarted_core(1, CoreArch.Mainline))
+    var syms: Buf[ImageSymbol] = buf()
+    syms.push(ImageSymbol(0x10000200, 0x40, "main", 0x10001000))
+    val text = exit_report_json(&r, syms.view())
+    assert(text.ends_with("}\n"), text)
+    val j = reread(text)
+    assert(j.get("exit").unwrap().as_str() == Some("fault") && j.get("status").unwrap().as_int() == Some(3), text)
+    assert(j.get("message").unwrap().as_str() == Some("a \"quoted\"\nline\twith a \\ backslash"), text)
+    assert(text.contains("\"message\":\"a \\\"quoted\\\"\\nline\\twith a \\\\ backslash\""), text)
+    assert(j.get("cycles").unwrap().as_int() == Some(1234) && j.get("virtual_time_ns").unwrap().as_int() == Some(5678), text)
+    assert(!j.has("exit_status") && !j.has("fault"), text)
+    val c = j.get("cores").unwrap().at(0).unwrap()
+    assert(c.get("pc").unwrap().as_str() == Some("0x10000234") && c.get("symbol").unwrap().as_str() == Some("main+0x34"), text)
+    assert(c.get("sp").unwrap().as_str() == Some("0x20001000") && c.get("psp").unwrap().as_str() == Some("0x20000800"), text)
+    assert(c.get("exception").unwrap().as_str() == Some("hardfault") && c.get("ipsr").unwrap().as_int() == Some(3), text)
+    assert(c.get("basepri").unwrap().as_int() == Some(0x40) && c.get("ns").unwrap().as_bool() == Some(true), text)
+    assert(c.get("state").unwrap().as_str() == Some("running") && !c.has("mstatus"), text)
+    val off = j.get("cores").unwrap().at(1).unwrap()
+    assert(off.len() == 2 && off.get("core").unwrap().as_int() == Some(1) && off.get("started").unwrap().as_bool() == Some(false), text)
+
+    // An M0+ has no BASEPRI, FAULTMASK or security state; a hart has mstatus and its privilege only.
+    var small = exit_report(ExitKind.Exit, 0, "")
+    small.exit_status = 0
+    var m0 = a_core(0, CoreArch.Baseline, 0x100)
+    m0.security = false
+    small.cores.push(m0)
+    small.cores.push(a_core(1, CoreArch.RiscV, 0x20000000))
+    val text2 = exit_report_json(&small, [][..])
+    val k = reread(text2)
+    assert(k.get("exit_status").unwrap().as_int() == Some(0) && !k.has("message") && !k.has("virtual_time_ns"), text2)
+    val b = k.get("cores").unwrap().at(0).unwrap()
+    assert(b.has("primask") && !b.has("basepri") && !b.has("faultmask") && !b.has("ns") && !b.has("symbol"), text2)
+    val h = k.get("cores").unwrap().at(1).unwrap()
+    assert(h.get("mstatus").unwrap().as_str() == Some("0x00001800") && h.get("privilege").unwrap().as_str() == Some("machine"), text2)
+    assert(!h.has("sp") && !h.has("primask") && !h.has("exception"), text2)
+
+    // A refusal before any board: no clock, no cores.
+    val refused = exit_report_json(&exit_report(ExitKind.Error, 1, "cannot read x.elf"), [][..])
+    assert(refused == "{\"exit\":\"error\",\"status\":1,\"message\":\"cannot read x.elf\"}\n", refused)

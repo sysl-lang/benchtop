@@ -1,0 +1,176 @@
+module sh.sysl.benchtop.script
+@tests
+
+// `--report` in a scripted run (`run`'s `report_file`): the exit report is written however the run
+// ends, each end its own `exit` word, on the Pico 2, the Pico, the Hazard3 harts and the virtual board;
+// read back as JSON, so a malformed file fails. Each report is parsed whole, and the virtual board's
+// are compared exactly.
+
+import sh.sysl.benchtop.v6m.no_faults
+import sh.sysl.json as json
+import sh.sysl.json.Json
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, read_bytes, remove_dir_all, write_bytes}
+import sysl.text.from_utf8_lossy
+
+// Virtual-board raw images: the stack at 0x10000, the reset vector 0x9, the code from 0x8.
+//
+// `ldr r0, =0x40000008; movs r1, #7; str r1, [r0]; b .`: 7 to the console's EXIT register.
+private val REPORT_EXIT: [20]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x01, 0x48, 0x07, 0x21, 0x01, 0x60, 0xfe, 0xe7, 0x08, 0x00, 0x00, 0x40]
+// `udf #0`: an undefined instruction, where the virtual board stops.
+private val REPORT_UDF: [10]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0xde]
+// `svc #0` with no SVCall vector (0, no Thumb bit): an exception the M0+ cannot take, a lockup.
+private val REPORT_SVC: [10]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0xdf]
+// `bkpt #0`.
+private val REPORT_BKPT: [10]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0xbe]
+// `wfi; b .` with nothing that could wake the core.
+private val REPORT_WFI: [12]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00, 0x30, 0xbf, 0xfe, 0xe7]
+// `ldr r0, =0xe000ed0c; ldr r1, =0x05fa0004; str r1, [r0]; b .`: AIRCR.SYSRESETREQ.
+private val REPORT_RESET: [24]u8 = [0x00, 0x00, 0x01, 0x00, 0x09, 0x00, 0x00, 0x00,
+    0x01, 0x48, 0x02, 0x49, 0x01, 0x60, 0xfe, 0xe7, 0x0c, 0xed, 0x00, 0xe0, 0x04, 0x00, 0xfa, 0x05]
+
+// The script `args` give, run quietly on `board` with `image`, its exit report written to `file`.
+private reported(board: string, image: string, args: []const string, file: string) -> Outcome
+    var all: Buf[string] = buf()
+    all.push("--quiet")
+    for a in args do all.push(a)
+    run(board, image, parse(all.view()).unwrap(), setup(), no_faults(), "", file)
+
+// The report in `file`, parsed; a file that is not JSON fails the test.
+private report_json(file: string) -> Json
+    val text = report_text(file)
+    json.parse(source_of(file, text)) match
+        Ok(j) -> j
+        Err(_) -> panic(s"$file is not JSON:\n$text")
+
+private report_text(file: string) -> string = read_bytes(file) match
+    Ok(b) -> from_utf8_lossy(b.view())
+    Err(_) -> ""
+
+private str_of(j: Json, key: string) -> string = j.get(key).unwrap().as_str().unwrap()
+private int_of(j: Json, key: string) -> long = j.get(key).unwrap().as_int().unwrap()
+private core_of(j: Json, k: usize) -> Json = j.get("cores").unwrap().at(k).unwrap()
+
+// The virtual board's image `bytes`, run with a timeout far off, its report's text.
+private virt_report(dir: string, name: string, bytes: []const u8) -> (Outcome, string)
+    val image = s"$dir/$name.bin"
+    write_bytes(image, bytes).unwrap()
+    val file = s"$dir/$name.json"
+    val o = reported("virt", image, ["--timeout", "1000000cycles"][..], file)
+    report_json(file)
+    (o, report_text(file))
+
+@test("script: --report on the virtual board gives each end its word: exit with the guest's status, fault, fault_lockup, breakpoint, asleep and reset; core 1, never started, is only its index")
+script_report_virt_ends()
+    val dir = make_temp_dir("benchtop-report").unwrap()
+    defer remove_dir_all(dir).unwrap()
+
+    val (e, exit_text) = virt_report(dir, "exit", REPORT_EXIT[..])
+    assert(e.status == 7, e.why)
+    assert(exit_text == "{\"exit\":\"exit\",\"status\":7,\"exit_status\":7,\"message\":\"the guest exited with status 7\",\"cycles\":2,\"cores\":[{\"core\":0,\"started\":true,\"state\":\"halted\",\"pc\":\"0x0000000c\",\"cycles\":2,\"retired\":2,\"sp\":\"0x00010000\",\"msp\":\"0x00010000\",\"psp\":\"0x00000000\",\"control\":0,\"primask\":0,\"ipsr\":0,\"exception\":\"thread\"},{\"core\":1,\"started\":false}]}\n", exit_text)
+
+    val (f, fault_text) = virt_report(dir, "udf", REPORT_UDF[..])
+    assert(f.status == FAULTED, f.why)
+    val fault = report_json(s"$dir/udf.json")
+    assert(str_of(fault, "exit") == "fault" && int_of(fault, "status") == 3, fault_text)
+    assert(str_of(core_of(fault, 0), "state") == "halted" && str_of(core_of(fault, 0), "pc") == "0x00000008", fault_text)
+    assert(str_of(fault, "message").contains("undefined instruction"), fault_text)
+
+    val (l, lockup_text) = virt_report(dir, "svc", REPORT_SVC[..])
+    assert(l.status == FAULTED, l.why)
+    val lockup = report_json(s"$dir/svc.json")
+    assert(str_of(lockup, "exit") == "fault_lockup" && str_of(core_of(lockup, 0), "state") == "locked_up", lockup_text)
+
+    val (b, bkpt_text) = virt_report(dir, "bkpt", REPORT_BKPT[..])
+    val bkpt = report_json(s"$dir/bkpt.json")
+    assert(str_of(bkpt, "exit") == "breakpoint" && int_of(bkpt, "status") == long(b.status), bkpt_text)
+    assert(str_of(core_of(bkpt, 0), "pc") == "0x00000008" && !bkpt.has("exit_status"), bkpt_text)
+
+    // A scripted run on the virtual board keeps its console's input open, so a WFI sleeps to the
+    // timeout: the core is reported sleeping (`asleep` itself: exit_report_command_tests.sysl).
+    val (s, asleep_text) = virt_report(dir, "wfi", REPORT_WFI[..])
+    assert(s.status == TIMED_OUT, s.why)
+    val asleep = report_json(s"$dir/wfi.json")
+    assert(str_of(asleep, "exit") == "timeout" && str_of(core_of(asleep, 0), "state") == "sleeping", asleep_text)
+
+    val (r, reset_text) = virt_report(dir, "reset", REPORT_RESET[..])
+    val reset = report_json(s"$dir/reset.json")
+    assert(str_of(reset, "exit") == "reset" && int_of(reset, "status") == long(r.status), reset_text)
+    // A raw image has no symbols: no core names one.
+    assert(!reset_text.contains("\"symbol\""), reset_text)
+
+@test("script: --report on the Pico 2 at its --timeout: both Cortex-M33s with their pcs' symbols, the M33's registers and security state, and the board's time in nanoseconds")
+script_report_pico2_timeout()
+    val dir = make_temp_dir("benchtop-report").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val file = s"$dir/pico2.json"
+    val o = reported("pico2", "examples/pico2/hello_serial.elf", ["--expect", "never", "--timeout", "20ms"][..], file)
+    assert(o.status == TIMED_OUT, o.why)
+    val j = report_json(file)
+    val text = report_text(file)
+    assert(str_of(j, "exit") == "timeout" && int_of(j, "status") == 124 && str_of(j, "message") == "timed out at 20ms waiting for \"never\"", text)
+    assert(int_of(j, "virtual_time_ns") >= 20000000 && int_of(j, "cycles") >= 3000000, text)
+    for k in 0..<2
+        val c = core_of(j, k)
+        assert(int_of(c, "core") == long(k) && c.get("started").unwrap().as_bool().unwrap(), text)
+        assert(str_of(c, "pc").starts_with("0x") && str_of(c, "pc").bytes.len == 10, text)
+        for key in ["sp", "msp", "psp", "control", "primask", "basepri", "faultmask", "ipsr", "exception", "ns", "state", "cycles", "retired"]
+            assert(c.has(key), s"core $k has no $key: $text")
+        assert(!c.has("mstatus") && !c.has("r0"), text)
+    // Core 0 sleeps in the SDK's sleep_ms, between lines, its pc inside a function the ELF names.
+    assert(str_of(core_of(j, 0), "symbol").starts_with("sleep_ms+0x"), text)
+    assert(!j.has("fault") && !j.has("exit_status"), text)
+
+@test("script: --report on the Pico when its --expect is met: expect_met, status 0, and the M0+s with no BASEPRI, FAULTMASK or security state")
+script_report_pico_expect_met()
+    val dir = make_temp_dir("benchtop-report").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val file = s"$dir/pico.json"
+    val o = reported("pico", "examples/pico/hello_serial.elf", ["--expect", "hello, serial 1", "--timeout", "2s"][..], file)
+    assert(o.status == 0, o.why)
+    val j = report_json(file)
+    val text = report_text(file)
+    assert(str_of(j, "exit") == "expect_met" && int_of(j, "status") == 0, text)
+    assert(str_of(j, "message").starts_with("passed: every expected text appeared by "), text)
+    for k in 0..<2
+        val c = core_of(j, k)
+        assert(c.has("primask") && c.has("control") && !c.has("basepri") && !c.has("faultmask") && !c.has("ns"), text)
+
+    val p2 = s"$dir/pico2.json"
+    assert(reported("pico2", "examples/pico2/hello_serial.elf", ["--expect", "hello, serial 1", "--timeout", "2s"][..], p2).status == 0)
+    assert(str_of(report_json(p2), "exit") == "expect_met", report_text(p2))
+
+@test("script: --report on the Hazard3 harts: each hart's pc and symbol, mstatus and privilege, and no Cortex-M register")
+script_report_riscv()
+    val dir = make_temp_dir("benchtop-report").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val file = s"$dir/riscv.json"
+    val o = reported("pico2-riscv", "examples/pico2-riscv/blink.elf", ["--timeout", "5ms"][..], file)
+    assert(o.status == TIMED_OUT, o.why)
+    val j = report_json(file)
+    val text = report_text(file)
+    assert(str_of(j, "exit") == "timeout" && j.has("virtual_time_ns"), text)
+    val c = core_of(j, 0)
+    assert(str_of(c, "mstatus").starts_with("0x") && str_of(c, "privilege") == "machine", text)
+    assert(str_of(c, "symbol").starts_with("main"), text)
+    assert(!c.has("sp") && !c.has("primask") && !c.has("ipsr"), text)
+
+@test("script: --report when benchtop refuses the run is an error with its message and no cores; a report that cannot be written fails the run, naming the file and the run's own end")
+script_report_errors()
+    val dir = make_temp_dir("benchtop-report").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val missing = s"$dir/missing.json"
+    val o = reported("pico2", s"$dir/no-such-image.elf", ["--timeout", "1ms"][..], missing)
+    assert(o.status == FAILED, o.why)
+    val j = report_json(missing)
+    assert(str_of(j, "exit") == "error" && int_of(j, "status") == 1 && str_of(j, "message").starts_with("cannot read "), report_text(missing))
+    assert(!j.has("cores") && !j.has("cycles"), report_text(missing))
+
+    val board = s"$dir/board.json"
+    assert(reported("no-such-board", "examples/pico2/hello_serial.elf", ["--timeout", "1ms"][..], board).status == FAILED)
+    assert(str_of(report_json(board), "exit") == "error", report_text(board))
+
+    val nowhere = reported("pico2", "examples/pico2/hello_serial.elf", ["--timeout", "1ms"][..], s"$dir/no/such/dir/report.json")
+    assert(nowhere.status == FAILED && nowhere.why.contains("cannot write") && nowhere.why.contains("report.json") && nowhere.why.contains("timed out"), nowhere.why)

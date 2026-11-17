@@ -10,7 +10,7 @@ import sh.sysl.benchtop.{Part, article_of, part_model}
 import sh.sysl.benchtop.chip as chip
 import sh.sysl.benchtop.v6m.{Faults, no_faults}
 import sh.sysl.benchtop.virt as virt
-import sh.sysl.benchtop.virt.{PartInput, SdChoice, Session, SliceEnd}
+import sh.sysl.benchtop.virt.{ExitKind, ExitReport, PartInput, SdChoice, Session, SliceEnd, exit_report, exit_report_json, image_symbols, with_guest}
 import sysl.buf.{Buf, buf}
 import sysl.fs.{read_bytes, write_text}
 import sysl.raw.str_cast
@@ -27,12 +27,15 @@ const FAULTED = 3
 const ASLEEP = 4
 
 /** How a scripted run ended: the status `benchtop run` exits with, the line it writes on stderr after
- * `benchtop: `, and the last of what the console showed.
+ * `benchtop: `, the last of what the console showed, the exit report's word for the end, and the
+ * guest's own status where it ended the run itself (-1 where it did not).
  */
 struct Outcome
     status: int
     why: string
     console: Buf[u8]
+    end: ExitKind
+    exit_status: long
 
 /** What else `benchtop run` says about the board: whether benchtop's USB host is on the bus (an
  * RP2350's Cortex-M33 board's, whose CDC serial port then joins the console), whether `--usb` was
@@ -63,15 +66,32 @@ private refused(why: string) -> Outcome
     val b = why.bytes
     var n = b.len
     while n > 0 && b[n - 1] == 10 do n -= 1
-    Outcome(FAILED, why[..<n], buf())
+    Outcome(FAILED, why[..<n], buf(), ExitKind.Error, -1)
 /** Run the image in `file` on the board `which` names, as `sc` scripts it, its console on stdout unless
  * the script is quiet, varied as `faults` says (`--seed` and the fault options). A `masking_file` not
  * empty receives the masking report of the board's Cortex-M cores (`--report-masking`) when the run
- * ends, whichever way it ends: the script passing, the timeout, a fault, an exit. `benchtop run` exits
- * with the outcome's status after writing why on stderr; a board or an option it refuses, or a report
- * it cannot write, is status 1.
+ * ends, whichever way it ends: the script passing, the timeout, a fault, an exit. A `report_file` not
+ * empty receives the exit report (`--report`, virt/exit_report.sysl) however the run ends, a refusal
+ * included. `benchtop run` exits with the outcome's status after writing why on stderr; a board or an
+ * option it refuses, or a report it cannot write, is status 1.
  */
-run(which: string, file: string, sc: Script, setup: Setup, faults: Faults = no_faults(), masking_file: string = "") -> Outcome
+run(which: string, file: string, sc: Script, setup: Setup, faults: Faults = no_faults(), masking_file: string = "", report_file: string = "") -> Outcome
+    var report = exit_report(ExitKind.Error, 0, "")
+    val outcome = played(which, file, sc, setup, faults, masking_file, !report_file.is_empty(), &report)
+    if report_file.is_empty() then return outcome
+    report.exit = outcome.end
+    report.status = outcome.status
+    report.message = outcome.why
+    report.exit_status = outcome.exit_status
+    val symbols = read_bytes(file) match
+        Ok(b) -> image_symbols(b.view())
+        Err(_) -> buf()
+    write_text(report_file, exit_report_json(&report, symbols.view())) match
+        Ok(_) -> outcome
+        Err(e) -> Outcome(FAILED, s"cannot write $report_file: $e (the run: ${outcome.why})", outcome.console, outcome.end, outcome.exit_status)
+
+// `run`'s run: where `reporting`, the board's clock and cores go into `report` as the run ends.
+private played(which: string, file: string, sc: Script, setup: Setup, faults: Faults, masking_file: string, reporting: bool, report: *ExitReport) -> Outcome
     val image = read_bytes(file) match
         Ok(b) -> b
         Err(e) -> return refused(s"cannot read $file: $e")
@@ -110,10 +130,11 @@ run(which: string, file: string, sc: Script, setup: Setup, faults: Faults = no_f
             Err(why) -> return refused(why)
     var rig = Rig(session, 0, buf(), buf(), name)
     val outcome = drive(&rig, sc)
+    if reporting then *report = with_guest(*report, session.guest)
     if !masking then return outcome
     write_text(masking_file, virt.guest_masking_text(session.guest)) match
         Ok(_) -> outcome
-        Err(e) -> Outcome(FAILED, s"cannot write $masking_file: $e (the run: ${outcome.why})", outcome.console)
+        Err(e) -> Outcome(FAILED, s"cannot write $masking_file: $e (the run: ${outcome.why})", outcome.console, outcome.end, outcome.exit_status)
 
 // ---------------------------------------------------------------------------------------------------
 // The steps, over any board.
@@ -311,7 +332,7 @@ private drive(r: *Rig, sc: Script) -> Outcome
                 if !why.is_empty() then return refused(why)
                 targets.push(0)
             Expect(_) -> targets.push(0)
-    var out = Outcome(0, "", buf())
+    var out = Outcome(0, "", buf(), ExitKind.Budget, -1)
     // What the console has shown that no expected text has taken yet, and what came in the last slice.
     var seen: Buf[u8] = buf()
     var fresh: Buf[u8] = buf()
@@ -358,6 +379,7 @@ private drive(r: *Rig, sc: Script) -> Outcome
         val finished = step == sc.steps.len() && held.is_empty() && typed == typing.len()
         if finished && expects
             out.why = s"passed: every expected text appeared by ${time_text(r, now)}"
+            out.end = ExitKind.ExpectMet
             return out
         if finished && !ended_input && sc.active()
             r.end_input()
@@ -365,6 +387,7 @@ private drive(r: *Rig, sc: Script) -> Outcome
         sc.timeout match
             Some(d) -> if reached(now, d)
                 out.status = TIMED_OUT
+                out.end = ExitKind.Timeout
                 var why = s"timed out at ${d.text()}${waiting_for(&sc, step)}"
                 if typed < typing.len() then why = why + s", ${typing.len() - typed} typed characters not taken" + (if blocked.is_empty() then "" else s" ($blocked)")
                 out.why = why
@@ -413,6 +436,7 @@ private drive(r: *Rig, sc: Script) -> Outcome
                 elif stalled_at != int(step) || !fresh.is_empty() then stalled_at = int(step)
                 else
                     out.status = ASLEEP
+                    out.end = ExitKind.Asleep
                     out.why = s"the cores sleep, and nothing on the board will wake them${waiting_for(&sc, step)}"
                     return out
             Ended(status, why) ->
@@ -425,7 +449,10 @@ private drive(r: *Rig, sc: Script) -> Outcome
                     step += 1
                 if expects && step == sc.steps.len()
                     out.why = s"passed: every expected text appeared by ${time_text(r, r.now())}"
+                    out.end = ExitKind.ExpectMet
                     return out
+                out.end = virt.ended_kind(r.session.guest.report_cores().view(), ExitKind.Exit)
+                if out.end == ExitKind.Exit then out.exit_status = long(status)
                 if expects
                     out.status = if status != 0 then status else FAILED
                     out.why = s"$why${waiting_for(&sc, step, ended = true)}"
@@ -435,6 +462,9 @@ private drive(r: *Rig, sc: Script) -> Outcome
                 return out
             Faulted(why) ->
                 out.status = FAULTED
+                // A chip's refusal stops no core; a core's stop says which sort of fault it was.
+                val k = virt.ended_kind(r.session.guest.report_cores().view(), ExitKind.Fault)
+                out.end = if k == ExitKind.FaultLockup || k == ExitKind.Reset then k else ExitKind.Fault
                 out.why = why
                 return out
     end loop

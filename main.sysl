@@ -1,6 +1,6 @@
 // benchtop: a microcontroller board emulator.
 //
-//     benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--semihosting] [--serial uart0|uart1=file:<path>] [--report-masking <file>] <image.elf | image.bin>
+//     benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--usb console|pty|off] [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--semihosting] [--serial uart0|uart1=file:<path>] [--report-masking <file>] [--report <file.json>] <image.elf | image.bin>
 //         Boot the image on the board `--board` names, the virtual board `virt` where none is named,
 //         its console on this terminal, a keystroke at a time. Ctrl-] ends benchtop whatever the
 //         guest is doing. The exit status is the guest's, written to the console's EXIT register.
@@ -15,7 +15,13 @@
 //         board at reset until a gdb resumes it (docs/gdb.md). `--report-masking` writes each Cortex-M
 //         core's masked intervals and interrupt latencies to `file` when the run ends, however it
 //         ends: on a virtual board, a Pico or a Pico 2, scripted or not; `--window`, `--gdb` and the
-//         Hazard3 harts refuse it (README.md, "The masking report").
+//         Hazard3 harts refuse it (README.md, "The masking report"). `--report` writes the exit
+//         report to `file.json` as the run ends, however it ends (a file it cannot write fails the
+//         run, status 1): one JSON object saying how it ended (`exit`: exit,
+//         expect_met, timeout, fault_lockup, fault, breakpoint, asleep, budget, reset or error), the
+//         status, the board's clock and each core's pc, symbol, state and registers, on every board
+//         and its Cortex-M cores or Hazard3 harts, scripted or not; `--window` and `--gdb` refuse it
+//         (README.md, "The exit report").
 //
 //     benchtop check [--mcu] <name | file.hocon>
 //         Read a chip, board or product description and hold it to the library: print every mistake,
@@ -51,7 +57,8 @@
 //         that one, so a process-wide counter (`time -l`'s cycles and instructions) measures it alone.
 
 import sh.sysl.benchtop.v6m.{cycles as memory_cycles,configure_instruction_timing,Cpu, FAULT_OPTIONS, Faults, Kind, Memory, Stop, memory, model_named, no_faults, reset, run_match, run_threaded, take_fault}
-import sh.sysl.benchtop.virt.{Machine, SdChoice, board_named, board_named_sd, sd_choice, boot, capture, core0, core1, described_error, explore, image_of, listen, machine, machine_guest, open_console, output, run_board, set_threads, stop_message, type_in, record_board_masking, board_masking_text, MASKING_CORTEX_ONLY}
+import sh.sysl.benchtop.virt.{Machine, SdChoice, board_named, board_named_sd, sd_choice, boot, capture, core0, core1, described_error, explore, image_of, listen, machine, machine_guest, open_console, output, run_board, set_threads, stop_message, type_in, record_board_masking, board_masking_text, MASKING_CORTEX_ONLY, ExitKind, ExitReport, exit_report, exit_report_json, image_symbols, stop_kind, with_machine}
+import sysl.buf.buf
 import sh.sysl.benchtop.{built_in_shelf, library, listing, load, open_chip, open_description, summary}
 import sysl.raw.str_cast
 import sh.sysl.parsing.Span
@@ -79,7 +86,7 @@ usage()
     print("usage: benchtop demo [--headless] [--frames N] [--screenshot out.png]")
     print("       benchtop view <board | file.hocon> [--frames N] [--screenshot out.png]")
     print("       benchtop render <board | file.hocon> <out.png>")
-    print("       benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--threads] [--usb console|pty|off] [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--semihosting] [--serial uart0|uart1=file:<path>] [--report-masking <file>] <image.elf | image.bin>")
+    print("       benchtop run [--board <name | file.hocon>] [--window] [--deterministic] [--threads] [--usb console|pty|off] [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--semihosting] [--serial uart0|uart1=file:<path>] [--report-masking <file>] [--report <file.json>] <image.elf | image.bin>")
     print("       run --window: [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>] [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png]")
     print(s"       run, scripted: ${script.OPTIONS}")
     print(s"       run, varied: $FAULT_OPTIONS")
@@ -90,8 +97,39 @@ usage()
     exit(2)
 
 die(why: string) -> never
+    report_end(exit_report(ExitKind.Error, 1, why))
     eprints(s"benchtop: $why\n")
     exit(1)
+
+// End the run on a description's refusal, `why` as it renders itself, on lines of its own: status 1,
+// and an `error` report holding its first line.
+refuse(why: string) -> never
+    val b = why.bytes
+    var n: usize = 0
+    while n < b.len && b[n] != 10 do n += 1
+    val first = why[..<n]
+    report_end(exit_report(ExitKind.Error, 1, if first.starts_with("benchtop: ") then first[10..] else first))
+    eprints(why)
+    exit(1)
+
+// The exit report's file (`benchtop run --report`), empty for none, and the image whose symbols name
+// the cores' pcs in it. A run names the file once its options are accepted; from then on, however the
+// run ends, its report is written there: by the run's own end, or as an `error` by `die`.
+var report_file = ""
+var report_image = ""
+
+// Write `r` to the exit report's file, where one is named, and forget the file, so that a report is
+// written once. A file that cannot be written ends the run with status 1.
+report_end(r: ExitReport)
+    if report_file.is_empty() then return
+    val f = report_file
+    report_file = ""
+    val symbols = read_bytes(report_image) match
+        Ok(b) -> image_symbols(b.view())
+        Err(_) -> buf()
+    write_text(f, exit_report_json(&r, symbols.view())) match
+        Ok(_) -> ()
+        Err(e) -> die(if r.message.is_empty() then s"cannot write $f: $e" else s"cannot write $f: $e (the run: ${r.message})")
 
 read_or_die(file: string) -> []u8 = read_bytes(file) match
     Ok(b) -> b
@@ -161,6 +199,7 @@ run_command(args: []string)
     var threads_named = false
     var faults = no_faults()
     var masking_file = ""
+    var report = ""
     var steps = script.script()
     var i = 2
 
@@ -229,6 +268,10 @@ run_command(args: []string)
                 if i + 1 >= args.len - 1 then usage()
                 masking_file = args[i + 1]
                 i += 2
+            "--report" ->
+                if i + 1 >= args.len - 1 then usage()
+                report = args[i + 1]
+                i += 2
             "--semihosting" ->
                 arm.semihosting = true
                 i += 1
@@ -259,12 +302,14 @@ run_command(args: []string)
         parallel = false
 
     if !masking_file.is_empty() && (window || gdb_port != 0) then die("--report-masking is for a run without --window or --gdb")
+    if !report.is_empty() && window then die("--report is for a run without --window")
+    if !report.is_empty() && gdb_port != 0 then die("--report is for a run without --gdb")
 
     if steps.active()
         if window then die("--expect, --type, --press, --timeout and --quiet are for a run without --window")
         if gdb_port != 0 then die("--expect, --type, --press, --timeout and --quiet are for a run without --gdb")
         if usb == UsbMode.Pty then die("--usb pty is for a run without a script: a scripted run types into the console")
-        val outcome = script.run(which, args[i], steps, script.Setup(usb != UsbMode.Off, usb_named, sd, sd_named, rom_boot, arm), faults, masking_file)
+        val outcome = script.run(which, args[i], steps, script.Setup(usb != UsbMode.Off, usb_named, sd, sd_named, rom_boot, arm), faults, masking_file, report)
         eprints(s"benchtop: ${outcome.why}\n")
         exit(outcome.status)
 
@@ -284,6 +329,8 @@ run_command(args: []string)
     if !instrument_file.is_empty() then die("--instruments requires --window")
     if host.enabled(develop) then die("--watch, --build and --watch-source require --window")
     if headless || frames != 0 || !screenshot.is_empty() then die("--headless, --frames and --screenshot require --window")
+    report_file = report
+    report_image = args[i]
     run(which, args[i], parallel, usb, usb_named, gdb_port, sd, sd_named, rom_boot, arm, faults, masking_file)
 
 // The port gdb connects to for core 0 where `--gdb` names none, OpenOCD's.
@@ -320,9 +367,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
             if faults.any() then die("--seed and the fault options are for a board of Cortex-M cores")
             if !masking_file.is_empty() then die(MASKING_CORTEX_ONLY)
             run_riscv(map, file, rp_parts_named(which))
-        Some(Err(why)) ->
-            eprints(why)
-            exit(1)
+        Some(Err(why)) -> refuse(why)
         None -> ()
     chip.arm_named(which) match
         Some(Ok(map)) ->
@@ -332,9 +377,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
             b.rom_boot = rom_boot
             b.apply_options(arm)
             run_arm(b, file, usb, rp_parts_named(which), faults, masking_file)
-        Some(Err(why)) ->
-            eprints(why)
-            exit(1)
+        Some(Err(why)) -> refuse(why)
         None -> ()
     chip.pico_named(which) match
         Some(Ok(map)) ->
@@ -345,9 +388,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
             val b = chip.pico_board(map)
             b.apply_options(arm)
             run_arm(b, file, UsbMode.Off, rp_parts_named(which), faults, masking_file)
-        Some(Err(why)) ->
-            eprints(why)
-            exit(1)
+        Some(Err(why)) -> refuse(why)
         None -> ()
     if usb_named then die("--usb is for a board of an RP2350's Cortex-M33 cores")
     if rom_boot then die(script.BOOT_ROM_RP2350)
@@ -356,9 +397,7 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
     val m = &*board
     board_named_sd(m, which, sd) match
         Ok(_) -> ()
-        Err(why) ->
-            eprints(why)
-            exit(1)
+        Err(why) -> refuse(why)
 
     val image = image_of(m, read_or_die(file)) match
         Ok(b) -> b
@@ -380,6 +419,15 @@ run(which: string, file: string, parallel: bool, usb: UsbMode, usb_named: bool, 
     val core = run_board(m)
 
     if !masking_file.is_empty() then write_masking(m, masking_file)
+    if !report_file.is_empty()
+        val (status, why) = core.stop match
+            Exit -> (int(core.exit_code), "")
+            Running -> (0, "")
+            Breakpoint | Reset -> (0, stop_message(core))
+            _ -> (3, stop_message(core))
+        var r = with_machine(exit_report(stop_kind(core), status, why), m)
+        if core.stop == Stop.Exit then r.exit_status = long(core.exit_code)
+        report_end(r)
 
     core.stop match
         Exit -> exit(int(core.exit_code))
@@ -410,15 +458,22 @@ run_riscv(map: chip.SramMap, file: string, parts: chip.RpParts) -> never
     loop
         val end = b.run(QUANTUM)
         // At a breakpoint the chip runs on, as under a debugger, until UART0 has sent what it holds.
-        if end == chip.RunEnd.Breakpoint && !b.finish_sending() then die(b.refused)
+        if end == chip.RunEnd.Breakpoint && !b.finish_sending()
+            if !report_file.is_empty() then report_end(b.end_report(chip.RunEnd.Fault, 1, b.refused))
+            die(b.refused)
         shown = show_console(b.console.view(), shown, end != chip.RunEnd.Budget)
-        end match
-            Budget -> ()
-            Breakpoint | Exit -> exit(0)
-            Fault -> die(if b.refused.is_empty() then "a hart stopped on a fault" else b.refused)
-            Asleep ->
-                eprints("benchtop: both harts sleep, and nothing on the chip will wake them\n")
-                exit(4)
+        if end == chip.RunEnd.Budget then continue
+        val why = end match
+            Fault -> if b.refused.is_empty() then "a hart stopped on a fault" else b.refused
+            Asleep -> "both harts sleep, and nothing on the chip will wake them"
+            _ -> ""
+        val status = end match
+            Breakpoint | Exit | Budget -> 0
+            Fault -> 1
+            Asleep -> 4
+        if !report_file.is_empty() then report_end(b.end_report(end, status, why))
+        if !why.is_empty() then eprints(s"benchtop: $why\n")
+        exit(status)
 
 // Serve gdb on `port` and on for the RP board `which`, an RP2350 on its Cortex-M33 cores (benchtop's USB
 // host on its bus where `usb` says so) or an RP2040, running the image `file`; its UART0, and its USB
@@ -462,7 +517,9 @@ run_arm[C: chip.ArmChip + chip.PartPins](b: &chip.ArmBoard[C], file: string, usb
         val end = b.run(QUANTUM)
         if end != chip.RunEnd.Budget && !masking_file.is_empty() then write_report(masking_file, b.masking_text())
         // At a breakpoint the chip runs on, as under a debugger, until UART0 has sent what it holds.
-        if (end == chip.RunEnd.Breakpoint || end == chip.RunEnd.Exit) && !b.finish_sending() then die(b.refused)
+        if (end == chip.RunEnd.Breakpoint || end == chip.RunEnd.Exit) && !b.finish_sending()
+            if !report_file.is_empty() then report_end(b.end_report(chip.RunEnd.Fault, 1, b.refused))
+            die(b.refused)
         shown = show_console(b.console.view(), shown, end != chip.RunEnd.Budget)
         val h = &b.usb_host
         pty match
@@ -475,20 +532,25 @@ run_arm[C: chip.ArmChip + chip.PartPins](b: &chip.ArmBoard[C], file: string, usb
         h.take_note() match
             Some(n) -> eprints(s"benchtop: $n\n")
             None -> ()
-        end match
-            Budget -> ()
-            Breakpoint -> exit(0)
-            Exit -> exit(int(b.exit_status))
-            Fault -> die(if b.refused.is_empty() then s"a core stopped: ${arm_stop(&*b)}" else b.refused)
-            Asleep ->
-                if const C.rp2350()
-                    if b.chip.swcore_off then die_asleep("benchtop: POWMAN has powered the switched core down, and nothing on the chip will power it up\n")
-                die_asleep("benchtop: both cores sleep, and nothing on the chip will wake them\n")
+        if end == chip.RunEnd.Budget then continue
+        val why = end match
+            Fault -> if b.refused.is_empty() then s"a core stopped: ${arm_stop(&*b)}" else b.refused
+            Asleep -> asleep_why(&*b)
+            _ -> ""
+        val status = end match
+            Breakpoint | Budget -> 0
+            Exit -> int(b.exit_status)
+            Fault -> 1
+            Asleep -> 4
+        if !report_file.is_empty() then report_end(b.end_report(end, status, why))
+        if !why.is_empty() then eprints(s"benchtop: $why\n")
+        exit(status)
 
-// Say why the run ends asleep, and end it (exit 4).
-die_asleep(why: string) -> never
-    eprints(why)
-    exit(4)
+// Why an Arm RP run ends asleep.
+asleep_why[C: chip.ArmChip](b: *chip.ArmBoard[C]) -> string
+    if const C.rp2350()
+        if b.chip.swcore_off then return "POWMAN has powered the switched core down, and nothing on the chip will power it up"
+    "both cores sleep, and nothing on the chip will wake them"
 
 // How the core that stopped an Arm run stopped, as `stop_message` says it.
 arm_stop[C: chip.ArmChip](b: *chip.ArmBoard[C]) -> string

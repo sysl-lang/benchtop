@@ -1,0 +1,114 @@
+module sh.sysl.benchtop.chip
+@tests
+
+// The exit report of an RP board run as `benchtop run` runs one unscripted (`ArmBoard.end_report`,
+// `RiscvBoard.end_report`): a semihosting exit with its status and a breakpoint on the Pico 2 and the
+// Pico, both cores reported, the pc named from the image's symbols; read back as JSON.
+
+import sh.sysl.benchtop.v6m as arm
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.benchtop.virt.{ExitKind, exit_report_json, image_symbols}
+import sh.sysl.json as json
+import sh.sysl.json.Json
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+
+private val REPORT_PICO2 = embed("../../../../examples/pico2/blink.elf")
+private val REPORT_PICO = embed("../../../../examples/pico/blink.elf")
+private const REPORT_CODE: u32 = 0x20030000
+private const REPORT_DATA: u32 = 0x20030100
+
+private reread(text: string) -> Json = json.parse(source_of("report.json", text)) match
+    Ok(j) -> j
+    Err(_) -> panic(s"not JSON:\n$text")
+
+// `code` at REPORT_CODE, core 0 starting there; run until something other than the budget ends it.
+private report_ran[C: ArmChip](b: &ArmBoard[C], code: []const u16) -> RunEnd
+    val c = &b.cores[0]
+    for i in 0..<code.len do arm.store16(c, REPORT_CODE + u32(2 * i), u32(code[i]))
+    c.pc = REPORT_CODE
+    c.stop = Stop.Running
+    c.sleeping = false
+    var end = RunEnd.Budget
+    var rounds = 0
+    while end == RunEnd.Budget && rounds < 100
+        end = b.run(10000)
+        rounds += 1
+    end
+
+// `--semihosting`, which a board takes before it boots.
+private semihosting() -> ArmOptions
+    var o = arm_options()
+    o.semihosting = true
+    o
+
+// SYS_EXIT_EXTENDED with ADP_Stopped_ApplicationExit and `code`: two NOPs, then `bkpt 0xab`.
+private exit_with[C: ArmChip](b: &ArmBoard[C], code: u32) -> RunEnd
+    val c = &b.cores[0]
+    arm.store32(c, REPORT_DATA, 0x20026)
+    arm.store32(c, REPORT_DATA + 4, code)
+    c.r[0] = 0x20
+    c.r[1] = REPORT_DATA
+    report_ran(b, [0xBF00u16, 0xBF00, 0xBEAB][..])
+
+private exit_report_checked(text: string, status: long, m33: bool)
+    val j = reread(text)
+    assert(j.get("exit").unwrap().as_str() == Some("exit") && j.get("status").unwrap().as_int() == Some(status), text)
+    assert(j.get("exit_status").unwrap().as_int() == Some(status) && j.has("virtual_time_ns"), text)
+    val c0 = j.get("cores").unwrap().at(0).unwrap()
+    assert(c0.get("pc").unwrap().as_str() == Some("0x20030004") && c0.get("state").unwrap().as_str() == Some("halted"), text)
+    // The code was placed in SRAM, where no symbol of the image is.
+    assert(!c0.has("symbol"), text)
+    assert(c0.has("basepri") == m33 && c0.has("ns") == m33, text)
+    // Core 1 is in the boot ROM, started; the board's clock is at least core 0's.
+    val c1 = j.get("cores").unwrap().at(1).unwrap()
+    assert(c1.get("started").unwrap().as_bool() == Some(true) && c1.has("pc") && c1.has("state"), text)
+    val cycles = j.get("cycles").unwrap().as_int().unwrap()
+    assert(cycles > 0 && cycles >= c0.get("cycles").unwrap().as_int().unwrap(), text)
+
+@test("exit report on the RP boards: a semihosting exit is `exit` with the guest's status, 3 and 0, on the Pico 2 and the Pico, both cores reported")
+rp_report_semihost_exit()
+    for code in [3u32, 0]
+        val b = arm_board(SramMap(0x20000000, 520 * 1024))
+        b.apply_options(semihosting())
+        b.boot(REPORT_PICO2).unwrap()
+        assert(exit_with(b, code) == RunEnd.Exit && b.exit_status == code, b.refused)
+        val syms = image_symbols(REPORT_PICO2[..])
+        exit_report_checked(exit_report_json(&b.end_report(RunEnd.Exit, int(b.exit_status), ""), syms.view()), long(code), true)
+
+        val p = pico_board(SramMap(0x20000000, 264 * 1024))
+        p.apply_options(semihosting())
+        p.boot(REPORT_PICO).unwrap()
+        assert(exit_with(p, code) == RunEnd.Exit && p.exit_status == code, p.refused)
+        exit_report_checked(exit_report_json(&p.end_report(RunEnd.Exit, int(p.exit_status), ""), [][..]), long(code), false)
+
+@test("exit report on the RP boards: a breakpoint is `breakpoint` with status 0 and no guest status; a pc in the image is named by its function")
+rp_report_breakpoint()
+    val b = arm_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(REPORT_PICO2).unwrap()
+    assert(report_ran(b, [0xBF00u16, 0xBE00][..]) == RunEnd.Breakpoint, b.refused)
+    val text = exit_report_json(&b.end_report(RunEnd.Breakpoint, 0, ""), image_symbols(REPORT_PICO2[..]).view())
+    val j = reread(text)
+    assert(j.get("exit").unwrap().as_str() == Some("breakpoint") && j.get("status").unwrap().as_int() == Some(0) && !j.has("exit_status"), text)
+    assert(j.get("cores").unwrap().at(0).unwrap().get("pc").unwrap().as_str() == Some("0x20030002"), text)
+
+    // The same board, its pc moved into `main`: the report names it.
+    var main_at: u32 = 0
+    for s in image_symbols(REPORT_PICO2[..]) do if s.name == "main" then main_at = s.start
+    b.cores[0].pc = main_at + 4
+    val named = reread(exit_report_json(&b.end_report(RunEnd.Breakpoint, 0, ""), image_symbols(REPORT_PICO2[..]).view()))
+    assert(named.get("cores").unwrap().at(0).unwrap().get("symbol").unwrap().as_str() == Some("main+0x4"))
+
+@test("exit report on the RP boards: a core stopped on a fault it cannot take is `fault_lockup`, one the chip refused `fault`")
+rp_report_faults()
+    val b = arm_board(SramMap(0x20000000, 520 * 1024))
+    b.boot(REPORT_PICO2).unwrap()
+    b.cores[0].stop = Stop.StackLimit
+    assert(b.end_report(RunEnd.Fault, 1, "x").exit == ExitKind.FaultLockup)
+    b.cores[0].stop = Stop.Undefined
+    assert(b.end_report(RunEnd.Fault, 1, "x").exit == ExitKind.Fault)
+    // A refusal of the chip's stops no core.
+    b.cores[0].stop = Stop.Running
+    val refused = b.end_report(RunEnd.Fault, 1, "the chip: refused")
+    assert(refused.exit == ExitKind.Fault && refused.message == "the chip: refused")
+    assert(b.end_report(RunEnd.Asleep, 4, "").exit == ExitKind.Asleep)
