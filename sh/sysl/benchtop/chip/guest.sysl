@@ -50,8 +50,10 @@ private[chip] trait Runner
     wait_outside(*self, cycles: u64)
     @keeps(self)
     finish_sending(*self) -> bool
-    /** Why the run ended at `end`, a breakpoint or a fault. */
+    /** Why the run ended at `end`, a breakpoint, an exit or a fault. */
     why(*self, end: RunEnd) -> string
+    /** The status a run that ended at `RunEnd.Exit` gave. */
+    exit_status(*self) -> int
     clock(*self) -> u64
     hz(*self) -> u64
     pc(*self) -> u32
@@ -99,9 +101,12 @@ impl[C: ArmChip + PartPins] Runner for ArmRunner[C]
 
     why(*self, end: RunEnd) -> string
         if end == RunEnd.Breakpoint then return "the program ended (a core executed BKPT, as the SDK's exit does)"
+        if end == RunEnd.Exit then return s"the guest exited with status ${self.b.exit_status} (semihosting)"
         if !self.b.refused.is_empty() then return self.b.refused
         for k in 0..<2 do if self.b.cores[k].stop != Stop.Running then return s"a core stopped: core $k: ${virt.stop_message(&self.b.cores[k])}"
         "a core stopped"
+
+    exit_status(*self) -> int = int(self.b.exit_status)
 
     clock(*self) -> u64 = self.b.chip.clock()
     hz(*self) -> u64 = self.b.chip.clock_rate()
@@ -173,6 +178,8 @@ impl Runner for RiscvRunner
         if end == RunEnd.Breakpoint then return "the program ended (a hart executed EBREAK, as the SDK's exit does)"
         if self.b.refused.is_empty() then "a hart stopped on a fault" else self.b.refused
 
+    exit_status(*self) -> int = 0
+
     clock(*self) -> u64 = self.b.chip.now
     hz(*self) -> u64 = self.b.chip.sys_hz()
     pc(*self) -> u32 = self.b.harts[0].pc
@@ -201,16 +208,23 @@ impl Runner for RiscvRunner
     debug_read(*self, k: u32, a: u32, width: u32) -> Option[u32] = None
     debug_write(*self, k: u32, a: u32, width: u32, x: u32) -> bool = false
 
-private arm_runner(map: SramMap, usb: bool, qfn80: bool, rom_boot: bool) -> &Runner
+private arm_runner(map: SramMap, usb: bool, qfn80: bool, rom_boot: bool, options: ArmOptions) -> &Runner
     val b = if qfn80 then arm_board_qfn80(map) else arm_board(map)
     b.rom_boot = rom_boot
+    b.apply_options(options)
     if usb then b.attach_usb_host(true)
     ArmRunner(b, 0)
+
+/** Why `--semihosting` and `--serial` are refused on a board that is not an Arm RP board. */
+const SEMIHOST_ARM_ONLY = "--semihosting and --serial are for a board of an RP2040's or an RP2350's Cortex-M cores"
 
 /** Why `--boot rom` is refused on an RP board other than an RP2350 on its Cortex-M33s. */
 const BOOT_ROM_ARM_ONLY = "--boot rom is for a board of an RP2350's Cortex-M33 cores: the RP2040's boot path is benchtop's own ROM, and the Hazard3 harts' is not run"
 
-private pico_runner(map: SramMap) -> &Runner = ArmRunner(pico_board(map), 0)
+private pico_runner(map: SramMap, options: ArmOptions) -> &Runner
+    val b = pico_board(map)
+    b.apply_options(options)
+    ArmRunner(b, 0)
 
 private riscv_runner(map: SramMap) -> &Runner = RiscvRunner(riscv_board(map), 0)
 
@@ -251,21 +265,22 @@ private[chip] struct RpGuest
  * None where `which` is not an RP board; why not where benchtop cannot run it, `rom_boot` on a board
  * other than an RP2350 on its Cortex-M33s among them.
  */
-rp_guest(which: string, usb: bool, rom_boot: bool = false) -> Option[Result[&virt.Guest, string]]
+rp_guest(which: string, usb: bool, rom_boot: bool = false, options: ArmOptions = arm_options()) -> Option[Result[&virt.Guest, string]]
     val fresh: &Fn() -> &Runner = riscv_named(which) match
         Some(Ok(map)) ->
             if rom_boot then return Some(Err(BOOT_ROM_ARM_ONLY))
+            if options.named() then return Some(Err(SEMIHOST_ARM_ONLY))
             () -> riscv_runner(map)
         Some(Err(why)) -> return Some(Err(why))
         None -> arm_named(which) match
             Some(Ok(map)) ->
                 val qfn80 = qfn80_named(which)
-                () -> arm_runner(map, usb, qfn80, rom_boot)
+                () -> arm_runner(map, usb, qfn80, rom_boot, options)
             Some(Err(why)) -> return Some(Err(why))
             None -> pico_named(which) match
                 Some(Ok(map)) ->
                     if rom_boot then return Some(Err(BOOT_ROM_ARM_ONLY))
-                    () -> pico_runner(map)
+                    () -> pico_runner(map, options)
                 Some(Err(why)) -> return Some(Err(why))
                 None -> return None
     val state = GuestState(fresh(), rp_parts(described(which).unwrap().0), GuestStanding(RunStatus.Running, "", 0, 0, None),
@@ -311,7 +326,7 @@ impl GuestState
                     break
             elif n > 1 then r.wait_outside(n - 1)
             end = r.run(1)
-            if end == RunEnd.Breakpoint || end == RunEnd.Fault then break
+            if end == RunEnd.Breakpoint || end == RunEnd.Exit || end == RunEnd.Fault then break
             turns += 1
         self.settle(end)
 
@@ -322,7 +337,7 @@ impl GuestState
         var end = ran
         r.observe(&self.parts)
         // At a breakpoint the chip runs on, as under a debugger, until UART0 has sent what it holds.
-        if end == RunEnd.Breakpoint && !r.finish_sending() then end = RunEnd.Fault
+        if (end == RunEnd.Breakpoint || end == RunEnd.Exit) && !r.finish_sending() then end = RunEnd.Fault
         var fresh: Buf[u8] = buf()
         r.take_console(&fresh)
         self.keep(fresh.view())
@@ -337,11 +352,14 @@ impl GuestState
             Budget -> RunStatus.Running
             Asleep -> RunStatus.Waiting
             Breakpoint -> RunStatus.Breakpoint
+            Exit -> RunStatus.Exit(r.exit_status())
             Fault -> RunStatus.Fault
-        val why = if end == RunEnd.Breakpoint || end == RunEnd.Fault then r.why(end) else ""
+        val why = if end == RunEnd.Breakpoint || end == RunEnd.Exit || end == RunEnd.Fault then r.why(end) else ""
         self.standing = GuestStanding(status, why, r.pc(), r.retired(), None)
 
-    private[chip] ended(*self) -> bool = self.standing.status == RunStatus.Breakpoint || self.standing.status == RunStatus.Fault
+    private[chip] ended(*self) -> bool = self.standing.status match
+        Breakpoint | Exit(_) | Fault -> true
+        _ -> false
 
     private keep(*self, bytes: []const u8)
         self.out.extend(bytes)
@@ -361,6 +379,7 @@ private sliced(r: &Runner, end: RunEnd) -> SliceEnd = end match
     Budget -> SliceEnd.Ran
     Asleep -> SliceEnd.Asleep
     Breakpoint -> SliceEnd.Ended(0, r.why(end))
+    Exit -> SliceEnd.Ended(r.exit_status(), r.why(end))
     Fault -> SliceEnd.Faulted(r.why(end))
 
 // The GPIO `name` (`GP2`) of a board `board` whose GPIOs number below `count`.
