@@ -88,6 +88,32 @@ xip_qmi_flash_program()
     assert(b.mem.flash[(1 << 20) + 256] == 0xFF && b.mem.flash[(1 << 20) - 1] == 0xFF, "the sector's rest erased, the byte below untouched")
     assert(!b.direct && b.mem.page_table[XIP_BASE >> 12] != 0, "direct mode left, the flash back on the fast path")
 
+// `c` put back in thread mode with its fault state cleared, after a case that took a fault, for the
+// next case on the same board.
+private recovered(c: *arm.Cpu)
+    c.ipsr = 0
+    for w in 0..<c.active.len do c.active[w] = 0
+    c.active_banks = 0
+    c.cfsr = 0
+    c.hfsr = 0
+    c.bfar = 0
+
+// Whether the run `end` ended in core `k`'s HardFault handler (a BKPT), the core having taken the
+// BusFault `bits` — PRECISE with BFAR `at` for an access, FETCH for a fetch, its frame returning to
+// `at` — escalated, with nothing refused. The core is `recovered` after.
+private bus_faulted(b: &ArmBoard, end: RunEnd, k: usize, bits: u32, at: u32) -> bool
+    val c = &b.cores[k]
+    val precise = bits == PRECISE
+    val returns = if precise then 0u32 else arm.load32(c, c.r[13] + 24)
+    val ok = end == RunEnd.Breakpoint && b.refused.is_empty() && c.ipsr == 3 && c.hfsr == 1 << 30 && c.cfsr == bits && (if precise then c.bfar == at else returns == at)
+    if !ok then print(s"$end ${b.refused}: core $k ${c.stop} IPSR ${c.ipsr} CFSR 0x${hex(c.cfsr)} BFAR 0x${hex(c.bfar)} returns to 0x${hex(returns, 8)}")
+    recovered(c)
+    ok
+
+// PRECISERR with BFARVALID; IBUSERR.
+private const PRECISE: u32 = 0x8200
+private const FETCH: u32 = 0x100
+
 // Thumb halfwords into SRAM at `at`, and core 0 started there with `regs` in r0 to r5.
 private run_code(b: &ArmBoard, code: []const u16, regs: [6]u32) -> RunEnd
     val at: u32 = 0x20070000
@@ -111,13 +137,12 @@ private const BKPT: u16 = 0xBE00
 private const MAINTENANCE: u32 = 0x18000000
 private const SRAM_OFFSET: u32 = 0x03FFC000
 
-@test("XIP_SRAM: an unpinned line is a named bus error; a core's pin through the maintenance window makes one line hold its bytes, off the fast path")
+@test("XIP_SRAM: an unpinned line is a bus error, the guest's BusFault as on silicon; a core's pin through the maintenance window makes one line hold its bytes, off the fast path")
 xip_sram_lines()
     val b = arm_board(PICO2_SRAM)
     b.boot(PLAIN_BLINK).unwrap()
     for p in 0u32..<4 do assert(b.mem.page_table[(XIP_SRAM_BASE >> 12) + p] == 0, "nothing pinned, nothing mapped")
-    assert(run_code(b, [LDR_R4_R3, BKPT], [0, 0, 0, XIP_SRAM_BASE, 0, 0]) == RunEnd.Fault)
-    assert(b.refused.contains("0x13ffc000 is in XIP_SRAM, and no cache line is pinned"), b.refused)
+    assert(bus_faulted(b, run_code(b, [LDR_R4_R3, BKPT], [0, 0, 0, XIP_SRAM_BASE, 0, 0]), 0, PRECISE, XIP_SRAM_BASE), "a miss")
     // Pin the first line (operation 7) and the last, then store and load through them.
     val last = XIP_SRAM_BASE + 16384 - 8
     assert(run_code(b, [STRB_R1_R0, STR_R2_R3, LDR_R4_R3, BKPT], [MAINTENANCE + SRAM_OFFSET + 7, 0, 0xCAFEF00D, XIP_SRAM_BASE, 0, 0]) == RunEnd.Breakpoint, b.refused)
@@ -125,12 +150,10 @@ xip_sram_lines()
     assert(run_code(b, [STRB_R1_R0, STR_R2_R3, LDR_R4_R3, BKPT], [MAINTENANCE + SRAM_OFFSET + 16384 - 8 + 7, 0, 0x5A5A1234, last + 4, 0, 0]) == RunEnd.Breakpoint, b.refused)
     assert(b.cores[0].r[4] == 0x5A5A1234 && b.mem.ram[b.sram_at + 16383] == 0x5A, "the last word of XIP_SRAM")
     // The line after the first is not pinned.
-    assert(run_code(b, [LDR_R5_R3_8, BKPT], [0, 0, 0, XIP_SRAM_BASE, 0, 0]) == RunEnd.Fault)
-    assert(b.refused.contains("0x13ffc008"), b.refused)
+    assert(bus_faulted(b, run_code(b, [LDR_R5_R3_8, BKPT], [0, 0, 0, XIP_SRAM_BASE, 0, 0]), 0, PRECISE, XIP_SRAM_BASE + 8), "the next line")
     for p in 0u32..<4 do assert(b.mem.page_table[(XIP_SRAM_BASE >> 12) + p] == 0, "a page with one line pinned stays off the fast path")
     // Invalidating the first line by address (operation 2) unpins it.
-    assert(run_code(b, [STRB_R1_R0, LDR_R4_R3, BKPT], [MAINTENANCE + SRAM_OFFSET + 2, 0, 0, XIP_SRAM_BASE, 0, 0]) == RunEnd.Fault)
-    assert(b.refused.contains("0x13ffc000"), b.refused)
+    assert(bus_faulted(b, run_code(b, [STRB_R1_R0, LDR_R4_R3, BKPT], [MAINTENANCE + SRAM_OFFSET + 2, 0, 0, XIP_SRAM_BASE, 0, 0]), 0, PRECISE, XIP_SRAM_BASE), "unpinned")
     // A pin over flash and a read of the maintenance window are refused by name.
     assert(run_code(b, [STRB_R1_R0, BKPT], [MAINTENANCE + 7, 0, 0, 0, 0, 0]) == RunEnd.Fault)
     assert(b.refused.contains("pinning a cache line over flash"), b.refused)
@@ -146,9 +169,10 @@ xip_sram_pages()
     assert(b.mem.page_table[(XIP_SRAM_BASE >> 12) + 1] != 0 && b.mem.page_table[XIP_SRAM_BASE >> 12] == 0)
     assert(run_code(b, [STR_R2_R3, LDR_R4_R3, BKPT], [0, 0, 77, XIP_SRAM_BASE + 4096 + 4092, 0, 0]) == RunEnd.Breakpoint, b.refused)
     assert(b.cores[0].r[4] == 77, s"r4 = ${b.cores[0].r[4]}")
-    // XIP_CTRL's CLR alias takes EN_SECURE away: the page leaves the fast path and the access is refused.
-    assert(run_code(b, [STR_R1_R0, LDR_R4_R3, BKPT], [xip_ctrl_reg.BASE + 0x3000, xip_ctrl_reg.CTRL_EN_SECURE_MASK, 0, XIP_SRAM_BASE + 4096, 0, 0]) == RunEnd.Fault)
-    assert(b.mem.page_table[(XIP_SRAM_BASE >> 12) + 1] == 0 && b.refused.contains("0x13ffd000"), b.refused)
+    // XIP_CTRL's CLR alias takes EN_SECURE away: the page leaves the fast path and the access is a bus
+    // error.
+    assert(bus_faulted(b, run_code(b, [STR_R1_R0, LDR_R4_R3, BKPT], [xip_ctrl_reg.BASE + 0x3000, xip_ctrl_reg.CTRL_EN_SECURE_MASK, 0, XIP_SRAM_BASE + 4096, 0, 0]), 0, PRECISE, XIP_SRAM_BASE + 4096), "the cache disabled")
+    assert(b.mem.page_table[(XIP_SRAM_BASE >> 12) + 1] == 0)
 
 @test("direct mode takes the flash off the cores' fast path, where a load from XIP is refused by name, and puts it back when it ends")
 xip_direct_mode_map()
@@ -316,9 +340,8 @@ xip_sram_fast_path_edges()
     assert(run_code(b, [STR_R2_R3, LDR_R4_R3, BKPT], [0, 0, 0x55667788, last, 0, 0]) == RunEnd.Breakpoint, b.refused)
     assert(b.cores[0].r[4] == 0x55667788 && b.mem.ram[b.sram_at + 16383] == 0x55)
     // Invalidating the last line by address (operation 2) unpins it: its page leaves the fast path
-    // at once, the load is refused by name, and the other pages stay.
-    assert(run_code(b, [STRB_R1_R0, LDR_R4_R3, BKPT], [MAINTENANCE + SRAM_OFFSET + 16384 - 8 + 2, 0, 0, last, 0, 0]) == RunEnd.Fault)
-    assert(b.refused.contains("0x13fffffc is in XIP_SRAM, and no cache line is pinned"), b.refused)
+    // at once, the load is a bus error, and the other pages stay.
+    assert(bus_faulted(b, run_code(b, [STRB_R1_R0, LDR_R4_R3, BKPT], [MAINTENANCE + SRAM_OFFSET + 16384 - 8 + 2, 0, 0, last, 0, 0]), 0, PRECISE, last), "the last line unpinned")
     assert(!fast(b, last, 4) && fast(b, XIP_SRAM_BASE + 8192, 4))
     // A line of that page still pinned is reached off the fast path, and its store lands in the backing.
     assert(run_code(b, [STR_R2_R3, LDR_R4_R3, BKPT], [0, 0, 0x0BADCAFE, last - 8, 0, 0]) == RunEnd.Breakpoint, b.refused)
@@ -358,7 +381,7 @@ private const B_SELF: u16 = 0xE7FE
 private const BLX_R3: u16 = 0x4798
 private const BX_LR: u16 = 0x4770
 
-@test("XIP_SRAM: a store unpinning the line after its own stops the core at the line, its next instruction, not executed; the store keeps its write-back; pinned again, the line's bytes now run")
+@test("XIP_SRAM: a store unpinning the line after its own makes the fetch of its next instruction a bus error, IBUSERR, that instruction not executed; the store keeps its write-back; pinned again, the line's bytes now run")
 xip_sram_unpin_running_code()
     val b = arm_board(PICO2_SRAM)
     b.boot(PLAIN_BLINK).unwrap()
@@ -373,9 +396,8 @@ xip_sram_unpin_running_code()
     // Invalidating line 1 by address (operation 2) unpins it under the running code.
     val end = run_at(b, XIP_SRAM_BASE, [line1 + 2, 0, 0, 0, 0, 0, 0, 0])
     val c = &b.cores[0]
-    assert(end == RunEnd.Fault, s"r7 ${c.r[7]}: the stale record ran")
-    assert(b.refused.contains("pc 0x13ffc008: 0x13ffc008 is in XIP_SRAM, and no cache line is pinned"), b.refused)
-    assert(c.pc == XIP_SRAM_BASE + 8 && c.r[5] == 1 && c.r[6] == 2 && c.r[7] == 0, s"pc 0x${hex(c.pc, 8)} r5 ${c.r[5]} r6 ${c.r[6]} r7 ${c.r[7]}")
+    assert(c.r[5] == 1 && c.r[6] == 2 && c.r[7] == 0, s"r5 ${c.r[5]} r6 ${c.r[6]} r7 ${c.r[7]}: the stale record ran")
+    assert(bus_faulted(b, end, 0, FETCH, XIP_SRAM_BASE + 8), "the fetch at the unpinned line")
     assert(c.r[0] == line1 + 3, s"the store's write-back: r0 0x${hex(c.r[0], 8)}")
     // Pinned again, holding movs r7, #4 now: the line is fetched afresh.
     b.chip.xip.maintain(SRAM_OFFSET + 8 + 7).unwrap()
@@ -384,7 +406,7 @@ xip_sram_unpin_running_code()
     assert(run_at(b, XIP_SRAM_BASE, [line1 + 1, 0, 0, 0, 0, 0, 0, 0]) == RunEnd.Breakpoint, b.refused)
     assert(b.cores[0].r[7] == 4, s"r7 ${b.cores[0].r[7]}")
 
-@test("XIP_SRAM: the cache disabled by core 0 stops core 1 looping in an XIP_SRAM page at its next fetch there, by name")
+@test("XIP_SRAM: the cache disabled by core 0 makes core 1's next fetch in the XIP_SRAM page it loops in a bus error, IBUSERR")
 xip_sram_unmapped_under_the_other_core()
     val b = arm_board(PICO2_SRAM)
     b.boot(PLAIN_BLINK).unwrap()
@@ -392,6 +414,9 @@ xip_sram_unmapped_under_the_other_core()
     b.sync_xip()
     put_sram(b, XIP_SRAM_BASE + 16, [ADDS_R4_1, B_BACK_1])
     b.cores[1].pc = XIP_SRAM_BASE + 16
+    // A stack and core 0's vectors, as a launch gives core 1, for the fault to be taken on.
+    b.cores[1].r[13] = 0x20081000
+    b.cores[1].vtor = b.cores[0].vtor
     b.cores[1].stop = Stop.Running
     b.started[1] = true
     // Core 0 spins in SRAM while core 1 loops in XIP_SRAM, decoded.
@@ -400,9 +425,8 @@ xip_sram_unmapped_under_the_other_core()
     assert(count > 0 && b.mem.page_table[XIP_SRAM_BASE >> 12] != 0)
     // XIP_CTRL's CLR alias takes EN_SECURE away from core 0; core 1 runs after it in the quantum.
     val end = run_code(b, [STR_R1_R0, B_SELF], [xip_ctrl_reg.BASE + 0x3000, xip_ctrl_reg.CTRL_EN_SECURE_MASK, 0, 0, 0, 0])
-    assert(end == RunEnd.Fault, s"core 1 ran on: r4 ${b.cores[1].r[4]}")
-    assert(b.refused.contains("core 1 at pc 0x13ffc010: 0x13ffc010 is in XIP_SRAM"), b.refused)
-    assert(b.cores[1].r[4] == count, s"r4 ${b.cores[1].r[4]}, was $count")
+    assert(b.cores[1].r[4] == count, s"core 1 ran on: r4 ${b.cores[1].r[4]}, was $count")
+    assert(bus_faulted(b, end, 1, FETCH, XIP_SRAM_BASE + 16), "core 1's fetch")
 
 @test("direct mode stops code decoded from flash being run: a branch back into it is refused by name, and runs again when direct mode ends")
 xip_direct_mode_running_code()

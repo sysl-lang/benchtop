@@ -5,7 +5,7 @@ module sh.sysl.benchtop.virt
 // hand-assembled images reaching each register, each way off the RAM, and each way an image is
 // refused. Every test makes a machine of its own.
 
-import sh.sysl.benchtop.v6m.{Cpu, Stop, RAM_BYTES, reset, run_threaded}
+import sh.sysl.benchtop.v6m.{Cpu, Stop, RAM_BYTES, load32, reset, run_threaded}
 import sysl.raw.str_cast
 import sysl.buf.{Buf, buf}
 import sysl.threads.{Channel, spawn}
@@ -71,6 +71,37 @@ ran(m: *Machine, code: [4]u16, literal: u32)
 
     booted(m, image[..], "")
     run_capped(core0(m))
+
+// Where `raw_handled` puts its code and its HardFault handler's BKPT.
+const HANDLED_CODE: u32 = 0x20
+const HANDLED_BKPT: u32 = 0x2C
+
+// A raw image whose HardFault handler is a BKPT: the stack at the top of RAM, the reset vector to the
+// Thumb code at HANDLED_CODE, HardFault's to HANDLED_BKPT; `code` at HANDLED_CODE, then `literal` at
+// 0x28, which `ldr r0, [pc, #4]` at HANDLED_CODE reads, then the BKPT.
+raw_handled(code: [4]u16, literal: u32) -> [48]u8
+    val words: [12]u32 = [RAM_BYTES, HANDLED_CODE | 1, 0, HANDLED_BKPT | 1, 0, 0, 0, 0, code[0] | u32(code[1]) << 16, code[2] | u32(code[3]) << 16, literal, 0xBE00]
+    var b: [48]u8
+
+    for i in 0..<48 do b[i] = u8(words[i / 4] >> (i % 4 * 8) & 0xFF)
+    b
+
+// `raw_handled`'s image run on `m`'s core 0 to its stop, with nothing typed; a debugger's core where
+// `caught` (`Cpu.catch_faults`).
+ran_handled(m: *Machine, code: [4]u16, literal: u32, caught: bool)
+    val image = raw_handled(code, literal)
+
+    booted(m, image[..], "")
+    core0(m).catch_faults = caught
+    run_capped(core0(m))
+
+// Whether the virtual board's M0+ took HardFault for the instruction at `at`, its handler's BKPT the
+// stop and its frame returning to `at`.
+took_hard_fault(cpu: *Cpu, at: u32) -> bool
+    if cpu.stop != Stop.Breakpoint || cpu.stop_at != HANDLED_BKPT || cpu.ipsr != 3
+        print(f"${cpu.stop} at 0x${cpu.stop_at}%x, IPSR ${cpu.ipsr}")
+        return false
+    load32(cpu, cpu.r[13] + 24) == at
 
 @test("echo.elf greets, echoes each line typed after a prompt, and exits 0 when the input ends")
 board_echo()
@@ -263,59 +294,57 @@ board_exit_code()
     // The core stops on the store, which the console has taken and which is not counted.
     assert(cpu.retired == 2 && cpu.pc == 12, s"${cpu.retired} pc ${cpu.pc}")
 
-// 8: ldr r0, [pc, #4]   10: ldr r1, [r0]   12: b 12   14: nop   16: the address
-@test("a read where nothing is stops the core at Unmapped, at that address, on the load")
+// 0x20: ldr r0, [pc, #4]   0x22: ldr r1, [r0]   0x24: b .   0x26: nop   0x28: the address
+@test("a read where nothing is — outside every window, or an offset of benchtop's own devices that is no register — is a bus error: the M0+'s HardFault on the load, nothing loaded")
 board_unmapped_read()
     val board = machine()
     val m = &*board
     val cpu = core0(m)
 
     for a in [0x50000000u32, 0x40000010, CONSOLE + EXIT, 0xD0000180, 0xCFFFFFFC, RAM_BYTES]
-        ran(m, [0x4801, 0x6801, 0xE7FE, 0xBF00], a)
+        ran_handled(m, [0x4801, 0x6801, 0xE7FE, 0xBF00], a, false)
 
-        assert(cpu.stop == Stop.Unmapped && cpu.stop_at == a, f"0x${a}%08x")
-        assert(cpu.pc == 10 && cpu.retired == 1 && cpu.r[1] == 0, f"pc 0x${cpu.pc}%x, ${cpu.retired} retired")
+        assert(took_hard_fault(cpu, HANDLED_CODE + 2), f"0x${a}%08x")
+        assert(cpu.retired == 1 && cpu.r[1] == 0, f"${cpu.retired} retired")
 
-// 8: ldr r0, [pc, #4]   10: str r0, [r0]   12: b 12   14: nop   16: the address
-@test("a write where nothing is stops the core at Unmapped, at that address, on the store")
+// 0x20: ldr r0, [pc, #4]   0x22: str r0, [r0]   0x24: b .   0x26: nop   0x28: the address
+@test("a write where nothing is is a bus error: the M0+'s HardFault on the store")
 board_unmapped_write()
     val board = machine()
     val m = &*board
     val cpu = core0(m)
 
     for a in [0x50000000u32, 0x40000010, CONSOLE + STATUS, 0xD0000180, 0xCFFFFFFC, RAM_BYTES]
-        ran(m, [0x4801, 0x6000, 0xE7FE, 0xBF00], a)
+        ran_handled(m, [0x4801, 0x6000, 0xE7FE, 0xBF00], a, false)
 
-        assert(cpu.stop == Stop.Unmapped && cpu.stop_at == a, f"0x${a}%08x")
-        assert(cpu.pc == 10 && cpu.retired == 1, f"pc 0x${cpu.pc}%x, ${cpu.retired} retired")
+        assert(took_hard_fault(cpu, HANDLED_CODE + 2) && cpu.retired == 1, f"0x${a}%08x")
 
-// 8: ldr r0, [pc, #4]   10: bx r0   12: b 12   14: nop   16: the target
-@test("a jump off the RAM stops the core at Unmapped, its pc the target")
+// 0x20: ldr r0, [pc, #4]   0x22: bx r0   0x24: b .   0x26: nop   0x28: the target
+@test("a jump off the RAM is a bus error on the fetch at the target: the M0+'s HardFault, its frame returning there")
 board_jump_off_ram()
     val board = machine()
     val m = &*board
     val cpu = core0(m)
 
-    ran(m, [0x4801, 0x4700, 0xE7FE, 0xBF00], 0x00200001)
+    ran_handled(m, [0x4801, 0x4700, 0xE7FE, 0xBF00], 0x00200001, false)
 
-    assert(cpu.stop == Stop.Unmapped && cpu.stop_at == 0x00200000, f"0x${cpu.stop_at}%08x")
-    assert(cpu.pc == 0x00200000 && cpu.retired == 2, f"pc 0x${cpu.pc}%08x")
+    assert(took_hard_fault(cpu, 0x00200000) && cpu.retired == 2, f"pc 0x${cpu.pc}%08x")
 
-@test("benchtop run's message for a stop names where the guest stopped")
+@test("benchtop run's message for a stop names where the guest stopped: a debugger's core on a bus error")
 board_stop_message()
     val board = machine()
     val m = &*board
     val cpu = core0(m)
 
-    // 8: ldr r0, [pc, #4]   10: ldr r1, [r0]: an access to nothing, on the load at 10
-    ran(m, [0x4801, 0x6801, 0xE7FE, 0xBF00], 0x50000000)
+    // 0x20: ldr r0, [pc, #4]   0x22: ldr r1, [r0]: an access to nothing, on the load at 0x22
+    ran_handled(m, [0x4801, 0x6801, 0xE7FE, 0xBF00], 0x50000000, true)
 
     val read = stop_message(cpu)
 
-    assert(read == "the guest stopped at an access to 0x50000000, where nothing is (pc 0x0000000a, 1 instructions)", read)
+    assert(read == "the guest stopped at an access to 0x50000000, where nothing is (pc 0x00000022, 1 instructions)", read)
 
-    // 8: ldr r0, [pc, #4]   10: bx r0: a jump to nothing
-    ran(m, [0x4801, 0x4700, 0xE7FE, 0xBF00], 0x00200001)
+    // 0x20: ldr r0, [pc, #4]   0x22: bx r0: a jump to nothing
+    ran_handled(m, [0x4801, 0x4700, 0xE7FE, 0xBF00], 0x00200001, true)
 
     val jump = stop_message(cpu)
 

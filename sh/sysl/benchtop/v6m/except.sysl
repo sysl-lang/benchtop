@@ -27,9 +27,10 @@ import sysl.math.max
 //
 // An instruction's fault — UNDEFINSTR, INVSTATE, NOCP, DIVBYZERO, UNALIGNED, HardFault on a Baseline
 // core — is taken (t2secure.sysl's `usage`), and a fault that cannot be taken is a lockup, which stops
-// the core at `Fault`. What is not modelled: the MPU but the ARMv8-M one (mpu.sysl), the fault for a
-// bad access (the core stops at `Unmapped` instead), and an access off the RAM while stacking or
-// unstacking, which stops at `Unmapped` like any other.
+// the core at `Fault`. So is a bus error (cpu.sysl's `bus_error`): a precise BusFault on a load or a
+// store, IBUSERR on a fetch, STKERR and UNSTKERR stacking and unstacking, HardFault on a Baseline core.
+// What is not modelled: the MPU but the ARMv8-M one (mpu.sysl), and a bus error reading a vector
+// (HardFault VECTTBL), which stops at `Unmapped`.
 
 // The system control space: SysTick, the NVIC and the SCB, all word registers.
 const SCS: u32 = 0xE000E000
@@ -156,10 +157,12 @@ begin_run(cpu: *Cpu) -> bool
 // What every run does after its last instruction: a core that stopped on an instruction of an IT block
 // — a fault, a breakpoint, an access nothing answers — holds that instruction's own ITSTATE, not the
 // one its step had moved on to, as the architecture reports it and as an exception taken there would
-// stack it. The instruction did not retire, so `retired` is still the count it was stepped at.
+// stack it. The instruction did not retire, so `retired` is still the count it was stepped at. A fetch
+// that failed takes its IBUSERR here (`fetch_fault`), in place of the stop.
 @inline
 end_run(cpu: *Cpu)
     if cpu.retired == cpu.it_at then cpu.it = cpu.it_own
+    if cpu.fetch_failed then fetch_fault(cpu)
 
 // The clock at `n` instructions retired, including accumulated extra cycles.
 @inline
@@ -422,6 +425,7 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
         top = floor
         if group(cpu, priority(cpu, u32(derived))) < group(cpu, priority(cpu, e)) then to = u32(derived)
 
+    cpu.access = Access.Stack
     for k in 0..<8 do if frame +% u32(k) * 4 >= floor then write32(cpu, frame +% u32(k) * 4, words[k], n)
 
     if extended
@@ -429,9 +433,26 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
         if frame +% 0x60 >= floor then write32(cpu, frame +% 0x60, fpscr_now(cpu), n)
         if frame +% 0x64 >= floor then write32(cpu, frame +% 0x64, 0, n)
         cpu.fpcar = frame +% 0x20
+    cpu.access = Access.Host
 
-    // A derived fault taken instead is the stack's own state's.
-    if to != e then target_ns = cpu.ns
+    // A bus error stacking derives BusFault STKERR (`derived_bus`), taken as the stack-limit fault is:
+    // instead of `e` where it is higher, pending otherwise; where not even HardFault could be taken, a
+    // lockup on the address the exception would have returned to.
+    if cpu.stack_errors != 0
+        val d = derived_bus(cpu, cpu.stack_errors)
+        cpu.stack_errors = 0
+        if d < 0
+            if cpu.fault_log != null then note_lockup(cpu, HARD_FAULT, ret)
+            halt(cpu, Stop.Fault, ret)
+            return false
+        if derived < 0
+            derived = d
+            if group(cpu, priority(cpu, u32(d))) < group(cpu, priority(cpu, e)) then to = u32(d)
+        else
+            set_pending(cpu, u32(d), true)
+
+    // A derived fault taken instead is the stack's own state's; BusFault is Secure state's.
+    if to != e then target_ns = to != BUS_FAULT && cpu.ns
 
     val vtor = if target_ns == cpu.ns then cpu.vtor else cpu.banked.vtor
     val at = vtor + architectural(to) * 4
@@ -441,7 +462,18 @@ enter(cpu: *Cpu, e: u32, ret: u32, n: u64) -> bool
     cpu.access_faulted = false
     if cpu.stop != Stop.Running then return false
 
-    if callee then callee_stack(cpu, low, floor, extended, n)
+    if callee
+        cpu.access = Access.Stack
+        callee_stack(cpu, low, floor, extended, n)
+        cpu.access = Access.Host
+        // A bus error on the callee registers' words derives STKERR too, pending behind the handler.
+        if cpu.stack_errors != 0
+            val d = derived_bus(cpu, cpu.stack_errors)
+            cpu.stack_errors = 0
+            if d < 0
+                halt(cpu, Stop.Fault, ret)
+                return false
+            if u32(d) != to then set_pending(cpu, u32(d), true)
 
     // EXC_RETURN's bit 4 is clear for an extended frame; S (bit 6), DCRS (bit 5) and ES (bit 0) say the
     // state returned to, whether the callee registers were stacked, and the handler's state.
@@ -544,10 +576,17 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
     var fp: [17]u32
     var saved: [10]u32
 
+    cpu.access = Access.Unstack
     for k in 0..<8 do words[k] = read32(cpu, frame +% u32(k) * 4, n)
     if extended then for k in 0..<17 do fp[k] = read32(cpu, frame +% 0x20 +% u32(k) * 4, n)
     if callee then for k in 0..<10 do saved[k] = read32(cpu, low +% u32(k) * 4, n)
+    cpu.access = Access.Host
     cpu.access_faulted = false
+
+    // A frame the bus answers with an error: UNSTKERR, taken in the return's place (`unstack_failed`).
+    if cpu.stack_errors != 0 && cpu.stop == Stop.Running
+        if to_ns != was_ns then switch_state(cpu, was_ns)
+        return unstack_failed(cpu, v, returning, frame, words, extended, from, n)
 
     // A frame where nothing is: the core stops on the return, with nothing restored. A signature that
     // does not match is SecureFault INVIS, from the handler.
@@ -615,14 +654,55 @@ exception_return(cpu: *Cpu, v: u32, from: u32, n: u64) -> *Insn
     recheck(cpu)
     // A frame whose xPSR has T clear returns with EPSR.T clear: the instruction returned to takes
     // INVSTATE.
-    if psr & (1 << 24) == 0 && cpu.mem.is_code(pc) then invalid_state(cpu, pc & ~1, from)
+    if psr & (1 << 24) == 0 then invalid_state(cpu, pc & ~1, from)
     insn_at(cpu, pc & ~1)
 
+// The return at `from` (EXC_RETURN `v`) of exception `returning` met a bus error unstacking its frame at
+// `frame` (`words`, the words read, an `extended` one): UNSTKERR. The exception returning is
+// deactivated, and the fault that derives (`derived_bus`) is taken at once as a tail-chain, as the ARM
+// ARM's ExceptionReturn and QEMU's v7m_exception_taken take it: nothing stacked, the frame left where
+// it is, LR still `v`, so the handler's own return unstacks it again. Where not even HardFault can be
+// taken, a lockup on the return. A Non-secure handler's return, whose tail-chain into Secure state's
+// BusFault benchtop does not model, stops at `Unmapped` on the frame instead.
+@cold
+@noinline
+private unstack_failed(cpu: *Cpu, v: u32, returning: u32, frame: u32, words: [8]u32, extended: bool, from: u32, n: u64) -> *Insn
+    val bits = cpu.stack_errors
+    cpu.stack_errors = 0
+    if cpu.ns
+        halt(cpu, Stop.Unmapped, frame)
+        return stopped_on(cpu, from, n)
+    set_active(cpu, returning, false)
+    val d = derived_bus(cpu, bits)
+    if d < 0
+        set_active(cpu, returning, true)
+        if cpu.fault_log != null then note_lockup(cpu, HARD_FAULT, from)
+        halt(cpu, Stop.Fault, from)
+        return stopped_on(cpu, from, n)
+    val e = u32(d)
+    if cpu.fault_log != null then fault_taken(cpu, e, frame, 0, words, v, extended, n)
+    set_active(cpu, e, true)
+    set_pending(cpu, e, false)
+    cpu.ipsr = e
+    cpu.r[14] = v
+    cpu.it = 0
+    cpu.it_at = ~0
+    cpu.excl = false
+    if cpu.masking != null then entered(cpu, e, n)
+    if cpu.mpu_used then mpu_select(cpu)
+    recheck(cpu)
+    val at = cpu.vtor + e * 4
+    val vector = read32(cpu, at, n)
+    cpu.pc = vector & ~1
+    cpu.thumb_off = false
+    if vector & 1 == 0 then invalid_state(cpu, cpu.pc, at)
+    insn_at(cpu, cpu.pc)
+
 // The record a branch that is no exception return goes to, `v` its target and `from` the branch: an
-// even target leaves EPSR.T clear, and the instruction there takes INVSTATE (`invalid_state`). A
-// target off the RAM stops the core at `Unmapped` there, as a fetch nothing answers does.
+// even target leaves EPSR.T clear, and the instruction there takes INVSTATE (`invalid_state`), which
+// comes before any fetch. A target off the RAM fails its fetch (`fetch_stop`): IBUSERR.
 interworked(cpu: *Cpu, v: u32, from: u32) -> *Insn
-    if v & 1 == 0 && cpu.mem.is_code(v) then invalid_state(cpu, v, from)
+    if v & 1 == 0 then invalid_state(cpu, v, from)
     insn_at(cpu, v & ~1)
 
 // The record a `BLX` at `ip` goes to, `v` its register's value.
@@ -820,13 +900,20 @@ tick_start(cpu: *Cpu, now: u64)
 
 // ---------------------------------------------------------------------------------------------------
 // The system control space. Every register is a word; any other width, and any address in the space
-// that is not a register here, stops the core at `Unmapped` as an access where nothing is would.
+// that is not a register here, is one benchtop does not model (`scs_unmodelled`).
+
+// An access to the system control space at `a` that is not to a register benchtop models: a register
+// the core has and benchtop does not, a reserved address, or a width the register does not take. The
+// architecture makes none of them a bus error (reserved addresses are RES0 or UNPREDICTABLE, the
+// widths UNPREDICTABLE), so the core stops at `Unmodelled` on it rather than guess.
+@cold
+scs_unmodelled(cpu: *Cpu, a: u32) = unmodelled_register(cpu, a, f"the system control space + 0x${a - SCS}%03x")
 
 scs_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
     if !is_baseline(cpu.kind) && width != 4 && byte_wide(a, width) then return part_of(scs_read(cpu, a & ~3, 4, n), a, width)
 
     if width != 4 || a & 3 != 0
-        halt(cpu, Stop.Unmapped, a)
+        scs_unmodelled(cpu, a)
         return 0
 
     val now = clock(cpu, n)
@@ -872,7 +959,7 @@ scs_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
         return scs_write(cpu, a & ~3, 4, with_part(rest, a, width, x), n)
 
     if width != 4 || a & 3 != 0
-        halt(cpu, Stop.Unmapped, a)
+        scs_unmodelled(cpu, a)
         return
 
     val now = clock(cpu, n)

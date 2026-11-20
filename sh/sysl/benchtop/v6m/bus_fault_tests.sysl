@@ -1,0 +1,218 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// A bus error, taken as silicon takes it (ARMv7-M ARM B1.5.6 and B3.2.15 "BFSR", ARMv8-M ARM "BFSR",
+// "PushStack", "ExceptionReturn"; QEMU's target/arm/m_helper.c as a second reading): a load or a store
+// where nothing answers is a precise BusFault, PRECISERR with BFARVALID and BFAR, the frame returning to
+// the instruction; a fetch is IBUSERR, taken only where the instruction would run; stacking STKERR and
+// unstacking UNSTKERR, each the entry's or the return's derived fault; escalated to HardFault with
+// HFSR.FORCED where BusFault is disabled or masked; a lockup where not even HardFault can be taken; on
+// the M0+ HardFault for each, nothing recorded. A core a debugger runs (`catch_faults`) stops instead,
+// and a register benchtop does not model stops at `Unmodelled` whatever runs the core. Every case runs
+// under both executors, which must agree (usage_fault_tests.sysl's `ran`).
+//
+// The layout is usage_fault_tests.sysl's: the case's code at 0, a handler at HANDLER (0x10), r4 the log
+// (LOG). HOLE is where nothing answers: the unit-test machine has no devices, so everything off its RAM
+// is a bus error, as on a chip with nothing there.
+
+import sysl.buf.Buf
+
+const HOLE: u32 = 0x30000000
+const SHCSR_BUSFAULTENA: u32 = 1 << 17
+// ldr r0, [r1]; str r0, [r1]; bx r1; mov sp, r1; svc #0.
+const LDR_R0_R1: u16 = 0x6808
+const STR_R0_R1: u16 = 0x6008
+const BX_R1: u16 = 0x4708
+const MOV_SP_R1: u16 = 0x468D
+const SVC_0: u16 = 0xDF00
+// Where the stacking and unstacking cases put a second handler.
+const SECOND: u32 = 0x20
+
+// Every kind: the Mainline ones, then the M0+.
+val EVERY_KIND: [5]Kind = [Kind.V8mMain, Kind.V7em, Kind.V7emM7, Kind.M3, Kind.V6m]
+
+// The exception a bus error is on a core of `kind` with BusFault enabled: HardFault on the M0+.
+bus_exception(kind: Kind) -> u32 = if kind == Kind.V6m then HARD_FAULT else BUS_FAULT
+
+// BusFault enabled, on a core that has one.
+bus_on(cpu: *Cpu)
+    if !is_baseline(cpu.kind) then store32(cpu, SCB_SHCSR, SHCSR_BUSFAULTENA)
+
+// BusFault enabled but at priority 0x80, which BASEPRI 0x40 masks.
+bus_masked(cpu: *Cpu)
+    bus_on(cpu)
+    store32(cpu, SCB_SHPR1, 0x00008000)
+    cpu.basepri = 0x40
+
+// BusFault enabled, and SVCall below it at 0x80, so that a derived BusFault preempts an SVC's entry.
+bus_over_svcall(cpu: *Cpu)
+    bus_on(cpu)
+    store32(cpu, SCB_SHPR2, 0x80000000)
+
+bus_caught(cpu: *Cpu) = cpu.catch_faults = true
+
+// BusFault enabled on an M33 with the Security Extension.
+secure_bus(cpu: *Cpu)
+    cpu.security = true
+    bus_on(cpu)
+
+// A 32-bit instruction's first halfword (BL's) as the RAM's last, its second cut off; BusFault enabled.
+cut_at_the_end(cpu: *Cpu)
+    bus_on(cpu)
+    store16(cpu, RAM_BYTES - 2, 0xF000)
+
+// Whether `c` recorded the precise data BusFault of an access to `address`: PRECISERR, BFARVALID and
+// BFAR on a Mainline core, nothing on the M0+, which has no status registers.
+precise(c: *Cpu, address: u32) -> bool
+    if is_baseline(c.kind) then return c.cfsr == 0 && c.bfar == 0
+    c.cfsr == CFSR_PRECISERR | CFSR_BFARVALID && c.bfar == address
+
+// `first` at 0, NOPs to HANDLER and `handler` there, then NOPs to SECOND and `second` there.
+laid_twice(first: []const u16, handler: []const u16, second: []const u16) -> Buf[u16]
+    var code = laid(first, handler)
+    while code.len() < usize(SECOND / 2) do code.push(NOP)
+    for h in second do code.push(h)
+    code
+
+// Whether `c` stopped at the BKPT at `at` in exception `e`'s handler, with `cfsr` and `hfsr` recorded,
+// saying what differs where it did not.
+in_handler(c: *Cpu, at: u32, e: u32, cfsr: u32, hfsr: u32) -> bool
+    if c.stop == Stop.Breakpoint && c.stop_at == at && c.ipsr == e && c.cfsr == cfsr && c.hfsr == hfsr then return true
+    print(f"${c.stop} at 0x${c.stop_at}%x, IPSR ${c.ipsr}, CFSR 0x${c.cfsr}%x, HFSR 0x${c.hfsr}%x")
+    false
+
+// The BusFault bits `bits` as a core of `kind` records them: none on the M0+.
+recorded(kind: Kind, bits: u32) -> u32 = if kind == Kind.V6m then 0 else bits
+
+// ---------------------------------------------------------------------------------------------------
+// A load or a store: PRECISERR.
+
+@test("PRECISERR: a load or a store where nothing answers takes BusFault with BFARVALID and BFAR, the frame returning to the instruction, nothing loaded or stored, and a handler stepping over it resumes; on the M0+ HardFault, nothing recorded")
+bf_precise_handled()
+    for kind in EVERY_KIND
+        for op in [LDR_R0_R1, STR_R0_R1]
+            var c = ran(kind, laid([op, BKPT], skipping(2)[..]).view(), [99, HOLE, 0, 0, LOG], [[bus_exception(kind), HANDLER]], &bus_on)
+            assert(resumed(&c, 2, [0]) && c.r[0] == 99 && precise(&c, HOLE) && c.hfsr == 0, f"$kind 0x$op%04x")
+    // A word load whose last bytes run past the RAM's end: BFAR the access's address.
+    var c = ran(Kind.V8mMain, laid([0xF8D1, 0x0000, BKPT], skipping(4)[..]).view(), [99, RAM_BYTES - 2, 0, 0, LOG], [[BUS_FAULT, HANDLER]], &bus_on)
+    assert(resumed(&c, 4, [0]) && c.r[0] == 99 && precise(&c, RAM_BYTES - 2), "ldr.w across the end")
+
+@test("PRECISERR disabled in SHCSR, or masked by BASEPRI, escalates to HardFault with HFSR.FORCED, BFSR and BFAR still saying why")
+bf_precise_escalated()
+    for kind in WITH_USAGE
+        var c = ran(kind, laid([LDR_R0_R1, BKPT], skipping(2)[..]).view(), [99, HOLE, 0, 0, LOG], [[HARD_FAULT, HANDLER]], &nothing)
+        assert(resumed(&c, 2, [0]) && precise(&c, HOLE) && c.hfsr == HFSR_FORCED, s"$kind disabled")
+        c = ran(kind, laid([STR_R0_R1, BKPT], skipping(2)[..]).view(), [99, HOLE, 0, 0, LOG], [[BUS_FAULT, 0x40], [HARD_FAULT, HANDLER]], &bus_masked)
+        assert(resumed(&c, 2, [0]) && precise(&c, HOLE) && c.hfsr == HFSR_FORCED, s"$kind masked")
+
+@test("a bus error where not even HardFault can be taken — in HardFault's handler, or under FAULTMASK — is a lockup, with nothing more stacked")
+bf_lockup()
+    for kind in EVERY_KIND
+        // ldr at 0, taken as HardFault; HardFault's handler at HANDLER loads from the hole again.
+        var c = ran(kind, laid([LDR_R0_R1, BKPT], [LDR_R0_R1]).view(), [99, HOLE], [[HARD_FAULT, HANDLER]], &nothing)
+        assert(c.stop == Stop.Fault && c.stop_at == HOLE && c.pc == HANDLER && c.ipsr == HARD_FAULT && c.r[13] == 0x2000 - 0x20, s"$kind in HardFault: ${c.stop} at ${c.stop_at}")
+        assert(precise(&c, HOLE) && c.hfsr == recorded(kind, HFSR_FORCED), s"$kind recorded")
+        if kind != Kind.V6m
+            c = ran(kind, laid([LDR_R0_R1, BKPT], [BKPT]).view(), [99, HOLE], [[HARD_FAULT, HANDLER]], &faults_masked)
+            assert(c.stop == Stop.Fault && c.pc == 0 && c.ipsr == 0 && c.r[13] == 0x2000 && c.retired == 0 && c.r[0] == 99, s"$kind FAULTMASK: ${c.stop} at ${c.stop_at}")
+
+@test("a debugger's core stops on a bus error at Unmapped, on the instruction, nothing taken or recorded")
+bf_caught()
+    for kind in EVERY_KIND
+        var c = ran(kind, laid([LDR_R0_R1, BKPT], [BKPT]).view(), [99, HOLE], [[HARD_FAULT, HANDLER], [BUS_FAULT, HANDLER]], &bus_caught)
+        assert(c.stop == Stop.Unmapped && c.stop_at == HOLE && c.pc == 0 && c.retired == 0 && c.ipsr == 0 && c.cfsr == 0 && c.bfar == 0 && c.pending[0] == 0, s"$kind ${c.stop}")
+
+// ---------------------------------------------------------------------------------------------------
+// A fetch: IBUSERR.
+
+@test("IBUSERR: a branch to where nothing answers takes BusFault on the fetch, no BFAR, the frame returning to the target; on the M0+ HardFault")
+bf_fetch()
+    for kind in EVERY_KIND
+        val e = bus_exception(kind)
+        // bx r1, to HOLE.
+        var c = ran(kind, laid([BX_R1, BKPT], [BKPT]).view(), [0, HOLE | 1], [[e, HANDLER]], &bus_on)
+        assert(in_handler(&c, HANDLER, e, recorded(kind, CFSR_IBUSERR), 0) && c.bfar == 0, s"$kind")
+        assert(load32(&c, c.r[13] + 24) == HOLE && c.r[14] == 0xFFFFFFF9, f"$kind returns to 0x${load32(&c, c.r[13] + 24)}%x")
+
+@test("IBUSERR is taken only where the instruction would run: a branch to the hole not taken is no fault, and a debugger's core stops on the target at Unmapped")
+bf_fetch_not_run()
+    for kind in EVERY_KIND
+        // cmp r0, r0; bne to the hole's veneer (bx r1 at 6); bkpt; bx r1
+        var c = ran(kind, laid([0x4280, 0xD100, BKPT, BX_R1], [BKPT]).view(), [0, HOLE | 1], [[bus_exception(kind), HANDLER]], &bus_on)
+        assert(c.stop == Stop.Breakpoint && c.stop_at == 4 && c.ipsr == 0 && c.cfsr == 0, s"$kind not taken: ${c.stop} at ${c.stop_at}")
+        c = ran(kind, laid([BX_R1, BKPT], [BKPT]).view(), [0, HOLE | 1], [[bus_exception(kind), HANDLER]], &bus_caught)
+        assert(c.stop == Stop.Unmapped && c.stop_at == HOLE && c.pc == HOLE && c.ipsr == 0 && c.cfsr == 0 && c.pending[0] == 0, s"$kind caught: ${c.stop}")
+
+@test("a 32-bit instruction cut off by the RAM's end is IBUSERR on the instruction, not UNDEFINSTR; on the M0+ HardFault")
+bf_fetch_cut_off()
+    for kind in EVERY_KIND
+        // bx r1, to the RAM's last halfword, the first of a BL.
+        val e = bus_exception(kind)
+        var c = ran(kind, laid([BX_R1, BKPT], [BKPT]).view(), [0, (RAM_BYTES - 2) | 1], [[e, HANDLER]], &cut_at_the_end)
+        assert(in_handler(&c, HANDLER, e, recorded(kind, CFSR_IBUSERR), 0), s"$kind")
+        assert(load32(&c, c.r[13] + 24) == RAM_BYTES - 2, f"$kind returns to 0x${load32(&c, c.r[13] + 24)}%x")
+
+@test("a branch to an even address where nothing answers is INVSTATE, which comes before the fetch, not IBUSERR")
+bf_even_target_off_the_ram()
+    for kind in WITH_USAGE
+        // bx r1, to the hole without its Thumb bit; the UsageFault not enabled.
+        var c = ran(kind, laid([BX_R1, BKPT], [BKPT]).view(), [0, HOLE], [[HARD_FAULT, HANDLER]], &bus_on)
+        assert(in_handler(&c, HANDLER, HARD_FAULT, CFSR_INVSTATE, HFSR_FORCED), s"$kind")
+        assert(load32(&c, c.r[13] + 24) == HOLE && load32(&c, c.r[13] + 28) & (1 << 24) == 0, s"$kind frame")
+    var c = ran(Kind.V6m, laid([BX_R1, BKPT], [BKPT]).view(), [0, HOLE], [[HARD_FAULT, HANDLER]], &nothing)
+    assert(in_handler(&c, HANDLER, HARD_FAULT, 0, 0) && load32(&c, c.r[13] + 24) == HOLE, "M0+")
+
+// ---------------------------------------------------------------------------------------------------
+// Stacking and unstacking: STKERR, UNSTKERR.
+
+@test("STKERR: an SVC with SP in the hole derives BusFault STKERR, escalated to HardFault where BusFault is disabled, taken first as a late arrival with SVCall left pending; enabled above SVCall, BusFault itself; on the M0+ HardFault")
+bf_stacking()
+    for kind in EVERY_KIND
+        // mov sp, r1; svc #0; bkpt
+        var c = ran(kind, laid([MOV_SP_R1, SVC_0, BKPT], [BKPT]).view(), [0, HOLE + 0x100], [[SVCALL, SECOND], [HARD_FAULT, HANDLER]], &nothing)
+        assert(in_handler(&c, HANDLER, HARD_FAULT, recorded(kind, CFSR_STKERR), recorded(kind, HFSR_FORCED)), s"$kind disabled")
+        assert(c.r[13] == HOLE + 0x100 - 0x20 && bit_of(c.pending[0], SVCALL) == 1 && c.bfar == 0, s"$kind SP and SVCall pending")
+        if kind != Kind.V6m
+            c = ran(kind, laid([MOV_SP_R1, SVC_0, BKPT], [BKPT]).view(), [0, HOLE + 0x100], [[SVCALL, SECOND], [BUS_FAULT, HANDLER]], &bus_over_svcall)
+            assert(in_handler(&c, HANDLER, BUS_FAULT, CFSR_STKERR, 0) && bit_of(c.pending[0], SVCALL) == 1, s"$kind enabled")
+
+@test("UNSTKERR: a return whose frame is in the hole deactivates the handler and tail-chains into BusFault UNSTKERR, nothing stacked, LR still the EXC_RETURN; HardFault where BusFault is disabled; on the M0+ HardFault")
+bf_unstacking()
+    for kind in EVERY_KIND
+        // svc #0; bkpt. SVCall's handler: mov sp, r1; bx lr. The fault's, at SECOND: bkpt.
+        val e = bus_exception(kind)
+        var c = ran(kind, laid_twice([SVC_0, BKPT], [MOV_SP_R1, BX_LR], [BKPT]).view(), [0, HOLE + 0x100], [[SVCALL, HANDLER], [e, SECOND]], &bus_on)
+        assert(in_handler(&c, SECOND, e, recorded(kind, CFSR_UNSTKERR), 0), s"$kind")
+        assert(c.r[13] == HOLE + 0x100 && c.r[14] == 0xFFFFFFF9 && bit_of(c.active[0], SVCALL) == 0 && bit_of(c.active[0], e) == 1, s"$kind tail-chained")
+        if kind != Kind.V6m
+            c = ran(kind, laid_twice([SVC_0, BKPT], [MOV_SP_R1, BX_LR], [BKPT]).view(), [0, HOLE + 0x100], [[SVCALL, HANDLER], [HARD_FAULT, SECOND]], &nothing)
+            assert(in_handler(&c, SECOND, HARD_FAULT, CFSR_UNSTKERR, HFSR_FORCED), s"$kind disabled")
+
+// ---------------------------------------------------------------------------------------------------
+// The M33's security states, and what benchtop does not model.
+
+@test("on the M33 BusFault is Secure state's while BFHFNMINS is clear: BFSR and BFAR in the Secure registers, nothing in the Non-secure CFSR, and zero through the Non-secure view; BFHFNMINS written 1 stops at NonSecure, not modelled")
+bf_secure_target()
+    // A Secure load from the hole; BusFault's handler at HANDLER.
+    var c = ran(Kind.V8mMain, laid([LDR_R0_R1, BKPT], [BKPT]).view(), [99, HOLE], [[BUS_FAULT, HANDLER]], &secure_bus)
+    assert(in_handler(&c, HANDLER, BUS_FAULT, CFSR_PRECISERR | CFSR_BFARVALID, 0) && c.bfar == HOLE && load32(&c, SCB_BFAR) == HOLE, "Secure")
+    assert(c.cfsr_ns == 0, "nothing in the Non-secure CFSR")
+    // Through the Non-secure view the BusFault bytes and BFAR read as zero.
+    c.ns = true
+    assert(ns_view_read(&c, SCB_CFSR, 4, 0) == 0 && ns_view_read(&c, SCB_BFAR, 4, 0) == 0, "the Non-secure view")
+    c.ns = false
+    // aircr = 0x05FA2000 (VECTKEY, BFHFNMINS): str r0, [r1]
+    c = ran(Kind.V8mMain, laid([STR_R0_R1, BKPT], [BKPT]).view(), [0x05FA2000, SCB_AIRCR], [], &secure_bus)
+    assert(c.stop == Stop.NonSecure && c.transition == Transition.Aircr && c.pc == 0, s"BFHFNMINS: ${c.stop}")
+
+@test("a register benchtop does not model stops at Unmodelled, named with its device and offset, with no fault recorded, even where a debugger runs the core")
+bf_unmodelled_register()
+    for kind in EVERY_KIND
+        val setups: [2]Setup = [&bus_on, &bus_caught]
+        for setup in setups
+            // ldrb r0, [r1]: a byte of CPUID, which takes only words.
+            var c = ran(kind, laid([0x7808, BKPT], [BKPT]).view(), [99, SCB_CPUID], [[bus_exception(kind), HANDLER], [HARD_FAULT, HANDLER]], setup)
+            assert(c.stop == Stop.Unmodelled && c.stop_at == SCB_CPUID && c.pc == 0 && c.retired == 0 && c.r[0] == 99, s"$kind ${c.stop}")
+            assert(c.unmodelled == Extension.Device && unmodelled_name(&c) == "the system control space + 0xd00", s"[${unmodelled_name(&c)}]")
+            assert(c.cfsr == 0 && c.hfsr == 0 && c.pending[0] == 0, f"CFSR 0x${c.cfsr}%x HFSR 0x${c.hfsr}%x pending 0x${c.pending[0]}%x")
+            assert(unmodelled_text(&c) == "the system control space + 0xd00 at 0xe000ed00, which the chip has and benchtop does not model", unmodelled_text(&c))
