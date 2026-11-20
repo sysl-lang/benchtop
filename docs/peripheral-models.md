@@ -88,6 +88,7 @@ Each model's header lists its own divergences. The current ones:
 | `peripheral/dsi` | refuses video mode, more than two lanes and out-of-range PLL settings |
 | `virt/h7` (`stm32h7-rcc`) | stores the peripheral clock enables and refuses their unimplemented bits, but gates nothing: enable bits are stored; peripherals run regardless. Refuses every other RCC register but GCR |
 | `peripheral/stm32_pwr` (`stm32h7-pwr`) | ignores writes to read-only and reserved bits, as the silicon does; enters no Stop or Standby, so STOPF, SBF, SBF_D1/D2, HOLDxF and the wake-up flags never set; the monitors report a healthy board (PVDO, AVDO, VBAT/temperature flags 0, BRRDY follows BREN, USB33RDY follows USB33DEN); no VOS0, which needs SYSCFG |
+| `virt/hsem` (`stm32h7-hsem`) | only the two cores reach it (no DMA master's COREID); the hardware-configuration and ID registers above KEYR are unmapped |
 | `parts/wm8994` | NACKs an unmodelled register address and configurations outside the 48 kHz slave subset |
 | `parts/ds3231` | none: it keeps the chip's own leap-year rule (2100 is a leap year), not the Gregorian one |
 

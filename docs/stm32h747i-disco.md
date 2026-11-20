@@ -120,7 +120,7 @@ board and all original SPI/GPIO firmware modes remain available.
 
 The built-in description lives in `boards/stm32h747-disco.hocon`, on the built-in mcu
 `stm32h747` (`mcus/stm32h747.hocon`), which holds the chip's facts: the real internal
-flash and AXI SRAM addresses, RCC CM4 release, STM32 DSI at 0x50000000, I2C4 at
+flash and AXI SRAM addresses, RCC CM4 release, HSEM, STM32 DSI at 0x50000000, I2C4 at
 0x58001c00, SDMMC1, SPI1, GPIO A to K with their reset modes, and the pins each signal
 can be routed to. The board picks I2C4's pins, PD12/PD13, under `buses`;
 An FT6206 at address 0x2a supplies touch
@@ -137,6 +137,18 @@ the file (a multiple of 512 KiB, up to 64 MiB), and `run --sd none` takes the ca
 board's pull-up) and SDMMC1 commands time out. A description does the same with `inserted = false` on
 the `card` part. `boards/stm32h747-spi-sd.hocon` is the same board with the card instead on an
 external SPI1 module, J2.
+
+The hardware semaphores, HSEM at 0x58026400, are the two cores' lock and doorbell, since each core's
+exclusives reach only its own local monitor. All 32 semaphores are modelled: the 2-step lock (write
+`R[n]` with LOCK, COREID and PROCID, then read it back), the 1-step lock (read `RLR[n]`, which locks
+a free semaphore with the reader's COREID and PROCID 0), and the free (write `R[n]` with LOCK clear
+and the holder's COREID and PROCID; any other free is ignored). The COREID is the accessing core's:
+3 for the M7 (CPU1), 1 for the M4 (CPU2); a lock or free naming the other core's is ignored. A free
+sets the semaphore's bit in both `C1ISR` and `C2ISR`; `C1MISR`/`C2MISR` is ISR AND IER, and while it
+is not zero HSEM1 (IRQ 125) is raised in the M7 or HSEM2 (IRQ 126) in the M4. `CnICR` clears by
+writing 1. `CR` with the key in `KEYR` frees every semaphore of the COREID written. Registers take
+word accesses only; a byte or halfword faults. Both cores may run on threads of their own, and a
+lock is one atomic step there too: two cores racing for a semaphore never both win.
 
 The four user LEDs, LD1 to LD4, are on PI12 to PI15 and light while their pin is an output driven
 low. The wake-up button B2 holds PC13 high while pressed (key 1); the reset button B1 (key 2)
