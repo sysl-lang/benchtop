@@ -1,0 +1,498 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+import sysl.buf.{Buf, buf}
+
+// The ARMv7-M MPU (PMSAv7, pmsav7.sysl) enforced on the M7 (16 regions) and the M4 (8), against the
+// ARMv7-M ARM (DDI0403E, B3.5, Table B3-15, "ValidateAddress") and QEMU's `get_phys_addr_pmsav7`: the
+// registers and their aliases, a region's size, alignment and subregions, priority by number, every AP
+// code at both privileges, XN, PRIVDEFENA, HFNMIENA, the PPB, the System space, the fast path, and a
+// CMSIS `ARM_MPU_SetRegion`/`ARM_MPU_Enable` sequence. Every guest case runs on both cores and under
+// both executors (`run_both_thumb2`), which must agree. mpu_tests.sysl's `refused`, `made` and
+// `stacked_pc` judge the outcomes.
+
+val V7_KINDS: [2]Kind = [Kind.V7emM7, Kind.V7em]
+
+const RASR_ALL: u32 = 0x173FFF3F
+const AT_6000: u32 = 0x99AABBCC
+
+// The STM32H747's: 16 regions on the M7, 8 on the M4.
+v7_regions(kind: Kind) -> u32 = if kind == Kind.V7emM7 then 16 else 8
+
+// MPU_RASR enabling a region of 2^`log2` bytes with AP `ap`.
+rasr(log2: u32, ap: u32) -> u32 = (ap << 24) | ((log2 - 1) << 1) | 1
+
+// Region `k` at `base` with MPU_RASR `x`, through MPU_RNR.
+v7_region(cpu: *Cpu, k: u32, base: u32, x: u32)
+    store32(cpu, MPU_RNR, k)
+    store32(cpu, MPU_RBAR, base)
+    store32(cpu, MPU_RASR, x)
+
+// A core of `kind` reset with its MPU, for the register-level cases.
+v7_core(kind: Kind) -> Cpu
+    var c: Cpu
+    c.kind = kind
+    reset(&c, test_memory, [], 0)
+    c.pmsav7_regions = v7_regions(kind)
+    c
+
+// The MPU the core has, never written.
+v7_untouched(cpu: *Cpu)
+    cpu.pmsav7_regions = v7_regions(cpu.kind)
+    store16(cpu, FAULT_AT, BKPT)
+    store32(cpu, 0x3000, AT_3000)
+    store32(cpu, 0x4000, AT_4000)
+
+// Region 0, 0x0000–0x3FFF, read-write at any privilege, execute-never, its subregion 6 (0x3000–0x37FF)
+// disabled; 1, 0x0000–0x0FFF, read-only, executable: the code, the vectors and the handler, over
+// region 0; 2, 0x4000–0x4FFF, read-only, execute-never; 3, 0x5000–0x50FF, privileged read-write only.
+// The MPU on with PRIVDEFENA, MemManage enabled, a BKPT at FAULT_AT.
+v7_on(cpu: *Cpu)
+    v7_untouched(cpu)
+    store32(cpu, 0x6000, AT_6000)
+    store32(cpu, SCB_SHCSR, MEMFAULTENA)
+    v7_region(cpu, 0, 0x0000, RASR_XN | rasr(14, 3) | (1 << 14))
+    v7_region(cpu, 1, 0x0000, rasr(12, 6))
+    v7_region(cpu, 2, 0x4000, RASR_XN | rasr(12, 6))
+    v7_region(cpu, 3, 0x5000, RASR_XN | rasr(8, 1))
+    store32(cpu, MPU_CTRL, 5)
+
+v7_no_default(cpu: *Cpu)
+    v7_on(cpu)
+    store32(cpu, MPU_CTRL, 1)
+
+v7_hfnmiena(cpu: *Cpu)
+    v7_on(cpu)
+    store32(cpu, MPU_CTRL, 3)
+
+v7_escalating(cpu: *Cpu)
+    v7_on(cpu)
+    store32(cpu, SCB_SHCSR, 0)
+
+// Region 4, 0x4800–0x4FFF, read-write at any privilege, over the second half of region 2.
+v7_overlap(cpu: *Cpu)
+    v7_on(cpu)
+    v7_region(cpu, 4, 0x4800, RASR_XN | rasr(11, 3))
+
+// Regions 6 (read-write) and 7 (read-only) over 0x4000–0x4FFF: 7 decides.
+v7_seven_read_only(cpu: *Cpu)
+    v7_on(cpu)
+    v7_region(cpu, 6, 0x4000, RASR_XN | rasr(12, 3))
+    v7_region(cpu, 7, 0x4000, RASR_XN | rasr(12, 6))
+
+// The same the other way round: 7 read-write decides.
+v7_seven_read_write(cpu: *Cpu)
+    v7_on(cpu)
+    v7_region(cpu, 6, 0x4000, RASR_XN | rasr(12, 6))
+    v7_region(cpu, 7, 0x4000, RASR_XN | rasr(12, 3))
+
+// Region 1 with its subregion 7 (0x0E00–0x0FFF) disabled, which region 0 holds read-write beneath it.
+v7_hole(cpu: *Cpu)
+    v7_on(cpu)
+    v7_region(cpu, 1, 0x0000, rasr(12, 6) | (1 << 15))
+
+// Region 4, 0x6000–0x607F, 128 bytes read-write with every SRD bit set, which a region under 256 bytes
+// ignores; region 5, 0x6100–0x61FF, 256 bytes read-write, its first 32-byte subregion disabled.
+v7_small(cpu: *Cpu)
+    v7_on(cpu)
+    v7_region(cpu, 4, 0x6000, RASR_XN | rasr(7, 3) | 0xFF00)
+    v7_region(cpu, 5, 0x6100, RASR_XN | rasr(8, 3) | (1 << 8))
+
+// Region 4 with SIZE 3 (16 bytes, UNPREDICTABLE: none) at 0x6000; region 5, the smallest, 32 bytes at
+// 0x6020; region 6, 4 KB written at 0x7100, which holds 0x7000–0x7FFF.
+v7_sizes(cpu: *Cpu)
+    v7_on(cpu)
+    v7_region(cpu, 4, 0x6000, RASR_XN | (3 << 24) | (3 << 1) | 1)
+    v7_region(cpu, 5, 0x6020, RASR_XN | rasr(5, 3))
+    v7_region(cpu, 6, 0x7100, RASR_XN | rasr(12, 3))
+
+// Region 0 the whole 4 GB, read-write at any privilege, execute-never.
+v7_whole(cpu: *Cpu)
+    v7_on(cpu)
+    v7_region(cpu, 0, 0x0000, RASR_XN | rasr(32, 3))
+
+// Region 4, 0x6000–0x6FFF, with AP r5.
+v7_ap(cpu: *Cpu)
+    v7_on(cpu)
+    v7_region(cpu, 4, 0x6000, RASR_XN | rasr(12, cpu.r[5]))
+
+// The PPB and the 1 MB after it under region 7 with AP 000, the MPU on without PRIVDEFENA.
+v7_ppb_closed(cpu: *Cpu)
+    v7_no_default(cpu)
+    v7_region(cpu, 7, 0xE0000000, RASR_XN | rasr(21, 0))
+
+// A NOP at 0x1800 (region 0, execute-never) and a BKPT at 0x3000 (no region); region 5, 0x7000–0x70FF,
+// privileged read-only and executable, holding `bx lr`; region 6, 0x7100–0x71FF, executable with AP
+// 000, holding a BKPT.
+v7_fetching(cpu: *Cpu)
+    v7_on(cpu)
+    store16(cpu, 0x1800, NOP)
+    store16(cpu, 0x3000, BKPT)
+    store16(cpu, 0x7000, BX_LR)
+    store16(cpu, 0x7100, BKPT)
+    v7_region(cpu, 5, 0x7000, rasr(8, 5))
+    v7_region(cpu, 6, 0x7100, rasr(8, 0))
+
+// Region 4, 0x6000–0x6FFF read-write at any privilege; an SVCall handler at 0x200 that disables it:
+// str r5, [r4] (RNR = 4); movs r3, #0; str r3, [r7] (RASR); bx lr.
+v7_switching(cpu: *Cpu)
+    v7_on(cpu)
+    store32(cpu, 0x6000, 0xABCD)
+    v7_region(cpu, 4, 0x6000, RASR_XN | rasr(12, 3))
+    store16(cpu, 0x200, 0x6025)
+    store16(cpu, 0x202, 0x2300)
+    store16(cpu, 0x204, 0x603B)
+    store16(cpu, 0x206, BX_LR)
+
+// `code` run from 0 on a core of `kind` with r1 = `at`, r0, r2, r3 = 0x10, 0x22, 0x33 and r5 = `r5`,
+// under `setup`, MemManage and HardFault both going to the BKPT at FAULT_AT.
+v7_case(kind: Kind, code: []const u16, at: u32, r5: u32, setup: Setup) -> Cpu
+    run_both_thumb2(kind, code, [0x10, at, 0x22, 0x33, 0, r5, 1], 0, [[MEM_MANAGE, FAULT_AT], [HARD_FAULT, FAULT_AT]], setup)
+
+// `code` after dropping to unprivileged: the access is at 8.
+unpriv(code: []const u16) -> Buf[u16]
+    var out: Buf[u16] = buf()
+    for h in DROP do out.push(h)
+    for h in code do out.push(h)
+    out
+
+// MemManage IACCVIOL for a fetch at `at`, MMFAR not valid.
+fetch_refused(c: *Cpu, at: u32) -> bool =
+    c.ipsr == MEM_MANAGE && c.cfsr == MMFSR_IACCVIOL && c.mmfar == 0 && stacked_pc(c) == at
+
+// ---------------------------------------------------------------------------------------------------
+// The registers.
+
+@test("PMSAv7's registers: MPU_TYPE's DREGION, the bits each keeps, MPU_RNR's width, RBAR's REGION and VALID")
+v7_registers()
+    for kind in V7_KINDS
+        val n = v7_regions(kind)
+        var c = v7_core(kind)
+        assert(load32(&c, MPU_TYPE) == n << 8, "DREGION, one map for instructions and data")
+        store32(&c, MPU_TYPE, 0xFFFFFFFF)
+        assert(load32(&c, MPU_TYPE) == n << 8, "MPU_TYPE is read-only")
+        store32(&c, MPU_CTRL, 0xFFFFFFFF)
+        assert(load32(&c, MPU_CTRL) == 7, "ENABLE, HFNMIENA, PRIVDEFENA")
+        store32(&c, MPU_CTRL, 0)
+        store32(&c, MPU_RNR, 0xFF)
+        assert(load32(&c, MPU_RNR) == n - 1, "REGION keeps the bits that number the regions")
+        store32(&c, MPU_RASR, 0xFFFFFFFF)
+        assert(load32(&c, MPU_RASR) == RASR_ALL, "XN, AP, TEX, S, C, B, SRD, SIZE, ENABLE")
+        store32(&c, MPU_RASR, 0)
+        store32(&c, MPU_RNR, 2)
+        store32(&c, MPU_RBAR, 0x12345668)
+        assert(load32(&c, MPU_RBAR) == 0x12345662 && load32(&c, MPU_RNR) == 2, "without VALID: RNR's region, REGION reads RNR")
+        store32(&c, MPU_RBAR, 0x20000013)
+        assert(load32(&c, MPU_RNR) == 3 && load32(&c, MPU_RBAR) == 0x20000003, "VALID writes REGION to RNR first, and reads 0")
+        store32(&c, MPU_RNR, 2)
+        assert(load32(&c, MPU_RBAR) == 0x12345662, "region 2 kept its own")
+        store32(&c, MPU_RBAR, 0x40000019)
+        assert(load32(&c, MPU_RNR) == (9 & (n - 1)), "REGION 9 on the M4's eight regions keeps its low bits")
+
+@test("MPU_RBAR_A1–A3 and MPU_RASR_A1–A3 are MPU_RBAR and MPU_RASR: they name MPU_RNR's region, not RNR + n")
+v7_aliases()
+    for kind in V7_KINDS
+        var c = v7_core(kind)
+        store32(&c, MPU_RNR, 4)
+        store32(&c, MPU_RASR + 8, 0x0306001B)
+        assert(load32(&c, MPU_RASR) == 0x0306001B && load32(&c, MPU_RASR + 16) == 0x0306001B && load32(&c, MPU_RASR + 24) == 0x0306001B, "RASR_A1 is region 4's")
+        assert(load32(&c, MPU_RNR) == 4, "RNR unmoved")
+        store32(&c, MPU_RNR, 5)
+        assert(load32(&c, MPU_RASR) == 0, "region 5 untouched")
+        // ARM_MPU_Load's copy of four regions into RBAR, RASR, RBAR_A1 … RASR_A3, each RBAR with VALID.
+        for i in 0u32..<4
+            store32(&c, MPU_RBAR + i * 8, (0x10000000 * (i + 1)) | 0x10 | (i + 2))
+            store32(&c, MPU_RASR + i * 8, rasr(12 + i, 3))
+        for i in 0u32..<4
+            store32(&c, MPU_RNR, i + 2)
+            assert(load32(&c, MPU_RBAR) == (0x10000000 * (i + 1)) | (i + 2) && load32(&c, MPU_RASR) == rasr(12 + i, 3), s"region ${i + 2}")
+        assert(load32(&c, MPU_RBAR + 16) == 0x40000005, "RBAR_A2 reads RNR's region")
+
+@test("a core with no MPU reads MPU_TYPE as 0, and its other MPU registers are not modelled")
+v7_absent()
+    for kind in V7_KINDS
+        var c = v7_core(kind)
+        c.pmsav7_regions = 0
+        assert(load32(&c, MPU_TYPE) == 0, "DREGION 0: no MPU")
+        for a in [MPU_CTRL, MPU_RNR, MPU_RBAR, MPU_RASR, MPU_RASR_A3]
+            load32(&c, a)
+            assert(refused_at(&c, a), f"0x$a%x")
+
+@test("an MPU never written leaves the fast path alone: the memory's own table, no slow path, nothing refused")
+v7_untouched_fast_path()
+    for kind in V7_KINDS
+        var c = v7_core(kind)
+        assert(load32(&c, MPU_TYPE) != 0 && load32(&c, MPU_CTRL) == 0 && load32(&c, MPU_RASR) == 0, "reset")
+        assert(!c.mpu_used && !c.mpu_live && c.pages == &test_memory.page_table[0], "reading changes nothing")
+        // Unprivileged: ldr r0, [r1]; str r2, [r1]
+        var g = v7_case(kind, unpriv([0x6808, 0x600A]).view(), 0x3000, 0, &v7_untouched)
+        assert(made(&g) && g.r[0] == AT_3000 && load32(&g, 0x3000) == 0x22 && !g.mpu_used && !g.mpu_live, "no MPU in use")
+        store32(&c, MPU_CTRL, 0)
+        assert(c.mpu_used && !c.mpu_live && c.pages == &test_memory.page_table[0], "written but off: still the memory's table")
+
+// ---------------------------------------------------------------------------------------------------
+// Regions.
+
+@test("a region holds 2^(SIZE+1) bytes from its base: inside it its AP decides, past its end the background map")
+v7_region_match()
+    for kind in V7_KINDS
+        var c = v7_case(kind, [0x6808], 0x50FC, 0, &v7_on)
+        assert(made(&c), "privileged, region 3's last word")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x50FC, 0, &v7_on)
+        assert(refused(&c, 8, 0x50FC), "unprivileged, region 3 is privileged-only")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x5100, 0, &v7_on)
+        assert(refused(&c, 8, 0x5100), "unprivileged, past region 3: no region")
+        c = v7_case(kind, [0x6808, 0x600A], 0x5100, 0, &v7_on)
+        assert(made(&c) && load32(&c, 0x5100) == 0x22, "privileged, past region 3: PRIVDEFENA")
+        c = v7_case(kind, unpriv([0x6808, 0x600A]).view(), 0x1F00, 0, &v7_on)
+        assert(made(&c) && load32(&c, 0x1F00) == 0x22, "unprivileged, region 0 read and written")
+        // ldr r0, [r1] at 0x2FFE: its last bytes are in region 0's disabled subregion.
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x2FFE, 0, &v7_on)
+        assert(refused(&c, 8, 0x3000), "MMFAR is the first refused byte's granule")
+
+@test("a region's size: SIZE below 4 holds nothing, 32 bytes is the smallest, the base's bits below the size are ignored, SIZE 31 is all of memory")
+v7_region_sizes()
+    for kind in V7_KINDS
+        var c = v7_case(kind, unpriv([0x6808]).view(), 0x6000, 0, &v7_sizes)
+        assert(refused(&c, 8, 0x6000), "SIZE 3: no region")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x603C, 0, &v7_sizes)
+        assert(made(&c), "32 bytes: its last word")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x6040, 0, &v7_sizes)
+        assert(refused(&c, 8, 0x6040), "32 bytes: the next")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x7000, 0, &v7_sizes)
+        assert(made(&c), "4 KB written at 0x7100 holds 0x7000")
+        c = v7_case(kind, unpriv([0x6808, 0x600A]).view(), 0x3000, 0, &v7_whole)
+        assert(made(&c) && load32(&c, 0x3000) == 0x22, "4 GB: unprivileged anywhere")
+
+@test("where regions overlap the highest-numbered decides, whichever is more permissive, and the overlap is no fault")
+v7_priority()
+    for kind in V7_KINDS
+        var c = v7_case(kind, unpriv([0x600A]).view(), 0x4800, 0, &v7_overlap)
+        assert(made(&c) && load32(&c, 0x4800) == 0x22, "region 4 read-write over region 2 read-only")
+        c = v7_case(kind, unpriv([0x600A]).view(), 0x47FC, 0, &v7_overlap)
+        assert(refused(&c, 8, 0x47FC), "region 2 alone")
+        c = v7_case(kind, unpriv([0x600A]).view(), 0x0800, 0, &v7_overlap)
+        assert(refused(&c, 8, 0x0800), "region 1 read-only over region 0 read-write")
+        c = v7_case(kind, [0x600A], 0x4000, 0, &v7_seven_read_only)
+        assert(refused(&c, 0, 0x4000), "7 read-only over 6 read-write")
+        c = v7_case(kind, [0x600A], 0x4000, 0, &v7_seven_read_write)
+        assert(made(&c) && load32(&c, 0x4000) == 0x22, "7 read-write over 6 read-only")
+
+@test("region 15 is the M7's highest, over every other")
+v7_region_15()
+    var c = v7_core(Kind.V7emM7)
+    v7_on(&c)
+    v7_region(&c, 15, 0x4000, RASR_XN | rasr(12, 3))
+    assert(load32(&c, MPU_RNR) == 15 && mpu_data_permits(&c, 0x4000, true, true), "15 read-write over 2 read-only")
+    v7_region(&c, 14, 0x4000, RASR_XN | rasr(12, 0))
+    assert(mpu_data_permits(&c, 0x4000, true, true), "14 beneath it changes nothing")
+
+@test("subregions: a disabled one holds nothing, so its addresses fall to the regions beneath, or the background")
+v7_subregions()
+    for kind in V7_KINDS
+        var c = v7_case(kind, unpriv([0x6808]).view(), 0x3000, 0, &v7_on)
+        assert(refused(&c, 8, 0x3000), "region 0's subregion 6 disabled: no region, unprivileged")
+        c = v7_case(kind, [0x6808], 0x37FC, 0, &v7_on)
+        assert(made(&c), "privileged, PRIVDEFENA")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x3800, 0, &v7_on)
+        assert(made(&c), "subregion 7 enabled")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x2FFC, 0, &v7_on)
+        assert(made(&c), "subregion 5 enabled")
+        c = v7_case(kind, unpriv([0x600A]).view(), 0x0E00, 0, &v7_hole)
+        assert(made(&c) && load32(&c, 0x0E00) == 0x22, "region 1's subregion 7 off: region 0 read-write beneath")
+        c = v7_case(kind, unpriv([0x600A]).view(), 0x0DFC, 0, &v7_hole)
+        assert(refused(&c, 8, 0x0DFC), "region 1's subregion 6 on: read-only")
+
+@test("a region under 256 bytes has no subregions and ignores SRD; one of 256 has eight of 32 bytes")
+v7_subregion_sizes()
+    for kind in V7_KINDS
+        var c = v7_case(kind, unpriv([0x6808]).view(), 0x6000, 0, &v7_small)
+        assert(made(&c), "128 bytes, every SRD bit set: held")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x607C, 0, &v7_small)
+        assert(made(&c), "its last word")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x6080, 0, &v7_small)
+        assert(refused(&c, 8, 0x6080), "past it")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x6100, 0, &v7_small)
+        assert(refused(&c, 8, 0x6100), "256 bytes, subregion 0 disabled")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x6120, 0, &v7_small)
+        assert(made(&c), "its subregion 1")
+
+@test("every AP code, privileged and unprivileged, read and written, as Table B3-15 gives it (100 reserved: none)")
+v7_access_permissions()
+    val priv_read: [8]bool = [false, true, true, true, false, true, true, true]
+    val priv_write: [8]bool = [false, true, true, true, false, false, false, false]
+    val user_read: [8]bool = [false, false, true, true, false, false, true, true]
+    val user_write: [8]bool = [false, false, false, true, false, false, false, false]
+    for kind in V7_KINDS
+        for ap in 0u32..<8
+            var c = v7_case(kind, [0x6808], 0x6000, ap, &v7_ap)
+            assert(if priv_read[ap] then made(&c) && c.r[0] == AT_6000 else refused(&c, 0, 0x6000), f"AP $ap, privileged read")
+            c = v7_case(kind, [0x600A], 0x6000, ap, &v7_ap)
+            assert(if priv_write[ap] then made(&c) && load32(&c, 0x6000) == 0x22 else refused(&c, 0, 0x6000) && load32(&c, 0x6000) == AT_6000, f"AP $ap, privileged write")
+            c = v7_case(kind, unpriv([0x6808]).view(), 0x6000, ap, &v7_ap)
+            assert(if user_read[ap] then made(&c) && c.r[0] == AT_6000 else refused(&c, 8, 0x6000), f"AP $ap, unprivileged read")
+            c = v7_case(kind, unpriv([0x600A]).view(), 0x6000, ap, &v7_ap)
+            assert(if user_write[ap] then made(&c) && load32(&c, 0x6000) == 0x22 else refused(&c, 8, 0x6000) && load32(&c, 0x6000) == AT_6000, f"AP $ap, unprivileged write")
+
+@test("TEX, S, C and B change nothing: a region with all of them set allows and refuses as one with none")
+v7_attributes_inert()
+    for kind in V7_KINDS
+        var c = v7_core(kind)
+        v7_on(&c)
+        val before = [mpu_data_permits(&c, 0x4000, false, true), mpu_data_permits(&c, 0x4000, true, false)]
+        v7_region(&c, 2, 0x4000, RASR_XN | rasr(12, 6) | 0x003F0000)
+        assert(load32(&c, MPU_RASR) == RASR_XN | rasr(12, 6) | 0x003F0000, "stored")
+        assert(before[0] && !before[1] && mpu_data_permits(&c, 0x4000, false, true) && !mpu_data_permits(&c, 0x4000, true, false), "the same answers")
+
+// ---------------------------------------------------------------------------------------------------
+// The controls.
+
+@test("without PRIVDEFENA privileged code reaches nothing outside the regions; with it, the default map")
+v7_privdefena()
+    for kind in V7_KINDS
+        var c = v7_case(kind, [0x6808], 0x3000, 0, &v7_no_default)
+        assert(refused(&c, 0, 0x3000), "no background map")
+        c = v7_case(kind, [0x6808], 0x3000, 0, &v7_on)
+        assert(made(&c) && c.r[0] == AT_3000, "PRIVDEFENA")
+        c = v7_case(kind, unpriv([0x6808]).view(), 0x3000, 0, &v7_on)
+        assert(refused(&c, 8, 0x3000), "never unprivileged")
+
+@test("the PPB is always reached, under no region, or under a region that allows nothing")
+v7_ppb()
+    for kind in V7_KINDS
+        var c = v7_case(kind, [0x6808], 0xE000ED00, 0, &v7_no_default)
+        assert(made(&c) && c.r[0] == load32(&c, 0xE000ED00), "no region, no PRIVDEFENA")
+        c = v7_case(kind, [0x6808], MPU_TYPE, 0, &v7_ppb_closed)
+        assert(made(&c) && c.r[0] == v7_regions(kind) << 8, "region 7 with AP 000 over it")
+        var d = v7_core(kind)
+        v7_ppb_closed(&d)
+        assert(!mpu_data_permits(&d, PPB_END, false, false), "past the PPB the region decides")
+
+@test("at a negative priority the MPU does not apply unless HFNMIENA; with it, a refusal there is a lockup")
+v7_hfnmiena()
+    for kind in V7_KINDS
+        // cpsid f; ldr r0, [r1]
+        var c = v7_case(kind, [0xB671, 0x6808], 0x3000, 0, &v7_no_default)
+        assert(made(&c) && c.r[0] == AT_3000, "FAULTMASK set: no MPU")
+        c = v7_case(kind, [0xB671, 0x6808], 0x3000, 0, &v7_hfnmiena)
+        assert(c.stop == Stop.Fault && c.pc == 2 && c.r[0] == 0x10 && c.cfsr == MMFSR_REFUSED, "a lockup, nothing loaded")
+        // cpsid f; cpsie f; ldr r0, [r1]
+        c = v7_case(kind, [0xB671, 0xB661, 0x6808], 0x3000, 0, &v7_no_default)
+        assert(refused(&c, 4, 0x3000), "FAULTMASK clear again")
+        c = v7_case(kind, [0xB671, 0xB661, 0x6808], 0x3000, 0, &v7_hfnmiena)
+        assert(refused(&c, 4, 0x3000), "HFNMIENA changes nothing at priority 0 and up")
+
+@test("MemManage not enabled escalates to HardFault, HFSR.FORCED, with MMFSR and MMFAR recorded")
+v7_escalation()
+    for kind in V7_KINDS
+        var c = v7_case(kind, [0x600A], 0x4000, 0, &v7_escalating)
+        assert(c.stop == Stop.Breakpoint && c.ipsr == HARD_FAULT && c.hfsr == HFSR_FORCED, "HardFault")
+        assert(c.cfsr == MMFSR_REFUSED && c.mmfar == 0x4000 && load32(&c, 0x4000) == AT_4000, "MMFSR and MMFAR")
+
+@test("LDRT and STRT from privileged code are checked as unprivileged code's")
+v7_unprivileged_forms()
+    for kind in V7_KINDS
+        var c = v7_case(kind, [0xF851, 0x0E00], 0x3000, 0, &v7_on)
+        assert(refused(&c, 0, 0x3000), "LDRT, no region")
+        c = v7_case(kind, [0xF841, 0x2E00], 0x5000, 0, &v7_on)
+        assert(refused(&c, 0, 0x5000), "STRT to a privileged-only region")
+
+// ---------------------------------------------------------------------------------------------------
+// Fetches.
+
+@test("a fetch from an execute-never region is MemManage IACCVIOL, MMFAR not valid")
+v7_execute_never()
+    for kind in V7_KINDS
+        // bx r1
+        var c = v7_case(kind, [0x4708], 0x1801, 0, &v7_fetching)
+        assert(fetch_refused(&c, 0x1800), "region 0 is execute-never")
+
+@test("a fetch needs the AP to let the privilege read: AP 000 refuses privileged code, AP 101 unprivileged")
+v7_fetch_by_ap()
+    for kind in V7_KINDS
+        var c = v7_case(kind, [0x4708], 0x7101, 0, &v7_fetching)
+        assert(fetch_refused(&c, 0x7100), "AP 000, privileged")
+        // blx r1 (0x7000: bx lr); msr control, r6; isb; bx r1
+        c = v7_case(kind, [0x4788, DROP[0], DROP[1], DROP[2], DROP[3], 0x4708], 0x7001, 0, &v7_fetching)
+        assert(fetch_refused(&c, 0x7000), "AP 101: called privileged, refused unprivileged")
+
+@test("a fetch from no region is made privileged under PRIVDEFENA, and refused unprivileged or without it")
+v7_fetch_background()
+    for kind in V7_KINDS
+        var c = v7_case(kind, [0x4708], 0x3001, 0, &v7_fetching)
+        assert(c.stop == Stop.Breakpoint && c.stop_at == 0x3000 && c.ipsr == 0, "privileged, PRIVDEFENA")
+        c = v7_case(kind, unpriv([0x4708]).view(), 0x3001, 0, &v7_fetching)
+        assert(fetch_refused(&c, 0x3000), "unprivileged")
+
+@test("the System space is execute-never whatever region holds it; the default map's Peripheral and Device spaces too")
+v7_system_space()
+    for kind in V7_KINDS
+        var c = v7_core(kind)
+        v7_on(&c)
+        v7_region(&c, 0, 0x0000, rasr(32, 3))
+        assert(mpu_fetch_permits(&c, 0x60000000, true), "an executable 4 GB region")
+        assert(!mpu_fetch_permits(&c, 0xE0001000, false) && !mpu_fetch_permits(&c, 0xF0000000, false), "but not the System space")
+        assert(mpu_data_permits(&c, 0xE0100000, true, true), "which it reads and writes")
+        v7_region(&c, 0, 0x0000, 0)
+        assert(mpu_fetch_permits(&c, 0x20000000, false) && !mpu_fetch_permits(&c, 0x40000000, false) && !mpu_fetch_permits(&c, 0xA0000000, false), "the default map")
+
+// ---------------------------------------------------------------------------------------------------
+// The tables.
+
+@test("the tables: a page the deciding region allows whole is on the fast path; one it holds in part, or read-only RAM, is not")
+v7_tables()
+    for kind in V7_KINDS
+        var c = v7_core(kind)
+        v7_on(&c)
+        assert(c.mpu_live && !c.mpu_unpriv, "privileged")
+        assert(c.pages[1] != 0 && c.pages[6] != 0, "region 0's whole page; no region under PRIVDEFENA")
+        assert(c.pages[0] == 0 && c.pages[3] == 0 && c.pages[4] == 0 && c.pages[5] == 0, "read-only RAM, a disabled subregion, a 256-byte region")
+        v7_region(&c, 4, 0x4000, RASR_XN | rasr(12, 3))
+        assert(c.pages[4] != 0, "region 4 read-write whole over region 2")
+        v7_region(&c, 5, 0x4000, RASR_XN | rasr(11, 3))
+        assert(c.pages[4] == 0, "region 5 over half of it")
+        c.control = 1
+        mpu_select(&c)
+        assert(c.mpu_unpriv && c.pages[1] != 0 && c.pages[6] == 0, "unprivileged")
+        store32(&c, MPU_CTRL, 0)
+        assert(!c.mpu_live && c.pages == &test_memory.page_table[0], "the MPU off: the memory's own table")
+
+@test("a page made forbidden after a fast access traps on the next, on both executors")
+v7_region_change()
+    // msr control, r6; isb; ldr r0, [r1]; svc 0 (region 4 disabled); ldr r2, [r1]
+    val code: []const u16 = [DROP[0], DROP[1], DROP[2], DROP[3], 0x6808, 0xDF00, 0x680A]
+    for kind in V7_KINDS
+        var c = run_both_thumb2(kind, code, [0x10, 0x6000, 0x22, 0x33, MPU_RNR, 4, 1, MPU_RASR], 0, [[MEM_MANAGE, FAULT_AT], [SVCALL, 0x200]], &v7_switching)
+        assert(c.ipsr == MEM_MANAGE && c.cfsr == MMFSR_REFUSED && c.mmfar == 0x6000 && stacked_pc(&c) == 12, "the second load refused")
+        assert(c.r[0] == 0xABCD && c.r[2] == 0x22, "the first made, the second not")
+
+// ---------------------------------------------------------------------------------------------------
+// CMSIS.
+
+// The MPU as a reset leaves it, for CMSIS to program; a word at 0x4010 to see that nothing is stored.
+v7_cmsis(cpu: *Cpu)
+    v7_untouched(cpu)
+    store32(cpu, 0x4010, 0x5A5A5A5A)
+
+@test("CMSIS's ARM_MPU_SetRegion twice and ARM_MPU_Enable(PRIVDEFENA), hand-assembled, enforce the regions")
+v7_cmsis_sequence()
+    // r4 = MPU (0xE000ED90); r1, r2 = ARM_MPU_RBAR(0, 0), ARM_MPU_RASR(0, ARM_MPU_AP_RO, 0, 0, 1, 0, 0,
+    // ARM_MPU_REGION_SIZE_4KB); r3, r5 = ARM_MPU_RBAR(1, 0x4000), ARM_MPU_RASR(1, ARM_MPU_AP_RO, 0, 1,
+    // 1, 1, 0, ARM_MPU_REGION_SIZE_4KB); r6 = MPU_CTRL_PRIVDEFENA_Msk; r7 = SCB_SHCSR_MEMFAULTENA_Msk.
+    val code: []const u16 = [
+        0x60E1, 0x6122,             // MPU->RBAR = r1; MPU->RASR = r2
+        0x60E3, 0x6125,             // MPU->RBAR = r3; MPU->RASR = r5
+        0xF3BF, 0x8F5F,             // dmb
+        0x2001, 0x4330, 0x6060,     // MPU->CTRL = r6 | MPU_CTRL_ENABLE_Msk
+        0xF854, 0x0C6C, 0x4338,     // SCB->SHCSR |= r7
+        0xF844, 0x0C6C,
+        0xF3BF, 0x8F4F,             // dsb
+        0xF3BF, 0x8F6F,             // isb
+        0x7018]                     // strb r0, [r3]: 0x4011, region 1, read-only
+    val regs: []const u32 = [0, 0x00000010, 0x06020017, 0x00004011, 0xE000ED90, 0x16070017, 4, MEMFAULTENA]
+    for kind in V7_KINDS
+        var c = run_both_thumb2(kind, code, regs, 0, [[MEM_MANAGE, FAULT_AT], [HARD_FAULT, FAULT_AT]], &v7_cmsis)
+        assert(c.ipsr == MEM_MANAGE && c.cfsr == MMFSR_REFUSED && c.mmfar == 0x4011 && stacked_pc(&c) == 36, "MemManage DACCVIOL at the store")
+        assert(load32(&c, MPU_CTRL) == 5 && load32(&c, SCB_SHCSR) & MEMFAULTENA != 0, "enabled, MemManage on")
+        assert(load32(&c, MPU_RNR) == 1 && load32(&c, MPU_RBAR) == 0x4001 && load32(&c, MPU_RASR) == 0x16070017, "region 1 as written")
+        assert(load32(&c, 0x4010) == 0x5A5A5A5A, "nothing stored")

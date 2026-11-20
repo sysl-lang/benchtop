@@ -949,7 +949,8 @@ options, and writing a description back preserves them. **Integer DSP is impleme
 multiply/accumulate families, including APSR.GE and exception stacking. It defaults to off.
 `fpu = sp` (or `dp` on the M7) gives a core its floating-point unit, whose results and flags
 match QEMU's (DESIGN §2.13).
-`run` rejects enabled MPU, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
+`mpu-regions` on an M3, M4 or M7 gives it an enforced PMSAv7 MPU (the STM32H747's M7 has 16, its M4 8).
+`run` rejects an enabled MPU on any other model, TrustZone, caches, MVE, low-overhead loops and PACBTI with a message naming the
 unsupported selection; it never silently
 ignores them. A chip's integrated core configuration is defined by its chip model; these options
 apply to boards that declare `cores` directly.
@@ -995,7 +996,10 @@ RP2350's Cortex-M33s are the exception: they have the Security Extension and an 
 per security state, which is enforced on every load, store and instruction fetch (MemManage
 DACCVIOL with MMFAR, or IACCVIOL; PRIVDEFENA, HFNMIENA, AP, XN, overlaps and `LDRT`/`STRT`), but not
 yet on exception stacking and unstacking, lazy floating-point preservation or `BLXNS`'s push. The
-M4's and M7's PMSAv7 MPU and the M0+'s are not enforced.
+M3's, M4's and M7's PMSAv7 MPU is enforced where the board gives `mpu-regions` (the STM32H747's M7
+and M4 have 16 and 8): sizes, alignment, subregions, the highest-numbered region winning, AP, XN,
+PRIVDEFENA, HFNMIENA, MemManage as on the M33; TEX, S, C and B are stored with no effect, there being
+no cache model. The M0+'s MPU is not enforced.
 M4 and M7 always have integer DSP; M33/M35P/M52/M55/M85 can enable it independently per core. The M52/M55/M85
 models implement a scalar subset, not the full Armv8.1-M ISA: low-overhead loops, long shifts,
 MVE/Helium, PACBTI, cache maintenance and TCM control are not emulated. A low-overhead loop, long
