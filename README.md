@@ -1168,6 +1168,12 @@ return size, one/two lanes, packet completion timing and polling status. Invalid
 or unsupported operations fail explicitly. The common DCS display is a separate
 part connected by `dsi = <controller>` and optional `channel = 0..3`.
 
+The two cores lock and ring each other through the HSEM (`stm32h7-hsem` at 0x58026400): all 32
+semaphores with the 2-step write lock and the 1-step `RLR` read lock, each access carrying its core's
+ID (3 for the M7, 1 for the M4), frees that must name the holder, each core's free interrupt (HSEM1,
+IRQ 125, to the M7; HSEM2, IRQ 126, to the M4) behind its `IER`/`ICR`/`ISR`/`MISR`, and clear by core
+ID with `KEYR`'s key. A lock is atomic across the cores' host threads.
+
 This is a runnable subset, not complete Discovery emulation: LTDC/video mode,
 DMA2D, remaining codec modes, the remaining RAM banks, external memory, full RCC/PWR and
 panel-specific vendor initialization are still missing. I2C4 is a functional
