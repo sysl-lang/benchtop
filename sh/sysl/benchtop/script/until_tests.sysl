@@ -1,0 +1,387 @@
+module sh.sysl.benchtop.script
+@tests
+
+// The stop conditions (until.sysl) in scripted runs: each on the virtual board, the STM32H747I-DISCO,
+// the Pico and the Pico 2; any one of several ending the run; the refusals; and the report's `until`.
+// The guests are raw images assembled here (the RP boards', which take only an ELF file, wrapped in
+// one), and the SDK's examples where a symbol's name is wanted.
+
+import sh.sysl.benchtop.v6m.{WATCH_READ, WATCH_WRITE, no_faults}
+import sh.sysl.benchtop.virt.ExitKind
+import sh.sysl.json as json
+import sh.sysl.json.Json
+import sh.sysl.parsing.source_of
+import sysl.buf.{Buf, buf}
+import sysl.fs.{is_file, make_temp_dir, read_bytes, remove_dir_all, write_bytes}
+import sysl.process.{capture, Output, Stdio}
+import sysl.testing.skip
+import sysl.text.from_utf8_lossy
+
+// ---------------------------------------------------------------------------------------------------
+// The guests.
+
+private put16(b: *Buf[u8], at: usize, h: u16)
+    b[at] = u8(h & 0xFF)
+    b[at + 1] = u8(h >> 8)
+
+private put32(b: *Buf[u8], at: usize, w: u32)
+    for i in 0..<4 do b[at + i] = u8((w >> u32(8 * i)) & 0xFF)
+
+private zeros(n: usize) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    for _ in 0..<n do b.push(0)
+    b
+
+// The virtual board's guest, from address 0: the stack at 0x10000, reset at 0x40, HardFault's handler
+// at 0x80 (`b .`). It says `A`, counts to 200 with interrupts masked, stores and loads 0x8000, says
+// `B` and takes UNDEFINSTR (HardFault on its M0+):
+//
+//     40: movs r0, #0x40; lsls r0, r0, #24     r0 = the console, 0x40000000
+//     44: movs r1, #'A'; str r1, [r0]
+//     48: cpsid i; movs r2, #0
+//     4c: adds r2, #1; cmp r2, #200; bne 4c
+//     52: cpsie i
+//     54: movs r3, #0x80; lsls r3, r3, #8      r3 = 0x8000
+//     58: str r1, [r3]
+//     5a: ldr r4, [r3]
+//     5c: movs r1, #'B'; str r1, [r0]
+//     60: udf #0; b .
+private virt_guest() -> Buf[u8]
+    var b = zeros(0x100)
+    put32(&b, 0, 0x10000)
+    put32(&b, 4, 0x41)
+    put32(&b, 12, 0x81)
+    val code: [18]u16 = [0x2040, 0x0600, 0x2141, 0x6001, 0xB672, 0x2200, 0x3201, 0x2AC8, 0xD1FC, 0xB662, 0x2380, 0x021B, 0x6019, 0x681C, 0x2142, 0x6001, 0xDE00, 0xE7FE]
+    for i in 0..<code.len do put16(&b, 0x40 + 2 * i, code[i])
+    put16(&b, 0x80, 0xE7FE)
+    b
+
+// The DISCO's M7 guest, in flash from 0x08000000: the stack at 0x24080000, reset at 0x100, HardFault's
+// handler at 0x200 (`b .`). It stores and loads 0x24000000 and takes UNDEFINSTR (HardFault, with
+// UsageFault not enabled):
+//
+//     100: movs r0, #0x24; lsls r0, r0, #24; movs r1, #5
+//     106: str r1, [r0]
+//     108: ldr r2, [r0]
+//     10a: udf #0; b .
+//
+// `masked` is instead a long masked stretch: `cpsid i`, 0xFF00 times round `subs r0, #1; bne`,
+// `cpsie i; b .`, from 0x100.
+private disco_guest(masked: bool) -> Buf[u8]
+    var b = zeros(0x400)
+    put32(&b, 0, 0x24080000)
+    put32(&b, 4, 0x08000101)
+    put32(&b, 12, 0x08000201)
+    val straight: [7]u16 = [0x2024, 0x0600, 0x2105, 0x6001, 0x6802, 0xDE00, 0xE7FE]
+    val stretch: [7]u16 = [0xB672, 0x20FF, 0x0200, 0x3801, 0xD1FD, 0xB662, 0xE7FE]
+    val code = if masked then stretch else straight
+    for i in 0..<code.len do put16(&b, 0x100 + 2 * i, code[i])
+    put16(&b, 0x200, 0xE7FE)
+    b
+
+// The RP boards' guest, in RAM from 0x20000000, as an ELF file entered at 0x40: its vector table at
+// 0x20000000 (VTOR set to it), the stack at 0x20001000, HardFault's handler at 0x80 (`b .`). It takes
+// UNDEFINSTR at 0x4a:
+//
+//     40: ldr r2, =0xe000ed08; ldr r3, =0x20000000; str r3, [r2]
+//     46: ldr r0, =0x20001000; mov sp, r0
+//     4a: udf #0; b .
+private rp_guest() -> Buf[u8]
+    var b = zeros(0x100)
+    put32(&b, 0, 0x20001000)
+    put32(&b, 4, 0x20000041)
+    put32(&b, 12, 0x20000081)
+    val code: [8]u16 = [0x4A03, 0x4B04, 0x6013, 0x4804, 0x4685, 0xDE00, 0xE7FE, 0xBF00]
+    for i in 0..<code.len do put16(&b, 0x40 + 2 * i, code[i])
+    put32(&b, 0x50, 0xE000ED08)
+    put32(&b, 0x54, 0x20000000)
+    put32(&b, 0x58, 0x20001000)
+    put16(&b, 0x80, 0xE7FE)
+    elf_of(0x20000000, 0x20000041, b.view())
+
+// `body` as a little-endian ARM ELF file of one loaded segment at `base`, entered at `entry`.
+private elf_of(base: u32, entry: u32, body: []const u8) -> Buf[u8]
+    var b = zeros(0x100)
+    val ident: [8]u8 = [0x7F, 0x45, 0x4C, 0x46, 1, 1, 1, 0]
+    for i in 0..<ident.len do b[i] = ident[i]
+    put16(&b, 16, 2)
+    put16(&b, 18, 40)
+    put32(&b, 20, 1)
+    put32(&b, 24, entry)
+    put32(&b, 28, 52)
+    put32(&b, 36, 0x05000200)
+    put16(&b, 40, 52)
+    put16(&b, 42, 32)
+    put16(&b, 44, 1)
+    put16(&b, 46, 40)
+    // The segment: PT_LOAD, its bytes at 0x100, read, write and execute.
+    put32(&b, 52, 1)
+    put32(&b, 56, 0x100)
+    put32(&b, 60, base)
+    put32(&b, 64, base)
+    put32(&b, 68, u32(body.len))
+    put32(&b, 72, u32(body.len))
+    put32(&b, 76, 7)
+    put32(&b, 80, 4)
+    b.extend(body)
+    b
+
+// ---------------------------------------------------------------------------------------------------
+// Running them.
+
+// `args` as a quiet scripted run of `image` on `board`, its report to `report` where not empty.
+private until_run(board: string, image: string, args: []const string, report: string = "") -> Outcome
+    var all: Buf[string] = buf()
+    all.push("--quiet")
+    for a in args do all.push(a)
+    run(board, image, parse(all.view()).unwrap(), setup(), no_faults(), "", report)
+
+// `bytes` written to `dir`/`name`.
+private written(dir: string, name: string, bytes: Buf[u8]) -> string
+    val file = s"$dir/$name"
+    write_bytes(file, bytes.view()).unwrap()
+    file
+
+private met(o: Outcome, line: string) -> bool = o.status == 0 && o.end == ExitKind.UntilMet && o.why == line
+
+private console(o: Outcome) -> string = from_utf8_lossy(o.console.view())
+
+private report_of(file: string) -> Json
+    val text = read_bytes(file) match
+        Ok(b) -> from_utf8_lossy(b.view())
+        Err(_) -> ""
+    json.parse(source_of(file, text)) match
+        Ok(j) -> j
+        Err(_) -> panic(s"$file is not JSON:\n$text")
+
+private str_at(j: Json, key: string) -> string = j.get(key).unwrap().as_str().unwrap()
+
+// ---------------------------------------------------------------------------------------------------
+// The options.
+
+@test("until: each option is taken with its value, a write or read range with its length or one byte, --until-masked in microseconds or as --timeout writes it")
+until_options()
+    val sc = parse(["--until-symbol", "main", "--until-symbol", "0x10000234", "--until-uart", "ready [0-9]+", "--until-fault", "--until-masked", "50", "--until-write", "0x20000100:4", "--until-read", "536871168"][..]).unwrap()
+    val u = sc.until
+    assert(u.any() && u.on_cores() && !sc.active() && sc.headless(), "conditions alone make a headless run, not a script")
+    assert(u.symbols.len() == 2 && u.symbols[1] == "0x10000234" && u.patterns[0] == "ready [0-9]+" && u.fault, "symbols, pattern, fault")
+    assert(u.masked == Some(Duration.Time(50000)) && u.masked_value == "50", "50 is microseconds")
+    assert(u.watches.len() == 2, "two ranges")
+    assert(u.watches[0].kind == WATCH_WRITE && u.watches[0].at == 0x20000100 && u.watches[0].len == 4, "a write, four bytes")
+    assert(u.watches[1].kind == WATCH_READ && u.watches[1].at == 0x20000100 && u.watches[1].len == 1, "a read, decimal, one byte")
+    assert(parse(["--until-masked", "2ms"][..]).unwrap().until.masked == Some(Duration.Time(2000000)), "2ms")
+    assert(parse(["--until-masked", "100cycles"][..]).unwrap().until.masked == Some(Duration.Cycles(100)), "cycles")
+    val uart_only = parse(["--until-uart", "x"][..]).unwrap().until
+    assert(uart_only.any() && !uart_only.on_cores(), "a pattern needs no Cortex-M core")
+    assert(!script().until.any() && !script().headless(), "none by default")
+
+@test("until: an empty name, a bad address or range, a pattern that does not compile, a masked time of none or given twice, and a fifth watched range are refused, saying why")
+until_option_refusals()
+    refused(["--until-symbol", ""][..], "--until-symbol takes a symbol's name or an address, and this one is empty")
+    refused(["--until-symbol", "0x12g"][..], "--until-symbol takes a symbol's name or an address as 0x…, not 0x12g")
+    refused(["--until-uart", ""][..], "--until-uart takes a pattern to wait for, and this one is empty")
+    refused(["--until-uart", "ready ("][..], "--until-uart \"ready (\": a group is never closed, opened at 6")
+    refused(["--until-masked", "0"][..], "--until-masked takes a time longer than none")
+    refused(["--until-masked", "fast"][..], "--until-masked takes microseconds of the board's time, as 50, or a time or cycles as 50us, 2ms or 100000cycles, not fast")
+    refused(["--until-masked", "5", "--until-masked", "6"][..], "--until-masked is given once")
+    refused(["--until-write", "0x100:0"][..], "--until-write watches one byte at least, not 0x100:0")
+    refused(["--until-read", "0x100:x"][..], "--until-read takes an address and a length in bytes, as 0x20000100 or 0x20000100:4, not 0x100:x")
+    refused(["--until-write", "0x1FFFFFFFF"][..], "--until-write takes an address and a length in bytes, as 0x20000100 or 0x20000100:4, not 0x1FFFFFFFF")
+    refused(["--until-write", "0xFFFFFFFF:2"][..], "--until-write 0xFFFFFFFF:2 runs past the end of the address space")
+    refused(["--until-symbol"][..], "--until-symbol takes a value")
+    refused(["--until-write", "1", "--until-write", "2", "--until-read", "3", "--until-read", "4", "--until-write", "5"][..], "--until-write and --until-read watch 4 ranges at most, a core's watchpoints")
+
+private refused(args: []const string, why: string) = parse(args) match
+    Ok(_) -> panic(s"taken: ${args[0]}")
+    Err(e) -> assert(e == why, e)
+
+// ---------------------------------------------------------------------------------------------------
+// The virtual board: an M0+ machine with no clock rate.
+
+@test("until on the virtual board: a symbol by address stops before it runs; a pattern on the console; a fault at its handler; masking in cycles; a store and a load to a watched range")
+until_virt()
+    val dir = make_temp_dir("benchtop-until").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val image = written(dir, "guest.bin", virt_guest())
+    val far = ["--timeout", "1000000cycles"]
+
+    val sym = until_run("virt", image, ["--timeout", "1000000cycles", "--until-symbol", "0x5c"][..])
+    assert(met(sym, "until symbol 0x5c met on core 0 at pc 0x0000005c"), sym.why)
+    assert(console(sym) == "A", console(sym))
+    // The Thumb bit of an address is no part of it.
+    assert(until_run("virt", image, ["--timeout", "1000000cycles", "--until-symbol", "0x5D"][..]).why == "until symbol 0x5D met on core 0 at pc 0x0000005c", "odd")
+
+    val uart = until_run("virt", image, ["--timeout", "1000000cycles", "--until-uart", "A+B"][..])
+    assert(met(uart, "until uart \"A+B\" met on core 0 at pc 0x00000080: matched \"AB\""), uart.why)
+
+    val fault = until_run("virt", image, ["--timeout", "1000000cycles", "--until-fault"][..])
+    assert(met(fault, "until fault met on core 0 at pc 0x00000080: HardFault taken, its handler not yet run"), fault.why)
+    assert(fault.explanation.starts_with("core 0 faulted: took HardFault") && fault.explanation.contains("pc 0x00000060"), fault.explanation)
+    // Unarmed, the handler runs: `b .` to the timeout.
+    val spun = until_run("virt", image, far[..])
+    assert(spun.status == TIMED_OUT && spun.end == ExitKind.Timeout, spun.why)
+
+    val masked = until_run("virt", image, ["--timeout", "1000000cycles", "--until-masked", "100cycles"][..])
+    assert(masked.status == 0 && masked.end == ExitKind.UntilMet && masked.why.starts_with("until masked 100cycles met on core 0 at pc 0x0000004c: masked for 10") && masked.why.ends_with(" cycles since 0x00000048"), masked.why)
+    assert(until_run("virt", image, ["--timeout", "1000000cycles", "--until-masked", "5000cycles"][..]).status == TIMED_OUT, "a shorter stretch does not stop it")
+    // The virtual board's mcu names no clock rate: microseconds mean nothing on it.
+    val unrated = until_run("virt", image, ["--timeout", "1000000cycles", "--until-masked", "50"][..])
+    assert(unrated.status == 1 && unrated.end == ExitKind.Error && unrated.why.contains("names no clock rate"), unrated.why)
+
+    val store = until_run("virt", image, ["--timeout", "1000000cycles", "--until-write", "0x8000"][..])
+    assert(met(store, "until write 0x8000 met on core 0 at pc 0x00000058: a store reaching 0x00008000"), store.why)
+    val inside = until_run("virt", image, ["--timeout", "1000000cycles", "--until-write", "0x8002:2"][..])
+    assert(met(inside, "until write 0x8002:2 met on core 0 at pc 0x00000058: a store reaching 0x00008002"), inside.why)
+    val load = until_run("virt", image, ["--timeout", "1000000cycles", "--until-read", "0x8000:4"][..])
+    assert(met(load, "until read 0x8000:4 met on core 0 at pc 0x0000005a: a load reaching 0x00008000"), load.why)
+    assert(until_run("virt", image, ["--timeout", "1000000cycles", "--until-read", "0x9000:16"][..]).status == TIMED_OUT, "nothing reads there")
+
+@test("until on the virtual board: a symbol by name in an ELF file; a name the image lacks, or a raw image's, is refused naming the image; an address that is not code is refused")
+until_virt_symbols()
+    val count = "examples/virt/count.elf"
+    val o = until_run("virt", count, ["--timeout", "100000000cycles", "--until-symbol", "main"][..])
+    assert(o.status == 0 && o.end == ExitKind.UntilMet && o.why.starts_with("until symbol main met on core 0 at pc 0x") && o.why.ends_with(" (main)"), o.why)
+    val none = until_run("virt", count, ["--until-symbol", "no_such_function"][..])
+    assert(none.status == 1 && none.why == s"--until-symbol no_such_function: $count has no function or label named no_such_function", none.why)
+
+    val dir = make_temp_dir("benchtop-until-sym").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val image = written(dir, "guest.bin", virt_guest())
+    val raw = until_run("virt", image, ["--until-symbol", "main"][..])
+    assert(raw.status == 1 && raw.why.starts_with(s"--until-symbol main: $image has no symbols"), raw.why)
+    val data = until_run("virt", image, ["--until-symbol", "0x50000000"][..])
+    assert(data.status == 1 && data.why == "--until-symbol 0x50000000: 0x50000000 is not code the cores can run", data.why)
+
+@test("until: conditions combine as OR — whichever is met first ends the run, the rest unmet")
+until_or()
+    val dir = make_temp_dir("benchtop-until-or").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val image = written(dir, "guest.bin", virt_guest())
+    // The store at 0x58 comes before the load at 0x5a, which comes before 0x5c and the `B`.
+    val a = until_run("virt", image, ["--timeout", "1000000cycles", "--until-read", "0x8000", "--until-symbol", "0x58"][..])
+    assert(a.why.starts_with("until symbol 0x58 met on core 0 at pc 0x00000058"), a.why)
+    val b = until_run("virt", image, ["--timeout", "1000000cycles", "--until-symbol", "0x5c", "--until-write", "0x8000"][..])
+    assert(b.why.starts_with("until write 0x8000 met"), b.why)
+    val c = until_run("virt", image, ["--timeout", "1000000cycles", "--until-uart", "B", "--until-symbol", "0x5c"][..])
+    assert(c.why.starts_with("until symbol 0x5c met"), c.why)
+    // The console is looked at between slices, a core's stop at once: the `B` and the UDF just after it
+    // fall in one slice, so the fault, which stopped the core inside it, is the one met.
+    val d = until_run("virt", image, ["--timeout", "1000000cycles", "--until-fault", "--until-uart", "B", "--until-masked", "5000cycles"][..])
+    assert(d.why.starts_with("until fault met on core 0 at pc 0x00000080"), d.why)
+    val d2 = until_run("virt", image, ["--timeout", "1000000cycles", "--until-uart", "B", "--until-masked", "5000cycles"][..])
+    assert(d2.why.starts_with("until uart \"B\" met"), d2.why)
+    // None met: the run ends as it would have.
+    val e = until_run("virt", image, ["--timeout", "1000000cycles", "--until-uart", "C", "--until-read", "0x9000"][..])
+    assert(e.status == TIMED_OUT && e.end == ExitKind.Timeout && console(e) == "AB", e.why)
+
+@test("until: the report's exit is until_met, status 0, with an `until` naming the condition, value, core, pc and the address the access reached")
+until_report()
+    val dir = make_temp_dir("benchtop-until-report").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val image = written(dir, "guest.bin", virt_guest())
+    val file = s"$dir/report.json"
+    val o = until_run("virt", image, ["--timeout", "1000000cycles", "--until-write", "0x8000:4"][..], file)
+    assert(o.status == 0, o.why)
+    val j = report_of(file)
+    assert(str_at(j, "exit") == "until_met" && j.get("status").unwrap().as_int() == Some(0) && str_at(j, "message") == o.why, o.why)
+    val u = j.get("until").unwrap()
+    assert(str_at(u, "condition") == "write" && str_at(u, "value") == "0x8000:4" && u.get("core").unwrap().as_int() == Some(0), o.why)
+    assert(str_at(u, "pc") == "0x00000058" && str_at(u, "address") == "0x00008000" && !u.has("symbol") && !u.has("text"), o.why)
+    assert(str_at(j.get("cores").unwrap().at(0).unwrap(), "pc") == "0x00000058", "the core is where the condition was met")
+
+    // A fault's: the exception, and the fault object beside it.
+    val fault = s"$dir/fault.json"
+    until_run("virt", image, ["--timeout", "1000000cycles", "--until-fault"][..], fault)
+    val f = report_of(fault)
+    assert(str_at(f.get("until").unwrap(), "exception") == "HardFault" && f.get("fault").unwrap().get("count").unwrap().as_int() == Some(1), "fault")
+
+    // A run that ends otherwise has none.
+    val plain = s"$dir/plain.json"
+    until_run("virt", image, ["--timeout", "1000000cycles", "--until-uart", "never"][..], plain)
+    val p = report_of(plain)
+    assert(str_at(p, "exit") == "timeout" && !p.has("until"), "timeout")
+
+// ---------------------------------------------------------------------------------------------------
+// The STM32H747I-DISCO: the machine with a clock rate, on its M7.
+
+@test("until on the DISCO's M7: a store and a load to AXI SRAM, a fault at its handler, a symbol by address, masking in microseconds of the board's time")
+until_disco()
+    val dir = make_temp_dir("benchtop-until-disco").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val image = written(dir, "guest.bin", disco_guest(false))
+    val store = until_run("stm32h747-disco", image, ["--timeout", "10ms", "--until-write", "0x24000000:4"][..])
+    assert(met(store, "until write 0x24000000:4 met on core 0 at pc 0x08000106: a store reaching 0x24000000"), store.why)
+    val load = until_run("stm32h747-disco", image, ["--timeout", "10ms", "--until-read", "0x24000002"][..])
+    assert(met(load, "until read 0x24000002 met on core 0 at pc 0x08000108: a load reaching 0x24000002"), load.why)
+    val fault = until_run("stm32h747-disco", image, ["--timeout", "10ms", "--until-fault"][..])
+    assert(met(fault, "until fault met on core 0 at pc 0x08000200: HardFault taken, its handler not yet run"), fault.why)
+    val sym = until_run("stm32h747-disco", image, ["--timeout", "10ms", "--until-symbol", "0x0800010a"][..])
+    assert(met(sym, "until symbol 0x0800010a met on core 0 at pc 0x0800010a"), sym.why)
+
+    val stretch = written(dir, "masked.bin", disco_guest(true))
+    val masked = until_run("stm32h747-disco", stretch, ["--timeout", "10ms", "--until-masked", "50"][..])
+    assert(masked.status == 0 && masked.end == ExitKind.UntilMet && masked.why.starts_with("until masked 50 met on core 0 at pc 0x08000106: masked for ") && masked.why.ends_with(" cycles since 0x08000100"), masked.why)
+    // 0xFF00 rounds of two instructions are far short of 100 ms.
+    assert(until_run("stm32h747-disco", stretch, ["--timeout", "10ms", "--until-masked", "100ms"][..]).status == TIMED_OUT, "not that long")
+
+// ---------------------------------------------------------------------------------------------------
+// The RP boards: the Pico's M0+s and the Pico 2's M33s.
+
+@test("until on the Pico and the Pico 2: main by name, a pattern on UART0, a fault at its handler, a store and a load to a peripheral, masking in cycles")
+until_rp()
+    val dir = make_temp_dir("benchtop-until-rp").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val guest = written(dir, "guest.elf", rp_guest())
+    for (board, hello) in [("pico", "examples/pico/hello_serial.elf"), ("pico2", "examples/pico2/hello_serial.elf")]
+        val main = until_run(board, hello, ["--timeout", "1s", "--until-symbol", "main"][..])
+        assert(main.status == 0 && main.end == ExitKind.UntilMet && main.why.starts_with("until symbol main met on core 0 at pc 0x2") && main.why.ends_with(" (main)"), main.why)
+        val uart = until_run(board, hello, ["--timeout", "1s", "--until-uart", "serial [0-9]+"][..])
+        assert(uart.status == 0 && uart.why.starts_with("until uart \"serial [0-9]+\" met on core 0") && uart.why.ends_with(": matched \"serial 0\""), uart.why)
+        val fault = until_run(board, guest, ["--timeout", "10ms", "--until-fault"][..])
+        assert(met(fault, "until fault met on core 0 at pc 0x20000080: HardFault taken, its handler not yet run"), fault.why)
+        val masked = until_run(board, hello, ["--timeout", "1s", "--until-masked", "15cycles"][..])
+        assert(masked.status == 0 && masked.why.starts_with("until masked 15cycles met on core 0") && masked.why.contains(": masked for "), masked.why)
+    // UART0's data register on the RP2350, written for each character; the RP2040's timer, read.
+    val dr = until_run("pico2", "examples/pico2/hello_serial.elf", ["--timeout", "1s", "--until-write", "0x40070000:4"][..])
+    assert(dr.status == 0 && dr.why.starts_with("until write 0x40070000:4 met on core 0 at pc 0x2") && dr.why.ends_with(": a store reaching 0x40070000"), dr.why)
+    val timer = until_run("pico", "examples/pico/hello_serial.elf", ["--timeout", "1s", "--until-read", "0x40054028"][..])
+    assert(timer.status == 0 && timer.why.contains("(time_us_64+") && timer.why.ends_with(": a load reaching 0x40054028"), timer.why)
+
+@test("until on the Hazard3 harts: every condition but --until-uart is refused, saying the harts have none of the machinery")
+until_riscv()
+    for (option, value) in [("--until-symbol", "main"), ("--until-masked", "5"), ("--until-write", "0x20000000")]
+        val o = until_run("pico2-riscv", "examples/pico2-riscv/blink.elf", [option, value][..])
+        assert(o.status == 1 && o.end == ExitKind.Error && o.why == UNTIL_CORTEX_ONLY, o.why)
+    val fault = until_run("pico2-riscv", "examples/pico2-riscv/blink.elf", ["--until-fault"][..])
+    assert(fault.status == 1 && fault.why == UNTIL_CORTEX_ONLY, fault.why)
+    val uart = until_run("pico2-riscv", "examples/pico2-riscv/blink.elf", ["--timeout", "1ms", "--until-uart", "never"][..])
+    assert(uart.status == TIMED_OUT, uart.why)
+
+// ---------------------------------------------------------------------------------------------------
+// The command.
+
+private benchtop(args: []const string) -> Output =
+    capture("./benchtop", args, stderr = true, timeout = 60000, stdin = Stdio.FromPath("/dev/null")).unwrap()
+
+private exited(o: Output) -> int = o.status match
+    Exited(c) -> c
+    _ -> -1
+
+private err_of(o: Output) -> string = o.err match
+    Some(e) -> e
+    None -> ""
+
+@test("benchtop run --until-…: a run that is otherwise not scripted stops on the condition, status 0, saying so on stderr; --window and --gdb refuse the conditions by name")
+until_command()
+    if !is_file("benchtop") then skip("needs ./benchtop built with `sysl build .`")
+    val dir = make_temp_dir("benchtop-until-command").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val image = written(dir, "guest.bin", virt_guest())
+    val o = benchtop(["run", "--until-symbol", "0x5c", image][..])
+    assert(exited(o) == 0 && err_of(o) == "benchtop: until symbol 0x5c met on core 0 at pc 0x0000005c\n", err_of(o))
+    val f = benchtop(["run", "--until-fault", image][..])
+    assert(exited(f) == 0 && err_of(f).starts_with("benchtop: until fault met on core 0 at pc 0x00000080: HardFault taken, its handler not yet run\nbenchtop: core 0 faulted: took HardFault"), err_of(f))
+    val w = benchtop(["run", "--board", "pico2", "--window", "--until-fault", "examples/pico2/hello_serial.elf"][..])
+    assert(exited(w) == 1 && err_of(w).contains(UNTIL_WINDOW), err_of(w))
+    val g = benchtop(["run", "--board", "pico2", "--gdb", "--until-uart", "x", "examples/pico2/hello_serial.elf"][..])
+    assert(exited(g) == 1 && err_of(g).contains(UNTIL_GDB), err_of(g))

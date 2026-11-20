@@ -207,6 +207,11 @@ receives nothing from the console.
   refused, naming the two the board has.
 - `--report`, `--report-masking` (with `--masking-sites` and `--masking-ranks`), `--explain-faults`,
   `--trace-ring`, and `--seed` with the fault options, on both cores, scripted or not.
+- The stop conditions (README.md, "Stop conditions"): `--until-symbol`, `--until-fault`,
+  `--until-masked` (in microseconds at the mcu's `clock-hz`), `--until-write` and `--until-read` on
+  either core, and `--until-uart` on what both USARTs send to the console (a USART sent to a file with
+  `--serial` is not the console). The run ends, status 0, at the first one met:
+  `benchtop: until fault met on core 1 at pc 0x08100200: HardFault taken, its handler not yet run`.
 
 For example, skiff's boot test with each core's console in a file and the guest's exit status as
 benchtop's:

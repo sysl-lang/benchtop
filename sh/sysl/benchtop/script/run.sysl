@@ -10,7 +10,7 @@ import sh.sysl.benchtop.{Part, article_of, part_model}
 import sh.sysl.benchtop.chip as chip
 import sh.sysl.benchtop.v6m.{ExplainOptions, Faults, MaskingOptions, masking_defaults, SymbolTable, explain_defaults, image_symbols, no_faults, symbol_table}
 import sh.sysl.benchtop.virt as virt
-import sh.sysl.benchtop.virt.{ExitKind, ExitReport, PartInput, SdChoice, Session, SliceEnd, exit_report, exit_report_json, with_guest}
+import sh.sysl.benchtop.virt.{ExitKind, ExitReport, PartInput, SdChoice, Session, SliceEnd, UntilReport, exit_report, exit_report_json, with_guest}
 import sysl.buf.{Buf, buf}
 import sysl.fs.{read_bytes, write_text}
 import sysl.raw.str_cast
@@ -76,7 +76,8 @@ private refused(why: string) -> Outcome
  * ends, whichever way it ends: the script passing, the timeout, a fault, an exit. A `report_file` not
  * empty receives the exit report (`--report`, virt/exit_report.sysl) however the run ends, a refusal
  * included. The Cortex-M cores' faults are recorded and explained as `explain` asks (v6m/explain.sysl),
- * the one the run ended on in the outcome's `explanation`. `benchtop run` exits with the outcome's
+ * the one the run ended on in the outcome's `explanation`. The script's stop conditions (`--until-…`,
+ * until.sysl) end the run, status 0, at the first one met. `benchtop run` exits with the outcome's
  * status after writing why on stderr; a board or an option it refuses, or a report it cannot write, is
  * status 1.
  */
@@ -140,11 +141,17 @@ private played(which: string, file: string, sc: Script, setup: Setup, faults: Fa
     virt.explain_guest_faults(session.guest, explain, table) match
         Ok(_) -> ()
         Err(why) -> return refused(why)
-    var rig = Rig(session, 0, buf(), buf(), name)
+    // The stop conditions (until.sysl), on the cores now that they record their faults.
+    val armed = arm(session.guest, sc.until, file, table) match
+        Ok(a) -> a
+        Err(why) -> return refused(why)
+    var rig = Rig(session, 0, buf(), buf(), name, armed, None)
     var outcome = drive(&rig, sc)
     var faults_seen = virt.guest_faults(session.guest)
     outcome.explanation = faults_seen.text(table.names.view())
-    if reporting then *report = with_guest(*report, session.guest)
+    if reporting
+        *report = with_guest(*report, session.guest)
+        report.until = rig.hit
     if !masking then return outcome
     write_text(masking_file, virt.guest_masking_text(session.guest)) match
         Ok(_) -> outcome
@@ -170,6 +177,9 @@ private struct Rig
     holds: Buf[Hold]
     knobs: Buf[Hold]
     name: string
+    // The stop conditions armed on the board, and the one the run ended on.
+    until: Armed
+    hit: Option[UntilReport]
 
 impl Rig
     /** Run the board on a slice. */
@@ -281,7 +291,7 @@ private timed(sc: *Script) -> bool
     false
 
 // A text as a message shows it: quoted, its line ends and controls escaped.
-private quoted(text: string) -> string
+private[script] quoted(text: string) -> string
     var out = "\""
     for c in text.bytes
         out = out + (if c == 10 then "\\n" elif c == 13 then "\\r" elif c == 9 then "\\t" elif c < 32 || c == 127 then "?" elif c == u8('"') then "\\\"" else text_of(c))
@@ -308,7 +318,7 @@ private consume(seen: *Buf[u8], text: string) -> bool
     drop_front(seen, at + text.bytes.len)
     true
 
-private drop_front(b: *Buf[u8], n: usize)
+private[script] drop_front(b: *Buf[u8], n: usize)
     var rest: Buf[u8] = buf()
     rest.extend(b.view()[n..])
     *b = rest
@@ -420,6 +430,7 @@ private drive(r: *Rig, sc: Script) -> Outcome
         if typed == typing.len()
             typing.clear()
             typed = 0
+        if r.until.on() then r.until.retime(r.session.guest)
         val standing = r.advance()
         fresh.clear()
         r.take_output(&fresh)
@@ -436,6 +447,16 @@ private drive(r: *Rig, sc: Script) -> Outcome
                     Expect(text) ->
                         if seen.view().index_of(text.bytes).is_none() && seen.len() >= text.bytes.len then drop_front(&seen, seen.len() - text.bytes.len + 1)
                     _ -> if seen.len() > KEPT then drop_front(&seen, seen.len() - KEPT)
+        // A stop condition met in the slice ends the run there, whatever else it did.
+        if r.until.on()
+            r.until.met(r.session.guest, fresh.view(), standing is SliceEnd.Ended(_, _)) match
+                Some(u) ->
+                    out.status = 0
+                    out.end = ExitKind.UntilMet
+                    out.why = r.until.line(u)
+                    r.hit = Some(u)
+                    return out
+                None -> ()
         standing match
             Ran -> stalled_at = -1
             Asleep ->

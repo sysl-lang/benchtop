@@ -1,0 +1,298 @@
+module sh.sysl.benchtop.script
+
+// Stop conditions (`benchtop run --until-symbol … --until-uart … --until-fault --until-masked …
+// --until-write … --until-read …`): the run ends, status 0, as soon as any one of them is met, saying
+// which, on which core and where; a run that ends any other way ends as it would have. They are for an
+// agent or a CI script that wants one precise answer: did the firmware get there, and where was it.
+//
+// **Each is off until named, and costs a run nothing while off; named, it rides a path the engine
+// already takes rarely.** A symbol is a debugger's breakpoint (v6m/debug.sysl): no byte of the guest
+// changes, and the record decoded at the address stops the core before the instruction runs. A watched
+// range is a debugger's watchpoint: only the pages it covers leave the fast path, and the core stops
+// before the load or store that reaches it. A fault stops the core in the fault's capture
+// (v6m/explain.sysl), which runs only as a fault is taken: the frame stacked, the handler's first
+// instruction not run. Masking is the masking report's record (v6m/masking.sysl), whose hooks run only
+// at `MSR`, `CPS`, exception entry and return, and the start of a run. The console's pattern is matched
+// between slices, on what the slice printed, so its core and pc are where the board was at the end of
+// that slice.
+
+import sh.sysl.benchtop.v6m.{Cpu, Stop, SymbolTable, WATCH_READ, WATCH_WRITE, at_debug_break, fault_name, set_debug_break, set_debug_watch, stop_at_faults, stop_when_masked, stopped_at_fault, stopped_masked, symbol_at, records_masking}
+import sh.sysl.benchtop.virt as virt
+import sh.sysl.benchtop.virt.{Guest, UntilReport}
+import sysl.buf.{Buf, buf}
+import sysl.regex.{Regex, describe, regex}
+import sysl.text.from_utf8_lossy
+
+/** A range `--until-write` (`kind` WATCH_WRITE) or `--until-read` (WATCH_READ) watches: the `len` bytes
+ * at `at`, and the option's value as written. */
+struct Watched
+    kind: u32
+    at: u32
+    len: u32
+    value: string
+
+/** The stop conditions a run names, as written; none by default. `--until-symbol`, `--until-uart`,
+ * `--until-write` and `--until-read` may each be given more than once; any one met ends the run. */
+struct Until
+    symbols: Buf[string]
+    patterns: Buf[string]
+    fault: bool
+    masked: Option[Duration]
+    masked_value: string
+    watches: Buf[Watched]
+
+/** No stop condition. */
+no_until() -> Until = Until(buf(), buf(), false, None, "", buf())
+
+impl Until
+    /** Whether any stop condition is named. */
+    any(self) -> bool = !self.patterns.is_empty() || self.on_cores()
+
+    /** Whether any named condition is a Cortex-M core's: all but `--until-uart`. */
+    on_cores(self) -> bool = !self.symbols.is_empty() || self.fault || self.masked.is_some() || !self.watches.is_empty()
+
+/** The options, as `benchtop`'s usage gives them. */
+const UNTIL_OPTIONS = "[--until-symbol <name | 0xaddr>] [--until-uart <regex>] [--until-fault] [--until-masked <us>] [--until-write <addr>[:<len>]] [--until-read <addr>[:<len>]]"
+
+/** Why a board of RISC-V harts refuses every condition but `--until-uart`. */
+const UNTIL_CORTEX_ONLY = "--until-symbol, --until-fault, --until-masked, --until-write and --until-read are for a board of Cortex-M cores: benchtop has no breakpoints, watchpoints or fault capture on a Hazard3 hart yet"
+
+/** Why `--window` and `--gdb` refuse the conditions, as they refuse `--report`. */
+const UNTIL_WINDOW = "--until-symbol, --until-uart, --until-fault, --until-masked, --until-write and --until-read are for a run without --window"
+const UNTIL_GDB = "--until-symbol, --until-uart, --until-fault, --until-masked, --until-write and --until-read are for a run without --gdb"
+
+/** How many ranges `--until-write` and `--until-read` watch together at most: a core's watchpoints. */
+const UNTIL_WATCHES: usize = 4
+
+/** Where `args[i]` is a stop condition's option, `u` with it added and the index after it, or why it is
+ * refused; None where it is not one. The values lie before `end` (the image). */
+take_until(u: *Until, args: []const string, i: usize, end: usize) -> Option[Result[usize, string]]
+    val name = args[i]
+    if name == "--until-fault"
+        u.fault = true
+        return Some(Ok(i + 1))
+    if name != "--until-symbol" && name != "--until-uart" && name != "--until-masked" && name != "--until-write" && name != "--until-read" then return None
+    if i + 1 >= end then return Some(Err(s"$name takes a value"))
+    val value = args[i + 1]
+    val refusal = name match
+        "--until-symbol" -> symbol_refusal(value)
+        "--until-uart" -> pattern_refusal(value)
+        "--until-masked" -> masked_refusal(u, value)
+        _ -> watch_refusal(u, name, value)
+    if !refusal.is_empty() then return Some(Err(refusal))
+    if name == "--until-symbol" then u.symbols.push(value)
+    elif name == "--until-uart" then u.patterns.push(value)
+    Some(Ok(i + 2))
+
+// Why `--until-symbol`'s value is refused: empty, or an address that is not one; "" where it is taken.
+private symbol_refusal(value: string) -> string
+    if value.is_empty() then return "--until-symbol takes a symbol's name or an address, and this one is empty"
+    if is_hex(value) && number(value).is_none() then return s"--until-symbol takes a symbol's name or an address as 0x…, not $value"
+    ""
+
+private pattern_refusal(value: string) -> string
+    if value.is_empty() then return "--until-uart takes a pattern to wait for, and this one is empty"
+    regex(value) match
+        Ok(_) -> ""
+        Err(e) -> s"--until-uart \"$value\": ${describe(e)}"
+
+// `--until-masked`'s value into `u`: a whole number of microseconds, or a time or cycles as `--timeout`
+// writes them.
+private masked_refusal(u: *Until, value: string) -> string
+    if u.masked.is_some() then return "--until-masked is given once"
+    val bad = s"--until-masked takes microseconds of the board's time, as 50, or a time or cycles as 50us, 2ms or 100000cycles, not $value"
+    val d = if !is_hex(value) && number(value).is_some() then Duration.Time(number(value).unwrap() * 1000)
+    else duration(value) match
+        Ok(d) -> d
+        Err(_) -> return bad
+    if d.is_zero() then return "--until-masked takes a time longer than none"
+    u.masked = Some(d)
+    u.masked_value = value
+    ""
+
+// `--until-write` or `--until-read`'s `<addr>[:<len>]` into `u`; a length not given is one byte.
+private watch_refusal(u: *Until, name: string, value: string) -> string
+    if u.watches.len() == UNTIL_WATCHES then return s"--until-write and --until-read watch $UNTIL_WATCHES ranges at most, a core's watchpoints"
+    val bad = s"$name takes an address and a length in bytes, as 0x20000100 or 0x20000100:4, not $value"
+    val b = value.bytes
+    var colon = b.len
+    for i in 0..<b.len do if b[i] == u8(':') && colon == b.len then colon = i
+    val at = number(value[..<colon]) match
+        Some(n) -> n
+        None -> return bad
+    var len: u64 = 1
+    if colon < b.len
+        len = number(value[(colon + 1)..]) match
+            Some(n) -> n
+            None -> return bad
+    if len == 0 then return s"$name watches one byte at least, not $value"
+    if at + len > 0x100000000 then return s"$name $value runs past the end of the address space"
+    u.watches.push(Watched(if name == "--until-write" then WATCH_WRITE else WATCH_READ, u32(at), u32(len), value))
+    ""
+
+private is_hex(text: string) -> bool = text.starts_with("0x") || text.starts_with("0X")
+
+// `text` as a number below 2^32: hex after `0x`, decimal otherwise; None where it is not one.
+private number(text: string) -> Option[u64]
+    val hex = is_hex(text)
+    val digits = if hex then text.bytes[2..] else text.bytes
+    if digits.len == 0 then return None
+    val base: u64 = if hex then 16 else 10
+    var n: u64 = 0
+    for c in digits
+        var d: u64 = 16
+        if c >= u8('0') && c <= u8('9') then d = u64(c - u8('0'))
+        elif c >= u8('a') && c <= u8('f') then d = u64(c - u8('a')) + 10
+        elif c >= u8('A') && c <= u8('F') then d = u64(c - u8('A')) + 10
+        if d >= base then return None
+        n = n * base + d
+        if n > 0xFFFFFFFF then return None
+    Some(n)
+
+// ---------------------------------------------------------------------------------------------------
+// Armed on a board.
+
+/** A breakpoint `--until-symbol` set: its address, and the option's value. */
+struct Break
+    at: u32
+    value: string
+
+/** A run's stop conditions, armed on its board: the breakpoints, the compiled patterns and the tail of
+ * the console they may still match in, and `--until-masked` in the board's time where it was written
+ * so (its nanoseconds, and the clock rate the cores' limit was last worked out at). */
+struct Armed
+    until: Until
+    breaks: Buf[Break]
+    patterns: Buf[Regex]
+    tail: Buf[u8]
+    masked_ns: u64
+    hz: u64
+    table: &SymbolTable
+
+/** The most of the console a pattern's match may span: what it has not matched in is kept this long. */
+const UNTIL_TAIL: usize = 4096
+
+/** No condition armed. */
+disarmed(table: &SymbolTable) -> Armed = Armed(no_until(), buf(), buf(), buf(), 0, 0, table)
+
+/** `u` armed on the board `g` runs, which has booted `file`, whose symbols `table` holds; or why not: a
+ * name the image has no symbol of, an address that is not code, a condition a board of RISC-V harts
+ * cannot have. Its Cortex-M cores record their faults already (`virt.explain_guest_faults`). */
+arm(g: &Guest, u: Until, file: string, table: &SymbolTable) -> Result[Armed, string]
+    var a = Armed(u, buf(), buf(), buf(), 0, 0, table)
+    if !u.any() then return Ok(a)
+    val cores = g.cores()
+    if u.on_cores() && cores == 0 then return Err(UNTIL_CORTEX_ONLY)
+    for value in u.symbols
+        val at = symbol_address(value, file, table)?
+        if !set_debug_break(g.memory(), at) then return Err(f"--until-symbol $value: 0x$at%08x is not code the cores can run")
+        a.breaks.push(Break(at, value))
+    for p in u.patterns do a.patterns.push(regex(p).unwrap())
+    if u.fault
+        for k in 0..<cores do stop_at_faults(g.core(k))
+    u.masked match
+        Some(d) ->
+            // The masking report's record, where `--report-masking` has not started it.
+            if !records_masking(g.core(0)) then virt.record_guest_masking(g)?
+            d match
+                Cycles(n) ->
+                    for k in 0..<cores do stop_when_masked(g.core(k), n)
+                Time(ns) ->
+                    if g.hz() == 0 then return Err("--until-masked counts the board's time, and this board's mcu names no clock rate (no `clock-hz`): write it in cycles, as 5000cycles")
+                    a.masked_ns = ns
+                    a.retime(g)
+        None -> ()
+    for w in u.watches
+        for k in 0..<cores
+            if !set_debug_watch(g.core(k), w.kind, w.at, w.len) then return Err(s"${watch_option(w.kind)} ${w.value}: core $k cannot watch it")
+    Ok(a)
+
+private watch_option(kind: u32) -> string = if kind == WATCH_WRITE then "--until-write" else "--until-read"
+
+// The address `--until-symbol`'s `value` names: an address as written, or the image's function or
+// label of that name.
+private symbol_address(value: string, file: string, table: &SymbolTable) -> Result[u32, string]
+    if is_hex(value) then return Ok(u32(number(value).unwrap()) & ~1u32)
+    for s in table.names do if s.name == value then return Ok(s.start)
+    if table.names.is_empty() then return Err(s"--until-symbol $value: $file has no symbols (a raw image, or an ELF file stripped of them): name an address, as 0x10000234")
+    Err(s"--until-symbol $value: $file has no function or label named $value")
+
+impl Armed
+    /** Whether any condition is armed. */
+    on(*self) -> bool = self.until.any()
+
+    /** `--until-masked` in the board's time, its limit in cycles worked out again where the board's
+     * clock rate has moved since (an RP board's firmware raising clk_sys). */
+    retime(*self, g: &Guest)
+        if self.masked_ns == 0 then return
+        val hz = g.hz()
+        if hz == self.hz || hz == 0 then return
+        self.hz = hz
+        val n = u64(u128(self.masked_ns) * u128(hz) / 1000000000)
+        for k in 0..<g.cores() do stop_when_masked(g.core(k), if n == 0 then 1 else n)
+
+    /** The condition met in the slice `g` has just run, whose console showed `fresh`: a core stopped on
+     * one (only where the slice ended with a core stopped, `stopped`), or the console matching a
+     * pattern. */
+    met(*self, g: &Guest, fresh: []const u8, stopped: bool) -> Option[UntilReport]
+        if stopped
+            for k in 0..<g.cores()
+                if !g.started(k) then continue
+                val hit = self.core_met(g.core(k), k)
+                if hit.is_some() then return hit
+        if self.patterns.is_empty() || fresh.len == 0 then return None
+        self.tail.extend(fresh)
+        val text = from_utf8_lossy(self.tail.view())
+        for i in 0..<self.patterns.len()
+            self.patterns[i].find(text) match
+                Some(m) ->
+                    val cores = g.report_cores()
+                    val pc = if cores.is_empty() then 0 else cores[0].pc
+                    return Some(UntilReport("uart", self.until.patterns[i], 0, pc, None, Some(m.text()), None, None, 0))
+                None -> ()
+        if self.tail.len() > UNTIL_TAIL then drop_front(&self.tail, self.tail.len() - UNTIL_TAIL)
+        None
+
+    // The condition core `k`, `c`, stopped on; None where it stopped on none of them.
+    private core_met(*self, c: *Cpu, k: u32) -> Option[UntilReport]
+        if c.stop != Stop.Breakpoint then return None
+        if c.watch_hit != 0
+            for w in self.until.watches
+                if w.kind != c.watch_hit || c.watch_at < w.at || u64(c.watch_at) >= u64(w.at) + u64(w.len) then continue
+                val condition = if w.kind == WATCH_WRITE then "write" else "read"
+                return Some(UntilReport(condition, w.value, k, c.pc, Some(c.watch_at), None, None, None, 0))
+            return None
+        if stopped_at_fault(c) then return Some(UntilReport("fault", "", k, c.pc, None, None, Some(c.ipsr), None, 0))
+        stopped_masked(c) match
+            Some((from, n)) -> return Some(UntilReport("masked", self.until.masked_value, k, c.pc, None, None, None, Some(from), n))
+            None -> ()
+        if at_debug_break(c)
+            for b in self.breaks do if b.at == c.pc then return Some(UntilReport("symbol", b.value, k, c.pc, None, None, None, None, 0))
+        None
+
+    /** The line `benchtop run` writes on stderr for `u`, after `benchtop: `. */
+    line(*self, u: UntilReport) -> string
+        val names = self.table.names.view()
+        val condition = u.condition match
+            "uart" -> s"uart ${quoted(u.value)}"
+            "fault" -> "fault"
+            _ -> s"${u.condition} ${u.value}"
+        var line = f"until $condition met on core ${u.core} at pc 0x${u.pc}%08x${in_symbol(names, u.pc)}"
+        u.address match
+            Some(a) -> line = f"$line: a ${if u.condition == "write" then "store" else "load"} reaching 0x$a%08x"
+            None -> ()
+        u.text match
+            Some(t) -> line = s"$line: matched ${quoted(t)}"
+            None -> ()
+        u.exception match
+            Some(e) -> line = s"$line: ${fault_name(e)} taken, its handler not yet run"
+            None -> ()
+        u.masked_from match
+            Some(a) -> line = f"$line: masked for ${u.masked_cycles} cycles since 0x$a%08x${in_symbol(names, a)}"
+            None -> ()
+        line
+
+// ` (name+0x…)` for `a`, or nothing where no symbol holds it.
+private in_symbol(names: []const sh.sysl.benchtop.v6m.ImageSymbol, a: u32) -> string = symbol_at(names, a) match
+    Some(n) -> s" ($n)"
+    None -> ""
