@@ -458,9 +458,21 @@ checked against the SVD):
   default map applies under PRIVDEFENA. **skiff rewrites the MPU on every context switch**, with
   regions as small as 64 bytes (its stack guard), so updating the fast table on an MPU write is on the
   critical path (§2.4).
-- **DWT/ITM**: `DWT_CYCCNT` is provided because HAL and benchmarks read it. It is the core's virtual
-  cycle count. ITM stimulus port 0 is a second console (SWO), which is cheap and useful. QEMU has
-  no DWT (skiff-old's notes), so benchtop improves on that.
+- **DWT/DEMCR** (`v6m/dwt.sysl`, every Mainline core: M3, M4, M7, M33, M35P, M52, M55, M85):
+  `DWT_CYCCNT` is provided because HAL, CMSIS and benchmarks read it. It counts the core's own clock
+  (executed cycles and cycles slept) while DEMCR.TRCENA and DWT_CTRL.CYCCNTENA are both set, wraps at
+  32 bits, takes writes, and is kept lazily (a value and the clock it was fixed at), so counting costs
+  the instruction path nothing; each core of a two-core board has its own. DEMCR stores its vector
+  catches and monitor bits, TRCENA the only one with an effect. DWT_CTRL reads 0x40000000 at reset
+  (NUMCOMP 4, NOTRCPKT/NOEXTTRIG/NOCYCCNT/NOPRFCNT clear); the four comparators and the profiling
+  counters are stored without effect (a debugger's watchpoints are `debug.sysl`'s, not these); PCSR
+  stops at `Unmodelled`. The M7's DWT has the CoreSight software lock: locked at reset (LSR = 3), so
+  writes are ignored until LAR takes 0xC5ACCE55, as CMSIS's core_cm7.h and Zephyr expect; the other
+  cores have none (LAR/LSR read 0). PID/CID read the Cortex-M4 TRM's values on ARMv7-M and the
+  RP2350 M33's on ARMv8-M. ARMv6-M and ARMv8-M Baseline have no CYCCNT: DEMCR stops at `Unmodelled`
+  and the DWT's addresses are the board's. QEMU has no DWT (skiff-old's notes), so benchtop improves
+  on that.
+- **ITM**: stimulus port 0 is a second console (SWO), which is cheap and useful.
 - **Semihosting** (`BKPT 0xAB`) is built, behind `--semihosting` (`Cpu.semihosting`, set by the board;
   `v6m/semihost.sysl`), on the RP2040's and the RP2350's cores under both executors (the `match` loop
   and the threaded chain share the one routine, so Thumb-2 and gdb's stops see no difference). It
