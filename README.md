@@ -233,7 +233,7 @@ sysl build . -o benchtop
 ./benchtop run [--board <name | file.hocon>] [--window] [--deterministic | --threads] [--usb console|pty|off]
                [--boot debugger|rom] [--gdb [port]] [--sd <card.img | none>] [--report-masking <file> [--masking-sites] [--masking-ranks <n>]]
                [--report <file.json>] [--explain-faults] [--trace-ring <n>] [--semihosting]
-               [--serial uart0|uart1=file:<path>] ... <image.elf | image.bin>
+               [--serial <uart>=file:<path>] ... <image.elf | image.bin>
 ./benchtop run --window [--watch] [--build <program>] [--build-arg <arg>] [--watch-source <file>]
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
@@ -264,12 +264,13 @@ selects reproducible turns on one thread. The explicit **`--threads`** spelling 
 each core a host thread of its own once core 1 is launched: faster where both cores are busy, and
 not reproducible, as two real cores are not.
 
-**`--semihosting`** makes `BKPT 0xAB` an Arm semihosting call rather than a stop, on the Pico and Pico 2
-boards (any other board refuses it), for either core, either executor and `--deterministic` or not. The
+**`--semihosting`** makes `BKPT 0xAB` an Arm semihosting call rather than a stop, on every board of
+Cortex-M cores — the Pico and Pico 2 boards, the STM32H747I-DISCO (the M7 and the M4), the virtual boards
+— (the Hazard3 harts refuse it), for either core, either executor and `--deterministic` or not. The
 calls are `SYS_WRITEC`, `SYS_WRITE0`, `SYS_OPEN` of `:tt` (the console), `SYS_WRITE`, `SYS_CLOSE`,
 `SYS_EXIT` and `SYS_EXIT_EXTENDED`, as `qemu-system-arm -semihosting` runs them (it is QEMU's
-`semihosting/arm-compat-semi.c` that was followed). Text written to the console joins what UART0 sent, on
-stdout; text written to a descriptor opened for append goes to stderr. **The exit status of the run is
+`semihosting/arm-compat-semi.c` that was followed). Text written to the console joins what UART0 (on the
+DISCO, its USARTs) sent, on stdout; text written to a descriptor opened for append goes to stderr. **The exit status of the run is
 the guest's**, as QEMU computes it: `SYS_EXIT_EXTENDED` with reason `0x20026` (`ADP_Stopped_ApplicationExit`)
 gives its subcode, any other reason 1; `SYS_EXIT`, whose R1 is the reason itself, gives 0 for `0x20026` and
 1 for any other. A call benchtop does not implement (`SYS_OPEN` of a host file answers -1; the rest stop
@@ -277,10 +278,13 @@ the core as undefined) ends the run with status 3. Without `--semihosting` a `BK
 below, so the SDK's `_exit` is unchanged. A semihosting run is a scripted run too where it has `--expect`
 or `--timeout`; it also works under `--gdb`, but not with `--window`.
 
-**`--serial uartN=file:<path>`**, repeatable, sends what UART `N` (`uart0` or `uart1`, on the Pico and Pico 2
-boards) transmits to `<path>`, which is emptied at the start of the run and appended to as the board runs,
-like QEMU's `-serial file:`. A UART with no `--serial` is as it always was: UART0 is the console, and
-UART1's output is not kept. With UART0 redirected the console carries only what the guest writes through
+**`--serial <uart>=file:<path>`**, repeatable, sends what the UART the board names `<uart>` transmits to
+`<path>`, which is emptied at the start of the run and appended to as the board runs, like QEMU's
+`-serial file:`. The names are the board's own: `uart0` and `uart1` on the Pico and Pico 2 boards;
+`usart1` (the ST-LINK's virtual COM port) and `uart8` (the Arduino connector's D1/D0, the board's second
+console) on the STM32H747I-DISCO ([its page](docs/stm32h747i-disco.md#headless-runs)). A name the board
+does not have is refused with the ones it has. A UART with no `--serial` is as it always was: on a Pico
+UART0 is the console and UART1's output is not kept; on the DISCO both USARTs' output joins the console. With UART0 redirected the console carries only what the guest writes through
 semihosting (and the USB serial port), and **`--expect` reads the console only**, so it never sees a UART
 that has a file: check that file after the run instead.
 

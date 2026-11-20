@@ -1,0 +1,305 @@
+module sh.sysl.benchtop.script
+@tests
+
+// The STM32H747I-DISCO run headless as skiff runs it: each core's console on a USART of its own (the M7
+// on USART1, the M4 on UART8), `--serial` sending each to a file, `--semihosting` ending the run with
+// the status the guest gives on either core, and the reports a headless run writes. The guests are raw
+// images in flash, assembled here: the M7's vector table at 0x08000000 and its code at 0x08000100; the
+// M4's, which the M7 starts through RCC_GCR, at the option bytes' 0x08100000 and its code at 0x08100100.
+
+import sh.sysl.benchtop.chip as chip
+import sh.sysl.benchtop.v6m.{ExplainOptions, Faults, MaskingOptions, explain_defaults, no_faults}
+import sh.sysl.benchtop.virt.ExitKind
+import sh.sysl.stm32h747.usart1 as reg
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, read_bytes, remove_dir_all, write_bytes}
+import sysl.raw.str_cast
+
+// MOVW and MOVT: `rd` = `v`.
+private mov32(c: *Buf[u16], rd: u16, v: u32)
+    for (op, half) in [(0xF240u16, v & 0xFFFF), (0xF2C0u16, v >> 16)]
+        val i = u16((half >> 11) & 1)
+        val imm4 = u16(half >> 12)
+        val imm3 = u16((half >> 8) & 7)
+        val imm8 = u16(half & 0xFF)
+        c.push(op | (i << 10) | imm4)
+        c.push((imm3 << 12) | (rd << 8) | imm8)
+
+// STR (immediate, a word offset under 128) and MOVS (8-bit immediate), in their 16-bit forms.
+private str_at(c: *Buf[u16], rt: u16, rn: u16, offset: u32) = c.push(0x6000 | (u16(offset / 4) << 6) | (rn << 3) | rt)
+private movs(c: *Buf[u16], rd: u16, imm: u16) = c.push(0x2000 | (rd << 8) | imm)
+
+private const BKPT_SEMIHOST: u16 = 0xBEAB
+private const SPIN: u16 = 0xE7FE
+
+// GPIO port `gpio`'s MODER and AFRH set to `mode` and `afrh`, then `text` sent on the USART at `base`,
+// enabled at its fastest rate, each character waited for until TC: `ldr r2, [r0, #ISR]; lsls r2, r2,
+// #25; bpl` back to the load.
+private usart_send(c: *Buf[u16], gpio: u32, mode: u32, afrh: u32, base: u32, text: string)
+    mov32(c, 0, gpio)
+    mov32(c, 1, mode)
+    str_at(c, 1, 0, 0)
+    mov32(c, 1, afrh)
+    str_at(c, 1, 0, 0x24)
+    mov32(c, 0, base)
+    movs(c, 1, 16)
+    str_at(c, 1, 0, reg.BRR_OFFSET)
+    movs(c, 1, u16(reg.CR1_UE_MASK | reg.CR1_TE_MASK))
+    str_at(c, 1, 0, reg.CR1_OFFSET)
+    for b in text.bytes
+        movs(c, 1, u16(b))
+        str_at(c, 1, 0, reg.TDR_OFFSET)
+        c.push(0x6802 | (u16(reg.ISR_OFFSET / 4) << 6))
+        c.push(0x0652)
+        c.push(0xD5FC)
+
+// The M7's console, USART1 on PA9 (AF7), and the M4's, UART8 on PJ8 (AF8).
+private on_usart1(c: *Buf[u16], text: string) = usart_send(c, 0x58020000, (0xabffffffu32 & ~(3u32 << 18)) | (2u32 << 18), 0x70, 0x40011000, text)
+private on_uart8(c: *Buf[u16], text: string) = usart_send(c, 0x58022400, 0xfffeffff, 0x8, 0x40007c00, text)
+
+// SYS_EXIT_EXTENDED with ADP_Stopped_ApplicationExit and `status`, its block at `block`.
+private exit_extended(c: *Buf[u16], block: u32, status: u16)
+    mov32(c, 1, block)
+    mov32(c, 2, 0x20026)
+    str_at(c, 2, 1, 0)
+    movs(c, 2, status)
+    str_at(c, 2, 1, 4)
+    movs(c, 0, 0x20)
+    c.push(BKPT_SEMIHOST)
+    c.push(SPIN)
+
+// SYS_EXIT with `reason` in R1.
+private exit_plain(c: *Buf[u16], reason: u32)
+    mov32(c, 1, reason)
+    movs(c, 0, 0x18)
+    c.push(BKPT_SEMIHOST)
+    c.push(SPIN)
+
+// SYS_WRITE0 of the string at `at`.
+private write0(c: *Buf[u16], at: u32)
+    mov32(c, 1, at)
+    movs(c, 0, 4)
+    c.push(BKPT_SEMIHOST)
+
+// RCC_GCR's BOOT_C1 and BOOT_C2: the M4 starts from the option bytes' address.
+private launch_m4(c: *Buf[u16])
+    mov32(c, 0, 0x580244a0)
+    movs(c, 1, 12)
+    str_at(c, 1, 0, 0)
+
+// Where a guest's text for SYS_WRITE0 is.
+private const TEXT_AT: u32 = 0x08000800
+
+private put_word(b: *Buf[u8], at: usize, w: u32)
+    for i in 0..<4 do b[at + i] = u8((w >> u32(8 * i)) & 0xFF)
+
+private put_code(b: *Buf[u8], at: usize, code: []const u16)
+    for i in 0..<code.len
+        b[at + 2 * i] = u8(code[i] & 0xFF)
+        b[at + 2 * i + 1] = u8(code[i] >> 8)
+
+private no_code() -> Buf[u16] = buf()
+
+// The raw image of `m7`'s code, `m4`'s where it has any, and `text` NUL-terminated at `TEXT_AT`.
+private image(m7: Buf[u16], m4: Buf[u16], text: string) -> Buf[u8]
+    var b: Buf[u8] = buf()
+    val size = if m4.len() > 0 then 0x100400 else 0x1000
+    for _ in 0..<size do b.push(0)
+    put_word(&b, 0, 0x24080000)
+    put_word(&b, 4, 0x08000101)
+    put_code(&b, 0x100, m7.view())
+    for i in 0..<text.len do b[0x800 + i] = text.bytes[i]
+    if m4.len() > 0
+        put_word(&b, 0x100000, 0x30020000)
+        put_word(&b, 0x100004, 0x08100101)
+        put_code(&b, 0x100100, m4.view())
+    b
+
+private file_text(file: string) -> string = read_bytes(file) match
+    Ok(b) -> str_cast(b.view())
+    Err(_) -> "<no file>"
+
+// The options of a run with `semihosting` and each `--serial` of `serial`.
+private options(semihosting: bool, serial: []const string) -> Setup
+    var s = setup()
+    s.arm.semihosting = semihosting
+    for x in serial do chip.take_serial(&s.arm, x).unwrap()
+    s
+
+// The options of a run with `--semihosting` alone.
+private semihosting_only() -> Setup
+    var s = setup()
+    s.arm.semihosting = true
+    s
+
+// `bytes` written to `dir`/`name`.bin and run on the DISCO, quiet, with a timeout of `timeout` and `s`.
+private disco_run(dir: string, name: string, bytes: Buf[u8], timeout: string, s: Setup) -> Outcome
+    val file = s"$dir/$name.bin"
+    write_bytes(file, bytes.view()).unwrap()
+    run("stm32h747-disco", file, parse(["--quiet", "--timeout", timeout][..]).unwrap(), s)
+
+@test("DISCO --semihosting: SYS_EXIT_EXTENDED and SYS_EXIT end the run with QEMU's status, on the M7 and on the M4")
+h7_semihosting_exits()
+    val dir = make_temp_dir("benchtop-h7-semi").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val semi = semihosting_only()
+    var m7: Buf[u16] = buf()
+    exit_extended(&m7, 0x24000100, 42)
+    val a = disco_run(dir, "m7-extended", image(m7, no_code(), ""), "10ms", semi)
+    assert(a.status == 42 && a.end == ExitKind.Exit && a.exit_status == 42, a.why)
+
+    var m7_zero: Buf[u16] = buf()
+    exit_plain(&m7_zero, 0x20026)
+    val b = disco_run(dir, "m7-exit", image(m7_zero, no_code(), ""), "10ms", semi)
+    assert(b.status == 0 && b.end == ExitKind.Exit && b.exit_status == 0, b.why)
+    // Any other reason is a failure: status 1.
+    var m7_fail: Buf[u16] = buf()
+    exit_plain(&m7_fail, 0x20023)
+    val c = disco_run(dir, "m7-fail", image(m7_fail, no_code(), ""), "10ms", semi)
+    assert(c.status == 1 && c.end == ExitKind.Exit && c.exit_status == 1, c.why)
+
+    // The M7 starts the M4 and spins; the M4 exits.
+    var starter: Buf[u16] = buf()
+    launch_m4(&starter)
+    starter.push(SPIN)
+    var m4: Buf[u16] = buf()
+    exit_extended(&m4, 0x30000100, 7)
+    val d = disco_run(dir, "m4-extended", image(starter, m4, ""), "10ms", semi)
+    assert(d.status == 7 && d.end == ExitKind.Exit && d.exit_status == 7, d.why)
+    var m4_plain: Buf[u16] = buf()
+    exit_plain(&m4_plain, 0x20026)
+    val e = disco_run(dir, "m4-exit", image(starter, m4_plain, ""), "10ms", semi)
+    assert(e.status == 0 && e.end == ExitKind.Exit && e.exit_status == 0, e.why)
+
+    // Without --semihosting the BKPT is a breakpoint, as before.
+    val off = disco_run(dir, "m7-off", image(m7, no_code(), ""), "10ms", setup())
+    assert(off.end == ExitKind.Breakpoint && off.exit_status == -1, off.why)
+
+@test("DISCO --semihosting: SYS_WRITE0 from either core joins the console, beside each core's USART output")
+h7_semihosting_write0()
+    val dir = make_temp_dir("benchtop-h7-write0").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val semi = semihosting_only()
+    var m7: Buf[u16] = buf()
+    write0(&m7, TEXT_AT)
+    exit_extended(&m7, 0x24000100, 0)
+    val a = disco_run(dir, "write0", image(m7, no_code(), "hello from m7\n"), "10ms", semi)
+    assert(a.status == 0, a.why)
+    assert(str_cast(a.console.view()) == "hello from m7\n", str_cast(a.console.view()))
+
+    // The M7 says `7` on USART1 and starts the M4; the M4 says `4` on UART8, then writes through
+    // semihosting and exits.
+    var starter: Buf[u16] = buf()
+    on_usart1(&starter, "7")
+    launch_m4(&starter)
+    starter.push(SPIN)
+    var m4: Buf[u16] = buf()
+    on_uart8(&m4, "4")
+    write0(&m4, TEXT_AT)
+    exit_extended(&m4, 0x30000100, 3)
+    val b = disco_run(dir, "both", image(starter, m4, "!\n"), "10ms", semi)
+    assert(b.status == 3, b.why)
+    assert(str_cast(b.console.view()) == "74!\n", str_cast(b.console.view()))
+
+@test("DISCO --serial: each core's USART to its own file, by the chip's names, in a run ended by --timeout and in one ended by a semihosting exit")
+h7_serial_files()
+    val dir = make_temp_dir("benchtop-h7-serial").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val one = s"$dir/usart1.txt"
+    val eight = s"$dir/uart8.txt"
+    write_bytes(one, "stale".bytes).unwrap()
+    write_bytes(eight, "stale".bytes).unwrap()
+
+    var m7: Buf[u16] = buf()
+    on_usart1(&m7, "m7\n")
+    launch_m4(&m7)
+    m7.push(SPIN)
+    var m4: Buf[u16] = buf()
+    on_uart8(&m4, "m4\n")
+    m4.push(SPIN)
+    val program = image(m7, m4, "")
+    val timed = disco_run(dir, "timeout", program, "5ms", options(false, [s"usart1=file:$one", s"uart8=file:$eight"][..]))
+    assert(timed.status == TIMED_OUT && timed.end == ExitKind.Timeout, timed.why)
+    assert(file_text(one) == "m7\n", file_text(one))
+    assert(file_text(eight) == "m4\n", file_text(eight))
+    assert(timed.console.view().len == 0, str_cast(timed.console.view()))
+
+    // Only UART8 redirected: USART1 stays the console.
+    val half = disco_run(dir, "half", program, "5ms", options(false, [s"uart8=file:$eight"][..]))
+    assert(half.status == TIMED_OUT, half.why)
+    assert(str_cast(half.console.view()) == "m7\n" && file_text(eight) == "m4\n", str_cast(half.console.view()))
+
+    // Ended by the M4's semihosting exit, after its output: both files hold what was sent.
+    var m4_exit: Buf[u16] = buf()
+    on_uart8(&m4_exit, "bye\n")
+    exit_extended(&m4_exit, 0x30000100, 9)
+    var m7_wait: Buf[u16] = buf()
+    on_usart1(&m7_wait, "hi\n")
+    launch_m4(&m7_wait)
+    m7_wait.push(SPIN)
+    val exited = disco_run(dir, "exit", image(m7_wait, m4_exit, ""), "10ms", options(true, [s"usart1=file:$one", s"uart8=file:$eight"][..]))
+    assert(exited.status == 9 && exited.end == ExitKind.Exit, exited.why)
+    assert(file_text(one) == "hi\n" && file_text(eight) == "bye\n", s"${file_text(one)} ${file_text(eight)}")
+
+@test("DISCO --serial: a UART the board does not have is refused, naming the ones it has; the Hazard3 harts refuse --semihosting")
+h7_serial_refusals()
+    val dir = make_temp_dir("benchtop-h7-serial-bad").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    var m7: Buf[u16] = buf()
+    m7.push(SPIN)
+    val program = image(m7, no_code(), "")
+    for name in ["uart0", "usart2", "uart1"]
+        val o = disco_run(dir, "bad", program, "1ms", options(false, [s"$name=file:$dir/x.txt"][..]))
+        assert(o.status == 1 && o.end == ExitKind.Error && o.why == s"--serial names a UART the board has, usart1 or uart8, not $name", o.why)
+    val riscv = run("pico2-riscv", s"$dir/bad.bin", parse(["--quiet"][..]).unwrap(), semihosting_only())
+    assert(riscv.status == 1 && riscv.why == chip.SEMIHOST_ARM_ONLY, riscv.why)
+
+@test("pico2 --serial: uart0 and uart1 still name the RP2350's UARTs; a STM32 name is refused")
+pico2_serial_names()
+    val dir = make_temp_dir("benchtop-pico2-serial").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    val zero = s"$dir/uart0.txt"
+    val one = s"$dir/uart1.txt"
+    val o = run("pico2", "examples/pico2/hello_serial.elf", parse(["--quiet", "--timeout", "300ms"][..]).unwrap(),
+        options(false, [s"uart0=file:$zero", s"uart1=file:$one"][..]))
+    assert(o.status == TIMED_OUT, o.why)
+    assert(file_text(zero).contains("hello, serial 1"), file_text(zero))
+    assert(file_text(one) == "", "uart1 sent nothing")
+    assert(o.console.view().len == 0, "the console has nothing")
+    val refused = run("pico2", "examples/pico2/hello_serial.elf", parse(["--quiet", "--timeout", "1ms"][..]).unwrap(), options(false, [s"usart1=file:$zero"][..]))
+    assert(refused.status == 1 && refused.why.contains("uart0 or uart1, not usart1"), refused.why)
+
+@test("DISCO headless: --report, --report-masking with sites and ranks, --explain-faults with --trace-ring, and --seed, with the M4 started")
+h7_headless_reports()
+    val dir = make_temp_dir("benchtop-h7-reports").unwrap()
+    defer remove_dir_all(dir).unwrap()
+    var m7: Buf[u16] = buf()
+    on_usart1(&m7, "a")
+    launch_m4(&m7)
+    m7.push(SPIN)
+    var m4: Buf[u16] = buf()
+    exit_extended(&m4, 0x30000100, 5)
+    val file = s"$dir/run.bin"
+    write_bytes(file, image(m7, m4, "").view()).unwrap()
+    val s = semihosting_only()
+    val sc =parse(["--quiet", "--timeout", "10ms"][..]).unwrap()
+
+    val report = s"$dir/report.json"
+    val r = run("stm32h747-disco", file, sc, s, no_faults(), "", report)
+    assert(r.status == 5, r.why)
+    val text = file_text(report)
+    assert(text.contains("\"exit\":\"exit\"") && text.contains("\"exit_status\":5"), text)
+    assert(text.contains("{\"core\":1,\"started\":true"), text)
+
+    val masking = s"$dir/masking.txt"
+    val k = run("stm32h747-disco", file, sc, s, no_faults(), masking, "", explain_defaults(), MaskingOptions(true, 3, null))
+    assert(k.status == 5, k.why)
+    val masked = file_text(masking)
+    assert(masked.starts_with("masking core=0 ") && masked.contains("\nmasking core=1 "), masked)
+
+    val explained = run("stm32h747-disco", file, sc, s, no_faults(), "", "", ExplainOptions(true, 64))
+    assert(explained.status == 5, explained.why)
+
+    for seed in 1u64..3
+        val o = run("stm32h747-disco", file, sc, s, Faults(true, seed, 0, 0, 0, 0))
+        assert(o.status == 5 && o.why == r.why, o.why)

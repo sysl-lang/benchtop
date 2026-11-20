@@ -1,0 +1,243 @@
+module sh.sysl.benchtop.virt
+@tests
+
+// The STM32H747I-DISCO's second console: UART8, on the Arduino connector's D1/D0 (PJ8/PJ9, AF8), beside
+// USART1's ST-LINK virtual COM port. Either core reaches either USART; what each sends joins the console
+// or goes to its own file (`--serial`, `headless_options`); typed input reaches USART1 only. And
+// `--semihosting` reaching both cores of the machine.
+
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.benchtop.v6m.{IRQ0, Stop, exception_pending}
+import sh.sysl.stm32h747.usart1 as reg
+import sh.sysl.stm32h747.uart8 as reg8
+import sysl.buf.{Buf, buf}
+import sysl.fs.{make_temp_dir, read_bytes, remove_dir_all}
+import sysl.raw.str_cast
+import sysl.text.replace_all
+
+const UART8: u32 = 0x40007c00
+const USART1: u32 = 0x40011000
+const GPIOJ: u32 = 0x58022400
+// RCC_C2_APB1LENR (the CM4's copy) and RCC_C1_APB1LENR, and UART8EN in them.
+const C2_APB1LENR: u32 = 0x58024400 + 0x194 + 0x14
+const C1_APB1LENR: u32 = 0x58024400 + 0x134 + 0x14
+const UART8EN: u32 = 1u32 << 31
+
+// The DISCO, booted with no program, its output captured and `keys` typed.
+private disco_board(keys: string) -> &Machine
+    val board = machine()
+    val m = &*board
+    assert(board_named(m, "stm32h747-disco").is_ok())
+    open_console(m)
+    capture(m)
+    if !keys.is_empty() then type_in(m, keys.bytes)
+    boot(m, image_of(m, []).unwrap().view())
+    board
+
+// PJ8 and PJ9 in alternate function `af` (GPIOJ's AFRH), by core `k`; every other pin of the bank
+// analogue, as at reset.
+private route_j(m: *Machine, k: u32, af: u32, n: u64)
+    val c = &m.cores[k]
+    board_write(m, c, GPIOJ, 4, 0xfffaffff, n)
+    board_write(m, c, GPIOJ + 0x24, 4, af | (af << 4), n)
+
+// PA9 and PA10 in AF7, USART1's, by core 0.
+private route_a(m: *Machine, n: u64)
+    val mode = (GPIOA_RESET & ~(0xfu32 << 18)) | (0xau32 << 18)
+    board_write(m, core0(m), GPIOA, 4, mode, n)
+    board_write(m, core0(m), GPIOA + 0x24, 4, 0x770, n)
+
+private w8(m: *Machine, k: u32, offset: u32, value: u32, n: u64) = board_write(m, &m.cores[k], UART8 + offset, 4, value, n)
+private r8(m: *Machine, k: u32, offset: u32, n: u64) -> u32 = board_read(m, &m.cores[k], UART8 + offset, 4, n)
+
+// UART8 enabled by core `k` at the fastest baud rate it takes, with CR1's `bits` besides UE.
+private enable8(m: *Machine, k: u32, bits: u32, n: u64)
+    w8(m, k, reg8.BRR_OFFSET, 16, n)
+    w8(m, k, reg8.CR1_OFFSET, reg8.CR1_UE_MASK | bits, n)
+
+// `text` sent on UART8, enabled, by core `k` from `n`, a character every 10000 instructions. Answers
+// the instruction count it ends at.
+private send8(m: *Machine, k: u32, text: string, n: u64) -> u64
+    var at = n
+    for b in text.bytes
+        at += 10000
+        w8(m, k, reg8.TDR_OFFSET, u32(b), at)
+    at += 10000
+    r8(m, k, reg8.ISR_OFFSET, at)
+    at
+
+private file_text(file: string) -> string = str_cast(read_bytes(file).unwrap().view())
+
+@test("UART8 on the DISCO: the second USART at 0x40007c00, IRQ 83, AF8, its own window and device; USART1 still the first")
+uart8_described()
+    val board = disco_board("")
+    val m = &*board
+    val d = &m.devices
+    assert(d.usart.present && d.usart.name() == "usart1" && d.usart.irq == 37 && d.usart.af == 7 && d.usart.terminal && d.usart.input)
+    assert(d.usart2.present && d.usart2.name() == "uart8" && d.usart2.irq == 83 && d.usart2.af == 8 && d.usart2.terminal)
+    assert(!d.usart2.input, "typed input reaches USART1's receiver, not UART8's")
+    assert(d.usart2.pins && d.usart2.tx.pin == 8 && d.usart2.rx.pin == 9)
+    val bus = &d.bus
+    var found = false
+    for i in 0..<bus.attached
+        if bus.mapped[i].base != UART8 then continue
+        found = true
+        assert(bus.mapped[i].device == Device.Usart2 && bus.mapped[i].last == UART8 + 0x3ff && bus.mapped[i].irqs[0] == 83)
+    assert(found)
+    // Each window reaches its own USART's state.
+    board_write(m, core0(m), UART8 + reg8.BRR_OFFSET, 4, 0x123, 0)
+    assert(d.usart2.live.with(u -> u.brr) == 0x123 && d.usart.live.with(u -> u.brr) == 0)
+    board_write(m, core0(m), USART1 + reg.BRR_OFFSET, 4, 0x456, 0)
+    assert(d.usart.live.with(u -> u.brr) == 0x456 && d.usart2.live.with(u -> u.brr) == 0x123)
+
+@test("UART8: its registers from reset, BRR and CR1 read back, from either core; UART8EN in each core's RCC_APB1LENR")
+uart8_registers()
+    val board = disco_board("")
+    val m = &*board
+    // Out of reset the transmitter is empty: TXE and TC (RM0399, USART_ISR reset value 0x000000C0 with
+    // the FIFO off).
+    assert(r8(m, 1, reg8.ISR_OFFSET, 0) & (reg8.ISR_TXE_MASK | reg8.ISR_TC_MASK) == reg8.ISR_TXE_MASK | reg8.ISR_TC_MASK)
+    assert(r8(m, 0, reg8.CR1_OFFSET, 0) == 0 && r8(m, 1, reg8.BRR_OFFSET, 0) == 0)
+    w8(m, 1, reg8.BRR_OFFSET, 0x341, 0)
+    w8(m, 1, reg8.CR1_OFFSET, reg8.CR1_UE_MASK | reg8.CR1_TE_MASK, 0)
+    assert(r8(m, 0, reg8.BRR_OFFSET, 0) == 0x341, "the M7 reads what the M4 wrote")
+    assert(r8(m, 0, reg8.CR1_OFFSET, 0) == reg8.CR1_UE_MASK | reg8.CR1_TE_MASK)
+    assert(r8(m, 1, reg8.ISR_OFFSET, 0) & reg8.ISR_TEACK_MASK != 0)
+    // BRR is fixed while the UART is enabled.
+    board_write(m, core0(m), UART8 + reg8.BRR_OFFSET, 4, 16, 0)
+    assert(core0(m).stop == Stop.Fault)
+    // A byte write of anything but TDR and RDR faults, as USART1's does.
+    board_write(m, core1(m), UART8 + reg8.BRR_OFFSET, 1, 1, 0)
+    assert(core1(m).stop == Stop.Fault)
+    val other = disco_board("")
+    val o = &*other
+    for (core, at) in [(0u32, C1_APB1LENR), (1u32, C2_APB1LENR)]
+        board_write(o, &o.cores[core], at, 4, UART8EN, 0)
+        assert(board_read(o, &o.cores[core], at, 4, 0) == UART8EN, s"core $core's UART8EN")
+    assert(board_read(o, core1(o), 0x58024400 + 0xd4 + 0x14, 4, 0) == UART8EN, "the M4's own APB1LENR is its C2 copy")
+
+@test("UART8: its interrupt is IRQ 83 on whichever core signals it, raised while TXE and TXEIE")
+uart8_irq()
+    val board = disco_board("")
+    val m = &*board
+    w8(m, 1, reg8.BRR_OFFSET, 16, 0)
+    w8(m, 1, reg8.CR1_OFFSET, reg8.CR1_UE_MASK | reg8.CR1_TE_MASK, 0)
+    signal_usart(m, &m.devices.usart2, core1(m))
+    assert(!exception_pending(core1(m), IRQ0 + 83), "no interrupt enabled")
+    w8(m, 1, reg8.CR1_OFFSET, reg8.CR1_UE_MASK | reg8.CR1_TE_MASK | reg8.CR1_TXEIE_MASK, 0)
+    signal_usart(m, &m.devices.usart2, core1(m))
+    assert(exception_pending(core1(m), IRQ0 + 83) && !exception_pending(core1(m), IRQ0 + 37), "UART8's line, not USART1's")
+    signal_usart(m, &m.devices.usart2, core0(m))
+    assert(exception_pending(core0(m), IRQ0 + 83), "the M7's NVIC has IRQ 83 as well")
+
+@test("UART8: what the guest sends reaches the console only while PJ8 is in AF8, beside USART1's output")
+uart8_to_console()
+    val board = disco_board("")
+    val m = &*board
+    // Analogue, then USART1's AF7: nothing reaches the console.
+    enable8(m, 1, reg8.CR1_TE_MASK, 0)
+    var n = send8(m, 1, "x", 0)
+    route_j(m, 1, 7, n)
+    n = send8(m, 1, "y", n)
+    assert(output(m).view().len == 0, str_cast(output(m).view()))
+    route_j(m, 1, 8, n)
+    n = send8(m, 1, "m4\n", n)
+    assert(output(m).view() == "m4\n".bytes, str_cast(output(m).view()))
+    // USART1, from the M7, joins it.
+    route_a(m, n)
+    board_write(m, core0(m), USART1 + reg.BRR_OFFSET, 4, 16, n)
+    board_write(m, core0(m), USART1 + reg.CR1_OFFSET, 4, reg.CR1_UE_MASK | reg.CR1_TE_MASK, n)
+    board_write(m, core0(m), USART1 + reg.TDR_OFFSET, 1, u32('7'), n + 10000)
+    board_read(m, core0(m), USART1 + reg.ISR_OFFSET, 4, n + 20000)
+    assert(output(m).view() == "m4\n7".bytes, str_cast(output(m).view()))
+
+@test("UART8: a slice's signal alone finishes a character once its frame is due, and before then changes nothing")
+uart8_signal_due()
+    val board = disco_board("")
+    val m = &*board
+    route_j(m, 1, 8, 0)
+    enable8(m, 1, reg8.CR1_TE_MASK | reg8.CR1_TCIE_MASK, 0)
+    w8(m, 1, reg8.TDR_OFFSET, u32('z'), 0)
+    val c = core1(m)
+    c.retired = 0
+    signal_usart(m, &m.devices.usart2, c)
+    assert(output(m).view().len == 0 && !exception_pending(c, IRQ0 + 83), "the frame is not over at the write")
+    c.retired = 100000
+    signal_usart(m, &m.devices.usart2, c)
+    assert(output(m).view() == "z".bytes, str_cast(output(m).view()))
+    assert(exception_pending(c, IRQ0 + 83), "TC with TCIE, raised from the signal")
+    // Idle again, its next event NEVER: a later signal leaves the console as it was.
+    c.retired = 200000
+    signal_usart(m, &m.devices.usart2, c)
+    assert(output(m).view() == "z".bytes && usart_due(&m.devices.usart2) == NEVER)
+
+@test("UART8: typed input waits for USART1's receiver and never reaches UART8's")
+uart8_no_input()
+    val board = disco_board("q")
+    val m = &*board
+    route_j(m, 1, 8, 0)
+    enable8(m, 1, reg8.CR1_RE_MASK | reg8.CR1_RXNEIE_MASK, 0)
+    assert(r8(m, 1, reg8.ISR_OFFSET, 10000) & reg8.ISR_RXNE_MASK == 0)
+    assert(r8(m, 1, reg8.ISR_OFFSET, 50000) & reg8.ISR_RXNE_MASK == 0)
+    assert(console_status(&m.console) == WAITING, "the character still waits for USART1")
+    assert(!usart_listens(m, &m.devices.usart2, core1(m)))
+
+@test("--serial on the DISCO: each USART to its own file by the chip's name, the console keeping neither; a UART it lacks is refused")
+uart8_serial_files()
+    val dir = make_temp_dir("benchtop-h7-serial").unwrap()
+    val one = s"$dir/usart1.txt"
+    val eight = s"$dir/uart8.txt"
+    val board = machine()
+    val m = &*board
+    assert(board_named(m, "stm32h747-disco").is_ok())
+    var why = headless_options(m, false, ["uart0"][..], [one][..]).unwrap_err()
+    assert(why == "--serial names a UART the board has, usart1 or uart8, not uart0", why)
+    why = headless_options(m, false, ["usart2"][..], [one][..]).unwrap_err()
+    assert(why.contains("not usart2"), why)
+    assert(headless_options(m, false, ["usart1", "uart8"][..], [one, eight][..]).is_ok())
+    open_console(m)
+    capture(m)
+    boot(m, image_of(m, []).unwrap().view())
+    assert(file_text(one) == "" && file_text(eight) == "", "emptied")
+    route_j(m, 1, 8, 0)
+    enable8(m, 1, reg8.CR1_TE_MASK, 0)
+    var n = send8(m, 1, "from m4\n", 0)
+    route_a(m, n)
+    board_write(m, core0(m), USART1 + reg.BRR_OFFSET, 4, 16, n)
+    board_write(m, core0(m), USART1 + reg.CR1_OFFSET, 4, reg.CR1_UE_MASK | reg.CR1_TE_MASK, n)
+    for b in "m7".bytes
+        n += 10000
+        board_write(m, core0(m), USART1 + reg.TDR_OFFSET, 1, u32(b), n)
+    board_read(m, core0(m), USART1 + reg.ISR_OFFSET, 4, n + 10000)
+    assert(file_text(eight) == "from m4\n", file_text(eight))
+    assert(file_text(one) == "m7", file_text(one))
+    assert(output(m).view().len == 0, str_cast(output(m).view()))
+    // Booting again empties both files.
+    boot(m, image_of(m, []).unwrap().view())
+    assert(file_text(one) == "" && file_text(eight) == "")
+    // A board whose USART has no pins under `buses` and no single listed pin refuses a file.
+    val spi_sd = machine()
+    val spi_text = replace_all(str_cast(embed("../../../../boards/stm32h747-spi-sd.hocon")), "target/disco-sd.img", "")
+    board_from(&*spi_sd, "spi-sd.hocon", spi_text.bytes).unwrap()
+    why = headless_options(&*spi_sd, false, ["uart8"][..], [eight][..]).unwrap_err()
+    assert(why.contains("no pins"), why)
+    // A board without a USART names none.
+    val virt_board = machine()
+    assert(board_named(&*virt_board, "virt").is_ok())
+    why = headless_options(&*virt_board, false, ["usart1"][..], [one][..]).unwrap_err()
+    assert(why.contains("has no USART"), why)
+    _ = remove_dir_all(dir)
+
+@test("--semihosting on the machine reaches both cores at boot, and the M4 when it launches; off, neither")
+machine_semihosting_flag()
+    val board = machine()
+    val m = &*board
+    assert(board_named(m, "stm32h747-disco").is_ok())
+    boot(m, image_of(m, []).unwrap().view())
+    assert(!core0(m).semihosting && !core1(m).semihosting)
+    val none: Buf[string] = buf()
+    assert(headless_options(m, true, none.view(), none.view()).is_ok())
+    boot(m, image_of(m, []).unwrap().view())
+    assert(core0(m).semihosting && core1(m).semihosting)
+    launch(m, 0x08100000, 0x30020000, 0x08100101)
+    assert(core1(m).semihosting, "launch configures the M4 again")
