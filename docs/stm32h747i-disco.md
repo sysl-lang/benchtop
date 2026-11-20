@@ -94,8 +94,9 @@ then `__HAL_PWR_VOLTAGESCALING_CONFIG` sets D3CR.VOS and waits for VOSRDY.
   guest time after a configuration that wiring runs, or the power-on one; one it cannot run,
   such as LDO-only on the DISCO, is latched and never becomes ready, as on silicon. A board
   wired otherwise writes the mcu out with its own `supply`.
-- **VOS**: a write that changes the scale reads back at once with VOSRDY clear; VOSRDY sets
-  10 µs later, and CSR1.ACTVOS follows. Scale 1 is the fastest; VOS0 needs SYSCFG's
+- **VOS**: D3CR leaves reset at 0x00004000, Scale 3 with VOSRDY clear, and VOSRDY stays
+  clear until ACTVOSRDY sets. From then a write that changes the scale reads back at once
+  with VOSRDY clear; VOSRDY sets 10 µs later, and CSR1.ACTVOS follows. Scale 1 is the fastest; VOS0 needs SYSCFG's
   PWRCR.ODEN, which is not modelled. The active scale is exposed for a clock model to read.
 - **CPU1CR and CPU2CR** keep PDDS_D1–D3, HOLD2/HOLD1 and RUN_D3; CSSF clears that register's
   STOPF, SBF, SBF_D1, SBF_D2 and HOLD2F/HOLD1F. No Stop or Standby is entered, so the flags
