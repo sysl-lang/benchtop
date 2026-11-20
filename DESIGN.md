@@ -402,7 +402,7 @@ checked against the SVD):
 | DSP | SIMD add/sub (`SADD16`, `UQSUB8`, `SEL` and GE flags), saturating (`QADD`, `SSAT`, `USAT16`), the multiply family (`SMLAD`, `SMLALD`, `SMMLA`, `SMUAD`…), packing and extends (`PKHBT`, `SXTAB16`) | same |
 | FPU | **FPv5-D16, single and double**: FPv4's set plus `VSEL`, `VMAXNM`/`VMINNM`, `VRINT*`, `VCVTA/N/P/M`, and every op at `.F64` | **FPv4-SP-D16, single only**: a `.F64` op is UNDEFINED, a NOCP/UNDEFINSTR UsageFault |
 | MPU | PMSAv7, **16 regions** | PMSAv7, **8 regions** |
-| caches | 16 KB I + 16 KB D, as no-ops; every `ICIALLU`/`DCIMVAC`/`DCCMVAC`/`DCCIMVAC`/`DCISW`… write to the SCB cache-maintenance registers is accepted, and CCR.IC/DC are stored | none |
+| caches | 16 KB I + 16 KB D, as no-ops; every `ICIALLU`/`DCIMVAC`/`DCCMVAC`/`DCCIMVAC`/`DCISW`… write to the SCB cache-maintenance registers is accepted, and CCR.IC/DC are stored. There is no cache model, so maintenance is coherent by construction; CLIDR/CTR/CCSIDR read the Cortex-M7 TRM's values, not a silicon dump | none |
 | TCMs | ITCM 64 KB and DTCM 128 KB as RAM regions in the M7's view; `ITCMCR`/`DTCMCR` stored | none |
 | CPUID | 0x411F_C27x (part 0xC27), which `HAL_GetCurrentCPUID` reads | 0x410F_C24x (part 0xC24) |
 
@@ -963,10 +963,18 @@ cannot turn it off; FP, MPU and bit-band aliases are not implemented. The exampl
 instruction handlers, both executors and exception machinery. No new instruction semantics are
 introduced. It reports CPUID 0x410FC270 (r0p0). M7's CCR.BP and STKALIGN always read one;
 exception frames are always eight-byte aligned, with xPSR recording a padding word only where
-needed. NONBASETHRDENA is writable, unlike the M33's fixed bit 0. The model has no optional
-caches and CCR.IC/DC read zero. Cache identification/maintenance and TCM control registers,
-Integer DSP is always present, as on the M4; FP and MPU are not implemented. The intended H7's cache and TCM model in §2.1 remains
-future work; this virtual M7 has the same 32 implemented IRQs and four priority bits as M4.
+needed. NONBASETHRDENA is writable, unlike the M33's fixed bit 0. The model has no cache: CCR.IC/DC
+are stored and read back with no effect, and the M7 accepts the SCB cache maintenance writes
+(ICIALLU 0xE000EF50, ICIMVAU 58, DCIMVAC 5C, DCISW 60, DCCMVAU 64, DCCMVAC 68, DCCSW 6C,
+DCCIMVAC 70, DCCISW 74, BPIALL 78), which read 0. They do nothing, correctly while no cache is
+modelled: memory is always coherent, so there is nothing to clean or invalidate. A later cache
+model (§1.5 `--dcache-model`) would give them effect. CLIDR 0xE000ED78 reads 0x09000003,
+CTR 0xE000ED7C 0x8303C003, and CCSIDR 0xE000ED80, selected by CSSELR bit 0, 0xF00FE019 (D-cache)
+or 0x200FE019 (I-cache): 16 KB each, 4 ways, 32-byte lines, 128 sets, as the H747's M7 has. These
+values come from the Cortex-M7 TRM's field layout, not from a silicon dump. The M3, M4 and M33 do
+not have these registers and treat the addresses as any other reserved system space. TCM control
+registers are not modelled. Integer DSP is always present, as on the M4; FP and MPU are not
+implemented. The intended H7's cache and TCM model in §2.1 remains future work; this virtual M7 has the same 32 implemented IRQs and four priority bits as M4.
 
 Tests cover every width of ARMv8-M-only ordered access, MSPLIM/PSPLIM, CCR fixed/writable/reserved
 bits, divide boundaries and traps, exception alignment/return, interrupt masks, exclusive-monitor

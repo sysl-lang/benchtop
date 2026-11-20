@@ -22,6 +22,20 @@ const M7_CPUID: u32 = 0x410FC270
 // BP and STKALIGN are read-as-one on M7 (Arm DUI0646C, CCR bit assignments).
 const M7_CCR_FIXED: u32 = 0x40200
 
+// CCR.DC (bit 16) and CCR.IC (bit 17): stored and read back, with no effect on any access.
+const M7_CCR_CACHE_ENABLES: u32 = 0x30000
+
+// The M7's L1 cache identification (Cortex-M7 TRM, "Cache identification registers"; ARMv7-M ARM
+// B4.2) for the STM32H747's 16 KB I-cache and 16 KB D-cache, each 4-way with 32-byte lines (128 sets).
+// CLIDR: Ctype1 = 3 (separate I and D), LoC = 1, LoUU = 1. CTR: CWG = 3, DminLine = IminLine = 3
+// (2^3 words), L1Ip = PIPT. CCSIDR, selected by CSSELR.InD: NumSets - 1 = 127, Associativity - 1 = 3,
+// LineSize = 1 (8 words); the D-cache supports write-through, write-back, read- and write-allocate,
+// the I-cache read-allocate only.
+const M7_CLIDR: u32 = 0x09000003
+const M7_CTR: u32 = 0x8303C003
+const M7_CCSIDR_DCACHE: u32 = 0xF00FE019
+const M7_CCSIDR_ICACHE: u32 = 0x200FE019
+
 // The Cortex-M33 r1p0, as the RP2350's report themselves.
 const M33_CPUID: u32 = 0x411FD210
 
@@ -40,7 +54,7 @@ ccr_reset(kind: Kind) -> u32
 ccr_written(kind: Kind, x: u32) -> u32
     if is_v6m(kind) then return 0
     if is_baseline(kind) then return 0x208
-    if kind == Kind.V7emM7 then return (x & 0x11B) | M7_CCR_FIXED
+    if kind == Kind.V7emM7 then return (x & (0x11B | M7_CCR_CACHE_ENABLES)) | M7_CCR_FIXED
     if is_v7m(kind) then return x & 0x31B
     (x & 0x0007071A) | CCR_RESET
 
@@ -54,8 +68,25 @@ const SCB_CFSR: u32 = 0xE000ED28
 const SCB_HFSR: u32 = 0xE000ED2C
 const SCB_MMFAR: u32 = 0xE000ED34
 const SCB_BFAR: u32 = 0xE000ED38
+const SCB_CLIDR: u32 = 0xE000ED78
+const SCB_CTR: u32 = 0xE000ED7C
+const SCB_CCSIDR: u32 = 0xE000ED80
+const SCB_CSSELR: u32 = 0xE000ED84
 const SCB_CPACR: u32 = 0xE000ED88
 const NVIC_STIR: u32 = 0xE000EF00
+
+// The M7's cache maintenance operations: ICIALLU, ICIMVAU, DCIMVAC, DCISW, DCCMVAU, DCCMVAC, DCCSW,
+// DCCIMVAC, DCCISW and BPIALL. They are write-only: a write is accepted, a read gives 0.
+// benchtop models no cache, so memory is always coherent and a maintenance operation has nothing to
+// clean or invalidate; accepting it is the whole of its effect.
+cache_maintenance(a: u32) -> bool =
+    a match
+        0xE000EF50 | 0xE000EF58 | 0xE000EF5C | 0xE000EF60 | 0xE000EF64 -> true
+        0xE000EF68 | 0xE000EF6C | 0xE000EF70 | 0xE000EF74 | 0xE000EF78 -> true
+        _ -> false
+
+// CCSIDR for the cache CSSELR selects.
+m7_ccsidr(cpu: *Cpu) -> u32 = if cpu.csselr & 1 != 0 then M7_CCSIDR_ICACHE else M7_CCSIDR_DCACHE
 
 // The configurable faults' exception numbers, whose priorities SHPR1 holds.
 const MEM_MANAGE: u32 = 4
@@ -118,7 +149,13 @@ scs_read8(cpu: *Cpu, a: u32) -> u32
         SCB_BFAR -> 0
         // Without the floating-point extension, every CPACR field reads as "no access".
         SCB_CPACR -> cpu.cpacr
+        SCB_CLIDR if cpu.kind == Kind.V7emM7 -> M7_CLIDR
+        SCB_CTR if cpu.kind == Kind.V7emM7 -> M7_CTR
+        SCB_CCSIDR if cpu.kind == Kind.V7emM7 -> m7_ccsidr(cpu)
+        SCB_CSSELR if cpu.kind == Kind.V7emM7 -> cpu.csselr
         _ ->
+            if cpu.kind == Kind.V7emM7 && cache_maintenance(a) then return 0
+
             if cpu.fpu != Fpu.Absent
                 a match
                     FP_FPCCR -> return cpu.fpccr
@@ -180,7 +217,14 @@ scs_write8(cpu: *Cpu, a: u32, x: u32)
             cpu.fp_ready = false
         FP_FPCAR if cpu.fpu != Fpu.Absent -> cpu.fpcar = x & ~7
         FP_FPDSCR if cpu.fpu != Fpu.Absent -> cpu.fpdscr = x & FPSCR_CONTROLS
-        _ -> if !secure_write(cpu, a, x) then halt(cpu, Stop.Unmapped, a)
+        // The M7's identification registers are read-only; CSSELR keeps its InD bit (level 0 is the
+        // only level). A maintenance operation is accepted and does nothing: no cache is modelled, so
+        // memory is always coherent.
+        SCB_CLIDR | SCB_CTR | SCB_CCSIDR if cpu.kind == Kind.V7emM7 -> ()
+        SCB_CSSELR if cpu.kind == Kind.V7emM7 -> cpu.csselr = x & 1
+        _ ->
+            if cpu.kind == Kind.V7emM7 && cache_maintenance(a) then return
+            if !secure_write(cpu, a, x) then halt(cpu, Stop.Unmapped, a)
 
 // ---------------------------------------------------------------------------------------------------
 // The system instructions.
