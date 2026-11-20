@@ -80,6 +80,30 @@ unsupported write. **The enable bits are stored; peripherals run regardless**: n
 peripheral model is gated by its clock, so firmware that forgets an enable still works
 here and will not on the board.
 
+The power controller, `stm32h7-pwr` at 0x58024800, has every register of RM0399's PWR
+chapter with its reset value: CR1, CSR1, CR2, CR3, CPU1CR, CPU2CR, D3CR, WKUPCR, WKUPFR
+and WKUPEPR, word access only. ST's start-up runs through it unchanged:
+`HAL_PWREx_ConfigSupply(PWR_DIRECT_SMPS_SUPPLY)` writes CR3 and waits for CSR1.ACTVOSRDY,
+then `__HAL_PWR_VOLTAGESCALING_CONFIG` sets D3CR.VOS and waits for VOSRDY.
+
+- **CR3 is write-once.** The first write after power-on latches SMPSEN, LDOEN, BYPASS,
+  SMPSLEVEL and SMPSEXTHP; later writes change only VBE, VBRS, USB33DEN and USBREGEN. A
+  combination RM0399 does not list is not written, and still locks CR3.
+- **The board's wiring decides readiness.** The mcu's `pwr` takes `supply = direct-smps`
+  (the DISCO's, and the default), `ldo`, `smps-ldo` or `external`. ACTVOSRDY sets 10 µs of
+  guest time after a configuration that wiring runs, or the power-on one; one it cannot run,
+  such as LDO-only on the DISCO, is latched and never becomes ready, as on silicon. A board
+  wired otherwise writes the mcu out with its own `supply`.
+- **VOS**: a write that changes the scale reads back at once with VOSRDY clear; VOSRDY sets
+  10 µs later, and CSR1.ACTVOS follows. Scale 1 is the fastest; VOS0 needs SYSCFG's
+  PWRCR.ODEN, which is not modelled. The active scale is exposed for a clock model to read.
+- **CPU1CR and CPU2CR** keep PDDS_D1–D3, HOLD2/HOLD1 and RUN_D3; CSSF clears that register's
+  STOPF, SBF, SBF_D1, SBF_D2 and HOLD2F/HOLD1F. No Stop or Standby is entered, so the flags
+  never set: WFI or WFE with SLEEPDEEP sleeps as plain WFI does, until an interrupt.
+- The monitors report a healthy board: PVDO, AVDO and CR2's VBAT and temperature flags read
+  0, BRRDY follows BREN, and USB33RDY follows USB33DEN. CR2 takes writes only while CR1.DBP
+  is set.
+
 The UI executes on M4. In images built without the `audio` feature M7 only spins;
 `audio-disco.elf` (built with `audio`) runs sine DSP on M7 and sleeps in `wfi`
 between interrupts. The screen/touch are still the existing

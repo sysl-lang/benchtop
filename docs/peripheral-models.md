@@ -87,6 +87,7 @@ Each model's header lists its own divergences. The current ones:
 | `peripheral/stm32_usart` | refuses synchronous, LIN, smartcard and IrDA modes, half duplex, hardware flow control and driver enable, DMA requests, auto baud rate, receiver timeout, character match and mute mode, swapped or inverted lines, MSB first, the reserved word length M1:M0 = 11, changing the frame, baud rate or prescaler while UE is set, and enabling with a BRR below 16; the line never corrupts a character (PE, FE and NF stay clear), sends no break and no idle preamble |
 | `peripheral/dsi` | refuses video mode, more than two lanes and out-of-range PLL settings |
 | `virt/h7` (`stm32h7-rcc`) | stores the peripheral clock enables and refuses their unimplemented bits, but gates nothing: enable bits are stored; peripherals run regardless. Refuses every other RCC register but GCR |
+| `peripheral/stm32_pwr` (`stm32h7-pwr`) | ignores writes to read-only and reserved bits, as the silicon does; enters no Stop or Standby, so STOPF, SBF, SBF_D1/D2, HOLDxF and the wake-up flags never set; the monitors report a healthy board (PVDO, AVDO, VBAT/temperature flags 0, BRRDY follows BREN, USB33RDY follows USB33DEN); no VOS0, which needs SYSCFG |
 | `parts/wm8994` | NACKs an unmodelled register address and configurations outside the 48 kHz slave subset |
 | `parts/ds3231` | none: it keeps the chip's own leap-year rule (2100 is a leap year), not the Gregorian one |
 

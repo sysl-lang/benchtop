@@ -1,0 +1,136 @@
+module sh.sysl.benchtop.peripheral.stm32_pwr
+@tests
+import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.stm32h747.pwr as reg
+
+// CR3's supply configurations as ST's HAL names them (stm32h7xx_hal_pwr_ex.h).
+const LDO_SUPPLY: u32 = 0x02
+const DIRECT_SMPS_SUPPLY: u32 = 0x04
+const SMPS_1V8_SUPPLIES_LDO: u32 = 0x16
+const SMPS_2V5_SUPPLIES_EXT: u32 = 0x2d
+const EXTERNAL_SOURCE_SUPPLY: u32 = 0x01
+const SETTLE: u64 = 4800
+
+private rd(p: *Pwr, offset: u32, time: u64 = 0) -> u32 = p.read(offset, 4, time).unwrap()
+private wr(p: *Pwr, offset: u32, value: u32, time: u64 = 0) = assert(p.write(offset, 4, value, time))
+
+@test("STM32H7 PWR: every register's reset value, and unknown offsets answer nothing")
+reset_values()
+    var p = pwr(settle = SETTLE)
+    for (offset, value) in [(0x00u32, 0xf000c000u32), (0x04, 0x00004000), (0x08, 0), (0x0c, 0x00000006), (0x10, 0),
+            (0x14, 0), (0x18, 0x00006000), (0x20, 0), (0x24, 0), (0x28, 0)]
+        assert(rd(&p, offset) == value, f"offset 0x$offset%02x")
+    for offset in [0x1cu32, 0x2c, 0x30, 0x3fc]
+        assert(p.read(offset, 4, 0).is_none() && !p.write(offset, 4, 0, 0), f"offset 0x$offset%02x")
+    assert(vos_scale(&p, 0) == 3, "the core domain leaves reset at Scale 3")
+
+@test("STM32H7 PWR: CR3's first write latches the supply configuration and later writes leave it")
+cr3_write_once()
+    var p = pwr(settle = SETTLE)
+    wr(&p, 0x0c, DIRECT_SMPS_SUPPLY, 100)
+    assert(rd(&p, 0x0c, 100) == DIRECT_SMPS_SUPPLY)
+    wr(&p, 0x0c, LDO_SUPPLY, 200)
+    assert(rd(&p, 0x0c, 200) == DIRECT_SMPS_SUPPLY, "the second write changes no supply bit")
+    wr(&p, 0x0c, SMPS_1V8_SUPPLIES_LDO | reg.CR3_USB33DEN_MASK | reg.CR3_VBE_MASK, 300)
+    assert(rd(&p, 0x0c, 300) == DIRECT_SMPS_SUPPLY | reg.CR3_USB33DEN_MASK | reg.CR3_USB33RDY_MASK | reg.CR3_VBE_MASK,
+        "the upper bits stay writable, and the USB detector reports its supply")
+    p.reset()
+    wr(&p, 0x0c, LDO_SUPPLY | reg.CR3_USBREGEN_MASK, 0)
+    assert(rd(&p, 0x0c) == LDO_SUPPLY | reg.CR3_USBREGEN_MASK, "power-on lets CR3 be written once more")
+
+@test("STM32H7 PWR: ACTVOSRDY sets a settling time after a configuration the board's wiring runs")
+actvosrdy_after_valid_configuration()
+    var p = pwr(settle = SETTLE)
+    assert(rd(&p, 0x04, 1000000) & reg.CSR1_ACTVOSRDY_MASK == 0, "no configuration written yet")
+    wr(&p, 0x0c, DIRECT_SMPS_SUPPLY, 1000)
+    assert(rd(&p, 0x04, 1000) & reg.CSR1_ACTVOSRDY_MASK == 0, "not ready at the write")
+    assert(rd(&p, 0x04, 1000 + SETTLE - 1) & reg.CSR1_ACTVOSRDY_MASK == 0)
+    assert(rd(&p, 0x04, 1000 + SETTLE) == 0x00004000 | reg.CSR1_ACTVOSRDY_MASK, "ready, at Scale 3")
+    // Each wiring runs its own configurations and the power-on one.
+    for (supply, config) in [(Supply.Ldo, LDO_SUPPLY), (Supply.SmpsLdo, SMPS_1V8_SUPPLIES_LDO),
+            (Supply.External, EXTERNAL_SOURCE_SUPPLY), (Supply.External, SMPS_2V5_SUPPLIES_EXT),
+            (Supply.Ldo, 0x06), (Supply.DirectSmps, 0x06)]
+        var q = pwr(supply, SETTLE)
+        wr(&q, 0x0c, config, 0)
+        assert(rd(&q, 0x0c) & 0x3f == config && rd(&q, 0x04, SETTLE) & reg.CSR1_ACTVOSRDY_MASK != 0, f"config 0x$config%02x")
+    var e = pwr(Supply.SmpsLdo, SETTLE)
+    wr(&e, 0x0c, SMPS_1V8_SUPPLIES_LDO | 0x08, 0)
+    assert(rd(&e, 0x0c, SETTLE - 1) & 0x00010000 == 0 && rd(&e, 0x0c, SETTLE) & 0x00010000 != 0,
+        "SMPSEXTRDY sets with the supply when the external output is on")
+
+@test("STM32H7 PWR: a configuration the wiring cannot run is latched and never reaches ACTVOSRDY")
+mismatched_supply_never_ready()
+    for (supply, config) in [(Supply.DirectSmps, LDO_SUPPLY), (Supply.DirectSmps, SMPS_1V8_SUPPLIES_LDO),
+            (Supply.Ldo, DIRECT_SMPS_SUPPLY), (Supply.SmpsLdo, DIRECT_SMPS_SUPPLY), (Supply.External, LDO_SUPPLY)]
+        var p = pwr(supply, SETTLE)
+        wr(&p, 0x0c, config, 0)
+        assert(rd(&p, 0x0c) & 0x3f == config, f"config 0x$config%02x is written")
+        assert(rd(&p, 0x04, 1u64 << 60) & reg.CSR1_ACTVOSRDY_MASK == 0, f"config 0x$config%02x never ready")
+        wr(&p, 0x0c, 0x06, 10)
+        assert(rd(&p, 0x04, 1u64 << 60) & reg.CSR1_ACTVOSRDY_MASK == 0, "a second write cannot repair it")
+
+@test("STM32H7 PWR: a combination the manual does not list is not written, locks CR3 and is never ready")
+invalid_combination()
+    for config in [0x00u32, 0x03, 0x07, 0x08, 0x0c, 0x12, 0x24, 0x11]
+        var p = pwr(Supply.External, SETTLE)
+        wr(&p, 0x0c, config, 0)
+        assert(rd(&p, 0x0c) & 0x3f == 0x06, f"config 0x$config%02x is not written")
+        wr(&p, 0x0c, EXTERNAL_SOURCE_SUPPLY, 1)
+        assert(rd(&p, 0x0c) & 0x3f == 0x06 && rd(&p, 0x04, 1u64 << 60) & reg.CSR1_ACTVOSRDY_MASK == 0, f"config 0x$config%02x locks")
+
+@test("STM32H7 PWR: a VOS write reads back, VOSRDY clears and sets a settling time later, and ACTVOS follows")
+vos_handshake()
+    var p = pwr(settle = SETTLE)
+    wr(&p, 0x0c, DIRECT_SMPS_SUPPLY, 0)
+    wr(&p, 0x18, 0x0000c000, SETTLE)
+    assert(rd(&p, 0x18, SETTLE) == 0x0000c000, "VOS reads back Scale 1 with VOSRDY clear")
+    assert(rd(&p, 0x04, SETTLE) == 0x00004000, "ACTVOS is still Scale 3 and the voltages are not valid")
+    assert(vos_scale(&p, 2 * SETTLE - 1) == 3)
+    assert(rd(&p, 0x18, 2 * SETTLE) == 0x0000e000, "VOSRDY sets")
+    assert(rd(&p, 0x04, 2 * SETTLE) == 0x0000e000, "ACTVOS is Scale 1 and ACTVOSRDY is set")
+    assert(vos_scale(&p, 2 * SETTLE) == 1)
+    wr(&p, 0x18, 0x0000c000 | reg.D3CR_VOSRDY_MASK, 3 * SETTLE)
+    assert(rd(&p, 0x18, 3 * SETTLE) == 0x0000e000, "rewriting the same scale keeps VOSRDY, which is read-only")
+    wr(&p, 0x18, 0x00008000, 3 * SETTLE)
+    assert(rd(&p, 0x18, 3 * SETTLE) == 0x00008000 && vos_scale(&p, 4 * SETTLE) == 2)
+
+@test("STM32H7 PWR: CPU1CR and CPU2CR keep their own bits, and CSSF clears only its own core's flags")
+cpu_flags()
+    var p = pwr(settle = SETTLE)
+    wr(&p, 0x10, 0xffffffff)
+    assert(rd(&p, 0x10) == 0x00000c07, "PDDS_D1..D3, HOLD2 and RUN_D3; the flags and CSSF read 0")
+    wr(&p, 0x14, 0x00000801)
+    assert(rd(&p, 0x14) == 0x00000801 && rd(&p, 0x10) == 0x00000c07)
+    // No low-power mode is entered, so the flags are set by hand: HOLDxF, STOPF, SBF, SBF_D1, SBF_D2.
+    p.cpu[0] |= 0x1f0
+    p.cpu[1] |= 0x1f0
+    wr(&p, 0x10, 0x00000c07)
+    assert(rd(&p, 0x10) == 0x00000df7, "a write without CSSF keeps the flags")
+    wr(&p, 0x10, reg.CPUCR_CSSF_MASK)
+    assert(rd(&p, 0x10) == 0, "CSSF clears the flags; the control bits take the written zeros")
+    assert(rd(&p, 0x14) == 0x000009f1, "CPU2's flags stay")
+    wr(&p, 0x14, reg.CPUCR_CSSF_MASK | 0x00000400)
+    assert(rd(&p, 0x14) == 0x00000400)
+
+@test("STM32H7 PWR: CR1, CR2 behind DBP, the wake-up registers, and read-only registers ignore writes")
+other_registers()
+    var p = pwr(settle = SETTLE)
+    wr(&p, 0x08, 0x11)
+    assert(rd(&p, 0x08) == 0, "CR2 is write-protected until DBP")
+    wr(&p, 0x00, 0xffffffff)
+    assert(rd(&p, 0x00) == 0xf007c3f1)
+    wr(&p, 0x08, 0xffffffff)
+    assert(rd(&p, 0x08) == 0x00010011, "BREN and MONEN; BRRDY follows BREN")
+    wr(&p, 0x00, 0)
+    assert(rd(&p, 0x00) == 0xf0000000)
+    wr(&p, 0x04, 0xffffffff, SETTLE)
+    assert(rd(&p, 0x04, SETTLE) == 0x00004000, "CSR1 is read-only")
+    wr(&p, 0x28, 0xffffffff)
+    assert(rd(&p, 0x28) == 0x0fff3f3f)
+    p.wkupfr = 0x3f
+    wr(&p, 0x24, 0)
+    assert(rd(&p, 0x24) == 0x3f, "WKUPFR is read-only")
+    wr(&p, 0x20, 0x05)
+    assert(rd(&p, 0x24) == 0x3a && rd(&p, 0x20) == 0, "WKUPCR clears the flags it names and reads 0")
+    p.reset()
+    assert(rd(&p, 0x28) == 0 && rd(&p, 0x24) == 0 && rd(&p, 0x00) == 0xf000c000 && p.supply == Supply.DirectSmps)

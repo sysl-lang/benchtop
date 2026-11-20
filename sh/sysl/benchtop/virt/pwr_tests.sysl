@@ -1,0 +1,165 @@
+module sh.sysl.benchtop.virt
+@tests
+
+// The STM32H747's PWR on the DISCO: both cores reach it at 0x58024800, ST's HAL start-up sequence
+// (`HAL_PWREx_ConfigSupply(PWR_DIRECT_SMPS_SUPPLY)`, then `__HAL_PWR_VOLTAGESCALING_CONFIG`) gets
+// through its polls, and a supply configuration the board is not wired for never becomes ready.
+
+import sh.sysl.benchtop.v6m as cpu
+import sysl.text.replace_all
+import sysl.raw.str_cast
+
+const PWR: u32 = 0x58024800
+const CSR1: u32 = PWR + 0x04
+const CR3: u32 = PWR + 0x0c
+const D3CR: u32 = PWR + 0x18
+const ACTVOSRDY: u32 = 1 << 13
+const VOSRDY: u32 = 1 << 13
+// The regulator's settling time on the DISCO: 10 µs of the 480 MHz board clock.
+const SETTLE: u64 = 4800
+
+// `description`, booted with no program.
+private booted(description: string) -> &Machine
+    val board = machine()
+    val m = &*board
+    assert(board_from(m, "pwr.hocon", description.bytes).is_ok())
+    boot(m, image_of(m, []).unwrap().view())
+    board
+
+private disco() -> &Machine = booted(str_cast(embed("../../../../boards/stm32h747-disco.hocon")))
+
+@test("H747 PWR: the DISCO maps it, each register reads its reset value, and words alone reach it")
+h747_pwr_reset_values()
+    val board = disco()
+    val m = &*board
+    for (offset, value) in [(0x00u32, 0xf000c000u32), (0x04, 0x00004000), (0x08, 0), (0x0c, 0x00000006), (0x10, 0),
+            (0x14, 0), (0x18, 0x00006000), (0x20, 0), (0x24, 0), (0x28, 0)]
+        assert(board_read(m, core0(m), PWR + offset, 4, 0) == value && core0(m).stop == cpu.Stop.Running, f"offset 0x$offset%02x")
+        assert(board_read(m, core1(m), PWR + offset, 4, 0) == value, f"the M4 reads offset 0x$offset%02x")
+    assert(pwr_scale(&m.devices.pwr, 0) == 3)
+    board_read(m, core0(m), PWR + 0x1c, 4, 0)
+    assert(core0(m).stop == cpu.Stop.Unmapped, "the gap after D3CR has no register")
+    boot(m, image_of(m, []).unwrap().view())
+    board_read(m, core0(m), D3CR, 2, 0)
+    assert(core0(m).stop == cpu.Stop.Fault, "a halfword access faults")
+    boot(m, image_of(m, []).unwrap().view())
+    board_write(m, core0(m), CR3 + 1, 1, 0, 0)
+    assert(core0(m).stop == cpu.Stop.Fault, "a byte access faults")
+
+@test("H747 PWR: CR3's first write latches on the bus, the second is ignored, and boot re-arms it")
+h747_pwr_cr3_write_once()
+    val board = disco()
+    val m = &*board
+    board_write(m, core0(m), CR3, 4, 0x04, 0)
+    board_write(m, core1(m), CR3, 4, 0x02, 0)
+    assert(board_read(m, core0(m), CR3, 4, 0) == 0x04, "the M4's later write changes nothing")
+    assert(board_read(m, core0(m), CSR1, 4, 0) & ACTVOSRDY == 0, "not ready at the write")
+    assert(board_read(m, core0(m), CSR1, 4, SETTLE) & ACTVOSRDY != 0, "ready once the SMPS settles")
+    boot(m, image_of(m, []).unwrap().view())
+    assert(board_read(m, core0(m), CR3, 4, 0) == 0x06 && board_read(m, core0(m), CSR1, 4, SETTLE) & ACTVOSRDY == 0)
+
+@test("H747 PWR: the DISCO, wired for the direct SMPS, never readies an LDO configuration; a board wired for the LDO does")
+h747_pwr_mismatched_supply()
+    val board = disco()
+    val m = &*board
+    board_write(m, core0(m), CR3, 4, 0x02, 0)
+    assert(board_read(m, core0(m), CR3, 4, 0) == 0x02)
+    for n in [0u64, SETTLE, 1000 * SETTLE, 1u64 << 40]
+        assert(board_read(m, core0(m), CSR1, 4, n) & ACTVOSRDY == 0, s"never ready, at $n")
+    val ldo = replace_all(h7_written_out(str_cast(embed("../../../../boards/stm32h747-disco.hocon"))), "supply = direct-smps", "supply = ldo")
+    val wired = booted(ldo)
+    val w = &*wired
+    board_write(w, core0(w), CR3, 4, 0x02, 0)
+    assert(board_read(w, core0(w), CSR1, 4, SETTLE) & ACTVOSRDY != 0)
+    board_write(w, core0(w), CR3, 4, 0x04, 0)
+    assert(board_read(w, core0(w), CR3, 4, 0) == 0x02, "still write-once")
+    val refused = replace_all(ldo, "supply = ldo", "supply = buck")
+    assert(board_from(m, "buck.hocon", refused.bytes).is_err(), "an unknown wiring is refused")
+
+@test("H747 PWR: a VOS write reads back, VOSRDY clears then sets, and the scale is the RCC's to read")
+h747_pwr_vos()
+    val board = disco()
+    val m = &*board
+    board_write(m, core0(m), CR3, 4, 0x04, 0)
+    board_write(m, core0(m), D3CR, 4, 0xc000, SETTLE)
+    assert(board_read(m, core0(m), D3CR, 4, SETTLE) == 0xc000, "Scale 1, VOSRDY clear")
+    assert(pwr_scale(&m.devices.pwr, board_time(core0(m), SETTLE)) == 3, "the regulator has not moved yet")
+    // The M4 runs at half the board clock: its SETTLE / 2 instructions are the M7's SETTLE.
+    assert(board_read(m, core1(m), D3CR, 4, SETTLE / 2) == 0xc000, "the M4 sees the M7's write")
+    assert(board_read(m, core1(m), D3CR, 4, SETTLE) == 0xc000 | VOSRDY, "and sees it settle at the same board time")
+    assert(board_read(m, core0(m), D3CR, 4, 2 * SETTLE) == 0xc000 | VOSRDY)
+    assert(board_read(m, core0(m), CSR1, 4, 2 * SETTLE) == 0xc000 | ACTVOSRDY)
+    assert(pwr_scale(&m.devices.pwr, board_time(core0(m), 2 * SETTLE)) == 1)
+
+@test("H747 PWR: the M4 reaches CPU2CR and the M7 CPU1CR, and CSSF clears only the writer's register's flags")
+h747_pwr_cpu_flags()
+    val board = disco()
+    val m = &*board
+    board_write(m, core1(m), PWR + 0x14, 4, 0x00000c07, 0)
+    assert(board_read(m, core0(m), PWR + 0x14, 4, 0) == 0x00000c07 && core1(m).stop == cpu.Stop.Running)
+    m.devices.pwr.live.with(p ->
+        p.cpu[0] |= 0x1f0
+        p.cpu[1] |= 0x1f0)
+    board_write(m, core1(m), PWR + 0x14, 4, 0x00000200 | 0x00000c07, 0)
+    assert(board_read(m, core1(m), PWR + 0x14, 4, 0) == 0x00000c07, "CSSF cleared CPU2's flags")
+    assert(board_read(m, core0(m), PWR + 0x10, 4, 0) == 0x000001f0, "CPU1's flags stay")
+    board_write(m, core0(m), PWR + 0x10, 4, 0x00000200, 0)
+    assert(board_read(m, core0(m), PWR + 0x10, 4, 0) == 0)
+
+// The HAL's start-up on the M7, at 0x24000100: CR3's supply bits set to the direct SMPS (read,
+// modify, write), ACTVOSRDY polled, VOS set to Scale 1 in D3CR and read back at once into r5, then
+// VOSRDY polled. Each poll gives up after 100000 reads. It ends in WFI with r4 = 1 where both polls
+// got through, r4 = 2 where one gave up; r6 holds CSR1 at the end.
+private val STARTUP: [34]u16 = [
+    0x4810,         // ldr   r0, =PWR
+    0x68c1,         // ldr   r1, [r0, #0x0c]      CR3
+    0x223f,         // movs  r2, #0x3f
+    0x4391,         // bics  r1, r2
+    0x2204,         // movs  r2, #4               SMPSEN
+    0x4311,         // orrs  r1, r2
+    0x60c1,         // str   r1, [r0, #0x0c]
+    0x4b0e,         // ldr   r3, =100000
+    0x6841,         // 1: ldr r1, [r0, #0x04]     CSR1
+    0x0489,         // lsls  r1, r1, #18          ACTVOSRDY into N
+    0xd402,         // bmi   2f
+    0x3b01,         // subs  r3, #1
+    0xd1fa,         // bne   1b
+    0xe010,         // b     fail
+    0x6981,         // 2: ldr r1, [r0, #0x18]     D3CR
+    0x2203,         // movs  r2, #3
+    0x0392,         // lsls  r2, r2, #14          VOS = 11, Scale 1
+    0x4311,         // orrs  r1, r2
+    0x6181,         // str   r1, [r0, #0x18]
+    0x6985,         // ldr   r5, [r0, #0x18]
+    0x4b07,         // ldr   r3, =100000
+    0x6981,         // 3: ldr r1, [r0, #0x18]
+    0x0489,         // lsls  r1, r1, #18          VOSRDY into N
+    0xd402,         // bmi   4f
+    0x3b01,         // subs  r3, #1
+    0xd1fa,         // bne   3b
+    0xe003,         // b     fail
+    0x6846,         // 4: ldr r6, [r0, #0x04]     CSR1
+    0x2401,         // movs  r4, #1
+    0xbf30,         // 5: wfi
+    0xe7fd,         // b     5b
+    0x2402,         // fail: movs r4, #2
+    0xbf30,         // 6: wfi
+    0xe7fd]         // b     6b
+private const STARTUP_AT: u32 = 0x24000100
+
+@test("H747 PWR: the HAL's direct-SMPS start-up on the M7 polls ACTVOSRDY and VOSRDY and gets through")
+h747_pwr_hal_startup()
+    val board = disco()
+    val m = &*board
+    val c = core0(m)
+    for i in 0u32..<34 do cpu.store16(c, STARTUP_AT + i * 2, u32(STARTUP[i]))
+    cpu.store32(c, STARTUP_AT + 0x44, PWR)
+    cpu.store32(c, STARTUP_AT + 0x48, 100000)
+    c.pc = STARTUP_AT
+    run_board(m)
+    assert(c.stop == cpu.Stop.Asleep, stop_message(c))
+    assert(c.r[4] == 1, s"a poll gave up: r4 = ${c.r[4]}")
+    assert(c.r[5] == 0xc000, "VOSRDY read clear straight after the VOS write")
+    assert(c.r[6] == 0xc000 | ACTVOSRDY, "Scale 1 is active and the voltages are valid")
+    assert(board_read(m, c, CR3, 4, c.retired) == 0x04)
+    assert(pwr_scale(&m.devices.pwr, board_time(c, c.retired)) == 1)
