@@ -114,25 +114,27 @@ t2e_fault_in_block()
     assert(c.r[1] == 1 && c.r[2] == 0 && c.it == 0 && c.stop == Stop.Breakpoint && c.retired == 11, "the block went on as it was")
 
 // cmp r0, r0; itte eq; then `access` (ldreq r3, [r1] or streq r3, [r1]), nothing at r1; addeq r2, #1;
-// addne r2, #1. Under both executors, which must agree on ITSTATE as on everything else.
+// addne r2, #1. Under both executors, which must agree on ITSTATE as on everything else. The access is a
+// precise BusFault, escalated to HardFault, whose frame returns to it.
 stop_in_block(access: u16) -> Cpu
-    val c = execute8([0x4280, 0xBF06, access, 0x3201, 0x3201], [0, 0x50000000], 0, [])
+    var c = execute8([0x4280, 0xBF06, access, 0x3201, 0x3201], [0, 0x50000000], 0, [])
 
-    assert(c.stop == Stop.Unmapped && c.stop_at == 0x50000000, s"${c.stop}")
-    assert(c.pc == 4 && c.retired == 2 && c.r[2] == 0, f"stopped at 0x${c.pc}%x after ${c.retired}")
+    assert(took(&c, HARD_FAULT, 4, CFSR_PRECISERR | CFSR_BFARVALID, HFSR_FORCED) && c.bfar == 0x50000000, s"${c.stop}")
+    assert(c.retired == 2 && c.r[2] == 0, f"faulted after ${c.retired}")
     c
 
-@test("an access that stops the core inside a block stops on it, with nothing after it in the block run")
+@test("an access that faults inside a block takes its fault on it, with nothing after it in the block run")
 t2e_stop_in_block()
     for access in [0x680Bu16, 0x600B] do stop_in_block(access)
 
-@test("a core stopped on an instruction inside a block holds that instruction's own ITSTATE")
+@test("a fault taken on an instruction inside a block stacks that instruction's own ITSTATE")
 t2e_stop_in_block_itstate()
     // ITTE EQ: the access's own ITSTATE is 0x06, the next instruction's 0x0C.
     for access in [0x680Bu16, 0x600B]
-        val c = stop_in_block(access)
+        var c = stop_in_block(access)
+        val it = it_of_psr(load32(&c, c.r[13] + 28))
 
-        assert(c.it == 0x06, f"ITSTATE 0x${c.it}%02x")
+        assert(it == 0x06, f"ITSTATE 0x$it%02x")
 
 // cmp r0, r0; itttt eq, whose four instructions' ITSTATEs are 0x01, 0x02, 0x04 and 0x08; each of them
 // addeq r2, #1 but the `k`-th, `stopper`; 12: bkpt; 14: a handler logging the xPSR it stacked. r1
@@ -184,21 +186,28 @@ hard_fault_bkpt(cpu: *Cpu)
     store32(cpu, VECTORS + HARD_FAULT * 4, FAULT_AT | 1)
     store16(cpu, FAULT_AT, BKPT)
 
-@test("a core stopped on any instruction of a block — an access nothing answers, a breakpoint — holds its own ITSTATE, and an undefined one stacks it, under both executors, timed or not")
+@test("a core stopped on any instruction of a block — a breakpoint — holds its own ITSTATE, and one that faults — an access nothing answers, an undefined one — stacks it, under both executors, timed or not")
 t2e_stop_itstate_every_position()
-    // ldr r3, [r1]; str r3, [r1]; bkpt.
-    val stoppers: []const u16 = [0x680B, 0x600B, BKPT]
-    val stops = [Stop.Unmapped, Stop.Unmapped, Stop.Breakpoint]
+    for k in 0u32..<4
+        for timed in [false, true]
+            val c = stops_alike(block_with(BKPT, k)[0..<6], timed, &nothing, null)
+            val at = 4 + 2 * k
 
-    for s in 0..<stoppers.len
+            assert(c.stop == Stop.Breakpoint && c.stop_at == at, f"BKPT at ${k}: ${c.stop} at 0x${c.stop_at}%x")
+            assert(c.pc == at && c.retired == u64(2 + k) && c.r[2] == k, f"BKPT at ${k}: pc 0x${c.pc}%x after ${c.retired}")
+            assert(c.it == 1 << k, f"BKPT at ${k}, timed ${timed}: ITSTATE 0x${c.it}%02x")
+
+    // ldr r3, [r1] and str r3, [r1] at each position: PRECISERR, escalated, the frame holding the
+    // access's own ITSTATE.
+    for access in [0x680Bu16, 0x600B]
         for k in 0u32..<4
             for timed in [false, true]
-                val c = stops_alike(block_with(stoppers[s], k)[0..<6], timed, &nothing, null)
+                var c = stops_alike(block_with(access, k)[0..<6], timed, &hard_fault_bkpt, null)
                 val at = 4 + 2 * k
 
-                assert(c.stop == stops[s] && c.stop_at == (if s < 2 then 0x50000000 else at), f"stopper ${s} at ${k}: ${c.stop} at 0x${c.stop_at}%x")
-                assert(c.pc == at && c.retired == u64(2 + k) && c.r[2] == k, f"stopper ${s} at ${k}: pc 0x${c.pc}%x after ${c.retired}")
-                assert(c.it == 1 << k, f"stopper ${s} at ${k}, timed ${timed}: ITSTATE 0x${c.it}%02x")
+                assert(c.stop == Stop.Breakpoint && c.stop_at == FAULT_AT && c.ipsr == HARD_FAULT && c.it == 0, f"0x$access%04x at ${k}: ${c.stop} at 0x${c.stop_at}%x")
+                assert(c.cfsr == CFSR_PRECISERR | CFSR_BFARVALID && c.bfar == 0x50000000 && c.hfsr == HFSR_FORCED && c.retired == u64(2 + k) && c.r[2] == k, f"0x$access%04x at ${k}")
+                assert(load32(&c, c.r[13] + 24) == at && load32(&c, c.r[13] + 28) == xpsr_with(1 << k), f"0x$access%04x at ${k}, timed ${timed}: xPSR 0x${load32(&c, c.r[13] + 28)}%08x")
 
     // udf #0 at each position: UNDEFINSTR, escalated, its frame holding the instruction's own ITSTATE.
     for k in 0u32..<4
@@ -664,17 +673,17 @@ t2e_scs()
     store32(&c, SCB_CCR, 0x10)
     assert(load32(&c, SCB_CCR) == 0x211 && c.stop == Stop.Running, "DIV_0_TRP")
 
-@test("an M0+ keeps its own system control space: no CCR, no byte access to a priority")
+@test("an M0+ keeps its own system control space: no CCR, no byte access to a priority, each one benchtop does not model")
 t2e_scs_v6m()
     var c: Cpu
 
     reset(&c, test_memory, [], 0)
     assert(load32(&c, SCB_CPUID) == 0x410CC601, "CPUID")
-    assert(load32(&c, SCB_CCR) == 0 && c.stop == Stop.Unmapped && c.stop_at == SCB_CCR, "CCR")
+    assert(load32(&c, SCB_CCR) == 0 && c.stop == Stop.Unmodelled && c.stop_at == SCB_CCR && c.unmodelled == Extension.Device, "CCR")
 
     reset(&c, test_memory, [], 0)
     store8(&c, NVIC_IPR, 0x40)
-    assert(c.stop == Stop.Unmapped, "a byte of a priority")
+    assert(c.stop == Stop.Unmodelled && c.stop_at == NVIC_IPR, "a byte of a priority")
 
 ccr_traps(cpu: *Cpu) = store32(cpu, SCB_CCR, 0x10)
 

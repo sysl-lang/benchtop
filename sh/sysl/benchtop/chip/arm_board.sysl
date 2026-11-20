@@ -663,10 +663,17 @@ impl[C: ArmChip] ArmBoard[C]
         arm.halt(cpu, Stop.Reset, a)
         true
 
-    // The first refusal is the run's reason.
+    // Something of the chip's that benchtop does not model, `why` saying what: the core stops at
+    // `Unmodelled` on `a` (`arm.unmodelled_register`), no fault taken. The first refusal is the run's
+    // reason.
     private refuse(*self, cpu: *arm.Cpu, a: u32, why: string)
         if self.why.is_empty() then self.why = why
-        arm.halt(cpu, Stop.Unmapped, a)
+        arm.unmodelled_register(cpu, a, why)
+
+    // The access to `a` that the chip refused: where its bus has nothing there, a bus error, as on
+    // silicon (`arm.bus_error`), and no refusal of benchtop's; otherwise a refusal, `why` saying what.
+    private refused_access(*self, cpu: *arm.Cpu, a: u32, why: string)
+        if silicon_hole(a) then arm.bus_error(cpu, a) else self.refuse(cpu, a, why)
 
     // The page table changed: each core's Non-secure copy of it follows.
     private pages_changed(*self)
@@ -1025,8 +1032,8 @@ impl ArmBoard[Rp2350]
         self.pages_changed()
 
     // ACCESSCTRL on the bus: an access whose master, security state and privilege some device denies
-    // looks its device up, and one the device denies is refused by name, where silicon answers a bus
-    // fault. Non-secure state reaching the SIO is refused too: its Non-secure bank is not modelled.
+    // looks its device up, and one the device denies is a bus error, as on silicon. Non-secure state
+    // reaching the SIO is refused: its Non-secure bank is not modelled.
     // The common case costs two tests: Secure code with nPRIV clear, where no device denies either core
     // Secure privileged access and FORCE_CORE_NS is clear (`AccessCtrl.secure_free`).
     @inline
@@ -1041,20 +1048,22 @@ impl ArmBoard[Rp2350]
             self.refuse(cpu, a, s"0x${hex(a, 8)} is the SIO, from Non-secure state: the SIO's Non-secure bank is not modelled")
             return true
         val privileged = cpu.ipsr != 0 || cpu.control & 1 == 0
-        // The DMA's own registers are guarded by its SECCFG and MPU levels.
+        // The DMA's own registers are guarded by its SECCFG and MPU levels, whose refusal is a bus
+        // error (RP2350 datasheet, the DMA's security and memory protection).
         if a >= dma_reg.BASE && a < dma_reg.BASE + 0x1000
             self.chip.dma.access_refusal(a - dma_reg.BASE, write, x, cpu.ns, privileged) match
-                Some(why) ->
-                    self.refuse(cpu, a, why)
+                Some(_) ->
+                    arm.bus_error(cpu, a)
                     return true
                 None -> ()
+        // An access ACCESSCTRL denies is a bus error (RP2350 datasheet, ACCESSCTRL).
         val ac = &self.chip.accessctrl
         val need = ac.need(cpu.core, cpu.ns, privileged)
         if need & ac.denied == 0 then return false
         ac.refusal(a, need) match
             None -> false
-            Some(why) ->
-                self.refuse(cpu, a, why)
+            Some(_) ->
+                arm.bus_error(cpu, a)
                 true
 
     // Each XIP_SRAM cache line pinned or unpinned since the last time: the code decoded from each run
@@ -1077,6 +1086,11 @@ impl ArmBoard[Rp2350]
         if !self.chip.xip.sram_live(a)
             return Err(s"0x${hex(a, 8)} is in XIP_SRAM, and no cache line is pinned there with the cache enabled: on silicon the access misses, and the miss is a bus error")
         Ok(usize(self.sram_at + (a - XIP_SRAM_BASE)))
+
+    // An XIP_SRAM access `sram_line` refused: a miss, which is a bus error on silicon; or an unaligned
+    // one, which the core would split into aligned accesses and benchtop does not.
+    private sram_refused(*self, cpu: *arm.Cpu, a: u32, width: u32, why: string)
+        if a & (width - 1) != 0 then self.refuse(cpu, a, why) else arm.bus_error(cpu, a)
 end ArmBoard[Rp2350]
 
 impl[C: ArmChip] arm.Bus for ArmBoard[C]
@@ -1097,7 +1111,7 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
                         for k in 0..<usize(width) do v |= u32(self.mem.ram[at + k]) << u32(8 * k)
                         return v
                     Err(why) ->
-                        self.refuse(cpu, a, why)
+                        self.sram_refused(cpu, a, width, why)
                         return 0
         else
             self.striped(a) match
@@ -1114,7 +1128,7 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
         got match
             Ok(v) -> v
             Err(why) ->
-                self.refuse(cpu, a, why)
+                self.refused_access(cpu, a, why)
                 0
 
     write(*self, cpu: *arm.Cpu, a: u32, width: u32, x: u32, n: u64)
@@ -1131,7 +1145,7 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
                     Ok(at) ->
                         for k in 0..<usize(width) do self.mem.ram[at + k] = u8.wrap(x >> u32(8 * k))
                         arm.bus_stored(cpu, a, width)
-                    Err(why) -> self.refuse(cpu, a, why)
+                    Err(why) -> self.sram_refused(cpu, a, width, why)
                 return
         else
             self.striped(a) match
@@ -1151,7 +1165,7 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
                 self.settle()
                 // TRIGGER: the core stops after the store that made the reset.
                 if self.chip.resetting(cpu.core) then arm.halt(cpu, Stop.Reset, a)
-            Err(why) -> self.refuse(cpu, a, why)
+            Err(why) -> self.refused_access(cpu, a, why)
 
     // `SEV`: each core's TXEV is the other's RXEV.
     override event(*self, cpu: *arm.Cpu)
@@ -1185,6 +1199,12 @@ impl[C: ArmChip] arm.Bus for ArmBoard[C]
                 Some(0)
       else
         None
+
+// Whether `a` is where the RP2040's and the RP2350's buses have nothing at all, so that an access there
+// is a bus error on silicon (each datasheet's address map): 0x3000_0000 up to the APB peripherals at
+// 0x4000_0000, and 0x6000_0000 up to the SIO at 0xD000_0000. An address the chip refuses elsewhere,
+// inside a region whose devices benchtop models only in part, is benchtop's limit, not a hole.
+private silicon_hole(a: u32) -> bool = (a >= 0x30000000 && a < 0x40000000) || (a >= 0x60000000 && a < 0xD0000000)
 
 /** The RP2040's SRAM: its non-striped alias of banks 0–3, each 64 KB (RP2040 datasheet 2.6.2). */
 const SRAM_ALIAS_RP2040: u32 = 0x21000000

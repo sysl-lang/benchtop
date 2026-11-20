@@ -141,6 +141,11 @@ clear_security(cpu: *Cpu)
     cpu.transition = Transition.None
     cpu.unmodelled = Extension.None
     cpu.unmodelled_insn = 0
+    cpu.unmodelled_what_len = 0
+    cpu.access = Access.Host
+    cpu.stack_errors = 0
+    cpu.bfar = 0
+    cpu.fetch_failed = false
     cpu.nsacr = 0
     cpu.scr = 0
     cpu.idau = NO_IDAU
@@ -208,12 +213,20 @@ fault_here(cpu: *Cpu, ip: *Insn, n: u64, bits: u32, why: Stop)
 // The instruction at `ip`, `n` retired before it, which the core's records say it cannot execute. On an
 // ARMv8.1-M core one of an extension it has on silicon that benchtop does not model stops the core at
 // `Unmodelled` (`unmodelled_extension`), whatever runs it: no fault is taken, since silicon takes none.
-// The rest are undefined: UNDEFINSTR, or NOCP for an instruction of a coprocessor the core does not have
+// A 32-bit instruction cut off by the end of the memory code runs from is no instruction at all: its
+// second halfword's fetch is a bus error (`fetch_stop`), IBUSERR, the frame returning to it. The rest
+// are undefined: UNDEFINSTR, or NOCP for an instruction of a coprocessor the core does not have
 // (`undefined_bits`).
 @cold
 @noinline
 undefined_here(cpu: *Cpu, ip: *Insn, n: u64)
     val at = addr_of(cpu, ip)
+    if cut_off(cpu, at)
+        if cpu.stop != Stop.Running then return
+        cpu.retired = n
+        fetch_stop(cpu, at)
+        cpu.stop_at = at +% 2
+        return
     if is_v81m(cpu.kind)
         val x = unmodelled_extension(cpu, at)
         if x != Extension.None then return unmodelled_here(cpu, ip, n, x)
@@ -286,6 +299,50 @@ invalid_state(cpu: *Cpu, to: u32, at: u32)
     if cpu.catch_faults then return halt(cpu, Stop.Fault, at)
     cpu.thumb_off = true
     usage(cpu, CFSR_INVSTATE, to, Stop.Fault)
+
+// BusFault, `bits` recorded in BFSR and, with BFARVALID among them, `address` in BFAR: taken, escalated
+// to HardFault with HFSR.FORCED, or a lockup at `at`, as `fault` decides. BFSR and BFAR are the Secure
+// state's (the only ones on a core without the Security Extension), BusFault targeting Secure state
+// while AIRCR.BFHFNMINS is clear, which is the only setting benchtop runs (`Transition.Aircr`). A
+// Baseline core has no BusFault and no status registers: its fault is HardFault, nothing recorded.
+@cold
+bus_fault(cpu: *Cpu, bits: u32, address: u32, at: u32)
+    if is_baseline(cpu.kind) then return fault(cpu, HARD_FAULT, at, Stop.Fault)
+    cpu.cfsr |= bits
+    if bits & CFSR_BFARVALID != 0 then cpu.bfar = address
+    fault(cpu, BUS_FAULT, at, Stop.Fault)
+
+// The fetch of the instruction at `pc` failed (`fetch_stop`): unless a debugger or the window runs the
+// core, the stop gives way to IBUSERR, pending, its frame returning to `pc`, escalated or a lockup as
+// `fault` decides. Where the instruction would take INVSTATE first (EPSR.T clear, `invalid_state`),
+// the fetch is never made and that fault alone is taken.
+@cold
+@noinline
+fetch_fault(cpu: *Cpu)
+    cpu.fetch_failed = false
+    if cpu.catch_faults || cpu.stop != Stop.Unmapped then return
+    cpu.stop = Stop.Running
+    if !cpu.thumb_off then bus_fault(cpu, CFSR_IBUSERR, 0, cpu.pc)
+
+// The 32-bit instruction at `at` whose second halfword is off the memory code runs from (the end of the
+// flash or a RAM bank): whether it is so, which makes its fetch a bus error rather than an undefined
+// instruction.
+cut_off(cpu: *Cpu, at: u32) -> bool
+    if !cpu.mem.is_code(at) || cpu.mem.is_code(at +% 2) then return false
+    wide(load16(cpu, at))
+
+// The fault a bus error stacking or unstacking derives, `bits` (STKERR, UNSTKERR) recorded in BFSR,
+// judged against the priority the core runs at: BusFault where it is enabled and would preempt,
+// HardFault with HFSR.FORCED where only that would; -1 for a lockup. A Baseline core records nothing
+// and derives HardFault.
+derived_bus(cpu: *Cpu, bits: u32) -> int
+    val running = running_priority(cpu, true)
+    if !is_baseline(cpu.kind)
+        cpu.cfsr |= bits
+        if fault_enabled(cpu, BUS_FAULT) && group(cpu, priority(cpu, BUS_FAULT)) < running then return int(BUS_FAULT)
+    if running <= -1 then return -1
+    if !is_baseline(cpu.kind) then cpu.hfsr |= HFSR_FORCED
+    int(HARD_FAULT)
 
 // Whether a stack-limit violation is ignored: at a negative priority, under CCR.STKOFHFNMIGN.
 @inline
@@ -361,8 +418,8 @@ shcsr_write(cpu: *Cpu, x: u32)
     if cpu.security then set_pending(cpu, SECURE_FAULT, (x >> 20) & 1 != 0)
 
 // The Security Extension's registers in the system control space, read: None for an address that is
-// not one, or on a core without the extension. A region register with SAU_RNR past the last region is
-// refused, as an access where nothing is.
+// not one, or on a core without the extension. A region register with SAU_RNR past the last region,
+// which the architecture leaves UNPREDICTABLE, is one benchtop does not model (`scs_unmodelled`).
 secure_read(cpu: *Cpu, a: u32) -> Option[u32]
     if !cpu.security then return None
 
@@ -372,7 +429,7 @@ secure_read(cpu: *Cpu, a: u32) -> Option[u32]
         SAU_RNR -> Some(cpu.sau_rnr)
         SAU_RBAR | SAU_RLAR ->
             if cpu.sau_rnr >= SAU_REGIONS
-                halt(cpu, Stop.Unmapped, a)
+                scs_unmodelled(cpu, a)
                 return Some(0)
             Some(if a == SAU_RBAR then cpu.sau_rbar[cpu.sau_rnr] else cpu.sau_rlar[cpu.sau_rnr])
         SCB_SFSR -> Some(cpu.sfsr)
@@ -403,7 +460,7 @@ secure_write(cpu: *Cpu, a: u32, x: u32) -> bool
         SAU_RNR -> cpu.sau_rnr = x & 0xFF
         SAU_RBAR | SAU_RLAR ->
             if cpu.sau_rnr >= SAU_REGIONS
-                halt(cpu, Stop.Unmapped, a)
+                scs_unmodelled(cpu, a)
                 return true
             if a == SAU_RBAR then cpu.sau_rbar[cpu.sau_rnr] = x & 0xFFFFFFE0 else cpu.sau_rlar[cpu.sau_rnr] = x & 0xFFFFFFE3
             cpu.attribution_stale = true

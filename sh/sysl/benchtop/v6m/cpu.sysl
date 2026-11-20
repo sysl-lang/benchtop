@@ -2,7 +2,7 @@ module sh.sysl.benchtop.v6m
 
 import sysl.buf.{Buf, Frozen, buf}
 import sysl.rand.Rng
-import sysl.raw.ptr_cast
+import sysl.raw.{ptr_cast, str_cast}
 import sysl.sync.*
 
 // The core: the registers, the flags, guest memory behind a page table, and the decoded-instruction
@@ -291,7 +291,9 @@ enum Stop
     Running = 0
     Breakpoint
     Undefined
-    // An access, or a jump, to an address nothing answers; `stop_at` is the address.
+    // An access, or a jump, to an address nothing answers, where the core does not take the BusFault
+    // silicon takes: a debugger or the window runs it (`Cpu.catch_faults`), or the access is the host's
+    // own. `stop_at` is the address.
     Unmapped
     // The guest asked to end, with `exit_code`.
     Exit
@@ -315,12 +317,14 @@ enum Stop
     // `Cpu.transition` says which. `stop_at` is the instruction (for a register access, the address);
     // nothing of it was done.
     NonSecure
-    // An instruction the core has on silicon that benchtop does not model: `Cpu.unmodelled` says which
-    // extension, `Cpu.unmodelled_insn` its encoding, `stop_at` its address. Nothing of it was done, and
-    // no fault was taken: the limit is benchtop's, not the guest's.
+    // Something the core or its chip has on silicon that benchtop does not model: an instruction,
+    // `Cpu.unmodelled` saying which extension, `Cpu.unmodelled_insn` its encoding, `stop_at` its address;
+    // or a device's register (`Extension.Device`), `Cpu.unmodelled_what` naming the device and offset,
+    // `stop_at` the address accessed. Nothing of it was done, and no fault was taken: the limit is
+    // benchtop's, not the guest's.
     Unmodelled
 
-/** The extension of an instruction a core stopped at `Stop.Unmodelled` on. */
+/** What a core stopped at `Stop.Unmodelled` on: an instruction's extension, or a device's register. */
 enum Extension: u8
     None = 0
     // ARMv8.1-M's low-overhead loops: `WLS`, `DLS`, `LE` and their tail-predicated forms.
@@ -329,6 +333,9 @@ enum Extension: u8
     LongShift
     // MVE (Helium), the vector extension.
     Mve
+    // A register of a device on the bus, or an operation of one, that benchtop does not model
+    // (`unmodelled_register`).
+    Device
 
 /** The name a stop at `Stop.Unmodelled` gives extension `x`. */
 extension_name(x: Extension) -> string = x match
@@ -336,13 +343,29 @@ extension_name(x: Extension) -> string = x match
     LowOverheadLoop -> "a low-overhead loop instruction (ARMv8.1-M LOB)"
     LongShift -> "an MVE long shift"
     Mve -> "an MVE (Helium) vector instruction"
+    Device -> "a device register"
 
-/** What a core stopped at `Stop.Unmodelled` says: the extension, the encoding and where, benchtop's
- * limit rather than a fault of the guest's. */
+/** What a core stopped at `Stop.Unmodelled` says: the extension, the encoding and where, or the device
+ * and register, benchtop's limit rather than a fault of the guest's. */
 unmodelled_text(cpu: *Cpu) -> string
+    if cpu.unmodelled == Extension.Device
+        return f"${unmodelled_name(cpu)} at 0x${cpu.stop_at}%08x, which the chip has and benchtop does not model"
     val hw1 = cpu.unmodelled_insn >> 16
     val hw2 = cpu.unmodelled_insn & 0xFFFF
     f"${extension_name(cpu.unmodelled)} (0x$hw1%04x 0x$hw2%04x), which this core has and benchtop does not model, at 0x${cpu.stop_at}%08x"
+
+/** The kind of access the core is making, which decides what a bus error on it is (`bus_error`). */
+enum Access: u8
+    // The host's own (a debugger's, a test's, a vector read): a bus error stops the core at `Unmapped`.
+    Host = 0
+    // An instruction's load or store: a precise BusFault, PRECISERR with BFAR.
+    Data
+    // Stacking an exception frame: STKERR.
+    Stack
+    // Unstacking one: UNSTKERR.
+    Unstack
+    // Fetching an instruction to decode it: IBUSERR (`fetch_stop`).
+    Fetch
 
 /** The part of the Security Extension a core stopped at `Stop.NonSecure` was asked for. */
 enum Transition: u8
@@ -577,6 +600,21 @@ struct Cpu
     // the top half, a 16-bit one's alone).
     unmodelled: Extension
     unmodelled_insn: u32
+    // For a device's register (`Extension.Device`): the device and the register's offset, in words, its
+    // first `unmodelled_what_len` bytes (`unmodelled_name`). Bytes rather than a string, which a core
+    // shared across threads may not hold.
+    unmodelled_what: [UNMODELLED_WHAT]u8
+    unmodelled_what_len: u32
+    // The access the core is making (`bus_error`), Host outside an instruction's or the exception
+    // model's; and the BusFault bits a bus error has raised while stacking or unstacking, which the
+    // entry or return takes as its derived fault.
+    access: Access
+    stack_errors: u32
+    // BFAR: the address of the last precise data BusFault.
+    bfar: u32
+    // An instruction fetch went where nothing answers (`fetch_stop`): the core stopped at `Unmapped`
+    // there, and `end_run` takes IBUSERR in its place unless a debugger or the window runs it.
+    fetch_failed: bool
     // The Security Extension's two states (t2nonsecure.sysl). `ns`: the core runs in Non-secure state.
     // Every banked register above (the stack pointers and their limits, CONTROL, the masks, VTOR, CCR,
     // CPACR, SCR and the MPU) is the current state's copy, and `banked` holds the other state's.
@@ -817,16 +855,73 @@ lower_limit(cpu: *Cpu, n: u64)
         seen = got
 
 // The record for guest address `a`: past the end of RAM, the one record that stands for everywhere
-// else, and the core stopped at `a`, both its `stop_at` and its `pc`. A branch to it comes back at
-// once, since the stop has spent the budget.
+// else, and the fetch there failed (`fetch_stop`), the core stopped at `a`, both its `stop_at` and its
+// `pc`. A branch to it comes back at once, since the stop has spent the budget.
 @inline
 insn_at(cpu: *Cpu, a: u32) -> *Insn
     val offset = cpu.mem.code_offset(a)
     if offset != NO_CODE then return &cpu.dec[offset >> 1]
 
-    if cpu.stop == Stop.Running then cpu.pc = a
-    halt(cpu, Stop.Unmapped, a)
+    fetch_stop(cpu, a)
     &cpu.dec[NO_CODE >> 1]
+
+// The instruction at `a` is fetched where nothing answers: the core stops at `Unmapped` on it, `pc` and
+// `stop_at` both `a`. The run that comes back takes IBUSERR in the stop's place (`fetch_fault`, from
+// `end_run`), so the fault is taken only where the instruction would have executed, its frame returning
+// to `a`; a debugger or the window keeps the stop. A core already stopped is left as it is.
+@cold
+@noinline
+fetch_stop(cpu: *Cpu, a: u32)
+    if cpu.stop != Stop.Running then return
+    cpu.pc = a
+    halt(cpu, Stop.Unmapped, a)
+    cpu.fetch_failed = true
+
+// The bus answered the core's access to `a` with an error, as silicon's does where the chip has nothing
+// (a hole in the map, a peripheral that refuses the master): what that is depends on the access
+// (`Cpu.access`). An instruction's load or store takes a precise BusFault, PRECISERR with BFAR `a`, and
+// does not complete (`access_faulted`); a stacking or unstacking access raises STKERR or UNSTKERR, which
+// the entry or the return takes as its derived fault; a fetch to decode an instruction fails as
+// `fetch_stop` says, the decoder's caller putting `pc` on the instruction. The host's own access, and an
+// instruction's or the exception model's on a core a debugger or the window runs (`catch_faults`),
+// stops the core at `Unmapped` on `a` instead. Every write is taken as precise: none of the buses
+// benchtop models is documented to buffer one.
+@cold
+@noinline
+bus_error(cpu: *Cpu, a: u32)
+    if cpu.stop != Stop.Running then return
+    if cpu.catch_faults || cpu.access == Access.Host then return halt(cpu, Stop.Unmapped, a)
+    cpu.access match
+        Data ->
+            cpu.access_faulted = true
+            bus_fault(cpu, CFSR_PRECISERR | CFSR_BFARVALID, a, a)
+        Stack -> cpu.stack_errors |= CFSR_STKERR
+        Unstack -> cpu.stack_errors |= CFSR_UNSTKERR
+        Fetch ->
+            halt(cpu, Stop.Unmapped, a)
+            cpu.fetch_failed = true
+        Host -> ()
+
+// The register at `a` of a device on the bus, which silicon has and benchtop does not model, or an
+// operation of the device's it does not model: `what` names the device and the register's offset (or
+// the operation). The core stops at `Unmodelled` on `a`, nothing of the access done and no fault taken,
+// whatever runs it: the limit is benchtop's, not the guest's.
+@cold
+@noinline
+unmodelled_register(cpu: *Cpu, a: u32, what: string)
+    if cpu.stop != Stop.Running then return
+    cpu.unmodelled = Extension.Device
+    val n = if what.len < usize(UNMODELLED_WHAT) then what.len else usize(UNMODELLED_WHAT)
+    for i in 0..<n do cpu.unmodelled_what[i] = what[i]
+    cpu.unmodelled_what_len = u32(n)
+    halt(cpu, Stop.Unmodelled, a)
+
+/** What a core stopped at `Stop.Unmodelled` on a device's register names: the device and the offset
+ * (cut at UNMODELLED_WHAT bytes). */
+unmodelled_name(cpu: *Cpu) -> string = str_cast(cpu.unmodelled_what[..<usize(cpu.unmodelled_what_len)])
+
+// The most bytes of a device's name and offset a core keeps for a stop at `Unmodelled`.
+const UNMODELLED_WHAT: u32 = 160
 
 // Stop the core for `why` at `at`, unless it has already stopped. A taken branch then comes back at
 // once, since the budget is gone, and leaves `pc` alone: whatever stops the core says where.
@@ -858,25 +953,25 @@ fetch_refused(cpu: *Cpu, ip: *Insn, n: u64)
     cpu.pc = addr_of(cpu, ip)
     cpu.retired = n
 
-// A taken `Leave` at `ip`, `n` retired before it: the branch retires, and the core stops at its target.
+// A taken `Leave` at `ip`, `n` retired before it: the branch retires, and the fetch at its target fails
+// (`fetch_stop`).
 leave(cpu: *Cpu, ip: *Insn, n: u64)
     if ip.a != 0 then cpu.r[14] = (addr_of(cpu, ip) + 4) | 1
 
-    halt(cpu, Stop.Unmapped, ip.imm)
-    cpu.pc = ip.imm
+    fetch_stop(cpu, ip.imm)
     charge_instruction(cpu,ip)
     cpu.retired = n + 1
 
-// A machine with no devices: every access off the page table stops the core.
+// A machine with no devices: every access off the page table is a bus error (`bus_error`).
 struct NoDevices
 end NoDevices
 
 impl Bus for NoDevices
     read(*self, cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
-        halt(cpu, Stop.Unmapped, a)
+        bus_error(cpu, a)
         0
 
-    write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64) = halt(cpu, Stop.Unmapped, a)
+    write(*self, cpu: *Cpu, a: u32, width: u32, x: u32, n: u64) = bus_error(cpu, a)
 
 /** The bus `reset` gives a core: nothing is on it. */
 var nothing_attached = NoDevices()
@@ -1281,13 +1376,16 @@ load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
 // one a debugger's watchpoint stops the core before (`watch_reached`): the pages its watchpoints cover
 // are the only ones it takes off the fast path, so an instruction's access to any other pays nothing.
 // Nor does one the MPU refuses (`mpu_refuses`), which takes MemManage: while the MPU applies, the
-// table the fast path reads holds only pages its view lets the access make whole (mpu.sysl).
+// table the fast path reads holds only pages its view lets the access make whole (mpu.sysl). Nor does
+// one the bus answers with an error, which takes a precise BusFault (`bus_error`).
 @noinline
 slow_load(cpu: *Cpu, a: u32, width: u32, n: u64, into: *u32) -> bool
     if cpu.watch_count != 0 && watch_reached(cpu, a, width, false) then return false
     if cpu.mpu_live && mpu_refuses(cpu, a, width, false) then return false
 
+    cpu.access = Access.Data
     val x = slow_read(cpu, a, width, n)
+    cpu.access = Access.Host
 
     if cpu.stop != Stop.Running || cpu.access_faulted then return false
 
@@ -1309,7 +1407,9 @@ store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
 slow_store(cpu: *Cpu, a: u32, x: u32, width: u32, n: u64) -> bool
     if cpu.watch_count != 0 && watch_reached(cpu, a, width, true) then return false
     if cpu.mpu_live && mpu_refuses(cpu, a, width, true) then return false
+    cpu.access = Access.Data
     slow_write(cpu, a, width, low_bytes(x, width), n)
+    cpu.access = Access.Host
     cpu.stop == Stop.Running && !cpu.access_faulted
 
 // The same accesses where nothing stops on them: the exception model's stacking and the host's own.
