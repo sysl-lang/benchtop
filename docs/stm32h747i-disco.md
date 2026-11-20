@@ -155,9 +155,53 @@ tab's terminal: click in it and type (see the [README](../README.md#try-the-visu
 The register model is the STM32H7 USART in asynchronous mode: 7, 8 or 9 data bits with even or odd
 parity, 0.5 to 2 stop bits, 16 or 8 times oversampling and the prescaler, the 16-deep FIFOs and their
 thresholds, and the flags and interrupts a polling or interrupt-driven driver uses. What it refuses
-is listed in [peripheral models](peripheral-models.md). Benchtop runs one STM32 USART on a board;
-a second is refused, as is a `stm32-usart` without `kernel-clock-hz` and a terminal on a USART
-whose TX and RX are not routed to pins of the chip's GPIO.
+is listed in [peripheral models](peripheral-models.md). Benchtop runs two STM32 USARTs on a board,
+the first two `stm32-usart`s of its chip; a third is refused, as is a `stm32-usart` without
+`kernel-clock-hz` and a terminal on a USART whose TX and RX are not routed to pins of the chip's
+GPIO. A `stm32-usart`'s `alternate-function` (0 to 15, 7 where it gives none) is the function its
+pins take.
+
+## A second console (UART8)
+
+The board's second USART is UART8 at 0x40007C00, IRQ 83, its clock enable RCC_APB1LENR.UART8EN
+(bit 31, in each core's copy), its TX on PJ8 and RX on PJ9 in alternate function 8 (`buses { uart8 {
+tx = PJ8, rx = PJ9 } }`). They are the Arduino Uno connector's D1 and D0 (UM2411), where a USB-serial
+adapter makes a second port; the board's `serial2` part is the host's terminal there. Its kernel
+clock is 120 MHz, rcc_pclk1, the reset choice of USART234578SEL. The board's BSP defines one COM
+port, USART1, so nothing of ST's fixes a second console; UART8 is the one the board brings to a
+connector. Base, IRQ and enable bit are
+RM0399's and ST's CMSIS header's (`UART8_IRQn` = 83), and agree with Zephyr's `stm32h7.dtsi` (`reg =
+<0x40007c00>`, `interrupts = <83>`, APB1L bit 31); PJ8 and PJ9 agree with Zephyr's DISCO board file
+(`uart8_tx_pj8`, `uart8_rx_pj9`). AF8 is DS12930's alternate-function table, which no source in this
+repo or its dependencies carries, so it has not been checked against one; the connector pins are the
+user manual's Arduino table.
+
+Either core reaches either USART, as on silicon. A guest such as skiff that gives each core a console
+of its own puts the M7's on USART1 and the M4's on UART8. What UART8 sends joins the console's output
+beside USART1's (only while PJ8 is in AF8); typed input reaches USART1's receiver alone, so UART8
+receives nothing from the console.
+
+## Headless runs
+
+`benchtop run --board stm32h747-disco` takes the options a Pico's headless run does:
+
+- `--semihosting`: a `BKPT 0xAB` on either core is a semihosting call, as QEMU runs them
+  (`sh/sysl/benchtop/v6m/semihost.sysl`). `SYS_EXIT` and `SYS_EXIT_EXTENDED` end the run with QEMU's status
+  (`ADP_Stopped_ApplicationExit` with a subcode is that subcode); `SYS_WRITE0`, `SYS_WRITEC` and
+  `SYS_WRITE` write to the console, beside what the USARTs send. Without it a `BKPT` stops the core.
+- `--serial usart1=file:<path>` and `--serial uart8=file:<path>`: the USART's output goes to the file,
+  emptied when the run starts and appended to as the guest sends, instead of the console. The names
+  are the chip's own (`mcus/stm32h747.hocon`), as `uart0` and `uart1` are an RP board's; any other is
+  refused, naming the two the board has.
+- `--report`, `--report-masking` (with `--masking-sites` and `--masking-ranks`), `--explain-faults`,
+  `--trace-ring`, and `--seed` with the fault options, on both cores, scripted or not.
+
+For example, skiff's boot test with each core's console in a file and the guest's exit status as
+benchtop's:
+
+```
+./benchtop run --board stm32h747-disco --semihosting --serial usart1=file:m7.txt --serial uart8=file:m4.txt --timeout 2s skiff.elf
+```
 
 ### Forth example
 
