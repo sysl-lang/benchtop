@@ -1,0 +1,216 @@
+module sh.sysl.benchtop.virt
+
+// The STM32H747's hardware semaphore block (`stm32h7-hsem`, RM0399 "Hardware semaphore (HSEM)"): 32
+// semaphores the M7 and the M4 lock and free through registers, each core told of a free by its own
+// interrupt. It is the chip's cross-core lock, since the cores' exclusives reach only their local
+// monitors, and its doorbell, a semaphore freed by one core raising the other's interrupt.
+//
+// Registers, from the base (0x5802_6400):
+//
+//   R[n]    0x00 + 4n   LOCK (31), COREID (11:8), PROCID (7:0). A write with LOCK set locks a free
+//                       semaphore with the written COREID and PROCID (the 2-step lock, whose readback
+//                       tells the writer whether it won); a write with LOCK clear and the holder's
+//                       COREID and PROCID frees it. A write naming a COREID other than the writing
+//                       core's, and any other write, is ignored. A free semaphore reads 0.
+//   RLR[n]  0x80 + 4n   read-only. Reading a free semaphore locks it with the reader's COREID and
+//                       PROCID 0 (the 1-step lock); either way it answers the semaphore as it stands.
+//   C1IER/ICR/ISR/MISR 0x100-0x10C, the M7's; C2IER/ICR/ISR/MISR 0x110-0x11C, the M4's. A free sets the
+//                       semaphore's bit in both ISRs; MISR is ISR & IER, and HSEM1 (the M7) or HSEM2
+//                       (the M4) is raised while it is not 0. ICR clears the ISR bits written 1 and
+//                       reads 0.
+//   CR      0x140       write-only: KEY (31:16) and COREID (11:8). Where KEY is KEYR's, every
+//                       semaphore locked by COREID is freed, as a write of R[n] would free it.
+//   KEYR    0x144       KEY (31:16).
+//
+// The COREID of an access is its bus master's (RM0399's bus-master table): 3 for CPU1, the M7 (core
+// 0), and 1 for CPU2, the M4 (core 1). Every register takes a word access only; anything else
+// faults, and an offset that is no register stops the core at Unmodelled, named (`unmodelled_register`).
+//
+// Two cores on two threads reach it at once, so its state is host atomics and nothing else: a lock is
+// one compare-and-swap of R[n] from 0, a free one compare-and-swap from the holder's exact value, so
+// of two cores racing for a semaphore exactly one wins, and a free can only free the lock it names.
+// The lock acquires and the free releases, so what the holder wrote is seen by the next to lock it.
+
+import sh.sysl.benchtop.Board
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.benchtop.v6m.{Cpu, Stop, IRQ0, could_wake, cut, exception_active, halt, raise, set_limit, unmodelled_register}
+import sysl.sync.*
+
+// Register offsets and fields (RM0399; ST's SVD for the STM32H747).
+private const SEMAPHORES: u32 = 32
+private const R0: u32 = 0x00
+private const RLR0: u32 = 0x80
+private const C1IER: u32 = 0x100
+private const C2IER: u32 = 0x110
+// Within a core's four: IER, ICR, ISR, MISR.
+private const IER: u32 = 0x0
+private const ICR: u32 = 0x4
+private const ISR: u32 = 0x8
+private const MISR: u32 = 0xC
+private const CR: u32 = 0x140
+private const KEYR: u32 = 0x144
+
+private const LOCK: u32 = 0x80000000
+private const COREID_SHIFT: u32 = 8
+private const COREID_MASK: u32 = 0xF00
+private const PROCID_MASK: u32 = 0xFF
+private const KEY_MASK: u32 = 0xFFFF0000
+
+/** The COREIDs of the H747's bus masters that reach the HSEM: core 0 (CPU1, the M7) and core 1 (CPU2,
+ * the M4).
+ */
+val HSEM_COREIDS: [2]u32 = [3, 1]
+
+/** The HSEM: whether the bus has it and the IRQ it raises in each core, HSEM1 in core 0 and HSEM2 in
+ * core 1 (-1 for none), which the board fixes; and the registers, each read and written atomically
+ * by both cores' threads.
+ */
+struct HsemState
+    present: bool
+    irqs: [2]int
+    sems: [32]u32
+    ier: [2]u32
+    isr: [2]u32
+    key: u32
+
+/** No HSEM on the bus. */
+hsem_state() -> HsemState = HsemState(false, [-1, -1], [0; 32], [0, 0], [0, 0], 0)
+
+/** The HSEM `b` makes, its IRQs as the bus `mapped` gives them, or why benchtop cannot run it: its
+ * core IDs are the H747's, so core 0 must be the Cortex-M7 and core 1 the Cortex-M4.
+ */
+private[virt] check_hsem(b: Board, mapped: []const Mapped) -> Result[HsemState, string]
+    var s = hsem_state()
+    for w in mapped
+        if w.device != Hsem then continue
+        val cores = b.chip.cores
+        if cores.len() != 2 || cores[0].name != "cortex-m7" || cores[1].name != "cortex-m4" then
+            return Err("stm32h7-hsem requires core 0 Cortex-M7 and core 1 Cortex-M4")
+        s.present = true
+        s.irqs = [w.irqs[0], w.irqs[1]]
+    Ok(s)
+
+/** Every semaphore free and every interrupt register and the key 0, as at reset. */
+private[virt] boot_hsem(s: *HsemState)
+    for n in 0..<SEMAPHORES do atomic_store(&s.sems[n], 0, SeqCst)
+    for k in 0..<2
+        atomic_store(&s.ier[k], 0, SeqCst)
+        atomic_store(&s.isr[k], 0, SeqCst)
+    atomic_store(&s.key, 0, SeqCst)
+
+// Core k's masked interrupt status.
+private hsem_misr(s: *HsemState, k: usize) -> u32 = atomic_load(&s.isr[k], Acquire) & atomic_load(&s.ier[k], Acquire)
+
+/** Whether the HSEM's interrupt is raised in `cpu`: it has one there and the core's MISR is not 0. */
+private[virt] hsem_raising(s: *HsemState, cpu: *Cpu) -> bool
+    val k = usize(cpu.core)
+    s.present && s.irqs[k] >= 0 && hsem_misr(s, k) != 0
+
+private[virt] signal_hsem(s: *HsemState, cpu: *Cpu)
+    if !hsem_raising(s, cpu) then return
+    val irq = u32(s.irqs[usize(cpu.core)])
+    if !exception_active(cpu, IRQ0 + irq) then raise(cpu, irq)
+
+private[virt] hsem_wake(s: *HsemState, cpu: *Cpu) -> u64
+    if !hsem_raising(s, cpu) || !could_wake(cpu, IRQ0 + u32(s.irqs[usize(cpu.core)])) then return NEVER
+    board_time(cpu, cpu.retired)
+
+// Bring core k to its HSEM interrupt after `cpu`'s access: `cpu` itself at its next taken branch, the
+// other core, on a thread of its own, at its next taken branch too, woken where it sleeps. Either way
+// the core's own `signal` raises the interrupt from MISR as it then stands, so the line is a level, as
+// on silicon: an interrupt the core's handler has already answered is not raised a second time, as a
+// pend latched from this thread would be. In turns, the other core's `signal` raises it before it
+// next runs.
+private reach(m: *Machine, cpu: *Cpu, k: usize)
+    if k == usize(cpu.core) then set_limit(cpu, 0)
+    elif m.scheduler.threaded
+        cut(&m.cores[k])
+        rouse_core(m, int(k))
+
+// The semaphores in `bits` have just been freed by `cpu`: set their bits in both cores' ISRs, and
+// bring each core whose MISR they reach to its interrupt.
+private freed(m: *Machine, s: *HsemState, cpu: *Cpu, bits: u32)
+    for k in 0..<2
+        atomic_or(&s.isr[k], bits, AcqRel)
+        if s.irqs[k] >= 0 && atomic_load(&s.ier[k], Acquire) & bits != 0 then reach(m, cpu, usize(k))
+
+// The semaphore an offset in `base`'s block of 32 names, if it does.
+private semaphore_at(offset: u32, base: u32) -> Option[u32]
+    if offset >= base && offset < base + SEMAPHORES * 4 then Some((offset - base) / 4) else None
+
+// The 1-step lock: semaphore n locked by `cpu` with PROCID 0 if it was free; answer it as it now is.
+private read_lock(s: *HsemState, cpu: *Cpu, n: u32) -> u32
+    val mine = LOCK | (HSEM_COREIDS[usize(cpu.core)] << COREID_SHIFT)
+    val was = atomic_cas(&s.sems[n], 0, mine, AcqRel)
+    if was == 0 then mine else was
+
+private[virt] hsem_read(s: *HsemState, cpu: *Cpu, address: u32, offset: u32, width: u32) -> u32
+    if width != 4 || offset & 3 != 0
+        halt(cpu, Stop.Fault, address)
+        return 0
+    semaphore_at(offset, R0) match
+        Some(n) -> return atomic_load(&s.sems[n], Acquire)
+        None -> ()
+    semaphore_at(offset, RLR0) match
+        Some(n) -> return read_lock(s, cpu, n)
+        None -> ()
+    if offset >= C1IER && offset <= C2IER + MISR
+        val k = usize((offset - C1IER) / 0x10)
+        return (offset & 0xF) match
+            IER -> atomic_load(&s.ier[k], Acquire)
+            ISR -> atomic_load(&s.isr[k], Acquire)
+            MISR -> hsem_misr(s, k)
+            _ -> 0
+    if offset == CR then return 0
+    if offset == KEYR then return atomic_load(&s.key, Acquire)
+    unmodelled_register(cpu, address, f"the STM32H7 HSEM + 0x$offset%03x")
+    0
+
+// A write of R[n]: the 2-step lock where LOCK is set, a free where it is clear, each only under the
+// writing core's own COREID.
+private write_semaphore(m: *Machine, s: *HsemState, cpu: *Cpu, n: u32, value: u32)
+    if (value & COREID_MASK) >> COREID_SHIFT != HSEM_COREIDS[usize(cpu.core)] then return
+    val named = LOCK | (value & (COREID_MASK | PROCID_MASK))
+    if value & LOCK != 0
+        atomic_cas(&s.sems[n], 0, named, AcqRel)
+    elif atomic_cas(&s.sems[n], named, 0, AcqRel) == named
+        freed(m, s, cpu, 1 << n)
+
+// CR: with the key, free every semaphore locked by the COREID written, whichever PROCID holds it.
+private clear_core(m: *Machine, s: *HsemState, cpu: *Cpu, value: u32)
+    if value & KEY_MASK != atomic_load(&s.key, Acquire) then return
+    val core = value & COREID_MASK
+    var bits: u32 = 0
+    for n in 0..<SEMAPHORES
+        val held = atomic_load(&s.sems[n], Acquire)
+        if held & LOCK == 0 || held & COREID_MASK != core then continue
+        if atomic_cas(&s.sems[n], held, 0, AcqRel) == held then bits |= 1 << n
+    if bits != 0 then freed(m, s, cpu, bits)
+
+private[virt] hsem_write(m: *Machine, s: *HsemState, cpu: *Cpu, address: u32, offset: u32, width: u32, value: u32)
+    if width != 4 || offset & 3 != 0
+        halt(cpu, Stop.Fault, address)
+        return
+    semaphore_at(offset, R0) match
+        Some(n) ->
+            write_semaphore(m, s, cpu, n, value)
+            return
+        None -> ()
+    // RLR, ISR and MISR are read-only: a write leaves them.
+    if semaphore_at(offset, RLR0).is_some() then return
+    if offset >= C1IER && offset <= C2IER + MISR
+        val k = usize((offset - C1IER) / 0x10)
+        (offset & 0xF) match
+            IER ->
+                atomic_store(&s.ier[k], value, Release)
+                if s.irqs[k] >= 0 && hsem_misr(s, k) != 0 then reach(m, cpu, k)
+            ICR -> atomic_and(&s.isr[k], ~value, AcqRel)
+            _ -> ()
+        return
+    if offset == CR
+        clear_core(m, s, cpu, value)
+        return
+    if offset == KEYR
+        atomic_store(&s.key, value & KEY_MASK, Release)
+        return
+    unmodelled_register(cpu, address, f"the STM32H7 HSEM + 0x$offset%03x")

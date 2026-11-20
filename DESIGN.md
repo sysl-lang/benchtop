@@ -298,12 +298,19 @@ checked against the SVD):
     at its interrupt; its output is collected and written a line at a time as on one thread.
   - **The devices are a plain array**, which both threads read and neither writes while the board
     runs. A `Buf` would not do: reading one copies a counted reference, a write to its count.
-- **HSEM** (32 semaphores, RM0399 "Hardware semaphore"): each `R[n]` is a host `Atomic[u32]` holding
-  `LOCK | COREID<<8 | PROCID`. A 2-step write-lock or a 1-step read-lock (`RLR[n]`) is a
-  compare-and-swap against the unlocked value. Unlock requires a matching COREID/PROCID. The core IDs
-  are the bus-master IDs (RM0399 Table 95): CM7 = 3, CM4 = 1. A free semaphore sets its bit in
-  `C1ISR` and `C2ISR`, raising HSEM1 (to the M7) or HSEM2 (to the M4) where `CnIER` enables it. That is
-  the ST examples' "core notification", and skiff's natural doorbell on this chip.
+- **HSEM** (32 semaphores, RM0399 "Hardware semaphore"; `virt/hsem.sysl`, `stm32h7-hsem` at
+  0x5802_6400, IRQs 125 and 126): each `R[n]` is a host atomic `u32` holding
+  `LOCK | COREID<<8 | PROCID`, 0 when free. A 2-step write-lock (write `R[n]` with LOCK, then read it
+  back) or a 1-step read-lock (read `RLR[n]`, which locks with PROCID 0) is one compare-and-swap from
+  0, so of two cores on two threads racing for a semaphore exactly one wins. A free is a
+  compare-and-swap from the holder's exact value, so it needs a matching COREID and PROCID and is
+  otherwise ignored. A lock or free naming a COREID other than the accessing core's is ignored. The
+  core IDs are the bus-master IDs (RM0399 Table 95): CM7 = 3, CM4 = 1, from the core that made the
+  access. A free sets its bit in `C1ISR` and `C2ISR`; `CnMISR` is `CnISR & CnIER`, and HSEM1 (to the
+  M7) or HSEM2 (to the M4) is raised while it is not 0, a core on the other thread poked and woken at
+  once. `CnICR` clears by writing 1. `CR` with `KEYR`'s key frees every semaphore of the COREID
+  written, as a free would. Registers take word accesses only. That is the ST examples' "core
+  notification", and skiff's natural doorbell on this chip.
 - **Events between cores**: on the H745/747 each core's TXEV is wired to the other's RXEV, so `SEV` on
   one core wakes a `WFE` on the other (the ST HSEM readme lists SEV as a D2 wake source). benchtop sets
   the other core's event register and signals its condition variable.

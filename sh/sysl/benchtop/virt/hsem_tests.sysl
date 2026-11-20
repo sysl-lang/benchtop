@@ -1,0 +1,382 @@
+module sh.sysl.benchtop.virt
+@tests
+
+import sh.sysl.benchtop.v6m as cpu
+import sysl.sync.*
+import sysl.threads.scope
+
+private val DISCO_GUEST = embed("../../../../examples/touch/disco.elf")
+
+private const HSEM: u32 = 0x58026400
+private const LOCK: u32 = 0x80000000
+// The M7's (CPU1) and the M4's (CPU2) COREIDs, in place in a semaphore.
+private const M7: u32 = 3 << 8
+private const M4: u32 = 1 << 8
+private const C1IER: u32 = 0x100
+private const C1ICR: u32 = 0x104
+private const C1ISR: u32 = 0x108
+private const C1MISR: u32 = 0x10C
+private const C2IER: u32 = 0x110
+private const C2ICR: u32 = 0x114
+private const C2ISR: u32 = 0x118
+private const C2MISR: u32 = 0x11C
+private const CR: u32 = 0x140
+private const KEYR: u32 = 0x144
+private const HSEM1: u32 = 125
+private const HSEM2: u32 = 126
+
+// The DISCO booted, its cores not run.
+private disco() -> &Machine
+    val board = machine()
+    assert(board_named(&*board, "stm32h747-disco").is_ok())
+    boot(&*board, image_of(&*board, DISCO_GUEST).unwrap().view())
+    board
+
+private r(n: u32) -> u32 = n * 4
+private rlr(n: u32) -> u32 = 0x80 + n * 4
+private hr(m: *Machine, c: *cpu.Cpu, offset: u32) -> u32 = board_read(m, c, HSEM + offset, 4, 0)
+private hw(m: *Machine, c: *cpu.Cpu, offset: u32, value: u32) = board_write(m, c, HSEM + offset, 4, value, 0)
+
+// Every register as at reset, read without locking anything: no RLR.
+private at_reset(m: *Machine) -> bool
+    for n in 0u32..<32 do if hr(m, core0(m), r(n)) != 0 then return false
+    for offset in [C1IER, C1ICR, C1ISR, C1MISR, C2IER, C2ICR, C2ISR, C2MISR, CR, KEYR]
+        if hr(m, core0(m), offset) != 0 || hr(m, core1(m), offset) != 0 then return false
+    true
+
+@test("HSEM: every register is zero from reset, and a boot puts back what was changed")
+hsem_reset_state()
+    val board = disco()
+    val m = &*board
+    assert(m.devices.hsem.present && m.devices.hsem.irqs[0] == 125 && m.devices.hsem.irqs[1] == 126)
+    assert(at_reset(m))
+    hw(m, core0(m), r(4), LOCK | M7 | 9)
+    assert(hr(m, core1(m), rlr(7)) == LOCK | M4)
+    hw(m, core0(m), C1IER, 0xF0)
+    hw(m, core1(m), C2IER, 0x0F)
+    hw(m, core0(m), KEYR, 0x12340000)
+    hw(m, core0(m), r(4), M7 | 9)
+    assert(hr(m, core0(m), C1ISR) == 0x10 && hr(m, core0(m), C2ISR) == 0x10)
+    boot(m, image_of(m, DISCO_GUEST).unwrap().view())
+    assert(at_reset(m))
+    assert(core0(m).stop == cpu.Stop.Running && core1(m).stop == cpu.Stop.Running)
+
+@test("HSEM 2-step lock: a write with LOCK locks a free semaphore with its COREID and PROCID, read back by either core")
+hsem_two_step_lock()
+    val board = disco()
+    val m = &*board
+    hw(m, core0(m), r(3), LOCK | M7 | 0x42)
+    assert(hr(m, core0(m), r(3)) == LOCK | M7 | 0x42)
+    assert(hr(m, core1(m), r(3)) == LOCK | M7 | 0x42, "the M4 sees the M7's lock")
+    hw(m, core1(m), r(31), LOCK | M4 | 0xFF)
+    assert(hr(m, core0(m), r(31)) == LOCK | M4 | 0xFF)
+    // Bits outside LOCK, COREID and PROCID are not stored.
+    hw(m, core0(m), r(5), 0xFFFFF3FF)
+    assert(hr(m, core0(m), r(5)) == LOCK | M7 | 0xFF)
+    // A COREID that is not the writing core's locks nothing.
+    hw(m, core0(m), r(6), LOCK | M4 | 1)
+    hw(m, core1(m), r(7), LOCK | M7 | 1)
+    hw(m, core0(m), r(8), LOCK | 1)
+    assert(hr(m, core0(m), r(6)) == 0 && hr(m, core0(m), r(7)) == 0 && hr(m, core0(m), r(8)) == 0)
+    for n in [0u32, 1, 2, 4] do assert(hr(m, core0(m), r(n)) == 0, "only the semaphore written is locked")
+    assert(core0(m).stop == cpu.Stop.Running && core1(m).stop == cpu.Stop.Running)
+
+@test("HSEM 1-step lock: reading RLR locks a free semaphore with the reader's COREID and PROCID 0, and answers a held one as it stands")
+hsem_one_step_lock()
+    val board = disco()
+    val m = &*board
+    assert(hr(m, core1(m), rlr(5)) == LOCK | M4)
+    assert(hr(m, core0(m), r(5)) == LOCK | M4)
+    assert(hr(m, core0(m), rlr(5)) == LOCK | M4, "the M7 is told the M4 holds it, and takes nothing")
+    assert(hr(m, core1(m), rlr(5)) == LOCK | M4, "a second read by the holder answers its own lock")
+    assert(hr(m, core0(m), rlr(0)) == LOCK | M7)
+    hw(m, core0(m), r(9), LOCK | M7 | 3)
+    assert(hr(m, core1(m), rlr(9)) == LOCK | M7 | 3, "a 2-step lock is answered with its PROCID")
+    assert(hr(m, core0(m), r(9)) == LOCK | M7 | 3)
+    // RLR is read-only: a write locks and frees nothing.
+    hw(m, core0(m), rlr(10), LOCK | M7)
+    hw(m, core1(m), rlr(5), M4)
+    assert(hr(m, core0(m), r(10)) == 0 && hr(m, core0(m), r(5)) == LOCK | M4)
+    // A 1-step lock frees with PROCID 0.
+    hw(m, core1(m), r(5), M4)
+    assert(hr(m, core0(m), r(5)) == 0)
+
+@test("HSEM: a held semaphore refuses the other core's lock, and its holder's second lock")
+hsem_held_refuses()
+    val board = disco()
+    val m = &*board
+    hw(m, core0(m), r(2), LOCK | M7 | 7)
+    hw(m, core1(m), r(2), LOCK | M4 | 7)
+    assert(hr(m, core1(m), r(2)) == LOCK | M7 | 7, "the M4's readback tells it it lost")
+    hw(m, core0(m), r(2), LOCK | M7 | 8)
+    assert(hr(m, core0(m), r(2)) == LOCK | M7 | 7, "another process of the same core does not take it over")
+    assert(hr(m, core1(m), rlr(2)) == LOCK | M7 | 7)
+    hw(m, core0(m), r(2), M7 | 7)
+    hw(m, core1(m), r(2), LOCK | M4 | 7)
+    assert(hr(m, core1(m), r(2)) == LOCK | M4 | 7, "freed, it is the M4's to take")
+
+@test("HSEM: a free naming another COREID or PROCID than the holder's is ignored, and sets no status")
+hsem_mismatched_free()
+    val board = disco()
+    val m = &*board
+    hw(m, core0(m), C2IER, 0xFFFFFFFF)
+    hw(m, core0(m), C1IER, 0xFFFFFFFF)
+    hw(m, core0(m), r(1), LOCK | M7 | 0x10)
+    hw(m, core0(m), r(1), M7 | 0x11)
+    hw(m, core0(m), r(1), M7)
+    hw(m, core0(m), r(1), M4 | 0x10)
+    hw(m, core1(m), r(1), M4 | 0x10)
+    hw(m, core1(m), r(1), M7 | 0x10)
+    assert(hr(m, core0(m), r(1)) == LOCK | M7 | 0x10)
+    assert(hr(m, core0(m), C1ISR) == 0 && hr(m, core0(m), C2ISR) == 0)
+    // A free of a free semaphore is no free either.
+    hw(m, core0(m), r(12), M7)
+    assert(hr(m, core0(m), C1ISR) == 0 && hr(m, core0(m), C2ISR) == 0)
+    hw(m, core0(m), r(1), M7 | 0x10)
+    assert(hr(m, core0(m), r(1)) == 0)
+    assert(hr(m, core0(m), C1ISR) == 2 && hr(m, core0(m), C2ISR) == 2, "the holder's free sets the bit in both cores' status")
+
+@test("HSEM: a free raises HSEM1 in the M7 or HSEM2 in the M4 only where that core's IER enables it; MISR is ISR & IER")
+hsem_free_interrupts()
+    val board = disco()
+    val m = &*board
+    val s = &m.devices.hsem
+    hw(m, core1(m), C2IER, 1 << 4)
+    hw(m, core0(m), r(4), LOCK | M7 | 1)
+    hw(m, core0(m), r(4), M7 | 1)
+    assert(hr(m, core0(m), C1ISR) == 1 << 4 && hr(m, core0(m), C2ISR) == 1 << 4)
+    assert(hr(m, core0(m), C1MISR) == 0 && hr(m, core1(m), C2MISR) == 1 << 4)
+    signal_hsem(s, core0(m))
+    signal_hsem(s, core1(m))
+    assert(cpu.exception_pending(core1(m), cpu.IRQ0 + HSEM2), "the M4's HSEM2 is raised")
+    assert(!cpu.exception_pending(core0(m), cpu.IRQ0 + HSEM1), "the M7 enabled nothing, so HSEM1 stays low")
+    assert(!cpu.exception_pending(core1(m), cpu.IRQ0 + HSEM1) && !cpu.exception_pending(core0(m), cpu.IRQ0 + HSEM2))
+    cpu.set_pending(core1(m), cpu.IRQ0 + HSEM2, false)
+    // A free of a semaphore the M4 has not enabled raises nothing there.
+    hw(m, core1(m), C2ICR, 1 << 4)
+    hw(m, core1(m), r(5), LOCK | M4 | 2)
+    hw(m, core1(m), r(5), M4 | 2)
+    assert(hr(m, core1(m), C2ISR) == 1 << 5 && hr(m, core1(m), C2MISR) == 0)
+    signal_hsem(s, core1(m))
+    assert(!cpu.exception_pending(core1(m), cpu.IRQ0 + HSEM2))
+    // Enabling a bit whose status is already set raises it: MISR follows IER as well as ISR.
+    hw(m, core0(m), C1IER, 1 << 5)
+    assert(hr(m, core0(m), C1MISR) == 1 << 5 && hr(m, core0(m), C1ISR) == (1 << 4) | (1 << 5))
+    signal_hsem(s, core0(m))
+    assert(cpu.exception_pending(core0(m), cpu.IRQ0 + HSEM1))
+    hw(m, core0(m), C1IER, 0)
+    assert(hr(m, core0(m), C1MISR) == 0 && hr(m, core0(m), C1ISR) == (1 << 4) | (1 << 5))
+    // Either core reaches both cores' registers.
+    hw(m, core0(m), C2IER, 0xA5A5A5A5)
+    assert(hr(m, core1(m), C2IER) == 0xA5A5A5A5 && hr(m, core1(m), C1IER) == 0)
+
+@test("HSEM: ICR clears the ISR bits written 1 in its own core's status only, and reads 0")
+hsem_icr_clears()
+    val board = disco()
+    val m = &*board
+    hw(m, core1(m), C2IER, 0xFF)
+    for n in 0u32..<8
+        hw(m, core0(m), r(n), LOCK | M7 | n)
+        hw(m, core0(m), r(n), M7 | n)
+    assert(hr(m, core0(m), C1ISR) == 0xFF && hr(m, core0(m), C2ISR) == 0xFF && hr(m, core0(m), C2MISR) == 0xFF)
+    hw(m, core1(m), C2ICR, 0x0F)
+    assert(hr(m, core0(m), C2ISR) == 0xF0 && hr(m, core0(m), C2MISR) == 0xF0 && hr(m, core0(m), C1ISR) == 0xFF)
+    assert(hr(m, core0(m), C2ICR) == 0 && hr(m, core0(m), C1ICR) == 0)
+    hw(m, core0(m), C1ICR, 0x81)
+    assert(hr(m, core0(m), C1ISR) == 0x7E && hr(m, core0(m), C2ISR) == 0xF0)
+    hw(m, core1(m), C2ICR, 0xFFFFFFFF)
+    assert(hr(m, core0(m), C2ISR) == 0 && hr(m, core0(m), C2MISR) == 0)
+    signal_hsem(&m.devices.hsem, core1(m))
+    assert(!cpu.exception_pending(core1(m), cpu.IRQ0 + HSEM2), "a cleared status raises nothing")
+    // ISR and MISR are read-only.
+    hw(m, core0(m), C1ISR, 0)
+    hw(m, core0(m), C1MISR, 0)
+    assert(hr(m, core0(m), C1ISR) == 0x7E)
+
+@test("HSEM CR: with KEYR's key, every semaphore of the COREID written is freed and reported; with another key, none")
+hsem_clear_by_core()
+    val board = disco()
+    val m = &*board
+    hw(m, core0(m), r(0), LOCK | M7 | 1)
+    hw(m, core0(m), r(3), LOCK | M7 | 2)
+    assert(hr(m, core0(m), rlr(6)) == LOCK | M7)
+    hw(m, core1(m), r(1), LOCK | M4 | 1)
+    assert(hr(m, core1(m), rlr(2)) == LOCK | M4)
+    hw(m, core1(m), KEYR, 0xBEEF1234)
+    assert(hr(m, core0(m), KEYR) == 0xBEEF0000, "KEYR holds KEY alone")
+    hw(m, core1(m), CR, 0xBEEE0000 | M7)
+    hw(m, core1(m), CR, M7)
+    assert(hr(m, core0(m), r(0)) == LOCK | M7 | 1 && hr(m, core0(m), r(3)) == LOCK | M7 | 2 && hr(m, core0(m), r(6)) == LOCK | M7)
+    assert(hr(m, core0(m), C1ISR) == 0 && hr(m, core0(m), C2ISR) == 0)
+    hw(m, core1(m), CR, 0xBEEF0000 | M7)
+    for n in [0u32, 3, 6] do assert(hr(m, core0(m), r(n)) == 0, s"semaphore $n freed")
+    assert(hr(m, core0(m), r(1)) == LOCK | M4 | 1 && hr(m, core0(m), r(2)) == LOCK | M4, "the M4's semaphores are left")
+    assert(hr(m, core0(m), C1ISR) == 0x49 && hr(m, core0(m), C2ISR) == 0x49)
+    assert(hr(m, core0(m), CR) == 0, "CR reads 0")
+    // The key from reset is 0, which a CR without a key matches.
+    boot(m, image_of(m, DISCO_GUEST).unwrap().view())
+    hw(m, core1(m), r(1), LOCK | M4 | 1)
+    hw(m, core0(m), CR, M4)
+    assert(hr(m, core0(m), r(1)) == 0 && hr(m, core0(m), C2ISR) == 2)
+
+@test("HSEM: a word is the only access; a byte or halfword faults, and an offset that is no register stops at Unmodelled, named")
+hsem_access_width()
+    val board = disco()
+    val m = &*board
+    board_read(m, core0(m), HSEM, 2, 0)
+    assert(core0(m).stop == cpu.Stop.Fault)
+    boot(m, image_of(m, DISCO_GUEST).unwrap().view())
+    board_write(m, core0(m), HSEM + 4, 1, 0x80, 0)
+    assert(core0(m).stop == cpu.Stop.Fault && hr(m, core1(m), r(1)) == 0)
+    boot(m, image_of(m, DISCO_GUEST).unwrap().view())
+    hr(m, core0(m), 0x120)
+    assert(core0(m).stop == cpu.Stop.Unmodelled && cpu.unmodelled_name(core0(m)) == "the STM32H7 HSEM + 0x120", cpu.unmodelled_name(core0(m)))
+    boot(m, image_of(m, DISCO_GUEST).unwrap().view())
+    hw(m, core0(m), 0x148, 0)
+    assert(core0(m).stop == cpu.Stop.Unmodelled && cpu.unmodelled_name(core0(m)) == "the STM32H7 HSEM + 0x148", cpu.unmodelled_name(core0(m)))
+
+// The doorbell's guests, in AXI SRAM, with the HSEM's base in r0 and C1IER's address in r4.
+// The M7 locks semaphore 0 (STR r1, [r0]) and frees it (STR r2, [r0]), ringing the M4, then waits
+// (WFI; B .-2). Its HSEM1 handler clears semaphore 1's status (STR r3, [r4, #4], C1ICR) and stops at
+// a breakpoint.
+private val M7_MAIN: [4]u16 = [0x6001, 0x6002, 0xBF30, 0xE7FD]
+private val M7_HSEM1: [2]u16 = [0x6063, 0xBE00]
+// The M4 waits (WFI; B .-2). Its HSEM2 handler clears semaphore 0's status (STR r3, [r4, #0x14],
+// C2ICR), rings back by locking and freeing semaphore 1 (STR r1, [r0, #4]; STR r2, [r0, #4]) and
+// returns (BX lr).
+private val M4_MAIN: [2]u16 = [0xBF30, 0xE7FD]
+private val M4_HSEM2: [4]u16 = [0x6163, 0x6041, 0x6042, 0x4770]
+
+private const M7_CODE: u32 = 0x24000100
+private const M7_HANDLER: u32 = 0x24000180
+private const M4_CODE: u32 = 0x24000200
+private const M4_HANDLER: u32 = 0x24000280
+private const M7_VECTORS: u32 = 0x24002000
+private const M4_VECTORS: u32 = 0x24003000
+private const NVIC_ISER3: u32 = 0xE000E10C
+
+private place(c: *cpu.Cpu, at: u32, code: []const u16)
+    for i in 0..<code.len do cpu.store16(c, at + u32(i) * 2, code[i])
+
+// The DISCO with the doorbell's guests in place: the M7 at its code, the M4 launched at its own, each
+// with its HSEM interrupt enabled in its NVIC and its IER (the M7 semaphore 1, the M4 semaphore 0).
+private doorbell(m: *Machine)
+    assert(board_named(m, "stm32h747-disco").is_ok())
+    boot(m, image_of(m, DISCO_GUEST).unwrap().view())
+    val c = core0(m)
+    place(c, M7_CODE, M7_MAIN[..])
+    place(c, M7_HANDLER, M7_HSEM1[..])
+    place(c, M4_CODE, M4_MAIN[..])
+    place(c, M4_HANDLER, M4_HSEM2[..])
+    cpu.store32(c, M7_VECTORS + (16 + HSEM1) * 4, M7_HANDLER | 1)
+    cpu.store32(c, M4_VECTORS + (16 + HSEM2) * 4, M4_HANDLER | 1)
+    launch(m, M4_VECTORS, 0x24070000, M4_CODE | 1)
+    c.vtor = M7_VECTORS
+    c.pc = M7_CODE
+    val d = core1(m)
+    for (k, lock, irq) in [(c, M7, HSEM1), (d, M4, HSEM2)]
+        k.r[0] = HSEM
+        k.r[1] = LOCK | lock
+        k.r[2] = lock
+        k.r[4] = HSEM + C1IER
+        cpu.store32(k, NVIC_ISER3, 1 << (irq - 96))
+    c.r[3] = 2
+    d.r[3] = 1
+    hw(m, c, C1IER, 2)
+    hw(m, d, C2IER, 1)
+
+// What the doorbell leaves: the M7 at its breakpoint in its handler, both semaphores free, and each
+// core's own status cleared of the bit that rang it.
+private rang(m: *Machine) -> bool
+    val c = core0(m)
+    assert(c.stop == cpu.Stop.Breakpoint, stop_message(c))
+    assert(c.pc == M7_HANDLER + 2, s"${c.pc}")
+    assert(core1(m).stop == cpu.Stop.Running && core1(m).retired > 0)
+    assert(hr(m, c, r(0)) == 0 && hr(m, c, r(1)) == 0)
+    // The M7's own free left bit 0 in its status, the M4's bit 1 in the M4's.
+    assert(hr(m, c, C1ISR) == 1 && hr(m, c, C2ISR) == 2, s"${hr(m, c, C1ISR)} ${hr(m, c, C2ISR)}")
+    hr(m, c, C1MISR) == 0 && hr(m, c, C2MISR) == 0
+
+@test("HSEM doorbell on the DISCO: the M7 frees a semaphore, the M4's HSEM2 rings it back through another, the M7's HSEM1 takes it")
+hsem_doorbell_round_trip()
+    val board = machine()
+    val m = &*board
+    doorbell(m)
+    run_board(m)
+    assert(rang(m))
+    // The same round trip with each core on a thread of its own.
+    doorbell(m)
+    set_threads(m)
+    run_board(m)
+    assert(rang(m))
+
+@test("HSEM across threads: a free cuts the other core's run and latches no pend there, so an interrupt its handler has answered is not taken twice")
+hsem_threaded_free_is_a_level()
+    val board = disco()
+    val m = &*board
+    val (c, d) = (core0(m), core1(m))
+    m.scheduler.threaded = true
+    hw(m, d, C2IER, 1)
+    d.limit = 1000
+    hw(m, c, r(0), LOCK | M7)
+    hw(m, c, r(0), M7)
+    // The M4 is sent back to look at its devices, and nothing is latched for it to take regardless.
+    assert(d.limit == 0, "the M4's run is cut")
+    assert(d.incoming_banks == 0, "no bank latched")
+    for w in d.incoming do assert(w == 0, "no IRQ latched in the M4")
+    assert(hsem_raising(&m.devices.hsem, d), "HSEM2 is high while C2MISR is not 0")
+    // Its handler answers it: the line falls, and nothing rings again.
+    hw(m, d, C2ICR, 1)
+    assert(!hsem_raising(&m.devices.hsem, d), "HSEM2 falls with C2ISR cleared")
+    cpu.take_incoming(d)
+    for w in d.incoming do assert(w == 0)
+    // The M7's own IER is clear: its run is left alone.
+    assert(!hsem_raising(&m.devices.hsem, c))
+    m.scheduler.threaded = false
+
+// Two cores' threads contending for semaphore 0 with both locks, each critical section marked by a
+// swap of `inside`: a second core finding it set is an overlap. `count` is a plain counter that only a
+// holder increments, so a lost update shows two holders too.
+private struct Race
+    m: *Machine
+    inside: u32
+    overlaps: u32
+    count: u64
+    wins: [2]u64
+
+private const ROUNDS: u32 = 200000
+
+private race(r: *Race, c: *cpu.Cpu)
+    val s = &r.m.devices.hsem
+    val k = usize(c.core)
+    val id = HSEM_COREIDS[k] << 8
+    for i in 0..<ROUNDS
+        // Even rounds take the 2-step lock with PROCID 1, odd rounds the 1-step lock.
+        val procid = if i & 1 == 0 then 1u32 else 0
+        var won = false
+        if procid == 1
+            hsem_write(r.m, s, c, HSEM, 0, 4, LOCK | id | 1)
+            won = hsem_read(s, c, HSEM, 0, 4) == LOCK | id | 1
+        else
+            won = hsem_read(s, c, HSEM + 0x80, 0x80, 4) == LOCK | id
+        if !won then continue
+        if atomic_swap(&r.inside, 1, SeqCst) != 0 then atomic_add(&r.overlaps, 1, SeqCst)
+        r.count += 1
+        r.wins[k] += 1
+        atomic_store(&r.inside, 0, SeqCst)
+        hsem_write(r.m, s, c, HSEM, 0, 4, id | procid)
+
+@test("HSEM: two cores' threads racing both locks for one semaphore never both hold it")
+hsem_two_thread_race()
+    val board = disco()
+    val m = &*board
+    var state = Race(m, 0, 0, 0, [0, 0])
+    val p = &state
+    scope((s) ->
+        s.spawn(() -> race(p, core1(m)))
+        race(p, core0(m)))
+    assert(state.overlaps == 0, s"${state.overlaps} overlapping holds")
+    assert(state.count == state.wins[0] + state.wins[1], s"${state.count} counted, ${state.wins[0]} + ${state.wins[1]} won")
+    assert(state.wins[0] > 0 && state.wins[1] > 0)
+    assert(hr(m, core0(m), r(0)) == 0, "every hold was freed")
+    assert(core0(m).stop == cpu.Stop.Running && core1(m).stop == cpu.Stop.Running)
