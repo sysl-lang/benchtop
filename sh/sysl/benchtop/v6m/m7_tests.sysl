@@ -53,7 +53,7 @@ m7_architecture_boundary()
                 assert(c.r[0] == 0 && c.r[2] == 9 && load32(&c, 0x1000) == 42, "rejection changes no registers or data")
 end m7_architecture_boundary
 
-@test("M7 CPUID is read-only and CCR preserves fixed bits while masking absent caches and reserved fields")
+@test("M7 CPUID is read-only and CCR preserves fixed bits while masking reserved fields")
 m7_system()
     var c: Cpu
     c.kind = Kind.V7emM7
@@ -63,7 +63,7 @@ m7_system()
     assert(load32(&c, SCB_CPUID) == 0x410FC270, "identity cannot be overwritten")
     assert(load32(&c, SCB_CCR) == 0x40200, "BP and STKALIGN reset set")
     store32(&c, SCB_CCR, 0xFFFFFFFF)
-    assert(load32(&c, SCB_CCR) == 0x4031B, "only implemented fields")
+    assert(load32(&c, SCB_CCR) == 0x7031B, "only implemented fields, the cache enables among them")
     store32(&c, SCB_CCR, 0)
     assert(load32(&c, SCB_CCR) == 0x40200, "BP and STKALIGN cannot clear; NONBASETHRDENA can")
     store32(&c, NVIC_IPR, 0xFFFFFFFF)
@@ -91,3 +91,136 @@ m7_exceptions()
     c = run_both_thumb2(Kind.V7emM7, [0xE851, 0x0F00, SVC, 0xE841, 0x0200, BKPT, BX_LR], [0, 0x1000, 9], 0, [[SVCALL, 12]], &nothing)
     assert(c.stop == Stop.Breakpoint && c.r[2] == 1 && c.ipsr == 0, "SVC invalidates exclusive monitor")
 end m7_exceptions
+
+val CACHE_MAINTENANCE: [10]u32 = [
+    0xE000EF50, 0xE000EF58, 0xE000EF5C, 0xE000EF60, 0xE000EF64,
+    0xE000EF68, 0xE000EF6C, 0xE000EF70, 0xE000EF74, 0xE000EF78,
+]
+
+m7_core() -> Cpu
+    var c: Cpu
+    c.kind = Kind.V7emM7
+    reset(&c, test_memory, [], 0)
+    c
+
+@test("M7 accepts every cache maintenance write and reads each as zero, and the run continues")
+m7_cache_maintenance()
+    var c = m7_core()
+    for a in CACHE_MAINTENANCE
+        store32(&c, a, 0xFFFFFFFF)
+        assert(c.stop == Stop.Running, "the write is accepted")
+        assert(load32(&c, a) == 0 && c.stop == Stop.Running, "the read gives 0")
+        store32(&c, a, 0)
+        assert(c.stop == Stop.Running, "a zero operand is accepted too")
+    end for
+    // The address between ICIALLU and ICIMVAU is no register.
+    store32(&c, 0xE000EF54, 0)
+    assert(c.stop == Stop.Unmapped, "reserved space next to the operations is still reserved")
+end m7_cache_maintenance
+
+@test("M7 CLIDR, CTR and CCSIDR describe the 16 KB L1 caches, CCSIDR by CSSELR, and are read-only")
+m7_cache_identification()
+    var c = m7_core()
+    assert(load32(&c, 0xE000ED78) == 0x09000003, "CLIDR")
+    assert(load32(&c, 0xE000ED7C) == 0x8303C003, "CTR")
+    assert(load32(&c, 0xE000ED84) == 0, "CSSELR resets to the data cache")
+    assert(load32(&c, 0xE000ED80) == 0xF00FE019, "CCSIDR of the D-cache: 128 sets, 4 ways, 32-byte lines")
+    store32(&c, 0xE000ED84, 1)
+    assert(load32(&c, 0xE000ED84) == 1 && load32(&c, 0xE000ED80) == 0x200FE019, "CCSIDR of the I-cache")
+    store32(&c, 0xE000ED84, 0xFFFFFFFE)
+    assert(load32(&c, 0xE000ED84) == 0 && load32(&c, 0xE000ED80) == 0xF00FE019, "only InD is kept; level 0")
+    store32(&c, 0xE000ED78, 0)
+    store32(&c, 0xE000ED7C, 0)
+    store32(&c, 0xE000ED80, 0)
+    assert(load32(&c, 0xE000ED78) == 0x09000003 && load32(&c, 0xE000ED7C) == 0x8303C003, "read-only")
+    assert(load32(&c, 0xE000ED80) == 0xF00FE019 && c.stop == Stop.Running, "read-only")
+
+    // The geometry in CCSIDR is 16 KB: (sets) * (ways) * (4 * 2^(LineSize + 2)) bytes.
+    val geometries: [2]u32 = [0xF00FE019, 0x200FE019]
+    for ccsidr in geometries
+        val sets = ((ccsidr >> 13) & 0x7FFF) + 1
+        val ways = ((ccsidr >> 3) & 0x3FF) + 1
+        val line = 4 << ((ccsidr & 7) + 2)
+        assert(sets * ways * line == 16384 && line == 32, "16 KB, 32-byte lines")
+    end for
+end m7_cache_identification
+
+@test("M7 CCR.IC and CCR.DC read back and clear")
+m7_cache_enables()
+    var c = m7_core()
+    assert(load32(&c, SCB_CCR) & 0x30000 == 0, "caches off at reset")
+    store32(&c, SCB_CCR, load32(&c, SCB_CCR) | 0x10000)
+    assert(load32(&c, SCB_CCR) == 0x50200, "DC")
+    store32(&c, SCB_CCR, load32(&c, SCB_CCR) | 0x20000)
+    assert(load32(&c, SCB_CCR) == 0x70200, "IC and DC")
+    store32(&c, SCB_CCR, load32(&c, SCB_CCR) & ~0x10000)
+    assert(load32(&c, SCB_CCR) == 0x60200, "IC alone")
+    store32(&c, SCB_CCR, 0)
+    assert(load32(&c, SCB_CCR) == 0x40200, "both clear")
+end m7_cache_enables
+
+// CMSIS's SCB_CleanInvalidateDCache and SCB_EnableDCache loops, then SCB_EnableICache, hand-assembled.
+// r1 = CCSIDR, r2 = the set/way operation (DCCISW or DCISW), r5 = CSSELR, r8 = CCR, r9 = CCR.IC|DC,
+// r10 = ICIALLU. The loops run CCSIDR's 128 sets by 4 ways: 4 + 128 * (1 + 4 * 6 + 2) instructions,
+// then 8 for the enables, so the count is right only if CCSIDR is.
+@test("M7 runs the CMSIS data cache clean-and-invalidate and enable sequences to completion")
+m7_cmsis_cache_sequence()
+    val code: [23]u16 = [
+        0x2300,         // movs r3, #0
+        0x602B,         // str r3, [r5]            CSSELR = 0
+        0x680B,         // ldr r3, [r1]            CCSIDR
+        0xF3C3, 0x344E, // ubfx r4, r3, #13, #15   sets - 1
+        0xF3C3, 0x06C9, // ubfx r6, r3, #3, #10    ways - 1
+        0x0167,         // lsls r7, r4, #5
+        0x07B0,         // lsls r0, r6, #30
+        0x4307,         // orrs r7, r0
+        0x6017,         // str r7, [r2]            DCCISW / DCISW
+        0x3E01,         // subs r6, #1
+        0xD5F9,         // bpl  way loop
+        0x3C01,         // subs r4, #1
+        0xD5F5,         // bpl  set loop
+        0x4646,         // mov r6, r8
+        0x6837,         // ldr r7, [r6]            CCR
+        0x464C,         // mov r4, r9
+        0x4327,         // orrs r7, r4
+        0x6037,         // str r7, [r6]            CCR |= IC | DC
+        0x4656,         // mov r6, r10
+        0x6034,         // str r4, [r6]            ICIALLU
+        0x6830,         // ldr r0, [r6]            reads 0
+    ]
+
+    val ops: [2]u32 = [0xE000EF74, 0xE000EF60]
+    for op in ops
+        val regs: [11]u32 = [7, 0xE000ED80, op, 0, 0, 0xE000ED84, 0, 0, 0xE000ED14, 0x30000, 0xE000EF50]
+        val c = execute_thumb2(Kind.V7emM7, code, regs, 0, [])
+        assert(c.stop == Stop.Breakpoint && c.retired == 3468, s"the loops end: ${c.stop} after ${c.retired}")
+        assert(c.r[0] == 0 && c.r[6] == 0xE000EF50, "ICIALLU reads 0")
+        var d = c
+        assert(load32(&d, SCB_CCR) == 0x70200, "the caches are enabled")
+    end for
+end m7_cmsis_cache_sequence
+
+@test("the same addresses on the M4 and M33 act as any other reserved system space does")
+non_m7_cache_addresses()
+    for kind in [Kind.V7em, Kind.V8mMain, Kind.M3]
+        var base: Cpu
+        base.kind = kind
+        reset(&base, test_memory, [], 0)
+        load32(&base, 0xE000EFA0)
+        val reserved = base.stop
+
+        val probes: [8]u32 = [0xE000ED78, 0xE000ED7C, 0xE000ED80, 0xE000ED84, 0xE000EF50, 0xE000EF5C, 0xE000EF74, 0xE000EF78]
+        for a in probes
+            var r: Cpu
+            r.kind = kind
+            reset(&r, test_memory, [], 0)
+            load32(&r, a)
+            assert(r.stop == reserved, "a read is what reserved space gives")
+            var w: Cpu
+            w.kind = kind
+            reset(&w, test_memory, [], 0)
+            store32(&w, a, 0)
+            assert(w.stop == reserved, "a write is what reserved space gives")
+        end for
+    end for
+end non_m7_cache_addresses
