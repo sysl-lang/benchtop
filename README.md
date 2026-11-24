@@ -1175,7 +1175,7 @@ IRQ 125, to the M7; HSEM2, IRQ 126, to the M4) behind its `IER`/`ICR`/`ISR`/`MIS
 ID with `KEYR`'s key. A lock is atomic across the cores' host threads.
 
 This is a runnable subset, not complete Discovery emulation: LTDC/video mode,
-DMA2D, remaining codec modes, the remaining RAM banks, external memory, full RCC/PWR and
+DMA2D, remaining codec modes, the remaining RAM banks, external memory, full RCC, PWR's low-power modes and
 panel-specific vendor initialization are still missing. I2C4 is a functional
 polling adapter, without SCL timing or interrupts. See
 [the hardware target and supported subset](docs/stm32h747i-disco.md).

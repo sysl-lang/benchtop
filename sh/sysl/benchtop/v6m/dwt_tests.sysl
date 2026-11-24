@@ -1,0 +1,278 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// DEMCR and the DWT (dwt.sysl): CYCCNT counting the core's cycles from the CMSIS sequence, freezing,
+// re-basing and wrapping; TRCENA; each core's own counter; the M7's lock; the registers' reset values;
+// and ARMv6-M, which has none of it.
+
+const DWT_CTRL: u32 = 0xE0001000
+const DWT_CYCCNT: u32 = 0xE0001004
+const DWT_LAR: u32 = 0xE0001FB0
+const DWT_LSR: u32 = 0xE0001FB4
+
+val DWT_KINDS: [8]Kind = [Kind.M3, Kind.V7em, Kind.V7emM7, Kind.V8mMain, Kind.M35p, Kind.M52, Kind.M55, Kind.M85]
+
+// CMSIS's `DWT->LAR = 0xC5ACCE55; CoreDebug->DEMCR |= TRCENA; DWT->CYCCNT = 0; DWT->CTRL |= 1;`, a loop
+// of r4 times `subs; bne`, and a read of CYCCNT into r0. r1 = DEMCR, r2 = DWT_CTRL, r3 = TRCENA,
+// r6 = DWT_LAR, r7 = the key. The count runs from the store that enables it to the load that reads it:
+// that store, and the loop's two instructions r4 times.
+val CMSIS: [13]u16 = [
+    0x6037, // str r7, [r6]        DWT->LAR = key
+    0x6808, // ldr r0, [r1]        DEMCR
+    0x4318, // orrs r0, r3
+    0x6008, // str r0, [r1]        DEMCR |= TRCENA
+    0x2000, // movs r0, #0
+    0x6050, // str r0, [r2, #4]    CYCCNT = 0
+    0x6810, // ldr r0, [r2]        CTRL
+    0x2501, // movs r5, #1
+    0x4328, // orrs r0, r5
+    0x6010, // str r0, [r2]        CTRL |= CYCCNTENA
+    0x3C01, // subs r4, #1
+    0xD1FD, // bne the subs
+    0x6850, // ldr r0, [r2, #4]    CYCCNT
+]
+
+cmsis_regs(loops: u32) -> [8]u32 = [0, DEMCR, DWT_CTRL, DEMCR_TRCENA, loops, 0, DWT_LAR, DWT_UNLOCK]
+
+core_of(kind: Kind) -> Cpu
+    var c: Cpu
+    c.kind = kind
+    reset(&c, test_memory, [], 0)
+    c
+
+// The CMSIS sequence on `kind`, timed or not, under `exec`: what it read, and the cycles the core counted.
+cmsis_timed(kind: Kind, loops: u32, timed: bool, exec: Exec) -> (u32, u64)
+    var c: Cpu
+    c.kind = kind
+    val regs = cmsis_regs(loops)
+    prepare(&c, CMSIS[..], regs[..], 0, [])
+    configure_instruction_timing(&c, timed)
+    finish(&c, exec)
+    assert(c.stop == Stop.Breakpoint, s"${c.stop}")
+    (c.r[0], cycles(&c))
+
+@test("DWT: CMSIS's TRCENA, CYCCNT = 0, CYCCNTENA sequence counts the loop's cycles on every Mainline core, under both executors")
+dwt_cmsis_sequence()
+    for kind in DWT_KINDS
+        for loops in [1u32, 100, 1000]
+            val regs = cmsis_regs(loops)
+            var c = execute_thumb2(kind, CMSIS[..], regs[..], 0, [])
+            assert(c.stop == Stop.Breakpoint, s"$kind: ${c.stop}")
+            assert(c.r[0] == 1 + 2 * loops, s"$kind: CYCCNT read ${c.r[0]} after $loops loops")
+            assert(load32(&c, DEMCR) == DEMCR_TRCENA && load32(&c, DWT_CTRL) == 0x40000001, s"$kind: TRCENA and CYCCNTENA read back")
+        end for
+    end for
+
+@test("DWT: with instruction timing, CYCCNT counts exactly the cycles the core counts, under both executors")
+dwt_cmsis_timed()
+    for kind in [Kind.M3, Kind.V7em, Kind.V7emM7, Kind.V8mMain]
+        for exec in [&run_match, &run_threaded]
+            val short = cmsis_timed(kind, 100, true, exec)
+            val long = cmsis_timed(kind, 300, true, exec)
+            assert(u64(long.0 - short.0) == long.1 - short.1, s"$kind: CYCCNT moved ${long.0 - short.0}, the core ${long.1 - short.1}")
+            assert(long.0 > 601, "timed, the loop costs more than one cycle an instruction")
+            val untimed = cmsis_timed(kind, 300, false, exec)
+            assert(untimed.0 == 601, "untimed, one cycle each")
+        end for
+    end for
+
+@test("DWT: CYCCNTENA cleared freezes CYCCNT, set again resumes from there; a write re-bases it; it wraps at 32 bits")
+dwt_freeze_rebase_wrap()
+    for kind in DWT_KINDS
+        var c = core_of(kind)
+        store32(&c, DWT_LAR, DWT_UNLOCK)
+        store32(&c, DEMCR, DEMCR_TRCENA)
+        assert(load32(&c, DWT_CYCCNT) == 0, "reset value 0")
+        c.retired += 50
+        assert(load32(&c, DWT_CYCCNT) == 0, "TRCENA alone does not count")
+        store32(&c, DWT_CTRL, 1)
+        c.retired += 40
+        assert(load32(&c, DWT_CYCCNT) == 40, "counts from the enable")
+        store32(&c, DWT_CTRL, 0)
+        c.retired += 1000
+        assert(load32(&c, DWT_CYCCNT) == 40 && load32(&c, DWT_CTRL) == 0x40000000, "frozen while disabled")
+        store32(&c, DWT_CTRL, 1)
+        c.retired += 7
+        assert(load32(&c, DWT_CYCCNT) == 47, "resumes where it froze")
+        store32(&c, DWT_CYCCNT, 1000)
+        assert(load32(&c, DWT_CYCCNT) == 1000, "a write takes at once")
+        c.retired += 5
+        assert(load32(&c, DWT_CYCCNT) == 1005, "and counts on from what was written")
+        store32(&c, DWT_CTRL, 0)
+        store32(&c, DWT_CYCCNT, 9)
+        c.retired += 100
+        assert(load32(&c, DWT_CYCCNT) == 9, "written while frozen, it stays")
+        store32(&c, DWT_CTRL, 1)
+        store32(&c, DWT_CYCCNT, 0xFFFFFFF0)
+        c.retired += 0x20
+        assert(load32(&c, DWT_CYCCNT) == 0x10, "wraps at 32 bits")
+        c.retired += 0x1_0000_0000
+        assert(load32(&c, DWT_CYCCNT) == 0x10, "a whole 2^32 cycles later it reads the same")
+        // Sleeping cycles count: the DWT's clock runs while the core sleeps.
+        c.slept += 25
+        assert(load32(&c, DWT_CYCCNT) == 0x10 + 25, "the cycles slept count")
+        assert(c.stop == Stop.Running, "nothing stopped")
+    end for
+
+@test("DWT: TRCENA cleared stops CYCCNT whatever CYCCNTENA says, and set again resumes it; DEMCR keeps its other bits")
+dwt_trcena()
+    for kind in DWT_KINDS
+        var c = core_of(kind)
+        store32(&c, DWT_LAR, DWT_UNLOCK)
+        store32(&c, DWT_CTRL, 1)
+        c.retired += 30
+        assert(load32(&c, DWT_CYCCNT) == 0, "CYCCNTENA alone does not count")
+        store32(&c, DEMCR, DEMCR_TRCENA)
+        c.retired += 30
+        assert(load32(&c, DWT_CYCCNT) == 30, "both set: counting")
+        store32(&c, DEMCR, 0)
+        c.retired += 500
+        assert(load32(&c, DWT_CYCCNT) == 30 && load32(&c, DWT_CTRL) == 0x40000001, "TRCENA off stops it")
+        store32(&c, DWT_CYCCNT, 3)
+        assert(load32(&c, DWT_CYCCNT) == 3, "written with TRCENA off")
+        store32(&c, DEMCR, DEMCR_TRCENA)
+        c.retired += 4
+        assert(load32(&c, DWT_CYCCNT) == 7, "resumes")
+        store32(&c, DEMCR, 0xFFFFFFFF)
+        val bits: u32 = if c.security then 0x010F0FF1 else 0x010F07F1
+        assert(load32(&c, DEMCR) == bits, s"$kind: DEMCR keeps the vector catches, the monitor bits and TRCENA")
+        assert(c.stop == Stop.Running)
+    end for
+
+@test("DWT: each core of a two-core board has its own CYCCNT, DEMCR and lock: the DISCO's M7 and M4, the RP2350's two M33s")
+dwt_per_core()
+    for pair in [(Kind.V7emM7, Kind.V7em), (Kind.V8mMain, Kind.V8mMain)]
+        var a = core_of(pair.0)
+        var b = core_of(pair.1)
+        b.core = 1
+        store32(&a, DWT_LAR, DWT_UNLOCK)
+        store32(&a, DEMCR, DEMCR_TRCENA)
+        store32(&a, DWT_CTRL, 1)
+        a.retired += 100
+        b.retired += 100
+        assert(load32(&a, DWT_CYCCNT) == 100 && load32(&b, DWT_CYCCNT) == 0, "only the enabled core counts")
+        assert(load32(&b, DEMCR) == 0 && load32(&b, DWT_CTRL) == 0x40000000, "the other's DEMCR and CTRL are its own")
+        store32(&b, DWT_LAR, DWT_UNLOCK)
+        store32(&b, DEMCR, DEMCR_TRCENA)
+        store32(&b, DWT_CTRL, 1)
+        store32(&b, DWT_CYCCNT, 5000)
+        a.retired += 10
+        b.retired += 3
+        assert(load32(&a, DWT_CYCCNT) == 110 && load32(&b, DWT_CYCCNT) == 5003, "each counts its own cycles from its own value")
+        store32(&a, DWT_CTRL, 0)
+        a.retired += 10
+        b.retired += 10
+        assert(load32(&a, DWT_CYCCNT) == 110 && load32(&b, DWT_CYCCNT) == 5013, "disabling one leaves the other counting")
+    end for
+
+@test("DWT: the M7's lock is locked at reset and ignores writes until LAR takes the key; another value locks it again; the M4 and M33 have none")
+dwt_m7_lock()
+    var c = core_of(Kind.V7emM7)
+    assert(load32(&c, DWT_LSR) == 3, "SLI and SLK: present and locked")
+    store32(&c, DEMCR, DEMCR_TRCENA)
+    store32(&c, DWT_CTRL, 1)
+    store32(&c, DWT_CYCCNT, 77)
+    store32(&c, 0xE0001020, 0x1234)
+    c.retired += 50
+    assert(load32(&c, DWT_CTRL) == 0x40000000 && load32(&c, DWT_CYCCNT) == 0, "locked: CTRL and CYCCNT ignore writes")
+    assert(load32(&c, 0xE0001020) == 0 && load32(&c, DEMCR) == DEMCR_TRCENA, "and the comparators; DEMCR is not the DWT's")
+    store32(&c, DWT_LAR, DWT_UNLOCK)
+    assert(load32(&c, DWT_LSR) == 1 && load32(&c, DWT_LAR) == 0, "unlocked; LAR is write-only")
+    store32(&c, DWT_CTRL, 1)
+    c.retired += 50
+    assert(load32(&c, DWT_CYCCNT) == 50, "counts once unlocked")
+    store32(&c, DWT_LAR, 0)
+    assert(load32(&c, DWT_LSR) == 3, "any other value locks it")
+    c.retired += 10
+    store32(&c, DWT_CTRL, 0)
+    store32(&c, DWT_CYCCNT, 0)
+    assert(load32(&c, DWT_CYCCNT) == 60, "locked again: the counter runs on, and the writes that would stop or clear it are ignored")
+    store32(&c, DWT_LAR, DWT_UNLOCK + 1)
+    assert(load32(&c, DWT_LSR) == 3, "a near-miss key does not unlock")
+    assert(c.stop == Stop.Running)
+
+    for kind in [Kind.M3, Kind.V7em, Kind.V8mMain, Kind.M55]
+        var d = core_of(kind)
+        assert(load32(&d, DWT_LSR) == 0, s"$kind: no lock")
+        store32(&d, DWT_CTRL, 1)
+        assert(load32(&d, DWT_CTRL) == 0x40000001, s"$kind: writes take without a key")
+        store32(&d, DWT_LAR, 0)
+        store32(&d, DWT_CTRL, 0)
+        assert(load32(&d, DWT_CTRL) == 0x40000000 && load32(&d, DWT_LSR) == 0, s"$kind: LAR does nothing")
+
+@test("DWT: the identification registers, CTRL's fixed fields, the comparators and counters stored without effect, a reset clearing them")
+dwt_registers()
+    for kind in DWT_KINDS
+        var c = core_of(kind)
+        val v8 = !is_v7m(kind)
+        assert(load32(&c, DWT_CTRL) == 0x40000000, "NUMCOMP 4; NOTRCPKT, NOEXTTRIG, NOCYCCNT, NOPRFCNT clear")
+        val ids: [12]u32 = if v8 then [0x04, 0, 0, 0, 0x21, 0xBD, 0x0B, 0, 0x0D, 0x90, 0x05, 0xB1] else [0x04, 0, 0, 0, 0x02, 0xB0, 0x3B, 0, 0x0D, 0xE0, 0x05, 0xB1]
+        for i in 0..<12 do assert(load32(&c, 0xE0001FD0 + u32(i) * 4) == ids[i], s"$kind: ID register $i")
+        store32(&c, DWT_LAR, DWT_UNLOCK)
+        store32(&c, 0xE0001FD0, 0)
+        assert(load32(&c, 0xE0001FD0) == 4, "read-only")
+        store32(&c, DWT_CTRL, 0xFFFFFFFF)
+        assert(load32(&c, DWT_CTRL) == (if v8 then 0x40FF1FFF else 0x407F1FFF), s"$kind: the writable bits")
+        store32(&c, DWT_CTRL, 0)
+        for k in 0u32..<4
+            store32(&c, 0xE0001020 + k * 16, 0x20000100 + k)
+            store32(&c, 0xE0001028 + k * 16, 0xFFFFFFFF)
+            assert(load32(&c, 0xE0001020 + k * 16) == 0x20000100 + k, "COMP stored")
+            val ids8: [4]u32 = [0x58000000, 0x88000000, 0x50000000, 0x20000000]
+            val function: u32 = if v8 then ids8[k] | 0xC3F else 0x000FFDAF
+            assert(load32(&c, 0xE0001028 + k * 16) == function, s"$kind: FUNCTION$k")
+            if !v8
+                store32(&c, 0xE0001024 + k * 16, 0xFFFFFFFF)
+                assert(load32(&c, 0xE0001024 + k * 16) == 0x1F, "MASK")
+        end for
+        for k in 0u32..<5
+            store32(&c, 0xE0001008 + k * 4, 0x1FF)
+            assert(load32(&c, 0xE0001008 + k * 4) == 0xFF, "an 8-bit profiling counter, stored")
+        if v8 then assert(load32(&c, 0xE0001FBC) == 0x47701A02 && load32(&c, 0xE0001FCC) == 0, "DEVARCH, DEVTYPE")
+        assert(c.stop == Stop.Running, s"$kind: ${c.stop}")
+        store32(&c, DEMCR, DEMCR_TRCENA)
+        store32(&c, DWT_CTRL, 1)
+        c.retired += 9
+        clear(&c, 0)
+        assert(load32(&c, DEMCR) == 0 && load32(&c, DWT_CTRL) == 0x40000000 && load32(&c, DWT_CYCCNT) == 0, "a reset clears them")
+        assert(load32(&c, 0xE0001020) == 0 && load32(&c, 0xE0001008) == 0, "and the stored ones")
+        assert(load32(&c, DWT_LSR) == (if kind == Kind.V7emM7 then 3u32 else 0), "and locks the M7's again")
+    end for
+
+@test("DWT: PCSR, a halfword, an unaligned word and a reserved offset stop at Unmodelled by name; v8-M has no MASK")
+dwt_unmodelled_accesses()
+    for probe in [(Kind.V7em, 0xE000101Cu32, 4u32), (Kind.V7emM7, 0xE0001004, 2), (Kind.V8mMain, 0xE0001006, 4), (Kind.M3, 0xE0001060, 4), (Kind.V8mMain, 0xE0001024, 4), (Kind.V7em, 0xE0001FBC, 4)]
+        var c = core_of(probe.0)
+        if probe.2 == 2 then load16(&c, probe.1) else load32(&c, probe.1)
+        assert(c.stop == Stop.Unmodelled && c.stop_at == probe.1, s"${probe.0} 0x${probe.1}%x: ${c.stop}")
+        assert(unmodelled_name(&c) == f"the DWT + 0x${probe.1 - DWT_CTRL}%03x", unmodelled_name(&c))
+        var w = core_of(probe.0)
+        store32(&w, probe.1 & ~3, 0)
+        if probe.2 == 4 && probe.1 & 3 == 0 then assert(w.stop == Stop.Unmodelled, "a write too")
+
+@test("DWT: ARMv6-M and ARMv8-M Baseline are as they were: DEMCR stops at Unmodelled, and the DWT's addresses are the board's as the FPB's are")
+dwt_absent_on_baseline()
+    for kind in [Kind.M0, Kind.M1, Kind.V6m, Kind.M23]
+        var d = core_of(kind)
+        load32(&d, DEMCR)
+        assert(d.stop == Stop.Unmodelled && d.stop_at == DEMCR && unmodelled_name(&d) == "the system control space + 0xdfc", s"$kind: DEMCR read")
+        var e = core_of(kind)
+        store32(&e, DEMCR, DEMCR_TRCENA)
+        assert(e.stop == Stop.Unmodelled && e.stop_at == DEMCR, s"$kind: DEMCR write")
+
+        // An address past the DWT, which no core models, is the reference.
+        var base = core_of(kind)
+        load32(&base, 0xE0002000)
+        val read_stop = base.stop
+        var base_w = core_of(kind)
+        store32(&base_w, 0xE0002000, 1)
+        val write_stop = base_w.stop
+        for a in [DWT_CTRL, DWT_CYCCNT, DWT_LAR, DWT_LSR, 0xE0001FD0]
+            var r = core_of(kind)
+            load32(&r, a)
+            assert(r.stop == read_stop && (r.stop == Stop.Running || r.stop_at == a), s"$kind 0x$a%x: a read is the board's (${r.stop})")
+            var w = core_of(kind)
+            store32(&w, a, 1)
+            assert(w.stop == write_stop, s"$kind 0x$a%x: a write is the board's")
+        end for
+    end for

@@ -1,0 +1,214 @@
+module sh.sysl.benchtop.peripheral.stm32_pwr
+
+import sh.sysl.benchtop.peripheral.Model
+import sh.sysl.benchtop.timing.NEVER
+import sh.sysl.stm32h747.pwr as reg
+
+// The STM32H745/747's power controller, PWR (RM0399 §7): its registers, the supply configuration in
+// CR3 that the first write after power-on latches, the voltage-scaling handshake (D3CR's VOS and
+// VOSRDY, CSR1's ACTVOS and ACTVOSRDY), and each core's low-power flags in CPU1CR and CPU2CR.
+//
+// Time is the board clock. A regulator change (a latched supply configuration, a new VOS) settles
+// `settle` ticks after the write that asked for it, so a driver that polls a ready bit sees it clear
+// first and set later.
+//
+// What the board's hardware is wired for is `supply`. A latched configuration that the wiring cannot
+// run never reaches ACTVOSRDY, as on silicon, where it would leave the core supply invalid; a
+// combination the reference manual does not list is not written at all, and also locks CR3.
+//
+// Divergences from the silicon (policy: docs/peripheral-models.md):
+// - No low-power mode is entered, so STOPF, SBF, SBF_D1, SBF_D2, HOLD1F/HOLD2F and the wake-up pin
+//   flags never set; the bits are stored and cleared as the manual says.
+// - The monitors report a healthy board: PVDO, AVDO, VBATL/H and TEMPL/H read 0, BRRDY follows BREN,
+//   USB33RDY follows USB33DEN.
+// - VOS0 needs SYSCFG_PWRCR.ODEN, which no model has, so the scale is never above 1.
+
+// The generated package is ST's single-core H743 SVD: these are the dual-core SMPS parts' fields it
+// lacks (ST CMSIS stm32h747xx.h).
+const CR3_SMPSEXTHP: u32 = 0x00000008
+const CR3_SMPSLEVEL: u32 = 0x00000030
+const CR3_SMPSEXTRDY: u32 = 0x00010000
+const CPU2CR_OFFSET: u32 = 0x14
+// HOLD2F/HOLD1F: the other core was held as this one left Stop; HOLD2/HOLD1 asks for that hold.
+const CPUCR_HOLDF: u32 = 0x00000010
+const CPUCR_HOLD: u32 = 0x00000400
+
+// CR1 leaves reset with SVOS at 11 (Stop mode at SVOS3) and bits 31:28 reading 1.
+const CR1_RESET: u32 = 0xf000c000
+const CR1_WRITABLE: u32 = reg.CR1_LPDS_MASK | reg.CR1_PVDE_MASK | reg.CR1_PLS_MASK | reg.CR1_DBP_MASK |
+    reg.CR1_FLPS_MASK | reg.CR1_SVOS_MASK | reg.CR1_AVDEN_MASK | reg.CR1_ALS_MASK
+const CR2_WRITABLE: u32 = reg.CR2_BREN_MASK | reg.CR2_MONEN_MASK
+// CR3's supply configuration: the lower byte the first write latches.
+const CR3_SUPPLY: u32 = reg.CR3_BYPASS_MASK | reg.CR3_LDOEN_MASK | reg.CR3_SDEN_MASK | CR3_SMPSEXTHP | CR3_SMPSLEVEL
+// The power-on configuration: the SMPS and the LDO both on, the SMPS at its default level.
+const CR3_RESET: u32 = reg.CR3_LDOEN_MASK | reg.CR3_SDEN_MASK
+// CR3's bits that any write changes.
+const CR3_FREE: u32 = reg.CR3_VBE_MASK | reg.CR3_VBRS_MASK | reg.CR3_USB33DEN_MASK | reg.CR3_USBREGEN_MASK
+const CPUCR_WRITABLE: u32 = reg.CPUCR_PDDS_D1_MASK | reg.CPUCR_PDDS_D2_MASK | reg.CPUCR_PDDS_D3_MASK | CPUCR_HOLD |
+    reg.CPUCR_RUN_D3_MASK
+// The flags CSSF clears.
+const CPUCR_FLAGS: u32 = CPUCR_HOLDF | reg.CPUCR_STOPF_MASK | reg.CPUCR_SBF_MASK | reg.CPUCR_SBF_D1_MASK |
+    reg.CPUCR_SBF_D2_MASK
+// VOS's codes: 01 Scale 3 (the reset value), 10 Scale 2, 11 Scale 1; 00 is reserved and runs Scale 3.
+const VOS_RESET: u32 = 1
+const WKUPF: u32 = reg.WKUPCR_WKUPC_MASK
+const WKUPEPR_WRITABLE: u32 = 0x0fff3f3f
+
+/** How the board's hardware supplies the core domain (RM0399 §7.4, "Power supply configurations").
+ * The STM32H747I-DISCO is wired for the direct SMPS.
+ */
+enum Supply
+    DirectSmps
+    Ldo
+    SmpsLdo
+    External
+end Supply
+
+/** The supply named `name` as a board description writes it, if there is one. */
+supply_named(name: string) -> Option[Supply]
+    if name == "direct-smps" then return Some(Supply.DirectSmps)
+    if name == "ldo" then return Some(Supply.Ldo)
+    if name == "smps-ldo" then return Some(Supply.SmpsLdo)
+    if name == "external" then return Some(Supply.External)
+    None
+
+/** The names `supply_named` takes. */
+val SUPPLY_NAMES: [4]string = ["direct-smps", "ldo", "smps-ldo", "external"]
+
+/** The PWR block of one chip, both cores' view of it. */
+struct Pwr
+    supply: Supply
+    settle: u64
+    cr1: u32
+    cr2: u32
+    cr3: u32
+    // Whether CR3's supply configuration has been written since power-on.
+    locked: bool
+    // When the latched configuration's voltages are valid, NEVER while they cannot be.
+    supply_ready: u64
+    // CPU1CR and CPU2CR.
+    cpu: [2]u32
+    vos: u32
+    // The VOS code the regulator held before the latest change, and when that change settles.
+    previous_vos: u32
+    vos_ready: u64
+    wkupfr: u32
+    wkupepr: u32
+end Pwr
+
+/** A PWR on a board wired for `supply`, whose regulator changes settle in `settle` ticks. */
+pwr(supply: Supply = Supply.DirectSmps, settle: u64 = 1) -> Pwr =
+    Pwr(supply, settle, CR1_RESET, 0, CR3_RESET, false, NEVER, [0, 0], VOS_RESET, VOS_RESET, 0, 0, 0)
+
+// Whether `config`, CR3's lower byte, is one of the supply configurations RM0399 lists.
+private valid(config: u32) -> bool
+    val enables = config & (reg.CR3_BYPASS_MASK | reg.CR3_LDOEN_MASK | reg.CR3_SDEN_MASK)
+    val level = config & CR3_SMPSLEVEL
+    val exthp = (config & CR3_SMPSEXTHP) != 0
+    if level == 0
+        return !exthp && (enables == reg.CR3_LDOEN_MASK || enables == reg.CR3_SDEN_MASK || enables == reg.CR3_BYPASS_MASK ||
+            enables == CR3_RESET)
+    // The SMPS at 1.8 or 2.5 V feeding the LDO, or with the LDO bypassed feeding an external regulator.
+    enables == CR3_RESET || (exthp && enables == (reg.CR3_SDEN_MASK | reg.CR3_BYPASS_MASK))
+
+// Whether a board wired for `supply` runs the valid configuration `config`. The power-on
+// configuration runs on every wiring, since the chip starts in it.
+private suits(supply: Supply, config: u32) -> bool
+    if config == CR3_RESET then return true
+    val enables = config & (reg.CR3_BYPASS_MASK | reg.CR3_LDOEN_MASK | reg.CR3_SDEN_MASK)
+    val level = config & CR3_SMPSLEVEL
+    supply match
+        DirectSmps -> enables == reg.CR3_SDEN_MASK
+        Ldo -> enables == reg.CR3_LDOEN_MASK
+        SmpsLdo -> level != 0 && enables == CR3_RESET
+        External -> enables & reg.CR3_BYPASS_MASK != 0
+
+/** The VOS code the regulator runs at `time`. */
+active_vos(p: *Pwr, time: u64) -> u32 = if time >= p.vos_ready then p.vos else p.previous_vos
+
+/** The voltage scale the core domain runs at `time`, 1 (the fastest) to 3: what the clock limits
+ * depend on.
+ */
+vos_scale(p: *Pwr, time: u64) -> u32 = active_vos(p, time) match
+    3 -> 1
+    2 -> 2
+    _ -> 3
+
+// Whether the core supply is valid at `time`: the latched configuration has settled, and so has VOS.
+private voltages_ready(p: *Pwr, time: u64) -> bool = time >= p.supply_ready && time >= p.vos_ready
+
+private csr1(p: *Pwr, time: u64) -> u32
+    var v = active_vos(p, time) << reg.CSR1_ACTVOS_SHIFT
+    if voltages_ready(p, time) then v |= reg.CSR1_ACTVOSRDY_MASK
+    v
+
+private cr2(p: *Pwr) -> u32 = if p.cr2 & reg.CR2_BREN_MASK != 0 then p.cr2 | reg.CR2_BRRDY_MASK else p.cr2
+
+private cr3(p: *Pwr, time: u64) -> u32
+    var v = p.cr3
+    if p.cr3 & CR3_SMPSEXTHP != 0 && time >= p.supply_ready then v |= CR3_SMPSEXTRDY
+    if p.cr3 & reg.CR3_USB33DEN_MASK != 0 then v |= reg.CR3_USB33RDY_MASK
+    v
+
+// VOSRDY reads 0 from reset (D3CR resets to 0x00004000) until the latched supply configuration is
+// valid, and from then follows each VOS change.
+private d3cr(p: *Pwr, time: u64) -> u32
+    val ready = if voltages_ready(p, time) then reg.D3CR_VOSRDY_MASK else 0
+    (p.vos << reg.D3CR_VOS_SHIFT) | ready
+
+// The first write since power-on latches the supply configuration, a valid one only, and locks it;
+// every later write changes only CR3's other bits.
+private write_cr3(p: *Pwr, value: u32, time: u64)
+    p.cr3 = (p.cr3 & ~CR3_FREE) | (value & CR3_FREE)
+    if p.locked then return
+    p.locked = true
+    val config = value & CR3_SUPPLY
+    if !valid(config) then return
+    p.cr3 = (p.cr3 & ~CR3_SUPPLY) | config
+    if suits(p.supply, config) then p.supply_ready = time + p.settle
+
+private write_cpu(p: *Pwr, core: usize, value: u32)
+    var v = (p.cpu[core] & ~CPUCR_WRITABLE) | (value & CPUCR_WRITABLE)
+    if value & reg.CPUCR_CSSF_MASK != 0 then v &= ~CPUCR_FLAGS
+    p.cpu[core] = v
+
+private write_d3cr(p: *Pwr, value: u32, time: u64)
+    val vos = (value & reg.D3CR_VOS_MASK) >> reg.D3CR_VOS_SHIFT
+    if vos == p.vos then return
+    p.previous_vos = active_vos(p, time)
+    p.vos = vos
+    p.vos_ready = time + p.settle
+
+impl Model for Pwr
+    read(*self, offset: u32, width: u32, time: u64) -> Option[u32] = offset match
+        reg.CR1_OFFSET -> Some(self.cr1)
+        reg.CSR1_OFFSET -> Some(csr1(self, time))
+        reg.CR2_OFFSET -> Some(cr2(self))
+        reg.CR3_OFFSET -> Some(cr3(self, time))
+        reg.CPUCR_OFFSET -> Some(self.cpu[0])
+        CPU2CR_OFFSET -> Some(self.cpu[1])
+        reg.D3CR_OFFSET -> Some(d3cr(self, time))
+        reg.WKUPCR_OFFSET -> Some(0)
+        reg.WKUPFR_OFFSET -> Some(self.wkupfr)
+        reg.WKUPEPR_OFFSET -> Some(self.wkupepr)
+        _ -> None
+
+    // Read-only and reserved bits ignore a write, as on silicon; CR2 takes one only while CR1.DBP
+    // lifts its protection.
+    write(*self, offset: u32, width: u32, value: u32, time: u64) -> bool
+        offset match
+            reg.CR1_OFFSET -> self.cr1 = (CR1_RESET & ~CR1_WRITABLE) | (value & CR1_WRITABLE)
+            reg.CSR1_OFFSET -> ()
+            reg.CR2_OFFSET -> if self.cr1 & reg.CR1_DBP_MASK != 0 then self.cr2 = value & CR2_WRITABLE
+            reg.CR3_OFFSET -> write_cr3(self, value, time)
+            reg.CPUCR_OFFSET -> write_cpu(self, 0, value)
+            CPU2CR_OFFSET -> write_cpu(self, 1, value)
+            reg.D3CR_OFFSET -> write_d3cr(self, value, time)
+            reg.WKUPCR_OFFSET -> self.wkupfr &= ~(value & WKUPF)
+            reg.WKUPFR_OFFSET -> ()
+            reg.WKUPEPR_OFFSET -> self.wkupepr = value & WKUPEPR_WRITABLE
+            _ -> return false
+        true
+
+    reset(*self)
+        *self = pwr(self.supply, self.settle)

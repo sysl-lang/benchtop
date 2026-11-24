@@ -149,8 +149,9 @@ packet is answered empty, which gdb reads as unsupported. benchtop never sends r
 
 ## Not yet
 
-- semihosting, ITM/SWO trace, and the CoreSight debug registers (DHCSR, DEMCR, the FPB and DWT) as the
-  guest would see them;
+- semihosting, ITM/SWO trace, and the CoreSight debug registers DHCSR and the FPB as the guest would
+  see them (DEMCR and the DWT's cycle counter are modelled, DESIGN.md "DWT/DEMCR"; the DWT's
+  comparators are stored, not gdb's watchpoints);
 - `monitor` commands (`qRcmd`), among them `monitor reset`;
 - `load` into flash;
 - `--gdb` with `--window`, which runs the board paced on its own threads;

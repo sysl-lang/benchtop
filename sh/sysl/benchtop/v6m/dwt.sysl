@@ -1,0 +1,175 @@
+module sh.sysl.benchtop.v6m
+
+// The Data Watchpoint and Trace unit and the register that enables it, DEMCR.TRCENA (ARMv7-M ARM,
+// DDI0403, C1.6.5 and C1.8; ARMv8-M ARM, DDI0553, "Debug and Trace"), on the Mainline cores: the M3,
+// the M4, the M7, and the M33, M35P, M52, M55 and M85. ARMv6-M and ARMv8-M Baseline have no CYCCNT;
+// on them the DWT's addresses are the board's, as every address between the ITM and the system
+// control space is.
+//
+// **CYCCNT counts the core's clock while TRCENA and CYCCNTENA are both set**, and wraps at 32 bits.
+// It is kept lazily, so that counting costs the instruction path nothing: `cyccnt` is its value at
+// the clock `cyccnt_base`, and while it counts a read is `cyccnt + (clock - cyccnt_base)`. A write of
+// CYCCNT, and any write that may start or stop it (DWT_CTRL, DEMCR), first fixes it where it stands.
+// The clock is the core's own (`clock`: executed cycles, and the cycles it slept), so each core of a
+// two-core board has a counter of its own, and CYCCNT keeps counting through `WFI`, as the DWT's free-
+// running clock (FCLK in the Cortex-M3 and M4 TRMs) does.
+//
+// DWT_CTRL reads NUMCOMP = 4 with NOTRCPKT, NOEXTTRIG, NOCYCCNT and NOPRFCNT clear, 0x40000000 at
+// reset, as the Cortex-M3, M4, M7 and M33 TRMs give it; its writable bits are stored, CYCCNTENA the
+// only one that does anything. The profiling counters (CPICNT, EXCCNT, SLEEPCNT, LSUCNT, FOLDCNT) are
+// stored, eight bits each, and do not count. The four comparators' COMP, MASK (ARMv7-M) and FUNCTION
+// are stored and match nothing: a debugger's watchpoints are its own (debug.sysl), not these
+// registers. PCSR, which samples the PC, is not modelled.
+//
+// The Cortex-M7's DWT has the CoreSight software lock (DWT_LAR, DWT_LSR; CMSIS core_cm7.h, and
+// Zephyr's `dwt_access`, which unlocks it only on the M7): it is locked at reset, LSR reads 3 (SLI,
+// SLK), writing 0xC5ACCE55 to LAR unlocks it and any other value locks it again, and while it is
+// locked a write to any other DWT register is ignored. The other cores have no lock: LAR and LSR
+// read as zero, so software that checks LSR.SLI finds none.
+
+const DWT_BASE: u32 = 0xE0001000
+const DWT_END: u32 = 0xE0002000
+const DEMCR: u32 = 0xE000EDFC
+
+const DEMCR_TRCENA: u32 = 0x01000000
+const DWT_CYCCNTENA: u32 = 1
+
+// NUMCOMP = 4; NOTRCPKT, NOEXTTRIG, NOCYCCNT and NOPRFCNT clear.
+const DWT_CTRL_RESET: u32 = 0x40000000
+
+// The key that unlocks the M7's DWT.
+const DWT_UNLOCK: u32 = 0xC5ACCE55
+
+// DWT_DEVARCH and DWT_DEVTYPE on ARMv8-M (the RP2350's Cortex-M33, pico-sdk hardware/regs/m33.h).
+const DWT_DEVARCH: u32 = 0x47701A02
+
+// The identification registers from 0xFD0: PIDR4–7, PIDR0–3 and CIDR0–3. ARMv7-M's from the Cortex-M4
+// TRM's DWT register summary; ARMv8-M's from the RP2350's Cortex-M33 (pico-sdk m33.h).
+val DWT_IDS_V7: [12]u32 = [0x04, 0, 0, 0, 0x02, 0xB0, 0x3B, 0, 0x0D, 0xE0, 0x05, 0xB1]
+val DWT_IDS_V8: [12]u32 = [0x04, 0, 0, 0, 0x21, 0xBD, 0x0B, 0, 0x0D, 0x90, 0x05, 0xB1]
+
+// ARMv8-M's DWT_FUNCTIONn.ID, what each comparator can match, read-only (the RP2350's M33, m33.h).
+val DWT_FUNCTION_IDS_V8: [4]u32 = [0x58000000, 0x88000000, 0x50000000, 0x20000000]
+
+// Whether a core of `kind` has the DWT's cycle counter and DEMCR: every Mainline core.
+@inline
+has_dwt(kind: Kind) -> bool = !is_baseline(kind)
+
+// DEMCR's bits a write keeps: VC_CORERESET and the vector catches, MON_EN, MON_PEND, MON_STEP,
+// MON_REQ and TRCENA, and with the Security Extension VC_SFERR. Only TRCENA does anything.
+demcr_bits(cpu: *Cpu) -> u32 = if cpu.security then 0x010F0FF1 else 0x010F07F1
+
+// DWT_CTRL's writable bits: CYCCNTENA, POSTPRESET, POSTINIT, CYCTAP, SYNCTAP, PCSAMPLENA and the
+// event enables, and on ARMv8-M CYCDISS.
+dwt_ctrl_bits(kind: Kind) -> u32 = if is_v7m(kind) then 0x007F1FFF else 0x00FF1FFF
+
+@inline
+cyccnt_counting(cpu: *Cpu) -> bool = cpu.demcr & DEMCR_TRCENA != 0 && cpu.dwt_ctrl & DWT_CYCCNTENA != 0
+
+// CYCCNT at the clock `now`.
+cyccnt_at(cpu: *Cpu, now: u64) -> u32 = if cyccnt_counting(cpu) then cpu.cyccnt +% u32.wrap(now - cpu.cyccnt_base) else cpu.cyccnt
+
+// Fix CYCCNT where it stands at `now`, before a write changes whether it counts.
+cyccnt_fix(cpu: *Cpu, now: u64)
+    cpu.cyccnt = cyccnt_at(cpu, now)
+    cpu.cyccnt_base = now
+
+// DEMCR, written at the clock `now`.
+demcr_write(cpu: *Cpu, x: u32, now: u64)
+    cyccnt_fix(cpu, now)
+    cpu.demcr = x & demcr_bits(cpu)
+
+// The DWT as a reset leaves it: nothing counting, the M7's lock locked.
+clear_dwt(cpu: *Cpu)
+    cpu.demcr = 0
+    cpu.dwt_ctrl = 0
+    cpu.cyccnt = 0
+    cpu.cyccnt_base = 0
+    cpu.dwt_locked = cpu.kind == Kind.V7emM7
+    for k in 0..<4
+        cpu.dwt_comp[k] = 0
+        cpu.dwt_mask[k] = 0
+        cpu.dwt_function[k] = 0
+    for k in 0..<5 do cpu.dwt_counters[k] = 0
+
+// Whether the offset `r` into the DWT is a register of a core of `kind`.
+dwt_register(kind: Kind, r: u32) -> bool
+    val v8 = !is_v7m(kind)
+    if r < 0x1C then return true
+    if r >= 0x20 && r < 0x60 then return r & 0xF == 0 || r & 0xF == 8 || (r & 0xF == 4 && !v8)
+    if r == 0xFB0 || r == 0xFB4 || r >= 0xFD0 then return true
+    v8 && (r == 0xFBC || r == 0xFCC)
+
+@cold
+dwt_unmodelled(cpu: *Cpu, a: u32) = unmodelled_register(cpu, a, f"the DWT + 0x${a - DWT_BASE}%03x")
+
+// A read of `width` bytes at `a`, between the ITM and the system control space, `n` retired before it:
+// the DWT's, where the core has one, and otherwise the board's.
+dwt_read(cpu: *Cpu, a: u32, width: u32, n: u64) -> u32
+    if a < DWT_BASE || a >= DWT_END || !has_dwt(cpu.kind)
+        return if cpu.ns then ns_read(cpu, a, width, n) else cpu.bus.read(cpu, a, width, n)
+
+    val r = a - DWT_BASE
+
+    if width != 4 || a & 3 != 0 || !dwt_register(cpu.kind, r)
+        dwt_unmodelled(cpu, a)
+        return 0
+
+    val v8 = !is_v7m(cpu.kind)
+
+    if r >= 0x20 && r < 0x60
+        val k = usize((r - 0x20) >> 4)
+
+        if r & 0xF == 0 then return cpu.dwt_comp[k]
+        if r & 0xF == 4 then return cpu.dwt_mask[k]
+        return if v8 then cpu.dwt_function[k] | DWT_FUNCTION_IDS_V8[k] else cpu.dwt_function[k]
+
+    if r >= 0xFD0 then return if v8 then DWT_IDS_V8[usize((r - 0xFD0) >> 2)] else DWT_IDS_V7[usize((r - 0xFD0) >> 2)]
+
+    r match
+        0x000 -> DWT_CTRL_RESET | cpu.dwt_ctrl
+        0x004 -> cyccnt_at(cpu, clock(cpu, n))
+        0xFB4 -> if cpu.kind != Kind.V7emM7 then 0 elif cpu.dwt_locked then 3 else 1
+        0xFBC -> DWT_DEVARCH
+        // CPICNT, EXCCNT, SLEEPCNT, LSUCNT and FOLDCNT; LAR, write-only; DEVTYPE.
+        _ -> if r < 0x1C && r >= 8 then u32(cpu.dwt_counters[usize((r - 8) >> 2)]) else 0
+
+// The same, written. On the M7, while the lock is locked, only LAR takes a write.
+dwt_write(cpu: *Cpu, a: u32, width: u32, x: u32, n: u64)
+    if a < DWT_BASE || a >= DWT_END || !has_dwt(cpu.kind)
+        if cpu.ns then return ns_write(cpu, a, width, x, n)
+        return cpu.bus.write(cpu, a, width, x, n)
+
+    val r = a - DWT_BASE
+
+    if width != 4 || a & 3 != 0 || !dwt_register(cpu.kind, r) then return dwt_unmodelled(cpu, a)
+
+    if r == 0xFB0
+        if cpu.kind == Kind.V7emM7 then cpu.dwt_locked = x != DWT_UNLOCK
+        return
+
+    if cpu.dwt_locked then return
+
+    if r >= 0x20 && r < 0x60
+        val k = usize((r - 0x20) >> 4)
+
+        if r & 0xF == 0
+            cpu.dwt_comp[k] = x
+        elif r & 0xF == 4
+            cpu.dwt_mask[k] = x & 0x1F
+        else
+            // ARMv7-M: DATAVADDR1, DATAVADDR0, DATAVSIZE, DATAVMATCH, CYCMATCH, EMITRANGE and FUNCTION.
+            // ARMv8-M: DATAVSIZE, ACTION and MATCH.
+            cpu.dwt_function[k] = x & (if is_v7m(cpu.kind) then 0x000FFDAF else 0x00000C3F)
+        return
+
+    val now = clock(cpu, n)
+
+    if r == 0
+        cyccnt_fix(cpu, now)
+        cpu.dwt_ctrl = x & dwt_ctrl_bits(cpu.kind)
+    elif r == 4
+        cpu.cyccnt = x
+        cpu.cyccnt_base = now
+    elif r >= 8 && r < 0x1C
+        cpu.dwt_counters[usize((r - 8) >> 2)] = u8(x & 0xFF)
