@@ -401,7 +401,7 @@ checked against the SVD):
 | ISA | ARMv7E-M Thumb-2: all 16- and 32-bit encodings, IT blocks | same |
 | DSP | SIMD add/sub (`SADD16`, `UQSUB8`, `SEL` and GE flags), saturating (`QADD`, `SSAT`, `USAT16`), the multiply family (`SMLAD`, `SMLALD`, `SMMLA`, `SMUAD`…), packing and extends (`PKHBT`, `SXTAB16`) | same |
 | FPU | **FPv5-D16, single and double**: FPv4's set plus `VSEL`, `VMAXNM`/`VMINNM`, `VRINT*`, `VCVTA/N/P/M`, and every op at `.F64` | **FPv4-SP-D16, single only**: a `.F64` op is UNDEFINED, a NOCP/UNDEFINSTR UsageFault |
-| MPU | PMSAv7, **16 regions** | PMSAv7, **8 regions** |
+| MPU | PMSAv7, **16 regions**, enforced (`v6m/pmsav7.sysl`) | PMSAv7, **8 regions**, enforced |
 | caches | 16 KB I + 16 KB D, as no-ops; every `ICIALLU`/`DCIMVAC`/`DCCMVAC`/`DCCIMVAC`/`DCISW`… write to the SCB cache-maintenance registers is accepted, and CCR.IC/DC are stored. There is no cache model, so maintenance is coherent by construction; CLIDR/CTR/CCSIDR read the Cortex-M7 TRM's values, not a silicon dump | none |
 | TCMs | ITCM 64 KB and DTCM 128 KB as RAM regions in the M7's view; `ITCMCR`/`DTCMCR` stored | none |
 | CPUID | 0x411F_C27x (part 0xC27), which `HAL_GetCurrentCPUID` reads | 0x410F_C24x (part 0xC24) |
@@ -458,6 +458,17 @@ checked against the SVD):
   default map applies under PRIVDEFENA. **skiff rewrites the MPU on every context switch**, with
   regions as small as 64 bytes (its stack guard), so updating the fast table on an MPU write is on the
   critical path (§2.4).
+  **Enforced** (`v6m/pmsav7.sysl`, over `v6m/mpu.sysl`'s machinery) on a core the board gives
+  `mpu-regions` (the STM32H747's M7 16, M4 8; MPU_TYPE reads 0 without): a region is 2^(SIZE+1)
+  bytes, at least 32, its base's bits below the size ignored; a region of 256 bytes or more has eight
+  subregions, a disabled one falling through to the regions beneath; overlaps are no fault; AP's eight
+  codes as Table B3-15 gives them (the reserved 100 allows nothing); XN; the PPB always reached; the
+  System space execute-never; HFNMIENA; MemManage DACCVIOL with MMFAR and MMARVALID, or IACCVIOL,
+  taken, escalated or a lockup as any fault. The aliases name MPU_RNR's region (not RNR + n), and an
+  RBAR write with VALID sets RNR first. TEX, S, C and B are stored and read back and change nothing,
+  there being no cache model. Not enforced, as on the M33: the accesses of exception entry and return
+  (MSTKERR, MUNSTKERR) and lazy FP preservation (MLSPERR). The M0+'s optional MPU (PMSAv6-like, no
+  subregions under 256 bytes) is not modelled yet: a follow-up.
 - **DWT/DEMCR** (`v6m/dwt.sysl`, every Mainline core: M3, M4, M7, M33, M35P, M52, M55, M85):
   `DWT_CYCCNT` is provided because HAL, CMSIS and benchmarks read it. It counts the core's own clock
   (executed cycles and cycles slept) while DEMCR.TRCENA and DWT_CTRL.CYCCNTENA are both set, wraps at
@@ -514,7 +525,7 @@ subset of the above):
   instruction faults, its frame's xPSR with T clear — and an exception return to a frame whose xPSR
   has T clear. HardFault within HardFault is a lockup, which stops the core at `Fault` there. Under a
   debugger or the window (`Cpu.catch_faults`) the core stops on the instruction instead.
-- **Not modelled**: the MPU, and HardFault for a bad access, which stops the core at `Unmapped`. An
+- **Not modelled**: the M0+'s MPU, and HardFault for a bad access, which stops the core at `Unmapped`. An
   exception that cannot be taken — `SVC` inside HardFault, an EXC_RETURN naming no return, a return
   whose stacked IPSR disagrees with the mode it names — stops at `Fault`. An access off the RAM while
   stacking or unstacking stops at `Unmapped` like any other.
@@ -662,6 +673,12 @@ loop
   decoded, and unprivileged code runs on records of its own, so a record decoded privileged never
   runs unprivileged; a region write forgets the records on the pages it covers. skiff's Pico 2 test
   run, which reprograms regions on every switch, takes about 5% longer than with the MPU ignored.
+  **The M7's and M4's PMSAv7 runs on the same tables and records** (`v6m/pmsav7.sysl`): only what a
+  region holds and allows differs. A page's entry is decided by the highest-numbered region touching
+  it: kept where that region holds the whole page (every subregion over it enabled) and allows it,
+  0 where it holds part of it, the regions beneath it not consulted. `mpu_data_permits` and
+  `mpu_fetch_permits` dispatch on `Cpu.pmsav7_regions` on the slow path only, so the fast path is
+  unchanged and an MPU never written still costs nothing.
 
 ### 2.5 The interface a JIT would plug into
 
@@ -966,7 +983,8 @@ acquire/release instructions and MSPLIM/PSPLIM accesses for M4; stack limits nev
 M4 reports CPUID 0x410FC241 (r0p1), resets CCR to 0x200 and permits STKALIGN to be cleared.
 The virtual implementation exposes 32 IRQs and four priority bits. Configurable faults stop
 execution, as on M33. Integer DSP is always present, as ARMv7E-M defines it, and a description
-cannot turn it off; FP, MPU and bit-band aliases are not implemented. The example build emits
+cannot turn it off; the PMSAv7 MPU is enforced where the board gives `mpu-regions = 8` (§2.2); FP
+and bit-band aliases are not implemented. The example build emits
 `*-m4.elf` with `-mcpu=cortex-m4 -mfloat-abi=soft`, so its guests use DSP instructions.
 
 ### 2.11 Cortex-M7: another model of the shared ARMv7-M core
@@ -985,8 +1003,8 @@ CTR 0xE000ED7C 0x8303C003, and CCSIDR 0xE000ED80, selected by CSSELR bit 0, 0xF0
 or 0x200FE019 (I-cache): 16 KB each, 4 ways, 32-byte lines, 128 sets, as the H747's M7 has. These
 values come from the Cortex-M7 TRM's field layout, not from a silicon dump. The M3, M4 and M33 do
 not have these registers and treat the addresses as any other reserved system space. TCM control
-registers are not modelled. Integer DSP is always present, as on the M4; FP and MPU are not
-implemented. The intended H7's cache and TCM model in §2.1 remains future work; this virtual M7 has the same 32 implemented IRQs and four priority bits as M4.
+registers are not modelled. Integer DSP is always present, as on the M4; the PMSAv7 MPU is
+enforced where the board gives `mpu-regions` (8 or 16; §2.2). The intended H7's cache and TCM model in §2.1 remains future work; this virtual M7 has the same 32 implemented IRQs and four priority bits as M4.
 
 Tests cover every width of ARMv8-M-only ordered access, MSPLIM/PSPLIM, CCR fixed/writable/reserved
 bits, divide boundaries and traps, exception alignment/return, interrupt masks, exclusive-monitor

@@ -1,0 +1,168 @@
+module sh.sysl.benchtop.v6m
+
+// The ARMv7-M MPU (PMSAv7) of the M3, M4 and M7, against the ARMv7-M ARM (DDI0403E, B3.5: "Protected
+// Memory System Architecture", the MPU_TYPE, MPU_CTRL, MPU_RNR, MPU_RBAR and MPU_RASR descriptions,
+// Table B3-15 and the "ValidateAddress" pseudocode), with QEMU's `get_phys_addr_pmsav7`
+// (target/arm/ptw.c) as a second witness. A core has one where its board gives it `mpu-regions`
+// (`Cpu.pmsav7_regions`: the STM32H747's M7 16, its M4 8); with none, MPU_TYPE reads 0.
+//
+// It is enforced by the M33's machinery (mpu.sysl) — the same tables per view, slow path, judgement of
+// fetches at decode and records for unprivileged code — over the regions as these registers have
+// them. Each region's MPU_RBAR is kept in `Cpu.mpu_rbar` and its MPU_RASR in `Cpu.mpu_rlar`. What
+// differs from PMSAv8 is here: a region is 2^(SIZE+1) bytes, at least 32, at its base with the bits
+// below its size ignored; a region of 256 bytes or more has eight subregions, each disabled by its SRD
+// bit, so that an address there falls through to the regions below; where regions overlap the
+// highest-numbered one holding the address decides, and an overlap is no fault; and AP has three
+// bits, as Table B3-15 gives them.
+//
+// TEX, S, C and B are stored and read back and change nothing: benchtop models no cache, so memory is
+// always coherent and every type of memory behaves alike. A SIZE below 4 (under 32 bytes) is
+// UNPREDICTABLE, and such a region holds nothing; an AP of 100, reserved, lets no access be made
+// (QEMU's choice). The aliases MPU_RBAR_A1–A3 and MPU_RASR_A1–A3 are MPU_RBAR and MPU_RASR themselves:
+// unlike PMSAv8's, they name the region MPU_RNR names. A write to MPU_RBAR with VALID set writes its
+// REGION to MPU_RNR first. MPU_RNR and REGION keep the bits that number the core's regions; a number
+// past the last is UNPREDICTABLE. A register is written and read a word at a time.
+
+/** The most regions a core's MPU has, the M7's 16, which `Cpu.mpu_rbar` and `Cpu.mpu_rlar` hold. */
+const MPU_SLOTS: u32 = 16
+
+const MPU_RASR: u32 = 0xE000EDA0
+const MPU_RASR_A3: u32 = 0xE000EDB8
+
+// The bits MPU_RASR keeps: XN, AP, TEX, S, C, B, SRD, SIZE and ENABLE.
+const MPU_RASR_BITS: u32 = 0x173FFF3F
+const RBAR_VALID: u32 = 1 << 4
+const RASR_XN: u32 = 1 << 28
+
+/** The regions the core's MPU has: the board's for a PMSAv7 one, the M33's eight otherwise. */
+@inline
+mpu_count(cpu: *Cpu) -> u32 = if cpu.pmsav7_regions != 0 then cpu.pmsav7_regions else MPU_REGIONS
+
+// ---------------------------------------------------------------------------------------------------
+// The registers.
+
+/** An ARMv7-M core's MPU registers, read: None for an address that is not one. Without an MPU, MPU_TYPE
+ * reads 0 and the others are addresses benchtop does not model.
+ */
+pmsav7_read(cpu: *Cpu, a: u32) -> Option[u32]
+    if a < MPU_TYPE || a > MPU_RASR_A3 then return None
+    if a == MPU_TYPE then return Some(cpu.pmsav7_regions << 8)
+    if cpu.pmsav7_regions == 0 then return None
+
+    a match
+        MPU_CTRL -> Some(cpu.mpu_ctrl)
+        MPU_RNR -> Some(cpu.mpu_rnr)
+        _ ->
+            val k = cpu.mpu_rnr
+            // MPU_RBAR's REGION reads as MPU_RNR, its VALID as 0.
+            Some(if (a - MPU_RBAR) & 4 != 0 then cpu.mpu_rlar[k] else cpu.mpu_rbar[k] | k)
+
+/** The same, written; whether `a` is one of them. */
+pmsav7_write(cpu: *Cpu, a: u32, x: u32) -> bool
+    if a < MPU_TYPE || a > MPU_RASR_A3 then return false
+    // The region count is fixed.
+    if a == MPU_TYPE then return true
+    if cpu.pmsav7_regions == 0 then return false
+
+    val last = cpu.pmsav7_regions - 1
+    a match
+        MPU_CTRL ->
+            val was = cpu.mpu_ctrl
+            cpu.mpu_ctrl = x & MPU_CTRL_BITS
+            mpu_ctrl_changed(cpu, was)
+        MPU_RNR -> cpu.mpu_rnr = x & last
+        _ ->
+            val rasr = (a - MPU_RBAR) & 4 != 0
+            if !rasr && x & RBAR_VALID != 0 then cpu.mpu_rnr = x & 0xF & last
+            val k = cpu.mpu_rnr
+            val was_rbar = cpu.mpu_rbar[k]
+            val was_rasr = cpu.mpu_rlar[k]
+            if rasr then cpu.mpu_rlar[k] = x & MPU_RASR_BITS else cpu.mpu_rbar[k] = x & ~0x1F
+            mpu_region_changed(cpu, usize(k), was_rbar, was_rasr)
+    true
+
+// ---------------------------------------------------------------------------------------------------
+// The regions.
+
+/** The first and last addresses of the region whose registers are `rbar` and `rlar`, and whether it
+ * holds any: an enabled PMSAv8 region from its base to its limit; an enabled PMSAv7 one (`rlar` its
+ * MPU_RASR) of 2^(SIZE+1) bytes at its MPU_RBAR address with the bits below its size ignored, as
+ * "ValidateAddress" compares them.
+ */
+region_extent(cpu: *Cpu, rbar: u32, rlar: u32) -> (u32, u32, bool)
+    if rlar & 1 == 0 then return (0, 0, false)
+    if cpu.pmsav7_regions == 0
+        val from = rbar & ~0x1F
+        val limit = rlar | 0x1F
+        return (from, limit, from <= limit)
+    val size = (rlar >> 1) & 0x1F
+    if size < 4 then return (0, 0, false)
+    val mask = u32((1u64 << u64(size + 1)) - 1)
+    val from = rbar & ~mask
+    (from, from | mask, true)
+
+// The bytes in each of the eight subregions of the region from `from` to `limit`, or 0 where it is
+// under 256 bytes and has none.
+private subregion_bytes(from: u32, limit: u32) -> u32
+    val size = u64(limit - from) + 1
+    if size < 256 then 0 else u32(size >> 3)
+
+/** The PMSAv7 region holding `a` ("ValidateAddress"): the highest-numbered enabled one whose extent
+ * holds it, where its subregion there is not disabled; -1 where none does.
+ */
+pmsav7_region(cpu: *Cpu, a: u32) -> int
+    var k = cpu.pmsav7_regions
+    while k > 0
+        k -= 1
+        val rasr = cpu.mpu_rlar[k]
+        val (from, limit, held) = region_extent(cpu, cpu.mpu_rbar[k], rasr)
+        if !held || a < from || a > limit then continue
+        val sub = subregion_bytes(from, limit)
+        if sub == 0 || (rasr >> (8 + (a - from) / sub)) & 1 == 0 then return int(k)
+    -1
+
+/** How region `k` covers the addresses `lo` to `hi`: 0 where it holds none of them, 2 where it holds
+ * every one, and 1 where it holds some. A disabled subregion holds none of its addresses.
+ */
+region_cover(cpu: *Cpu, k: u32, lo: u32, hi: u32) -> int
+    val rlar = cpu.mpu_rlar[k]
+    val (from, limit, held) = region_extent(cpu, cpu.mpu_rbar[k], rlar)
+    if !held || limit < lo || from > hi then return 0
+    val whole = from <= lo && limit >= hi
+    val sub = if cpu.pmsav7_regions != 0 then subregion_bytes(from, limit) else 0
+    if sub == 0 then return if whole then 2 else 1
+    val first = ((if lo > from then lo else from) - from) / sub
+    val last = ((if hi < limit then hi else limit) - from) / sub
+    var on: u32 = 0
+    for i in first..last do if (rlar >> (8 + i)) & 1 == 0 then on += 1
+    if on == 0 then return 0
+    if whole && on == last - first + 1 then 2 else 1
+
+/** Whether MPU_RASR's AP lets an access be made, a write where `write`, by unprivileged code where
+ * `unpriv` (Table B3-15): 000 none; 001 privileged only; 010 privileged, and unprivileged reads; 011
+ * any; 101 privileged reads; 110 and 111 reads. The reserved 100 lets none.
+ */
+ap_permits(ap: u32, write: bool, unpriv: bool) -> bool = ap match
+    1 -> !unpriv
+    2 -> !unpriv || !write
+    3 -> true
+    5 -> !unpriv && !write
+    6 | 7 -> !write
+    _ -> false
+
+/** Whether region `k` lets a load, or with `write` a store, be made by unprivileged code where
+ * `unpriv`: by its AP, PMSAv8's two bits (bit 1 lets unprivileged code in, bit 2 makes it read-only)
+ * or PMSAv7's three.
+ */
+region_permits(cpu: *Cpu, k: u32, write: bool, unpriv: bool) -> bool
+    if cpu.pmsav7_regions != 0 then return ap_permits((cpu.mpu_rlar[k] >> 24) & 7, write, unpriv)
+    val ap = (cpu.mpu_rbar[k] >> 1) & 3
+    (!unpriv || ap & 1 != 0) && !(write && ap & 2 != 0)
+
+/** Whether region `k` lets code be fetched by unprivileged code where `unpriv`: where it is not
+ * execute-never and its AP lets the privilege read.
+ */
+region_executes(cpu: *Cpu, k: u32, unpriv: bool) -> bool
+    if cpu.pmsav7_regions != 0 then return cpu.mpu_rlar[k] & RASR_XN == 0 && region_permits(cpu, k, false, unpriv)
+    val rbar = cpu.mpu_rbar[k]
+    rbar & 1 == 0 && (!unpriv || rbar & 2 != 0)

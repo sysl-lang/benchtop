@@ -3,8 +3,8 @@ module sh.sysl.benchtop.v6m
 import sysl.raw.ptr_cast
 import sysl.sync.*
 
-// The ARMv8-M MPU (PMSAv8) enforced, on a core whose MPU registers t2secure.sysl stores, against the
-// ARMv8-M ARM (DDI0553: "MPUCheck", "ValidateAddress", "SecurityCheck", "IsReqExcPriNeg", "MemA_with_priv"
+// The MPU enforced: the ARMv8-M one (PMSAv8), on a core whose MPU registers t2secure.sysl stores, and
+// the ARMv7-M one (PMSAv7, at the end of this header). PMSAv8 is checked against the ARMv8-M ARM (DDI0553: "MPUCheck", "ValidateAddress", "SecurityCheck", "IsReqExcPriNeg", "MemA_with_priv"
 // and the MMFSR and MMFAR descriptions), with QEMU's `pmsav8_mpu_lookup` and
 // `get_phys_addr_pmsav7_default` (target/arm/ptw.c) as a second witness.
 //
@@ -49,9 +49,16 @@ import sysl.sync.*
 // floating-point preservation (MLSPERR), `BLXNS`'s push and a Non-secure function return's pop, and
 // the instructions of an IT block, which are decoded, and judged, with their IT. A store-exclusive
 // whose monitor has failed is not checked (QEMU's order; the ARM ARM leaves it IMPLEMENTATION DEFINED).
-// The ARMv7-M MPU (PMSAv7) of the M4 and M7 and the M0+'s are not enforced: each would be another
-// `mpu_data_permits` and `mpu_fetch_permits` over these tables and records. Cores sharing records (a
-// machine not `pair`ed) share the privileged view's judgments of fetches.
+// Cores sharing records (a machine not `pair`ed) share the privileged view's judgments of fetches.
+//
+// **The ARMv7-M MPU (PMSAv7)** of the M3, M4 and M7 (pmsav7.sysl) is enforced by everything here.
+// Where `Cpu.pmsav7_regions` is set, `mpu_data_permits` and `mpu_fetch_permits` ask its regions: the
+// highest-numbered one holding the address, past disabled subregions, decides (`pmsav7_region`), an
+// overlap being no fault, and AP has PMSAv7's three bits (`region_permits`). A table's entry is
+// decided by the highest-numbered region touching the page (`region_cover`, `entry`). Everything else
+// — the views, the slow path, the records, MemManage, HFNMIENA, the PPB, the System space — is shared;
+// such a core has no Security Extension, so only Secure state's fields are used. The M0+'s optional
+// MPU is not enforced.
 
 // MMFSR, CFSR's low byte.
 const CFSR_IACCVIOL: u32 = 1 << 0
@@ -88,26 +95,29 @@ mpu_applies(cpu: *Cpu) -> bool
  */
 mpu_data_permits(cpu: *Cpu, a: u32, write: bool, unpriv: bool) -> bool
     if a >= PPB && a < PPB_END then return true
-    val k = mpu_region(cpu, a)
+    val k = mpu_holder(cpu, a)
     if k == MPU_OVERLAP then return false
     if k < 0 then return !unpriv && cpu.mpu_ctrl & 4 != 0
-    val ap = (cpu.mpu_rbar[usize(k)] >> 1) & 3
-    (!unpriv || ap & 1 != 0) && !(write && ap & 2 != 0)
+    region_permits(cpu, u32(k), write, unpriv)
 
 /** Whether the live bank's MPU lets the halfword at `a` be fetched, for unprivileged code where
- * `unpriv` ("MPUCheck"): never from the System space, nor where two regions overlap; from one
- * region's where it is not execute-never and its AP lets the privilege read; from no region's only
- * privileged under PRIVDEFENA, outside the default map's Peripheral and Device spaces.
+ * `unpriv` ("MPUCheck"): never from the System space, nor where two PMSAv8 regions overlap; from the
+ * region's that decides where it is not execute-never and its AP lets the privilege read; from no
+ * region's only privileged under PRIVDEFENA, outside the default map's Peripheral and Device spaces.
  */
 mpu_fetch_permits(cpu: *Cpu, a: u32, unpriv: bool) -> bool
     if a >= SYSTEM_SPACE then return false
-    val k = mpu_region(cpu, a)
+    val k = mpu_holder(cpu, a)
     if k == MPU_OVERLAP then return false
     if k < 0
         if unpriv || cpu.mpu_ctrl & 4 == 0 then return false
         return !(a >= 0x40000000 && a < 0x60000000) && a < 0xA0000000
-    val rbar = cpu.mpu_rbar[usize(k)]
-    rbar & 1 == 0 && (!unpriv || rbar & 2 != 0)
+    region_executes(cpu, u32(k), unpriv)
+
+// The region that decides an access to `a`: PMSAv7's highest-numbered holding it, PMSAv8's one (an
+// overlap `MPU_OVERLAP`); -1 for none.
+@inline
+private mpu_holder(cpu: *Cpu, a: u32) -> int = if cpu.pmsav7_regions != 0 then pmsav7_region(cpu, a) else mpu_region(cpu, a)
 
 // ---------------------------------------------------------------------------------------------------
 // Data accesses.
@@ -235,33 +245,35 @@ private make_table(cpu: *Cpu, table: *usize, ns: bool, unpriv: bool)
     val base = state_table(cpu, ns)
     val background = !unpriv && cpu.mpu_ctrl & 4 != 0
     for p in 0..<PAGES do table[p] = if background then base[p] else 0
-    for k in 0..<MPU_REGIONS
-        val limit = cpu.mpu_rlar[k] | 0x1F
-        val from = cpu.mpu_rbar[k] & ~0x1F
-        if cpu.mpu_rlar[k] & 1 == 0 || from > limit then continue
+    for k in 0..<mpu_count(cpu)
+        val (from, limit, held) = region_extent(cpu, cpu.mpu_rbar[k], cpu.mpu_rlar[k])
+        if !held then continue
         for p in (from >> PAGE_SHIFT)..(limit >> PAGE_SHIFT) do table[p] = entry(cpu, base, p, unpriv)
     cpu.mpu_valid[view_of(ns, unpriv)] = true
 
-// Entry `p` of a view's table, over the state's own `base`: the base entry where one region holds the
-// whole page and lets the view read it, and write it where the fast path would write in place, or
-// where no region touches the page and the privileged view has PRIVDEFENA; 0 where a region holds
-// only part of the page, two hold it, or the view may not use it whole.
+// Entry `p` of a view's table, over the state's own `base`: the base entry where the region deciding
+// every address of the page holds it whole and lets the view read it, and write it where the fast path
+// would write in place, or where no region touches the page and the privileged view has PRIVDEFENA; 0
+// where that region holds only part of the page, or the view may not use it whole. The region
+// deciding is PMSAv7's highest-numbered one holding any of the page; under PMSAv8 two regions there
+// leave it 0.
 private entry(cpu: *Cpu, base: *usize, p: u32, unpriv: bool) -> usize
     val e = base[p]
     if e == 0 then return 0
     val lo = p << PAGE_SHIFT
     val hi = lo | PAGE_MASK
     var hit = -1
-    for k in 0..<MPU_REGIONS
-        val limit = cpu.mpu_rlar[k] | 0x1F
-        val from = cpu.mpu_rbar[k] & ~0x1F
-        if cpu.mpu_rlar[k] & 1 == 0 || from > limit || limit < lo || from > hi then continue
-        if from > lo || limit < hi || hit >= 0 then return 0
+    var k = mpu_count(cpu)
+    while k > 0
+        k -= 1
+        val cover = region_cover(cpu, k, lo, hi)
+        if cover == 0 then continue
+        if cover == 1 || hit >= 0 then return 0
         hit = int(k)
+        if cpu.pmsav7_regions != 0 then break
     if hit < 0 then return if !unpriv && cpu.mpu_ctrl & 4 != 0 then e else 0
-    val ap = (cpu.mpu_rbar[usize(hit)] >> 1) & 3
-    if unpriv && ap & 1 == 0 then return 0
-    if ap & 2 != 0 && stores_in_place(cpu.mem, p) then return 0
+    if !region_permits(cpu, u32(hit), false, unpriv) then return 0
+    if !region_permits(cpu, u32(hit), true, unpriv) && stores_in_place(cpu.mem, p) then return 0
     e
 
 // Whether the fast path stores to page `p` in place: the first RAM region's, or another's that is not
@@ -389,9 +401,8 @@ mpu_region_changed(cpu: *Cpu, k: usize, was_rbar: u32, was_rlar: u32)
 // The extent of a region as `rbar` and `rlar` have it, which the region's change may have changed: its
 // pages' entries made again, and their records forgotten. A disabled region has none.
 private extent_changed(cpu: *Cpu, rbar: u32, rlar: u32)
-    val from = rbar & ~0x1F
-    val limit = rlar | 0x1F
-    if rlar & 1 == 0 || from > limit then return
+    val (from, limit, held) = region_extent(cpu, rbar, rlar)
+    if !held then return
     val first = from >> PAGE_SHIFT
     val last = limit >> PAGE_SHIFT
     val ns = cpu.mpu_bank_ns
