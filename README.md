@@ -238,6 +238,8 @@ sysl build . -o benchtop
                [--instruments <file.hocon>] [--headless] [--frames N] [--screenshot out.png] ...
 ./benchtop run [--timeout <dur>] [--expect <text>] [--type <text>]
                [--press <part[.direction] | pin=high|low>[@<dur>][:<dur>]] [--set <part>=<0..1>] [--quiet] ... <image>
+./benchtop run [--until-symbol <name | 0xaddr>] [--until-uart <regex>] [--until-fault] [--until-masked <us>]
+               [--until-write <addr>[:<len>]] [--until-read <addr>[:<len>]] ... <image>
 ./benchtop run [--seed <n>] [--late-systick <cycles>] [--bunch-systick <n>] [--late-irq <cycles>]
                [--strex-fail <percent>] ... <image>
 ./benchtop check [--mcu] <name | file.hocon>
@@ -372,6 +374,60 @@ pin is pressed with the level its button would give:
 ./benchtop run --board stm32h747-disco --quiet --timeout 2s --expect "DISCO" --press wakeup:1s \
   --type "BUTTON? .\n" --expect "-1  ok" examples/disco-repl/repl-disco.elf
 ```
+
+### Stop conditions
+
+The `--until-…` options run a guest **until something specific happens**, and say exactly where it
+happened, for an agent or a CI script that wants one precise answer rather than a console to read.
+The run ends, **status 0**, as soon as **any one** of them is met (they combine as OR), with one line on
+stderr:
+
+```
+benchtop: until symbol main met on core 0 at pc 0x20000210 (main)
+benchtop: until write 0x40070000:4 met on core 0 at pc 0x20003210 (stdio_uart_out_chars+0x34): a store reaching 0x40070000
+benchtop: until uart "serial [0-9]+" met on core 0 at pc 0x20000d58 (sleep_ms+0xe0): matched "serial 0"
+```
+
+- **`--until-symbol <name | 0xaddr>`**: a core is about to execute that address — a function or label of
+  the ELF file by name, or an address (its Thumb bit ignored). It is a debugger's breakpoint: no byte of
+  the guest changes, and the core stops with the instruction not run. A name the image lacks is
+  refused naming the image; a raw image has no names, only addresses; an address that is not code
+  the cores can run is refused.
+- **`--until-uart <regex>`**: the console — every UART the board writes to stdout, and semihosting's
+  output — matches the pattern (sysl's `sysl.regex`: POSIX classes, groups, alternation, intervals).
+  The console is looked at between slices of the run, so the core and pc are where core 0 was at the
+  end of the slice that printed the match; a match may span the last 4 KiB of output.
+- **`--until-fault`**: a core takes a fault (HardFault, MemManage, BusFault, UsageFault, SecureFault),
+  stopped at the exception entry — the frame stacked, the pc at its handler's first instruction, which
+  has not run — and the fault is explained as `--explain-faults` explains it
+  ([Fault explanations](#fault-explanations)). A fault benchtop stops on rather than taking (a
+  lockup, an access nothing answers on a virtual board) ends the run as it always has.
+- **`--until-masked <us>`**: a core stays masked (PRIMASK, BASEPRI or FAULTMASK, as [the masking
+  report](#the-masking-report) counts it) longer than so many microseconds of the board's time, or
+  `<n>cycles`, or any duration `--timeout` takes (`50us`, `2ms`). The core stops still masked, at the
+  first point past the limit where it looks for an interrupt (a taken branch, a system instruction),
+  the instruction there not run; the line says where the masking began and for how many cycles. A
+  stretch that unmasks before reaching such a point is not caught. A board whose mcu names no clock
+  rate takes it in cycles only; on an RP board the limit follows clk_sys as the firmware moves it,
+  slice by slice.
+- **`--until-write <addr>[:<len>]`** and **`--until-read <addr>[:<len>]`**: a guest store, or load,
+  reaches the `len` bytes at `addr` (one byte unless given; hex or decimal), a device register as well
+  as memory. They are debugger watchpoints: the core stops before the access, at the instruction that
+  makes it, and the line names the first watched byte it reached. Four ranges at most, together.
+
+`--until-symbol`, `--until-uart`, `--until-write` and `--until-read` may each be given more than once.
+**Each condition is off unless named, and costs a run nothing then**: none adds a test to the
+per-instruction path. A breakpoint and a watchpoint are the debugger's, a fault stop is part of the
+capture a taken fault already makes, and the masking limit is checked by the masking record's own
+hooks (`MSR`, `CPS`, exception entry and return, the start of a run).
+
+A run with a condition runs as a scripted run does — the cores taking turns on this thread, the console
+not read from the terminal, but its input left open — and combines with every scripted option: with
+`--timeout`, whichever comes first ends it. **A run that ends any other way keeps its own status and
+message.** In `--report`, a condition met is the exit `until_met` with an `until` object
+([The exit report](#the-exit-report)). They work on every board `run` takes: the virtual boards, the
+STM32H747I-DISCO (both cores), the Pico and the Pico 2; the Hazard3 harts take `--until-uart` and refuse
+the rest. `--window` and `--gdb` refuse them, as they refuse `--report`.
 
 ### Exploring interleavings and injecting faults
 
@@ -591,6 +647,7 @@ status 1, saying so. Without `--report` nothing of it is built. A Pico 2 at its 
   - `exit`: the guest ended the run with a status of its own — a semihosting `SYS_EXIT` or
     `SYS_EXIT_EXTENDED`, the virtual console's EXIT register;
   - `expect_met`: every `--expect`ed text appeared;
+  - `until_met`: a stop condition was met ([Stop conditions](#stop-conditions)), status 0;
   - `timeout`: `--timeout` came first;
   - `fault_lockup`: a core locked up — a fault it could not take, such as an M0+'s HardFault within
     HardFault or a stack-limit violation at a negative priority, or one benchtop does not model;
@@ -625,6 +682,16 @@ status 1, saying so. Without `--report` nothing of it is built. A Pico 2 at its 
   ([Fault explanations](#fault-explanations)): `count`, the faults over all cores; `ended`, whether
   the run ended on this one; the fault's own fields; and `first`, the first fault in the same fields,
   where there was more than one. Left out where nothing faulted.
+
+- `until`: for `until_met` only, the condition met: `condition` (`symbol`, `uart`, `fault`, `masked`,
+  `write` or `read`), `value` (the option's own, as written; none for `fault`), `core`, `pc` and its
+  `symbol`; then `address`, the first watched byte the access reached, for `write` and `read`; `text`,
+  what the pattern matched, for `uart`; `exception` (`HardFault`, `MemManage`, ...) for `fault`; and
+  `from`, `from_symbol` and `cycles`, where the masking began and how long it had lasted, for `masked`:
+
+  ```
+  "until":{"condition":"write","value":"0x20000100:4","core":0,"pc":"0x10000312","symbol":"tick+0x6","address":"0x20000100"}
+  ```
 
 Addresses are `"0x…"` strings of eight hex digits, so they stay exact in any reader; a field that does
 not apply is left out, never null. The general registers are not reported, but a fault's frame is.

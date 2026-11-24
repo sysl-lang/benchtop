@@ -1,0 +1,91 @@
+module sh.sysl.benchtop.v6m
+@tests
+
+// The engine's half of `benchtop run --until-fault` and `--until-masked` (script/until.sysl) on one
+// core: the fault stop (explain.sysl's `stop_at_faults`) and the masked stop (masking.sysl's
+// `stop_when_masked`). Each case runs under both executors, which must stop at the same place; and each
+// is run unarmed too, which must run exactly as before.
+
+// movs r7, #9: the handler's mark; movs r0, #0; adds r0, #1; cmp r0, #50; bne back to the adds.
+private const MARK: u16 = 0x2709
+private const UDF_0: u16 = 0xDE00
+private const ZERO_R0: u16 = 0x2000
+private const ADD_R0: u16 = 0x3001
+private const CMP_R0_50: u16 = 0x2832
+private const BNE_BACK: u16 = 0xD1FC
+
+// `code` on a core of `kind` with a HardFault handler at 4, its faults recorded, under `exec`, `arm`
+// run before it.
+private stopped(kind: Kind, code: []const u16, arm: Setup, exec: Exec) -> Cpu
+    var c: Cpu
+    c.kind = kind
+    machine(&c, code, [], 0, [[HARD_FAULT, 4]], &nothing)
+    explain_faults(&c, explain_defaults(), None)
+    record_masking(&c)
+    arm(&c)
+    finish(&c, exec)
+    c
+
+// Both executors on `code`, required to stop alike; the threaded core answered.
+private both(kind: Kind, code: []const u16, arm: Setup) -> Cpu
+    var a = stopped(kind, code, arm, &run_match)
+    var b = stopped(kind, code, arm, &run_threaded)
+    assert(a.stop == b.stop && a.pc == b.pc && a.retired == b.retired && a.r[0] == b.r[0] && a.r[7] == b.r[7], s"the executors agree: pc 0x${a.pc} and 0x${b.pc}, retired ${a.retired} and ${b.retired}")
+    assert(stopped_at_fault(&a) == stopped_at_fault(&b) && stopped_masked(&a) == stopped_masked(&b), "and on why")
+    stop_explaining(&a)
+    stop_masking(&a)
+    b
+
+private unarmed(c: *Cpu) = ()
+private at_faults(c: *Cpu) = assert(stop_at_faults(c), "the core records its faults")
+
+@test("--until-fault: the core stops as the fault is taken, at its handler's first instruction, which has not run; unarmed, the handler runs as before")
+until_fault_stop()
+    // 0: udf; 2: bkpt; 4: movs r7, #9 (the handler); 6: bkpt.
+    val code: [4]u16 = [UDF_0, BKPT, MARK, BKPT]
+    for kind in [Kind.V6m, Kind.V8mMain]
+        var c = both(kind, code[..], &at_faults)
+        assert(c.stop == Stop.Breakpoint && c.pc == 4 && c.ipsr == HARD_FAULT && c.r[7] == 0, s"stopped at the handler: pc 0x${c.pc}, r7 ${c.r[7]}")
+        assert(stopped_at_fault(&c) && faults_taken(&c) == 1, "the stop is the fault's, and the fault is recorded")
+        stop_explaining(&c)
+        stop_masking(&c)
+
+        var plain = both(kind, code[..], &unarmed)
+        assert(plain.stop == Stop.Breakpoint && plain.pc == 6 && plain.r[7] == 9 && !stopped_at_fault(&plain), s"the handler ran: pc 0x${plain.pc}")
+        stop_explaining(&plain)
+        stop_masking(&plain)
+
+    // Armed, with no fault taken: the run is the unarmed one.
+    val clean: [2]u16 = [MARK, BKPT]
+    var quiet = both(Kind.V6m, clean[..], &at_faults)
+    assert(quiet.stop == Stop.Breakpoint && quiet.pc == 2 && quiet.r[7] == 9 && !stopped_at_fault(&quiet), "no fault, no stop")
+    stop_explaining(&quiet)
+    stop_masking(&quiet)
+
+private masked_20(c: *Cpu) = assert(stop_when_masked(c, 20), "the core records masking")
+private masked_1000(c: *Cpu) = assert(stop_when_masked(c, 1000), "the core records masking")
+
+@test("--until-masked: a core masked longer than the limit stops at the first point it looks for an interrupt past it, still masked; one masked for less, or unarmed, runs to its end")
+until_masked_stop()
+    // 0: cpsid i; movs r0, #0; 4: adds r0, #1; cmp r0, #50; bne 4; cpsie i; bkpt.
+    val code: [7]u16 = [CPSID, ZERO_R0, ADD_R0, CMP_R0_50, BNE_BACK, CPSIE, BKPT]
+    for kind in [Kind.V6m, Kind.V8mMain]
+        var c = both(kind, code[..], &masked_20)
+        assert(c.stop == Stop.Breakpoint && c.primask == 1 && c.r[0] < 50 && c.pc == 4, s"stopped masked in the loop: pc 0x${c.pc}, r0 ${c.r[0]}")
+        val (from, n) = stopped_masked(&c).unwrap()
+        assert(from == 0 && n > 20 && n <= 24, s"masked from 0x$from for $n cycles")
+        stop_explaining(&c)
+        stop_masking(&c)
+
+        val arms: [2]Setup = [&masked_1000, &unarmed]
+        for arm in arms
+            var long = both(kind, code[..], arm)
+            assert(long.stop == Stop.Breakpoint && long.pc == 12 && long.r[0] == 50 && long.primask == 0 && stopped_masked(&long).is_none(), s"ran to the end: pc 0x${long.pc}")
+            stop_explaining(&long)
+            stop_masking(&long)
+
+    // A core that records no masking is not armed.
+    var bare: Cpu
+    bare.kind = Kind.V6m
+    machine(&bare, code[..], [], 0, [], &nothing)
+    assert(!stop_when_masked(&bare, 20) && !stop_at_faults(&bare), "nothing to arm on")
