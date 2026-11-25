@@ -319,6 +319,8 @@ struct Rp2040
     i2c: I2cBus
     // What the board's parts watch of the GPIOs (`chip/parts.sysl`).
     watch: PinWatch
+    // The clocks deep sleep has stopped (`gate`, `GATE_*`); 0 whenever a core runs.
+    gated: u32
 
     /** Power-on, with core 1 in the boot ROM; the I2C parts stay on the workbench, and the board's
      * parts go on watching the pins.
@@ -360,10 +362,12 @@ struct Rp2040
             self.rosc_rest += cycles * ROSC_HZ_RP2040
             self.rosc.advance(self.rosc_rest / sys)
             self.rosc_rest %= sys
-        if self.rtc.enabled() then self.advance_rtc(cycles, sys)
+        // In deep sleep (`gate`) a device whose clock is stopped is passed nothing.
+        val stop = self.gated
+        if self.rtc.enabled() && stop & GATE_RTC == 0 then self.advance_rtc(cycles, sys)
         // No debugger halts a core, so no PAUSE applies.
         val ticks = self.watchdog.advance(ref_cycles)
-        self.timer.advance(ticks, 0)
+        self.timer.advance(if stop & GATE_TIMER0 == 0 then ticks else 0, 0)
         self.watchdog_fired()
         if self.uarts[0].active() || self.uarts[1].active() then self.advance_lines(cycles, sys)
         if self.pwm.enabled != 0 then self.advance_pwm(cycles)
@@ -528,14 +532,17 @@ struct Rp2040
             val total = u128(self.peri_rest) + u128(cycles) * u128(peri)
             left = u64(total / u128(sys)) * UART_UNITS_PER_CYCLE
             self.peri_rest = u64(total % u128(sys))
-        if left < self.uarts[0].until_event() && left < self.uarts[1].until_event()
-            self.uarts[0].pass(left)
-            self.uarts[1].pass(left)
+        // A UART whose clock deep sleep has stopped (`gate`) is passed nothing and waits on nothing.
+        val stop0 = self.gated & GATE_UART0 != 0
+        val stop1 = self.gated & GATE_UART1 != 0
+        if left < self.line_wait(0) && left < self.line_wait(1)
+            if !stop0 then self.uarts[0].pass(left)
+            if !stop1 then self.uarts[1].pass(left)
             return
         while left > 0
-            val step = min(left, min(self.uarts[0].until_event(), self.uarts[1].until_event()))
-            self.uarts[0].pass(step)
-            self.uarts[1].pass(step)
+            val step = min(left, min(self.line_wait(0), self.line_wait(1)))
+            if !stop0 then self.uarts[0].pass(step)
+            if !stop1 then self.uarts[1].pass(step)
             for k in 0..<2
                 if self.uarts[k].take_started()
                     self.check_frame(k) match
@@ -555,10 +562,35 @@ struct Rp2040
         val peri = self.clocks.peri_hz(self.sources())
         val sys = self.sys_hz()
         if peri == 0 || sys == 0 then return None
-        val units = min(self.uarts[0].until_event(), self.uarts[1].until_event())
+        val units = min(self.line_wait(0), self.line_wait(1))
+        if units == NEVER then return None
         val peri_cycles = (units + UART_UNITS_PER_CYCLE - 1) / UART_UNITS_PER_CYCLE
         val need = u128(peri_cycles) * u128(sys) - u128(self.peri_rest)
         Some(u64((need + u128(peri) - 1) / u128(peri)))
+
+    // UART `k`'s `Uart.until_event`, NEVER (all ones, as while idle) while deep sleep has stopped it.
+    @inline
+    private line_wait(*self, k: usize) -> u64 = if self.gated & (GATE_UART0 << u32(k)) != 0 then NEVER else self.uarts[k].until_event()
+
+    /** Deep sleep on or off (`ArmChip.gate`). On, the clocks stopped are those whose CLOCKS SLEEP_EN bit
+     * is clear (RP2040 datasheet, "Clocks": SLEEP_EN0/SLEEP_EN1): the TIMER stops with CLK_SYS_TIMER
+     * (the watchdog's tick it counts is clk_ref's, which no bit gates); UARTn with CLK_SYS_UARTn or
+     * CLK_PERI_UARTn; the RTC with CLK_RTC_RTC, its own clock.
+     */
+    sleep_gate(*self, deep: bool)
+        if !deep
+            self.gated = 0
+            return
+        val en0 = self.clocks.words[usize(clocks_reg.SLEEP_EN0_OFFSET / 4)]
+        val en1 = self.clocks.words[usize(clocks_reg.SLEEP_EN1_OFFSET / 4)]
+        var g: u32 = 0
+        if en1 & clocks_reg.SLEEP_EN1_CLK_SYS_TIMER_MASK == 0 then g |= GATE_TIMER0
+        val uart0 = clocks_reg.SLEEP_EN1_CLK_SYS_UART0_MASK | clocks_reg.SLEEP_EN1_CLK_PERI_UART0_MASK
+        val uart1 = clocks_reg.SLEEP_EN1_CLK_SYS_UART1_MASK | clocks_reg.SLEEP_EN1_CLK_PERI_UART1_MASK
+        if en1 & uart0 != uart0 then g |= GATE_UART0
+        if en1 & uart1 != uart1 then g |= GATE_UART1
+        if en0 & clocks_reg.SLEEP_EN0_CLK_RTC_RTC_MASK == 0 then g |= GATE_RTC
+        self.gated = g
 
     // Why the frame UART `k` has just started cannot be shown as benchtop models it: a GPIO its TX drives
     // has its interrupts enabled, which do not sample a frame's bits.
@@ -941,7 +973,7 @@ rp2040() -> Rp2040 =
         [divider(), divider()], rp.io_bank0_rp2040(), rp.pads_bank0_rp2040(), [rp.uart(), rp.uart()], rp.psm_rp2040(), rp.rosc(),
         rp.sysinfo(), rp.busctrl(false), 0, [0; 1024], [0, 0], r40.ssi(), r40.xip_ctrl(), w25q16jv(), rp.io_qspi_rp2040(), rp.qspi_pads_rp2040(), r40.vreg(), r40.rtc(), 0, true,
         false, false, 0, 0, 0, 0, 0, 0, 0, 0, "", r40.pwm_rp2040(), false, false, rp.spis(),
-        r40.adc("RP2040", adc_reg.CS_AINSEL_MASK, adc_reg.CS_RROBIN_MASK, r40.ADC_GPIO_INPUTS, r40.ADC_BASE_GPIO), 0, r40.analog_in(), i2c_bus(buf()), pin_watch())
+        r40.adc("RP2040", adc_reg.CS_AINSEL_MASK, adc_reg.CS_RROBIN_MASK, r40.ADC_GPIO_INPUTS, r40.ADC_BASE_GPIO), 0, r40.analog_in(), i2c_bus(buf()), pin_watch(), 0)
 
 // An SPI's MISO is the level its RX pin reads (`Rp2350`'s SpiHost); the parts that hear the GPIOs
 // hear the edge first.
@@ -970,11 +1002,14 @@ impl ArmChip for Rp2040
         self.watchdog.counter.ticks_to_fire(0) match
             Some(n) -> due = self.ticks_to_cycles(n)
             None -> ()
-        self.timer.next_alarm(0) match
-            Some(n) -> due = earliest(due, self.ticks_to_cycles(n))
-            None -> ()
+        // In deep sleep a device whose clock is stopped (`gate`) makes no event.
+        if self.gated & GATE_TIMER0 == 0
+            self.timer.next_alarm(0) match
+                Some(n) -> due = earliest(due, self.ticks_to_cycles(n))
+                None -> ()
         if self.adc.wakes() then due = earliest(due, self.adc_due())
-        earliest(earliest(earliest(earliest(due, self.line_due()), self.rtc_due()), self.pwm_due()), self.i2c_due())
+        if self.gated & GATE_RTC == 0 then due = earliest(due, self.rtc_due())
+        earliest(earliest(earliest(due, self.line_due()), self.pwm_due()), self.i2c_due())
 
     load(*self, core: u32, a: u32, width: u32) -> Result[u32, string]
         // The board maps the ROM on the cores' fast path; an access that reaches the bus reads the same bytes.
@@ -1060,6 +1095,7 @@ impl ArmChip for Rp2040
     serial_due(*self, k: u32) -> Option[u64] = if self.uarts[usize(k)].sending() then self.uart_due() else None
     clock_rate(*self) -> u64 = self.sys_hz()
     drive_pin(*self, n: u32, level: Option[bool]) = self.drive_from_outside(n, level)
+    gate(*self, deep: bool) = self.sleep_gate(deep)
 
 // Whether `a` is USBCTRL's SIE_CTRL, through any of its aliases.
 private is_sie_ctrl(a: u32) -> bool = a >= usb_reg.BASE && a < usb_reg.BASE + WINDOW_RP2040 && (a - usb_reg.BASE) & 0xFFC == usb_reg.SIE_CTRL_OFFSET

@@ -200,6 +200,25 @@ trait ArmChip
      * (`drive_from_outside`).
      */
     drive_pin(*self, n: u32, level: Option[bool])
+    /** Whether the chip is in deep sleep from now until the next call: while it is, every clock whose
+     * CLOCKS SLEEP_EN bit is clear is stopped (`GATE_*`), and the devices on it make no progress and
+     * raise no event. The board turns it on only for a span with both cores asleep in deep sleep
+     * (`deep_asleep`), and off again before a core runs.
+     */
+    gate(*self, deep: bool)
+
+// The clocks the chip stops in deep sleep (`ArmChip.gate`), one bit each: every TICKS generator
+// (clk_ref to TICKS, the RP2350's), each TIMER's (the RP2040's one TIMER is TIMER0), each UART's (its
+// clk_sys or its clk_peri), the watchdog's counter, the SIO's RISC-V platform timer, and the RP2040's
+// RTC (clk_rtc).
+private[chip] const GATE_TICKS: u32 = 0x1
+private[chip] const GATE_TIMER0: u32 = 0x2
+private[chip] const GATE_TIMER1: u32 = 0x4
+private[chip] const GATE_UART0: u32 = 0x8
+private[chip] const GATE_UART1: u32 = 0x10
+private[chip] const GATE_WATCHDOG: u32 = 0x20
+private[chip] const GATE_SIO: u32 = 0x40
+private[chip] const GATE_RTC: u32 = 0x80
 
 struct ArmBoard[C: ArmChip = Rp2350]
     chip: C
@@ -593,10 +612,15 @@ impl[C: ArmChip] ArmBoard[C]
         for k in 0..<2 do if self.started[k] && !self.cores[k].sleeping then return false
         true
 
-    // The cycles until a device event or a sleeping core's SysTick could wake a core.
+    // The cycles until a device event or a sleeping core's SysTick could wake a core. In deep sleep
+    // (`deep_asleep`) neither SysTick nor a device whose clock the chip stops is one.
     private[chip] next_wake(*self) -> Option[u64]
+        val deep = self.deep_asleep()
+        self.chip.gate(deep)
         var due = earliest(self.chip.due(), self.next_usb_frame())
+        self.chip.gate(false)
         if self.line_late != 0 then due = earliest(due, self.lines_due())
+        if deep then return due
         for k in 0..<2
             if !self.started[k] then continue
             val c = &self.cores[k]
@@ -604,14 +628,33 @@ impl[C: ArmChip] ArmBoard[C]
             if t != NEVER then due = earliest(due, Some(t - arm.clock(c, c.retired)))
         due
 
-    // Both cores sleep through `cycles`, the chip with them; a core whose SysTick is due wakes.
+    // Both cores sleep through `cycles`, the chip with them; a core whose SysTick is due wakes. In deep
+    // sleep the cores' SysTicks, on the processor clock, stop for the span, and so does every device
+    // whose SLEEP_EN bit is clear (`ArmChip.gate`).
     private sleep(*self, cycles: u64)
+        val deep = self.deep_asleep()
         for k in 0..<2
             if !self.started[k] then continue
             val c = &self.cores[k]
-            arm.wake_by(c, arm.clock(c, c.retired) + cycles)
+            val now = arm.clock(c, c.retired)
+            if deep then arm.stop_ticks(c, now, cycles)
+            arm.wake_by(c, now + cycles)
+        self.chip.gate(deep)
         self.chip.pass(cycles)
+        self.chip.gate(false)
         self.settle()
+
+    /** Whether the chip is in deep sleep: every started core asleep in `WFI` or `WFE` with SCR.SLEEPDEEP
+     * set. A core that has not started (held in reset) does not keep the chip out of it.
+     */
+    deep_asleep(*self) -> bool
+        var any = false
+        for k in 0..<2
+            if !self.started[k] then continue
+            val c = &self.cores[k]
+            if !c.sleeping || c.scr & arm.SCR_SLEEPDEEP == 0 then return false
+            any = true
+        any
 
     // After the chip has moved: the bytes UART0 sent, core 1's launch, and every core's interrupts.
     private settle(*self)

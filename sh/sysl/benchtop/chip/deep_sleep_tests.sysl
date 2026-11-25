@@ -1,0 +1,294 @@
+module sh.sysl.benchtop.chip
+@tests
+
+import sh.sysl.benchtop.v6m as arm
+import sh.sysl.benchtop.v6m.Stop
+import sh.sysl.rp2350.clocks as clk50
+import sh.sysl.rp2350.powman as pm
+import sh.sysl.rp2350.sio as sio50
+import sh.sysl.rp2350.ticks as ticks50
+import sh.sysl.rp2350.timer0 as tm0
+import sh.sysl.rp2350.timer1 as tm1
+import sh.sysl.rp2350.uart0 as u50
+import sh.sysl.rp2040.clocks as clk40
+import sh.sysl.rp2040.timer as tm40
+import sysl.fmt.hex
+
+// Deep sleep: with every started core asleep in WFI or WFE with SCR.SLEEPDEEP set, the chip stops each
+// clock whose CLOCKS SLEEP_EN bit is clear until a core wakes, and the cores' SysTicks stop with the
+// processor clock. Each board runs hello_serial for 5 ms, so that the SDK has set up the clocks, TICKS
+// and UART0, then parks core 0 in its own code with PRIMASK set and every interrupt disabled: only the
+// interrupt a test enables wakes it, without being taken.
+
+private val DS_HELLO50 = embed("../../../../examples/pico2/hello_serial.elf")
+private val DS_HELLO40 = embed("../../../../examples/pico/hello_serial.elf")
+private val DS_SRAM50 = SramMap(0x20000000, 520 * 1024)
+private val DS_SRAM40 = SramMap(0x20000000, 264 * 1024)
+
+private const DS_CODE: u32 = 0x20030000
+private const DS_CODE1: u32 = 0x20030100
+// wfi; bkpt; b .
+private val DS_WFI = [0xBF30u16, 0xBE00, 0xE7FE]
+// wfe; bkpt; b .
+private val DS_WFE = [0xBF20u16, 0xBE00, 0xE7FE]
+// wfi; b . (a core that runs on once woken)
+private val DS_WAKE_AND_RUN = [0xBF30u16, 0xE7FE]
+// Where the `b .` of DS_WFI and DS_WFE is.
+private const DS_SPIN: u32 = DS_CODE + 4
+
+private const DS_PW: u32 = 0x5AFE0000
+// POWMAN_IRQ_TIMER (`intctrl.h`).
+private const DS_AON_IRQ: u32 = 45
+// SYST_CSR's COUNTFLAG: SysTick has reached 0 since CSR was last read.
+private const DS_COUNTFLAG: u32 = 0x10000
+// skiff's `deep_stop`: every SLEEP_EN bit clear but POWMAN's and the SIO's.
+private const DS_EN0_SKIFF: u32 = clk50.SLEEP_EN0_CLK_SYS_SIO_MASK | clk50.SLEEP_EN0_CLK_SYS_POWMAN_MASK | clk50.SLEEP_EN0_CLK_REF_POWMAN_MASK
+// The microseconds a timer may move while deep sleep stops it: the quanta before the board sees both
+// cores asleep and after the wake, a few thousand clk_sys cycles.
+private const DS_SLACK_US: u32 = 50
+
+private ds_put[C: ArmChip](b: &ArmBoard[C], at: u32, code: []const u16)
+    for i in 0..<code.len
+        b.mem.ram[at - b.map.base + 2 * u32(i)] = u8.wrap(code[i])
+        b.mem.ram[at - b.map.base + 2 * u32(i) + 1] = u8(code[i] >> 8)
+
+// Core `c` at `at`, awake, PRIMASK set, every interrupt disabled and none pending, SCR.SLEEPDEEP as
+// `deep` says, and its SysTick counting down from 0xFFFFFF with no TICKINT.
+private ds_park(c: *arm.Cpu, at: u32, deep: bool)
+    c.pc = at
+    c.stop = Stop.Running
+    c.sleeping = false
+    c.on_event = false
+    c.event = false
+    c.primask = 1
+    // The RP2350's ROM leaves core 1's MPU on over a map where SRAM is execute-never.
+    if c.security then arm.store32(c, 0xE000ED94, 0)
+    for w in 0u32..<2
+        arm.nvic_write(c, arm.NVIC_ICER + 4 * w, 0xFFFFFFFF)
+        arm.nvic_write(c, arm.NVIC_ICPR + 4 * w, 0xFFFFFFFF)
+    c.scr = if deep then arm.SCR_SLEEPDEEP else 0
+    arm.store32(c, arm.SYST_RVR, 0xFFFFFF)
+    arm.store32(c, arm.SYST_CVR, 0)
+    arm.store32(c, arm.SYST_CSR, 5)
+
+// Enable `lines` (bit n for IRQ n) in core `c`'s NVIC.
+private ds_enable(c: *arm.Cpu, lines: u64)
+    arm.nvic_write(c, arm.NVIC_ISER, u32.wrap(lines))
+    arm.nvic_write(c, arm.NVIC_ISER + 4, u32(lines >> 32))
+
+// A Pico 2 with core 0 parked at DS_CODE in `code`, core 1 asleep in the ROM's wait, SCR.SLEEPDEEP on
+// each as `deep0` and `deep1` say, SLEEP_EN0 and SLEEP_EN1 `en0` and `en1`, TIMER1's tick running as
+// TIMER0's, and POWMAN's always-on timer running.
+private ds_board(code: []const u16, deep0: bool, deep1: bool, en0: u32, en1: u32) -> &ArmBoard
+    val b = arm_board(DS_SRAM50)
+    b.boot(DS_HELLO50).unwrap()
+    b.run(5 * 150000)
+    assert(b.finish_sending(), b.refused)
+    assert(b.started[1] && b.cores[1].sleeping, "core 1 asleep in the boot ROM")
+    ds_put(b, DS_CODE, code)
+    ds_park(&b.cores[0], DS_CODE, deep0)
+    b.cores[1].scr = if deep1 then arm.SCR_SLEEPDEEP else 0
+    val p = &b.chip
+    p.write(0, ticks50.BASE + ticks50.TIMER1_CYCLES_OFFSET, 4, p.read(0, ticks50.BASE + ticks50.TIMER0_CYCLES_OFFSET, 4).unwrap()).unwrap()
+    p.write(0, ticks50.BASE + ticks50.TIMER1_CTRL_OFFSET, 4, 1).unwrap()
+    p.write(0, clk50.BASE + clk50.SLEEP_EN0_OFFSET, 4, en0).unwrap()
+    p.write(0, clk50.BASE + clk50.SLEEP_EN1_OFFSET, 4, en1).unwrap()
+    // The LPOSC at power-on, 32 kHz stated: 1.024 ms a millisecond of real time.
+    p.write(0, pm.BASE + pm.LPOSC_FREQ_KHZ_FRAC_OFFSET, 4, DS_PW).unwrap()
+    p.write(0, pm.BASE + pm.TIMER_OFFSET + 0x2000, 4, DS_PW | pm.TIMER_RUN_MASK).unwrap()
+    p.write(0, pm.BASE + pm.INTE_OFFSET, 4, DS_PW | pm.INTE_TIMER_MASK).unwrap()
+    b
+
+// The always-on alarm 1024 of its milliseconds on, a second of clk_sys, with POWMAN_IRQ_TIMER enabled in
+// core `k`'s NVIC.
+private ds_alarm(b: &ArmBoard, k: usize)
+    val p = &b.chip
+    p.write(0, pm.BASE + pm.ALARM_TIME_15TO0_OFFSET, 4, DS_PW | u32(p.powman.time_ms() + 1024)).unwrap()
+    p.write(0, pm.BASE + pm.TIMER_OFFSET + 0x2000, 4, DS_PW | pm.TIMER_ALARM_ENAB_MASK).unwrap()
+    ds_enable(&b.cores[k], 1u64 << DS_AON_IRQ)
+
+private ds_timer(b: &ArmBoard, i: u32) -> u32 = b.chip.read(0, (if i == 0 then tm0.BASE else tm1.BASE) + tm0.TIMERAWL_OFFSET, 4).unwrap()
+
+// What a run of the board shows: the change in each TIMER, whether core 0's SysTick reached 0 and how
+// far it counted down (mod its period), the clk_sys cycles that passed, and the run's end.
+private struct DsSpan
+    timer0: u32
+    timer1: u32
+    wrapped: bool
+    counted: u32
+    cycles: u64
+    end: RunEnd
+
+private ds_span(b: &ArmBoard, budget: u64) -> DsSpan
+    val t0 = ds_timer(b, 0)
+    val t1 = ds_timer(b, 1)
+    _ = arm.load32(&b.cores[0], arm.SYST_CSR)
+    val v = arm.load32(&b.cores[0], arm.SYST_CVR)
+    val start = b.chip.now
+    val end = b.run(budget)
+    val wrapped = arm.load32(&b.cores[0], arm.SYST_CSR) & DS_COUNTFLAG != 0
+    val counted = (v -% arm.load32(&b.cores[0], arm.SYST_CVR)) & 0xFFFFFF
+    val cycles = b.chip.now - start
+    DsSpan(ds_timer(b, 0) -% t0, ds_timer(b, 1) -% t1, wrapped, counted, cycles, end)
+
+// About `us` microseconds, within 1%.
+private ds_about(got: u32, us: u32) -> bool = got >= us - us / 100 && got <= us + us / 100
+
+@test("in skiff's deep_stop, every SLEEP_EN bit clear but POWMAN's and the SIO's and SLEEPDEEP on both cores, SysTick, TIMER0, TIMER1 and UART0 stand still while the always-on timer runs to its alarm, which wakes core 0; awake, each goes on from where it stood")
+ds_deep_stop()
+    val b = ds_board(DS_WFI, true, true, DS_EN0_SKIFF, 0)
+    ds_alarm(b, 0)
+    // A character for UART0, whose frame at 115200 baud takes 87 us.
+    b.chip.write(0, u50.BASE + u50.UARTDR_OFFSET, 4, 0x41).unwrap()
+    val sent = b.console.len()
+    val aon = b.chip.powman.time_ms()
+    val hz = b.chip.sys_hz()
+    val s = ds_span(b, 2 * hz)
+    assert(s.end == RunEnd.Breakpoint && b.cores[0].pc == DS_CODE + 2, s"${s.end} ${b.refused} at 0x${hex(b.cores[0].pc, 8)}")
+    assert(b.chip.powman.time_ms() >= aon + 1024, s"the always-on timer at ${b.chip.powman.time_ms()}, from $aon")
+    assert(s.cycles >= hz - hz / 100 && s.cycles <= hz + hz / 100, s"${s.cycles} cycles at $hz Hz")
+    assert(s.timer0 <= DS_SLACK_US && s.timer1 <= DS_SLACK_US, s"TIMER0 moved ${s.timer0} us, TIMER1 ${s.timer1} us")
+    assert(!s.wrapped && s.counted <= 10000, s"SysTick counted ${s.counted}, wrapped ${s.wrapped}")
+    assert(b.console.len() == sent && b.chip.uarts[0].sending(), "UART0's frame is still on the line")
+    // Awake, 10 ms on: each counts the 10 ms, and the frame goes out.
+    b.cores[0].pc = DS_SPIN
+    b.cores[0].stop = Stop.Running
+    val r = ds_span(b, hz / 100)
+    assert(r.end == RunEnd.Budget, s"${r.end} ${b.refused}")
+    assert(ds_about(r.timer0, 10000) && ds_about(r.timer1, 10000), s"TIMER0 ${r.timer0} us, TIMER1 ${r.timer1} us")
+    assert(ds_about(r.counted, u32(hz / 100)), s"SysTick counted ${r.counted}")
+    assert(b.console.len() == sent + 1 && b.console.view()[sent] == 0x41, "UART0 sent the character once awake")
+
+@test("in deep sleep with SLEEP_EN as at power-on, every bit set, TIMER0, TIMER1 and UART0 count through the second to the alarm; SysTick, on the processor clock, still stops")
+ds_deep_all_enabled()
+    val b = ds_board(DS_WFI, true, true, 0xFFFFFFFF, 0x7FFFFFFF)
+    ds_alarm(b, 0)
+    b.chip.write(0, u50.BASE + u50.UARTDR_OFFSET, 4, 0x41).unwrap()
+    val sent = b.console.len()
+    val s = ds_span(b, 2 * b.chip.sys_hz())
+    assert(s.end == RunEnd.Breakpoint, s"${s.end} ${b.refused}")
+    assert(ds_about(s.timer0, 1000000) && ds_about(s.timer1, 1000000), s"TIMER0 ${s.timer0} us, TIMER1 ${s.timer1} us")
+    assert(!s.wrapped && s.counted <= 10000, s"SysTick counted ${s.counted}, wrapped ${s.wrapped}")
+    assert(b.console.len() == sent + 1, "UART0 sent the character asleep")
+
+@test("in deep sleep with only CLK_REF_TICKS and CLK_SYS_TIMER0 set in SLEEP_EN1, TIMER0 counts through it and TIMER1 stands still")
+ds_deep_timer0_enabled()
+    val b = ds_board(DS_WFI, true, true, DS_EN0_SKIFF, clk50.SLEEP_EN1_CLK_REF_TICKS_MASK | clk50.SLEEP_EN1_CLK_SYS_TIMER0_MASK)
+    ds_alarm(b, 0)
+    val s = ds_span(b, 2 * b.chip.sys_hz())
+    assert(s.end == RunEnd.Breakpoint, s"${s.end} ${b.refused}")
+    assert(ds_about(s.timer0, 1000000) && s.timer1 <= DS_SLACK_US, s"TIMER0 ${s.timer0} us, TIMER1 ${s.timer1} us")
+
+@test("with CLK_SYS_TIMER0 set but CLK_REF_TICKS clear, TIMER0's tick generator stops, and TIMER0 with it")
+ds_deep_ticks_stopped()
+    val b = ds_board(DS_WFI, true, true, DS_EN0_SKIFF, clk50.SLEEP_EN1_CLK_SYS_TIMER0_MASK | clk50.SLEEP_EN1_CLK_SYS_TIMER1_MASK)
+    ds_alarm(b, 0)
+    val s = ds_span(b, 2 * b.chip.sys_hz())
+    assert(s.end == RunEnd.Breakpoint, s"${s.end} ${b.refused}")
+    assert(s.timer0 <= DS_SLACK_US && s.timer1 <= DS_SLACK_US, s"TIMER0 ${s.timer0} us, TIMER1 ${s.timer1} us")
+
+@test("SLEEPDEEP on core 0 only, core 1 asleep in the ROM with it clear: no deep sleep, so with every SLEEP_EN bit clear the timers and SysTick count on")
+ds_one_core_deep()
+    val b = ds_board(DS_WFI, true, false, DS_EN0_SKIFF, 0)
+    ds_alarm(b, 0)
+    val s = ds_span(b, 2 * b.chip.sys_hz())
+    assert(s.end == RunEnd.Breakpoint, s"${s.end} ${b.refused}")
+    assert(ds_about(s.timer0, 1000000) && ds_about(s.timer1, 1000000), s"TIMER0 ${s.timer0} us, TIMER1 ${s.timer1} us")
+    assert(s.wrapped, "SysTick reached 0 in the second")
+
+@test("SLEEPDEEP clear on both cores: ordinary sleep, and with every SLEEP_EN bit clear the timers and SysTick count on")
+ds_ordinary_sleep()
+    val b = ds_board(DS_WFI, false, false, DS_EN0_SKIFF, 0)
+    ds_alarm(b, 0)
+    val s = ds_span(b, 2 * b.chip.sys_hz())
+    assert(s.end == RunEnd.Breakpoint, s"${s.end} ${b.refused}")
+    assert(ds_about(s.timer0, 1000000) && ds_about(s.timer1, 1000000), s"TIMER0 ${s.timer0} us, TIMER1 ${s.timer1} us")
+    assert(s.wrapped, "SysTick reached 0 in the second")
+
+@test("a core asleep in WFE takes the chip into deep sleep as WFI does: the timers and SysTick stand still to the alarm")
+ds_deep_wfe()
+    val b = ds_board(DS_WFE, true, true, DS_EN0_SKIFF, 0)
+    ds_alarm(b, 0)
+    val s = ds_span(b, 2 * b.chip.sys_hz())
+    assert(s.end == RunEnd.Breakpoint && b.cores[0].pc == DS_CODE + 2, s"${s.end} ${b.refused}")
+    assert(s.cycles >= b.chip.sys_hz() * 99 / 100, s"${s.cycles} cycles")
+    assert(s.timer0 <= DS_SLACK_US && s.timer1 <= DS_SLACK_US, s"TIMER0 ${s.timer0} us, TIMER1 ${s.timer1} us")
+    assert(!s.wrapped && s.counted <= 10000, s"SysTick counted ${s.counted}")
+
+@test("in deep sleep with nothing to wake it the run ends asleep and time passing outside moves no stopped timer; a word in core 0's SIO FIFO wakes it, and the timers count again")
+ds_deep_sio_wake()
+    val b = ds_board(DS_WFI, true, true, DS_EN0_SKIFF, 0)
+    // Core 0's FIFO emptied of what the boot left in it, its sticky flags cleared, and SIO_IRQ_FIFO
+    // enabled with nothing pending.
+    while b.chip.read(0, sio50.BASE + sio50.FIFO_ST_OFFSET, 4).unwrap() & sio50.FIFO_ST_VLD_MASK != 0
+        _ = b.chip.read(0, sio50.BASE + sio50.FIFO_RD_OFFSET, 4).unwrap()
+    b.chip.write(0, sio50.BASE + sio50.FIFO_ST_OFFSET, 4, 0xFF).unwrap()
+    arm.nvic_write(&b.cores[0], arm.NVIC_ICPR, 0xFFFFFFFF)
+    ds_enable(&b.cores[0], 1u64 << SIO_IRQ_FIFO)
+    val hz = b.chip.sys_hz()
+    val first = ds_span(b, hz / 100)
+    assert(first.end == RunEnd.Asleep && b.deep_asleep(), s"${first.end} ${b.refused}")
+    val t0 = ds_timer(b, 0)
+    b.wait_outside(hz / 10)
+    assert(ds_timer(b, 0) -% t0 <= DS_SLACK_US, s"TIMER0 moved ${ds_timer(b, 0) -% t0} us in 100 ms outside")
+    b.chip.write(1, sio50.BASE + sio50.FIFO_WR_OFFSET, 4, 0x5150).unwrap()
+    val woke = ds_span(b, hz / 100)
+    assert(woke.end == RunEnd.Breakpoint && woke.timer0 <= DS_SLACK_US, s"${woke.end} ${b.refused}: TIMER0 ${woke.timer0} us")
+    b.cores[0].pc = DS_SPIN
+    b.cores[0].stop = Stop.Running
+    val r = ds_span(b, hz / 100)
+    assert(ds_about(r.timer0, 10000) && ds_about(r.timer1, 10000), s"TIMER0 ${r.timer0} us, TIMER1 ${r.timer1} us")
+
+@test("both cores in deep sleep, core 1 woken by the alarm while core 0 sleeps on: the timers stand still to the alarm and count from it, though core 0 never wakes")
+ds_one_wakes()
+    val b = ds_board(DS_WFI, true, true, DS_EN0_SKIFF, 0)
+    ds_put(b, DS_CODE1, DS_WAKE_AND_RUN)
+    ds_park(&b.cores[1], DS_CODE1, true)
+    ds_alarm(b, 1)
+    val hz = b.chip.sys_hz()
+    val s = ds_span(b, 2 * hz)
+    assert(s.end == RunEnd.Budget && b.cores[0].sleeping && !b.cores[1].sleeping, s"${s.end} ${b.refused}")
+    assert(s.cycles >= 2 * hz, s"${s.cycles}")
+    assert(ds_about(s.timer0, 1000000) && ds_about(s.timer1, 1000000), s"TIMER0 ${s.timer0} us, TIMER1 ${s.timer1} us: a second stood still, a second counted")
+    assert(s.wrapped, "core 0's SysTick counts again once the chip is out of deep sleep")
+
+@test("SLEEP_EN0, SLEEP_EN1, WAKE_EN0 and WAKE_EN1 read as at power-on on both chips: every clock enabled")
+ds_enables_at_power_on()
+    var p = rp2350()
+    val at50 = [clk50.WAKE_EN0_OFFSET, clk50.WAKE_EN1_OFFSET, clk50.SLEEP_EN0_OFFSET, clk50.SLEEP_EN1_OFFSET]
+    val is50: [4]u32 = [0xFFFFFFFF, 0x7FFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF]
+    for i in 0..<4
+        val got = p.read(0, clk50.BASE + at50[i], 4).unwrap()
+        assert(got == is50[i], s"RP2350 0x${hex(at50[i])}: 0x${hex(got)}")
+    var q = rp2040()
+    val at40 = [clk40.WAKE_EN0_OFFSET, clk40.WAKE_EN1_OFFSET, clk40.SLEEP_EN0_OFFSET, clk40.SLEEP_EN1_OFFSET]
+    val is40: [4]u32 = [0xFFFFFFFF, 0x7FFF, 0xFFFFFFFF, 0x7FFF]
+    for i in 0..<4
+        val got = q.load(0, clk40.BASE + at40[i], 4).unwrap()
+        assert(got == is40[i], s"RP2040 0x${hex(at40[i])}: 0x${hex(got)}")
+
+@test("on the Pico, deep sleep with CLK_SYS_TIMER clear stops the TIMER while time passes outside, and with it set the TIMER counts through")
+ds_rp2040_deep()
+    val b = pico_board(DS_SRAM40)
+    b.boot(DS_HELLO40).unwrap()
+    b.run(5 * 150000)
+    assert(b.finish_sending(), b.refused)
+    assert(b.started[1] && b.cores[1].sleeping, "core 1 asleep in the boot ROM")
+    ds_put(b, DS_CODE, DS_WFI)
+    ds_park(&b.cores[0], DS_CODE, true)
+    b.cores[1].scr = arm.SCR_SLEEPDEEP
+    b.chip.store(0, clk40.BASE + clk40.SLEEP_EN0_OFFSET, 4, 0).unwrap()
+    b.chip.store(0, clk40.BASE + clk40.SLEEP_EN1_OFFSET, 4, 0).unwrap()
+    val hz = b.chip.clock_rate()
+    val end = b.run(hz / 100)
+    assert(end == RunEnd.Asleep && b.deep_asleep(), s"$end ${b.refused}")
+    val timer = tm40.BASE + tm40.TIMERAWL_OFFSET
+    val t = b.chip.load(0, timer, 4).unwrap()
+    b.wait_outside(hz / 10)
+    val stood = b.chip.load(0, timer, 4).unwrap() -% t
+    assert(stood <= DS_SLACK_US, s"TIMER moved $stood us")
+    b.chip.store(0, clk40.BASE + clk40.SLEEP_EN1_OFFSET, 4, clk40.SLEEP_EN1_CLK_SYS_TIMER_MASK).unwrap()
+    val u = b.chip.load(0, timer, 4).unwrap()
+    b.wait_outside(hz / 10)
+    val counted = b.chip.load(0, timer, 4).unwrap() -% u
+    assert(ds_about(counted, 100000), s"TIMER counted $counted us")

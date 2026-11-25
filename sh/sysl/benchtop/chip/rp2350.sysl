@@ -379,6 +379,8 @@ struct Rp2350
     watch: PinWatch
     // Whether the board's BOOTSEL button is held, pulling the QSPI chip select low (`sio_inputs`).
     bootsel: bool
+    // The clocks deep sleep has stopped (`gate`, `GATE_*`); 0 whenever a core runs.
+    gated: u32
 
     /** Power-on, with core 1 in the boot ROM; the flash keeps its array, as the board's part, the
      * board's memory stays connected, and the wires and I2C parts stay on the workbench.
@@ -461,11 +463,14 @@ struct Rp2350
             self.rosc_rest += cycles * ROSC_HZ
             self.rosc.advance(self.rosc_rest / sys)
             self.rosc_rest %= sys
-        val made = self.ticks.advance(ref_cycles)
+        // In deep sleep (`gate`) a device whose clock is stopped is passed nothing; TICKS stopped makes no
+        // tick for any of them.
+        val stop = self.gated
+        val made = if stop & GATE_TICKS == 0 then self.ticks.advance(ref_cycles) else [0u64; 6]
         for i in 0..<2
             val t = &self.timers[i]
-            t.advance(if t.clk_sys then cycles else made[usize(Tick.Timer0) + i])
-        self.sio.advance_mtime(if self.sio.mtime_full_speed() then cycles else made[usize(Tick.Riscv)])
+            if stop & (GATE_TIMER0 << u32(i)) == 0 then t.advance(if t.clk_sys then cycles else made[usize(Tick.Timer0) + i])
+        if stop & GATE_SIO == 0 then self.sio.advance_mtime(if self.sio.mtime_full_speed() then cycles else made[usize(Tick.Riscv)])
         if self.powman.counting()
             val level = self.powman.reference_gpio() match
                 Some(n) -> self.pin(n).input
@@ -473,7 +478,7 @@ struct Rp2350
             self.powman.advance(cycles, sys, LPOSC_HZ, self.crystal_hz(), level)
         if self.powman.watching() then self.powman.sample(self.pwrup_levels())
         // No debugger halts a core or drives JTAG, so no PAUSE applies.
-        self.watchdog.advance(made[usize(Tick.Watchdog)], 0)
+        self.watchdog.advance(if stop & GATE_WATCHDOG == 0 then made[usize(Tick.Watchdog)] else 0, 0)
         self.watchdog_reset()
         // The UARTs count only while their lines are busy, so an idle UART costs nothing here.
         if self.uarts[0].active() || self.uarts[1].active() then self.advance_lines(cycles, sys)
@@ -524,25 +529,28 @@ struct Rp2350
             self.peri_rest = u64(total % u128(sys))
         // Most steps end before any event: the counts go down and nothing else happens. A PIO block
         // reads the lines' levels, so while one listens each bit is an event too.
+        // A UART whose clock deep sleep has stopped (`gate`) is passed nothing and waits on nothing.
+        val stop0 = self.gated & GATE_UART0 != 0
+        val stop1 = self.gated & GATE_UART1 != 0
         val listening = self.pio.listening
-        if !listening && left < self.uarts[0].until_event() && left < self.uarts[1].until_event()
-            self.uarts[0].pass(left)
-            self.uarts[1].pass(left)
+        if !listening && left < self.line_wait(0) && left < self.line_wait(1)
+            if !stop0 then self.uarts[0].pass(left)
+            if !stop1 then self.uarts[1].pass(left)
             return
         val start = self.now - cycles
         var used: u64 = 0
         while left > 0
-            var step = min(left, min(self.uarts[0].until_event(), self.uarts[1].until_event()))
+            var step = min(left, min(self.line_wait(0), self.line_wait(1)))
             var edge = start
             if listening
-                step = min(step, min(self.uarts[0].until_bit(), self.uarts[1].until_bit()))
+                step = min(step, min(if stop0 then NEVER else self.uarts[0].until_bit(), if stop1 then NEVER else self.uarts[1].until_bit()))
                 edge = line_time(start, used + step, rest, peri, sys)
                 // The blocks run with the old level up to the cycle before the new one.
                 if edge > start && self.pio.running then self.pio_run_to(edge - 1)
             used += step
             // Both lines move through the step before either frame is delivered: a character arriving at
             // its end starts the receiver's timeout there, not a step earlier.
-            val sent = [self.uarts[0].pass(step), self.uarts[1].pass(step)]
+            val sent = [if stop0 then None else self.uarts[0].pass(step), if stop1 then None else self.uarts[1].pass(step)]
             if listening then self.pio.drive(if edge > start then edge - 1 else start, self.inputs_now())
             for k in 0..<2
                 sent[k] match
@@ -567,11 +575,45 @@ struct Rp2350
         val peri = self.clocks.peri_hz(self.sources())
         val sys = self.sys_hz()
         if peri == 0 || sys == 0 then return None
-        val units = min(self.uarts[0].until_event(), self.uarts[1].until_event())
+        val units = min(self.line_wait(0), self.line_wait(1))
+        if units == NEVER then return None
         val peri_cycles = (units + UART_UNITS_PER_CYCLE - 1) / UART_UNITS_PER_CYCLE
         // The first c with (peri_rest + c × peri) / sys reaching peri_cycles.
         val need = u128(peri_cycles) * u128(sys) - u128(self.peri_rest)
         Some(u64((need + u128(peri) - 1) / u128(peri)))
+
+    // UART `k`'s `Uart.until_event`, NEVER (all ones, as while idle) while deep sleep has stopped it.
+    @inline
+    private line_wait(*self, k: usize) -> u64 = if self.gated & (GATE_UART0 << u32(k)) != 0 then NEVER else self.uarts[k].until_event()
+
+    /** Deep sleep on or off (`ArmChip.gate`). On, the clocks stopped are those whose CLOCKS SLEEP_EN bit
+     * is clear (datasheet, "Clocks": SLEEP_EN0/SLEEP_EN1): TICKS's clk_ref (CLK_REF_TICKS) stops every
+     * tick generator; TIMERn stops with CLK_SYS_TIMERn; UARTn with CLK_SYS_UARTn or CLK_PERI_UARTn; the
+     * watchdog with CLK_SYS_WATCHDOG; the SIO's platform timer with CLK_SYS_SIO. POWMAN's always-on
+     * timer is in the always-on domain and runs on.
+     */
+    sleep_gate(*self, deep: bool)
+        if !deep
+            self.gated = 0
+            return
+        val en0 = self.clocks.words[usize(clocks_reg.SLEEP_EN0_OFFSET / 4)]
+        val en1 = self.clocks.words[usize(clocks_reg.SLEEP_EN1_OFFSET / 4)]
+        var g: u32 = 0
+        if en1 & clocks_reg.SLEEP_EN1_CLK_REF_TICKS_MASK == 0 then g |= GATE_TICKS
+        if en1 & clocks_reg.SLEEP_EN1_CLK_SYS_TIMER0_MASK == 0 then g |= GATE_TIMER0
+        if en1 & clocks_reg.SLEEP_EN1_CLK_SYS_TIMER1_MASK == 0 then g |= GATE_TIMER1
+        val uart0 = clocks_reg.SLEEP_EN1_CLK_SYS_UART0_MASK | clocks_reg.SLEEP_EN1_CLK_PERI_UART0_MASK
+        val uart1 = clocks_reg.SLEEP_EN1_CLK_SYS_UART1_MASK | clocks_reg.SLEEP_EN1_CLK_PERI_UART1_MASK
+        if en1 & uart0 != uart0 then g |= GATE_UART0
+        if en1 & uart1 != uart1 then g |= GATE_UART1
+        if en1 & clocks_reg.SLEEP_EN1_CLK_SYS_WATCHDOG_MASK == 0 then g |= GATE_WATCHDOG
+        if en0 & clocks_reg.SLEEP_EN0_CLK_SYS_SIO_MASK == 0 then g |= GATE_SIO
+        self.gated = g
+
+    // Whether a device's count is stopped in deep sleep: its own clock, or the TICKS generator it counts
+    // (`on_ticks`).
+    @inline
+    private stopped(*self, bit: u32, on_ticks: bool) -> bool = self.gated & bit != 0 || (on_ticks && self.gated & GATE_TICKS != 0)
 
     /** The clk_sys cycles until UART `k`'s transmitter has sent everything it will send, or until the DMA
      * gives it more (a busy channel paced by its TX request); None where it sends nothing more, or cannot
@@ -860,15 +902,19 @@ struct Rp2350
     next_event(*self) -> Option[u64]
         var due = self.powman.next_alarm(self.sys_hz(), LPOSC_HZ, self.crystal_hz())
         if self.swcore_off then return due
-        self.watchdog.ticks_to_fire(0) match
-            Some(n) -> due = earliest(due, self.ticks_to_cycles(Tick.Watchdog, n))
-            None -> ()
+        // In deep sleep a device whose clock is stopped (`gate`) makes no event.
+        if !self.stopped(GATE_WATCHDOG, true)
+            self.watchdog.ticks_to_fire(0) match
+                Some(n) -> due = earliest(due, self.ticks_to_cycles(Tick.Watchdog, n))
+                None -> ()
         for i in 0..<2
             val t = self.timers[i]
+            if self.stopped(GATE_TIMER0 << u32(i), !t.clk_sys) then continue
             t.next_alarm() match
                 Some(n) -> due = earliest(due, if t.clk_sys then Some(n) else self.ticks_to_cycles(if i == 0 then Tick.Timer0 else Tick.Timer1, n))
                 None -> ()
         for k in 0u32..<2
+            if self.stopped(GATE_SIO, !self.sio.mtime_full_speed()) then break
             self.sio.mtime_due(k) match
                 Some(n) -> due = earliest(due, if self.sio.mtime_full_speed() then Some(n) else self.ticks_to_cycles(Tick.Riscv, n))
                 None -> ()
@@ -1579,7 +1625,7 @@ rp2350() -> Rp2350 =
         rp.psm(), rp.rosc(), rp.sysinfo(), rp.syscfg(), rp.busctrl(true), rp.glitch_detector(), rp.powman(), rp.accessctrl(), rp.io_qspi(), rp.qspi_pads(),
         rp.xip(), rp.qmi(), qspi_flash(), rp.otp(), rp.trng(), rp.sha256(), 0, false,
         rcp(), dcp(), false, false, None, 0, 0, 0, 0, false, None, 0, 0, 0, 0, 0, 0, [NO_WIRE; GPIO_COUNT], "", rp.rp2350_dma(), None, pwm_rp2350(), false, false, rp.spis(),
-        adc("RP2350A", adc_reg.CS_AINSEL_MASK, adc_reg.CS_RROBIN_MASK, ADC_GPIO_INPUTS, ADC_BASE_GPIO), 0, analog_in(), i2c_bus(buf()), rp.hstx(), 0, None, 0, 0, buf(), false, pin_watch(), false)
+        adc("RP2350A", adc_reg.CS_AINSEL_MASK, adc_reg.CS_RROBIN_MASK, ADC_GPIO_INPUTS, ADC_BASE_GPIO), 0, analog_in(), i2c_bus(buf()), rp.hstx(), 0, None, 0, 0, buf(), false, pin_watch(), false, 0)
 
 /** The RP2350B at power-on: the chip of `rp2350` in the QFN-80 package, whose SYSINFO.PACKAGE_SEL reads 0
  * and whose ADC has eight GPIO inputs, on GPIO 40 to 47, with the temperature sensor on input 8.
@@ -1631,6 +1677,7 @@ impl ArmChip for Rp2350
     serial_due(*self, k: u32) -> Option[u64] = self.sending_due(usize(k))
     clock_rate(*self) -> u64 = self.sys_hz()
     drive_pin(*self, n: u32, level: Option[bool]) = self.drive_from_outside(n, level)
+    gate(*self, deep: bool) = self.sleep_gate(deep)
 
 private[chip] earliest(a: Option[u64], b: Option[u64]) -> Option[u64] = a match
     Some(x) -> b match
