@@ -2,24 +2,43 @@ module sh.sysl.benchtop.virt
 
 import sh.sysl.benchtop.v6m as cpu
 import sh.sysl.benchtop.timing.NEVER
+import sysl.math.gcd
 
 // Shared devices and schedulers use MCU ticks. SysTick, exception state and the
 // instruction executor keep local core cycles; no conversion in the hot loop.
-// A core's tick is `divisor` MCU ticks: its `Machine.configs` entry's, which `configure` gives the
-// core itself, so a core's clock is worked out from the core alone.
+// A core's tick is `divisor / clock_den` MCU ticks, counted from its anchor: its `Machine.configs`
+// entry's whole divisor from the anchor at 0, which `configure` gives the core itself, until a clock
+// switch retunes it (`retune_core`), so a core's clock is worked out from the core alone.
+
+// `n` core ticks of `c`'s as board ticks, rounded down.
+@inline
+private ticks_to_board(c: *cpu.Cpu, n: u64) -> u64 =
+    if c.clock_den <= 1 then n * c.divisor else u64(u128(n) * u128(c.divisor) / u128(c.clock_den))
+
+// `t` board ticks as `c`'s core ticks, rounded down, or up where `up`.
+private board_to_ticks(c: *cpu.Cpu, t: u64, up: bool) -> u64
+    val den = if c.clock_den <= 1 then 1u128 else u128(c.clock_den)
+    val scaled = u128(t) * den
+    val whole = scaled / u128(c.divisor)
+    u64(if up && scaled % u128(c.divisor) != 0 then whole + 1 else whole)
+
+/** The board time at which `c`'s own clock reads `local`. */
+@inline
+private[virt] board_at(c: *cpu.Cpu, local: u64) -> u64
+    if local >= c.anchor_local then return c.anchor_board + ticks_to_board(c, local - c.anchor_local)
+    val back = ticks_to_board(c, c.anchor_local - local)
+    if back >= c.anchor_board then 0 else c.anchor_board - back
 
 @inline
-private[virt] board_time(c: *cpu.Cpu, retired: u64) -> u64 = cpu.clock(c,retired) * c.divisor
-
-@inline
-private[virt] divisor_of(c: *cpu.Cpu) -> u64 = c.divisor
+private[virt] board_time(c: *cpu.Cpu, retired: u64) -> u64 = board_at(c, cpu.clock(c,retired))
 
 // Round toward the next core edge. A peripheral deadline between two core
 // edges becomes observable on the first edge at or after that deadline.
 private[virt] local_time(c: *cpu.Cpu, time: u64) -> u64
     if time == NEVER then return NEVER
-    val divisor = divisor_of(c)
-    time / divisor + (if time % divisor != 0 then 1 else 0)
+    if time >= c.anchor_board then return c.anchor_local + board_to_ticks(c, time - c.anchor_board, true)
+    val back = board_to_ticks(c, c.anchor_board - time, false)
+    if back >= c.anchor_local then 0 else c.anchor_local - back
 
 private[virt] retirement_limit(c: *cpu.Cpu, time: u64) -> u64
     val local = local_time(c,time)
@@ -29,4 +48,23 @@ private[virt] board_wake_by(c: *cpu.Cpu, time: u64) -> bool = cpu.wake_by(c,loca
 
 private[virt] board_next_wake(c: *cpu.Cpu) -> u64
     val local = cpu.next_wake(c)
-    if local == NEVER then NEVER else local * divisor_of(c)
+    if local == NEVER then NEVER else board_at(c, local)
+
+/** Run core `c` at `hz` from its clock now on, on a board whose clock is `board_hz`: the board time
+ * and the core's own clock both carry on from where they are, and each later core tick is
+ * `board_hz / hz` board ticks. SysTick, DWT and every count of the core's own clock follow, since they
+ * count its ticks.
+ */
+private[virt] retune_core(c: *cpu.Cpu, board_hz: u64, hz: u64)
+    require board_hz > 0 && hz > 0, "a clock has a rate"
+    val local = cpu.clock(c, c.retired)
+    val board = board_at(c, local)
+    val g = gcd(board_hz, hz)
+    c.anchor_local = local
+    c.anchor_board = board
+    c.divisor = board_hz / g
+    c.clock_den = hz / g
+
+/** The rate core `c` runs at, on a board whose clock is `board_hz`, to the hertz. */
+private[virt] core_rate(c: *cpu.Cpu, board_hz: u64) -> u64 =
+    u64(u128(board_hz) * u128(if c.clock_den <= 1 then 1 else c.clock_den) / u128(c.divisor))

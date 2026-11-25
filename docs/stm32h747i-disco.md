@@ -45,8 +45,9 @@ chosen revision must be explicit when the board description is introduced.
   core identities, DSP and FPU configuration.
 - Separate instruction decode records for different cores, including serial
   deterministic execution; shared-code writes still invalidate peer records.
-- Per-core `clock-hz` overrides on a shared MCU timebase. Current clock domains
-  require integer divisors (480 MHz / 240 MHz is supported).
+- Per-core `clock-hz` overrides on a shared MCU timebase, which need integer divisors
+  (480 MHz / 240 MHz is supported). On a board with the `stm32h7-rcc`, the RCC sets each
+  core's rate instead, at any ratio to the timebase (below).
 - Local SysTick timing, shared peripheral deadlines, persistent worker pacing,
   snapshots, pause and exact instruction stepping.
 - Regression coverage for 2:1 busy-loop progress in both schedulers, local
@@ -65,10 +66,42 @@ The image targets the common ARMv7E-M single-precision subset, with M4-compatibl
 newlib and PlutoVG; both vectors and code reside in the real internal-flash
 address range. Runtime data uses 512 KB AXI SRAM, with separate stacks.
 
-The boot configuration corresponds to BCM4 disabled in option bytes. The current
-`stm32h7-rcc` adapter implements GCR boot control and the peripheral clock enables;
-oscillator, PLL, reset (`xxxRSTR`), sleep-mode enable (`xxxLPENR`) and other RCC
-accesses fail explicitly. Clock rates are supplied by the description.
+The boot configuration corresponds to BCM4 disabled in option bytes. The
+`stm32h7-rcc` adapter implements GCR boot control, the peripheral clock enables and
+the clock tree; reset (`xxxRSTR`), sleep-mode enable (`xxxLPENR`), CSICFGR, the clock
+interrupts (CIER/CIFR/CICR), BDCR, CSR and the other RCC registers fail explicitly.
+
+**The cores run at HSI's 64 MHz from reset**, and at whatever the firmware then sets.
+RCC_CR's HSI (with HSIDIV), CSI (4 MHz), HSI48 and HSE (the board's crystal, the rcc's
+`hse-hz`: 25 MHz in `mcus/stm32h747.hocon`; with none, HSE never becomes ready) read
+ready as soon as they are on. PLL1, PLL2 and PLL3 take PLLCKSELR's source and DIVMx,
+PLLCFGR and PLLxDIVR/PLLxFRACR, and lock as soon as they are on with a running source,
+a DIVM other than 0 and a DIVN of at least 3; while a PLL is on its DIVM, PLLSRC, its
+PLLCFGR bits (but FRACEN) and its DIVR are ignored, and FRACN is latched as PLLxFRACEN
+rises. PLL1's P output is (source / DIVM) x (DIVN + 1 + FRACN / 8192) / (DIVP + 1).
+RCC_CFGR's SWS follows SW once the chosen source is ready, and a switch to one that is
+not waits for it. The M7 runs at sys_ck / D1CPRE and the M4 at that / HPRE. The
+oscillator and PLL1 that sys_ck runs from stay on when software clears them, as on
+silicon. D1CFGR's D1PPRE, D2CFGR, D3CFGR and the kernel clock muxes D1CCIPR, D2CCIP1R,
+D2CCIP2R and D3CCIPR are stored and time nothing: each peripheral keeps its board-given
+`kernel-clock-hz`.
+
+A write that changes a core's rate retunes the cores: the writer ends its slice and each
+core takes the rate in at its next, its board time carried on unbroken, so SysTick, DWT
+CYCCNT and every count of the core's own cycles follow; the pacing against the host's
+clock counts board time, so a real-time run stays real time at any rate. A rate past what
+PWR's voltage scale allows (400/200 MHz at scale 1, 300/150 at 2, 200/100 at 3) is run
+all the same and noted, as `rcc_undervolted` reads: 480/240 MHz is VOS0's, which the
+DISCO's direct SMPS cannot supply. Not modelled: the clock security system, MCO1/MCO2,
+start-up and lock times (every ready flag rises at the write that allows it), the VCO and
+input-range limits, the PLLs' Q and R outputs, PLL2 and PLL3 as clocks of anything, the
+trims, the domain clocks' stop modes (D1CKRDY and D2CKRDY read 1), and the flash wait
+states (FLASH_ACR is not modelled).
+
+The touch example's DISCO builds (`dsi` and every build above it) set the clocks first,
+in `configure_clocks`: the direct SMPS at scale 1, HSE, PLL1 at 480 MHz, HPRE /2 and the
+switch. The harness build (`h7`) runs on `boards/h747-cores.hocon`, which has no PWR and
+no HSE crystal, and stays at 64 MHz.
 
 The enables are the nine registers AHB3ENR, AHB1ENR, AHB2ENR, AHB4ENR, APB3ENR, APB1LENR,
 APB1HENR, APB2ENR and APB4ENR, in both cores' copies: `RCC_C1_xxxENR` at 0x134-0x154 (the
@@ -172,7 +205,7 @@ are used. Two FT6206 contacts are modeled; desktop pointer input supplies one.
 I2C DMA, IRQ, slave operation and SCL timing remain unsupported.
 
 The demonstration ELF has real flash load addresses and ARMv7E-M instructions,
-but complete physical-board startup is not ready: RCC oscillator/PLL setup, pin-mux setup
+but complete physical-board startup is not ready: flash wait states, pin-mux setup
 and the panel-specific vendor initialization sequence remain to be implemented
 before this example can boot unchanged on a physical Discovery board.
 

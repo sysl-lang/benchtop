@@ -1,0 +1,366 @@
+module sh.sysl.benchtop.virt
+@tests
+
+// The STM32H747's RCC clock tree on the DISCO: the cores at HSI's 64 MHz from reset, the oscillators'
+// ready flags, PLL1 to 480 MHz from the board's 25 MHz HSE as ST's DISCO examples set it, the system
+// clock switch, the D1 prescalers that give the M7 and the M4 their rates, and the cores retuned to
+// what the RCC says, their board time carried on unbroken.
+
+import sh.sysl.benchtop.v6m as cpu
+import sysl.raw.str_cast
+
+private const RCC: u32 = 0x58024400
+private const CR: u32 = RCC + 0x00
+private const HSICFGR: u32 = RCC + 0x04
+private const CFGR: u32 = RCC + 0x10
+private const D1CFGR: u32 = RCC + 0x18
+private const D2CFGR: u32 = RCC + 0x1c
+private const D3CFGR: u32 = RCC + 0x20
+private const PLLCKSELR: u32 = RCC + 0x28
+private const PLLCFGR: u32 = RCC + 0x2c
+private const PLL1DIVR: u32 = RCC + 0x30
+private const PLL1FRACR: u32 = RCC + 0x34
+private const PLL2DIVR: u32 = RCC + 0x38
+private const D2CCIP2R: u32 = RCC + 0x54
+
+private const HSION: u32 = 1 << 0
+private const HSIRDY: u32 = 1 << 2
+private const HSIDIVF: u32 = 1 << 5
+private const CSION: u32 = 1 << 7
+private const CSIRDY: u32 = 1 << 8
+private const RC48ON: u32 = 1 << 12
+private const RC48RDY: u32 = 1 << 13
+private const DOMAINS: u32 = 3 << 14
+private const HSEON: u32 = 1 << 16
+private const HSERDY: u32 = 1 << 17
+private const HSEBYP: u32 = 1 << 18
+private const PLL1ON: u32 = 1 << 24
+private const PLL1RDY: u32 = 1 << 25
+private const PLL2ON: u32 = 1 << 26
+private const PLL2RDY: u32 = 1 << 27
+private const DIVP1EN: u32 = 1 << 16
+private const PLL1FRACEN: u32 = 1 << 0
+
+// PLL1 as the DISCO's examples set it: HSE / 5 = 5 MHz, × 192 = 960 MHz, / 2 = 480 MHz.
+private const DISCO_PLLCKSELR: u32 = (5 << 4) | 2
+private const DISCO_PLL1DIVR: u32 = 191 | (1 << 9) | (1 << 16) | (1 << 24)
+// HPRE /2: the M4 at half the M7.
+private const HPRE_2: u32 = 8
+
+private const PWR_CR3: u32 = 0x5802480c
+private const PWR_D3CR: u32 = 0x58024818
+// The regulator's settling time, in board ticks: 10 µs of the 480 MHz board clock.
+private const RCC_SETTLE: u64 = 4800
+
+private const MHZ: u64 = 1000000
+
+private booted_rcc(description: string) -> &Machine
+    val board = machine()
+    val m = &*board
+    assert(board_from(m, "rcc.hocon", description.bytes).is_ok())
+    boot(m, image_of(m, []).unwrap().view())
+    board
+
+private disco() -> &Machine = booted_rcc(str_cast(embed("../../../../boards/stm32h747-disco.hocon")))
+
+private rd(m: *Machine, a: u32) -> u32 = board_read(m, core0(m), a, 4, 0)
+private wr(m: *Machine, a: u32, v: u32) = board_write(m, core0(m), a, 4, v, 0)
+
+// What the RCC says each core runs at.
+private rates(m: *Machine) -> [2]u64 = h7_core_rates(m)
+
+// PLL1 locked at 480 MHz from HSE, as the DISCO's examples set it, not yet the system clock.
+private pll1_at_480(m: *Machine)
+    wr(m, CR, HSION | HSEON)
+    wr(m, PLLCKSELR, DISCO_PLLCKSELR)
+    wr(m, PLL1DIVR, DISCO_PLL1DIVR)
+    wr(m, PLLCFGR, DIVP1EN)
+    wr(m, CR, HSION | HSEON | PLL1ON)
+
+/** `m`, a DISCO just booted, with its clocks set as its firmware sets them before anything else: PWR
+ * at voltage scale 1, PLL1 at 480 MHz from HSE as sys_ck, HPRE /2, and both cores retuned to it, the
+ * M7 at 480 MHz and the M4 at 240 (past scale 1's 400/200, which `rcc_undervolted` notes, as it does
+ * for the example firmware). For a test about something the clocks only time; one about PWR
+ * itself leaves it alone (`scale` false).
+ */
+clock_disco(m: *Machine, scale: bool = true)
+    if scale then wr(m, PWR_CR3, 0x04)
+    if scale then wr(m, PWR_D3CR, 0xc000)
+    pll1_at_480(m)
+    wr(m, D1CFGR, HPRE_2)
+    wr(m, CFGR, 3)
+    retune_h7(m, core0(m))
+    retune_h7(m, core1(m))
+    assert(core_rates(m)[0] == 480 * MHZ && core_rates(m)[1] == 240 * MHZ)
+
+@test("H747 RCC: from reset HSI runs both cores at 64 MHz, and every clock register reads its reset value")
+h747_rcc_reset()
+    val board = disco()
+    val m = &*board
+    assert(rd(m, CR) == HSION | HSIRDY | HSIDIVF | DOMAINS, f"CR 0x${rd(m, CR)}%08x")
+    assert(rd(m, HSICFGR) == 0x40000000 && rd(m, CFGR) == 0 && rd(m, D1CFGR) == 0 && rd(m, D2CFGR) == 0 && rd(m, D3CFGR) == 0)
+    assert(rd(m, PLLCKSELR) == 0x02020200 && rd(m, PLLCFGR) == 0x01ff0000)
+    assert(rd(m, PLL1DIVR) == 0x01010280 && rd(m, PLL2DIVR) == 0x01010280 && rd(m, PLL1FRACR) == 0)
+    assert(core0(m).stop == cpu.Stop.Running)
+    assert(rates(m)[0] == 64 * MHZ && rates(m)[1] == 64 * MHZ)
+    assert(core_rates(m)[0] == 64 * MHZ && core_rates(m)[1] == 64 * MHZ, "the cores themselves run at 64 MHz")
+    // 64 cycles of a 64 MHz core are a microsecond: 480 ticks of the 480 MHz board clock.
+    assert(board_time(core0(m), 64) == 480 && board_time(core0(m), 1) == 7, s"${board_time(core0(m), 1)}")
+    assert(local_time(core0(m), 480) == 64 && local_time(core0(m), 481) == 65, "a deadline between edges is seen at the next")
+
+@test("H747 RCC: HSIDIV divides HSI, and the cores follow")
+h747_rcc_hsidiv()
+    val board = disco()
+    val m = &*board
+    for (code, hz) in [(1u32, 32 * MHZ), (2, 16 * MHZ), (3, 8 * MHZ), (0, 64 * MHZ)]
+        wr(m, CR, HSION | (code << 3))
+        assert(rd(m, CR) == HSION | HSIRDY | HSIDIVF | DOMAINS | (code << 3))
+        assert(rates(m)[0] == hz && rates(m)[1] == hz, s"HSIDIV $code")
+
+@test("H747 RCC: CSI, HSI48 and HSE read ready once on, and not before; HSEBYP holds while HSE runs")
+h747_rcc_oscillators()
+    val board = disco()
+    val m = &*board
+    assert(rd(m, CR) & (CSIRDY | RC48RDY | HSERDY) == 0)
+    wr(m, CR, HSION | CSION | RC48ON | HSEON)
+    assert(rd(m, CR) & (CSIRDY | RC48RDY | HSERDY) == CSIRDY | RC48RDY | HSERDY)
+    wr(m, CR, HSION | HSEON | HSEBYP)
+    assert(rd(m, CR) & HSEBYP == 0, "HSEBYP is written only while HSE is off")
+    wr(m, CR, HSION)
+    wr(m, CR, HSION | HSEBYP)
+    assert(rd(m, CR) & (HSEON | HSERDY | HSEBYP) == HSEBYP)
+    wr(m, CR, HSION | HSEON | HSEBYP)
+    assert(rd(m, CR) & (HSEON | HSERDY | HSEBYP) == HSEON | HSERDY | HSEBYP)
+    wr(m, CR, HSION | HSEON)
+    assert(rd(m, CR) & HSEBYP != 0, "and holds while HSE runs")
+    wr(m, CR, HSION)
+    assert(rd(m, CR) & (CSIRDY | RC48RDY | HSERDY) == 0, "off again, not ready")
+
+@test("H747 RCC: a board with no HSE crystal never readies HSE, nor a PLL fed by it, nor a switch to either")
+h747_rcc_no_hse()
+    val board = machine()
+    val m = &*board
+    assert(board_named(m, "boards/h747-cores.hocon").is_ok())
+    boot(m, image_of(m, []).unwrap().view())
+    pll1_at_480(m)
+    assert(rd(m, CR) & (HSEON | HSERDY | PLL1ON | PLL1RDY) == HSEON | PLL1ON)
+    wr(m, CFGR, 2)
+    assert(rd(m, CFGR) == 2, "SWS stays HSI")
+    wr(m, CFGR, 3)
+    assert(rd(m, CFGR) == 3 && rates(m)[0] == 64 * MHZ)
+
+@test("H747 RCC: PLL1 from the DISCO's 25 MHz HSE locks at 480 MHz, and the switch to it runs the M7 at 480 and the M4 at 240")
+h747_rcc_pll1_480()
+    val board = disco()
+    val m = &*board
+    pll1_at_480(m)
+    assert(rd(m, CR) & (HSERDY | PLL1RDY) == HSERDY | PLL1RDY)
+    assert(rates(m)[0] == 64 * MHZ, "the PLL alone changes nothing")
+    wr(m, D1CFGR, HPRE_2)
+    assert(rates(m)[0] == 64 * MHZ && rates(m)[1] == 32 * MHZ, "HPRE divides the M4's clock")
+    wr(m, CFGR, 3)
+    assert(rd(m, CFGR) == 3 | (3 << 3), "SWS follows SW to PLL1")
+    assert(rates(m)[0] == 480 * MHZ && rates(m)[1] == 240 * MHZ)
+
+@test("H747 RCC: SWS follows SW once its source is ready, a switch to one that is not waits, and HSE and CSI run the cores directly")
+h747_rcc_switch()
+    val board = disco()
+    val m = &*board
+    wr(m, CFGR, 2)
+    assert(rd(m, CFGR) == 2 && rates(m)[0] == 64 * MHZ, "HSE is off: the switch waits")
+    wr(m, CR, HSION | HSEON)
+    assert(rd(m, CFGR) == 2 | (2 << 3) && rates(m)[0] == 25 * MHZ, "HSE ready: the waiting switch is made")
+    wr(m, CR, HSION | HSEON | CSION)
+    wr(m, CFGR, 1)
+    assert(rd(m, CFGR) == 1 | (1 << 3) && rates(m)[0] == 4 * MHZ && rates(m)[1] == 4 * MHZ)
+    wr(m, CFGR, 0)
+    assert(rd(m, CFGR) == 0 && rates(m)[0] == 64 * MHZ)
+    wr(m, CFGR, 5)
+    assert(rd(m, CFGR) == 5, "a reserved source is never ready")
+
+@test("H747 RCC: a switch to PLL1 before it locks, or with its P output disabled, leaves SWS where it was")
+h747_rcc_switch_to_unready_pll()
+    val board = disco()
+    val m = &*board
+    wr(m, CR, HSION | HSEON)
+    wr(m, PLLCKSELR, DISCO_PLLCKSELR)
+    wr(m, PLL1DIVR, DISCO_PLL1DIVR)
+    wr(m, CFGR, 3)
+    assert(rd(m, CFGR) == 3 && rates(m)[0] == 64 * MHZ, "PLL1 off")
+    wr(m, PLLCFGR, 0)
+    wr(m, CR, HSION | HSEON | PLL1ON)
+    assert(rd(m, CR) & PLL1RDY != 0 && rd(m, CFGR) == 3, "locked, but DIVP1EN is clear")
+    wr(m, CR, HSION | HSEON)
+    wr(m, PLLCFGR, DIVP1EN)
+    wr(m, PLLCKSELR, 2)
+    wr(m, CR, HSION | HSEON | PLL1ON)
+    assert(rd(m, CR) & PLL1RDY == 0 && rd(m, CFGR) == 3, "DIVM 0 disables the PLL's input")
+    wr(m, CR, HSION | HSEON)
+    wr(m, PLLCKSELR, DISCO_PLLCKSELR)
+    wr(m, PLL1DIVR, 2 | (1 << 9))
+    wr(m, CR, HSION | HSEON | PLL1ON)
+    assert(rd(m, CR) & PLL1RDY == 0 && rd(m, CFGR) == 3, "DIVN 2 is not a multiplier it runs with")
+    wr(m, CR, HSION | HSEON)
+    wr(m, PLL1DIVR, DISCO_PLL1DIVR)
+    wr(m, CR, HSION | HSEON | PLL1ON)
+    assert(rd(m, CFGR) == 3 | (3 << 3) && rates(m)[0] == 480 * MHZ, "and once it locks, the waiting switch is made")
+
+@test("H747 RCC: D1CPRE divides sys_ck for the M7, and HPRE the M7's clock for the M4")
+h747_rcc_prescalers()
+    val board = disco()
+    val m = &*board
+    pll1_at_480(m)
+    wr(m, CFGR, 3)
+    for (d1cpre, hpre, m7, m4) in [(0u32, 8u32, 480 * MHZ, 240 * MHZ), (7, 0, 480 * MHZ, 480 * MHZ), (8, 8, 240 * MHZ, 120 * MHZ),
+            (9, 9, 120 * MHZ, 30 * MHZ), (11, 12, 30 * MHZ, 468750), (12, 0, 7500000, 7500000), (15, 15, 937500, 1831)]
+        wr(m, D1CFGR, (d1cpre << 8) | hpre)
+        assert(rd(m, D1CFGR) == (d1cpre << 8) | hpre)
+        assert(rates(m)[0] == m7 && rates(m)[1] == m4, s"D1CPRE $d1cpre HPRE $hpre: ${rates(m)[0]} and ${rates(m)[1]}")
+    wr(m, D1CFGR, 0xffffffff)
+    assert(rd(m, D1CFGR) == 0xf7f, "only HPRE, D1PPRE and D1CPRE are stored")
+    wr(m, D2CFGR, 0xffffffff)
+    wr(m, D3CFGR, 0xffffffff)
+    assert(rd(m, D2CFGR) == 0x770 && rd(m, D3CFGR) == 0x70, "the APB prescalers are stored")
+    wr(m, D2CCIP2R, 0x12345678)
+    assert(rd(m, D2CCIP2R) == 0x12345678, "a kernel clock mux is stored")
+
+@test("H747 RCC: FRACN adds eighths of a thousandth to DIVN, latched as PLL1FRACEN rises")
+h747_rcc_fracn()
+    val board = disco()
+    val m = &*board
+    pll1_at_480(m)
+    wr(m, CFGR, 3)
+    wr(m, PLL1FRACR, 4096 << 3)
+    assert(rd(m, PLL1FRACR) == 4096 << 3 && rates(m)[0] == 480 * MHZ, "not latched yet")
+    wr(m, PLLCFGR, DIVP1EN | PLL1FRACEN)
+    // 5 MHz × 192.5 / 2.
+    assert(rates(m)[0] == 481250000, s"${rates(m)[0]}")
+    wr(m, PLL1FRACR, 8191 << 3)
+    assert(rates(m)[0] == 481250000, "FRACEN is already set: nothing latched")
+    wr(m, PLLCFGR, DIVP1EN)
+    wr(m, PLLCFGR, DIVP1EN | PLL1FRACEN)
+    // 5 MHz × (192 + 8191 / 8192) / 2, rounded down.
+    assert(rates(m)[0] == 482499694, s"${rates(m)[0]}")
+    wr(m, PLL1FRACR, 0xffffffff)
+    assert(rd(m, PLL1FRACR) == 0xfff8, "only FRACN is stored")
+
+@test("H747 RCC: PLL1's configuration is ignored while it is on, and written again once it is off")
+h747_rcc_pll_held_while_on()
+    val board = disco()
+    val m = &*board
+    pll1_at_480(m)
+    wr(m, PLL1DIVR, 99 | (3 << 9))
+    wr(m, PLLCKSELR, (4 << 4) | 1)
+    wr(m, PLLCFGR, 0)
+    assert(rd(m, PLL1DIVR) == DISCO_PLL1DIVR && rd(m, PLLCKSELR) == DISCO_PLLCKSELR && rd(m, PLLCFGR) == DIVP1EN)
+    wr(m, PLLCFGR, DIVP1EN | (1 << 19))
+    assert(rd(m, PLLCFGR) == DIVP1EN | (1 << 19), "PLL2's bits, PLL2 being off, are written")
+    wr(m, PLLCKSELR, DISCO_PLLCKSELR | (5 << 12))
+    assert(rd(m, PLLCKSELR) == DISCO_PLLCKSELR | (5 << 12), "DIVM2 is written while PLL2 is off, PLL1 running")
+    wr(m, CR, HSION | HSEON | PLL1ON | PLL2ON)
+    assert(rd(m, CR) & PLL2RDY != 0, "PLL2 locks too")
+    wr(m, CR, HSION | HSEON | PLL2ON)
+    wr(m, PLLCKSELR, (4 << 4) | 1 | (9 << 12) | (7 << 20))
+    assert(rd(m, PLLCKSELR) == (4 << 4) | 2 | (5 << 12) | (7 << 20), "PLLSRC, every PLL's, and DIVM2 hold while PLL2 runs; DIVM1 and DIVM3 are written")
+    wr(m, CR, HSION | HSEON)
+    wr(m, PLL1DIVR, 99 | (3 << 9))
+    wr(m, PLLCKSELR, (4 << 4) | 1)
+    assert(rd(m, PLL1DIVR) == 99 | (3 << 9) && rd(m, PLLCKSELR) == (4 << 4) | 1)
+
+@test("H747 RCC: the oscillator and PLL the system runs on stay on when software turns them off; the rest go")
+h747_rcc_running_source_stays_on()
+    val board = disco()
+    val m = &*board
+    wr(m, CR, 0)
+    assert(rd(m, CR) & (HSION | HSIRDY) == HSION | HSIRDY, "HSI is sys_ck")
+    pll1_at_480(m)
+    wr(m, CFGR, 3)
+    wr(m, CR, CSION)
+    assert(rd(m, CR) & (HSION | HSEON | PLL1ON | PLL1RDY | CSION) == HSEON | PLL1ON | PLL1RDY | CSION, "HSE and PLL1 hold, HSI goes")
+    assert(rates(m)[0] == 480 * MHZ)
+    wr(m, CFGR, 2)
+    wr(m, CR, 0)
+    assert(rd(m, CR) & (HSEON | PLL1ON) == HSEON && rates(m)[0] == 25 * MHZ, "on HSE directly, PLL1 may go but HSE stays")
+
+@test("H747 RCC: a clock switch retunes each core at its next slice, its board time carried on unbroken")
+h747_rcc_retune()
+    val board = disco()
+    val m = &*board
+    val c = core0(m)
+    c.retired = 6400
+    assert(board_time(c, c.retired) == 48000, "100 µs at 64 MHz")
+    cpu.set_limit(c, 1000000)
+    pll1_at_480(m)
+    wr(m, D1CFGR, HPRE_2)
+    val epoch = m.devices.rcc.epoch
+    assert(cpu.limit_of(c) == 0, "a write that changes a rate ends the writer's slice")
+    wr(m, CFGR, 3)
+    assert(m.devices.rcc.epoch == epoch + 1 && core_rates(m)[0] == 64 * MHZ, "the core takes it in at its next slice")
+    retune_h7(m, c)
+    assert(core_rates(m)[0] == 480 * MHZ && board_time(c, c.retired) == 48000, "carried on from the same board time")
+    assert(board_time(c, c.retired + 480) == 48480 && local_time(c, 48480) == c.retired + 480, "now a tick a cycle")
+    assert(core_rates(m)[1] == 64 * MHZ, "the M4 has not looked yet")
+    retune_h7(m, core1(m))
+    assert(core_rates(m)[1] == 240 * MHZ)
+    cpu.set_limit(c, 1000000)
+    wr(m, D2CFGR, 0x40)
+    assert(m.devices.rcc.epoch == epoch + 1 && cpu.limit_of(c) == 1000000, "a write that changes no rate retunes nothing")
+    boot(m, image_of(m, []).unwrap().view())
+    assert(core_rates(m)[0] == 64 * MHZ && core_rates(m)[1] == 64 * MHZ && rd(m, CFGR) == 0, "a reset brings both back to HSI")
+
+@test("H747 RCC: a rate past what PWR's voltage scale allows runs, and is noted; 400/200 MHz at scale 1 is not")
+h747_rcc_voltage_scale()
+    val board = disco()
+    val m = &*board
+    pll1_at_480(m)
+    wr(m, D1CFGR, HPRE_2)
+    wr(m, CFGR, 3)
+    assert(rates(m)[0] == 480 * MHZ, "the switch is made")
+    assert(rcc_undervolted(m) == "the M7 at 480000000 Hz and the M4 at 240000000 Hz, with PWR at voltage scale 3, which allows 200000000 Hz and 100000000 Hz", rcc_undervolted(m))
+    val scaled = disco()
+    val s = &*scaled
+    wr(s, PWR_CR3, 0x04)
+    wr(s, PWR_D3CR, 0xc000)
+    // PLL1 at 400 MHz: 5 MHz x 160 / 2.
+    wr(s, CR, HSION | HSEON)
+    wr(s, PLLCKSELR, DISCO_PLLCKSELR)
+    wr(s, PLL1DIVR, 159 | (1 << 9) | (1 << 16) | (1 << 24))
+    wr(s, PLLCFGR, DIVP1EN)
+    wr(s, CR, HSION | HSEON | PLL1ON)
+    wr(s, D1CFGR, HPRE_2)
+    board_write(s, core0(s), CFGR, 4, 3, RCC_SETTLE)
+    assert(rates(s)[0] == 400 * MHZ && rates(s)[1] == 200 * MHZ && rcc_undervolted(s) == "", rcc_undervolted(s))
+    board_write(s, core0(s), D1CFGR, 4, 0, RCC_SETTLE)
+    assert(rcc_undervolted(s) == "the M7 at 400000000 Hz and the M4 at 400000000 Hz, with PWR at voltage scale 1, which allows 400000000 Hz and 200000000 Hz", rcc_undervolted(s))
+    val early = disco()
+    val e = &*early
+    wr(e, PWR_CR3, 0x04)
+    wr(e, PWR_D3CR, 0xc000)
+    pll1_at_480(e)
+    wr(e, CFGR, 3)
+    assert(rcc_undervolted(e).contains("voltage scale 3"), "a switch before the regulator settled is judged at the scale it ran then")
+    val vos0 = disco()
+    val v = &*vos0
+    wr(v, PWR_CR3, 0x04)
+    wr(v, PWR_D3CR, 0xc000)
+    pll1_at_480(v)
+    wr(v, D1CFGR, HPRE_2)
+    board_write(v, core0(v), CFGR, 4, 3, RCC_SETTLE)
+    assert(rates(v)[0] == 480 * MHZ && rcc_undervolted(v) == "the M7 at 480000000 Hz and the M4 at 240000000 Hz, with PWR at voltage scale 1, which allows 400000000 Hz and 200000000 Hz",
+        "480/240 MHz is VOS0's, which the DISCO's direct SMPS does not reach")
+
+@test("H747 RCC: the registers it does not model still stop the core, named")
+h747_rcc_unmodelled()
+    for offset in [0x0cu32, 0x14, 0x24, 0x48, 0x60, 0x70, 0x74]
+        val board = disco()
+        val m = &*board
+        rd(m, RCC + offset)
+        assert(core0(m).stop == cpu.Stop.Unmodelled && cpu.unmodelled_name(core0(m)) == f"the STM32H7 RCC + 0x$offset%03x", cpu.unmodelled_name(core0(m)))
+
+@test("H747 RCC: a board with no RCC keeps its cores at the chip's clock")
+h747_rcc_absent()
+    val board = machine()
+    val m = &*board
+    assert(board_named(m, "virt").is_ok())
+    boot(m, image_of(m, []).unwrap().view())
+    assert(core0(m).clock_den == 1 && board_time(core0(m), 1000) == 1000 * core0(m).divisor)

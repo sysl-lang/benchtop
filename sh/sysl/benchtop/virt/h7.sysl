@@ -2,17 +2,37 @@ module sh.sysl.benchtop.virt
 
 import sh.sysl.benchtop.{Board, param_named}
 import sh.sysl.benchtop.v6m.{Cpu,Stop,halt,load32,set_limit,unmodelled_register}
+import sysl.math.max
+import sysl.sync.*
 import sysl.threads.Mutex
+import sh.sysl.stm32h747.rcc as reg
 import sh.sysl.stm32h747.rcc.GCR_OFFSET
 
-// The RCC's boot control and its peripheral clock enables, and nothing else of the RCC. Unknown
-// registers fault explicitly; this does not substitute ready bits for unimplemented
-// oscillator/PLL behavior. CM4's reset address is a board option-byte setting, not a fictitious
-// MMIO.
+// The RCC's boot control, its peripheral clock enables, and its clock tree: the oscillators, the
+// three PLLs, the system clock switch and the domain prescalers, which set the rate each core runs at.
+// Unknown registers fault explicitly.
+//
+// The clock tree (RM0399 §8): HSI (64 MHz, on from reset, divided by HSIDIV), CSI (4 MHz), HSI48 and
+// HSE (the board's crystal, `hse-hz`; none where the description names none, and then HSE never
+// becomes ready) each read ready as soon as they are on. A PLL locks as soon as it is on, while its
+// source is ready and its DIVM and DIVN are ones it can run with; its P output is
+// (source / DIVM) × (DIVN + 1 + FRACN / 8192) / (DIVP + 1), with FRACN as PLLxFRACEN last latched it.
+// RCC_CFGR's SWS follows SW once the chosen source is ready. The M7 runs at sys_ck / D1CPRE and the
+// M4 at that / HPRE: both at 64 MHz from reset. A write that changes either rate retunes the cores
+// (`retune_h7`): each takes the new rate in at its next slice, the writer at once. A rate beyond what
+// PWR's voltage scale allows is run all the same, and noted (`rcc_undervolted`).
+//
+// Not modelled: the clock security system, MCO1/MCO2, oscillator start-up and PLL lock times (every
+// ready flag rises at the write that allows it), the VCO and reference-range limits (VCOSEL and RGE
+// are stored), the PLLs' Q and R outputs and PLL2 and PLL3 as clocks of anything, the CSI and HSI
+// trims, the domain clocks' stop modes (D1CKRDY and D2CKRDY read 1), the clock interrupts, and the
+// kernel clock muxes (D1CCIPR to D3CCIPR are stored; each peripheral keeps its board-given kernel
+// clock). The APB prescalers in D1CFGR, D2CFGR and D3CFGR are stored and time nothing.
 //
 // The enables are stored and read back, but gate nothing: a peripheral whose clock is off still
 // runs. The reset registers (AHB3RSTR..APB4RSTR) stay refused, since a held reset would have to
-// reach the peripheral models.
+// reach the peripheral models. CM4's reset address is a board option-byte setting, not a fictitious
+// MMIO.
 
 // The nine enable registers of one core's view, in RM0399's order: AHB3, AHB1, AHB2, AHB4, APB3,
 // APB1L, APB1H, APB2, APB4. RCC_C1_xxxENR (CPU1, the CM7) starts at 0x134 and RCC_C2_xxxENR (CPU2,
@@ -36,6 +56,59 @@ private const GCR_BOOT: u32 = GCR_BOOT_C1 | GCR_BOOT_C2
 // The CM4 boot address's alignment: the option bytes hold its top 16 bits.
 private const CM4_BOOT_GRANULE_MASK: u32 = 0xffff
 
+// The oscillators' rates.
+private const HSI_HZ: u64 = 64000000
+private const CSI_HZ: u64 = 4000000
+// FRACN's unit: a PLL's multiplier is DIVN + 1 + FRACN / 8192.
+private const FRAC_ONE: u64 = 8192
+
+// RCC_CR's bits software sets, and the ready flags that follow them.
+private const CR_WRITABLE: u32 = reg.CR_HSION_MASK | reg.CR_HSIKERON_MASK | reg.CR_HSIDIV_MASK | reg.CR_CSION_MASK |
+    reg.CR_CSIKERON_MASK | reg.CR_RC48ON_MASK | reg.CR_HSEON_MASK | reg.CR_HSEBYP_MASK | reg.CR_HSECSSON_MASK |
+    reg.CR_PLL1ON_MASK | reg.CR_PLL2ON_MASK | reg.CR_PLL3ON_MASK
+private val PLL_ON: [3]u32 = [reg.CR_PLL1ON_MASK, reg.CR_PLL2ON_MASK, reg.CR_PLL3ON_MASK]
+private val PLL_RDY: [3]u32 = [reg.CR_PLL1RDY_MASK, reg.CR_PLL2RDY_MASK, reg.CR_PLL3RDY_MASK]
+// Each PLL's bits of PLLCKSELR (DIVMx) and PLLCFGR (everything of its but FRACEN), held while it is on.
+private val DIVM_MASK: [3]u32 = [reg.PLLCKSELR_DIVM1_MASK, reg.PLLCKSELR_DIVM2_MASK, reg.PLLCKSELR_DIVM3_MASK]
+private val DIVM_SHIFT: [3]u32 = [reg.PLLCKSELR_DIVM1_SHIFT, reg.PLLCKSELR_DIVM2_SHIFT, reg.PLLCKSELR_DIVM3_SHIFT]
+private val CFG_HELD: [3]u32 = [
+    reg.PLLCFGR_PLL1VCOSEL_MASK | reg.PLLCFGR_PLL1RGE_MASK | reg.PLLCFGR_DIVP1EN_MASK | reg.PLLCFGR_DIVQ1EN_MASK | reg.PLLCFGR_DIVR1EN_MASK,
+    reg.PLLCFGR_PLL2VCOSEL_MASK | reg.PLLCFGR_PLL2RGE_MASK | reg.PLLCFGR_DIVP2EN_MASK | reg.PLLCFGR_DIVQ2EN_MASK | reg.PLLCFGR_DIVR2EN_MASK,
+    reg.PLLCFGR_PLL3VCOSEL_MASK | reg.PLLCFGR_PLL3RGE_MASK | reg.PLLCFGR_DIVP3EN_MASK | reg.PLLCFGR_DIVQ3EN_MASK | reg.PLLCFGR_DIVR3EN_MASK]
+private val FRACEN: [3]u32 = [reg.PLLCFGR_PLL1FRACEN_MASK, reg.PLLCFGR_PLL2FRACEN_MASK, reg.PLLCFGR_PLL3FRACEN_MASK]
+private const PLLCFGR_WRITABLE: u32 = 0x01ff0fff
+private const DIVR_WRITABLE: u32 = reg.PLL1DIVR_DIVN1_MASK | reg.PLL1DIVR_DIVP1_MASK | reg.PLL1DIVR_DIVQ1_MASK | reg.PLL1DIVR_DIVR1_MASK
+private val DIVR_OFFSETS: [3]u32 = [reg.PLL1DIVR_OFFSET, reg.PLL2DIVR_OFFSET, reg.PLL3DIVR_OFFSET]
+private val FRACR_OFFSETS: [3]u32 = [reg.PLL1FRACR_OFFSET, reg.PLL2FRACR_OFFSET, reg.PLL3FRACR_OFFSET]
+// DIVN's smallest value a PLL runs with (a multiplier of 4).
+private const DIVN_LEAST: u32 = 3
+
+// RCC_CFGR's SW and SWS codes, and PLLCKSELR's PLLSRC codes.
+private const SW_HSI: u32 = 0
+private const SW_CSI: u32 = 1
+private const SW_HSE: u32 = 2
+private const SW_PLL1: u32 = 3
+private const SRC_NONE: u32 = 3
+private const CFGR_WRITABLE: u32 = 0xffffffff ^ reg.CFGR_SWS_MASK
+private const D1CFGR_WRITABLE: u32 = reg.D1CFGR_HPRE_MASK | reg.D1CFGR_D1PPRE_MASK | reg.D1CFGR_D1CPRE_MASK
+private const D2CFGR_WRITABLE: u32 = reg.D2CFGR_D2PPRE1_MASK | reg.D2CFGR_D2PPRE2_MASK
+private const D3CFGR_WRITABLE: u32 = reg.D3CFGR_D3PPRE_MASK
+// The four kernel clock selection registers, stored.
+private val KERNEL_OFFSETS: [4]u32 = [reg.D1CCIPR_OFFSET, reg.D2CCIP1R_OFFSET, reg.D2CCIP2R_OFFSET, reg.D3CCIPR_OFFSET]
+
+// Reset values (RM0399 §8.7): HSI on and ready, its divider settled, both domains' clocks ready;
+// every PLL fed from HSI through DIVM 32, with all its outputs enabled and DIVN 129, DIVP, DIVQ and DIVR 2.
+private const CR_RESET: u32 = reg.CR_HSION_MASK | reg.CR_HSIRDY_MASK | reg.CR_HSIDIVF_MASK | reg.CR_D1CKRDY_MASK | reg.CR_D2CKRDY_MASK
+private const HSICFGR_RESET: u32 = 0x40000000
+private const PLLCKSELR_RESET: u32 = 0x02020200
+private const PLLCFGR_RESET: u32 = 0x01ff0000
+private const DIVR_RESET: u32 = 0x01010280
+
+// The highest rate each core may run at in voltage scales 1 to 3, M7 then M4 (DS12930): 400/200,
+// 300/150 and 200/100 MHz. 480/240 MHz is VOS0's, which needs the LDO and SYSCFG_PWRCR.ODEN; neither
+// is modelled (`stm32_pwr`), and the DISCO's direct SMPS cannot supply it (DESIGN.md §0).
+private val SCALE_LIMITS: [3][2]u64 = [[400000000, 200000000], [300000000, 150000000], [200000000, 100000000]]
+
 /** Both cores' copies of the peripheral clock enables: CPU1's nine, then CPU2's. */
 struct RccEnables
     regs: [18]u32
@@ -45,16 +118,51 @@ private enables_at_reset() -> RccEnables
     for i in 0..<18 do e.regs[i] = ENR_RESET[i % 9]
     e
 
+/** The clock tree's registers as software last left them. `cr` holds the oscillators' and PLLs'
+ * enables (their ready flags are worked out as they are read); `fracn` is each PLL's FRACN as its
+ * modulator latched it; `kernel` D1CCIPR, D2CCIP1R, D2CCIP2R and D3CCIPR.
+ */
+struct RccClocks
+    cr: u32
+    hsicfgr: u32
+    cfgr: u32
+    d1cfgr: u32
+    d2cfgr: u32
+    d3cfgr: u32
+    pllckselr: u32
+    pllcfgr: u32
+    divr: [3]u32
+    fracr: [3]u32
+    fracn: [3]u32
+    kernel: [4]u32
+    // SWS: the source sys_ck runs from.
+    sws: u32
+    // The last rate past what the voltage scale allows, "" for none.
+    undervolted: string
+
+private clocks_at_reset() -> RccClocks =
+    RccClocks(CR_RESET & CR_WRITABLE, HSICFGR_RESET, 0, 0, 0, 0, PLLCKSELR_RESET, PLLCFGR_RESET,
+        [DIVR_RESET; 3], [0; 3], [0; 3], [0; 4], SW_HSI, "")
+
 /** The RCC's boot control: the CM4's boot address, from the board's option bytes, and GCR, which
- * either core may reach; and the peripheral clock enables of both cores.
+ * either core may reach; the peripheral clock enables of both cores; and the clock tree, with the
+ * board's HSE crystal (`hse_hz`, 0 for none). `epoch` counts the clock switches since power-on, each
+ * of which retunes the cores; `present` is whether the board has the RCC at all, and `pwr` whether it
+ * has the PWR whose voltage scale bounds the rates.
  */
 struct RccState
     cm4_boot: u32
     gcr: Mutex[u32]
     enables: Mutex[RccEnables]
+    clocks: Mutex[RccClocks]
+    epoch: u64
+    hse_hz: u64
+    present: bool
+    pwr: bool
 
 /** The RCC as a board without one leaves it. */
-rcc_state() -> RccState = RccState(0x08100000, Mutex.new(GCR_BOOT_C1), Mutex.new(enables_at_reset()))
+rcc_state() -> RccState = RccState(0x08100000, Mutex.new(GCR_BOOT_C1), Mutex.new(enables_at_reset()),
+    Mutex.new(clocks_at_reset()), 0, 0, false, false)
 
 // The slot in `RccEnables.regs` an offset names for core `core`, if it is an enable register.
 private enable_slot(core: u32, offset: u32) -> Option[u32]
@@ -68,20 +176,193 @@ private enable_slot(core: u32, offset: u32) -> Option[u32]
 private[virt] check_rcc(b: Board) -> Result[RccState,string]
     var s = rcc_state()
     for p in b.chip.peripherals
+        if p.kind == "stm32h7-pwr" then s.pwr = true
         if p.kind != "stm32h7-rcc" then continue
         if b.chip.cores[0].name != "cortex-m7" || b.chip.cores[1].name != "cortex-m4" then
             return Err("stm32h7-rcc requires core 0 Cortex-M7 and core 1 Cortex-M4")
+        s.present = true
         param_named(p.params,"cm4-boot-address") match
             Some(q) -> q.value match
                 Whole(at) -> s.cm4_boot = u32(at)
                 _ -> ()
             None -> ()
+        param_named(p.params,"hse-hz") match
+            Some(q) -> q.value match
+                Whole(hz) -> s.hse_hz = u64(hz)
+                _ -> ()
+            None -> ()
         if s.cm4_boot & CM4_BOOT_GRANULE_MASK != 0 then return Err("CM4 boot address must align to the option bytes' 64 KB granularity")
     Ok(s)
 
-private[virt] boot_h7(r: *RccState)
+// The clocks as at power-on, both cores running at HSI's 64 MHz.
+private[virt] boot_h7(r: *RccState, m: *Machine)
     r.gcr.with(gcr -> *gcr = GCR_BOOT_C1)
     r.enables.with(e -> *e = enables_at_reset())
+    r.clocks.with(k -> *k = clocks_at_reset())
+    if !r.present || m.clock_hz == 0 then return
+    val epoch = atomic_add(&r.epoch, 1, SeqCst) + 1
+    for k in 0..<2
+        retune_core(&m.cores[k], m.clock_hz, HSI_HZ)
+        m.cores[k].clock_epoch = epoch
+
+/** Bring core `cpu` to the rate the RCC last set for it, where a clock switch since it last looked
+ * has changed it: once a slice, a load where nothing has.
+ */
+private[virt] retune_h7(m: *Machine, cpu: *Cpu)
+    val r = &m.devices.rcc
+    val epoch = atomic_load(&r.epoch, Acquire)
+    if epoch == cpu.clock_epoch || m.clock_hz == 0 then return
+    val core = cpu.core
+    val hz = r.clocks.with(k -> core_hz(k, r.hse_hz, core))
+    retune_core(cpu, m.clock_hz, hz)
+    cpu.clock_epoch = epoch
+
+// Whether the oscillator `src` (a PLLSRC code) is on, and its rate.
+private source_hz(k: *RccClocks, hse_hz: u64, src: u32) -> u64 = src match
+    0 -> if k.cr & reg.CR_HSION_MASK != 0 then HSI_HZ >> u64((k.cr & reg.CR_HSIDIV_MASK) >> reg.CR_HSIDIV_SHIFT) else 0
+    1 -> if k.cr & reg.CR_CSION_MASK != 0 then CSI_HZ else 0
+    2 -> if k.cr & reg.CR_HSEON_MASK != 0 then hse_hz else 0
+    _ -> 0
+
+private divm(k: *RccClocks, x: int) -> u32 = (k.pllckselr & DIVM_MASK[x]) >> DIVM_SHIFT[x]
+private pll_source(k: *RccClocks) -> u32 = (k.pllckselr & reg.PLLCKSELR_PLLSRC_MASK) >> reg.PLLCKSELR_PLLSRC_SHIFT
+
+// Whether PLL `x` (0 for PLL1) is locked: on, fed by a running source, with a DIVM and DIVN it runs with.
+private pll_ready(k: *RccClocks, hse_hz: u64, x: int) -> bool =
+    k.cr & PLL_ON[x] != 0 && source_hz(k, hse_hz, pll_source(k)) != 0 && divm(k, x) != 0 &&
+        (k.divr[x] & reg.PLL1DIVR_DIVN1_MASK) >= DIVN_LEAST
+
+// PLL1's P output, in hertz, 0 where it is not locked or its P output is not enabled.
+private pll1_p_hz(k: *RccClocks, hse_hz: u64) -> u64
+    if !pll_ready(k, hse_hz, 0) || k.pllcfgr & reg.PLLCFGR_DIVP1EN_MASK == 0 then return 0
+    val n = u128((k.divr[0] & reg.PLL1DIVR_DIVN1_MASK) >> reg.PLL1DIVR_DIVN1_SHIFT) + 1
+    val p = u128((k.divr[0] & reg.PLL1DIVR_DIVP1_MASK) >> reg.PLL1DIVR_DIVP1_SHIFT) + 1
+    val src = u128(source_hz(k, hse_hz, pll_source(k)))
+    u64(src * (n * u128(FRAC_ONE) + u128(k.fracn[0])) / (u128(divm(k, 0)) * u128(FRAC_ONE) * p))
+
+// The rate of system clock source `sw`, 0 where it is not ready.
+private switch_hz(k: *RccClocks, hse_hz: u64, sw: u32) -> u64 = sw match
+    0 -> source_hz(k, hse_hz, 0)
+    1 -> source_hz(k, hse_hz, 1)
+    2 -> source_hz(k, hse_hz, 2)
+    3 -> pll1_p_hz(k, hse_hz)
+    _ -> 0
+
+// The divisor a D1CPRE or HPRE code divides by: 1 for 0xxx, then 2, 4, 8, 16, 64, 128, 256, 512.
+private prescale(code: u32) -> u64 = if code < 8 then 1 elif code < 12 then 2u64 << u64(code - 8) else 64u64 << u64(code - 12)
+
+/** The rate core `core` runs at (0 the M7, at sys_ck / D1CPRE; 1 the M4, at that / HPRE). */
+private[virt] core_hz(k: *RccClocks, hse_hz: u64, core: u32) -> u64
+    val sys = switch_hz(k, hse_hz, k.sws)
+    val m7 = sys / prescale((k.d1cfgr & reg.D1CFGR_D1CPRE_MASK) >> reg.D1CFGR_D1CPRE_SHIFT)
+    max(1u64, if core == 0 then m7 else m7 / prescale((k.d1cfgr & reg.D1CFGR_HPRE_MASK) >> reg.D1CFGR_HPRE_SHIFT))
+
+// Whether oscillator `src` (a PLLSRC code, which is SW's for the three oscillators) drives sys_ck,
+// directly or through PLL1.
+private drives_system(k: *RccClocks, src: u32) -> bool = k.sws == src || (k.sws == SW_PLL1 && pll_source(k) == src)
+
+// RCC_CR as read: the enables, and each one's ready flag.
+private cr_read(k: *RccClocks, hse_hz: u64) -> u32
+    var v = k.cr | reg.CR_HSIDIVF_MASK | reg.CR_D1CKRDY_MASK | reg.CR_D2CKRDY_MASK
+    if k.cr & reg.CR_HSION_MASK != 0 then v |= reg.CR_HSIRDY_MASK
+    if k.cr & reg.CR_CSION_MASK != 0 then v |= reg.CR_CSIRDY_MASK
+    if k.cr & reg.CR_RC48ON_MASK != 0 then v |= reg.CR_RC48RDY_MASK
+    if k.cr & reg.CR_HSEON_MASK != 0 && hse_hz != 0 then v |= reg.CR_HSERDY_MASK
+    for x in 0..<3 do if pll_ready(k, hse_hz, x) then v |= PLL_RDY[x]
+    v
+
+// A write of RCC_CR. An oscillator or PLL1 that sys_ck runs from stays on; HSEBYP holds while HSE is on.
+private cr_write(k: *RccClocks, value: u32)
+    var v = value & CR_WRITABLE
+    if drives_system(k, SW_HSI) then v |= reg.CR_HSION_MASK
+    if drives_system(k, SW_CSI) then v |= reg.CR_CSION_MASK
+    if drives_system(k, SW_HSE) then v |= reg.CR_HSEON_MASK
+    if k.sws == SW_PLL1 then v |= reg.CR_PLL1ON_MASK
+    if k.cr & reg.CR_HSEON_MASK != 0 then v = (v & ~reg.CR_HSEBYP_MASK) | (k.cr & reg.CR_HSEBYP_MASK)
+    // The clock security system, once on, stays on until a reset.
+    v |= k.cr & reg.CR_HSECSSON_MASK
+    k.cr = v
+
+// The PLL configuration a write leaves in a register: `value`'s bits but `held`, which keep `old`'s.
+private holding(old: u32, value: u32, held: u32) -> u32 = (value & ~held) | (old & held)
+
+private pll_on(k: *RccClocks, x: int) -> bool = k.cr & PLL_ON[x] != 0
+
+private pllckselr_write(k: *RccClocks, value: u32)
+    var held = 0u32
+    for x in 0..<3 do if pll_on(k, x) then held |= DIVM_MASK[x] | reg.PLLCKSELR_PLLSRC_MASK
+    k.pllckselr = holding(k.pllckselr, value & (reg.PLLCKSELR_PLLSRC_MASK | DIVM_MASK[0] | DIVM_MASK[1] | DIVM_MASK[2]), held)
+
+// A write of PLLCFGR. FRACEN may change at any time, and its rise latches FRACN into the modulator.
+private pllcfgr_write(k: *RccClocks, value: u32)
+    var held = 0u32
+    for x in 0..<3 do if pll_on(k, x) then held |= CFG_HELD[x]
+    val old = k.pllcfgr
+    k.pllcfgr = holding(old, value & PLLCFGR_WRITABLE, held)
+    for x in 0..<3
+        if old & FRACEN[x] == 0 && k.pllcfgr & FRACEN[x] != 0 then
+            k.fracn[x] = (k.fracr[x] & reg.PLL1FRACR_FRACN1_MASK) >> reg.PLL1FRACR_FRACN1_SHIFT
+
+// SWS takes SW's source once it is ready, and keeps the one it has until then.
+private follow_switch(k: *RccClocks, hse_hz: u64)
+    val sw = (k.cfgr & reg.CFGR_SW_MASK) >> reg.CFGR_SW_SHIFT
+    if sw != k.sws && switch_hz(k, hse_hz, sw) != 0 then k.sws = sw
+
+// A clock tree register's value, if `offset` is one.
+private clocks_read(k: *RccClocks, hse_hz: u64, offset: u32) -> Option[u32]
+    if offset == reg.CR_OFFSET then return Some(cr_read(k, hse_hz))
+    if offset == reg.HSICFGR_OFFSET then return Some(k.hsicfgr)
+    if offset == reg.CRRCR_OFFSET then return Some(0)
+    if offset == reg.CFGR_OFFSET then return Some(k.cfgr | (k.sws << reg.CFGR_SWS_SHIFT))
+    if offset == reg.D1CFGR_OFFSET then return Some(k.d1cfgr)
+    if offset == reg.D2CFGR_OFFSET then return Some(k.d2cfgr)
+    if offset == reg.D3CFGR_OFFSET then return Some(k.d3cfgr)
+    if offset == reg.PLLCKSELR_OFFSET then return Some(k.pllckselr)
+    if offset == reg.PLLCFGR_OFFSET then return Some(k.pllcfgr)
+    for x in 0..<3
+        if offset == DIVR_OFFSETS[x] then return Some(k.divr[x])
+        if offset == FRACR_OFFSETS[x] then return Some(k.fracr[x])
+    for i in 0..<4 do if offset == KERNEL_OFFSETS[i] then return Some(k.kernel[i])
+    None
+
+// A write of a clock tree register; false where `offset` is none.
+private clocks_write(k: *RccClocks, hse_hz: u64, offset: u32, value: u32) -> bool
+    if offset == reg.CR_OFFSET then cr_write(k, value)
+    elif offset == reg.HSICFGR_OFFSET then k.hsicfgr = (k.hsicfgr & ~reg.HSICFGR_HSITRIM_MASK) | (value & reg.HSICFGR_HSITRIM_MASK)
+    elif offset == reg.CRRCR_OFFSET then ()
+    elif offset == reg.CFGR_OFFSET then k.cfgr = value & CFGR_WRITABLE
+    elif offset == reg.D1CFGR_OFFSET then k.d1cfgr = value & D1CFGR_WRITABLE
+    elif offset == reg.D2CFGR_OFFSET then k.d2cfgr = value & D2CFGR_WRITABLE
+    elif offset == reg.D3CFGR_OFFSET then k.d3cfgr = value & D3CFGR_WRITABLE
+    elif offset == reg.PLLCKSELR_OFFSET then pllckselr_write(k, value)
+    elif offset == reg.PLLCFGR_OFFSET then pllcfgr_write(k, value)
+    else
+        var found = false
+        for x in 0..<3
+            if offset == DIVR_OFFSETS[x]
+                if !pll_on(k, x) then k.divr[x] = value & DIVR_WRITABLE
+                found = true
+            elif offset == FRACR_OFFSETS[x]
+                k.fracr[x] = value & reg.PLL1FRACR_FRACN1_MASK
+                found = true
+        for i in 0..<4
+            if offset == KERNEL_OFFSETS[i]
+                k.kernel[i] = value
+                found = true
+        if !found then return false
+    follow_switch(k, hse_hz)
+    true
+
+/** What the M7 and the M4 would run at, as the RCC of `m` is set now. */
+private[virt] h7_core_rates(m: *Machine) -> [2]u64
+    val r = &m.devices.rcc
+    r.clocks.with(k -> [core_hz(k, r.hse_hz, 0), core_hz(k, r.hse_hz, 1)])
+
+/** The last clock switch of `m`'s that asked a core for more than PWR's voltage scale allowed at the
+ * time, as a sentence; "" where none has. The switch is made all the same, as on silicon, where the
+ * core would be run out of its specification.
+ */
+rcc_undervolted(m: *Machine) -> string = m.devices.rcc.clocks.with(k -> k.undervolted.copy())
 
 private[virt] h7_rcc_read(r: *RccState, c: *Cpu, address: u32, offset: u32, width: u32) -> u32
     if width != 4 || offset & 3 != 0
@@ -90,6 +371,10 @@ private[virt] h7_rcc_read(r: *RccState, c: *Cpu, address: u32, offset: u32, widt
     if offset == GCR_OFFSET then return r.gcr.with(gcr -> *gcr)
     enable_slot(c.core,offset) match
         Some(slot) -> return r.enables.with(e -> e.regs[slot])
+        None -> ()
+    val hse = r.hse_hz
+    r.clocks.with(k -> clocks_read(k, hse, offset)) match
+        Some(v) -> return v
         None -> ()
     unmodelled_register(c,address,f"the STM32H7 RCC + 0x$offset%03x")
     0
@@ -101,16 +386,37 @@ private h7_enable_write(r: *RccState, c: *Cpu, address: u32, slot: u32, value: u
         return
     r.enables.with(e -> e.regs[slot] = value)
 
+// A write of a clock tree register by `c` at its instruction `n`; false where `offset` is none. Where
+// it changes a core's rate the cores are retuned: the writer ends its slice here and takes the rate
+// in at the next, the other at its own next.
+private h7_clocks_write(m: *Machine, c: *Cpu, offset: u32, value: u32, n: u64) -> bool
+    val r = &m.devices.rcc
+    val hse = r.hse_hz
+    val (known, before, after) = r.clocks.with(k ->
+        val was = [core_hz(k, hse, 0), core_hz(k, hse, 1)]
+        val wrote = clocks_write(k, hse, offset, value)
+        (wrote, was, [core_hz(k, hse, 0), core_hz(k, hse, 1)]))
+    if !known then return false
+    if after[0] == before[0] && after[1] == before[1] then return true
+    val scale = if r.pwr then pwr_scale(&m.devices.pwr, board_time(c, n)) else 1
+    val limit = SCALE_LIMITS[scale - 1]
+    if after[0] > limit[0] || after[1] > limit[1]
+        val why = s"the M7 at ${after[0]} Hz and the M4 at ${after[1]} Hz, with PWR at voltage scale $scale, which allows ${limit[0]} Hz and ${limit[1]} Hz"
+        r.clocks.with(k -> k.undervolted = why)
+    atomic_add(&r.epoch, 1, SeqCst)
+    set_limit(c, 0)
+    true
+
 // A write of GCR by core 0 that asks for the CM4's boot launches `m`'s core 1, as the option bytes'
 // boot address says.
-private[virt] h7_rcc_write(m: *Machine, c: *Cpu, address: u32, offset: u32, width: u32, value: u32)
+private[virt] h7_rcc_write(m: *Machine, c: *Cpu, address: u32, offset: u32, width: u32, value: u32, n: u64)
     if width != 4 || offset & 3 != 0
         halt(c,Stop.Fault,address)
         return
     if offset != GCR_OFFSET
         enable_slot(c.core,offset) match
             Some(slot) -> h7_enable_write(&m.devices.rcc,c,address,slot,value)
-            None -> unmodelled_register(c,address,f"the STM32H7 RCC + 0x$offset%03x")
+            None -> if !h7_clocks_write(m,c,offset,value,n) then unmodelled_register(c,address,f"the STM32H7 RCC + 0x$offset%03x")
         return
     val boot = m.devices.rcc.cm4_boot
     val s = &m.scheduler

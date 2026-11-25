@@ -884,7 +884,9 @@ The MCU may declare `clock-hz = 150000000`. The desktop uses this target for
 wall-time execution pacing, and virtual I2C/RTC, PWM and digital-audio timebases
 inherit it. Each Cortex-M core can override `clock-hz`; its rate must divide the
 MCU timebase exactly. For example, an M7 at 480 MHz and an M4 at 240 MHz use
-`mcu.clock-hz = 480000000`, with `clock-hz = 240000000` on the M4.
+`mcu.clock-hz = 480000000`, with `clock-hz = 240000000` on the M4. A chip with the
+`stm32h7-rcc` sets its cores' rates from the RCC instead: 64 MHz from reset, then
+whatever the firmware's PLL and prescalers give, at any ratio to the timebase.
 Core-local SysTick keeps that core's rate while shared peripherals use the MCU
 timebase. Different supported Cortex-M models may share a board, with independent
 instruction records and FPU settings. Existing boards that omit clocks retain
@@ -1215,8 +1217,9 @@ heterogeneous M7/M4 configuration.
 
 ## STM32H747 Discovery DSI bring-up
 
-The initial `stm32h747-disco` board description runs an M7 at a configured
-480 MHz and an M4 at 240 MHz, each on its own host worker. M4 runs the touchscreen
+The initial `stm32h747-disco` board description runs an M7 and an M4, each on its
+own host worker, at HSI's 64 MHz from reset; the example firmware sets the RCC's
+PLL1 up first, for the M7 at 480 MHz and the M4 at 240 MHz. M4 runs the touchscreen
 UI. The display-only image leaves M7 idle; the audio variant runs M7 sine DSP
 and interrupt-driven SAI/DMA playback through a WM8994 codec.
 
