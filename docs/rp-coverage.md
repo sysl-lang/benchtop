@@ -849,6 +849,22 @@ which the test drives from outside; woken by PWRUP0 (bit 1), the word kept, BOOT
 ignored, PWRUP0's edge still latched. `chip/power_tests.sysl` asserts every line and that the alarm's
 power-up came between 1000 and 1100 ms on the timer.
 
+**Deep sleep** (both chips; datasheet, "Clocks": WAKE_EN/SLEEP_EN, and "Power": sleep): once every
+started core sleeps in `WFI` or `WFE` with SCR.SLEEPDEEP set (`ArmBoard.deep_asleep`; a core held in
+reset does not count), the chip stops each clock whose SLEEP_EN bit is clear until a core wakes. On
+the RP2350: CLK_REF_TICKS stops every TICKS generator, and with them each TIMER counting its tick, the
+watchdog and the SIO's platform timer; CLK_SYS_TIMER0/1 stop TIMER0/1 (also one counting clk_sys);
+CLK_SYS_UARTn or CLK_PERI_UARTn stops UARTn's line; CLK_SYS_WATCHDOG the watchdog; CLK_SYS_SIO the
+platform timer. On the RP2040: CLK_SYS_TIMER, the UARTs' pairs, and CLK_RTC_RTC. POWMAN's always-on
+timer and its alarm run on. Each core's SysTick, which counts the processor clock (CLKSOURCE reads 1),
+stops in any deep sleep: SLEEP_EN has no bit for the processors. A stopped device makes no progress and
+raises no event, so it neither wakes a core nor shortens the board's skip; on the wake it goes on from
+where it stood. WAKE_EN0/1 and SLEEP_EN0/1 power up with every bit set, as on silicon. **Not
+modelled**: the gating of the other blocks (PWM, SPI, I2C, ADC, PIO, DMA, HSTX, USB and TRNG keep
+their clocks), the sleep state's wait for the DMA, the gating WAKE_EN does while a core runs, and the
+quantum (1000 clk_sys cycles) before the board sees both cores asleep, through which the clocks still
+run. The RISC-V harts' deep sleep (MSLEEP.DEEPSLEEP) gates nothing. `chip/deep_sleep_tests.sysl`.
+
 ### Item 9, done: the GPIO function mux and the GPIO interrupts
 
 `peripheral/rp2350/gpio.sysl` (the mux) and `gpio_irq.sysl` (the interrupts) against `hardware/regs/io_bank0.h`

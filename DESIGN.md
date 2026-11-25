@@ -1628,6 +1628,11 @@ so a program that polls the wrong bit hangs in benchtop as on the board:
   start-up forgets.
 - **PSM**, **POWMAN**, **WATCHDOG**: stored. Watchdog `SCRATCH` registers survive a watchdog reset,
   and the reset itself restarts the machine through §9.2's path.
+- **Deep sleep**: with every started core asleep and SCR.SLEEPDEEP set, the clocks whose `SLEEP_EN0/1`
+  bit is clear stop for the board's sleep skip — TICKS (`CLK_REF_TICKS`), TIMER0/1, the UARTs, the
+  watchdog, the SIO's platform timer — and so does each core's SysTick, on the processor clock; the
+  always-on timer runs on. The gating is decided once per skip (`ArmChip.gate`), never per
+  instruction. What is gated and what is not: `docs/rp-coverage.md`, item 34.
 
 ### 9.5 UART0, TIMER and GPIO
 
